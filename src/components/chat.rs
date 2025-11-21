@@ -78,13 +78,17 @@ impl Render for ChatView {
                     )
                     .child(
                         Button::new("theme-toggle")
-                            .icon(if self.state.read(cx).theme_mode == "light" {
-                                IconName::Moon
-                            } else {
-                                IconName::Sun
+                            .icon(match self.state.read(cx).theme_mode.as_str() {
+                                "light" => IconName::Moon,
+                                "dark" => IconName::Settings,
+                                _ => IconName::Sun,
                             })
                             .ghost()
-                            .tooltip("Toggle theme")
+                            .tooltip(match self.state.read(cx).theme_mode.as_str() {
+                                "light" => "Switch to Dark theme",
+                                "dark" => "Switch to System theme",
+                                _ => "Switch to Light theme",
+                            })
                             .on_click({
                                 let app_state = self.state.clone();
                                 cx.listener(move |_, _, _, cx| {

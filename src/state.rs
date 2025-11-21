@@ -91,19 +91,27 @@ impl AppState {
 
         println!("[THEME] Toggle called, current: {}", self.theme_mode);
 
-        self.theme_mode = if self.theme_mode == "light" {
-            "dark".to_string()
-        } else {
-            "light".to_string()
-        };
+        // Cycle: light → dark → system → light
+        self.theme_mode = match self.theme_mode.as_str() {
+            "light" => "dark",
+            "dark" => "system",
+            _ => "light",
+        }
+        .to_string();
 
         println!("[THEME] New mode: {}", self.theme_mode);
 
-        // Apply the theme
-        let theme_name = if self.theme_mode == "light" {
-            "macOS Classic Light"
-        } else {
-            "macOS Classic Dark"
+        // Determine which theme to apply
+        let theme_name = match self.theme_mode.as_str() {
+            "light" => "macOS Classic Light",
+            "dark" => "macOS Classic Dark",
+            "system" => {
+                // TODO: Detect actual system appearance
+                // For now, default to dark
+                println!("[THEME] System mode - defaulting to dark");
+                "macOS Classic Dark"
+            }
+            _ => "macOS Classic Light",
         };
 
         println!("[THEME] Loading theme: {}", theme_name);
