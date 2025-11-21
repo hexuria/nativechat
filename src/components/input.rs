@@ -73,30 +73,28 @@ impl Render for MessageInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        v_flex()
-            .w_full()
-            .bg(theme.background)
-            .border_t_1()
-            .border_color(theme.border)
-            .p_2()
-            .child(
-                v_form().w_full().child(
-                    field().child(
-                        h_flex()
-                            .id("message-input")
-                            .items_end()
-                            .gap_2()
-                            .child(div().flex_grow().child(Input::new(&self.input_state)))
-                            .child(
-                                Button::new("send")
-                                    .icon(IconName::ArrowUp)
-                                    .small()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.trigger_submit(window, cx);
-                                    })),
-                            ),
-                    ),
+        v_flex().w_full().bg(theme.background).p_2().child(
+            v_form().w_full().child(
+                field().child(
+                    h_flex()
+                        .id("message-input")
+                        .items_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_grow()
+                                .child(Input::new(&self.input_state).appearance(false)),
+                        )
+                        .child(
+                            Button::new("send")
+                                .icon(IconName::ArrowUp)
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.trigger_submit(window, cx);
+                                })),
+                        ),
                 ),
-            )
+            ),
+        )
     }
 }
