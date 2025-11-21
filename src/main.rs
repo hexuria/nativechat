@@ -1,6 +1,7 @@
 use gpui::*;
 use gpui_component::Root;
 use gpui_component_assets::Assets;
+use nativechat::components::input::SubmitMessage;
 use nativechat::root::RootView;
 use nativechat::theme;
 
@@ -8,6 +9,14 @@ use nativechat::state::AppState;
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
+        cx.bind_keys([
+            // Enter to submit in MessageInput context
+            KeyBinding::new("enter", SubmitMessage, Some("MessageInput")),
+            // Cmd+Enter to submit in Editor context (to override default behavior or ensure it works)
+            KeyBinding::new("cmd-enter", SubmitMessage, Some("Editor")),
+            KeyBinding::new("ctrl-enter", SubmitMessage, Some("Editor")),
+        ]);
+
         // Initialize GPUI Components
         gpui_component::init(cx);
 
