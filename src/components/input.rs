@@ -135,7 +135,7 @@ impl Render for MessageInput {
                                 .child(
                                     svg()
                                         .path("icons/mic.svg")
-                                        .size(px(16.0))
+                                        .size(px(18.0))
                                         .text_color(secondary_foreground),
                                 ),
                         )
@@ -155,7 +155,12 @@ impl Render for MessageInput {
                                 .hover(move |style| style.bg(secondary)) // Gray on hover
                                 .cursor_pointer()
                                 .tooltip(|w, cx| Tooltip::new("Read Aloud").build(w, cx))
-                                .child(Icon::new(IconName::Menu).text_color(secondary_foreground)) // Fallback to Menu
+                                .child(
+                                    svg()
+                                        .path("icons/sparkles.svg")
+                                        .size(px(18.0))
+                                        .text_color(secondary_foreground),
+                                ) // Fallback to Sparkles as requested
                         } else {
                             // Typing state: Send button (Black bg, White arrow)
                             div()

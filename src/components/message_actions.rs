@@ -31,12 +31,12 @@ impl MessageActions {
 
         let icon_element = match icon {
             IconSource::Name(name) => Icon::new(name)
-                .size(px(16.0))
+                .size(px(18.0))
                 .text_color(secondary_foreground)
                 .into_any_element(),
             IconSource::Path(path) => svg()
                 .path(path)
-                .size(px(16.0))
+                .size(px(18.0))
                 .text_color(secondary_foreground)
                 .into_any_element(),
         };
@@ -65,20 +65,20 @@ impl RenderOnce for MessageActions {
             .child(self.action_button("copy", IconSource::Name(IconName::Copy), "Copy", cx))
             .child(self.action_button(
                 "like",
-                IconSource::Name(IconName::ThumbsUp),
+                IconSource::Path("icons/thumbs_up.svg"),
                 "Good response",
                 cx,
             ))
             .child(self.action_button(
                 "dislike",
-                IconSource::Name(IconName::ThumbsDown),
+                IconSource::Path("icons/thumbs_down.svg"),
                 "Bad response",
                 cx,
             ))
             .child(self.action_button("share", IconSource::Path("icons/share.svg"), "Share", cx))
             .child(self.action_button(
                 "regenerate",
-                IconSource::Path("icons/sparkles.svg"),
+                IconSource::Path("icons/reset.svg"),
                 "Try again",
                 cx,
             ))
