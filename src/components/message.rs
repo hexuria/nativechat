@@ -1,116 +1,89 @@
-use gpui::*;
-use gpui_component::label::Label;
+use gpui::{prelude::FluentBuilder, *};
+use gpui_component::{ActiveTheme, h_flex};
 
-// Helper for v_flex if not available, or use div().flex().flex_col()
-fn v_flex() -> Div {
-    div().flex().flex_col()
-}
-
-#[derive(Clone, Debug)]
-pub struct Message {
-    pub id: usize,
-    pub sender: String,
-    pub content: String,
-    pub timestamp: String,
-    pub is_me: bool,
-}
-
-#[derive(Clone)]
+#[derive(Clone, IntoElement)]
 pub struct MessageBubble {
-    pub message: Message,
-    pub bg_color: Hsla,
-    pub text_color: Hsla,
+    text: String,
+    is_me: bool,
+    bg_color: Hsla,
+    text_color: Hsla,
 }
 
 impl MessageBubble {
-    pub fn new(message: Message, bg_color: Hsla, text_color: Hsla) -> Self {
+    pub fn new(text: String) -> Self {
         Self {
-            message,
-            bg_color,
-            text_color,
+            text,
+            is_me: false,
+            bg_color: gpui::white(),
+            text_color: gpui::black(),
         }
+    }
+
+    pub fn is_me(mut self, is_me: bool) -> Self {
+        self.is_me = is_me;
+        self
+    }
+
+    pub fn bg_color(mut self, bg_color: Hsla) -> Self {
+        self.bg_color = bg_color;
+        self
+    }
+
+    pub fn text_color(mut self, text_color: Hsla) -> Self {
+        self.text_color = text_color;
+        self
     }
 }
 
-impl IntoElement for MessageBubble {
-    type Element = Div;
-
-    fn into_element(self) -> Self::Element {
-        let is_me = self.message.is_me;
-
-        // We can't access cx.theme() directly in into_element easily without a context.
-        // However, gpui components usually use `Styled` or `theme()` helper if available.
-        // Or we can pass theme colors or use standard theme accessors if they are global/thread-local.
-        // Actually, `IntoElement` doesn't take `cx`.
-        // We might need to use `RenderOnce` or similar if we need context.
-        // Or, we can use `div().bg(gpui::white())` etc.
-        // But we want to use the active theme.
-        // `gpui_component` might have a way.
-
-        // Alternative: Make MessageBubble a function that takes `&App` or `&Window`? No.
-        // Let's look at how other components do it.
-        // Usually they implement `RenderOnce`.
-
-        // For now, let's use a simple approach:
-        // We will use `div()` and standard styling.
-        // Accessing theme might be tricky without `cx`.
-        // But `gpui::theme()` might be available? No.
-
-        // Let's use `RenderOnce` trait if it exists in GPUI 0.2.
-        // Or `impl Render for MessageBubble` is for Views.
-
-        // Wait, `gpui::Element`'s `render` takes `&mut Window, &mut Context`.
-        // But `IntoElement` converts to an Element.
-
-        // Let's try to use `impl RenderOnce for MessageBubble`.
-        // If `RenderOnce` is not available, we can use a helper function that takes `cx`.
-
-        // Let's change MessageBubble to be a helper function for now to avoid trait complexity.
-        // `pub fn message_bubble(message: Message, cx: &App) -> impl IntoElement`
-
-        // Actually, `chat.rs` has `cx`.
-        // So we can pass `cx` or `theme` to `MessageBubble::new`.
-
-        // Let's update MessageBubble to store the theme colors? No, that's inefficient.
-
-        // Let's try to use `div()` and assume we can style it.
-        // But we need theme.
-
-        // Let's go with: `impl IntoElement` and use hardcoded colors for now or try to find a way to get theme.
-        // Actually, `gpui_component::ActiveTheme` is a trait on `Context`.
-
-        // Let's use a functional component approach.
-        // `pub fn render_message(message: &Message, cx: &AppContext) -> impl IntoElement`
-
-        // But `chat.rs` calls it in `render`.
-
-        // Let's just implement `IntoElement` and use default colors for now to fix the build,
-        // and then improve styling.
-
-        let align_class = if is_me {
-            div().flex().justify_end()
+impl RenderOnce for MessageBubble {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let _align_class = if self.is_me {
+            "justify-end"
         } else {
-            div().flex().justify_start()
+            "justify-start"
         };
 
-        align_class.child(
-            div()
-                .p_3()
-                .rounded_md()
-                .bg(self.bg_color)
-                .text_color(self.text_color)
-                .max_w_3_4()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(Label::new(self.message.content.clone()).text_color(self.text_color))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(self.text_color.opacity(0.7))
-                                .child(self.message.timestamp.clone()),
-                        ),
-                ),
-        )
+        let _bg_color = if self.is_me {
+            cx.theme().primary
+        } else {
+            cx.theme().secondary
+        };
+
+        let _text_color = if self.is_me {
+            cx.theme().primary_foreground
+        } else {
+            cx.theme().secondary_foreground
+        };
+
+        let _rounded_class = if self.is_me {
+            "rounded-br-none"
+        } else {
+            "rounded-bl-none"
+        };
+
+        h_flex()
+            .w_full()
+            .map(|this| {
+                if self.is_me {
+                    this.justify_end()
+                } else {
+                    this.justify_start()
+                }
+            })
+            .child(
+                div()
+                    .max_w_3_4()
+                    .p_3()
+                    .rounded_xl()
+                    .map(|this| {
+                        if self.is_me {
+                            this.rounded_tr_none()
+                        } else {
+                            this.rounded_tl_none()
+                        }
+                    })
+                    .bg(self.bg_color)
+                    .child(div().text_sm().text_color(self.text_color).child(self.text)),
+            )
     }
 }

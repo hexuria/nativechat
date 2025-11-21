@@ -1,111 +1,97 @@
 use crate::components::input::MessageInput;
-use crate::components::message::{Message, MessageBubble};
+use crate::components::message::MessageBubble;
+use crate::state::AppState;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Sizable, StyledExt, avatar::Avatar, label::Label, scroll::ScrollbarAxis,
+    ActiveTheme, StyledExt, avatar::Avatar, h_flex, label::Label, scroll::ScrollbarAxis, v_flex,
 };
 
-#[derive(Clone)]
 pub struct ChatView {
-    messages: Vec<Message>,
     input: Entity<MessageInput>,
+    state: Entity<AppState>,
 }
 
 impl ChatView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| MessageInput::new(window, cx));
+    pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| {
+            MessageInput::new(window, cx).on_submit({
+                let state = state.clone();
+                move |text, cx| {
+                    state.update(cx, |state, cx| {
+                        state.send_message(text, cx);
+                    });
+                }
+            })
+        });
 
-        // Dummy data
-        let messages = vec![
-            Message {
-                id: 1,
-                sender: "Alice Johnson".to_string(),
-                content: "Hey! How are you doing?".to_string(),
-                timestamp: "10:00 AM".to_string(),
-                is_me: false,
-            },
-            Message {
-                id: 2,
-                sender: "Me".to_string(),
-                content: "I'm good, thanks! Working on this new chat app.".to_string(),
-                timestamp: "10:01 AM".to_string(),
-                is_me: true,
-            },
-            Message {
-                id: 3,
-                sender: "Alice Johnson".to_string(),
-                content: "That sounds cool! Is it using GPUI?".to_string(),
-                timestamp: "10:02 AM".to_string(),
-                is_me: false,
-            },
-            Message {
-                id: 4,
-                sender: "Me".to_string(),
-                content: "Yes, it is! It's pretty fast.".to_string(),
-                timestamp: "10:03 AM".to_string(),
-                is_me: true,
-            },
-        ];
-        Self { messages, input }
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+
+        Self { input, state }
     }
 }
 
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let state = self.state.read(cx);
 
-        div()
-            .flex()
-            .flex_col()
+        let active_conversation = state
+            .active_conversation_id
+            .and_then(|id| state.conversations.iter().find(|c| c.id == id));
+
+        let messages = if let Some(conversation) = active_conversation {
+            conversation.messages.clone()
+        } else {
+            vec![]
+        };
+
+        let title = active_conversation
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| "Select a conversation".to_string());
+
+        v_flex()
             .size_full()
             .bg(theme.background)
             .child(
-                // Header
-                div()
-                    .flex()
+                h_flex()
+                    .h(px(60.0)) // Increased height for window controls
+                    .pt(px(20.0)) // Top padding for "traffic lights"
+                    .flex_shrink_0()
                     .items_center()
-                    .p_4()
                     .border_b_1()
                     .border_color(theme.border)
+                    .px_4()
+                    .gap_2()
+                    .child(Avatar::new())
+                    .child(Label::new(title)),
+            )
+            .child(
+                v_flex()
+                    .flex_grow()
+                    .overflow_hidden() // Ensure scrollable area is contained
                     .child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .items_center()
-                            .child(Avatar::new().name("Alice Johnson").small())
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(Label::new("Alice Johnson").font_semibold())
-                                    .child(
-                                        Label::new("Online").text_xs().text_color(theme.success),
-                                    ),
-                            ),
+                        v_flex()
+                            .size_full()
+                            .p_4()
+                            .gap_4()
+                            .scrollable(ScrollbarAxis::Vertical)
+                            .children(messages.into_iter().map(|msg| {
+                                let (bg_color, text_color) = if msg.is_me {
+                                    (theme.primary, theme.primary_foreground)
+                                } else {
+                                    (theme.secondary, theme.secondary_foreground)
+                                };
+
+                                MessageBubble::new(msg.content)
+                                    .is_me(msg.is_me)
+                                    .bg_color(bg_color)
+                                    .text_color(text_color)
+                            })),
                     ),
             )
             .child(
-                // Message List
-                div().flex_grow().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .p_4()
-                        .children(self.messages.iter().map(|msg| {
-                            let (bg_color, text_color) = if msg.is_me {
-                                (theme.primary, theme.primary_foreground)
-                            } else {
-                                (theme.secondary, theme.secondary_foreground)
-                            };
-                            MessageBubble::new(msg.clone(), bg_color, text_color)
-                        }))
-                        .scrollable(ScrollbarAxis::Vertical),
-                ),
-            )
-            // Input
-            .child(
-                div()
+                h_flex()
+                    .flex_shrink_0() // Ensure footer doesn't shrink
                     .p_4()
                     .border_t_1()
                     .border_color(theme.border)

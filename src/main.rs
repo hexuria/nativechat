@@ -4,6 +4,8 @@ use gpui_component_assets::Assets;
 use nativechat::root::RootView;
 use nativechat::theme;
 
+use nativechat::state::AppState;
+
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         // Initialize GPUI Components
@@ -15,7 +17,7 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(800.0), px(600.0)),
+                size(px(1200.0), px(800.0)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -26,8 +28,46 @@ fn main() {
         };
 
         cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| RootView::new(window, cx));
-            // Root must be the first-level child
+            let state = cx.new(|_| AppState {
+                conversations: vec![
+                    nativechat::state::Conversation {
+                        id: 1,
+                        title: "John Doe".to_string(),
+                        messages: vec![
+                            nativechat::state::Message {
+                                id: 1,
+                                sender: "John Doe".to_string(),
+                                content: "Hello there!".to_string(),
+                                sent_at: std::time::SystemTime::now(),
+                                is_me: false,
+                            },
+                            nativechat::state::Message {
+                                id: 2,
+                                sender: "Me".to_string(),
+                                content: "Hi John!".to_string(),
+                                sent_at: std::time::SystemTime::now(),
+                                is_me: true,
+                            },
+                        ],
+                        unread_count: 0,
+                    },
+                    nativechat::state::Conversation {
+                        id: 2,
+                        title: "Jane Smith".to_string(),
+                        messages: vec![nativechat::state::Message {
+                            id: 1,
+                            sender: "Jane Smith".to_string(),
+                            content: "Meeting at 3?".to_string(),
+                            sent_at: std::time::SystemTime::now(),
+                            is_me: false,
+                        }],
+                        unread_count: 1,
+                    },
+                ],
+                active_conversation_id: Some(1),
+            });
+
+            let view = cx.new(|cx| RootView::new(window, state, cx));
             cx.new(|cx| Root::new(view, window, cx))
         })
         .unwrap();
