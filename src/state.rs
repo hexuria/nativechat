@@ -57,6 +57,7 @@ pub struct Conversation {
 pub struct AppState {
     pub conversations: Vec<Conversation>,
     pub active_conversation_id: Option<usize>,
+    pub theme_mode: String,
 }
 
 impl AppState {
@@ -83,5 +84,49 @@ impl AppState {
                 cx.notify();
             }
         }
+    }
+
+    pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        use gpui_component::{Theme, ThemeRegistry};
+
+        println!("[THEME] Toggle called, current: {}", self.theme_mode);
+
+        self.theme_mode = if self.theme_mode == "light" {
+            "dark".to_string()
+        } else {
+            "light".to_string()
+        };
+
+        println!("[THEME] New mode: {}", self.theme_mode);
+
+        // Apply the theme
+        let theme_name = if self.theme_mode == "light" {
+            "macOS Classic Light"
+        } else {
+            "macOS Classic Dark"
+        };
+
+        println!("[THEME] Loading theme: {}", theme_name);
+        println!(
+            "[THEME] Available themes: {:?}",
+            ThemeRegistry::global(cx)
+                .themes()
+                .keys()
+                .collect::<Vec<_>>()
+        );
+
+        if let Some(theme) = ThemeRegistry::global(cx)
+            .themes()
+            .get(&SharedString::from(theme_name))
+            .cloned()
+        {
+            println!("[THEME] Found theme, applying...");
+            Theme::global_mut(cx).apply_config(&theme);
+            println!("[THEME] Applied!");
+        } else {
+            println!("[THEME] ERROR: Theme not found!");
+        }
+
+        cx.notify();
     }
 }

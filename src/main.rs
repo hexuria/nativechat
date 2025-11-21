@@ -74,6 +74,7 @@ fn main() {
                     },
                 ],
                 active_conversation_id: Some(1),
+                theme_mode: "light".to_string(),
             });
 
             let view = cx.new(|cx| RootView::new(window, state, cx));

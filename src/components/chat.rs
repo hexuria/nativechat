@@ -3,7 +3,13 @@ use crate::components::message::MessageBubble;
 use crate::state::AppState;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, StyledExt, avatar::Avatar, h_flex, label::Label, scroll::ScrollbarAxis, v_flex,
+    ActiveTheme, IconName, StyledExt,
+    avatar::Avatar,
+    button::{Button, ButtonVariants},
+    h_flex,
+    label::Label,
+    scroll::ScrollbarAxis,
+    v_flex,
 };
 
 pub struct ChatView {
@@ -58,12 +64,36 @@ impl Render for ChatView {
                     .pt(px(20.0)) // Top padding for "traffic lights"
                     .flex_shrink_0()
                     .items_center()
+                    .justify_between()
                     .border_b_1()
                     .border_color(theme.border)
                     .px_4()
                     .gap_2()
-                    .child(Avatar::new())
-                    .child(Label::new(title)),
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(Avatar::new())
+                            .child(Label::new(title)),
+                    )
+                    .child(
+                        Button::new("theme-toggle")
+                            .icon(if self.state.read(cx).theme_mode == "light" {
+                                IconName::Moon
+                            } else {
+                                IconName::Sun
+                            })
+                            .ghost()
+                            .tooltip("Toggle theme")
+                            .on_click({
+                                let app_state = self.state.clone();
+                                cx.listener(move |_, _, _, cx| {
+                                    app_state.update(cx, |state, cx| {
+                                        state.toggle_theme(cx);
+                                    });
+                                })
+                            }),
+                    ),
             )
             .child(
                 v_flex()
