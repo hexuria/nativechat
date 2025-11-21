@@ -1,9 +1,8 @@
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, IconName, Sizable,
-    button::{Button, ButtonVariants},
-    h_flex,
+    ActiveTheme, Icon, IconName, h_flex,
     input::{Input, InputEvent, InputState},
+    tooltip::Tooltip,
 };
 
 actions!(chat, [SubmitMessage]);
@@ -71,6 +70,9 @@ impl MessageInput {
 impl Render for MessageInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let secondary = theme.secondary;
+        let secondary_foreground = theme.secondary_foreground;
+        let border = theme.border;
 
         // ChatGPT-style: centered container with max-width
         h_flex().w_full().justify_center().p_4().child(
@@ -82,13 +84,28 @@ impl Render for MessageInput {
                 .gap_2()
                 .px_4()
                 .py_3()
-                .bg(theme.secondary)
+                .bg(theme.background) // Match chat background (white in light mode)
                 .border_1()
-                .border_color(theme.border)
+                .border_color(border)
                 .rounded(px(26.0)) // Rounded pill shape
                 .shadow_sm()
                 // Plus icon on the left
-                .child(Button::new("attach").icon(IconName::Plus).ghost().small())
+                .child(
+                    div()
+                        .id("attach-btn")
+                        .w(px(36.0))
+                        .h(px(36.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(gpui::transparent_black())
+                        .text_color(secondary_foreground) // Set color on parent
+                        .hover(move |style| style.bg(secondary))
+                        .cursor_pointer()
+                        .tooltip(|w, cx| Tooltip::new("Attach files").build(w, cx))
+                        .child(Icon::new(IconName::Plus).text_color(secondary_foreground)),
+                )
                 // Input field (grows to fill space)
                 .child(
                     div()
@@ -100,22 +117,62 @@ impl Render for MessageInput {
                     h_flex()
                         .gap_1()
                         .items_center()
-                        // Microphone icon
+                        // Microphone icon (Voice Mode)
                         .child(
-                            Button::new("voice")
-                                .icon(IconName::Settings)
-                                .ghost()
-                                .small(),
+                            div()
+                                .id("voice-btn")
+                                .w(px(36.0))
+                                .h(px(36.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(gpui::transparent_black()) // Transparent/White by default
+                                .text_color(secondary_foreground)
+                                .hover(move |style| style.bg(secondary)) // Gray on hover
+                                .cursor_pointer()
+                                .tooltip(|w, cx| Tooltip::new("Voice Mode").build(w, cx))
+                                .child(
+                                    Icon::new(IconName::Settings).text_color(secondary_foreground),
+                                ), // Fallback to Settings
                         )
-                        // Send button
-                        .child(
-                            Button::new("send")
-                                .icon(IconName::ArrowUp)
-                                .small()
+                        // Send / Headphone button
+                        .child(if self.input_state.read(cx).text().len() == 0 {
+                            // Empty state: Headphone icon
+                            div()
+                                .id("headphone-btn")
+                                .w(px(36.0))
+                                .h(px(36.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(gpui::transparent_black()) // Transparent/White by default
+                                .text_color(secondary_foreground)
+                                .hover(move |style| style.bg(secondary)) // Gray on hover
+                                .cursor_pointer()
+                                .tooltip(|w, cx| Tooltip::new("Read Aloud").build(w, cx))
+                                .child(Icon::new(IconName::Menu).text_color(secondary_foreground)) // Fallback to Menu
+                        } else {
+                            // Typing state: Send button (Black bg, White arrow)
+                            div()
+                                .id("send-btn")
+                                .w(px(36.0))
+                                .h(px(36.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(theme.foreground) // Theme-aware foreground (Black in light, White in dark)
+                                .text_color(theme.background) // Theme-aware background (White in light, Black in dark)
+                                .hover(move |style| style.bg(theme.foreground.opacity(0.8)))
+                                .cursor_pointer()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.trigger_submit(window, cx);
-                                })),
-                        ),
+                                }))
+                                .tooltip(|w, cx| Tooltip::new("Send message").build(w, cx))
+                                .child(Icon::new(IconName::ArrowUp).text_color(theme.background))
+                        }),
                 ),
         )
     }
