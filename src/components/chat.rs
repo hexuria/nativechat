@@ -92,11 +92,14 @@ impl Render for ChatView {
                         .flex_col()
                         .gap_4()
                         .p_4()
-                        .children(
-                            self.messages
-                                .iter()
-                                .map(|msg| MessageBubble::new(msg.clone())),
-                        )
+                        .children(self.messages.iter().map(|msg| {
+                            let (bg_color, text_color) = if msg.is_me {
+                                (theme.primary, theme.primary_foreground)
+                            } else {
+                                (theme.secondary, theme.secondary_foreground)
+                            };
+                            MessageBubble::new(msg.clone(), bg_color, text_color)
+                        }))
                         .scrollable(ScrollbarAxis::Vertical),
                 ),
             )

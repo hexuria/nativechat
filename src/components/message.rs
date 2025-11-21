@@ -18,11 +18,17 @@ pub struct Message {
 #[derive(Clone)]
 pub struct MessageBubble {
     pub message: Message,
+    pub bg_color: Hsla,
+    pub text_color: Hsla,
 }
 
 impl MessageBubble {
-    pub fn new(message: Message) -> Self {
-        Self { message }
+    pub fn new(message: Message, bg_color: Hsla, text_color: Hsla) -> Self {
+        Self {
+            message,
+            bg_color,
+            text_color,
+        }
     }
 }
 
@@ -91,15 +97,19 @@ impl IntoElement for MessageBubble {
             div()
                 .p_3()
                 .rounded_md()
-                .bg(gpui::white()) // Placeholder
-                .border_1()
-                .border_color(gpui::black()) // Placeholder
+                .bg(self.bg_color)
+                .text_color(self.text_color)
                 .max_w_3_4()
                 .child(
                     v_flex()
                         .gap_1()
-                        .child(Label::new(self.message.content.clone()))
-                        .child(div().text_xs().child(self.message.timestamp.clone())),
+                        .child(Label::new(self.message.content.clone()).text_color(self.text_color))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(self.text_color.opacity(0.7))
+                                .child(self.message.timestamp.clone()),
+                        ),
                 ),
         )
     }
