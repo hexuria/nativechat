@@ -1,11 +1,9 @@
 use gpui::*;
 use gpui_component::{
     ActiveTheme, IconName, Sizable,
-    button::Button,
-    form::{field, v_form},
+    button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
-    v_flex,
 };
 
 actions!(chat, [SubmitMessage]);
@@ -54,10 +52,11 @@ impl MessageInput {
     fn trigger_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         println!("Triggering submit...");
         let text = self.input_state.read(cx).value();
-        if !text.trim().is_empty() {
-            println!("Submitting message: {}", text);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            println!("Submitting message: {}", trimmed);
             if let Some(handler) = &self.on_submit {
-                (handler)(text.to_string(), cx);
+                (handler)(trimmed.to_string(), cx);
             }
             self.input_state.update(cx, |state, cx| {
                 state.set_value("".to_string(), window, cx);
@@ -73,18 +72,42 @@ impl Render for MessageInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        v_flex().w_full().bg(theme.background).p_2().child(
-            v_form().w_full().child(
-                field().child(
+        // ChatGPT-style: centered container with max-width
+        h_flex().w_full().justify_center().p_4().child(
+            // Input container - rounded pill shape with shadow
+            h_flex()
+                .max_w(px(800.0)) // Max width like ChatGPT
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_3()
+                .bg(theme.secondary)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(26.0)) // Rounded pill shape
+                .shadow_sm()
+                // Plus icon on the left
+                .child(Button::new("attach").icon(IconName::Plus).ghost().small())
+                // Input field (grows to fill space)
+                .child(
+                    div()
+                        .flex_grow()
+                        .child(Input::new(&self.input_state).appearance(false)),
+                )
+                // Right side icons
+                .child(
                     h_flex()
-                        .id("message-input")
-                        .items_end()
-                        .gap_2()
+                        .gap_1()
+                        .items_center()
+                        // Microphone icon
                         .child(
-                            div()
-                                .flex_grow()
-                                .child(Input::new(&self.input_state).appearance(false)),
+                            Button::new("voice")
+                                .icon(IconName::Settings)
+                                .ghost()
+                                .small(),
                         )
+                        // Send button
                         .child(
                             Button::new("send")
                                 .icon(IconName::ArrowUp)
@@ -94,7 +117,6 @@ impl Render for MessageInput {
                                 })),
                         ),
                 ),
-            ),
         )
     }
 }

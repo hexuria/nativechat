@@ -62,6 +62,7 @@ impl Render for ChatView {
                 h_flex()
                     .h(px(60.0)) // Increased height for window controls
                     .pt(px(20.0)) // Top padding for "traffic lights"
+                    .pb_5() // Bottom padding to separate from border
                     .flex_shrink_0()
                     .items_center()
                     .justify_between()
@@ -100,37 +101,39 @@ impl Render for ChatView {
                     ),
             )
             .child(
-                v_flex()
+                // Messages area - centered with max-width like ChatGPT
+                h_flex()
                     .flex_grow()
-                    .overflow_hidden() // Ensure scrollable area is contained
+                    .w_full()
+                    .justify_center() // Center the content
+                    .overflow_hidden()
+                    .px_4() // Add horizontal padding to parent
                     .child(
-                        v_flex()
-                            .size_full()
-                            .p_4()
-                            .gap_4()
-                            .scrollable(ScrollbarAxis::Vertical)
-                            .children(messages.into_iter().map(|msg| {
-                                let (bg_color, text_color) = if msg.is_me {
-                                    (theme.primary, theme.primary_foreground)
-                                } else {
-                                    (theme.secondary, theme.secondary_foreground)
-                                };
+                        div()
+                            .w_full()
+                            .max_w(px(800.0)) // Max width constraint on wrapper
+                            .h_full()
+                            .child(
+                                v_flex()
+                                    .size_full()
+                                    .gap_4()
+                                    .scrollable(ScrollbarAxis::Vertical)
+                                    .children(messages.into_iter().map(|msg| {
+                                        let (bg_color, text_color) = if msg.is_me {
+                                            (theme.primary, theme.primary_foreground)
+                                        } else {
+                                            (theme.secondary, theme.secondary_foreground)
+                                        };
 
-                                MessageBubble::new(msg.content.clone())
-                                    .is_me(msg.is_me)
-                                    .bg_color(bg_color)
-                                    .text_color(text_color)
-                                    .timestamp(msg.formatted_time())
-                            })),
+                                        MessageBubble::new(msg.content.clone())
+                                            .is_me(msg.is_me)
+                                            .bg_color(bg_color)
+                                            .text_color(text_color)
+                                            .timestamp(msg.formatted_time())
+                                    })),
+                            ),
                     ),
             )
-            .child(
-                h_flex()
-                    .flex_shrink_0() // Ensure footer doesn't shrink
-                    .p_4()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(self.input.clone()),
-            )
+            .child(h_flex().flex_shrink_0().child(self.input.clone())) // Removed p_4 to avoid double padding
     }
 }
