@@ -133,8 +133,11 @@ impl Render for MessageInput {
                                 .cursor_pointer()
                                 .tooltip(|w, cx| Tooltip::new("Voice Mode").build(w, cx))
                                 .child(
-                                    Icon::new(IconName::Settings).text_color(secondary_foreground),
-                                ), // Fallback to Settings
+                                    svg()
+                                        .path("icons/mic.svg")
+                                        .size(px(16.0))
+                                        .text_color(secondary_foreground),
+                                ),
                         )
                         // Send / Headphone button
                         .child(if self.input_state.read(cx).text().len() == 0 {
