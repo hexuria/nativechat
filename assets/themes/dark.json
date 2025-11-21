@@ -1,0 +1,49 @@
+{
+    "$schema": "https://github.com/longbridge/gpui-component/raw/refs/heads/main/.theme-schema.json",
+    "name": "NativeChat Dark",
+    "author": "NativeChat",
+    "themes": [
+        {
+            "name": "NativeChat Dark",
+            "mode": "dark",
+            "radius": 8,
+            "radius.lg": 12,
+            "colors": {
+                "background": "#191919",
+                "foreground": "#fafafa",
+                "popover.background": "#191919",
+                "popover.foreground": "#fafafa",
+                "primary.background": "#3b82f6",
+                "primary.foreground": "#ffffff",
+                "secondary.background": "#333333",
+                "secondary.foreground": "#fafafa",
+                "muted.background": "#333333",
+                "muted.foreground": "#999999",
+                "accent.background": "#333333",
+                "accent.foreground": "#fafafa",
+                "border": "#333333",
+                "input.border": "#333333",
+                "ring": "#3b82f6",
+                "sidebar.background": "#141414",
+                "sidebar.foreground": "#fafafa",
+                "sidebar.border": "#333333",
+                "sidebar.accent.background": "#262626",
+                "sidebar.accent.foreground": "#fafafa",
+                "sidebar.primary.background": "#3b82f6",
+                "sidebar.primary.foreground": "#ffffff",
+                "scrollbar.background": "#19191900",
+                "scrollbar.thumb.background": "#333333",
+                "scrollbar.thumb.hover.background": "#4d4d4d",
+                "title_bar.background": "#191919",
+                "title_bar.border": "#333333"
+            },
+            "highlight": {
+                "editor.foreground": "#fafafa",
+                "editor.background": "#333333",
+                "editor.active_line.background": "#262626",
+                "editor.line_number": "#666666",
+                "editor.active_line_number": "#fafafa"
+            }
+        }
+    ]
+}

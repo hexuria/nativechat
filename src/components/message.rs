@@ -1,5 +1,5 @@
 use gpui::{prelude::FluentBuilder, *};
-use gpui_component::{ActiveTheme, h_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 #[derive(Clone, IntoElement)]
 pub struct MessageBubble {
@@ -7,6 +7,7 @@ pub struct MessageBubble {
     is_me: bool,
     bg_color: Hsla,
     text_color: Hsla,
+    timestamp: Option<String>,
 }
 
 impl MessageBubble {
@@ -16,6 +17,7 @@ impl MessageBubble {
             is_me: false,
             bg_color: gpui::white(),
             text_color: gpui::black(),
+            timestamp: None,
         }
     }
 
@@ -31,6 +33,11 @@ impl MessageBubble {
 
     pub fn text_color(mut self, text_color: Hsla) -> Self {
         self.text_color = text_color;
+        self
+    }
+
+    pub fn timestamp(mut self, timestamp: impl Into<String>) -> Self {
+        self.timestamp = Some(timestamp.into());
         self
     }
 }
@@ -83,7 +90,19 @@ impl RenderOnce for MessageBubble {
                         }
                     })
                     .bg(self.bg_color)
-                    .child(div().text_sm().text_color(self.text_color).child(self.text)),
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().text_color(self.text_color).child(self.text))
+                            .when_some(self.timestamp, |this, timestamp| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(self.text_color.opacity(0.7))
+                                        .child(timestamp),
+                                )
+                            }),
+                    ),
             )
     }
 }

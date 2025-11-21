@@ -10,6 +10,42 @@ pub struct Message {
     pub is_me: bool,
 }
 
+impl Message {
+    /// Format the message timestamp into a human-readable string
+    pub fn formatted_time(&self) -> String {
+        let now = SystemTime::now();
+        let duration = now.duration_since(self.sent_at).unwrap_or_default();
+
+        let secs = duration.as_secs();
+
+        if secs < 60 {
+            "Just now".to_string()
+        } else if secs < 3600 {
+            let mins = secs / 60;
+            format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" })
+        } else if secs < 86400 {
+            // Today - show time only
+            let hours = secs / 3600;
+            let mins = (secs % 3600) / 60;
+            format!("{:02}:{:02}", hours, mins)
+        } else if secs < 172800 {
+            // Yesterday
+            let hours = (secs % 86400) / 3600;
+            let mins = (secs % 3600) / 60;
+            format!("Yesterday {:02}:{:02}", hours, mins)
+        } else {
+            // Older messages - show date
+            let days = secs / 86400;
+            if days < 365 {
+                format!("{} days ago", days)
+            } else {
+                let years = days / 365;
+                format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Conversation {
     pub id: usize,

@@ -82,10 +82,11 @@ impl Render for ChatView {
                                     (theme.secondary, theme.secondary_foreground)
                                 };
 
-                                MessageBubble::new(msg.content)
+                                MessageBubble::new(msg.content.clone())
                                     .is_me(msg.is_me)
                                     .bg_color(bg_color)
                                     .text_color(text_color)
+                                    .timestamp(msg.formatted_time())
                             })),
                     ),
             )

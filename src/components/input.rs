@@ -86,11 +86,7 @@ impl Render for MessageInput {
                             .id("message-input")
                             .items_end()
                             .gap_2()
-                            .child(
-                                div()
-                                    .flex_grow()
-                                    .child(Input::new(&self.input_state).appearance(false)),
-                            )
+                            .child(div().flex_grow().child(Input::new(&self.input_state)))
                             .child(
                                 Button::new("send")
                                     .icon(IconName::ArrowUp)
