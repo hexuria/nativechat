@@ -81,6 +81,12 @@ pub struct AppState {
     pub gemini_client: Option<GeminiLiveClient>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -103,8 +109,8 @@ impl AppState {
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
-        if let Some(conversation_id) = self.active_conversation_id {
-            if let Some(conversation) = self
+        if let Some(conversation_id) = self.active_conversation_id
+            && let Some(conversation) = self
                 .conversations
                 .iter_mut()
                 .find(|c| c.id == conversation_id)
@@ -119,7 +125,6 @@ impl AppState {
                 conversation.messages.push(message);
                 cx.notify();
             }
-        }
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {

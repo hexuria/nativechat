@@ -32,16 +32,12 @@ impl MessageInput {
 
         // Subscribe to input events to handle Enter key
         cx.subscribe_in(&input_state, window, |this, _state, event, window, cx| {
-            match event {
-                InputEvent::PressEnter { secondary } => {
-                    if !secondary {
-                        // Enter without Shift - submit the message
-                        this.trigger_submit(window, cx);
-                    }
-                    // Shift+Enter is handled by the editor (newline)
+            if let InputEvent::PressEnter { secondary } = event
+                && !secondary {
+                    // Enter without Shift - submit the message
+                    this.trigger_submit(window, cx);
                 }
-                _ => {}
-            }
+                // Shift+Enter is handled by the editor (newline)
         })
         .detach();
 

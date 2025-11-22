@@ -242,13 +242,12 @@ impl GeminiLiveClient {
 
                 if let Some(text) = text_msg {
                     println!("[GeminiClient] Handshake received text: {:.50}...", text);
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if parsed.get("setupComplete").is_some() {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text)
+                        && parsed.get("setupComplete").is_some() {
                             println!("[GeminiClient] SetupComplete received!");
                             setup_complete = true;
                             break;
                         }
-                    }
                 }
             }
 
@@ -304,27 +303,24 @@ impl GeminiLiveClient {
                         // println!("[GeminiClient] Received text: {:.50}...", text);
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
                             // 1. Check for Interruption
-                            if let Some(server_content) = parsed.get("serverContent") {
-                                if let Some(interrupted) =
+                            if let Some(server_content) = parsed.get("serverContent")
+                                && let Some(interrupted) =
                                     server_content.get("interrupted").and_then(|v| v.as_bool())
-                                {
-                                    if interrupted {
+                                    && interrupted {
                                         println!(
                                             "[GeminiClient] Interruption detected! Stopping audio."
                                         );
                                         let _ = audio_tx_clone.send(AudioCommand::Stop);
                                         ai_amp_clone.store(0, Ordering::Relaxed);
                                     }
-                                }
-                            }
 
                             // 2. Handle Audio Data
                             if let Some(data) =
                                 parsed.pointer("/serverContent/modelTurn/parts/0/inlineData/data")
                             {
                                 println!("[GeminiClient] Received audio data!");
-                                if let Some(base64_str) = data.as_str() {
-                                    if let Ok(bytes) = general_purpose::STANDARD.decode(base64_str)
+                                if let Some(base64_str) = data.as_str()
+                                    && let Ok(bytes) = general_purpose::STANDARD.decode(base64_str)
                                     {
                                         // PCM 16-bit LE -> f32
                                         let mut samples = Vec::with_capacity(bytes.len() / 2);
@@ -343,7 +339,6 @@ impl GeminiLiveClient {
                                                 audio_tx_clone.send(AudioCommand::Samples(samples));
                                         }
                                     }
-                                }
                             }
                         }
                     }

@@ -184,7 +184,7 @@ impl Render for CircularVoiceViz {
                     move |bounds, _, _| bounds,
                     move |bounds, _, window, _| {
                         let center = bounds.center();
-                        let mut rng = rand::thread_rng();
+                        let rng = rand::thread_rng();
 
                         // --- 0. Radial Gradient Background ---
                         // Paint concentric circles to simulate radial gradient
@@ -248,14 +248,14 @@ impl Render for CircularVoiceViz {
                         while x < width {
                             grid_path.move_to(point(bounds.origin.x + x, bounds.origin.y));
                             grid_path.line_to(point(bounds.origin.x + x, bounds.origin.y + height));
-                            x = x + px(grid_step);
+                            x += px(grid_step);
                         }
                         // Draw horizontal lines
                         let mut y = px(0.0);
                         while y < height {
                             grid_path.move_to(point(bounds.origin.x, bounds.origin.y + y));
                             grid_path.line_to(point(bounds.origin.x + width, bounds.origin.y + y));
-                            y = y + px(grid_step);
+                            y += px(grid_step);
                         }
                         window.paint_path(grid_path.build().unwrap(), grid_color);
 
