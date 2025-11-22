@@ -16,7 +16,7 @@ pub struct MessageInput {
     input_state: Entity<InputState>,
     on_submit: Option<Box<dyn Fn(String, &mut Context<Self>)>>,
     voice_mode: bool,
-    voice_wave: Entity<VoiceWave>,
+    voice_wave: Option<Entity<VoiceWave>>,
     audio_input: Option<AudioInput>,
     amplitude: Arc<AtomicU32>,
 }
@@ -47,13 +47,12 @@ impl MessageInput {
         .detach();
 
         let amplitude = Arc::new(AtomicU32::new(0));
-        let voice_wave = VoiceWave::new(amplitude.clone(), cx);
 
         Self {
             input_state,
             on_submit: None,
             voice_mode: false,
-            voice_wave,
+            voice_wave: None,
             audio_input: None,
             amplitude,
         }
@@ -86,11 +85,13 @@ impl MessageInput {
         if self.voice_mode {
             self.voice_mode = false;
             self.audio_input = None;
+            self.voice_wave = None;
         } else {
             match AudioInput::new(self.amplitude.clone()) {
                 Ok(input) => {
                     self.voice_mode = true;
                     self.audio_input = Some(input);
+                    self.voice_wave = Some(VoiceWave::new(self.amplitude.clone(), cx));
                 }
                 Err(e) => {
                     eprintln!("Failed to start audio input: {}", e);
@@ -103,6 +104,7 @@ impl MessageInput {
     fn confirm_voice_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.voice_mode = false;
         self.audio_input = None;
+        self.voice_wave = None;
         cx.notify();
 
         // Mock transcription
@@ -156,7 +158,11 @@ impl Render for MessageInput {
                 })
                 // Input field (grows to fill space)
                 .child(div().flex_grow().child(if self.voice_mode {
-                    self.voice_wave.clone().into_any_element()
+                    if let Some(voice_wave) = &self.voice_wave {
+                        voice_wave.clone().into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }
                 } else {
                     Input::new(&self.input_state)
                         .appearance(false)

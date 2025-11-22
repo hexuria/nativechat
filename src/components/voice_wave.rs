@@ -13,6 +13,9 @@ use gpui_component::ActiveTheme;
 pub struct VoiceWave {
     amplitude: Arc<AtomicU32>,
     history: VecDeque<f32>,
+    scroll_phase: f32,
+    current_peak: f32,
+    animation_offset: f32,
 }
 
 impl VoiceWave {
@@ -22,25 +25,52 @@ impl VoiceWave {
                 let mut cx = cx.clone();
                 async move {
                     loop {
+                        // Run at 60fps (approx 16ms) for smooth animation
                         cx.background_executor()
                             .timer(Duration::from_millis(16))
                             .await;
 
-                        // Update history in the view
-                        let _ = view.update(&mut cx, |this, cx| {
-                            let current_amp =
-                                f32::from_bits(this.amplitude.load(Ordering::Relaxed));
+                        // Update view state
+                        if view
+                            .update(&mut cx, |this, cx| {
+                                let current_amp =
+                                    f32::from_bits(this.amplitude.load(Ordering::Relaxed));
 
-                            // Add new sample
-                            this.history.push_front(current_amp);
+                                // Peak sampling: capture the highest amplitude since the last bar push
+                                if current_amp > this.current_peak {
+                                    this.current_peak = current_amp;
+                                }
 
-                            // Keep history size fixed (e.g., 60 samples)
-                            if this.history.len() > 60 {
-                                this.history.pop_back();
-                            }
+                                // Scroll speed in pixels per frame
+                                // 2.0px per 16ms = ~120px per second (Faster, smoother scroll)
+                                let speed = 2.0;
+                                this.scroll_phase += speed;
 
-                            cx.notify();
-                        });
+                                // Animation speed for the "living" effect
+                                this.animation_offset += 0.8;
+
+                                let bar_width = 2.0;
+                                let spacing = 3.0;
+                                let stride = bar_width + spacing;
+
+                                // When we've scrolled a full bar's width, push the peak to history
+                                if this.scroll_phase >= stride {
+                                    this.history.push_front(this.current_peak);
+                                    this.current_peak = 0.0; // Reset peak for next bar
+                                    this.scroll_phase -= stride; // Keep remainder for smooth continuity
+
+                                    // Keep history size large enough
+                                    if this.history.len() > 300 {
+                                        this.history.pop_back();
+                                    }
+                                }
+
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             })
@@ -48,7 +78,10 @@ impl VoiceWave {
 
             Self {
                 amplitude,
-                history: VecDeque::with_capacity(60),
+                history: VecDeque::with_capacity(300),
+                scroll_phase: 0.0,
+                current_peak: 0.0,
+                animation_offset: 0.0,
             }
         })
     }
@@ -60,45 +93,77 @@ impl Render for VoiceWave {
         let foreground = theme.foreground;
         let muted_foreground = theme.muted_foreground;
         let history = self.history.clone();
+        let scroll_phase = self.scroll_phase;
+        let animation_offset = self.animation_offset;
 
         canvas(
             move |bounds, _, _| bounds,
             move |bounds, _, window, _| {
-                let bars = 60;
                 let spacing = px(3.0); // Space between bars
                 let bar_width = px(2.0); // Width of each bar
+                let stride = bar_width + spacing;
 
-                // Total width of the wave
-                let total_width = (bar_width + spacing) * bars as f32;
+                // Calculate how many bars fit in the available width
+                // Add 1 extra bar to cover the scrolling edge
+                let bars = (bounds.size.width / stride).ceil() as usize + 1;
 
                 // Center the waveform horizontally
+                // We shift everything left by `scroll_phase` to create smooth motion
+                let total_width = stride * bars as f32;
                 let start_x = bounds.origin.x + (bounds.size.width - total_width) / 2.0;
                 let center_y = bounds.origin.y + bounds.size.height / 2.0;
+                let max_height = bounds.size.height - px(4.0); // Leave some padding
 
                 for i in 0..bars {
-                    // Get amplitude from history, default to 0.0 if not enough history yet
-                    // History is stored newest first (push_front), so index 0 is the rightmost bar
-                    let amp = history.get(i).copied().unwrap_or(0.0);
+                    // i=0 is the rightmost bar (Newest)
 
-                    // Determine if "active" (speaking) or "idle" (silence)
-                    // Threshold can be tuned. 0.01 is a reasonable noise floor.
-                    let is_active = amp > 0.01;
+                    let (height, color) = if i < history.len() {
+                        // Recorded History (Past) -> ALWAYS Black (foreground)
+                        let amp = history[i];
 
-                    let (height, color) = if is_active {
-                        // Active: Taller bar, foreground color
-                        // Scale amplitude for visibility
-                        (px(12.0 + amp * 40.0), foreground)
+                        // Determine if "active" (speaking) or "idle" (silence)
+                        // Increased threshold to 0.05 to filter background noise
+                        let is_active = amp > 0.05;
+
+                        if is_active {
+                            // Active Speech: Taller bar, foreground color
+                            // Reduced scaling from 100.0 to 50.0 to prevent maxing out too easily
+                            let scaled_height = px(2.0 + amp * 50.0);
+
+                            // Apply "Living" Animation: Sine wave modulation
+                            // i varies across bars, animation_offset varies over time
+                            // This creates a ripple effect
+                            let modulation =
+                                1.0 + 0.3 * ((i as f32 * 0.2) + animation_offset).sin();
+                            let modulated_height = scaled_height * modulation;
+
+                            // Clamp between 2px and max_height
+                            let final_height = if modulated_height > max_height {
+                                max_height
+                            } else {
+                                modulated_height
+                            };
+
+                            (final_height, foreground)
+                        } else {
+                            // Silence in History: Small box/dot, foreground color
+                            // User requested "black small box" for silence in recorded track
+                            // No animation for silence
+                            (px(2.0), foreground)
+                        }
                     } else {
-                        // Idle: Small dot, muted color
-                        (px(4.0), muted_foreground)
+                        // Unrecorded Future -> ALWAYS Grey (muted_foreground)
+                        // Fixed height of 5px
+                        (px(5.0), muted_foreground)
                     };
 
-                    // Draw from right to left to simulate scrolling
-                    // i=0 is newest (rightmost), i=59 is oldest (leftmost)
-                    // We want newest on the right side.
-                    let x = start_x + (bar_width + spacing) * (bars - 1 - i) as f32;
+                    // Draw from Right to Left
+                    // Position 0 is at the far right
+                    // Apply scroll_phase to shift bars left smoothly
+                    let x = start_x + stride * (bars - 1 - i) as f32 - px(scroll_phase);
                     let y = center_y - height / 2.0;
 
+                    // Only draw if within bounds (optional optimization, canvas clips anyway)
                     window.paint_quad(
                         fill(Bounds::new(point(x, y), size(bar_width, height)), color)
                             .corner_radii(px(1.0)),
@@ -107,6 +172,6 @@ impl Render for VoiceWave {
             },
         )
         .w_full()
-        .h_full()
+        .h(px(36.0))
     }
 }
