@@ -148,24 +148,36 @@ impl Render for VoiceWave {
                         // Recorded History (Past) -> ALWAYS Black (foreground)
                         let amp = history[i];
 
-                        // Determine if "active" (speaking) or "idle" (silence)
-                        // Increased threshold to 0.05 to filter background noise
-                        let is_active = amp > 0.05;
+                        // Determine if "active" (speaking) or "idle" (silence/noise)
+                        // Increased threshold to 0.12 (12%) to filter background noise
+                        // ChatGPT-style: only show bars for actual speech
+                        let is_active = amp > 0.12;
 
                         if is_active {
-                            // Active Speech: Taller bar, foreground color
-                            // Increased scaling to 120.0 to ensure loud sounds hit the max_height (ceiling)
-                            let scaled_height = px(2.0 + amp * 120.0);
+                            // Active Speech: Apply logarithmic scaling for natural dynamics
+                            // Reduced k from 15 to 6 for MORE dynamic range (less compression)
+                            // This allows intonation changes to be visible
+
+                            // Logarithmic compression: log(1 + x*k) / log(1 + k)
+                            // Lower k = MORE variation visible
+                            let k = 6.0;
+                            let compressed = ((1.0 + amp * k).ln() / (1.0 + k).ln()).min(1.0);
+
+                            // Reduced max height from 80 to 60 to prevent maxing out
+                            // This ensures even loud sounds show variation
+                            let scaled_height = px(2.0 + compressed * 60.0);
 
                             // Liquid Flow Animation: Interference Patterns
+                            // Increased modulation to make variation MORE visible
                             // Wave 1: Slow Swell (Low frequency, slow speed)
                             let wave1 = ((i as f32 * 0.1) + animation_offset * 0.5).sin();
 
                             // Wave 2: Fast Ripple (High frequency, fast speed)
                             let wave2 = ((i as f32 * 0.3) + animation_offset * 2.0).sin();
 
-                            // Combine waves for non-repetitive motion
-                            let modulation = 1.0 + 0.25 * wave1 + 0.1 * wave2;
+                            // Combine waves with INCREASED modulation for visibility
+                            // Boosted from 0.15/0.08 to 0.25/0.15 to show more variation
+                            let modulation = 1.0 + 0.25 * wave1 + 0.15 * wave2;
                             let modulated_height = scaled_height * modulation;
 
                             // Clamp between 2px and max_height

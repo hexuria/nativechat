@@ -100,13 +100,14 @@ impl CircularVoiceViz {
         const NOISE_GATE: f32 = 0.02; // 2% threshold
 
         let gated_amplitude = if raw_amplitude > NOISE_GATE {
-            (raw_amplitude - NOISE_GATE) * 2.0 // Re-scale and boost slightly
+            // Gentler re-scale to preserve dynamics
+            (raw_amplitude - NOISE_GATE) * 1.2
         } else {
             0.0
         };
 
         let gated_ai_amplitude = if raw_ai_amplitude > NOISE_GATE {
-            (raw_ai_amplitude - NOISE_GATE) * 2.0
+            (raw_ai_amplitude - NOISE_GATE) * 1.2
         } else {
             0.0
         };
@@ -410,8 +411,8 @@ impl Render for CircularVoiceViz {
                         let mut wave_path = PathBuilder::stroke(px(3.0));
                         let num_points = 128; // Match buffer size roughly
                         let base_radius = CIRCLE_RADIUS;
-                        // Use amplitude to drive the "squiggles"
-                        let wave_amp = (amplitude + ai_amplitude).min(1.0) * 40.0;
+                        // Use amplitude to drive the "squiggles" with more reasonable scaling
+                        let wave_amp = (amplitude + ai_amplitude).min(1.0) * 25.0;
                         let mut first_p = point(px(0.0), px(0.0));
 
                         for i in 0..=num_points {

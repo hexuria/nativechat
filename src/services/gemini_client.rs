@@ -66,11 +66,18 @@ impl AudioOutput {
                 }
                 let rms = (sum_sq / data.len() as f32).sqrt();
 
-                // Boost sensitivity for visualizer
-                let boosted = (rms * 5.0).min(1.0);
+                // Apply logarithmic scaling for more natural visualization
+                // This prevents bars from maxing out too easily
+                let compressed = if rms > 0.0 {
+                    // Log scaling: log(1 + x*k) / log(1 + k) where k controls sensitivity
+                    let k = 10.0;
+                    ((1.0 + rms * k).ln() / (1.0 + k).ln()).min(1.0)
+                } else {
+                    0.0
+                };
 
                 if has_samples {
-                    ai_amplitude_clone.store(boosted.to_bits(), Ordering::Relaxed);
+                    ai_amplitude_clone.store(compressed.to_bits(), Ordering::Relaxed);
                 } else {
                     ai_amplitude_clone.store(0, Ordering::Relaxed);
                     is_ai_speaking_clone.store(false, Ordering::Relaxed);
@@ -243,11 +250,12 @@ impl GeminiLiveClient {
                 if let Some(text) = text_msg {
                     println!("[GeminiClient] Handshake received text: {:.50}...", text);
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text)
-                        && parsed.get("setupComplete").is_some() {
-                            println!("[GeminiClient] SetupComplete received!");
-                            setup_complete = true;
-                            break;
-                        }
+                        && parsed.get("setupComplete").is_some()
+                    {
+                        println!("[GeminiClient] SetupComplete received!");
+                        setup_complete = true;
+                        break;
+                    }
                 }
             }
 
@@ -306,13 +314,12 @@ impl GeminiLiveClient {
                             if let Some(server_content) = parsed.get("serverContent")
                                 && let Some(interrupted) =
                                     server_content.get("interrupted").and_then(|v| v.as_bool())
-                                    && interrupted {
-                                        println!(
-                                            "[GeminiClient] Interruption detected! Stopping audio."
-                                        );
-                                        let _ = audio_tx_clone.send(AudioCommand::Stop);
-                                        ai_amp_clone.store(0, Ordering::Relaxed);
-                                    }
+                                && interrupted
+                            {
+                                println!("[GeminiClient] Interruption detected! Stopping audio.");
+                                let _ = audio_tx_clone.send(AudioCommand::Stop);
+                                ai_amp_clone.store(0, Ordering::Relaxed);
+                            }
 
                             // 2. Handle Audio Data
                             if let Some(data) =
@@ -321,24 +328,23 @@ impl GeminiLiveClient {
                                 println!("[GeminiClient] Received audio data!");
                                 if let Some(base64_str) = data.as_str()
                                     && let Ok(bytes) = general_purpose::STANDARD.decode(base64_str)
-                                    {
-                                        // PCM 16-bit LE -> f32
-                                        let mut samples = Vec::with_capacity(bytes.len() / 2);
-                                        // let mut sum_sq = 0.0; // Removed calculation here
-                                        for chunk in bytes.chunks_exact(2) {
-                                            let sample = i16::from_le_bytes([chunk[0], chunk[1]])
-                                                as f32
-                                                / 32768.0;
-                                            samples.push(sample);
-                                            // sum_sq += sample * sample; // Removed
-                                        }
-
-                                        // Push to Audio Output
-                                        if !samples.is_empty() {
-                                            let _ =
-                                                audio_tx_clone.send(AudioCommand::Samples(samples));
-                                        }
+                                {
+                                    // PCM 16-bit LE -> f32
+                                    let mut samples = Vec::with_capacity(bytes.len() / 2);
+                                    // let mut sum_sq = 0.0; // Removed calculation here
+                                    for chunk in bytes.chunks_exact(2) {
+                                        let sample = i16::from_le_bytes([chunk[0], chunk[1]])
+                                            as f32
+                                            / 32768.0;
+                                        samples.push(sample);
+                                        // sum_sq += sample * sample; // Removed
                                     }
+
+                                    // Push to Audio Output
+                                    if !samples.is_empty() {
+                                        let _ = audio_tx_clone.send(AudioCommand::Samples(samples));
+                                    }
+                                }
                             }
                         }
                     }
