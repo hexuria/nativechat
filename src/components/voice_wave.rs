@@ -1,18 +1,23 @@
-use gpui::AppContext;
-use gpui::*;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use gpui::prelude::*;
+use gpui::{
+    AsyncApp, Bounds, Context, Entity, IntoElement, Render, WeakEntity, Window, canvas, fill,
+    point, px, size,
+};
+use gpui_component::ActiveTheme;
+
 pub struct VoiceWave {
     amplitude: Arc<AtomicU32>,
-    t: f32,
+    history: VecDeque<f32>,
 }
 
 impl VoiceWave {
-    pub fn new<P>(cx: &mut Context<P>, amplitude: Arc<AtomicU32>) -> Entity<Self> {
+    pub fn new<P: 'static>(amplitude: Arc<AtomicU32>, cx: &mut Context<P>) -> Entity<Self> {
         cx.new(|cx| {
-            // Animation loop
             cx.spawn(|view: WeakEntity<VoiceWave>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
@@ -20,9 +25,20 @@ impl VoiceWave {
                         cx.background_executor()
                             .timer(Duration::from_millis(16))
                             .await;
-                        // Update view state
+
+                        // Update history in the view
                         let _ = view.update(&mut cx, |this, cx| {
-                            this.t += 0.08;
+                            let current_amp =
+                                f32::from_bits(this.amplitude.load(Ordering::Relaxed));
+
+                            // Add new sample
+                            this.history.push_front(current_amp);
+
+                            // Keep history size fixed (e.g., 60 samples)
+                            if this.history.len() > 60 {
+                                this.history.pop_back();
+                            }
+
                             cx.notify();
                         });
                     }
@@ -30,19 +46,20 @@ impl VoiceWave {
             })
             .detach();
 
-            Self { amplitude, t: 0.0 }
+            Self {
+                amplitude,
+                history: VecDeque::with_capacity(60),
+            }
         })
     }
 }
 
-use gpui_component::ActiveTheme;
-
 impl Render for VoiceWave {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = self.t;
-        let amplitude = f32::from_bits(self.amplitude.load(Ordering::Relaxed));
         let theme = cx.theme();
         let foreground = theme.foreground;
+        let muted_foreground = theme.muted_foreground;
+        let history = self.history.clone();
 
         canvas(
             move |bounds, _, _| bounds,
@@ -59,40 +76,32 @@ impl Render for VoiceWave {
                 let center_y = bounds.origin.y + bounds.size.height / 2.0;
 
                 for i in 0..bars {
-                    // Normalized position (0.0 to 1.0)
-                    let normalized_i = i as f32 / bars as f32;
+                    // Get amplitude from history, default to 0.0 if not enough history yet
+                    // History is stored newest first (push_front), so index 0 is the rightmost bar
+                    let amp = history.get(i).copied().unwrap_or(0.0);
 
-                    // Window function (Hanning-like) to taper edges
-                    // sin(pi * x)^2
-                    let window_val = (std::f32::consts::PI * normalized_i).sin().powi(2);
+                    // Determine if "active" (speaking) or "idle" (silence)
+                    // Threshold can be tuned. 0.01 is a reasonable noise floor.
+                    let is_active = amp > 0.01;
 
-                    // Scrolling phase
-                    let phase = t * 2.0;
+                    let (height, color) = if is_active {
+                        // Active: Taller bar, foreground color
+                        // Scale amplitude for visibility
+                        (px(12.0 + amp * 40.0), foreground)
+                    } else {
+                        // Idle: Small dot, muted color
+                        (px(4.0), muted_foreground)
+                    };
 
-                    // Organic wave composition
-                    // Base wave + faster ripples
-                    let wave = ((normalized_i * 10.0 + phase).sin()) * 0.5
-                        + ((normalized_i * 23.0 - phase * 1.5).sin()) * 0.3
-                        + ((normalized_i * 47.0 + phase * 0.5).sin()) * 0.2;
-
-                    // Combine amplitude, wave, and window
-                    // Base height + dynamic height
-                    // Idle state: amplitude is low, but we still want some movement
-                    let effective_amp = amplitude.max(0.1);
-                    let height_val = 4.0 + (wave * 0.5 + 0.5) * effective_amp * 24.0;
-
-                    // Apply windowing to height
-                    let height = px(height_val * window_val);
-
-                    let x = start_x + (bar_width + spacing) * i as f32;
+                    // Draw from right to left to simulate scrolling
+                    // i=0 is newest (rightmost), i=59 is oldest (leftmost)
+                    // We want newest on the right side.
+                    let x = start_x + (bar_width + spacing) * (bars - 1 - i) as f32;
                     let y = center_y - height / 2.0;
 
                     window.paint_quad(
-                        fill(
-                            Bounds::new(point(x, y), size(bar_width, height)),
-                            foreground,
-                        )
-                        .corner_radii(px(1.0)),
+                        fill(Bounds::new(point(x, y), size(bar_width, height)), color)
+                            .corner_radii(px(1.0)),
                     );
                 }
             },

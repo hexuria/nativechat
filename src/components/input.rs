@@ -47,7 +47,7 @@ impl MessageInput {
         .detach();
 
         let amplitude = Arc::new(AtomicU32::new(0));
-        let voice_wave = VoiceWave::new(cx, amplitude.clone());
+        let voice_wave = VoiceWave::new(amplitude.clone(), cx);
 
         Self {
             input_state,
