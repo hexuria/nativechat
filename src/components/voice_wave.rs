@@ -15,8 +15,8 @@ pub struct VoiceWave {
     history: VecDeque<f32>,
     scroll_phase: f32,
     current_peak: f32,
+    smoothed_amp: f32,
     animation_offset: f32,
-    wobble_phase: f32,
 }
 
 impl VoiceWave {
@@ -42,24 +42,33 @@ impl VoiceWave {
                                     this.current_peak = current_amp;
                                 }
 
+                                // Envelope Follower (Attack/Release Physics)
+                                // Smooths out the jittery raw amplitude
+                                let target = this.current_peak;
+                                if target > this.smoothed_amp {
+                                    // Attack: Fast jump up (0.3)
+                                    this.smoothed_amp += (target - this.smoothed_amp) * 0.3;
+                                } else {
+                                    // Release: Slow fade down (0.05)
+                                    this.smoothed_amp += (target - this.smoothed_amp) * 0.05;
+                                }
+
                                 // Scroll speed in pixels per frame
                                 // 2.0px per 16ms = ~120px per second (Faster, smoother scroll)
                                 let speed = 2.0;
                                 this.scroll_phase += speed;
 
                                 // Animation speed for the "living" effect
+                                // Increased to 0.8 (2x) for faster height transitions
                                 this.animation_offset += 0.8;
-
-                                // Wobble speed (slower, organic)
-                                this.wobble_phase += 0.1;
 
                                 let bar_width = 2.0;
                                 let spacing = 3.0;
                                 let stride = bar_width + spacing;
 
-                                // When we've scrolled a full bar's width, push the peak to history
+                                // When we've scrolled a full bar's width, push the SMOOTHED value to history
                                 if this.scroll_phase >= stride {
-                                    this.history.push_front(this.current_peak);
+                                    this.history.push_front(this.smoothed_amp);
                                     this.current_peak = 0.0; // Reset peak for next bar
                                     this.scroll_phase -= stride; // Keep remainder for smooth continuity
 
@@ -85,8 +94,8 @@ impl VoiceWave {
                 history: VecDeque::with_capacity(300),
                 scroll_phase: 0.0,
                 current_peak: 0.0,
+                smoothed_amp: 0.0,
                 animation_offset: 0.0,
-                wobble_phase: 0.0,
             }
         })
     }
@@ -100,7 +109,6 @@ impl Render for VoiceWave {
         let history = self.history.clone();
         let scroll_phase = self.scroll_phase;
         let animation_offset = self.animation_offset;
-        let wobble_phase = self.wobble_phase;
 
         canvas(
             move |bounds, _, _| bounds,
@@ -118,7 +126,7 @@ impl Render for VoiceWave {
                 let total_width = stride * bars as f32;
                 let start_x = bounds.origin.x + (bounds.size.width - total_width) / 2.0;
                 let center_y = bounds.origin.y + bounds.size.height / 2.0;
-                let max_height = bounds.size.height - px(4.0); // Leave some padding
+                let max_height = bounds.size.height - px(2.0); // Reduced padding to 2px to allow near-edge touching
 
                 for i in 0..bars {
                     // i=0 is the rightmost bar (Newest)
@@ -133,14 +141,18 @@ impl Render for VoiceWave {
 
                         if is_active {
                             // Active Speech: Taller bar, foreground color
-                            // Reduced scaling from 100.0 to 50.0 to prevent maxing out too easily
-                            let scaled_height = px(2.0 + amp * 50.0);
+                            // Increased scaling to 120.0 to ensure loud sounds hit the max_height (ceiling)
+                            let scaled_height = px(2.0 + amp * 120.0);
 
-                            // Apply "Living" Animation: Sine wave modulation
-                            // i varies across bars, animation_offset varies over time
-                            // This creates a ripple effect
-                            let modulation =
-                                1.0 + 0.3 * ((i as f32 * 0.2) + animation_offset).sin();
+                            // Liquid Flow Animation: Interference Patterns
+                            // Wave 1: Slow Swell (Low frequency, slow speed)
+                            let wave1 = ((i as f32 * 0.1) + animation_offset * 0.5).sin();
+
+                            // Wave 2: Fast Ripple (High frequency, fast speed)
+                            let wave2 = ((i as f32 * 0.3) + animation_offset * 2.0).sin();
+
+                            // Combine waves for non-repetitive motion
+                            let modulation = 1.0 + 0.25 * wave1 + 0.1 * wave2;
                             let modulated_height = scaled_height * modulation;
 
                             // Clamp between 2px and max_height
@@ -150,13 +162,12 @@ impl Render for VoiceWave {
                                 modulated_height
                             };
 
-                            // Wobble Effect
-                            // Width breathing: 2.0 +/- 0.5px
-                            let wobble_width =
-                                px(2.0 + 0.5 * ((i as f32 * 0.1) + wobble_phase).sin());
+                            // Liquid Wobble Effect
+                            // Width breathing: REMOVED (User disliked thin/fat effect)
+                            let wobble_width = px(2.0);
 
-                            // Y-Offset Bobbing: +/- 2.0px
-                            let wobble_y = px(((i as f32 * 0.15) + wobble_phase).cos() * 2.0);
+                            // Y-Offset Bobbing: REMOVED (User disliked wobble)
+                            let wobble_y = px(0.0);
 
                             (final_height, wobble_width, wobble_y, foreground)
                         } else {
