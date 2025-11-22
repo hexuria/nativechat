@@ -1,6 +1,9 @@
 use gpui::*;
 use gpui_component::Root;
-use nativechat::actions::{Minimize, OpenSettings, Quit, ToggleSidebar, ToggleTheme, Zoom};
+use nativechat::actions::{
+    About, Hide, HideOthers, Minimize, OpenSettings, Quit, ShowAll, ToggleSidebar, ToggleTheme,
+    Zoom,
+};
 use nativechat::assets::CombinedAssets;
 use nativechat::components::input::SubmitMessage;
 use nativechat::root::RootView;
@@ -100,6 +103,9 @@ fn main() {
                 });
 
                 let view = cx.new(|cx| RootView::new(window, state, cx));
+                view.update(cx, |view, _cx| {
+                    view.focus_handle.focus(window);
+                });
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .unwrap();
@@ -110,13 +116,39 @@ fn set_menus(cx: &mut App) {
     cx.set_menus(vec![
         Menu {
             name: "NativeChat".into(),
-            items: vec![MenuItem::action("Quit", Quit)],
+            items: vec![
+                MenuItem::action("About NativeChat", About),
+                MenuItem::separator(),
+                MenuItem::action("Settings...", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide NativeChat", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit NativeChat", Quit),
+            ],
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                // MenuItem::os_submenu("Undo", SystemMenuType::Undo),
+                // MenuItem::os_submenu("Redo", SystemMenuType::Redo),
+                MenuItem::separator(),
+                // MenuItem::os_submenu("Cut", SystemMenuType::Cut),
+                // MenuItem::os_submenu("Copy", SystemMenuType::Copy),
+                // MenuItem::os_submenu("Paste", SystemMenuType::Paste),
+                // MenuItem::os_submenu("Select All", SystemMenuType::SelectAll),
+            ],
         },
         Menu {
             name: "Window".into(),
             items: vec![
                 MenuItem::action("Minimize", Minimize),
                 MenuItem::action("Zoom", Zoom),
+                MenuItem::separator(),
+                // MenuItem::os_submenu("Bring All to Front", SystemMenuType::BringAllToFront),
             ],
         },
         Menu {

@@ -8,6 +8,10 @@ actions!(
         OpenSettings,
         Quit,
         Minimize,
-        Zoom
+        Zoom,
+        Hide,
+        HideOthers,
+        ShowAll,
+        About
     ]
 );

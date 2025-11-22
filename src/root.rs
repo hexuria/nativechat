@@ -1,4 +1,6 @@
-use crate::actions::{Minimize, ToggleSidebar, ToggleTheme, Zoom};
+use crate::actions::{
+    About, Hide, HideOthers, Minimize, ShowAll, ToggleSidebar, ToggleTheme, Zoom,
+};
 use crate::components::layout::Layout;
 use gpui::*;
 
@@ -13,16 +15,19 @@ pub struct RootView {
     layout: Entity<Layout>,
     state: Entity<AppState>,
     circular_viz: Option<Entity<CircularVoiceViz>>,
+    pub focus_handle: FocusHandle,
 }
 
 impl RootView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let layout = cx.new(|cx| Layout::new(window, state.clone(), cx));
+        let focus_handle = cx.focus_handle();
 
         Self {
             layout,
             state,
             circular_viz: None,
+            focus_handle,
         }
     }
 }
@@ -53,6 +58,8 @@ impl Render for RootView {
 
         div()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context("Root")
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(self.layout.clone())
@@ -69,10 +76,26 @@ impl Render for RootView {
                 }
             })
             .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {
-                println!("Minimize action triggered (not implemented in GPUI yet)");
+                // cx.minimize_window(); // Not available on App
+                println!("Minimize action triggered");
             })
             .on_action(|_: &Zoom, _window: &mut Window, _cx: &mut App| {
-                println!("Zoom action triggered (not implemented in GPUI yet)");
+                // cx.zoom_window(); // Not available on App
+                println!("Zoom action triggered");
+            })
+            .on_action(|_: &Hide, _window: &mut Window, cx: &mut App| {
+                cx.hide();
+            })
+            .on_action(|_: &HideOthers, _window: &mut Window, _cx: &mut App| {
+                // cx.hide_others();
+                println!("Hide Others action triggered");
+            })
+            .on_action(|_: &ShowAll, _window: &mut Window, _cx: &mut App| {
+                // cx.show_all();
+                println!("Show All action triggered");
+            })
+            .on_action(|_: &About, _window: &mut Window, _cx: &mut App| {
+                println!("About NativeChat");
             })
             // Voice Mode Modal Overlay
             .children(if is_voice_mode_open {

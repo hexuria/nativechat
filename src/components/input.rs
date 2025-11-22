@@ -35,11 +35,12 @@ impl MessageInput {
         // Subscribe to input events to handle Enter key
         cx.subscribe_in(&input_state, window, |this, _state, event, window, cx| {
             if let InputEvent::PressEnter { secondary } = event
-                && !secondary {
-                    // Enter without Shift - submit the message
-                    this.trigger_submit(window, cx);
-                }
-                // Shift+Enter is handled by the editor (newline)
+                && !secondary
+            {
+                // Enter without Shift - submit the message
+                this.trigger_submit(window, cx);
+            }
+            // Shift+Enter is handled by the editor (newline)
         })
         .detach();
 
@@ -210,7 +211,7 @@ impl Render for MessageInput {
                         // Text Mode: Mic and Send/Headphone
                         this.child(
                             div()
-                                .id("voice-btn")
+                                .id("dictate")
                                 .w(px(36.0))
                                 .h(px(36.0))
                                 .flex()
@@ -221,7 +222,7 @@ impl Render for MessageInput {
                                 .text_color(secondary_foreground)
                                 .hover(move |style| style.bg(secondary)) // Gray on hover
                                 .cursor_pointer()
-                                .tooltip(|w, cx| Tooltip::new("Voice Mode").build(w, cx))
+                                .tooltip(|w, cx| Tooltip::new("Dictate").build(w, cx))
                                 .child(
                                     svg()
                                         .path("icons/mic.svg")
@@ -236,7 +237,7 @@ impl Render for MessageInput {
                             if self.input_state.read(cx).text().len() == 0 {
                                 // Empty state: Sparkles icon - opens voice mode modal
                                 div()
-                                    .id("sparkles-btn")
+                                    .id("voice-mode")
                                     .w(px(36.0))
                                     .h(px(36.0))
                                     .flex()
