@@ -185,6 +185,17 @@ impl Render for CircularVoiceViz {
                     move |bounds, _, window, _| {
                         let center = bounds.center();
 
+                        let is_ai_speaking = ai_amplitude > 0.01;
+                        let active_color = if is_ai_speaking {
+                            if theme.is_light {
+                                gpui::hsla(220.0 / 360.0, 0.6, 0.5, 1.0) // Bluish Grey
+                            } else {
+                                gpui::hsla(135.0 / 360.0, 1.0, 0.5, 1.0) // Matrix Green (#00FF41)
+                            }
+                        } else {
+                            theme.primary
+                        };
+
                         // --- 0. Radial Gradient Background ---
                         // Paint concentric circles to simulate radial gradient
                         let max_width: f32 = bounds.size.width.into();
@@ -294,7 +305,9 @@ impl Render for CircularVoiceViz {
                         window.paint_path(track_path.build().unwrap(), track_color);
 
                         // Gauge Ticks
-                        let tick_color = if theme.is_light {
+                        let tick_color = if is_ai_speaking {
+                            active_color
+                        } else if theme.is_light {
                             theme.primary
                         } else {
                             theme.accent
@@ -330,12 +343,18 @@ impl Render for CircularVoiceViz {
                             // GLOW EFFECT (Multi-layered to simulate shadowBlur)
                             // Matching TypeScript: shadowBlur = 10, shadowColor = primaryColor
 
+                            let base_glow_color = if is_ai_speaking {
+                                active_color
+                            } else {
+                                theme.primary
+                            };
+
                             // Layer 1: Outermost, widest blur (very soft)
                             let glow_width_1 = if theme.is_light { 28.0 } else { 24.0 };
-                            let glow_color_1 = if theme.is_light {
+                            let glow_color_1 = if theme.is_light && !is_ai_speaking {
                                 gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.15)
                             } else {
-                                theme.primary.opacity(0.15)
+                                base_glow_color.opacity(0.15)
                             };
                             let mut glow_path_1 = PathBuilder::stroke(px(glow_width_1));
                             draw_arc(
@@ -348,10 +367,10 @@ impl Render for CircularVoiceViz {
 
                             // Layer 2: Middle blur
                             let glow_width_2 = if theme.is_light { 20.0 } else { 16.0 };
-                            let glow_color_2 = if theme.is_light {
+                            let glow_color_2 = if theme.is_light && !is_ai_speaking {
                                 gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.25)
                             } else {
-                                theme.primary.opacity(0.25)
+                                base_glow_color.opacity(0.25)
                             };
                             let mut glow_path_2 = PathBuilder::stroke(px(glow_width_2));
                             draw_arc(
@@ -364,10 +383,10 @@ impl Render for CircularVoiceViz {
 
                             // Layer 3: Inner glow (closer to solid)
                             let glow_width_3 = if theme.is_light { 14.0 } else { 10.0 };
-                            let glow_color_3 = if theme.is_light {
+                            let glow_color_3 = if theme.is_light && !is_ai_speaking {
                                 gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.4)
                             } else {
-                                theme.primary.opacity(0.4)
+                                base_glow_color.opacity(0.4)
                             };
                             let mut glow_path_3 = PathBuilder::stroke(px(glow_width_3));
                             draw_arc(
@@ -388,10 +407,10 @@ impl Render for CircularVoiceViz {
                                 current_fill_angle,
                             );
 
-                            let needle_color = if theme.is_light {
+                            let needle_color = if theme.is_light && !is_ai_speaking {
                                 gpui::hsla(215.0 / 360.0, 0.16, 0.47, 1.0)
                             } else {
-                                theme.primary
+                                base_glow_color
                             };
                             window.paint_path(needle_path.build().unwrap(), needle_color);
                         }
@@ -422,7 +441,12 @@ impl Render for CircularVoiceViz {
                                 }
                             }
                         }
-                        window.paint_path(dash_path.build().unwrap(), theme.accent);
+                        let ring_color = if is_ai_speaking {
+                            active_color
+                        } else {
+                            theme.accent
+                        };
+                        window.paint_path(dash_path.build().unwrap(), ring_color);
 
                         // --- 4. Waveform Circle (Innermost) ---
                         // Matches TypeScript HUD: radius + (v * 30 * (volume / 50))
@@ -488,7 +512,12 @@ impl Render for CircularVoiceViz {
                         wave_path.line_to(first_p);
                         wave_path.close();
 
-                        window.paint_path(wave_path.build().unwrap(), theme.primary);
+                        let wave_color = if is_ai_speaking {
+                            active_color.opacity(0.5)
+                        } else {
+                            theme.primary
+                        };
+                        window.paint_path(wave_path.build().unwrap(), wave_color);
                     },
                 )
                 .absolute()
