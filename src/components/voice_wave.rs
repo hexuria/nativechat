@@ -16,6 +16,7 @@ pub struct VoiceWave {
     scroll_phase: f32,
     current_peak: f32,
     animation_offset: f32,
+    wobble_phase: f32,
 }
 
 impl VoiceWave {
@@ -48,6 +49,9 @@ impl VoiceWave {
 
                                 // Animation speed for the "living" effect
                                 this.animation_offset += 0.8;
+
+                                // Wobble speed (slower, organic)
+                                this.wobble_phase += 0.1;
 
                                 let bar_width = 2.0;
                                 let spacing = 3.0;
@@ -82,6 +86,7 @@ impl VoiceWave {
                 scroll_phase: 0.0,
                 current_peak: 0.0,
                 animation_offset: 0.0,
+                wobble_phase: 0.0,
             }
         })
     }
@@ -95,6 +100,7 @@ impl Render for VoiceWave {
         let history = self.history.clone();
         let scroll_phase = self.scroll_phase;
         let animation_offset = self.animation_offset;
+        let wobble_phase = self.wobble_phase;
 
         canvas(
             move |bounds, _, _| bounds,
@@ -117,7 +123,7 @@ impl Render for VoiceWave {
                 for i in 0..bars {
                     // i=0 is the rightmost bar (Newest)
 
-                    let (height, color) = if i < history.len() {
+                    let (height, width, y_offset, color) = if i < history.len() {
                         // Recorded History (Past) -> ALWAYS Black (foreground)
                         let amp = history[i];
 
@@ -144,28 +150,38 @@ impl Render for VoiceWave {
                                 modulated_height
                             };
 
-                            (final_height, foreground)
+                            // Wobble Effect
+                            // Width breathing: 2.0 +/- 0.5px
+                            let wobble_width =
+                                px(2.0 + 0.5 * ((i as f32 * 0.1) + wobble_phase).sin());
+
+                            // Y-Offset Bobbing: +/- 2.0px
+                            let wobble_y = px(((i as f32 * 0.15) + wobble_phase).cos() * 2.0);
+
+                            (final_height, wobble_width, wobble_y, foreground)
                         } else {
                             // Silence in History: Small box/dot, foreground color
                             // User requested "black small box" for silence in recorded track
                             // No animation for silence
-                            (px(2.0), foreground)
+                            (px(2.0), px(2.0), px(0.0), foreground)
                         }
                     } else {
                         // Unrecorded Future -> ALWAYS Grey (muted_foreground)
                         // Fixed height of 2px (Circle/Dot)
-                        (px(2.0), muted_foreground)
+                        (px(2.0), px(2.0), px(0.0), muted_foreground)
                     };
 
                     // Draw from Right to Left
                     // Position 0 is at the far right
                     // Apply scroll_phase to shift bars left smoothly
                     let x = start_x + stride * (bars - 1 - i) as f32 - px(scroll_phase);
-                    let y = center_y - height / 2.0;
+
+                    // Apply Y-offset (bobbing)
+                    let y = center_y - height / 2.0 + y_offset;
 
                     // Only draw if within bounds (optional optimization, canvas clips anyway)
                     window.paint_quad(
-                        fill(Bounds::new(point(x, y), size(bar_width, height)), color)
+                        fill(Bounds::new(point(x, y), size(width, height)), color)
                             .corner_radii(px(1.0)),
                     );
                 }
