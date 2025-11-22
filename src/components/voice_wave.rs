@@ -46,7 +46,7 @@ impl VoiceWave {
                                 let current_amp = if is_muted {
                                     0.0
                                 } else {
-                                    f32::from_bits(this.amplitude.load(Ordering::Relaxed))
+                                    f32::from_bits(this.amplitude.load(Ordering::Relaxed)) * 0.1
                                 };
 
                                 // Peak sampling: capture the highest amplitude since the last bar push
@@ -151,7 +151,7 @@ impl Render for VoiceWave {
                         // Determine if "active" (speaking) or "idle" (silence/noise)
                         // Increased threshold to 0.12 (12%) to filter background noise
                         // ChatGPT-style: only show bars for actual speech
-                        let is_active = amp > 0.12;
+                        let is_active = amp > 0.012;
 
                         if is_active {
                             // Active Speech: Apply logarithmic scaling for natural dynamics
