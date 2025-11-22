@@ -68,6 +68,13 @@ pub enum VoiceStatus {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Profile {
+    pub id: usize,
+    pub name: String,
+    pub avatar: Option<String>, // Path or IconName
+}
+
 pub struct AppState {
     pub conversations: Vec<Conversation>,
     pub active_conversation_id: Option<usize>,
@@ -78,8 +85,13 @@ pub struct AppState {
     pub is_sidebar_open: bool,
     pub is_voice_muted: bool,
     pub voice_status: VoiceStatus,
+    pub more_menu_open: bool,
     pub audio_input: Option<AudioInput>,
     pub gemini_client: Option<GeminiLiveClient>,
+    pub profiles: Vec<Profile>,
+    pub selected_profile: Option<Profile>,
+    pub available_apps: Vec<String>,
+    pub selected_apps: Vec<String>,
 }
 
 impl Default for AppState {
@@ -90,24 +102,105 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
+        let profiles = vec![
+            Profile {
+                id: 1,
+                name: "John Doe".to_string(),
+                avatar: None,
+            },
+            Profile {
+                id: 2,
+                name: "Jane Smith".to_string(),
+                avatar: None,
+            },
+        ];
+        let selected_profile = profiles.first().cloned();
+
+        let available_apps = vec![
+            "Canva".to_string(),
+            "Figma".to_string(),
+            "Notion".to_string(),
+            "Linear".to_string(),
+        ];
+
         Self {
-            conversations: Vec::new(),
-            active_conversation_id: None,
-            theme_mode: "system".to_string(), // Default theme mode
-            amplitude: Arc::new(AtomicU32::new(0)),
-            ai_amplitude: Arc::new(AtomicU32::new(0)),
+            conversations: vec![
+                Conversation {
+                    id: 1,
+                    title: "John Doe".to_string(),
+                    messages: vec![
+                        Message {
+                            id: 1,
+                            sender: "John Doe".to_string(),
+                            content: "Hello there!".to_string(),
+                            sent_at: std::time::SystemTime::now(),
+                            is_me: false,
+                        },
+                        Message {
+                            id: 2,
+                            sender: "Me".to_string(),
+                            content: "Hi John!".to_string(),
+                            sent_at: std::time::SystemTime::now(),
+                            is_me: true,
+                        },
+                    ],
+                    unread_count: 0,
+                },
+                Conversation {
+                    id: 2,
+                    title: "Jane Smith".to_string(),
+                    messages: vec![Message {
+                        id: 1,
+                        sender: "Jane Smith".to_string(),
+                        content: "Meeting at 3?".to_string(),
+                        sent_at: std::time::SystemTime::now(),
+                        is_me: false,
+                    }],
+                    unread_count: 1,
+                },
+            ],
+            active_conversation_id: Some(1),
+            theme_mode: "light".to_string(),
+            amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            ai_amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             is_voice_mode_open: false,
-            is_sidebar_open: true,
             is_voice_muted: false,
+            is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
+            more_menu_open: false,
             audio_input: None,
             gemini_client: None,
+            profiles,
+            selected_profile,
+            available_apps,
+            selected_apps: Vec::new(),
         }
     }
 
     pub fn select_conversation(&mut self, conversation_id: usize, cx: &mut Context<Self>) {
         self.active_conversation_id = Some(conversation_id);
         cx.notify();
+    }
+
+    pub fn select_profile(&mut self, profile_id: usize, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profiles.iter().find(|p| p.id == profile_id) {
+            self.selected_profile = Some(profile.clone());
+            cx.notify();
+        }
+    }
+
+    pub fn select_app(&mut self, app_name: String, cx: &mut Context<Self>) {
+        if !self.selected_apps.contains(&app_name) {
+            self.selected_apps.push(app_name);
+            cx.notify();
+        }
+    }
+
+    pub fn remove_app(&mut self, app_name: String, cx: &mut Context<Self>) {
+        if let Some(index) = self.selected_apps.iter().position(|a| *a == app_name) {
+            self.selected_apps.remove(index);
+            cx.notify();
+        }
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
@@ -196,6 +289,11 @@ impl AppState {
 
     pub fn toggle_voice_mute(&mut self, cx: &mut Context<Self>) {
         self.is_voice_muted = !self.is_voice_muted;
+        cx.notify();
+    }
+
+    pub fn toggle_more_menu(&mut self, cx: &mut Context<Self>) {
+        self.more_menu_open = !self.more_menu_open;
         cx.notify();
     }
 

@@ -14,12 +14,30 @@ fn themes_path() -> PathBuf {
         // In release, themes are copied to the `Resources` directory of the app bundle.
         // We construct the path relative to the executable.
         let exe_path = std::env::current_exe().expect("Failed to get current executable path");
-        if let Some(path) = exe_path.parent().and_then(|p| p.parent()).map(|p| p.join("Resources/themes")) {
-            path
-        } else {
-            // Fallback for unexpected bundle structure
-            PathBuf::from("themes")
+        if let Some(path) = exe_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("Resources/themes"))
+        {
+            if path.exists() {
+                return path;
+            }
         }
+
+        // Fallback for running from target/release (project root is 3 levels up)
+        if let Some(path) = exe_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.join("themes"))
+        {
+            if path.exists() {
+                return path;
+            }
+        }
+
+        // Fallback for unexpected bundle structure or CWD
+        PathBuf::from("themes")
     }
 }
 
@@ -31,7 +49,10 @@ pub fn init(cx: &mut App) {
         if let Some(theme) = ThemeRegistry::global(cx).themes().get(&theme_name).cloned() {
             Theme::global_mut(cx).apply_config(&theme);
         } else {
-            log::error!("Default theme '{}' not found after loading themes.", theme_name);
+            log::error!(
+                "Default theme '{}' not found after loading themes.",
+                theme_name
+            );
         }
     }) {
         log::error!("Failed to load themes, using default: {}", err);

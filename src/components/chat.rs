@@ -59,66 +59,23 @@ impl Render for ChatView {
             .size_full()
             .bg(theme.background)
             .child(
-                h_flex()
-                    .h(px(60.0)) // Increased height for window controls
-                    .pt(px(20.0)) // Top padding for "traffic lights"
-                    .pb_5() // Bottom padding to separate from border
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .px_4()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(Avatar::new())
-                            .child(Label::new(title)),
-                    )
-                    .child(
-                        Button::new("theme-toggle")
-                            .icon(match self.state.read(cx).theme_mode.as_str() {
-                                "light" => IconName::Moon,
-                                "dark" => IconName::Settings,
-                                _ => IconName::Sun,
-                            })
-                            .ghost()
-                            .tooltip(match self.state.read(cx).theme_mode.as_str() {
-                                "light" => "Switch to Dark theme",
-                                "dark" => "Switch to System theme",
-                                _ => "Switch to Light theme",
-                            })
-                            .on_click({
-                                let app_state = self.state.clone();
-                                cx.listener(move |_, _, _, cx| {
-                                    app_state.update(cx, |state, cx| {
-                                        state.toggle_theme(cx);
-                                    });
-                                })
-                            }),
-                    ),
-            )
-            .child(
-                // Messages area - centered with max-width like ChatGPT
-                h_flex()
+                // Main Content Area (Header + Messages)
+                div()
                     .flex_grow()
-                    .w_full()
-                    .justify_center() // Center the content
-                    .overflow_hidden()
-                    .px_4() // Add horizontal padding to parent
+                    .min_h(px(0.0)) // Ensure it can shrink/scroll properly
+                    .relative()
                     .child(
-                        div()
-                            .w_full()
-                            .max_w(px(800.0)) // Max width constraint on wrapper
-                            .h_full()
+                        // Messages Area - Full width/height, scrollable
+                        v_flex()
+                            .size_full()
+                            .scrollable(ScrollbarAxis::Vertical)
+                            .pt(px(80.0)) // Padding top to clear the absolute header (60px header + 20px padding)
+                            .pb_4()
+                            .items_center() // Center the message content wrapper
                             .child(
-                                v_flex()
-                                    .size_full()
-                                    .gap_4()
-                                    .scrollable(ScrollbarAxis::Vertical)
-                                    .children(messages.into_iter().map(|msg| {
+                                // Message Content Wrapper - Max width constraint
+                                div().w_full().max_w(px(800.0)).px_4().child(
+                                    v_flex().gap_4().children(messages.into_iter().map(|msg| {
                                         let (bg_color, text_color) = if msg.is_me {
                                             (theme.primary, theme.primary_foreground)
                                         } else {
@@ -131,6 +88,51 @@ impl Render for ChatView {
                                             .text_color(text_color)
                                             .timestamp(msg.formatted_time())
                                     })),
+                                ),
+                            ),
+                    )
+                    .child(
+                        // Header - Absolute positioned at top
+                        h_flex()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(60.0))
+                            .pt(px(20.0))
+                            .pb_5()
+                            .items_center()
+                            .justify_between()
+                            .px_4()
+                            .bg(theme.background.opacity(0.9)) // Slight transparency for glass effect if desired, or solid
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(Avatar::new())
+                                    .child(Label::new(title)),
+                            )
+                            .child(
+                                Button::new("theme-toggle")
+                                    .icon(match self.state.read(cx).theme_mode.as_str() {
+                                        "light" => IconName::Moon,
+                                        "dark" => IconName::Settings,
+                                        _ => IconName::Sun,
+                                    })
+                                    .ghost()
+                                    .tooltip(match self.state.read(cx).theme_mode.as_str() {
+                                        "light" => "Switch to Dark theme",
+                                        "dark" => "Switch to System theme",
+                                        _ => "Switch to Light theme",
+                                    })
+                                    .on_click({
+                                        let app_state = self.state.clone();
+                                        cx.listener(move |_, _, _, cx| {
+                                            app_state.update(cx, |state, cx| {
+                                                state.toggle_theme(cx);
+                                            });
+                                        })
+                                    }),
                             ),
                     ),
             )
