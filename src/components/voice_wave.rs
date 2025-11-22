@@ -153,8 +153,8 @@ impl Render for VoiceWave {
                         }
                     } else {
                         // Unrecorded Future -> ALWAYS Grey (muted_foreground)
-                        // Fixed height of 5px
-                        (px(5.0), muted_foreground)
+                        // Fixed height of 2px (Circle/Dot)
+                        (px(2.0), muted_foreground)
                     };
 
                     // Draw from Right to Left
