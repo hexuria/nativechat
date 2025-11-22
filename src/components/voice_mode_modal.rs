@@ -51,7 +51,7 @@ pub fn render_voice_mode_modal<V: 'static>(
                                 .child(
                                     h_flex().gap_2().items_center().child(
                                         div()
-                                            .text_xs()
+                                            .text_3xl()
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(theme.foreground)
                                             .child("NATIVECHAT"),
@@ -59,7 +59,7 @@ pub fn render_voice_mode_modal<V: 'static>(
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
+                                        .text_base()
                                         .text_color(theme.muted_foreground)
                                         .child("BETA"),
                                 ),
