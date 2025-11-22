@@ -75,6 +75,7 @@ pub struct AppState {
     pub amplitude: Arc<AtomicU32>,
     pub ai_amplitude: Arc<AtomicU32>, // New field for AI voice viz
     pub is_voice_mode_open: bool,
+    pub is_sidebar_open: bool,
     pub is_voice_muted: bool,
     pub voice_status: VoiceStatus,
     pub audio_input: Option<AudioInput>,
@@ -96,6 +97,7 @@ impl AppState {
             amplitude: Arc::new(AtomicU32::new(0)),
             ai_amplitude: Arc::new(AtomicU32::new(0)),
             is_voice_mode_open: false,
+            is_sidebar_open: true,
             is_voice_muted: false,
             voice_status: VoiceStatus::Ready,
             audio_input: None,
@@ -114,17 +116,22 @@ impl AppState {
                 .conversations
                 .iter_mut()
                 .find(|c| c.id == conversation_id)
-            {
-                let message = Message {
-                    id: conversation.messages.len() + 1,
-                    sender: "Me".to_string(),
-                    content,
-                    sent_at: SystemTime::now(),
-                    is_me: true,
-                };
-                conversation.messages.push(message);
-                cx.notify();
-            }
+        {
+            let message = Message {
+                id: conversation.messages.len() + 1,
+                sender: "Me".to_string(),
+                content,
+                sent_at: SystemTime::now(),
+                is_me: true,
+            };
+            conversation.messages.push(message);
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.is_sidebar_open = !self.is_sidebar_open;
+        cx.notify();
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {

@@ -9,13 +9,18 @@ use crate::state::AppState;
 pub struct Layout {
     sidebar: Entity<SidebarView>,
     chat: Entity<ChatView>,
+    state: Entity<AppState>,
 }
 
 impl Layout {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| SidebarView::new(state.clone(), cx));
-        let chat = cx.new(|cx| ChatView::new(window, state, cx));
-        Self { sidebar, chat }
+        let chat = cx.new(|cx| ChatView::new(window, state.clone(), cx));
+        Self {
+            sidebar,
+            chat,
+            state,
+        }
     }
 }
 
@@ -24,7 +29,11 @@ impl Render for Layout {
         h_flex()
             .h_full()
             .w_full()
-            .child(self.sidebar.clone())
+            .children(if self.state.read(_cx).is_sidebar_open {
+                Some(self.sidebar.clone())
+            } else {
+                None
+            })
             .child(
                 div()
                     .flex_grow()

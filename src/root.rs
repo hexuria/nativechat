@@ -1,3 +1,4 @@
+use crate::actions::{Minimize, ToggleSidebar, ToggleTheme, Zoom};
 use crate::components::layout::Layout;
 use gpui::*;
 
@@ -17,6 +18,7 @@ pub struct RootView {
 impl RootView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let layout = cx.new(|cx| Layout::new(window, state.clone(), cx));
+
         Self {
             layout,
             state,
@@ -54,6 +56,24 @@ impl Render for RootView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(self.layout.clone())
+            .on_action({
+                let state = self.state.clone();
+                move |_: &ToggleSidebar, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_sidebar(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &ToggleTheme, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_theme(cx));
+                }
+            })
+            .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {
+                println!("Minimize action triggered (not implemented in GPUI yet)");
+            })
+            .on_action(|_: &Zoom, _window: &mut Window, _cx: &mut App| {
+                println!("Zoom action triggered (not implemented in GPUI yet)");
+            })
             // Voice Mode Modal Overlay
             .children(if is_voice_mode_open {
                 if let Some(viz) = viz {

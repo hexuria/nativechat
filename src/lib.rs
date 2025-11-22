@@ -1,4 +1,6 @@
+pub mod actions;
 pub mod assets;
+
 pub mod audio;
 pub mod components;
 pub mod root;
