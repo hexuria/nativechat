@@ -327,13 +327,15 @@ impl Render for CircularVoiceViz {
                         let current_fill_angle = start_angle + (total_range * speed_ratio);
 
                         if speed_ratio > 0.01 {
-                            // GLOW EFFECT (Multi-layered for soft blur simulation)
-                            // Layer 1: Wide, very transparent
-                            let glow_width_1 = if theme.is_light { 24.0 } else { 20.0 };
+                            // GLOW EFFECT (Multi-layered to simulate shadowBlur)
+                            // Matching TypeScript: shadowBlur = 10, shadowColor = primaryColor
+
+                            // Layer 1: Outermost, widest blur (very soft)
+                            let glow_width_1 = if theme.is_light { 28.0 } else { 24.0 };
                             let glow_color_1 = if theme.is_light {
-                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.1)
+                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.15)
                             } else {
-                                theme.primary.opacity(0.1)
+                                theme.primary.opacity(0.15)
                             };
                             let mut glow_path_1 = PathBuilder::stroke(px(glow_width_1));
                             draw_arc(
@@ -344,12 +346,12 @@ impl Render for CircularVoiceViz {
                             );
                             window.paint_path(glow_path_1.build().unwrap(), glow_color_1);
 
-                            // Layer 2: Medium, semi-transparent
-                            let glow_width_2 = if theme.is_light { 16.0 } else { 12.0 };
+                            // Layer 2: Middle blur
+                            let glow_width_2 = if theme.is_light { 20.0 } else { 16.0 };
                             let glow_color_2 = if theme.is_light {
-                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.2)
+                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.25)
                             } else {
-                                theme.primary.opacity(0.2)
+                                theme.primary.opacity(0.25)
                             };
                             let mut glow_path_2 = PathBuilder::stroke(px(glow_width_2));
                             draw_arc(
@@ -360,7 +362,23 @@ impl Render for CircularVoiceViz {
                             );
                             window.paint_path(glow_path_2.build().unwrap(), glow_color_2);
 
-                            // Main Stroke
+                            // Layer 3: Inner glow (closer to solid)
+                            let glow_width_3 = if theme.is_light { 14.0 } else { 10.0 };
+                            let glow_color_3 = if theme.is_light {
+                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.4)
+                            } else {
+                                theme.primary.opacity(0.4)
+                            };
+                            let mut glow_path_3 = PathBuilder::stroke(px(glow_width_3));
+                            draw_arc(
+                                &mut glow_path_3,
+                                gauge_radius,
+                                start_angle,
+                                current_fill_angle,
+                            );
+                            window.paint_path(glow_path_3.build().unwrap(), glow_color_3);
+
+                            // Main Stroke (Solid)
                             let stroke_width = if theme.is_light { 12.0 } else { 8.0 };
                             let mut needle_path = PathBuilder::stroke(px(stroke_width));
                             draw_arc(
@@ -407,26 +425,53 @@ impl Render for CircularVoiceViz {
                         window.paint_path(dash_path.build().unwrap(), theme.accent);
 
                         // --- 4. Waveform Circle (Innermost) ---
-                        // This matches the "squiggly" circle in the screenshot
+                        // Matches TypeScript HUD: radius + (v * 30 * (volume / 50))
+                        // Creates jagged, erratic spikes like real FFT frequency data
                         let mut wave_path = PathBuilder::stroke(px(3.0));
-                        let num_points = 128; // Match buffer size roughly
+                        let num_points = 256; // Match dataArray.length from TypeScript
                         let base_radius = CIRCLE_RADIUS;
-                        // Use amplitude to drive the "squiggles" with more reasonable scaling
-                        let wave_amp = (amplitude + ai_amplitude).min(1.0) * 25.0;
+
+                        // Calculate volume (0-100 scale like TypeScript)
+                        let volume = ((amplitude + ai_amplitude) * 100.0).min(100.0);
+
                         let mut first_p = point(px(0.0), px(0.0));
+                        let slice_angle = (2.0 * PI) / num_points as f32;
 
-                        for i in 0..=num_points {
-                            // Slow spin for waveform itself: rotation * 0.5
-                            let angle =
-                                (i as f32 / num_points as f32) * 2.0 * PI + (rotation * 0.5);
+                        for i in 0..num_points {
+                            // Simulate CHAOTIC frequency data like real FFT bins
+                            // Each bin varies independently and erratically
 
-                            // Generate consistent noise based on angle and time (rotation)
-                            // We don't have per-frequency data here easily without FFT,
-                            // so we simulate the "jagged" look with high-frequency noise
-                            let noise_seed = (i as f32 * 0.5) + (rotation * 2.0);
-                            let noise = (noise_seed.sin() + (noise_seed * 2.7).cos()) * 0.5;
+                            // Use multiple overlapping noise sources for chaos
+                            let seed1 = (i as f32 * 12.9898) + (rotation * 43.758);
+                            let seed2 = (i as f32 * 78.233) + (rotation * 19.194);
+                            let seed3 = (i as f32 * 5.1234) + (rotation * 91.876);
 
-                            let r = base_radius + (noise * wave_amp);
+                            // Create pseudo-random values using sine (classic shader noise)
+                            let noise1 = ((seed1.sin() * 43758.5453).fract() * 2.0 - 1.0).abs();
+                            let noise2 = ((seed2.sin() * 27183.1234).fract() * 2.0 - 1.0).abs();
+                            let noise3 = ((seed3.sin() * 12345.6789).fract() * 2.0 - 1.0).abs();
+
+                            // Combine noises for very erratic behavior
+                            let combined_noise = noise1 * 0.5 + noise2 * 0.3 + noise3 * 0.2;
+
+                            // Add frequency-dependent bias (voice spectrum shape)
+                            let freq_position = i as f32 / num_points as f32;
+                            let freq_bias = if freq_position < 0.3 {
+                                1.2 // Boost low-mid frequencies
+                            } else if freq_position < 0.6 {
+                                0.8 // Moderate mid frequencies
+                            } else {
+                                0.4 // Reduce high frequencies
+                            };
+
+                            // Final simulated FFT bin value (0..2 range like TypeScript)
+                            let v = (combined_noise * freq_bias * 2.0).min(2.0);
+
+                            // Apply TypeScript formula: radius + (v * 30 * (volume / 50))
+                            let r = base_radius + (v * 30.0 * (volume / 50.0));
+
+                            // Slow spin for waveform itself: rotation * 0.5 (matches TypeScript)
+                            let angle = i as f32 * slice_angle + (rotation * 0.5);
 
                             let p = point(
                                 center.x + px(angle.cos() * r),
