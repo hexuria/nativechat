@@ -58,6 +58,9 @@ pub struct AppState {
     pub conversations: Vec<Conversation>,
     pub active_conversation_id: Option<usize>,
     pub theme_mode: String,
+    pub amplitude: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub is_voice_mode_open: bool,
+    pub is_voice_muted: bool,
 }
 
 impl AppState {
@@ -135,6 +138,16 @@ impl AppState {
             println!("[THEME] ERROR: Theme not found!");
         }
 
+        cx.notify();
+    }
+
+    pub fn set_voice_mode(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.is_voice_mode_open = open;
+        cx.notify();
+    }
+
+    pub fn toggle_voice_mute(&mut self, cx: &mut Context<Self>) {
+        self.is_voice_muted = !self.is_voice_muted;
         cx.notify();
     }
 }

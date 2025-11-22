@@ -1,5 +1,6 @@
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
+use crate::state::AppState;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{
@@ -7,8 +8,6 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     tooltip::Tooltip,
 };
-use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
 
 actions!(chat, [SubmitMessage]);
 
@@ -18,11 +17,11 @@ pub struct MessageInput {
     voice_mode: bool,
     voice_wave: Option<Entity<VoiceWave>>,
     audio_input: Option<AudioInput>,
-    amplitude: Arc<AtomicU32>,
+    state: Entity<AppState>,
 }
 
 impl MessageInput {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Type a message...")
@@ -46,15 +45,13 @@ impl MessageInput {
         })
         .detach();
 
-        let amplitude = Arc::new(AtomicU32::new(0));
-
         Self {
             input_state,
             on_submit: None,
             voice_mode: false,
             voice_wave: None,
             audio_input: None,
-            amplitude,
+            state,
         }
     }
 
@@ -87,11 +84,12 @@ impl MessageInput {
             self.audio_input = None;
             self.voice_wave = None;
         } else {
-            match AudioInput::new(self.amplitude.clone()) {
+            let amplitude = self.state.read(cx).amplitude.clone();
+            match AudioInput::new(amplitude.clone()) {
                 Ok(input) => {
                     self.voice_mode = true;
                     self.audio_input = Some(input);
-                    self.voice_wave = Some(VoiceWave::new(self.amplitude.clone(), cx));
+                    self.voice_wave = Some(VoiceWave::new(amplitude, self.state.clone(), cx));
                 }
                 Err(e) => {
                     eprintln!("Failed to start audio input: {}", e);
@@ -238,26 +236,31 @@ impl Render for MessageInput {
                         )
                         .child(
                             if self.input_state.read(cx).text().len() == 0 {
-                                // Empty state: Headphone icon
+                                // Empty state: Sparkles icon - opens voice mode modal
                                 div()
-                                    .id("headphone-btn")
+                                    .id("sparkles-btn")
                                     .w(px(36.0))
                                     .h(px(36.0))
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .rounded_full()
-                                    .bg(gpui::transparent_black()) // Transparent/White by default
+                                    .bg(gpui::transparent_black())
                                     .text_color(secondary_foreground)
-                                    .hover(move |style| style.bg(secondary)) // Gray on hover
+                                    .hover(move |style| style.bg(secondary))
                                     .cursor_pointer()
-                                    .tooltip(|w, cx| Tooltip::new("Read Aloud").build(w, cx))
+                                    .tooltip(|w, cx| Tooltip::new("Voice Mode").build(w, cx))
                                     .child(
                                         svg()
                                             .path("icons/sparkles.svg")
                                             .size(px(18.0))
                                             .text_color(secondary_foreground),
-                                    ) // Fallback to Sparkles as requested
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |state, cx| {
+                                            state.set_voice_mode(true, cx);
+                                        });
+                                    }))
                             } else {
                                 // Typing state: Send button (Black bg, White arrow)
                                 div()

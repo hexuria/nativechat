@@ -20,7 +20,7 @@ pub struct ChatView {
 impl ChatView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
-            MessageInput::new(window, cx).on_submit({
+            MessageInput::new(window, state.clone(), cx).on_submit({
                 let state = state.clone();
                 move |text, cx| {
                     state.update(cx, |state, cx| {

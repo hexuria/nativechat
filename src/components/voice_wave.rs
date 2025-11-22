@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use crate::state::AppState;
 use gpui::prelude::*;
 use gpui::{
     AsyncApp, Bounds, Context, Entity, IntoElement, Render, WeakEntity, Window, canvas, fill,
@@ -12,6 +13,7 @@ use gpui_component::ActiveTheme;
 
 pub struct VoiceWave {
     amplitude: Arc<AtomicU32>,
+    state: Entity<AppState>,
     history: VecDeque<f32>,
     scroll_phase: f32,
     current_peak: f32,
@@ -20,9 +22,13 @@ pub struct VoiceWave {
 }
 
 impl VoiceWave {
-    pub fn new<P: 'static>(amplitude: Arc<AtomicU32>, cx: &mut Context<P>) -> Entity<Self> {
+    pub fn new<P: 'static>(
+        amplitude: Arc<AtomicU32>,
+        state: Entity<AppState>,
+        cx: &mut Context<P>,
+    ) -> Entity<Self> {
         cx.new(|cx| {
-            cx.spawn(|view: WeakEntity<VoiceWave>, cx: &mut AsyncApp| {
+            cx.spawn(move |view: WeakEntity<VoiceWave>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
                     loop {
@@ -34,8 +40,14 @@ impl VoiceWave {
                         // Update view state
                         if view
                             .update(&mut cx, |this, cx| {
-                                let current_amp =
-                                    f32::from_bits(this.amplitude.load(Ordering::Relaxed));
+                                let is_muted =
+                                    this.state.read_with(cx, |state, _| state.is_voice_muted);
+
+                                let current_amp = if is_muted {
+                                    0.0
+                                } else {
+                                    f32::from_bits(this.amplitude.load(Ordering::Relaxed))
+                                };
 
                                 // Peak sampling: capture the highest amplitude since the last bar push
                                 if current_amp > this.current_peak {
@@ -91,6 +103,7 @@ impl VoiceWave {
 
             Self {
                 amplitude,
+                state,
                 history: VecDeque::with_capacity(300),
                 scroll_phase: 0.0,
                 current_peak: 0.0,

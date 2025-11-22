@@ -77,6 +77,9 @@ fn main() {
                     ],
                     active_conversation_id: Some(1),
                     theme_mode: "light".to_string(),
+                    amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    is_voice_mode_open: false,
+                    is_voice_muted: false,
                 });
 
                 let view = cx.new(|cx| RootView::new(window, state, cx));
