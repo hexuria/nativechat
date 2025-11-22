@@ -46,7 +46,7 @@ pub fn render_voice_mode_modal<V: 'static>(
                     })
                     .child(
                         svg()
-                            .path("icons/history.svg")
+                            .path("icons/panel.svg")
                             .size(px(20.0))
                             .text_color(theme.secondary_foreground),
                     ),
