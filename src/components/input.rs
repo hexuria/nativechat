@@ -85,7 +85,7 @@ impl MessageInput {
             self.voice_wave = None;
         } else {
             let amplitude = self.state.read(cx).amplitude.clone();
-            match AudioInput::new(amplitude.clone()) {
+            match AudioInput::new(amplitude.clone(), None) {
                 Ok(input) => {
                     self.voice_mode = true;
                     self.audio_input = Some(input);
@@ -258,7 +258,7 @@ impl Render for MessageInput {
                                     )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.update(cx, |state, cx| {
-                                            state.set_voice_mode(true, cx);
+                                            state.start_voice_mode(cx);
                                         });
                                     }))
                             } else {

@@ -1,5 +1,5 @@
-use crate::components::voice_wave::VoiceWave;
-use crate::state::AppState;
+use crate::components::circular_voice_viz::CircularVoiceViz;
+use crate::state::{AppState, VoiceStatus};
 use gpui::InteractiveElement;
 use gpui::prelude::*;
 use gpui::*;
@@ -7,139 +7,111 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 pub fn render_voice_mode_modal<V: 'static>(
     state: Entity<AppState>,
-    voice_wave: Entity<VoiceWave>,
+    circular_viz: Entity<CircularVoiceViz>,
     cx: &mut Context<V>,
 ) -> impl IntoElement {
     let theme = cx.theme();
+    let state_clone = state.clone();
+
     let app_state = state.read(cx);
-    let is_muted = app_state.is_voice_muted;
-    let state_mute = state.clone();
-    let state_close = state.clone();
+    let voice_status = app_state.voice_status.clone();
+
+    let (status_color, status_text) = match voice_status {
+        VoiceStatus::Ready => (gpui::hsla(0.0, 0.0, 0.5, 1.0), "READY"),
+        VoiceStatus::Connecting => (gpui::hsla(0.0, 0.0, 0.5, 1.0), "CONNECTING..."),
+        VoiceStatus::Connected => (gpui::hsla(0.3, 0.8, 0.5, 1.0), "LIVE"), // Green
+        VoiceStatus::Disconnected => (gpui::hsla(0.0, 0.8, 0.5, 1.0), "DISCONNECTED"), // Red
+        VoiceStatus::Error(_) => (gpui::hsla(0.0, 0.8, 0.5, 1.0), "ERROR"), // Red
+    };
 
     // Full screen overlay
     div()
         .absolute()
         .inset_0()
-        // .z_index(100) // Ensure it's on top
-        .bg(theme.background)
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        // Top Right Button (History)
+        // 1. Visualizer (Background + Grid + Gauge) - Full Screen
+        .child(div().absolute().inset_0().child(circular_viz))
+        // 2. UI Overlay
         .child(
-            div().absolute().top_4().right_4().child(
-                div()
-                    .id("history-btn")
-                    .w(px(40.0))
-                    .h(px(40.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(gpui::transparent_black())
-                    .hover(move |style| style.bg(theme.secondary))
-                    .cursor_pointer()
-                    .on_click(|_, _, _| {
-                        // TODO: Implement history functionality
-                        println!("History button clicked!");
-                    })
-                    .child(
-                        svg()
-                            .path("icons/panel.svg")
-                            .size(px(20.0))
-                            .text_color(theme.secondary_foreground),
-                    ),
-            ),
-        )
-        // Center Content: Voice Wave
-        .child(
-            v_flex()
-                .flex_grow()
-                .items_center()
-                .justify_center()
-                .w_full()
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .justify_between()
+                .p_8()
+                // HUD Header (Top Left)
                 .child(
                     div()
-                        .w(px(600.0)) // Wider container for the wave
-                        .h(px(200.0))
-                        .child(voice_wave),
-                ),
-        )
-        // Bottom Controls
-        .child(
-            h_flex()
-                .gap_6()
-                .pb_12()
-                .items_center()
-                .justify_center()
-                // Mute Button (Sparkles/Mic Mute)
-                .child(
-                    div()
-                        .id("mute-btn")
-                        .w(px(64.0))
-                        .h(px(64.0))
                         .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(if is_muted {
-                            gpui::red().opacity(0.1)
-                        } else {
-                            theme.secondary.opacity(0.5)
-                        })
-                        .hover(move |style| {
-                            style.bg(if is_muted {
-                                gpui::red().opacity(0.2)
-                            } else {
-                                theme.secondary.opacity(0.7)
-                            })
-                        })
-                        .cursor_pointer()
-                        .on_click(move |_, _, cx| {
-                            state_mute.update(cx, |state, cx| {
-                                state.toggle_voice_mute(cx);
-                            });
-                        })
+                        .justify_between()
+                        .items_start()
                         .child(
-                            svg()
-                                .path(if is_muted {
-                                    "icons/mic_mute.svg"
-                                } else {
-                                    "icons/mic.svg"
-                                })
-                                .size(px(24.0))
-                                .text_color(if is_muted {
-                                    gpui::red()
-                                } else {
-                                    theme.foreground
-                                }),
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    h_flex().gap_2().items_center().child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.foreground)
+                                            .child("NATIVECHAT"),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("BETA"),
+                                ),
+                        )
+                        // Status Indicator (Top Right)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().w_2().h_2().rounded_full().bg(status_color))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(status_color)
+                                        .child(status_text),
+                                ),
                         ),
                 )
-                // Close Button (X)
+                // Bottom Controls
                 .child(
-                    div()
-                        .id("close-btn")
-                        .w(px(64.0))
-                        .h(px(64.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(theme.secondary.opacity(0.5))
-                        .hover(move |style| style.bg(theme.secondary.opacity(0.7)))
-                        .cursor_pointer()
-                        .on_click(move |_, _, cx| {
-                            state_close.update(cx, |state, cx| {
-                                state.set_voice_mode(false, cx);
-                            });
-                        })
-                        .child(
-                            svg()
-                                .path("icons/close.svg")
-                                .size(px(24.0))
-                                .text_color(theme.foreground),
-                        ),
+                    div().flex().justify_center().child(
+                        div()
+                            .id("terminate-btn")
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .bg(gpui::hsla(0.0, 0.0, 0.0, 1.0)) // Always black
+                            .text_color(gpui::hsla(0.0, 0.0, 1.0, 1.0)) // Always white
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                state_clone.update(cx, |state, cx| {
+                                    state.stop_voice_mode(cx);
+                                });
+                            }))
+                            .child(svg().path("icons/power.svg").size(px(16.0)).text_color(
+                                if theme.mode.is_dark() {
+                                    gpui::hsla(0.0, 0.8, 0.6, 1.0) // Red on dark
+                                } else {
+                                    gpui::hsla(0.0, 0.0, 1.0, 1.0) // White on light
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("TERMINATE"),
+                            ),
+                    ),
                 ),
         )
 }

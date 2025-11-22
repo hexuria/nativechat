@@ -6,3 +6,4 @@ pub mod message_actions;
 pub mod sidebar;
 pub mod voice_mode_modal;
 pub mod voice_wave;
+pub mod circular_voice_viz;

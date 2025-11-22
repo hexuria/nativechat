@@ -5,7 +5,7 @@ use nativechat::components::input::SubmitMessage;
 use nativechat::root::RootView;
 use nativechat::theme;
 
-use nativechat::state::AppState;
+use nativechat::state::{AppState, VoiceStatus};
 
 fn main() {
     Application::new()
@@ -78,8 +78,12 @@ fn main() {
                     active_conversation_id: Some(1),
                     theme_mode: "light".to_string(),
                     amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    ai_amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     is_voice_mode_open: false,
                     is_voice_muted: false,
+                    voice_status: VoiceStatus::Ready,
+                    audio_input: None,
+                    gemini_client: None,
                 });
 
                 let view = cx.new(|cx| RootView::new(window, state, cx));

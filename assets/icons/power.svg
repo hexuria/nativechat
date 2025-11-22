@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-labelledby="title-power-outline" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <title id="title-power-outline">Power off</title>
+  <!-- vertical line -->
+  <path d="M12 2v8" />
+  <!-- broken circle -->
+  <path d="M5.07 8.07A9 9 0 1 0 18.93 8.07" />
+</svg>
