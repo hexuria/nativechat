@@ -11,6 +11,7 @@ rust-embed = "8.5.0"
 anyhow = "1.0"
 rand = "0.8"
 cpal = "0.15"
+coreaudio-sys = "0.2.17"
 tokio = { version = "1.36", features = ["full"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 serde = { version = "1.0", features = ["derive"] }
