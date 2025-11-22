@@ -2,38 +2,38 @@ use gpui::*;
 use gpui_component::{Theme, ThemeRegistry};
 use std::path::PathBuf;
 
+/// Returns the path to the themes directory, which is different for dev and release builds.
+fn themes_path() -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        // In development, load themes directly from the project's `themes` directory.
+        PathBuf::from("themes")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        // In release, themes are copied to the `Resources` directory of the app bundle.
+        // We construct the path relative to the executable.
+        let exe_path = std::env::current_exe().expect("Failed to get current executable path");
+        if let Some(path) = exe_path.parent().and_then(|p| p.parent()).map(|p| p.join("Resources/themes")) {
+            path
+        } else {
+            // Fallback for unexpected bundle structure
+            PathBuf::from("themes")
+        }
+    }
+}
+
 pub fn init(cx: &mut App) {
     let theme_name = SharedString::from("macOS Classic Light");
+    let themes_path = themes_path();
 
-    // Try to load themes from the gpui-component assets
-    // First, try to watch the themes directory if it exists
-    let themes_path = PathBuf::from("themes");
-
-    println!("[THEME INIT] Watching themes directory: {:?}", themes_path);
-
-    if let Err(err) = ThemeRegistry::watch_dir(themes_path.clone(), cx, move |cx| {
-        println!("[THEME INIT] Callback triggered!");
-        println!(
-            "[THEME INIT] Available themes: {:?}",
-            ThemeRegistry::global(cx)
-                .themes()
-                .keys()
-                .collect::<Vec<_>>()
-        );
-
+    if let Err(err) = ThemeRegistry::watch_dir(themes_path, cx, move |cx| {
         if let Some(theme) = ThemeRegistry::global(cx).themes().get(&theme_name).cloned() {
-            println!("[THEME INIT] Applying default theme: {}", theme_name);
             Theme::global_mut(cx).apply_config(&theme);
         } else {
-            println!("[THEME INIT] Default theme not found!");
+            log::error!("Default theme '{}' not found after loading themes.", theme_name);
         }
     }) {
-        eprintln!(
-            "Failed to watch themes directory: {}, using default theme",
-            err
-        );
-
-        // Fallback: Use default theme if themes directory not found
-        // The default theme should still work, but may not have cursor visible
+        log::error!("Failed to load themes, using default: {}", err);
     }
 }

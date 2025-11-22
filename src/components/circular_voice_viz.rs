@@ -2,7 +2,6 @@ use crate::state::AppState;
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::ActiveTheme;
-use rand::Rng;
 use std::f32::consts::PI;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -184,7 +183,6 @@ impl Render for CircularVoiceViz {
                     move |bounds, _, _| bounds,
                     move |bounds, _, window, _| {
                         let center = bounds.center();
-                        let rng = rand::thread_rng();
 
                         // --- 0. Radial Gradient Background ---
                         // Paint concentric circles to simulate radial gradient

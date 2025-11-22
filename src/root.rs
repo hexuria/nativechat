@@ -55,8 +55,12 @@ impl Render for RootView {
             .text_color(cx.theme().foreground)
             .child(self.layout.clone())
             // Voice Mode Modal Overlay
-            .children(if is_voice_mode_open && viz.is_some() {
-                Some(render_voice_mode_modal(app_state, viz.unwrap(), cx))
+            .children(if is_voice_mode_open {
+                if let Some(viz) = viz {
+                    Some(render_voice_mode_modal(app_state, viz, cx))
+                } else {
+                    None
+                }
             } else {
                 None
             })

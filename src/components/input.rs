@@ -11,9 +11,11 @@ use gpui_component::{
 
 actions!(chat, [SubmitMessage]);
 
+type SubmitCallback = Box<dyn Fn(String, &mut Context<MessageInput>)>;
+
 pub struct MessageInput {
     input_state: Entity<InputState>,
-    on_submit: Option<Box<dyn Fn(String, &mut Context<Self>)>>,
+    on_submit: Option<SubmitCallback>,
     voice_mode: bool,
     voice_wave: Option<Entity<VoiceWave>>,
     audio_input: Option<AudioInput>,

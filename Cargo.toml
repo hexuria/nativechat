@@ -20,3 +20,11 @@ base64 = "0.21"
 futures = "0.3"
 url = "2.5"
 log = "0.4"
+
+[package.metadata.bundle]
+name = "NativeChat"
+identifier = "com.example.nativechat"
+short_description = "A native chat application."
+resources = ["themes/"]
+macOS_entitlements_path = "./nativechat.entitlements"
+NSMicrophoneUsageDescription = "NativeChat needs access to your microphone for voice input."
