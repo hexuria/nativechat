@@ -25,11 +25,12 @@ impl SidebarView {
         label: impl Into<SharedString>,
         path: &str,
         active: bool,
+        any_modal_open: bool,
         theme: &Theme,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         let label = label.into();
-        div()
+        let mut item = div()
             .id(label.clone())
             .flex()
             .items_center()
@@ -37,7 +38,6 @@ impl SidebarView {
             .p_2()
             .rounded_md()
             .hover(|s| s.bg(theme.accent))
-            .cursor_pointer()
             .bg(if active {
                 theme.accent
             } else {
@@ -50,18 +50,25 @@ impl SidebarView {
                     .size(px(16.0))
                     .text_color(theme.foreground),
             )
-            .child(div().child(label).text_sm())
+            .child(div().child(label).text_sm());
+
+        if !any_modal_open {
+            item = item.cursor_pointer();
+        }
+
+        item
     }
 
     fn render_menu_item(
         &self,
         label: impl Into<SharedString>,
         icon: IconName,
+        any_modal_open: bool,
         theme: &Theme,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         let label = label.into();
-        div()
+        let mut item = div()
             .id(label.clone())
             .flex()
             .items_center()
@@ -69,10 +76,15 @@ impl SidebarView {
             .p_2()
             .rounded_md()
             .hover(|s| s.bg(theme.accent))
-            .cursor_pointer()
             .on_click(on_click)
             .child(Icon::new(icon).size(px(16.0)).text_color(theme.foreground))
-            .child(div().child(label).text_sm())
+            .child(div().child(label).text_sm());
+
+        if !any_modal_open {
+            item = item.cursor_pointer();
+        }
+
+        item
     }
 }
 
@@ -81,6 +93,11 @@ impl Render for SidebarView {
         let state = self.state.read(cx);
         let active_id = state.active_conversation_id;
         let theme = cx.theme();
+
+        // Check if any modal is open
+        let any_modal_open = state.is_voice_mode_open
+            || state.is_account_settings_open
+            || state.is_profile_settings_open;
 
         // Mock user data
         let _user_name = "Buggy";
@@ -126,6 +143,7 @@ impl Render for SidebarView {
                         "Library",
                         "icons/library.svg",
                         false,
+                        any_modal_open,
                         theme,
                         |_, _, _| {},
                     ))
@@ -161,6 +179,7 @@ impl Render for SidebarView {
                                 &c.title,
                                 "icons/session.svg",
                                 Some(id) == active_id,
+                                any_modal_open,
                                 theme,
                                 {
                                     let state = self.state.clone();
@@ -234,7 +253,7 @@ impl Render for SidebarView {
                                     };
 
                                 if let Some(icon) = icon_name {
-                                    self.render_menu_item(label, icon, theme, {
+                                    self.render_menu_item(label, icon, any_modal_open, theme, {
                                         let state = self.state.clone();
                                         move |_, _, cx| {
                                             println!(
@@ -251,6 +270,7 @@ impl Render for SidebarView {
                                         label,
                                         path,
                                         false, // Theme toggle doesn't show "active" state in the same way as nav items
+                                        any_modal_open,
                                         theme,
                                         {
                                             let state = self.state.clone();
@@ -271,6 +291,7 @@ impl Render for SidebarView {
                                 "Account Settings",
                                 "icons/account_settings.svg",
                                 false,
+                                any_modal_open,
                                 theme,
                                 {
                                     let state = self.state.clone();
@@ -284,6 +305,7 @@ impl Render for SidebarView {
                             .child(self.render_menu_item(
                                 "Profile Settings",
                                 IconName::Settings,
+                                any_modal_open,
                                 theme,
                                 {
                                     let state = self.state.clone();
@@ -298,6 +320,7 @@ impl Render for SidebarView {
                                 "Sign Out",
                                 "icons/signout.svg",
                                 false,
+                                any_modal_open,
                                 theme,
                                 |_, _, _| {
                                     // TODO: Implement sign out logic
