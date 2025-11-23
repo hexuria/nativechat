@@ -1,4 +1,4 @@
-use crate::actions::{SelectAppCanva, SelectAppCanvas, SelectAppCoursera, SelectAppDeepResearch, SelectAppFigma, SelectAppImageGeneration, SelectAppLinear, SelectAppNotion, SelectAppPhotos, SelectAppSpotify, SelectAppStudy, SelectAppThinking, SelectAppWebSearch, ToggleMoreMenu};
+use crate::actions::{SelectAppCanva, SelectAppCanvas, SelectAppCoursera, SelectAppDeepResearch, SelectAppFigma, SelectAppImageGeneration, SelectAppLinear, SelectAppNotion, SelectAppPhotos, SelectAppSpotify, SelectAppStudy, SelectAppThinking, SelectAppWebSearch};
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
 use crate::state::AppState;
@@ -170,6 +170,17 @@ impl Render for MessageInput {
                                     // App Picker Popover
                                     Popover::new("app-picker-popover")
                                         .anchor(gpui::Corner::BottomLeft) // Anchor BottomLeft of popover to trigger (appears above)
+                                        .on_open_change({
+                                            let state_model = state_model.clone();
+                                            move |open, _, cx| {
+                                                if !open {
+                                                    state_model.update(cx, |state, cx| {
+                                                        state.more_menu_open = false;
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }
+                                        })
                                         .trigger(
                                             Button::new("add-app").icon(IconName::Plus).ghost().rounded_full(),
                                         )
@@ -200,6 +211,22 @@ impl Render for MessageInput {
                                                                 .py_2()
                                                                 .hover(move |s| s.bg(inner_secondary))
                                                                 .cursor_pointer()
+                                                                .on_hover({
+                                                                    let state_model = state_model.clone();
+                                                                    move |hovered, _, cx| {
+                                                                        if *hovered {
+                                                                            let state_model = state_model.clone();
+                                                                            cx.defer(move |cx| {
+                                                                                state_model.update(cx, |state, cx| {
+                                                                                    if state.more_menu_open {
+                                                                                        state.more_menu_open = false;
+                                                                                        cx.notify();
+                                                                                    }
+                                                                                });
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                })
                                                                 .on_click({
                                                                     let state_model = state_model.clone();
                                                                     cx.listener(move |_, _, _, cx| {
@@ -221,6 +248,22 @@ impl Render for MessageInput {
                                                                 .py_2()
                                                                 .hover(move |s| s.bg(inner_secondary))
                                                                 .cursor_pointer()
+                                                                .on_hover({
+                                                                    let state_model = state_model.clone();
+                                                                    move |hovered, _, cx| {
+                                                                        if *hovered {
+                                                                            let state_model = state_model.clone();
+                                                                            cx.defer(move |cx| {
+                                                                                state_model.update(cx, |state, cx| {
+                                                                                    if state.more_menu_open {
+                                                                                        state.more_menu_open = false;
+                                                                                        cx.notify();
+                                                                                    }
+                                                                                });
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                })
                                                                 .on_click({
                                                                     let state_model = state_model.clone();
                                                                     cx.listener(move |_, _, _, cx| {
@@ -242,6 +285,22 @@ impl Render for MessageInput {
                                                                 .py_2()
                                                                 .hover(move |s| s.bg(inner_secondary))
                                                                 .cursor_pointer()
+                                                                .on_hover({
+                                                                    let state_model = state_model.clone();
+                                                                    move |hovered, _, cx| {
+                                                                        if *hovered {
+                                                                            let state_model = state_model.clone();
+                                                                            cx.defer(move |cx| {
+                                                                                state_model.update(cx, |state, cx| {
+                                                                                    if state.more_menu_open {
+                                                                                        state.more_menu_open = false;
+                                                                                        cx.notify();
+                                                                                    }
+                                                                                });
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                })
                                                                 .on_click({
                                                                     let state_model = state_model.clone();
                                                                     cx.listener(move |_, _, _, cx| {
@@ -263,6 +322,22 @@ impl Render for MessageInput {
                                                                 .py_2()
                                                                 .hover(move |s| s.bg(inner_secondary))
                                                                 .cursor_pointer()
+                                                                .on_hover({
+                                                                    let state_model = state_model.clone();
+                                                                    move |hovered, _, cx| {
+                                                                        if *hovered {
+                                                                            let state_model = state_model.clone();
+                                                                            cx.defer(move |cx| {
+                                                                                state_model.update(cx, |state, cx| {
+                                                                                    if state.more_menu_open {
+                                                                                        state.more_menu_open = false;
+                                                                                        cx.notify();
+                                                                                    }
+                                                                                });
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                })
                                                                 .on_click({
                                                                     let state_model = state_model.clone();
                                                                     cx.listener(move |_, _, _, cx| {
@@ -284,6 +359,22 @@ impl Render for MessageInput {
                                                                 .py_2()
                                                                 .hover(move |s| s.bg(inner_secondary))
                                                                 .cursor_pointer()
+                                                                .on_hover({
+                                                                    let state_model = state_model.clone();
+                                                                    move |hovered, _, cx| {
+                                                                        if *hovered {
+                                                                            let state_model = state_model.clone();
+                                                                            cx.defer(move |cx| {
+                                                                                state_model.update(cx, |state, cx| {
+                                                                                    if state.more_menu_open {
+                                                                                        state.more_menu_open = false;
+                                                                                        cx.notify();
+                                                                                    }
+                                                                                });
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                })
                                                                 .on_click({
                                                                     let state_model = state_model.clone();
                                                                     cx.listener(move |_, _, _, cx| {
@@ -294,132 +385,166 @@ impl Render for MessageInput {
                                                                 .child(svg().path("icons/study.svg").size(px(16.0)).text_color(inner_secondary_foreground))
                                                                 .child("Study and learn"),
                                                         )
-                                                        .child(
+                                                        .child({
+                                                            let state_model = state_model.clone();
+                                                            let inner_theme = cx.theme();
+                                                            let inner_secondary = inner_theme.secondary;
+                                                            let inner_secondary_foreground = inner_theme.secondary_foreground;
+                                                            let bg_color = inner_theme.background;
+                                                            let border_color = inner_theme.border;
+
                                                             div()
-                                                                .id("more-trigger")
-                                                                .w_full()
-                                                                .flex()
-                                                                .justify_between()
-                                                                .items_center()
-                                                                .px_3()
-                                                                .py_2()
-                                                                .hover(move |s| s.bg(inner_secondary))
-                                                                .cursor_pointer()
-                                                                .on_click({
+                                                                .id("more-container")
+                                                                .relative()
+                                                                .on_hover({
                                                                     let state_model = state_model.clone();
-                                                                    cx.listener(move |_, _, _, cx| {
-                                                                        state_model.update(cx, |state, cx| state.toggle_more_menu(cx));
-                                                                        cx.dispatch_action(&ToggleMoreMenu);
-                                                                    })
+                                                                    move |hovered, _, cx| {
+                                                                        if *hovered {
+                                                                            let state_model = state_model.clone();
+                                                                            cx.defer(move |cx| {
+                                                                                state_model.update(cx, |state, cx| {
+                                                                                    if !state.more_menu_open {
+                                                                                        state.more_menu_open = true;
+                                                                                        cx.notify();
+                                                                                    }
+                                                                                });
+                                                                            });
+                                                                        }
+                                                                    }
                                                                 })
                                                                 .child(
-                                                                    h_flex().gap_2().items_center()
-                                                                        .child(Icon::new(IconName::Ellipsis).size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                        .child("More")
+                                                                    Button::new("more-trigger")
+                                                                        .w_full()
+                                                                        .flex()
+                                                                        .justify_between()
+                                                                        .items_center()
+                                                                        .px_3()
+                                                                        .py_2()
+                                                                        .hover(move |s| s.bg(inner_secondary))
+                                                                        .cursor_pointer()
+                                                                        .child(
+                                                                            h_flex().gap_2().items_center()
+                                                                                .child(Icon::new(IconName::Ellipsis).size(px(16.0)).text_color(inner_secondary_foreground))
+                                                                                .child("More")
+                                                                        )
+                                                                        .child(
+                                                                            Icon::new(IconName::ChevronRight)
+                                                                                .size(px(14.0))
+                                                                                .text_color(inner_secondary_foreground)
+                                                                        )
                                                                 )
-                                                                .child(
-                                                                    Icon::new(if state_model.read(cx).more_menu_open { IconName::ChevronDown } else { IconName::ChevronRight })
-                                                                        .size(px(14.0))
-                                                                        .text_color(inner_secondary_foreground)
+                                                                .children(
+                                                                    if state_model.read(cx).more_menu_open {
+                                                                        Some(
+                                                                            div()
+                                                                                .absolute()
+                                                                                .left_full()
+                                                                                .bottom_0() // Extend upwards
+                                                                                .ml_6() // Add margin to separate from parent
+                                                                                .w(px(200.0))
+                                                                                .bg(bg_color)
+                                                                                .border_1()
+                                                                                .border_color(border_color)
+                                                                                .shadow_md()
+                                                                                .rounded_md()
+                                                                                .py_1()
+                                                                                .gap_0()
+                                                                                .child(
+                                                                                    div().id("web-search").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
+                                                                                        .on_click({
+                                                                                            let state_model = state_model.clone();
+                                                                                            cx.listener(move |_, _, _, cx| {
+                                                                                                state_model.update(cx, |state, cx| state.select_app("Web search".to_string(), cx));
+                                                                                                cx.dispatch_action(&SelectAppWebSearch);
+                                                                                            })
+                                                                                        })
+                                                                                        .child(h_flex().gap_2().items_center()
+                                                                                            .child(svg().path("icons/web_search.svg").size(px(16.0)).text_color(inner_secondary_foreground))
+                                                                                            .child("Web search")
+                                                                                        )
+                                                                                )
+                                                                                .child(
+                                                                                    div().id("canvas").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
+                                                                                        .on_click({
+                                                                                            let state_model = state_model.clone();
+                                                                                            cx.listener(move |_, _, _, cx| {
+                                                                                                state_model.update(cx, |state, cx| state.select_app("Canvas".to_string(), cx));
+                                                                                                cx.dispatch_action(&SelectAppCanvas);
+                                                                                            })
+                                                                                        })
+                                                                                        .child(h_flex().gap_2().items_center()
+                                                                                            .child(svg().path("icons/canvas.svg").size(px(16.0)).text_color(inner_secondary_foreground))
+                                                                                            .child("Canvas")
+                                                                                        )
+                                                                                )
+                                                                                .child(
+                                                                                    div().id("canva").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
+                                                                                        .on_click({
+                                                                                            let state_model = state_model.clone();
+                                                                                            cx.listener(move |_, _, _, cx| {
+                                                                                                state_model.update(cx, |state, cx| state.select_app("Canva".to_string(), cx));
+                                                                                                cx.dispatch_action(&SelectAppCanva);
+                                                                                            })
+                                                                                        })
+                                                                                        .child(h_flex().gap_2().items_center()
+                                                                                            .child(svg().path("icons/canva.svg").size(px(16.0)).text_color(inner_secondary_foreground))
+                                                                                            .child("Canva")
+                                                                                        )
+                                                                                )
+                                                                                .child(
+                                                                                    div().id("coursera").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
+                                                                                        .on_click({
+                                                                                            let state_model = state_model.clone();
+                                                                                            cx.listener(move |_, _, _, cx| {
+                                                                                                state_model.update(cx, |state, cx| state.select_app("Coursera".to_string(), cx));
+                                                                                                cx.dispatch_action(&SelectAppCoursera);
+                                                                                            })
+                                                                                        })
+                                                                                        .child(h_flex().gap_2().items_center()
+                                                                                            .child(svg().path("icons/coursera.svg").size(px(16.0)).text_color(inner_secondary_foreground))
+                                                                                            .child("Coursera")
+                                                                                        )
+                                                                                )
+                                                                                .child(
+                                                                                    div().id("figma-more").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
+                                                                                        .on_click({
+                                                                                            let state_model = state_model.clone();
+                                                                                            cx.listener(move |_, _, _, cx| {
+                                                                                                state_model.update(cx, |state, cx| state.select_app("Figma".to_string(), cx));
+                                                                                                cx.dispatch_action(&SelectAppFigma);
+                                                                                            })
+                                                                                        })
+                                                                                        .child(h_flex().gap_2().items_center()
+                                                                                            .child(svg().path("icons/figma.svg").size(px(16.0)).text_color(inner_secondary_foreground))
+                                                                                            .child("Figma")
+                                                                                        )
+                                                                                )
+                                                                                .child(
+                                                                                    div().id("spotify").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
+                                                                                        .on_click({
+                                                                                            let state_model = state_model.clone();
+                                                                                            cx.listener(move |_, _, _, cx| {
+                                                                                                state_model.update(cx, |state, cx| state.select_app("Spotify".to_string(), cx));
+                                                                                                cx.dispatch_action(&SelectAppSpotify);
+                                                                                            })
+                                                                                        })
+                                                                                        .child(h_flex().gap_2().items_center()
+                                                                                            .child(svg().path("icons/spotify.svg").size(px(16.0)).text_color(inner_secondary_foreground))
+                                                                                            .child("Spotify")
+                                                                                        )
+                                                                                )
+                                                                        )
+                                                                    } else {
+                                                                        None
+                                                                    }
                                                                 )
-                                                        )
-                                                        .children(if state_model.read(cx).more_menu_open {
-                                                            Some(
-                                                                v_flex().gap_0()
-                                                                    .child(
-                                                                         div().id("web-search").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                             .on_click({
-                                                                                 let state_model = state_model.clone();
-                                                                                 cx.listener(move |_, _, _, cx| {
-                                                                                     state_model.update(cx, |state, cx| state.select_app("Web search".to_string(), cx));
-                                                                                     cx.dispatch_action(&SelectAppWebSearch);
-                                                                                 })
-                                                                             })
-                                                                             .child(h_flex().gap_2().items_center()
-                                                                                 .child(svg().path("icons/web_search.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                 .child("Web search")
-                                                                             )
-                                                                     )
-                                                                     .child(
-                                                                         div().id("canvas").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                             .on_click({
-                                                                                 let state_model = state_model.clone();
-                                                                                 cx.listener(move |_, _, _, cx| {
-                                                                                     state_model.update(cx, |state, cx| state.select_app("Canvas".to_string(), cx));
-                                                                                     cx.dispatch_action(&SelectAppCanvas);
-                                                                                 })
-                                                                             })
-                                                                             .child(h_flex().gap_2().items_center()
-                                                                                 .child(svg().path("icons/canvas.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                 .child("Canvas")
-                                                                             )
-                                                                     )
-                                                                     .child(
-                                                                         div().id("canva").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                             .on_click({
-                                                                                 let state_model = state_model.clone();
-                                                                                 cx.listener(move |_, _, _, cx| {
-                                                                                     state_model.update(cx, |state, cx| state.select_app("Canva".to_string(), cx));
-                                                                                     cx.dispatch_action(&SelectAppCanva);
-                                                                                 })
-                                                                             })
-                                                                             .child(h_flex().gap_2().items_center()
-                                                                                 .child(svg().path("icons/canva.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                 .child("Canva")
-                                                                             )
-                                                                     )
-                                                                     .child(
-                                                                         div().id("coursera").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                             .on_click({
-                                                                                 let state_model = state_model.clone();
-                                                                                 cx.listener(move |_, _, _, cx| {
-                                                                                     state_model.update(cx, |state, cx| state.select_app("Coursera".to_string(), cx));
-                                                                                     cx.dispatch_action(&SelectAppCoursera);
-                                                                                 })
-                                                                             })
-                                                                             .child(h_flex().gap_2().items_center()
-                                                                                 .child(svg().path("icons/coursera.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                 .child("Coursera")
-                                                                             )
-                                                                     )
-                                                                     .child(
-                                                                         div().id("figma-more").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                             .on_click({
-                                                                                 let state_model = state_model.clone();
-                                                                                 cx.listener(move |_, _, _, cx| {
-                                                                                     state_model.update(cx, |state, cx| state.select_app("Figma".to_string(), cx));
-                                                                                     cx.dispatch_action(&SelectAppFigma);
-                                                                                 })
-                                                                             })
-                                                                             .child(h_flex().gap_2().items_center()
-                                                                                 .child(svg().path("icons/figma.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                 .child("Figma")
-                                                                             )
-                                                                     )
-                                                                     .child(
-                                                                         div().id("spotify").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                             .on_click({
-                                                                                 let state_model = state_model.clone();
-                                                                                 cx.listener(move |_, _, _, cx| {
-                                                                                     state_model.update(cx, |state, cx| state.select_app("Spotify".to_string(), cx));
-                                                                                     cx.dispatch_action(&SelectAppSpotify);
-                                                                                 })
-                                                                             })
-                                                                             .child(h_flex().gap_2().items_center()
-                                                                                 .child(svg().path("icons/spotify.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                 .child("Spotify")
-                                                                             )
-                                                                     )
-                                                            )
-                                                        } else {
-                                                            None
-                                                        })
+                                                        })                                          )
+                                                }
+                                                })
                                                 )
-                                        }}),
-                                )
-                                .child(
-                                    // Tags Area (Middle)
-                                    div()
+                                    .child(
+                                        // Tags Area (Middle)
+                                        div()
                                         .flex()
                                         .flex_wrap()
                                         .gap_2()
@@ -437,7 +562,8 @@ impl Render for MessageInput {
                                                 ("Apps", mini_apps, "icons/plugins.svg"),
                                             ];
 
-                                            groups.into_iter().flat_map(|(group_name, apps, icon_path)| -> Box<dyn Iterator<Item = AnyElement>> {
+                                            let state_model = state_model.clone();
+                                            groups.into_iter().flat_map(move |(group_name, apps, icon_path)| -> Box<dyn Iterator<Item = AnyElement>> {
                                                 if apps.len() >= 2 {
                                                     let apps_clone = apps.clone();
                                                     let state_model = state_model.clone();
@@ -600,8 +726,8 @@ impl Render for MessageInput {
                                                 }
                                             })
                                         }),
-                                ),
-                        )
+                                )
+                                )
                         .child(
                             // Right: Action Icons
                             h_flex()
@@ -629,7 +755,7 @@ impl Render for MessageInput {
                                             .child(
                                                 Icon::new(IconName::Close)
                                                     .text_color(secondary_foreground),
-                                            ),
+                                            )
                                     )
                                     .child(
                                         div()
@@ -653,7 +779,7 @@ impl Render for MessageInput {
                                             .child(
                                                 Icon::new(IconName::Check)
                                                     .text_color(theme.background),
-                                            ),
+                                            )
                                     )
                                 })
                                 .when(!self.voice_mode, |this| {
@@ -737,10 +863,10 @@ impl Render for MessageInput {
                                                     Icon::new(IconName::ArrowUp)
                                                         .text_color(theme.background),
                                                 )
-                                        },
+                                        }
                                     )
-                                }),
-                        ),
+                                })
+                        )
                 )
                 .on_action({
                     let state = self.state.clone();
@@ -765,7 +891,7 @@ impl Render for MessageInput {
                     move |_: &SelectAppLinear, _, cx| {
                         state.update(cx, |state, cx| state.select_app("Linear".to_string(), cx));
                     }
-                }),
-        )
+                }))
+        
     }
 }

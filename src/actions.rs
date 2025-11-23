@@ -28,7 +28,6 @@ actions!(
         SelectAppThinking,
         SelectAppDeepResearch,
         SelectAppStudy,
-        ToggleMoreMenu,
         NewChat,
         Search,
         Library,

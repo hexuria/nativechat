@@ -296,11 +296,6 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn toggle_more_menu(&mut self, cx: &mut Context<Self>) {
-        self.more_menu_open = !self.more_menu_open;
-        cx.notify();
-    }
-
     pub fn toggle_account_settings(&mut self, cx: &mut Context<Self>) {
         self.is_account_settings_open = !self.is_account_settings_open;
         cx.notify();
