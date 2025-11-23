@@ -187,7 +187,11 @@ impl Render for MessageInput {
                                             }
                                         })
                                         .trigger(
-                                            Button::new("add-app").icon(IconName::Plus).ghost().rounded_full(),
+                                            Button::new("add-app")
+                                                .icon(IconName::Plus)
+                                                .ghost()
+                                                .rounded_full()
+                                                .cursor_pointer(),
                                         )
                                         .content({
                                             let state_model = state_model.clone();
