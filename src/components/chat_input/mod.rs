@@ -1,3 +1,7 @@
+mod items;
+
+pub use items::{render_flyout_item, render_popover_item};
+
 use crate::actions::{SelectAppCanva, SelectAppCanvas, SelectAppCoursera, SelectAppDeepResearch, SelectAppFigma, SelectAppImageGeneration, SelectAppLinear, SelectAppNotion, SelectAppPhotos, SelectAppSpotify, SelectAppStudy, SelectAppThinking, SelectAppWebSearch};
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
@@ -116,89 +120,6 @@ impl MessageInput {
             state.set_value(mock_text.to_string(), window, cx);
         });
     }
-}
-
-fn render_popover_item<V: 'static>(
-    id: &str,
-    icon: &str,
-    label: &str,
-    state_model: Entity<AppState>,
-    on_action: impl Fn(&mut Context<V>) + 'static,
-    cx: &mut Context<V>,
-) -> impl IntoElement {
-    let inner_theme = cx.theme();
-    let inner_secondary = inner_theme.secondary;
-    let inner_secondary_foreground = inner_theme.secondary_foreground;
-
-    div()
-        .id(SharedString::from(id.to_string()))
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .py_2()
-        .hover(move |s| s.bg(inner_secondary))
-        .cursor_pointer()
-        .on_hover({
-            let state_model = state_model.clone();
-            move |hovered, _, cx| {
-                if *hovered {
-                    let state_model = state_model.clone();
-                    cx.defer(move |cx| {
-                        state_model.update(cx, |state, cx| {
-                            if state.more_menu_open {
-                                state.more_menu_open = false;
-                                cx.notify();
-                            }
-                        });
-                    });
-                }
-            }
-        })
-        .on_click({
-            let state_model = state_model.clone();
-            let label = label.to_string();
-            cx.listener(move |_, _, _, cx| {
-                state_model.update(cx, |state, cx| state.select_app(label.clone(), cx));
-                on_action(cx);
-            })
-        })
-        .child(svg().path(SharedString::from(icon.to_string())).size(px(16.0)).text_color(inner_secondary_foreground))
-        .child(SharedString::from(label.to_string()))
-}
-
-fn render_flyout_item<V: 'static>(
-    id: &str,
-    icon: &str,
-    label: &str,
-    state_model: Entity<AppState>,
-    on_action: impl Fn(&mut Context<V>) + 'static,
-    cx: &mut Context<V>,
-) -> impl IntoElement {
-    let inner_theme = cx.theme();
-    let inner_secondary = inner_theme.secondary;
-    let inner_secondary_foreground = inner_theme.secondary_foreground;
-
-    div()
-        .id(SharedString::from(id.to_string()))
-        .px_3()
-        .py_2()
-        .hover(move |s| s.bg(inner_secondary))
-        .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, {
-            let state_model = state_model.clone();
-            let label = label.to_string();
-            cx.listener(move |_, _, _, cx| {
-                println!("{} mouse down in flyout", label);
-                state_model.update(cx, |state, cx| state.select_app(label.clone(), cx));
-                on_action(cx);
-            })
-        })
-        .child(h_flex().gap_2().items_center()
-            .child(svg().path(SharedString::from(icon.to_string())).size(px(16.0)).text_color(inner_secondary_foreground))
-            .child(SharedString::from(label.to_string()))
-        )
 }
 
 impl Render for MessageInput {
@@ -820,19 +741,6 @@ impl Render for MessageInput {
                 .on_action({
                     let state = self.state.clone();
                     move |_: &SelectAppPhotos, _, cx| {
-                        // "Add photos & files" might not be an "app" in the same sense, but let's handle it if it selects something
-                        // Based on UI, it might just be an action. But if it adds to "selected_apps", we handle it.
-                        // The UI shows "Add photos & files" as a menu item.
-                        // Let's assume it might add a tag or trigger file picker.
-                        // For now, I'll just log or do nothing if it's not a "selected app".
-                        // But wait, the user said "miniapps, skills, toolcalls".
-                        // "Web search" is one.
-                        // "Add photos" might be different.
-                        // Let's check the dispatch for SelectAppPhotos.
-                        // Line 226: cx.dispatch_action(&SelectAppPhotos);
-                        // And state update?
-                        // Line 225: state.select_app("Photos".to_string(), cx);
-                        // So yes, it adds "Photos".
                         state.update(cx, |state, cx| state.select_app("Photos".to_string(), cx));
                     }
                 })

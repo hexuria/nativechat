@@ -5,7 +5,7 @@ use nativechat::actions::{
     Zoom,
 };
 use nativechat::assets::CombinedAssets;
-use nativechat::components::input::SubmitMessage;
+use nativechat::components::chat_input::SubmitMessage;
 use nativechat::root::RootView;
 use nativechat::theme;
 

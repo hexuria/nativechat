@@ -1,4 +1,4 @@
-use crate::components::input::MessageInput;
+use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::state::AppState;
 use gpui::*;

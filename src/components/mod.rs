@@ -1,6 +1,6 @@
 pub mod chat;
+pub mod chat_input;
 pub mod circular_voice_viz;
-pub mod input;
 pub mod layout;
 pub mod message;
 pub mod message_actions;
