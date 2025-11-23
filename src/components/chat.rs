@@ -3,13 +3,7 @@ use crate::components::message::MessageBubble;
 use crate::state::AppState;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, IconName, StyledExt,
-    avatar::Avatar,
-    button::{Button, ButtonVariants},
-    h_flex,
-    label::Label,
-    scroll::ScrollbarAxis,
-    v_flex,
+    ActiveTheme, StyledExt, avatar::Avatar, h_flex, label::Label, scroll::ScrollbarAxis, v_flex,
 };
 
 pub struct ChatView {
@@ -113,26 +107,7 @@ impl Render for ChatView {
                                     .child(Label::new(title)),
                             )
                             .child(
-                                Button::new("theme-toggle")
-                                    .icon(match self.state.read(cx).theme_mode.as_str() {
-                                        "light" => IconName::Moon,
-                                        "dark" => IconName::Settings,
-                                        _ => IconName::Sun,
-                                    })
-                                    .ghost()
-                                    .tooltip(match self.state.read(cx).theme_mode.as_str() {
-                                        "light" => "Switch to Dark theme",
-                                        "dark" => "Switch to System theme",
-                                        _ => "Switch to Light theme",
-                                    })
-                                    .on_click({
-                                        let app_state = self.state.clone();
-                                        cx.listener(move |_, _, _, cx| {
-                                            app_state.update(cx, |state, cx| {
-                                                state.toggle_theme(cx);
-                                            });
-                                        })
-                                    }),
+                                h_flex().gap_2().items_center(), // Add other header actions here if needed
                             ),
                     ),
             )

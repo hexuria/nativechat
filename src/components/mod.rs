@@ -1,9 +1,10 @@
 pub mod chat;
+pub mod circular_voice_viz;
 pub mod input;
 pub mod layout;
 pub mod message;
 pub mod message_actions;
+pub mod modals;
 pub mod sidebar;
 pub mod voice_mode_modal;
 pub mod voice_wave;
-pub mod circular_voice_viz;

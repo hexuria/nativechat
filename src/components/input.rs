@@ -173,8 +173,9 @@ impl Render for MessageInput {
                                         .trigger(
                                             Button::new("add-app").icon(IconName::Plus).ghost().rounded_full(),
                                         )
-                                        .content(move |_, _, cx| {
+                                        .content({
                                             let state_model = state_model.clone();
+                                            move |_, _, cx| {
                                             let inner_theme = cx.theme();
                                             let inner_secondary = inner_theme.secondary;
                                             let inner_secondary_foreground = inner_theme.secondary_foreground;
@@ -414,7 +415,7 @@ impl Render for MessageInput {
                                                             None
                                                         })
                                                 )
-                                        }),
+                                        }}),
                                 )
                                 .child(
                                     // Tags Area (Middle)
@@ -422,67 +423,183 @@ impl Render for MessageInput {
                                         .flex()
                                         .flex_wrap()
                                         .gap_2()
-                                        .children(
-                                        selected_apps.iter().enumerate().map(|(i, app)| {
-                                            let app_name = app.clone();
-                                            let icon_path = match app_name.as_str() {
-                                                "Photos" => "icons/clip.svg",
-                                                "Image Generation" => "icons/create_image.svg",
-                                                "Thinking" => "icons/thinking.svg",
-                                                "Deep Research" => "icons/deep_search.svg",
-                                                "Study" => "icons/study.svg",
-                                                "Web search" => "icons/web_search.svg",
-                                                "Canvas" => "icons/canvas.svg",
-                                                "Canva" => "icons/canva.svg",
-                                                "Coursera" => "icons/coursera.svg",
-                                                "Figma" => "icons/figma.svg",
-                                                "Spotify" => "icons/spotify.svg",
-                                                _ => "icons/clip.svg",
-                                            };
+                                        .children({
+                                            let (tool_calls, rest): (Vec<_>, Vec<_>) = selected_apps.iter()
+                                                .cloned()
+                                                .partition(|app| matches!(app.as_str(), "Web search" | "Deep Research" | "Image Generation" | "Photos" | "Thinking"));
 
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .bg(theme.secondary)
-                                                .rounded_md()
-                                                .px_2()
-                                                .py_1()
-                                                .child(
-                                                    svg()
-                                                        .path(icon_path)
-                                                        .size(px(12.0))
-                                                        .text_color(secondary_foreground)
-                                                )
-                                                .child(
-                                                    div()
-                                                        .child(app_name.clone())
-                                                        .text_size(px(12.0)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(("remove-app", i))
-                                                        .cursor_pointer()
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.state.update(
-                                                                    cx,
-                                                                    |state, cx| {
-                                                                        state.remove_app(
-                                                                            app_name.clone(),
-                                                                            cx,
-                                                                        );
-                                                                    },
-                                                                );
-                                                            },
-                                                        ))
-                                                        .child(
-                                                            Icon::new(IconName::Close)
-                                                                .size(px(14.0)),
-                                                        ),
-                                                )
+                                            let (skills, mini_apps): (Vec<_>, Vec<_>) = rest.into_iter()
+                                                .partition(|app| matches!(app.as_str(), "Study" | "Canvas"));
+
+                                            let groups = vec![
+                                                ("Tools", tool_calls, "icons/wrench.svg"),
+                                                ("Skills", skills, "icons/wizard_hat.svg"),
+                                                ("Apps", mini_apps, "icons/plugins.svg"),
+                                            ];
+
+                                            groups.into_iter().flat_map(|(group_name, apps, icon_path)| -> Box<dyn Iterator<Item = AnyElement>> {
+                                                if apps.len() >= 2 {
+                                                    let apps_clone = apps.clone();
+                                                    let state_model = state_model.clone();
+                                                    let group_name = group_name.to_string();
+                                                    let icon_path = icon_path.to_string();
+                                                    
+                                                    Box::new(std::iter::once(
+                                                        Popover::new(SharedString::from(format!("aggregated-{}-popover", group_name.to_lowercase())))
+                                                            .anchor(gpui::Corner::BottomLeft)
+                                                            .trigger(
+                                                                Button::new(SharedString::from(format!("aggregated-{}-btn", group_name.to_lowercase())))
+                                                                    .ghost()
+                                                                    .bg(secondary)
+                                                                    .rounded_md()
+                                                                    .px_2()
+                                                                    .py_1()
+                                                                    .child(
+                                                                        h_flex()
+                                                                            .gap_1()
+                                                                            .items_center()
+                                                                            .child(
+                                                                                svg()
+                                                                                    .path(icon_path.clone())
+                                                                                    .size(px(12.0))
+                                                                                    .text_color(secondary_foreground)
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .child(format!("{} {}", apps.len(), group_name.to_lowercase()))
+                                                                                    .text_size(px(12.0)),
+                                                                            )
+                                                                            .child(
+                                                                                Icon::new(IconName::ChevronDown)
+                                                                                    .size(px(12.0))
+                                                                                    .text_color(secondary_foreground)
+                                                                            )
+                                                                    )
+                                                            )
+                                                            .content(move |_, _, cx| {
+                                                                let theme = cx.theme();
+                                                                v_flex()
+                                                                    .w(px(200.0))
+                                                                    .p_1()
+                                                                    .gap_1()
+                                                                    .children(
+                                                                        apps_clone.iter().enumerate().map(|(i, app)| {
+                                                                            let app_name = app.clone();
+                                                                            let icon_path = match app_name.as_str() {
+                                                                                "Image Generation" => "icons/create_image.svg",
+                                                                                "Thinking" => "icons/thinking.svg",
+                                                                                "Deep Research" => "icons/deep_search.svg",
+                                                                                "Study" => "icons/study.svg",
+                                                                                "Web search" => "icons/web_search.svg",
+                                                                                "Canvas" => "icons/canvas.svg",
+                                                                                "Canva" => "icons/canva.svg",
+                                                                                "Coursera" => "icons/coursera.svg",
+                                                                                "Figma" => "icons/figma.svg",
+                                                                                "Spotify" => "icons/spotify.svg",
+                                                                                _ => "icons/clip.svg",
+                                                                            };
+
+                                                                            h_flex()
+                                                                                .gap_2()
+                                                                                .items_center()
+                                                                                .px_2()
+                                                                                .py_1()
+                                                                                .rounded_sm()
+                                                                                .hover(move |s| s.bg(theme.secondary))
+                                                                                .cursor_pointer()
+                                                                                .id(SharedString::from(format!("remove-{}-aggregated-{}", group_name.to_lowercase(), i)))
+                                                                                .on_click({
+                                                                                    let state_model = state_model.clone();
+                                                                                    move |_event, _window, cx| {
+                                                                                        state_model.update(cx, |state, cx| {
+                                                                                            state.remove_app(app_name.clone(), cx);
+                                                                                        });
+                                                                                    }
+                                                                                })
+                                                                                .child(
+                                                                                    svg()
+                                                                                        .path(icon_path)
+                                                                                        .size(px(12.0))
+                                                                                        .text_color(theme.secondary_foreground)
+                                                                                )
+                                                                                .child(
+                                                                                    div()
+                                                                                        .child(app.clone())
+                                                                                        .text_size(px(12.0))
+                                                                                )
+                                                                                .child(
+                                                                                    div().flex_grow() // Spacer
+                                                                                )
+                                                                                .child(
+                                                                                    Icon::new(IconName::Close)
+                                                                                        .size(px(12.0))
+                                                                                        .text_color(theme.secondary_foreground)
+                                                                                )
+                                                                        })
+                                                                    )
+                                                            })
+                                                            .into_any_element()
+                                                    ))
+                                                } else {
+                                                    // Render individual tags
+                                                    let state_model = state_model.clone();
+                                                    Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
+                                                            let app_name = app.clone();
+                                                            let icon_path = match app_name.as_str() {
+                                                                "Image Generation" => "icons/create_image.svg",
+                                                                "Thinking" => "icons/thinking.svg",
+                                                                "Deep Research" => "icons/deep_search.svg",
+                                                                "Study" => "icons/study.svg",
+                                                                "Web search" => "icons/web_search.svg",
+                                                                "Canvas" => "icons/canvas.svg",
+                                                                "Canva" => "icons/canva.svg",
+                                                                "Coursera" => "icons/coursera.svg",
+                                                                "Figma" => "icons/figma.svg",
+                                                                "Spotify" => "icons/spotify.svg",
+                                                                _ => "icons/clip.svg",
+                                                            };
+
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap_1()
+                                                                .bg(secondary)
+                                                                .rounded_md()
+                                                                .px_2()
+                                                                .py_1()
+                                                                .child(
+                                                                    svg()
+                                                                        .path(icon_path)
+                                                                        .size(px(12.0))
+                                                                        .text_color(secondary_foreground)
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .child(app_name.clone())
+                                                                        .text_size(px(12.0)),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .id(SharedString::from(format!("remove-{}-{}", app_name.to_lowercase(), i)))
+                                                                        .cursor_pointer()
+                                                                        .on_click({
+                                                                            let state_model = state_model.clone();
+                                                                            move |_event, _window, cx| {
+                                                                                state_model.update(cx, |state, cx| {
+                                                                                    state.remove_app(app_name.clone(), cx);
+                                                                                });
+                                                                            }
+                                                                        })
+                                                                        .child(
+                                                                            Icon::new(IconName::Close)
+                                                                                .size(px(14.0)),
+                                                                        ),
+                                                                )
+                                                                .into_any_element()
+                                                        }))
+                                                }
+                                            })
                                         }),
-                                    ),
                                 ),
                         )
                         .child(

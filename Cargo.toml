@@ -25,6 +25,6 @@ log = "0.4"
 name = "NativeChat"
 identifier = "com.example.nativechat"
 short_description = "A native chat application."
-resources = ["themes/"]
+resources = ["themes/", "assets/"]
 macOS_entitlements_path = "./nativechat.entitlements"
 NSMicrophoneUsageDescription = "NativeChat needs access to your microphone for voice input."

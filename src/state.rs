@@ -86,6 +86,8 @@ pub struct AppState {
     pub is_voice_muted: bool,
     pub voice_status: VoiceStatus,
     pub more_menu_open: bool,
+    pub is_account_settings_open: bool,
+    pub is_profile_settings_open: bool,
     pub audio_input: Option<AudioInput>,
     pub gemini_client: Option<GeminiLiveClient>,
     pub profiles: Vec<Profile>,
@@ -168,6 +170,8 @@ impl AppState {
             is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
+            is_account_settings_open: false,
+            is_profile_settings_open: false,
             audio_input: None,
             gemini_client: None,
             profiles,
@@ -294,6 +298,16 @@ impl AppState {
 
     pub fn toggle_more_menu(&mut self, cx: &mut Context<Self>) {
         self.more_menu_open = !self.more_menu_open;
+        cx.notify();
+    }
+
+    pub fn toggle_account_settings(&mut self, cx: &mut Context<Self>) {
+        self.is_account_settings_open = !self.is_account_settings_open;
+        cx.notify();
+    }
+
+    pub fn toggle_profile_settings(&mut self, cx: &mut Context<Self>) {
+        self.is_profile_settings_open = !self.is_profile_settings_open;
         cx.notify();
     }
 

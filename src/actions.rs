@@ -28,6 +28,13 @@ actions!(
         SelectAppThinking,
         SelectAppDeepResearch,
         SelectAppStudy,
-        ToggleMoreMenu
+        ToggleMoreMenu,
+        NewChat,
+        Search,
+        Library,
+        Projects,
+        OpenAccountSettings,
+        OpenProfileSettings,
+        SignOut
     ]
 );

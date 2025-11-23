@@ -44,6 +44,7 @@ fn themes_path() -> PathBuf {
 pub fn init(cx: &mut App) {
     let theme_name = SharedString::from("macOS Classic Light");
     let themes_path = themes_path();
+    println!("[THEME] Loading themes from: {:?}", themes_path);
 
     if let Err(err) = ThemeRegistry::watch_dir(themes_path, cx, move |cx| {
         if let Some(theme) = ThemeRegistry::global(cx).themes().get(&theme_name).cloned() {
