@@ -120,6 +120,7 @@ impl MessageInput {
 
 impl Render for MessageInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        println!("MessageInput::render called");
         let theme = cx.theme();
         let secondary = theme.secondary;
         let secondary_foreground = theme.secondary_foreground;
@@ -451,9 +452,10 @@ impl Render for MessageInput {
                                                                                 .gap_0()
                                                                                 .child(
                                                                                     div().id("web-search").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_click({
+                                                                                        .on_mouse_down(MouseButton::Left, {
                                                                                             let state_model = state_model.clone();
                                                                                             cx.listener(move |_, _, _, cx| {
+                                                                                                println!("Web search mouse down in flyout");
                                                                                                 state_model.update(cx, |state, cx| state.select_app("Web search".to_string(), cx));
                                                                                                 cx.dispatch_action(&SelectAppWebSearch);
                                                                                             })
@@ -465,9 +467,10 @@ impl Render for MessageInput {
                                                                                 )
                                                                                 .child(
                                                                                     div().id("canvas").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_click({
+                                                                                        .on_mouse_down(MouseButton::Left, {
                                                                                             let state_model = state_model.clone();
                                                                                             cx.listener(move |_, _, _, cx| {
+                                                                                                println!("Canvas mouse down in flyout");
                                                                                                 state_model.update(cx, |state, cx| state.select_app("Canvas".to_string(), cx));
                                                                                                 cx.dispatch_action(&SelectAppCanvas);
                                                                                             })
@@ -479,9 +482,10 @@ impl Render for MessageInput {
                                                                                 )
                                                                                 .child(
                                                                                     div().id("canva").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_click({
+                                                                                        .on_mouse_down(MouseButton::Left, {
                                                                                             let state_model = state_model.clone();
                                                                                             cx.listener(move |_, _, _, cx| {
+                                                                                                println!("Canva mouse down in flyout");
                                                                                                 state_model.update(cx, |state, cx| state.select_app("Canva".to_string(), cx));
                                                                                                 cx.dispatch_action(&SelectAppCanva);
                                                                                             })
@@ -493,9 +497,10 @@ impl Render for MessageInput {
                                                                                 )
                                                                                 .child(
                                                                                     div().id("coursera").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_click({
+                                                                                        .on_mouse_down(MouseButton::Left, {
                                                                                             let state_model = state_model.clone();
                                                                                             cx.listener(move |_, _, _, cx| {
+                                                                                                println!("Coursera mouse down in flyout");
                                                                                                 state_model.update(cx, |state, cx| state.select_app("Coursera".to_string(), cx));
                                                                                                 cx.dispatch_action(&SelectAppCoursera);
                                                                                             })
@@ -507,9 +512,10 @@ impl Render for MessageInput {
                                                                                 )
                                                                                 .child(
                                                                                     div().id("figma-more").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_click({
+                                                                                        .on_mouse_down(MouseButton::Left, {
                                                                                             let state_model = state_model.clone();
                                                                                             cx.listener(move |_, _, _, cx| {
+                                                                                                println!("Figma mouse down in flyout");
                                                                                                 state_model.update(cx, |state, cx| state.select_app("Figma".to_string(), cx));
                                                                                                 cx.dispatch_action(&SelectAppFigma);
                                                                                             })
@@ -521,9 +527,10 @@ impl Render for MessageInput {
                                                                                 )
                                                                                 .child(
                                                                                     div().id("spotify").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_click({
+                                                                                        .on_mouse_down(MouseButton::Left, {
                                                                                             let state_model = state_model.clone();
                                                                                             cx.listener(move |_, _, _, cx| {
+                                                                                                println!("Spotify mouse down in flyout");
                                                                                                 state_model.update(cx, |state, cx| state.select_app("Spotify".to_string(), cx));
                                                                                                 cx.dispatch_action(&SelectAppSpotify);
                                                                                             })
@@ -890,6 +897,74 @@ impl Render for MessageInput {
                     let state = self.state.clone();
                     move |_: &SelectAppLinear, _, cx| {
                         state.update(cx, |state, cx| state.select_app("Linear".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppWebSearch, _, cx| {
+                        println!("Action SelectAppWebSearch received");
+                        state.update(cx, |state, cx| state.select_app("Web search".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppCanvas, _, cx| {
+                        state.update(cx, |state, cx| state.select_app("Canvas".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppCoursera, _, cx| {
+                        state.update(cx, |state, cx| state.select_app("Coursera".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppSpotify, _, cx| {
+                        state.update(cx, |state, cx| state.select_app("Spotify".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppPhotos, _, cx| {
+                        // "Add photos & files" might not be an "app" in the same sense, but let's handle it if it selects something
+                        // Based on UI, it might just be an action. But if it adds to "selected_apps", we handle it.
+                        // The UI shows "Add photos & files" as a menu item.
+                        // Let's assume it might add a tag or trigger file picker.
+                        // For now, I'll just log or do nothing if it's not a "selected app".
+                        // But wait, the user said "miniapps, skills, toolcalls".
+                        // "Web search" is one.
+                        // "Add photos" might be different.
+                        // Let's check the dispatch for SelectAppPhotos.
+                        // Line 226: cx.dispatch_action(&SelectAppPhotos);
+                        // And state update?
+                        // Line 225: state.select_app("Photos".to_string(), cx);
+                        // So yes, it adds "Photos".
+                        state.update(cx, |state, cx| state.select_app("Photos".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppImageGeneration, _, cx| {
+                        state.update(cx, |state, cx| state.select_app("Image Generation".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppThinking, _, cx| {
+                        state.update(cx, |state, cx| state.select_app("Thinking".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppDeepResearch, _, cx| {
+                        state.update(cx, |state, cx| state.select_app("Deep Research".to_string(), cx));
+                    }
+                })
+                .on_action({
+                    let state = self.state.clone();
+                    move |_: &SelectAppStudy, _, cx| {
+                        state.update(cx, |state, cx| state.select_app("Study".to_string(), cx));
                     }
                 }))
         

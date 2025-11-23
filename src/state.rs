@@ -194,9 +194,13 @@ impl AppState {
     }
 
     pub fn select_app(&mut self, app_name: String, cx: &mut Context<Self>) {
+        println!("State: select_app called for {}", app_name);
         if !self.selected_apps.contains(&app_name) {
+            println!("State: Adding {} to selected_apps", app_name);
             self.selected_apps.push(app_name);
             cx.notify();
+        } else {
+            println!("State: {} already selected", app_name);
         }
     }
 
