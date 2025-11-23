@@ -28,6 +28,16 @@ pub fn render_voice_mode_modal<V: 'static>(
     div()
         .absolute()
         .inset_0()
+        // Prevent clicks from passing through to elements behind the modal
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down(MouseButton::Middle, |_, _, cx| {
+            cx.stop_propagation();
+        })
         // 1. Visualizer (Background + Grid + Gauge) - Full Screen
         .child(div().absolute().inset_0().child(circular_viz))
         // 2. UI Overlay

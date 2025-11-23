@@ -1,7 +1,9 @@
 use crate::state::AppState;
 use gpui::InteractiveElement;
 use gpui::prelude::*;
-use gpui::{Context, Entity, FontWeight, IntoElement, Render, Styled, Window, div, px};
+use gpui::{
+    Context, Entity, FontWeight, IntoElement, MouseButton, Render, Styled, Window, div, px,
+};
 use gpui_component::{
     ActiveTheme, Icon, IconName,
     button::Button,
@@ -151,6 +153,16 @@ impl Render for AccountSettingsModal {
             .absolute()
             .inset_0()
             .bg(gpui::black().opacity(0.5)) // Overlay
+            // Prevent clicks from passing through to elements behind the modal
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Middle, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .flex()
             .items_center()
             .justify_center()
