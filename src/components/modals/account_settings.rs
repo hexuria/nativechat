@@ -4,7 +4,7 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, FontWeight, IntoElement, Render, Styled, Window, div, px};
 use gpui_component::{
     ActiveTheme, Icon, IconName,
-    button::{Button, ButtonVariants},
+    button::Button,
     input::{Input, InputState},
 };
 

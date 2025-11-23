@@ -118,6 +118,89 @@ impl MessageInput {
     }
 }
 
+fn render_popover_item<V: 'static>(
+    id: &str,
+    icon: &str,
+    label: &str,
+    state_model: Entity<AppState>,
+    on_action: impl Fn(&mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> impl IntoElement {
+    let inner_theme = cx.theme();
+    let inner_secondary = inner_theme.secondary;
+    let inner_secondary_foreground = inner_theme.secondary_foreground;
+
+    div()
+        .id(SharedString::from(id.to_string()))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .hover(move |s| s.bg(inner_secondary))
+        .cursor_pointer()
+        .on_hover({
+            let state_model = state_model.clone();
+            move |hovered, _, cx| {
+                if *hovered {
+                    let state_model = state_model.clone();
+                    cx.defer(move |cx| {
+                        state_model.update(cx, |state, cx| {
+                            if state.more_menu_open {
+                                state.more_menu_open = false;
+                                cx.notify();
+                            }
+                        });
+                    });
+                }
+            }
+        })
+        .on_click({
+            let state_model = state_model.clone();
+            let label = label.to_string();
+            cx.listener(move |_, _, _, cx| {
+                state_model.update(cx, |state, cx| state.select_app(label.clone(), cx));
+                on_action(cx);
+            })
+        })
+        .child(svg().path(SharedString::from(icon.to_string())).size(px(16.0)).text_color(inner_secondary_foreground))
+        .child(SharedString::from(label.to_string()))
+}
+
+fn render_flyout_item<V: 'static>(
+    id: &str,
+    icon: &str,
+    label: &str,
+    state_model: Entity<AppState>,
+    on_action: impl Fn(&mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> impl IntoElement {
+    let inner_theme = cx.theme();
+    let inner_secondary = inner_theme.secondary;
+    let inner_secondary_foreground = inner_theme.secondary_foreground;
+
+    div()
+        .id(SharedString::from(id.to_string()))
+        .px_3()
+        .py_2()
+        .hover(move |s| s.bg(inner_secondary))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, {
+            let state_model = state_model.clone();
+            let label = label.to_string();
+            cx.listener(move |_, _, _, cx| {
+                println!("{} mouse down in flyout", label);
+                state_model.update(cx, |state, cx| state.select_app(label.clone(), cx));
+                on_action(cx);
+            })
+        })
+        .child(h_flex().gap_2().items_center()
+            .child(svg().path(SharedString::from(icon.to_string())).size(px(16.0)).text_color(inner_secondary_foreground))
+            .child(SharedString::from(label.to_string()))
+        )
+}
+
 impl Render for MessageInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         println!("MessageInput::render called");
@@ -188,9 +271,6 @@ impl Render for MessageInput {
                                         .content({
                                             let state_model = state_model.clone();
                                             move |_, _, cx| {
-                                            let inner_theme = cx.theme();
-                                            let inner_secondary = inner_theme.secondary;
-                                            let inner_secondary_foreground = inner_theme.secondary_foreground;
                                             
                                             v_flex()
                                                 .w(px(300.0)) // Wider popover
@@ -201,191 +281,46 @@ impl Render for MessageInput {
                                                 .child(
                                                     // Helper for menu items
                                                     v_flex().gap_0() // No gap
-                                                        .child(
-                                                            div()
-                                                                .id("add-photos")
-                                                                .w_full()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .px_3() // Padding inside item
-                                                                .py_2()
-                                                                .hover(move |s| s.bg(inner_secondary))
-                                                                .cursor_pointer()
-                                                                .on_hover({
-                                                                    let state_model = state_model.clone();
-                                                                    move |hovered, _, cx| {
-                                                                        if *hovered {
-                                                                            let state_model = state_model.clone();
-                                                                            cx.defer(move |cx| {
-                                                                                state_model.update(cx, |state, cx| {
-                                                                                    if state.more_menu_open {
-                                                                                        state.more_menu_open = false;
-                                                                                        cx.notify();
-                                                                                    }
-                                                                                });
-                                                                            });
-                                                                        }
-                                                                    }
-                                                                })
-                                                                .on_click({
-                                                                    let state_model = state_model.clone();
-                                                                    cx.listener(move |_, _, _, cx| {
-                                                                        state_model.update(cx, |state, cx| state.select_app("Photos".to_string(), cx));
-                                                                        cx.dispatch_action(&SelectAppPhotos);
-                                                                    })
-                                                                })
-                                                                .child(svg().path("icons/clip.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                .child("Add photos & files"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id("create-image")
-                                                                .w_full()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .px_3()
-                                                                .py_2()
-                                                                .hover(move |s| s.bg(inner_secondary))
-                                                                .cursor_pointer()
-                                                                .on_hover({
-                                                                    let state_model = state_model.clone();
-                                                                    move |hovered, _, cx| {
-                                                                        if *hovered {
-                                                                            let state_model = state_model.clone();
-                                                                            cx.defer(move |cx| {
-                                                                                state_model.update(cx, |state, cx| {
-                                                                                    if state.more_menu_open {
-                                                                                        state.more_menu_open = false;
-                                                                                        cx.notify();
-                                                                                    }
-                                                                                });
-                                                                            });
-                                                                        }
-                                                                    }
-                                                                })
-                                                                .on_click({
-                                                                    let state_model = state_model.clone();
-                                                                    cx.listener(move |_, _, _, cx| {
-                                                                        state_model.update(cx, |state, cx| state.select_app("Image Generation".to_string(), cx));
-                                                                        cx.dispatch_action(&SelectAppImageGeneration);
-                                                                    })
-                                                                })
-                                                                .child(svg().path("icons/create_image.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                .child("Create image"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id("thinking")
-                                                                .w_full()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .px_3()
-                                                                .py_2()
-                                                                .hover(move |s| s.bg(inner_secondary))
-                                                                .cursor_pointer()
-                                                                .on_hover({
-                                                                    let state_model = state_model.clone();
-                                                                    move |hovered, _, cx| {
-                                                                        if *hovered {
-                                                                            let state_model = state_model.clone();
-                                                                            cx.defer(move |cx| {
-                                                                                state_model.update(cx, |state, cx| {
-                                                                                    if state.more_menu_open {
-                                                                                        state.more_menu_open = false;
-                                                                                        cx.notify();
-                                                                                    }
-                                                                                });
-                                                                            });
-                                                                        }
-                                                                    }
-                                                                })
-                                                                .on_click({
-                                                                    let state_model = state_model.clone();
-                                                                    cx.listener(move |_, _, _, cx| {
-                                                                        state_model.update(cx, |state, cx| state.select_app("Thinking".to_string(), cx));
-                                                                        cx.dispatch_action(&SelectAppThinking);
-                                                                    })
-                                                                })
-                                                                .child(svg().path("icons/thinking.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                .child("Thinking"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id("deep-search")
-                                                                .w_full()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .px_3()
-                                                                .py_2()
-                                                                .hover(move |s| s.bg(inner_secondary))
-                                                                .cursor_pointer()
-                                                                .on_hover({
-                                                                    let state_model = state_model.clone();
-                                                                    move |hovered, _, cx| {
-                                                                        if *hovered {
-                                                                            let state_model = state_model.clone();
-                                                                            cx.defer(move |cx| {
-                                                                                state_model.update(cx, |state, cx| {
-                                                                                    if state.more_menu_open {
-                                                                                        state.more_menu_open = false;
-                                                                                        cx.notify();
-                                                                                    }
-                                                                                });
-                                                                            });
-                                                                        }
-                                                                    }
-                                                                })
-                                                                .on_click({
-                                                                    let state_model = state_model.clone();
-                                                                    cx.listener(move |_, _, _, cx| {
-                                                                        state_model.update(cx, |state, cx| state.select_app("Deep Research".to_string(), cx));
-                                                                        cx.dispatch_action(&SelectAppDeepResearch);
-                                                                    })
-                                                                })
-                                                                .child(svg().path("icons/deep_search.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                .child("Deep research"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id("study")
-                                                                .w_full()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .px_3()
-                                                                .py_2()
-                                                                .hover(move |s| s.bg(inner_secondary))
-                                                                .cursor_pointer()
-                                                                .on_hover({
-                                                                    let state_model = state_model.clone();
-                                                                    move |hovered, _, cx| {
-                                                                        if *hovered {
-                                                                            let state_model = state_model.clone();
-                                                                            cx.defer(move |cx| {
-                                                                                state_model.update(cx, |state, cx| {
-                                                                                    if state.more_menu_open {
-                                                                                        state.more_menu_open = false;
-                                                                                        cx.notify();
-                                                                                    }
-                                                                                });
-                                                                            });
-                                                                        }
-                                                                    }
-                                                                })
-                                                                .on_click({
-                                                                    let state_model = state_model.clone();
-                                                                    cx.listener(move |_, _, _, cx| {
-                                                                        state_model.update(cx, |state, cx| state.select_app("Study".to_string(), cx));
-                                                                        cx.dispatch_action(&SelectAppStudy);
-                                                                    })
-                                                                })
-                                                                .child(svg().path("icons/study.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                .child("Study and learn"),
-                                                        )
+                                                        .child(render_popover_item(
+                                                            "add-photos",
+                                                            "icons/clip.svg",
+                                                            "Add photos & files", // Label
+                                                            state_model.clone(),
+                                                            |cx| cx.dispatch_action(&SelectAppPhotos),
+                                                            cx,
+                                                        ))
+                                                        .child(render_popover_item(
+                                                            "create-image",
+                                                            "icons/create_image.svg",
+                                                            "Image Generation", // Matches select_app name
+                                                            state_model.clone(),
+                                                            |cx| cx.dispatch_action(&SelectAppImageGeneration),
+                                                            cx,
+                                                        ))
+                                                        .child(render_popover_item(
+                                                            "thinking",
+                                                            "icons/thinking.svg",
+                                                            "Thinking",
+                                                            state_model.clone(),
+                                                            |cx| cx.dispatch_action(&SelectAppThinking),
+                                                            cx,
+                                                        ))
+                                                        .child(render_popover_item(
+                                                            "deep-search",
+                                                            "icons/deep_search.svg",
+                                                            "Deep Research",
+                                                            state_model.clone(),
+                                                            |cx| cx.dispatch_action(&SelectAppDeepResearch),
+                                                            cx,
+                                                        ))
+                                                        .child(render_popover_item(
+                                                            "study",
+                                                            "icons/study.svg",
+                                                            "Study",
+                                                            state_model.clone(),
+                                                            |cx| cx.dispatch_action(&SelectAppStudy),
+                                                            cx,
+                                                        ))
                                                         .child({
                                                             let state_model = state_model.clone();
                                                             let inner_theme = cx.theme();
@@ -450,96 +385,54 @@ impl Render for MessageInput {
                                                                                 .rounded_md()
                                                                                 .py_1()
                                                                                 .gap_0()
-                                                                                .child(
-                                                                                    div().id("web-search").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_mouse_down(MouseButton::Left, {
-                                                                                            let state_model = state_model.clone();
-                                                                                            cx.listener(move |_, _, _, cx| {
-                                                                                                println!("Web search mouse down in flyout");
-                                                                                                state_model.update(cx, |state, cx| state.select_app("Web search".to_string(), cx));
-                                                                                                cx.dispatch_action(&SelectAppWebSearch);
-                                                                                            })
-                                                                                        })
-                                                                                        .child(h_flex().gap_2().items_center()
-                                                                                            .child(svg().path("icons/web_search.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                            .child("Web search")
-                                                                                        )
-                                                                                )
-                                                                                .child(
-                                                                                    div().id("canvas").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_mouse_down(MouseButton::Left, {
-                                                                                            let state_model = state_model.clone();
-                                                                                            cx.listener(move |_, _, _, cx| {
-                                                                                                println!("Canvas mouse down in flyout");
-                                                                                                state_model.update(cx, |state, cx| state.select_app("Canvas".to_string(), cx));
-                                                                                                cx.dispatch_action(&SelectAppCanvas);
-                                                                                            })
-                                                                                        })
-                                                                                        .child(h_flex().gap_2().items_center()
-                                                                                            .child(svg().path("icons/canvas.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                            .child("Canvas")
-                                                                                        )
-                                                                                )
-                                                                                .child(
-                                                                                    div().id("canva").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_mouse_down(MouseButton::Left, {
-                                                                                            let state_model = state_model.clone();
-                                                                                            cx.listener(move |_, _, _, cx| {
-                                                                                                println!("Canva mouse down in flyout");
-                                                                                                state_model.update(cx, |state, cx| state.select_app("Canva".to_string(), cx));
-                                                                                                cx.dispatch_action(&SelectAppCanva);
-                                                                                            })
-                                                                                        })
-                                                                                        .child(h_flex().gap_2().items_center()
-                                                                                            .child(svg().path("icons/canva.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                            .child("Canva")
-                                                                                        )
-                                                                                )
-                                                                                .child(
-                                                                                    div().id("coursera").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_mouse_down(MouseButton::Left, {
-                                                                                            let state_model = state_model.clone();
-                                                                                            cx.listener(move |_, _, _, cx| {
-                                                                                                println!("Coursera mouse down in flyout");
-                                                                                                state_model.update(cx, |state, cx| state.select_app("Coursera".to_string(), cx));
-                                                                                                cx.dispatch_action(&SelectAppCoursera);
-                                                                                            })
-                                                                                        })
-                                                                                        .child(h_flex().gap_2().items_center()
-                                                                                            .child(svg().path("icons/coursera.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                            .child("Coursera")
-                                                                                        )
-                                                                                )
-                                                                                .child(
-                                                                                    div().id("figma-more").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_mouse_down(MouseButton::Left, {
-                                                                                            let state_model = state_model.clone();
-                                                                                            cx.listener(move |_, _, _, cx| {
-                                                                                                println!("Figma mouse down in flyout");
-                                                                                                state_model.update(cx, |state, cx| state.select_app("Figma".to_string(), cx));
-                                                                                                cx.dispatch_action(&SelectAppFigma);
-                                                                                            })
-                                                                                        })
-                                                                                        .child(h_flex().gap_2().items_center()
-                                                                                            .child(svg().path("icons/figma.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                            .child("Figma")
-                                                                                        )
-                                                                                )
-                                                                                .child(
-                                                                                    div().id("spotify").px_3().py_2().hover(move |s| s.bg(inner_secondary)).cursor_pointer()
-                                                                                        .on_mouse_down(MouseButton::Left, {
-                                                                                            let state_model = state_model.clone();
-                                                                                            cx.listener(move |_, _, _, cx| {
-                                                                                                println!("Spotify mouse down in flyout");
-                                                                                                state_model.update(cx, |state, cx| state.select_app("Spotify".to_string(), cx));
-                                                                                                cx.dispatch_action(&SelectAppSpotify);
-                                                                                            })
-                                                                                        })
-                                                                                        .child(h_flex().gap_2().items_center()
-                                                                                            .child(svg().path("icons/spotify.svg").size(px(16.0)).text_color(inner_secondary_foreground))
-                                                                                            .child("Spotify")
-                                                                                        )
-                                                                                )
+                                                                                .child(render_flyout_item(
+                                                                                    "web-search",
+                                                                                    "icons/web_search.svg",
+                                                                                    "Web search",
+                                                                                    state_model.clone(),
+                                                                                    |cx| cx.dispatch_action(&SelectAppWebSearch),
+                                                                                    cx,
+                                                                                ))
+                                                                                .child(render_flyout_item(
+                                                                                    "canvas",
+                                                                                    "icons/canvas.svg",
+                                                                                    "Canvas",
+                                                                                    state_model.clone(),
+                                                                                    |cx| cx.dispatch_action(&SelectAppCanvas),
+                                                                                    cx,
+                                                                                ))
+                                                                                .child(render_flyout_item(
+                                                                                    "canva",
+                                                                                    "icons/canva.svg",
+                                                                                    "Canva",
+                                                                                    state_model.clone(),
+                                                                                    |cx| cx.dispatch_action(&SelectAppCanva),
+                                                                                    cx,
+                                                                                ))
+                                                                                .child(render_flyout_item(
+                                                                                    "coursera",
+                                                                                    "icons/coursera.svg",
+                                                                                    "Coursera",
+                                                                                    state_model.clone(),
+                                                                                    |cx| cx.dispatch_action(&SelectAppCoursera),
+                                                                                    cx,
+                                                                                ))
+                                                                                .child(render_flyout_item(
+                                                                                    "figma-more",
+                                                                                    "icons/figma.svg",
+                                                                                    "Figma",
+                                                                                    state_model.clone(),
+                                                                                    |cx| cx.dispatch_action(&SelectAppFigma),
+                                                                                    cx,
+                                                                                ))
+                                                                                .child(render_flyout_item(
+                                                                                    "spotify",
+                                                                                    "icons/spotify.svg",
+                                                                                    "Spotify",
+                                                                                    state_model.clone(),
+                                                                                    |cx| cx.dispatch_action(&SelectAppSpotify),
+                                                                                    cx,
+                                                                                ))
                                                                         )
                                                                     } else {
                                                                         None
