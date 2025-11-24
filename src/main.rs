@@ -1,5 +1,4 @@
 use gpui::*;
-use ui::Root;
 use nativechat::actions::{
     About, Hide, HideOthers, Minimize, OpenSettings, Quit, ShowAll, ToggleSidebar, ToggleTheme,
     Zoom,
@@ -8,6 +7,7 @@ use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
 use nativechat::root::RootView;
 use nativechat::theme;
+use ui::Root;
 
 use nativechat::state::AppState;
 
@@ -32,7 +32,8 @@ fn main() {
             cx.on_action(quit);
 
             // Initialize GPUI Components
-            gpui_component::init(cx);
+            // Initialize GPUI Components
+            ui::theme::init(cx);
 
             // Initialize Theme
             theme::init(cx);
