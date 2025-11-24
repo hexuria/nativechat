@@ -11,6 +11,7 @@ pub mod theme;
 // Support modules
 pub mod actions;
 pub mod animation;
+pub mod assets;
 pub mod dialog;
 pub mod global_state;
 pub mod highlighter;

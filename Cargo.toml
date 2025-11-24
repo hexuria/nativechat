@@ -28,8 +28,6 @@ futures = "0.3"
 url = "2.5"
 log = "0.4"
 ui = { path = "ui" }
-# Keep temporarily for reference during migration
-gpui-component-assets = "0.4.1"
 
 [package.metadata.bundle]
 name = "NativeChat"

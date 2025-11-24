@@ -16,11 +16,11 @@ impl AssetSource for CombinedAssets {
             return Ok(Some(f.data));
         }
         // Fallback to default assets
-        gpui_component_assets::Assets.load(path)
+        ui::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>, anyhow::Error> {
-        let mut files = gpui_component_assets::Assets.list(path)?;
+        let mut files = ui::assets::Assets.list(path)?;
         for file in LocalAssets::iter() {
             if file.starts_with(path) {
                 files.push(file.to_string().into());
