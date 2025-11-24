@@ -33,7 +33,7 @@ fn main() {
 
             // Initialize GPUI Components
             // Initialize GPUI Components
-            ui::theme::init(cx);
+            ui::init(cx);
 
             // Initialize Theme
             theme::init(cx);

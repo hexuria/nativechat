@@ -27,6 +27,11 @@ pub mod title_bar;
 pub mod virtual_list;
 pub mod window_border;
 
+pub fn init(cx: &mut gpui::App) {
+    components::init(cx);
+    theme::init(cx);
+}
+
 // Re-export commonly used items
 pub use components::*;
 pub use highlighter::HighlightTheme;

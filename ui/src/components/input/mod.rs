@@ -14,9 +14,9 @@ mod otp_input;
 pub(crate) mod popovers;
 mod rope_ext;
 mod search;
+mod selection;
 mod state;
 mod text_wrapper;
-mod selection;
 
 pub(crate) use clear_button::*;
 pub use cursor::*;
@@ -31,3 +31,7 @@ pub use state::*;
 pub use lsp_types::Position;
 pub use rope_ext::*;
 pub use ropey::Rope;
+
+pub fn init(cx: &mut gpui::App) {
+    state::init(cx);
+}
