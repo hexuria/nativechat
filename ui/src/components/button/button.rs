@@ -5,11 +5,14 @@ use crate::{
     FocusableExt as _, Icon, IconName, Selectable, Sizable, Size, StyleSized, StyledExt,
 };
 use gpui::{
-    div, prelude::FluentBuilder as _, px, relative, Action, AnyElement, App, ClickEvent, Corners,
-    Div, Edges, ElementId, Hsla, InteractiveElement, Interactivity, IntoElement, MouseButton,
-    ParentElement, Pixels, RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _,
-    StyleRefinement, Styled, Window,
+    div, prelude::FluentBuilder as _, px, relative, Action, AnyElement, App, ClickEvent, Context,
+    Corners, Div, Edges, ElementId, Hsla, InteractiveElement, Interactivity, IntoElement,
+    MouseButton, ParentElement, Pixels, Refineable, RenderOnce, SharedString, Stateful,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
 };
+
+use super::dropdown_button::DropdownButton;
+use crate::menu::PopupMenu;
 
 #[derive(Default, Clone, Copy)]
 pub enum ButtonRounded {
@@ -280,6 +283,23 @@ impl Button {
         self
     }
 
+    /// Set the dropdown menu of the button.
+    pub fn dropdown_menu(
+        self,
+        menu: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+    ) -> crate::menu::DropdownMenuPopover<Self> {
+        crate::menu::DropdownMenu::dropdown_menu(self, menu)
+    }
+
+    /// Set the dropdown menu of the button with anchor.
+    pub fn dropdown_menu_with_anchor(
+        self,
+        anchor: impl Into<gpui::Corner>,
+        menu: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+    ) -> crate::menu::DropdownMenuPopover<Self> {
+        crate::menu::DropdownMenu::dropdown_menu_with_anchor(self, anchor, menu)
+    }
+
     /// Set the tooltip of the button.
     pub fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
         self.tooltip = Some((tooltip.into(), None));
@@ -422,12 +442,32 @@ impl InteractiveElement for Button {
 }
 
 impl RenderOnce for Button {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let style: ButtonVariant = self.variant;
         let clickable = self.clickable();
         let is_disabled = self.disabled;
         let hoverable = self.hoverable();
         let normal_style = style.normal(self.outline, cx);
+
+        // Apply hover and active styles to self.style
+        if !self.disabled && !self.selected {
+            // Use a temporary button to construct the theme style refinement
+            // This is necessary because StyleRefinement fields are private and we can't use Styled methods on it directly.
+            let mut theme_btn = Button::new("theme_style_builder");
+
+            let hover_style = style.hovered(self.outline, cx);
+            theme_btn = theme_btn.hover(|s| {
+                s.bg(hover_style.bg)
+                    .border_color(hover_style.border)
+                    .text_color(hover_style.fg)
+            });
+
+            let mut theme_style = theme_btn.style;
+
+            // Merge existing styles on top of theme styles
+            theme_style.refine(&self.style);
+            self.style = theme_style;
+        }
         let icon_size = match self.size {
             Size::Size(v) => Size::Size(v * 0.75),
             _ => self.size,
@@ -511,12 +551,6 @@ impl RenderOnce for Button {
                 this.border_color(normal_style.border)
                     .bg(normal_style.bg)
                     .when(normal_style.underline, |this| this.text_decoration_1())
-                    .hover(|this| {
-                        let hover_style = style.hovered(self.outline, cx);
-                        this.bg(hover_style.bg)
-                            .border_color(hover_style.border)
-                            .text_color(crate::red_400())
-                    })
                     .active(|this| {
                         let active_style = style.active(self.outline, cx);
                         this.bg(active_style.bg)
