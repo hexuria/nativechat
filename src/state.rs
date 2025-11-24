@@ -236,7 +236,7 @@ impl AppState {
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        use gpui_component::{Theme, ThemeRegistry};
+        use ui::{Theme, ThemeRegistry};
 
         println!("[THEME] Toggle called, current: {}", self.theme_mode);
 

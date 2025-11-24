@@ -9,7 +9,7 @@ use gpui::{
     AsyncApp, Bounds, Context, Entity, IntoElement, Render, WeakEntity, Window, canvas, fill,
     point, px, size,
 };
-use gpui_component::ActiveTheme;
+use ui::ActiveTheme;
 
 pub struct VoiceWave {
     amplitude: Arc<AtomicU32>,

@@ -1,6 +1,6 @@
 use crate::components::message_actions::MessageActions;
 use gpui::{prelude::FluentBuilder, *};
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use ui::{ActiveTheme, h_flex, v_flex};
 
 #[derive(Clone, IntoElement)]
 pub struct MessageBubble {

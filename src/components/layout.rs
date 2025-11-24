@@ -4,7 +4,7 @@ use crate::components::modals::{
 };
 use crate::components::sidebar::SidebarView;
 use gpui::*;
-use gpui_component::h_flex;
+use ui::h_flex;
 
 use crate::state::AppState;
 

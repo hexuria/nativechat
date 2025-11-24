@@ -1,5 +1,5 @@
 use gpui::*;
-use gpui_component::Root;
+use ui::Root;
 use nativechat::actions::{
     About, Hide, HideOthers, Minimize, OpenSettings, Quit, ShowAll, ToggleSidebar, ToggleTheme,
     Zoom,

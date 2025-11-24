@@ -1,5 +1,5 @@
 use gpui::*;
-use gpui_component::{Theme, ThemeRegistry};
+use ui::{Theme, ThemeRegistry};
 use std::path::PathBuf;
 
 /// Returns the path to the themes directory, which is different for dev and release builds.

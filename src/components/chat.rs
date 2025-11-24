@@ -2,7 +2,7 @@ use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::state::AppState;
 use gpui::*;
-use gpui_component::{
+use ui::{
     ActiveTheme, StyledExt, avatar::Avatar, h_flex, label::Label, scroll::ScrollbarAxis, v_flex,
 };
 

@@ -3,7 +3,7 @@ use crate::state::{AppState, VoiceStatus};
 use gpui::InteractiveElement;
 use gpui::prelude::*;
 use gpui::*;
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use ui::{ActiveTheme, h_flex, v_flex};
 
 pub fn render_voice_mode_modal<V: 'static>(
     state: Entity<AppState>,

@@ -4,7 +4,7 @@ use gpui::{
     App, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement, Render,
     SharedString, Styled, Window, div, px,
 };
-use gpui_component::{
+use ui::{
     ActiveTheme, Icon, IconName, StyledExt, Theme, avatar::Avatar, scroll::ScrollbarAxis,
     sidebar::SidebarMenuItem,
 };

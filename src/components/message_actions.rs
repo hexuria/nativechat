@@ -1,5 +1,5 @@
 use gpui::*;
-use gpui_component::{ActiveTheme, Icon, IconName, h_flex, tooltip::Tooltip};
+use ui::{ActiveTheme, Icon, IconName, h_flex, tooltip::Tooltip};
 
 #[derive(IntoElement)]
 pub struct MessageActions {

@@ -8,7 +8,7 @@ use crate::state::AppState;
 
 use crate::components::circular_voice_viz::CircularVoiceViz;
 use crate::components::voice_mode_modal::render_voice_mode_modal;
-use gpui_component::{ActiveTheme, Root};
+use ui::{ActiveTheme, Root};
 
 #[derive(Clone)]
 pub struct RootView {

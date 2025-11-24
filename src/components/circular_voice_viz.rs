@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use gpui::prelude::*;
 use gpui::*;
-use gpui_component::ActiveTheme;
+use ui::ActiveTheme;
 use std::f32::consts::PI;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

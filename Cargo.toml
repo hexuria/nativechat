@@ -1,14 +1,21 @@
+[workspace]
+members = [".", "ui"]
+resolver = "2"
+
+[workspace.dependencies]
+gpui = "0.2.2"
+rust-embed = "8.5.0"
+anyhow = "1.0"
+
 [package]
 name = "nativechat"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gpui = "0.2.2"
-gpui-component = "0.4.1"
-gpui-component-assets = "0.4.1"
-rust-embed = "8.5.0"
-anyhow = "1.0"
+gpui.workspace = true
+anyhow.workspace = true
+rust-embed.workspace = true
 rand = "0.8"
 cpal = "0.15"
 coreaudio-sys = "0.2.17"
@@ -20,6 +27,10 @@ base64 = "0.21"
 futures = "0.3"
 url = "2.5"
 log = "0.4"
+ui = { path = "ui" }
+# Keep temporarily for reference during migration
+gpui-component = "0.4.1"
+gpui-component-assets = "0.4.1"
 
 [package.metadata.bundle]
 name = "NativeChat"

@@ -9,7 +9,7 @@ use crate::state::AppState;
 use gpui::InteractiveElement;
 use gpui::prelude::*;
 use gpui::*;
-use gpui_component::{
+use ui::{
     ActiveTheme, Icon, IconName,
     button::{Button, ButtonVariants},
     h_flex,
