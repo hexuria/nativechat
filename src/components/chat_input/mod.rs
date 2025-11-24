@@ -132,6 +132,11 @@ impl Render for MessageInput {
         let state_model = self.state.clone();
         let app_state = state_model.read(cx);
         let selected_apps = app_state.selected_apps.clone();
+        
+        // Check if any modal is open
+        let any_modal_open = app_state.is_voice_mode_open
+            || app_state.is_account_settings_open
+            || app_state.is_profile_settings_open;
 
         // ChatGPT-style: centered container with max-width
         h_flex().w_full().justify_center().p_4().child(
@@ -186,13 +191,18 @@ impl Render for MessageInput {
                                                 }
                                             }
                                         })
-                                        .trigger(
-                                            Button::new("add-app")
+                                        .trigger({
+                                            let mut btn = Button::new("add-app")
                                                 .icon(IconName::Plus)
                                                 .ghost()
-                                                .rounded_full()
-                                                .cursor_pointer(),
-                                        )
+                                                .rounded_full();
+                                            
+                                            if !any_modal_open {
+                                                btn = btn.cursor_pointer();
+                                            }
+                                            
+                                            btn
+                                        })
                                         .content({
                                             let state_model = state_model.clone();
                                             move |_, _, cx| {
@@ -560,8 +570,8 @@ impl Render for MessageInput {
                                 .items_center()
                                 .when(self.voice_mode, |this| {
                                     // Voice Mode: Cancel (X) and Confirm (Check)
-                                    this.child(
-                                        div()
+                                    this.child({
+                                        let mut cancel_btn = div()
                                             .id("cancel-voice-btn")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_voice_mode(cx);
@@ -575,15 +585,20 @@ impl Render for MessageInput {
                                             .bg(gpui::transparent_black())
                                             .text_color(secondary_foreground)
                                             .hover(move |style| style.bg(secondary))
-                                            .cursor_pointer()
                                             .tooltip(|w, cx| Tooltip::new("Cancel").build(w, cx))
                                             .child(
                                                 Icon::new(IconName::Close)
                                                     .text_color(secondary_foreground),
-                                            )
-                                    )
-                                    .child(
-                                        div()
+                                            );
+                                        
+                                        if !any_modal_open {
+                                            cancel_btn = cancel_btn.cursor_pointer();
+                                        }
+                                        
+                                        cancel_btn
+                                    })
+                                    .child({
+                                        let mut confirm_btn = div()
                                             .id("confirm-voice-btn")
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.confirm_voice_input(window, cx);
@@ -599,18 +614,23 @@ impl Render for MessageInput {
                                             .hover(move |style| {
                                                 style.bg(theme.foreground.opacity(0.8))
                                             })
-                                            .cursor_pointer()
                                             .tooltip(|w, cx| Tooltip::new("Done").build(w, cx))
                                             .child(
                                                 Icon::new(IconName::Check)
                                                     .text_color(theme.background),
-                                            )
-                                    )
+                                            );
+                                        
+                                        if !any_modal_open {
+                                            confirm_btn = confirm_btn.cursor_pointer();
+                                        }
+                                        
+                                        confirm_btn
+                                    })
                                 })
                                 .when(!self.voice_mode, |this| {
                                     // Text Mode: Mic and Send/Headphone
-                                    this.child(
-                                        div()
+                                    this.child({
+                                        let mut mic_btn = div()
                                             .id("dictate")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_voice_mode(cx);
@@ -624,19 +644,24 @@ impl Render for MessageInput {
                                             .bg(gpui::transparent_black()) // Transparent/White by default
                                             .text_color(secondary_foreground)
                                             .hover(move |style| style.bg(secondary)) // Gray on hover
-                                            .cursor_pointer()
                                             .tooltip(|w, cx| Tooltip::new("Dictate").build(w, cx))
                                             .child(
                                                 svg()
                                                     .path("icons/mic.svg")
                                                     .size(px(18.0))
                                                     .text_color(secondary_foreground),
-                                            ),
-                                    )
+                                            );
+                                        
+                                        if !any_modal_open {
+                                            mic_btn = mic_btn.cursor_pointer();
+                                        }
+                                        
+                                        mic_btn
+                                    })
                                     .child(
                                         if self.input_state.read(cx).text().len() == 0 {
                                             // Empty state: Sparkles icon - opens voice mode modal
-                                            div()
+                                            let mut sparkles_btn = div()
                                                 .id("voice-mode")
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.state.update(cx, |state, cx| {
@@ -652,7 +677,6 @@ impl Render for MessageInput {
                                                 .bg(gpui::transparent_black())
                                                 .text_color(secondary_foreground)
                                                 .hover(move |style| style.bg(secondary))
-                                                .cursor_pointer()
                                                 .tooltip(|w, cx| {
                                                     Tooltip::new("Voice Mode").build(w, cx)
                                                 })
@@ -661,10 +685,16 @@ impl Render for MessageInput {
                                                         .path("icons/sparkles.svg")
                                                         .size(px(18.0))
                                                         .text_color(secondary_foreground),
-                                                )
+                                                );
+                                            
+                                            if !any_modal_open {
+                                                sparkles_btn = sparkles_btn.cursor_pointer();
+                                            }
+                                            
+                                            sparkles_btn
                                         } else {
                                             // Typing state: Send button (Black bg, White arrow)
-                                            div()
+                                            let mut send_btn = div()
                                                 .id("send-btn")
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.trigger_submit(window, cx);
@@ -680,14 +710,19 @@ impl Render for MessageInput {
                                                 .hover(move |style| {
                                                     style.bg(theme.foreground.opacity(0.8))
                                                 })
-                                                .cursor_pointer()
                                                 .tooltip(|w, cx| {
                                                     Tooltip::new("Send message").build(w, cx)
                                                 })
                                                 .child(
                                                     Icon::new(IconName::ArrowUp)
                                                         .text_color(theme.background),
-                                                )
+                                                );
+                                            
+                                            if !any_modal_open {
+                                                send_btn = send_btn.cursor_pointer();
+                                            }
+                                            
+                                            send_btn
                                         }
                                     )
                                 })
