@@ -207,56 +207,19 @@ impl Render for AccountSettingsModal {
                                     ),
                             )
                             .child(
-                                // Tabs
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .child(
-                                        gpui::div()
-                                            .id("profile-tab")
-                                            .p_2()
-                                            .cursor_pointer()
-                                            .child("Profile")
-                                            .text_color(if self.active_tab == 0 {
-                                                theme.foreground
-                                            } else {
-                                                theme.muted_foreground
-                                            })
-                                            .border_b_2()
-                                            .border_color(if self.active_tab == 0 {
-                                                theme.foreground
-                                            } else {
-                                                gpui::transparent_black()
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.active_tab = 0;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .id("security-tab")
-                                            .p_2()
-                                            .cursor_pointer()
-                                            .child("Security")
-                                            .text_color(if self.active_tab == 1 {
-                                                theme.foreground
-                                            } else {
-                                                theme.muted_foreground
-                                            })
-                                            .border_b_2()
-                                            .border_color(if self.active_tab == 1 {
-                                                theme.foreground
-                                            } else {
-                                                gpui::transparent_black()
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.active_tab = 1;
-                                                cx.notify();
-                                            })),
-                                    ),
+                                // Tabs - using segmented tabs with filling space
+                                div().px_4().pt_4().child(
+                                    ui::tab::TabBar::new("account-settings-tabs")
+                                        .w_full()
+                                        .segmented()
+                                        .selected_index(self.active_tab)
+                                        .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                                            this.active_tab = *ix;
+                                            cx.notify();
+                                        }))
+                                        .child(ui::tab::Tab::new().flex_1().label("Profile"))
+                                        .child(ui::tab::Tab::new().flex_1().label("Security")),
+                                ),
                             )
                             .child(
                                 // Content

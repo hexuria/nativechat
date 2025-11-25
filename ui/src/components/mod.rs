@@ -7,6 +7,7 @@ pub mod input;
 pub mod label;
 pub mod popover;
 pub mod sidebar;
+pub mod tab;
 pub mod tooltip;
 
 // Re-export main types
@@ -17,6 +18,7 @@ pub use input::{Input, InputEvent, InputState};
 pub use label::Label;
 pub use popover::Popover;
 pub use sidebar::SidebarMenuItem;
+pub use tab::{Tab, TabBar, TabVariant};
 pub use tooltip::Tooltip;
 
 pub fn init(cx: &mut gpui::App) {
