@@ -75,6 +75,15 @@ pub struct Profile {
     pub avatar: Option<String>, // Path or IconName
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppCapability {
+    pub name: String,      // The tag name (e.g., "Photos")
+    pub label: String,     // The menu label (e.g., "Add photos & files")
+    pub icon: String,      // Icon path
+    pub action_id: String, // Action identifier
+    pub is_primary: bool,  // Whether it belongs in the main menu or "More" submenu
+}
+
 pub struct AppState {
     pub conversations: Vec<Conversation>,
     pub active_conversation_id: Option<usize>,
@@ -94,6 +103,7 @@ pub struct AppState {
     pub selected_profile: Option<Profile>,
     pub available_apps: Vec<String>,
     pub selected_apps: Vec<String>,
+    pub capabilities: Vec<AppCapability>,
 }
 
 impl Default for AppState {
@@ -123,6 +133,88 @@ impl AppState {
             "Figma".to_string(),
             "Notion".to_string(),
             "Linear".to_string(),
+        ];
+
+        let capabilities = vec![
+            // Primary Items
+            AppCapability {
+                name: "Photos".to_string(),
+                label: "Add photos & files".to_string(),
+                icon: "icons/clip.svg".to_string(),
+                action_id: "SelectAppPhotos".to_string(),
+                is_primary: true,
+            },
+            AppCapability {
+                name: "Image Generation".to_string(),
+                label: "Image Generation".to_string(),
+                icon: "icons/create_image.svg".to_string(),
+                action_id: "SelectAppImageGeneration".to_string(),
+                is_primary: true,
+            },
+            AppCapability {
+                name: "Thinking".to_string(),
+                label: "Thinking".to_string(),
+                icon: "icons/thinking.svg".to_string(),
+                action_id: "SelectAppThinking".to_string(),
+                is_primary: true,
+            },
+            AppCapability {
+                name: "Deep Research".to_string(),
+                label: "Deep Research".to_string(),
+                icon: "icons/deep_search.svg".to_string(),
+                action_id: "SelectAppDeepResearch".to_string(),
+                is_primary: true,
+            },
+            AppCapability {
+                name: "Study".to_string(),
+                label: "Study".to_string(),
+                icon: "icons/study.svg".to_string(),
+                action_id: "SelectAppStudy".to_string(),
+                is_primary: true,
+            },
+            // Secondary Items ("More" submenu)
+            AppCapability {
+                name: "Web search".to_string(),
+                label: "Web search".to_string(),
+                icon: "icons/web_search.svg".to_string(),
+                action_id: "SelectAppWebSearch".to_string(),
+                is_primary: false,
+            },
+            AppCapability {
+                name: "Canvas".to_string(),
+                label: "Canvas".to_string(),
+                icon: "icons/canvas.svg".to_string(),
+                action_id: "SelectAppCanvas".to_string(),
+                is_primary: false,
+            },
+            AppCapability {
+                name: "Canva".to_string(),
+                label: "Canva".to_string(),
+                icon: "icons/canva.svg".to_string(),
+                action_id: "SelectAppCanva".to_string(),
+                is_primary: false,
+            },
+            AppCapability {
+                name: "Coursera".to_string(),
+                label: "Coursera".to_string(),
+                icon: "icons/coursera.svg".to_string(),
+                action_id: "SelectAppCoursera".to_string(),
+                is_primary: false,
+            },
+            AppCapability {
+                name: "Figma".to_string(),
+                label: "Figma".to_string(),
+                icon: "icons/figma.svg".to_string(),
+                action_id: "SelectAppFigma".to_string(),
+                is_primary: false,
+            },
+            AppCapability {
+                name: "Spotify".to_string(),
+                label: "Spotify".to_string(),
+                icon: "icons/spotify.svg".to_string(),
+                action_id: "SelectAppSpotify".to_string(),
+                is_primary: false,
+            },
         ];
 
         Self {
@@ -178,6 +270,7 @@ impl AppState {
             selected_profile,
             available_apps,
             selected_apps: Vec::new(),
+            capabilities,
         }
     }
 

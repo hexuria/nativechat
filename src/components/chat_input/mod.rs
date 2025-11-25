@@ -188,6 +188,9 @@ impl Render for MessageInput {
                                         .dropdown_menu_with_anchor(Corner::BottomLeft, {
                                             let state_model = state_model.clone();
                                             move |menu, window, cx| {
+                                                let state = state_model.read(cx);
+                                                let capabilities = state.capabilities.clone();
+                                                
                                                 let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
                                                     let state_model = state_model.clone();
                                                     let label_string = label.to_string();
@@ -201,16 +204,44 @@ impl Render for MessageInput {
                                                         })
                                                 };
 
-                                                let state_model_submenu = state_model.clone();
+                                                fn get_action(action_id: &str) -> Box<dyn Action> {
+                                                    match action_id {
+                                                        "SelectAppPhotos" => Box::new(SelectAppPhotos),
+                                                        "SelectAppImageGeneration" => Box::new(SelectAppImageGeneration),
+                                                        "SelectAppThinking" => Box::new(SelectAppThinking),
+                                                        "SelectAppDeepResearch" => Box::new(SelectAppDeepResearch),
+                                                        "SelectAppStudy" => Box::new(SelectAppStudy),
+                                                        "SelectAppWebSearch" => Box::new(SelectAppWebSearch),
+                                                        "SelectAppCanvas" => Box::new(SelectAppCanvas),
+                                                        "SelectAppCanva" => Box::new(SelectAppCanva),
+                                                        "SelectAppCoursera" => Box::new(SelectAppCoursera),
+                                                        "SelectAppFigma" => Box::new(SelectAppFigma),
+                                                        "SelectAppSpotify" => Box::new(SelectAppSpotify),
+                                                        _ => Box::new(SelectAppWebSearch), // Fallback
+                                                    }
+                                                }
 
-                                                menu
-                                                    .item(make_item("Add photos & files", "Photos", "icons/clip.svg", Box::new(SelectAppPhotos), state_model.clone()))
-                                                    .item(make_item("Image Generation", "Image Generation", "icons/create_image.svg", Box::new(SelectAppImageGeneration), state_model.clone()))
-                                                    .item(make_item("Thinking", "Thinking", "icons/thinking.svg", Box::new(SelectAppThinking), state_model.clone()))
-                                                    .item(make_item("Deep Research", "Deep Research", "icons/deep_search.svg", Box::new(SelectAppDeepResearch), state_model.clone()))
-                                                    .item(make_item("Study", "Study", "icons/study.svg", Box::new(SelectAppStudy), state_model.clone()))
-                                                    .separator()
-                                                    .submenu("More", window, cx, move |menu, _, _| {
+                                                let mut menu = menu;
+                                                
+                                                // Primary Items
+                                                for cap in capabilities.iter().filter(|c| c.is_primary) {
+                                                    menu = menu.item(make_item(
+                                                        &cap.label,
+                                                        &cap.name,
+                                                        &cap.icon,
+                                                        get_action(&cap.action_id),
+                                                        state_model.clone()
+                                                    ));
+                                                }
+
+                                                menu = menu.separator();
+
+                                                // Secondary Items ("More" submenu)
+                                                let secondary_caps: Vec<_> = capabilities.iter().filter(|c| !c.is_primary).cloned().collect();
+                                                if !secondary_caps.is_empty() {
+                                                    let state_model_submenu = state_model.clone();
+                                                    let secondary_caps_for_submenu = secondary_caps.clone();
+                                                    menu = menu.submenu("More", window, cx, move |menu, _, _| {
                                                         let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
                                                             let state_model = state_model.clone();
                                                             let label_string = label.to_string();
@@ -223,15 +254,21 @@ impl Render for MessageInput {
                                                                     window.dispatch_action(action.boxed_clone(), cx);
                                                                 })
                                                         };
-                                                        
-                                                        menu
-                                                            .item(make_item("Web search", "Web search", "icons/web_search.svg", Box::new(SelectAppWebSearch), state_model_submenu.clone()))
-                                                            .item(make_item("Canvas", "Canvas", "icons/canvas.svg", Box::new(SelectAppCanvas), state_model_submenu.clone()))
-                                                            .item(make_item("Canva", "Canva", "icons/canva.svg", Box::new(SelectAppCanva), state_model_submenu.clone()))
-                                                            .item(make_item("Coursera", "Coursera", "icons/coursera.svg", Box::new(SelectAppCoursera), state_model_submenu.clone()))
-                                                            .item(make_item("Figma", "Figma", "icons/figma.svg", Box::new(SelectAppFigma), state_model_submenu.clone()))
-                                                            .item(make_item("Spotify", "Spotify", "icons/spotify.svg", Box::new(SelectAppSpotify), state_model_submenu.clone()))
-                                                    })
+
+                                                        let mut submenu = menu;
+                                                        for cap in secondary_caps_for_submenu.iter() {
+                                                            submenu = submenu.item(make_item(
+                                                                &cap.label,
+                                                                &cap.name,
+                                                                &cap.icon,
+                                                                get_action(&cap.action_id),
+                                                                state_model_submenu.clone()
+                                                            ));
+                                                        }
+                                                        submenu
+                                                    });
+                                                }
+                                                menu
                                             }
                                         })
                                 )
