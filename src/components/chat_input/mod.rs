@@ -2,7 +2,11 @@ mod items;
 
 pub use items::{render_flyout_item, render_popover_item};
 
-use crate::actions::{SelectAppCanva, SelectAppCanvas, SelectAppCoursera, SelectAppDeepResearch, SelectAppFigma, SelectAppImageGeneration, SelectAppLinear, SelectAppNotion, SelectAppPhotos, SelectAppSpotify, SelectAppStudy, SelectAppThinking, SelectAppWebSearch};
+use crate::actions::{
+    SelectAppCanva, SelectAppCanvas, SelectAppCoursera, SelectAppDeepResearch, SelectAppFigma,
+    SelectAppImageGeneration, SelectAppLinear, SelectAppNotion, SelectAppPhotos, SelectAppSpotify,
+    SelectAppStudy, SelectAppThinking, SelectAppWebSearch,
+};
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
 use crate::state::AppState;
@@ -133,7 +137,7 @@ impl Render for MessageInput {
         let state_model = self.state.clone();
         let app_state = state_model.read(cx);
         let selected_apps = app_state.selected_apps.clone();
-        
+
         // Check if any modal is open
         let any_modal_open = app_state.is_voice_mode_open
             || app_state.is_account_settings_open
@@ -702,6 +706,5 @@ impl Render for MessageInput {
                         state.update(cx, |state, cx| state.select_app("Study".to_string(), cx));
                     }
                 }))
-        
     }
 }

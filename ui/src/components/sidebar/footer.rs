@@ -71,14 +71,11 @@ impl RenderOnce for SidebarFooter {
         h_flex()
             .id("sidebar-footer")
             .gap_2()
-            .p_2()
+            .when(!self.collapsed, |this| this.px_2().pb_2())
+            .when(self.collapsed, |this| this.p_1())
             .w_full()
             .justify_between()
             .rounded(cx.theme().radius)
-            .hover(|this| {
-                this.bg(cx.theme().sidebar_accent)
-                    .text_color(cx.theme().sidebar_accent_foreground)
-            })
             .when(self.selected, |this| {
                 this.bg(cx.theme().sidebar_accent)
                     .text_color(cx.theme().sidebar_accent_foreground)

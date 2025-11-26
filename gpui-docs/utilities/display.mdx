@@ -1,0 +1,56 @@
+---
+title: "Display & overflow"
+description: "Toggle visibility, overflow, and stacking contexts."
+---
+
+## Display helpers
+
+| Method | Effect |
+| --- | --- |
+| `.block()` | Stack element on its own row (default for div). |
+| `.flex()` | Create a flex container. Pair with `.flex_row()` / `.flex_col()`. |
+| `.grid()` | Enable CSS grid-style layout. |
+| `.hidden()` | Remove from layout (display: none). |
+
+## Visibility
+
+- `.visible()` / `.invisible()` toggle whether an element is painted.
+- `.opacity(0.5)` fades content without affecting layout.
+
+## Overflow
+
+| Method | Notes |
+| --- | --- |
+| `.overflow_hidden()` | Clip children. |
+| `.overflow_scroll()` | Always show scrollbars. |
+| `.overflow_auto()` | Scroll only when content exceeds bounds. |
+| `.allow_concurrent_scroll(true)` | Opt into simultaneous horizontal + vertical scrolling. |
+
+```rust
+div()
+    .w(px(320.))
+    .h(px(200.))
+    .overflow_auto()
+    .child(long_content)
+```
+
+## Positioning
+
+- `.relative()` / `.absolute()` / `.fixed()` set the position context.
+- `.top(px(0.))`, `.left(px(12.))`, `.inset(px(8.))` nudge positioned elements.
+
+```rust
+div()
+    .relative()
+    .child(
+        div()
+            .absolute()
+            .top(px(8.))
+            .right(px(12.))
+            .child("Badge")
+    )
+```
+
+<Note>
+Because GPUI is GPU driven, clipped content isn’t “kept alive” like in the DOM—clipping is cheap, but avoid nesting dozens of scroll views unnecessarily.
+</Note>

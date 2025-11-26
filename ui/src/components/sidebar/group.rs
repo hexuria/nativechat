@@ -17,7 +17,7 @@ impl<E: Collapsible + IntoElement> SidebarGroup<E> {
     /// Create a new [`SidebarGroup`] with the given label.
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
-            base: div().gap_2().flex_col(),
+            base: div().gap_2().flex_col().px_2().pt_2(),
             label: label.into(),
             collapsed: false,
             children: Vec::new(),
@@ -50,10 +50,17 @@ impl<E: Collapsible + IntoElement> Collapsible for SidebarGroup<E> {
     }
 }
 
+impl<E: Collapsible + IntoElement> From<SidebarGroup<E>> for crate::resizable::ResizablePanel {
+    fn from(group: SidebarGroup<E>) -> Self {
+        crate::resizable::resizable_panel().child(group.into_element())
+    }
+}
+
 impl<E: Collapsible + IntoElement> RenderOnce for SidebarGroup<E> {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         v_flex()
             .relative()
+            .w_full()
             .when(!self.collapsed, |this| {
                 this.child(
                     div()

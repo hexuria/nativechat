@@ -1,0 +1,54 @@
+---
+title: "GPUI Handbook"
+description: "A practical, Tailwind-style guide to building GPU-accelerated apps with GPUI."
+---
+
+GPUI powers the Zed editor and gives you a GPU-accelerated, immediate + retained mode UI framework without needing prior Rust or graphics knowledge. This handbook explains the mental model, layout primitives, and styling utilities in the same spirit as Tailwind’s documentation so you can experiment quickly.
+
+<Tip>
+New to Rust? Start with the [Quickstart](/quickstart) page—every example here is copy/paste friendly and explains concepts in plain language first.
+</Tip>
+
+## Pick a path
+
+<CardGroup cols={2}>
+  <Card title="🚀 Quickstart" href="/quickstart" icon="rocket">
+    Install GPUI, open your first window, and understand how `Application::run` drives the render loop.
+  </Card>
+  <Card title="🧠 Core ideas" href="/foundations/mental-model" icon="lightbulb">
+    Learn how Applications, Views, Entities, and Elements fit together without any hidden magic.
+  </Card>
+  <Card title="📐 Layout recipes" href="/layout/layout-recipes" icon="grid-2">
+    Copy ready-made flexbox patterns for toolbars, sidebars, chat columns, and split panes.
+  </Card>
+  <Card title="🎨 Utility reference" href="/utilities/flex" icon="swatchbook">
+    Browse every `flex_*`, `gap_*`, `bg()`, and typography helper with their CSS equivalent.
+  </Card>
+</CardGroup>
+
+## Why GPUI feels familiar
+
+<Columns cols={2}>
+  <Card title="Tailwind-like styling" icon="wand-magic-sparkles">
+    Compose `.flex().gap_3().bg(rgb(0x1f2937))` fluently. Utilities map 1:1 to CSS concepts, so you can translate visual ideas directly to code.
+  </Card>
+  <Card title="Rust safety meets React vibes" icon="shield-halved">
+    Views implement `Render` and return nested elements, just like JSX. Application state lives in entities—reference counted, thread-safe, and explicit.
+  </Card>
+  <Card title="GPU-first performance" icon="bolt">
+    Every element compiles down to efficient Metal/Vulkan draw calls. Smooth scrolling, shadows, gradients, and large lists stay responsive by default.
+  </Card>
+  <Card title="Bring your own abstractions" icon="layers">
+    Divs expose mouse, keyboard, drag, and action hooks so you can build higher-level widgets (menus, resizers, tool palettes) without forking the framework.
+  </Card>
+</Columns>
+
+## How to use this guide
+
+- **Skim the Guide tab** to gain a mental model and learn the recommended patterns.
+- **Jump into the Utility reference** whenever you need the exact method name for a layout or styling tweak.
+- **Follow the code samples**—they point to real files in `zed/crates/gpui/examples`, so you can open them locally to explore further.
+
+<Note>
+Have a question while learning? The [Zed Discord](https://zed.dev/community-links) has a `#gpui` channel where the maintainers hang out.
+</Note>

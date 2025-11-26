@@ -1,0 +1,53 @@
+---
+title: "Spacing scale"
+description: "Reference for gap, padding, and margin helpers."
+---
+
+GPUI reuses Tailwind’s spacing scale (`0, 0.5, 1, 1.5, …, 12`). Each step equals `0.25rem` (4px) by default.
+
+## Gaps
+
+| Helper | Description |
+| --- | --- |
+| `.gap_0()` … `.gap_12()` | Set both row and column gaps. |
+| `.gap_x_4()`, `.gap_y_2()` | Axis-specific gaps. |
+| Fractional variants | `_0p5`, `_1p5`, `_2p5`, `_3p5`. |
+
+```rust
+div()
+    .flex_col()
+    .gap_y_3()
+    .child(card("Inbox"))
+    .child(card("Today"))
+```
+
+## Padding
+
+| Helper | Maps to |
+| --- | --- |
+| `.p_4()` | `padding: 1rem` |
+| `.px_6()` | `padding-left/right: 1.5rem` |
+| `.py_2()` | `padding-top/bottom: 0.5rem` |
+| `.pl_3()`, `.pr_3()`, `.pt_1()`, `.pb_8()` | Individual sides. |
+
+Need a custom value? Access the style directly: `let style = element.style(); style.padding.left = Some(px(24.));`.
+
+## Margins
+
+| Helper | Use case |
+| --- | --- |
+| `.m_auto()` | Center block with fixed width. |
+| `.mx_auto()` | Center horizontally only. |
+| `.mt_6()` / `.mb_2()` | Vertical separation between sections. |
+| `.ml_auto()` | Push sibling to the far edge inside flex layouts. |
+
+```rust
+div()
+    .flex()
+    .child(logo())
+    .child(div().ml_auto().child(profile_menu()))
+```
+
+<Tip>
+Spacing helpers are implemented via macros, so they’re zero-cost. Prefer them over manual pixels for consistency.
+</Tip>

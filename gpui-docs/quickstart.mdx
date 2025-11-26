@@ -1,0 +1,130 @@
+---
+title: "Quickstart"
+description: "Install GPUI, render your first window, and understand the event loop."
+---
+
+## What you'll build
+
+We will spin up a desktop window that renders a flexbox layout, making it crystal clear how a GPUI application fits together.
+
+### Step 1 · Install prerequisites
+
+<AccordionGroup>
+  <Accordion title="Rust toolchain" icon="wrench">
+    GPUI follows stable Rust, so update to the latest release:
+
+```bash
+rustup update stable
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+    On Linux you also need `libgtk-3-dev` and a Vulkan-capable GPU driver.
+  </Accordion>
+  <Accordion title="Create a project" icon="folder-tree">
+    Inside your workspace:
+
+```bash
+cargo new gpui_playground
+cd gpui_playground
+cargo add gpui --git https://github.com/zed-industries/zed --package gpui
+```
+
+    Using the git dependency keeps you in sync with the latest features until crates.io releases catch up.
+  </Accordion>
+</AccordionGroup>
+
+### Step 2 · Open a window
+
+Drop this into `src/main.rs`:
+
+```rust
+use gpui::{App, Application, Bounds, Context, SharedString, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size};
+
+struct HelloWorld {
+    text: SharedString,
+}
+
+impl Render for HelloWorld {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .size_full()
+            .bg(rgb(0x111827))
+            .items_center()
+            .justify_center()
+            .text_2xl()
+            .text_color(rgb(0xEFF6FF))
+            .child(format!("Hello, {}!", self.text))
+    }
+}
+
+fn main() {
+    Application::new().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(520.), px(360.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |_, cx| cx.new(|_| HelloWorld { text: "World".into() }),
+        )
+        .expect("window to open");
+        cx.activate(true);
+    });
+}
+```
+
+Run the app with:
+
+```bash
+cargo run
+```
+
+### Step 3 · Tweak layout live
+
+Most styling utilities follow Tailwind-style naming. Try changing the background or layout helpers and hot-reload:
+
+```rust
+div()
+    .flex()
+    .flex_col()
+    .gap_3()
+    .p_6()
+    .rounded_xl()
+    .shadow_lg()
+    .bg(rgb(0x1F2937))
+    .child("Stack children vertically")
+    .child("Utilities read like CSS")
+```
+
+<Tip>
+GPUI reruns your `Render` implementation every frame. Store state inside entities (`cx.new(|_| State {})`) and call `cx.notify()` when it changes.
+</Tip>
+
+## Understand the render loop
+
+1. `Application::new().run` hands you an [`App`](/foundations/mental-model#application) context.
+2. `cx.open_window` registers a root view. The closure receives the `Window` handle and returns your view entity.
+3. Each view implements `Render` and returns a tree of elements. Styling happens inline via the `Styled` trait.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Mental model" href="/foundations/mental-model" icon="brain">
+    See how Applications, Views, Entities, and Elements relate.
+  </Card>
+  <Card title="Views & elements" href="/foundations/views-and-elements" icon="sitemap">
+    Learn how `div()`, `text`, and custom elements compose.
+  </Card>
+  <Card title="Layout recipes" href="/layout/layout-recipes" icon="split">
+    Copy/paste sidebars, hero sections, and resizable panes.
+  </Card>
+  <Card title="Utility cheat sheet" href="/utilities/flex" icon="list">
+    Lookup every `.flex_*`, `.items_*`, and spacing helper fast.
+  </Card>
+</CardGroup>
+
+<Note>
+Hit `cargo run --example hello_world` inside `zed/crates/gpui` to compare your app with the official sample.
+</Note>

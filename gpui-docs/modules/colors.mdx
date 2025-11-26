@@ -1,0 +1,82 @@
+---
+title: "Color system"
+description: "Work with `Rgba`, `Hsla`, gradients, and the global `Colors` palette."
+---
+
+GPUI exposes two core color structs in [`color.rs`](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/color.rs):
+
+| Type | Use case | Helpers |
+| --- | --- | --- |
+| [`Rgba`] | Per-channel floating point color used by renderers | `rgb(0xffcc00)`, `rgba(0xffcc00ff)` |
+| [`Hsla`] | Hue/saturation/lightness representation, great for dynamic themes | `hsla(h, s, l, a)`, `Hsla::from(Rgba)` |
+
+```rust
+use gpui::{Rgba, Hsla, rgb, hsla};
+
+let accent: Rgba = rgb(0x4c8dff);
+let warning: Hsla = hsla(0.06, 0.82, 0.58, 1.0);
+let blended = accent.blend(warning.into());
+```
+
+`Rgba` implements `Serialize`, `Deserialize`, and `JsonSchema`, so you can safely store colors inside config files or IPC messages without writing glue code.
+
+## Building fills and gradients
+
+Most layout helpers accept anything that implements `Into<Fill>`. That includes solid colors and gradients from `gpui::color`:
+
+```rust
+use gpui::{div, linear_gradient, Fill, point};
+
+div()
+    .rounded_xl()
+    .bg(linear_gradient(120.0, gpui::purple(), gpui::blue()))
+    .child("Gradient background")
+```
+
+## Default palette (`colors.rs`)
+
+The [`colors`] module defines an ergonomic `Colors` struct plus a `GlobalColors` wrapper so you can pull a palette from `App` or inject your own.
+
+```rust
+use gpui::{App, Colors, GlobalColors, rgb};
+use std::sync::Arc;
+
+fn install_brand_palette(app: &mut App) {
+    let palette = Colors {
+        text: rgb(0xf8fafc),
+        selected_text: rgb(0xffffff),
+        background: rgb(0x05070d),
+        disabled: rgb(0x475569),
+        selected: rgb(0x3b82f6),
+        border: rgb(0x0f172a),
+        separator: rgb(0x1e293b),
+        container: rgb(0x0b1120),
+    };
+
+    app.set_global(GlobalColors(Arc::new(palette)));
+}
+```
+
+Inside any view or context you can retrieve the palette via `cx.default_colors()` and keep your components in sync with the current window appearance:
+
+```rust
+let palette = cx.default_colors().clone();
+div().bg(palette.background).text_color(palette.text);
+```
+
+## Appearance-aware themes
+
+`Colors::for_appearance(window)` chooses between `Colors::light()` and `Colors::dark()` based on `WindowAppearance`. Call it when reacting to OS theme changes:
+
+```rust
+window.on_appearance_changed(cx.listener(|view, _, window, cx| {
+    let palette = Colors::for_appearance(window);
+    cx.set_global(GlobalColors(Arc::new(palette)));
+}));
+```
+
+## Tips
+
+- Prefer `rgb`/`rgba` for literal colors and `hsla` when you want to offset hue/lightness for hover states.
+- Call `.opacity(f32)` on any `Hsla` to reuse semantic colors with subtle transparency.
+- When exposing theming hooks to end users, serialize `Rgba` values—they round-trip as familiar `#rrggbbaa` strings.

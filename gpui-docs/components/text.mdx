@@ -1,0 +1,60 @@
+---
+title: "Text"
+description: "Render plain strings or richly styled runs."
+---
+
+## Plain strings
+
+Any `&'static str`, `String`, or `SharedString` implements `IntoElement`, so this works everywhere:
+
+```rust
+div().child("Hello, GPUI!")
+```
+
+Apply typography utilities on the parent `div` (see [Typography](/utilities/typography)).
+
+## Styled text runs
+
+Use `StyledText` when different parts of the string need their own attributes:
+
+```rust
+use gpui::{StyledText, TextRun, TextStyle, FontWeight};
+
+let default = window.text_style();
+let runs = vec![
+    default.clone().to_run(7),
+    default.clone().font_weight(FontWeight::Semibold).to_run(5),
+];
+
+div().child(StyledText::new("Status: Ready").with_runs(runs));
+```
+
+## Highlight ranges
+
+```rust
+use gpui::HighlightStyle;
+
+StyledText::new(code_snippet).with_highlights([
+    (
+        10..20,
+        HighlightStyle {
+            font_weight: Some(FontWeight::Semibold),
+            background_color: Some(gpui::yellow().opacity(0.2)),
+            ..Default::default()
+        },
+    ),
+]);
+```
+
+## Measuring text
+
+Call `.layout()` to access glyph metrics (used for caret placement in `examples/input.rs`):
+
+```rust
+let layout = text.layout();
+let cursor_x = layout.x_for_index(offset);
+```
+
+<Tip>
+For live editing, route input events through `EntityInputHandler` (see the `input.rs` example) and use `StyledText` to draw selections.
+</Tip>

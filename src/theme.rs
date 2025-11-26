@@ -1,6 +1,6 @@
 use gpui::*;
-use ui::{Theme, ThemeRegistry};
 use std::path::PathBuf;
+use ui::{Theme, ThemeRegistry};
 
 /// Returns the path to the themes directory, which is different for dev and release builds.
 fn themes_path() -> PathBuf {

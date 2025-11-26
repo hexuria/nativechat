@@ -1,0 +1,134 @@
+---
+title: "Layout recipes"
+description: "Copy ready-made flexbox and stack patterns for dashboards, editors, and chats."
+---
+
+Each example below is a complete snippet you can paste into `Render::render`. Adjust colors and spacing to taste.
+
+## Centered card
+
+```rust
+div()
+    .size_full()
+    .flex()
+    .items_center()
+    .justify_center()
+    .bg(rgb(0x0f172a))
+    .child(
+        div()
+            .w(px(420.))
+            .rounded_2xl()
+            .p_8()
+            .gap_4()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x111827))
+            .shadow_xl()
+            .child("Title")
+            .child("Body copy")
+    )
+```
+
+## Sidebar + content
+
+```rust
+div()
+    .flex()
+    .h_full()
+    .child(
+        div()
+            .w(px(260.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .bg(rgb(0x11131a))
+            .child("Navigation")
+            .child("Projects")
+    )
+    .child(
+        div()
+            .flex_1()
+            .p_6()
+            .bg(rgb(0x0b1120))
+            .child("Main canvas")
+    )
+```
+
+## Split pane with resize handle
+
+Pair this View with the `ui/src/components/resizable` helper in this repository.
+
+```rust
+Resizable::new()
+    .direction(Axis::Horizontal)
+    .min(px(180.))
+    .initial_fraction(0.3)
+    .left(|_| sidebar())
+    .right(|_| editor())
+```
+
+## Toolbar with right-aligned actions
+
+```rust
+div()
+    .flex()
+    .items_center()
+    .gap_3()
+    .p_3()
+    .bg(rgb(0x0c111d))
+    .child(div().text_sm().text_color(gpui::slate(300)).child("Project"))
+    .child(div().flex_1()) // spacer
+    .child(pill("Share"))
+    .child(primary_button("Deploy"))
+```
+
+## Chat column
+
+```rust
+div()
+    .flex()
+    .flex_col()
+    .h_full()
+    .child(
+        div()
+            .flex_1()
+            .overflow_scroll()
+            .gap_3()
+            .p_4()
+            .children(messages.iter().map(|message| chat_bubble(message)))
+    )
+    .child(
+        div()
+            .p_4()
+            .bg(rgb(0x11131a))
+            .rounded_t_2xl()
+            .child(message_input())
+    )
+```
+
+## Uniform list for logs
+
+When every row has the same height, `uniform_list` avoids keeping thousands of DOM nodes alive.
+
+```rust
+let list = uniform_list(
+    self.list_state.clone(),
+    |row, _window, _cx| {
+        div()
+            .flex()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .child(row.timestamp.clone())
+            .child(row.message.clone())
+            .into_any_element()
+    },
+);
+
+div().child(list)
+```
+
+<Tip>
+Need inspiration? Browse `zed/crates/gpui/examples/*.rs`—they are small, focused demos of layout features.
+</Tip>

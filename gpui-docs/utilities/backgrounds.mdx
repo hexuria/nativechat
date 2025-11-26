@@ -1,0 +1,43 @@
+---
+title: "Backgrounds & borders"
+description: "Master the visual helpers for fills, borders, and shadows."
+---
+
+## Backgrounds
+
+| Method | Notes |
+| --- | --- |
+| `.bg(Fill)` | Solid colors, gradients, or theme fills. |
+| `.hover(|el| el.bg(...))` | Change fill on hover. |
+
+```rust
+div()
+    .bg(rgb(0x131825))
+    .hover(|card| card.bg(rgb(0x1f2937)))
+```
+
+## Borders
+
+| Method | Effect |
+| --- | --- |
+| `.border()` / `.border_1()` / `.border_2()` | Set uniform border width. |
+| `.border_color(hsla)` | Specify color. |
+| `.border_dashed()` / `.border_dotted()` | Style variants. |
+| `.rounded_sm()` … `.rounded_full()` | Corner radius scale. |
+
+Per-side borders are available via the `_t`, `_b`, `_l`, `_r` suffixes (e.g., `.border_t_1()`).
+
+## Shadows & blur
+
+| Method | Description |
+| --- | --- |
+| `.shadow_sm()` … `.shadow_xl()` | Predefined drop shadows. |
+| `.shadow_none()` | Remove drop shadow. |
+
+## Opacity & blend
+
+- `.opacity(0.8)` fades everything.
+
+<Tip>
+Use higher-level helpers when possible. If you need a bespoke look, call `let style = element.style(); style.box_shadow = vec![...]` to supply custom offsets/colors.
+</Tip>

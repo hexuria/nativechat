@@ -104,6 +104,7 @@ pub struct AppState {
     pub available_apps: Vec<String>,
     pub selected_apps: Vec<String>,
     pub capabilities: Vec<AppCapability>,
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for AppState {
@@ -271,6 +272,7 @@ impl AppState {
             available_apps,
             selected_apps: Vec::new(),
             capabilities,
+            sidebar_collapsed: true,
         }
     }
 
@@ -324,7 +326,7 @@ impl AppState {
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.is_sidebar_open = !self.is_sidebar_open;
+        self.sidebar_collapsed = !self.sidebar_collapsed;
         cx.notify();
     }
 

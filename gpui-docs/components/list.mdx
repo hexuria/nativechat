@@ -1,0 +1,105 @@
+---
+title: "List & UniformList"
+description: "Render thousands of rows efficiently."
+---
+
+GPUI provides two list elements:
+
+- `list(state, render_item)` – variable-height rows, virtualized.
+- `uniform_list(state, render_item)` – fixed-height rows, simpler API.
+
+## Variable-height list
+
+```rust
+use gpui::{ListState, ListAlignment, px};
+
+pub struct LogView {
+    rows: Vec<Row>,
+    list_state: ListState,
+}
+
+impl LogView {
+    pub fn new(rows: Vec<Row>) -> Self {
+        Self {
+            list_state: ListState::new(rows.len(), ListAlignment::Top, px(200.)),
+            rows,
+        }
+    }
+}
+
+impl Render for LogView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        list(
+            self.list_state.clone(),
+            move |index, window, _cx| {
+                let row = &self.rows[index];
+                div()
+                    .flex()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .child(row.timestamp.clone())
+                    .child(row.message.clone())
+                    .into_any_element()
+            },
+        )
+        .bg(rgb(0x0f172a))
+    }
+}
+```
+
+### Key points
+
+- Store `ListState` on your view so GPUI can cache measurements.
+- Call `list_state.splice(range, new_count)` when the data changes so the list knows which rows must be remeasured.
+- Use `ListAlignment::Bottom` for chat logs that grow upward.
+
+## Uniform list
+
+```rust
+use gpui::ElementId;
+
+let list = uniform_list(
+    ElementId::Name("logs".into()),
+    self.rows.len(),
+    move |range, _window, _cx| {
+        range
+            .map(|index| {
+                div()
+                    .h(px(32.))
+                    .px_3()
+                    .items_center()
+                    .child(self.rows[index].clone())
+            })
+            .collect::<Vec<_>>()
+    },
+);
+
+div().child(list)
+```
+
+Uniform lists infer row height from the first rendered child and recycle nodes behind the scenes. Use them when every row is the same height (chat bubbles, log lines, file explorers).
+
+## Scroll handlers
+
+Both lists expose callbacks for scroll position:
+
+```rust
+self.list_state.set_scroll_handler(|event, _window, _cx| {
+    println!("Rows {:?} now visible", event.visible_range);
+});
+```
+
+## Measuring again
+
+After inserting/removing rows with different heights, call:
+
+```rust
+self.list_state.reset(self.rows.len());
+```
+
+This clears cached metrics so the scrollbar reflects the new layout.
+
+<Tip>
+Need sticky headers or separators? Compose a `div()` above the list and keep the scrolling element height constrained with `.flex_1().overflow_hidden()`.
+</Tip>

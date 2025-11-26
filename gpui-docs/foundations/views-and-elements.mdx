@@ -1,0 +1,108 @@
+---
+title: "Views & elements"
+description: "Learn how Render works and how to compose div, text, and custom elements."
+---
+
+GPUI views are small Rust structs plus a `Render` implementation. Inside `render` you assemble elements with fluent builders.
+
+## Anatomy of a view
+
+```rust
+use gpui::{div, prelude::*, rgb};
+
+pub struct Toolbar {
+    pub items: Vec<String>,
+}
+
+impl Render for Toolbar {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(rgb(0x0f172a))
+            .child("My toolbar")
+            .children(self.items.iter().map(|label| {
+                div()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .hover(|btn| btn.bg(rgb(0x1d4ed8)))
+                    .text_sm()
+                    .text_color(rgb(0xf1f5f9))
+                    .child(label.clone())
+            }))
+    }
+}
+```
+
+Things to notice:
+
+- `div()` returns a builder that implements `Styled` and `IntoElement`.
+- `.child` accepts any `IntoElement`: strings, other divs, lists, SVGs.
+- `.children(iterable)` is handy when mapping vectors to UI.
+- All layout + styling helpers are chainable; they mutate the builder and return it.
+
+## Fluent styling and interaction
+
+Elements share two big traits:
+
+- **`Styled`** – exposes Tailwind-like helpers (`flex_row`, `gap_3`, `border_color`).
+- **`InteractiveElement`** – attaches events: `.on_mouse_down`, `.hover`, `.draggable`, `.on_action::<MyAction>()`.
+
+Example: a clickable list row.
+
+```rust
+div()
+    .flex()
+    .items_center()
+    .justify_between()
+    .px_4()
+    .py_2()
+    .rounded_lg()
+    .hover(|row| row.bg(rgb(0x1f2937)))
+    .on_click(|_event, window, cx| {
+        window.set_cursor_style(CursorStyle::PointingHand);
+        cx.dispatch(MyAction);
+    })
+    .child(title.clone())
+    .child("Open →")
+```
+
+## Returning multiple roots
+
+`Render::render` only needs to return something that implements `IntoElement`. Use `fragment` when you want siblings without wrapping them:
+
+```rust
+use gpui::fragment;
+
+fragment([
+    div().child("Primary column"),
+    div().child("Secondary column"),
+])
+```
+
+## Reusing UI trees
+
+Because builders are just Rust functions, extract helpers freely:
+
+```rust
+fn pill(label: impl IntoElement) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(rgb(0x312e81))
+        .text_xs()
+        .child(label)
+}
+
+// Usage inside render
+div().child(pill("Rust"));
+```
+
+<Tip>
+If your helper needs state, make it its own view struct and register it with `cx.new`. Keep pure helpers stateless for easy reuse.
+</Tip>

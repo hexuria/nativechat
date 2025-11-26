@@ -1,0 +1,53 @@
+---
+title: "The GPUI mental model"
+description: "Understand how applications, views, entities, and elements fit together."
+---
+
+GPUI blends immediate-mode rendering with retained state. Think of it as **React-style view code** running inside a **Rust application shell** that GPUI manages for you.
+
+## The three layers
+
+| Layer | What it owns | Rust types you’ll touch |
+| --- | --- | --- |
+| Application | Event loop, windows, async tasks | `Application`, `App`, `Application::run` |
+| Views | Your stateful UI components | `Entity<T>`, `cx.new`, `Render` trait |
+| Elements | Visual building blocks styled with utilities | `div()`, `list()`, `img()`, text nodes |
+
+### 1. Application
+
+- Call `Application::new().run(|cx| { ... })` once.
+- Use the [`App`] context to open windows (`cx.open_window`) and schedule tasks.
+- Each window receives a root view factory (`|window, cx| cx.new(|_| MyView::default())`).
+
+### 2. View entities
+
+- A view is just a Rust struct whose data lives inside an `Entity<T>` managed by GPUI.
+- The struct implements `Render` and optionally event traits (`Focusable`, `ElementInputHandler`, etc.).
+- Use `cx.update(&self.entity, |view, cx| ...)` to mutate state safely and notify GPUI when to repaint.
+
+### 3. Elements
+
+- `Render::render` returns anything that implements `IntoElement`—usually the fluent builders like `div()`.
+- Elements grab their styling from the `Styled` trait, so `.flex().gap_2().bg(...)` feels like Tailwind.
+- Complex widgets (lists, text editor, canvas) are just elements composed with the same API.
+
+<Note>
+You never manually diff or reconcile trees. GPUI invalidates regions automatically when you call `cx.notify()` inside a view update.
+</Note>
+
+## Data flow at a glance
+
+1. **User input** → translated into actions (`actions!` macro) or low-level events (mouse, keyboard, scroll).
+2. **Context methods** (`cx.listener`, `cx.spawn`, `cx.defer`) dispatch those events to the right entities.
+3. **State mutation** occurs inside `cx.update` or event handlers. When data changes, call `cx.notify()`.
+4. **Render** runs again for any view marked dirty and returns a fresh element tree for that frame.
+
+## When to use what
+
+- Use the **application layer** for window management, global shortcuts, and async executors.
+- Use **views** for anything that needs state (forms, panels, editors). Keep them small and composable.
+- Use **elements** for layout and styling. If you find yourself reusing the same tree, wrap it in a helper function that returns `impl IntoElement`.
+
+<Tip>
+If something feels global (theme, router, clipboard access), look for it on `App` or the `Context`. If it’s per-view, store it in your entity.
+</Tip>

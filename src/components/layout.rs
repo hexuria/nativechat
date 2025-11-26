@@ -3,8 +3,9 @@ use crate::components::modals::{
     account_settings::AccountSettingsModal, profile_settings::ProfileSettingsModal,
 };
 use crate::components::sidebar::SidebarView;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
-use ui::h_flex;
+use ui::{PixelsExt, resizable::h_resizable, resizable::resizable_panel};
 
 use crate::state::AppState;
 
@@ -42,32 +43,57 @@ impl Render for Layout {
 
         div()
             .size_full()
-            .child(
-                h_flex()
-                    .h_full()
-                    .w_full()
-                    .children(if state.is_sidebar_open {
-                        Some(self.sidebar.clone())
-                    } else {
-                        None
-                    })
-                    .child(
-                        div()
-                            .flex_grow()
-                            .size_full()
-                            .overflow_hidden()
-                            .child(self.chat.clone()),
-                    ),
+            .when(state.sidebar_collapsed, |this| {
+                this.child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .child(div().w(px(64.)).flex_shrink_0().child(self.sidebar.clone()))
+                        .child(
+                            div()
+                                .size_full()
+                                .flex_grow()
+                                .overflow_hidden()
+                                .child(self.chat.clone()),
+                        ),
+                )
+            })
+            .when(!state.sidebar_collapsed, |this| {
+                this.child(
+                    h_resizable("main-layout")
+                        .child(
+                            resizable_panel()
+                                .size(px(280.))
+                                .size_range(px(0.)..px(700.))
+                                .child(self.sidebar.clone()),
+                        )
+                        .on_resize({
+                            let state = self.state.clone();
+                            move |resizable_state, _, cx| {
+                                let sizes = resizable_state.read(cx).sizes();
+                                if let Some(sidebar_width) = sizes.get(0) {
+                                    if sidebar_width.as_f32() < 180.0 {
+                                        state.update(cx, |state, cx| {
+                                            if !state.sidebar_collapsed {
+                                                state.toggle_sidebar(cx);
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        })
+                        .child(resizable_panel().child(self.chat.clone())),
+                )
+            })
+            .children(
+                state
+                    .is_account_settings_open
+                    .then(|| self.account_settings_modal.clone().into_any_element()),
             )
-            .children(if state.is_account_settings_open {
-                Some(self.account_settings_modal.clone().into_any_element())
-            } else {
-                None
-            })
-            .children(if state.is_profile_settings_open {
-                Some(self.profile_settings_modal.clone().into_any_element())
-            } else {
-                None
-            })
+            .children(
+                state
+                    .is_profile_settings_open
+                    .then(|| self.profile_settings_modal.clone().into_any_element()),
+            )
     }
 }

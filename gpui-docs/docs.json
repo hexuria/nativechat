@@ -1,0 +1,149 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "GPUI Handbook",
+  "colors": {
+    "primary": "#2563EB",
+    "light": "#38BDF8",
+    "dark": "#1E3A8A"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Start here",
+            "pages": [
+              "index",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core ideas",
+            "pages": [
+              "foundations/mental-model",
+              "foundations/views-and-elements",
+              "foundations/state-and-actions"
+            ]
+          },
+          {
+            "group": "Layout & styling",
+            "pages": [
+              "layout/layout-recipes",
+              "layout/spacing-alignment",
+              "styling/colors-typography",
+              "styling/style-system"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Utility reference",
+        "groups": [
+          {
+            "group": "Layout primitives",
+            "pages": [
+              "utilities/display",
+              "utilities/flex",
+              "utilities/spacing"
+            ]
+          },
+          {
+            "group": "Visual design",
+            "pages": [
+              "utilities/backgrounds",
+              "utilities/typography"
+            ]
+          },
+          {
+            "group": "Elements",
+            "pages": [
+              "components/div",
+              "components/text",
+              "components/list"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Modules",
+        "groups": [
+          {
+            "group": "Rendering & colors",
+            "pages": [
+              "modules/colors"
+            ]
+          },
+          {
+            "group": "Assets & media",
+            "pages": [
+              "modules/assets"
+            ]
+          },
+          {
+            "group": "Input & text",
+            "pages": [
+              "modules/input"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GPUI crate",
+          "href": "https://docs.rs/gpui/latest/gpui/",
+          "icon": "code"
+        },
+        {
+          "anchor": "Zed source",
+          "href": "https://github.com/zed-industries/zed",
+          "icon": "book-open-cover"
+        }
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GPUI.rs",
+        "href": "https://www.gpui.rs/"
+      },
+      {
+        "label": "Examples",
+        "href": "https://github.com/zed-industries/zed/tree/main/crates/gpui/examples"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Join the Discord",
+      "href": "https://zed.dev/community-links"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "x": "https://x.com/zed_dev",
+      "github": "https://github.com/zed-industries/zed",
+      "linkedin": "https://www.linkedin.com/company/zed-industries/"
+    }
+  }
+}

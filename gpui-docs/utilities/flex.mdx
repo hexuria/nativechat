@@ -1,0 +1,54 @@
+---
+title: "Flex utilities"
+description: "Every flex helper GPUI exposes, with the CSS it maps to."
+---
+
+## Direction & wrapping
+
+| Method | CSS | Notes |
+| --- | --- | --- |
+| `.flex_row()` / `.flex_row_reverse()` | `flex-direction: row` | Horizontal layouts. |
+| `.flex_col()` / `.flex_col_reverse()` | `flex-direction: column` | Vertical stacks. |
+| `.flex_wrap()` / `.flex_wrap_reverse()` | `flex-wrap: wrap` | Allow wrapping. |
+| `.flex_nowrap()` | `flex-wrap: nowrap` | Default. |
+
+## Sizing children
+
+| Method | Meaning |
+| --- | --- |
+| `.flex_1()` | `flex: 1 1 0%` – fills available space. |
+| `.flex_auto()` | `flex: 1 1 auto` – grows but respects intrinsic width. |
+| `.flex_initial()` | `flex: 0 1 auto` – shrink only. |
+| `.flex_none()` | `flex: 0 0 auto` – fixed size. |
+| `.flex_basis(Length)` | Set `flex-basis`. Pass `px(200.)`, `Length::Percent(50.)`, etc. |
+| `.flex_grow()` | Same as `flex-grow: 1`. |
+| `.flex_shrink()` / `.flex_shrink_0()` | Control shrinking. |
+
+## Alignment helpers
+
+See [Spacing & alignment](/layout/spacing-alignment) for full tables of `.items_*`, `.justify_*`, and `.content_*` variants.
+
+## Putting it together
+
+```rust
+div()
+    .flex()
+    .flex_row()
+    .gap_4()
+    .child(
+        div()
+            .w(px(240.))
+            .flex_none()
+            .child("Sidebar")
+    )
+    .child(
+        div()
+            .flex_1()
+            .min_w(px(320.))
+            .child("Canvas")
+    )
+```
+
+<Tip>
+`flex_1()` is the quickest way to create a “fill the rest” column. Combine with `.min_w`/`.max_w` to keep layouts responsive.
+</Tip>

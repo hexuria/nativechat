@@ -1,0 +1,108 @@
+---
+title: "State & actions"
+description: "Manage data inside entities and wire keyboard or pointer input to your views."
+---
+
+State in GPUI lives inside entities that you register with the context. Actions translate input devices into intent, similar to React events or command palettes.
+
+## Creating and updating entities
+
+```rust
+struct Counter {
+    value: i32,
+}
+
+impl Counter {
+    fn increment(&mut self, cx: &mut Context<Self>) {
+        self.value += 1;
+        cx.notify();
+    }
+}
+
+fn spawn_counter(cx: &mut Context<AppShell>) -> Entity<Counter> {
+    cx.new(|_| Counter { value: 0 })
+}
+
+// somewhere else
+cx.update(&self.counter, |counter, cx| counter.increment(cx));
+```
+
+Key ideas:
+
+- `cx.new` stores the struct inside GPUI’s arena and returns an `Entity<T>` handle.
+- `cx.update(&entity, |state, cx| { ... })` gives you `&mut T` plus the context.
+- Call `cx.notify()` when data changes to trigger a re-render on the next frame.
+
+## Mapping input to actions
+
+The `actions!` macro declares strongly typed commands:
+
+```rust
+actions!(counter_actions, [Increment, Decrement]);
+
+impl Render for Counter {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let on_increment = cx.listener(|counter, _: &Increment, _window, cx| counter.increment(cx));
+        div()
+            .flex()
+            .gap_2()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(gpui::green())
+                    .on_action::<Increment>(on_increment)
+                    .child("+")
+            )
+            .child(self.value.to_string())
+    }
+}
+```
+
+Bind keystrokes globally or locally:
+
+```rust
+cx.bind_keys([KeyBinding::new("cmd=", Increment, None)]);
+```
+
+Inside an element you can capture actions either on the capture or bubble phase:
+
+```rust
+div().capture_action::<Increment>(|action, _window, cx| {
+    cx.dispatch(action.clone());
+});
+```
+
+## Low-level events
+
+If you need raw pointer or keyboard data, use the `InteractiveElement` methods exposed on `div`:
+
+```rust
+div()
+    .on_mouse_down(MouseButton::Left, |event, _window, cx| {
+        cx.log(format!("Mouse down at {:?}", event.position));
+    })
+    .on_scroll_wheel(|event, _, _| println!("Scrolled {:?}", event.delta));
+```
+
+For text input, implement `EntityInputHandler` on your view (see `examples/input.rs`). It gives you selection ranges, clipboard access, and IME hooks.
+
+## Async work
+
+GPUI ships with an executor that cooperates with the UI thread:
+
+```rust
+cx.spawn(|cx| async move {
+    let response = http_client.fetch_data().await?;
+    cx.update(&entity, |state, cx| {
+        state.data = response;
+        cx.notify();
+    });
+    anyhow::Ok(())
+});
+```
+
+<Tip>
+Keep your entities small and single-purpose. Compose them by storing `Entity<T>` handles inside parent structs.
+</Tip>

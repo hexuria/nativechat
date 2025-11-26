@@ -11,7 +11,6 @@ use gpui::{
     StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
 };
 
-use super::dropdown_button::DropdownButton;
 use crate::menu::PopupMenu;
 
 #[derive(Default, Clone, Copy)]

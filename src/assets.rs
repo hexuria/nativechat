@@ -5,6 +5,7 @@ use std::borrow::Cow;
 #[derive(RustEmbed)]
 #[folder = "assets"]
 #[include = "icons/**/*.svg"]
+#[include = "**/*.png"]
 pub struct LocalAssets;
 
 pub struct CombinedAssets;

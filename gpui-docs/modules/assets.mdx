@@ -1,0 +1,110 @@
+---
+title: "Asset pipeline"
+description: "Connect `AssetSource`, `Asset` loaders, and elements like `img()`."
+---
+
+GPUI keeps asset loading pluggable so you can serve bytes from the file system, embedded blobs, or even remote URLs. Two modules power this system:
+
+- [`assets.rs`](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/assets.rs) – synchronous `AssetSource` and the `RenderImage` container used by `img()`.
+- [`asset_cache.rs`](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/asset_cache.rs) – async `Asset` trait + cache keys, used by `window.use_asset`.
+
+## 1. Provide an `AssetSource`
+
+Implement `AssetSource` to tell GPUI how to load raw bytes by path. `Application::with_assets` installs it before the event loop starts.
+
+```rust
+use gpui::{Application, App, AssetSource, SharedString};
+use std::borrow::Cow;
+
+struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        std::fs::read(path)
+            .map(|buf| Some(Cow::Owned(buf)))
+            .map_err(Into::into)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(std::fs::read_dir(path)?
+            .filter_map(|entry| Some(entry.ok()?.path().to_string_lossy().into()))
+            .collect())
+    }
+}
+
+fn main() {
+    Application::new()
+        .with_assets(Assets)
+        .run(|cx: &mut App| { /* open windows */ });
+}
+```
+
+Once registered, `cx.asset_source()` becomes available to elements that fetch data (images, SVGs, etc.).
+
+## 2. Display images with `img()`
+
+`img(source)` accepts anything that implements `Into<ImageSource>`: embedded keys, file paths, URLs (`SharedUri`), or even `Arc<RenderImage>` you generated yourself.
+
+```rust
+div().child(
+    img("images/logo.png")
+        .object_fit(gpui::ObjectFit::Cover)
+        .with_loading(|| skeleton().into_any_element())
+        .with_fallback(|| error_badge().into_any_element()),
+);
+```
+
+Internally `img` uses `ImgResourceLoader = AssetLogger<ImageAssetLoader>`, which automatically logs failures and caches decoded frames. You can opt out by supplying your own `ImageSource::Custom` closure.
+
+## 3. Async assets with `Asset` + `window.use_asset`
+
+When bytes need preprocessing (e.g., decoding GIFs after an artificial delay) implement the `Asset` trait. Keys are simple structs you define and must implement `Clone + Hash`.
+
+```rust
+use gpui::{Asset, AssetLogger, ImageAssetLoader, RenderImage, Resource, Window};
+
+#[derive(Clone, Hash)]
+struct AvatarKey { path: Resource };
+
+struct AvatarAsset;
+
+impl Asset for AvatarAsset {
+    type Source = AvatarKey;
+    type Output = Result<Arc<RenderImage>, gpui::ImageCacheError>;
+
+    fn load(
+        key: Self::Source,
+        cx: &mut gpui::App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        AssetLogger::<ImageAssetLoader>::load(key.path, cx)
+    }
+}
+
+fn avatar(path: impl Into<Resource>) -> impl IntoElement {
+    let key = AvatarKey { path: path.into() };
+    img(move |window: &mut Window, cx: &mut gpui::App| window.use_asset::<AvatarAsset>(&key, cx))
+        .with_loading(|| spinner().into_any_element())
+        .with_fallback(|| placeholder().into_any_element())
+}
+```
+
+- `window.use_asset::<A>(&key, cx)` kicks off the future once and caches the result per key.
+- `cx.remove_asset::<A>(&key)` invalidates the cache, letting you refetch.
+
+## 4. Programmatic images (`RenderImage`)
+
+`RenderImage::new` takes decoded `image::Frame`s. Use it when you already have raw pixels (e.g., procedurally generated charts) and want to bypass disk I/O:
+
+```rust
+let image = RenderImage::new(vec![frame]);
+let arc = Arc::new(image);
+img(arc.clone()) // `ImageSource::Render`
+```
+
+## 5. Resources beyond images
+
+`asset_cache::Resource` tracks URIs, file system paths, or embedded identifiers. Reuse it anywhere you need a stable hash to look up arbitrary bytes (fonts, JSON, shaders, etc.).
+
+<Tip>
+Combine `AssetLogger<T>` with your loader type to automatically log `Err` variants, as seen in `examples/image_loading.rs`.
+</Tip>

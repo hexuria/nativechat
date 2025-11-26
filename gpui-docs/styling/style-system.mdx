@@ -1,0 +1,194 @@
+---
+title: "Style & Styled utilities"
+description: "Tailwind-inspired layout, spacing, and typography APIs defined in `gpui/src/style.rs` and `gpui/src/styled.rs`."
+---
+
+GPUI leans on familiar CSS/Tailwind mental models while still owning an explicit GPU-friendly `Style` object. The pairing of [`Style`](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/style.rs) and the Tailwind-like [`Styled`](https://github.com/zed-industries/zed/blob/main/crates/gpui/src/styled.rs) trait gives every element the same vocabulary for flexbox, grid, spacing, typography, cursors, and shadows—no stringly-typed class names required.
+
+## Style at a glance
+
+`Style` is a serializable struct that mirrors CSS properties and some GPUI-specific toggles. Many fields (marked with `#[refineable]` in `style.rs`) participate in the `StyleRefinement` diff so they can cascade through the view tree.
+
+| Concern | Fields in `Style` | Utility methods (from `Styled`) | Tailwind analogue |
+| --- | --- | --- | --- |
+| Layout & flow | `display`, `flex_direction`, `flex_wrap`, `align_*`, `justify_content`, `gap`, `grid_*` | `.flex()`, `.flex_col()`, `.items_center()`, `.gap_3()`, `.grid_cols(12)` | `flex`, `flex-col`, `items-center`, `gap-3`, `grid-cols-12` |
+| Sizing & spacing | `size`, `min_size`, `max_size`, `margin`, `padding`, `border_widths`, `inset` | `.w_64()`, `.size_full()`, `.m_neg_2()`, `.px_4()`, `.rounded_lg()` | `w-64`, `w-full`, `-m-2`, `px-4`, `rounded-lg` |
+| Visual treatment | `background`, `border_color`, `border_style`, `corner_radii`, `box_shadow`, `opacity`, `mouse_cursor` | `.bg(...)`, `.border_color(...)`, `.border_dashed()`, `.shadow_md()`, `.opacity(0.85)`, `.cursor_pointer()` | `bg-*`, `border-*`, `shadow-md`, `opacity-85`, `cursor-pointer` |
+| Text & overflow | `text` (`TextStyleRefinement`), `white_space`, `text_overflow`, `line_clamp`, `overflow`, `allow_concurrent_scroll`, `restrict_scroll_to_axis` | `.text_sm()`, `.font_weight(FontWeight::BOLD)`, `.truncate()`, `.line_clamp(2)`, `.overflow_hidden()` | `text-sm`, `font-bold`, `truncate`, `line-clamp-2`, `overflow-hidden` |
+
+### Layout, overflow, and scroll safety
+
+- `display`, `visibility`, `position`, and `Overflow` enums match their CSS counterparts, so `div().flex().overflow_y_hidden()` feels natural.
+- `scrollbar_width`, `allow_concurrent_scroll`, and `restrict_scroll_to_axis` expose GPUI-specific scroll ergonomics. Opt in to web-like wheel behavior by toggling `restrict_scroll_to_axis = Some(true)` on a refinement.
+- `grid_cols`, `grid_rows`, and `grid_location` (plus helpers like `.col_span(3)`) let flex and grid containers share the same struct.
+
+### Sizing and spacing scale
+
+`gpui_macros::style_helpers!()` generates every spacing ramp from Tailwind (0 → 96, fractions, `px`, `full`, etc.) plus negative variants, so you can call `.pt_6()`, `.gap_1_2()`, or `.m_neg_4()` without remembering pixel values. Passing explicit lengths still works via the value-taking setters like `.w(px(280.))`.
+
+### Visual & text styling
+
+- `background` accepts any `Into<Fill>`: `Hsla`, `Rgba`, or gradients.
+- Border helpers cover width, color, style (`solid` by default, `.border_dashed()` for patterns) and radius (`.rounded_sm()` up to `.rounded_full()`).
+- `box_shadow` uses the curated presets from `styled.rs` (`shadow_sm`, `shadow_lg`, …) or can be set manually with `Vec<BoxShadow>`.
+- `text` nests a `TextStyleRefinement`, giving you font family, fallbacks, feature flags, underline/strikethrough structs, white-space rules, and truncation (`TextOverflow::Truncate`).
+- `line_clamp` and `.truncate()` are layered helpers that mirror Tailwind’s typography utilities while still calling into GPUI’s `overflow_mask` logic.
+
+### Grid and placement extras
+
+`grid_location_mut()` on `StyleRefinement` provides typed access to the row/column `Range<GridPlacement>` used by `.col_start()`, `.row_span()`, etc. Because these methods ultimately populate `Style::grid_location`, you can mix utility calls and manual tweaks:
+
+```rust
+let style = view.style();
+style.grid_location_mut().column.start = GridPlacement::Line(2);
+```
+
+### Advanced knobs unique to GPUI
+
+- `opacity` applies to the element and cascades to children just like CSS `opacity`.
+- `mouse_cursor` takes any `CursorStyle` (with helpers like `.cursor_text()` and `.cursor_grab()`).
+- `debug`/`debug_below` (compiled in `debug_assertions`) draw red outlines so you can inspect layout bounds from your own components by toggling `.debug()`.
+- `ObjectFit::get_bounds` lives in `style.rs` and backs image/video components for `cover`, `contain`, and `scale-down` semantics.
+- `Style::paint` uses `corner_radii.clamp_radii_for_quad_size`, `box_shadow`, and border masks to match the web’s rendering order; you get consistent visuals regardless of platform scale.
+
+## Refinements and cascading defaults
+
+`Style` derives `Refineable`, so the macro creates a `StyleRefinement` companion where every field is optional. Views store refinements, and GPUI merges them from parent → child before painting.
+
+You can build reusable refinements because `StyleRefinement` itself implements `Styled`:
+
+```rust
+use gpui::{hsla, px, rems, StyleRefinement, Styled};
+
+pub fn badge_style() -> StyleRefinement {
+    StyleRefinement::default()
+        .flex()
+        .items_center()
+        .gap_x_2()
+        .px_3()
+        .py_1()
+        .rounded_full()
+        .text_sm()
+        .text_color(hsla(0.58, 0.4, 0.1, 1.0))
+        .bg(hsla(0.58, 0.65, 0.78, 1.0))
+        .line_height(rems(1.25))
+}
+```
+
+For less common toggles, mutate the refinement directly:
+
+```rust
+let style = pill.style();
+style.allow_concurrent_scroll = Some(true);
+style.restrict_scroll_to_axis = Some(true);
+style.scrollbar_width = Some(px(12.).into());
+```
+
+Need precise grid placement? Use the dedicated helper:
+
+```rust
+let location = pill.style().grid_location_mut();
+location.row = GridPlacement::Span(2)..GridPlacement::Auto;
+```
+
+Because refinements serialize cleanly (derive `Serialize`, `Deserialize`, and `JsonSchema`), you can persist them in workspace profiles or ship presets without bespoke glue.
+
+## The Styled trait: Tailwind ergonomics without class strings
+
+Every element that implements `Styled` exposes the same fluent builders that `div()` uses. `styled.rs` wires this trait to the `gpui_macros::style_helpers!()` family, which emits hundreds of zero-cost methods mirroring Tailwind’s docs.
+
+```rust
+use gpui::{div, hsla, px};
+
+let toolbar = div()
+    .flex()
+    .items_center()
+    .gap_x_3()
+    .px_4()
+    .py_2()
+    .h_12()
+    .bg(hsla(0.62, 0.32, 0.08, 0.85))
+    .text_sm()
+    .text_color(hsla(0.62, 0.12, 0.98, 1.0))
+    .border_color(hsla(0.62, 0.32, 0.25, 0.6))
+    .border_t_px();
+```
+
+Highlights from the helper catalog:
+
+- **Display & flow**: `.block()`, `.flex()`, `.grid()`, `.hidden()` toggle `display`. `flex_*` methods wrap [`FlexDirection`] variants. `.flex_wrap()` / `.flex_nowrap()` map to `FlexWrap`.
+- **Spacing & sizing**: `.w_*`, `.h_*`, `.min_w_*`, `.gap_*`, `.p_*`, `.m_*`, plus value-taking setters for arbitrary `Length`/`DefiniteLength`. Every spacing helper also has a negative sibling (e.g., `.m_neg_2()`).
+- **Positioning**: `.relative()`, `.absolute()`, and inset helpers (`.top_0()`, `.inset(px(8.))`).
+- **Overflow & scrolling**: `.overflow_hidden()`, `.overflow_x_hidden()`, `.truncate()`, `.line_clamp(n)` chain overflow, whitespace, and ellipsis logic for you.
+- **Cursors & interaction**: `.cursor_pointer()`, `.cursor_text()`, `.cursor_grab()`, etc., are thin setters over `CursorStyle`.
+- **Borders & effects**: `.border_color()`, `.border_px()`, `.rounded_2xl()`, `.shadow_md()` reuse the presets defined in `style.rs` to match Tailwind’s scale.
+- **Typography**: `.text_xs()` … `.text_3xl()`, `.font_weight(FontWeight::BOLD)`, `.italic()`, `.underline()`, `.line_through()`, `.text_decoration_color(hsla(...))`, `.text_decoration_wavy()`, `.text_bg()` all poke the nested `TextStyleRefinement`.
+- **Grid helpers**: `.grid_cols(n)`, `.grid_rows(n)`, `.col_span_full()`, `.row_start(2)`, `.col_end_auto()` wrap the structured `GridLocation` type.
+- **Debugging**: in debug builds use `.debug()` / `.debug_below()` to visualize element bounds from your component code.
+
+## Implementing Styled on your own components
+
+Store a `StyleRefinement` field, implement `Styled`, and your type instantly gains the fluent API:
+
+```rust
+use gpui::{SharedString, StyleRefinement, Styled};
+
+pub struct Pill {
+    label: SharedString,
+    style: StyleRefinement,
+}
+
+impl Pill {
+    pub fn new(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+            style: StyleRefinement::default(),
+        }
+        .flex()
+        .items_center()
+        .gap_x_2()
+        .px_3()
+        .py_1()
+        .rounded_full()
+        .text_sm()
+    }
+}
+
+impl Styled for Pill {
+    fn style(&mut self) -> &mut StyleRefinement {
+        &mut self.style
+    }
+}
+
+```
+
+Once the trait is implemented, whatever `IntoElement`/`Render` logic you provide for `Pill` automatically inherits the accumulated refinement before GPUI hands the element to the renderer.
+```
+
+Because the trait methods take ownership, you can expose builder-style APIs (`pill.text_color(...)`) the same way GPUI’s core elements do.
+
+## Text styling, highlighting, and truncation
+
+`TextStyle` (inside `Style::text`) captures color, font metadata, line height (`DefiniteLength`), underline/strikethrough structs, whitespace policies, and optional `line_clamp`. For inline emphasis you can build a `HighlightStyle` and blend ranges with `combine_highlights`:
+
+```rust
+use gpui::{combine_highlights, hsla, HighlightStyle, FontWeight};
+
+let highlights = combine_highlights(
+    [(0..12, HighlightStyle::color(hsla(0.0, 0.85, 0.55, 1.0)))],
+    [(4..20, FontWeight::BOLD.into())],
+);
+```
+
+The resulting iterator yields merged ranges with blended colors and font metadata, mirroring Tailwind’s `mix-blend` typography utilities but at run time.
+
+## Tips & best practices
+
+- Reach for `StyleRefinement::default()` + fluent helpers instead of mutating `Style` directly; it keeps components composable and diff-friendly.
+- Stick to the provided spacing scale unless you need bespoke measurements—custom `Length` setters coexist peacefully with the Tailwind ramp, but the ramp keeps your UI cohesive.
+- Toggle `restrict_scroll_to_axis` whenever a vertical list contains nested horizontal scrollers; it reproduces the web’s Shift-to-scroll behavior described inline in `style.rs`.
+- Use `.truncate()` or `.line_clamp(n)` instead of manual `TextOverflow` plumbing—they wire white-space, overflow, and ellipsis in one call.
+- When composing bespoke renderers, inspect `Style::paint` to see how shadows, fills, and borders interact; matching that order avoids visual seams.
+- Debug layout issues with `.debug()` during development, but gate it behind feature flags for release builds.
+
+With these building blocks you get the ergonomics of Tailwind plus the type safety of Rust, making `style.rs` and `styled.rs` the heart of GPUI’s design system.

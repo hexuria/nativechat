@@ -1,13 +1,9 @@
 use crate::state::AppState;
-use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement, Render,
-    SharedString, Styled, Window, div, px,
+    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use ui::{
-    ActiveTheme, Icon, IconName, StyledExt, Theme, avatar::Avatar, scroll::ScrollbarAxis,
-    sidebar::SidebarMenuItem,
-};
+use ui::{ActiveTheme, Collapsible, Icon, IconName, Side, avatar::Avatar, h_flex, sidebar::*};
 
 pub struct SidebarView {
     state: Entity<AppState>,
@@ -19,315 +15,267 @@ impl SidebarView {
 
         Self { state }
     }
-
-    fn render_custom_item(
-        &self,
-        label: impl Into<SharedString>,
-        path: &str,
-        active: bool,
-        any_modal_open: bool,
-        theme: &Theme,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        let label = label.into();
-        let mut item = div()
-            .id(label.clone())
-            .flex()
-            .items_center()
-            .gap_2()
-            .p_2()
-            .rounded_md()
-            .hover(|s| s.bg(theme.accent))
-            .bg(if active {
-                theme.accent
-            } else {
-                gpui::transparent_black()
-            })
-            .on_click(on_click)
-            .child(
-                gpui::svg()
-                    .path(path.to_string())
-                    .size(px(16.0))
-                    .text_color(theme.foreground),
-            )
-            .child(div().child(label).text_sm());
-
-        if !any_modal_open {
-            item = item.cursor_pointer();
-        }
-
-        item
-    }
-
-    fn render_menu_item(
-        &self,
-        label: impl Into<SharedString>,
-        icon: IconName,
-        any_modal_open: bool,
-        theme: &Theme,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        let label = label.into();
-        let mut item = div()
-            .id(label.clone())
-            .flex()
-            .items_center()
-            .gap_2()
-            .p_2()
-            .rounded_md()
-            .hover(|s| s.bg(theme.accent))
-            .on_click(on_click)
-            .child(Icon::new(icon).size(px(16.0)).text_color(theme.foreground))
-            .child(div().child(label).text_sm());
-
-        if !any_modal_open {
-            item = item.cursor_pointer();
-        }
-
-        item
-    }
 }
 
 impl Render for SidebarView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
+        let collapsed = state.sidebar_collapsed;
         let active_id = state.active_conversation_id;
+
         let theme = cx.theme();
 
+        // Check if any modal is open
         // Check if any modal is open
         let any_modal_open = state.is_voice_mode_open
             || state.is_account_settings_open
             || state.is_profile_settings_open;
 
-        // Mock user data
-        let _user_name = "Buggy";
-        let _user_email = "buggy.d.code@gmail.com";
-        let _user_type = "user";
+        let max_height = window.viewport_size().height - px(360.0);
+        let min_height = px(180.);
 
-        div()
-            .h_full()
-            .w(px(250.0))
-            .bg(theme.background)
-            .border_r_1()
-            .border_color(theme.border)
-            .flex()
-            .flex_col()
-            .child(
-                // Header
-                div()
-                    .flex()
-                    .flex_row()
+        Sidebar::<ui::resizable::ResizablePanel>::new(Side::Left)
+            .collapsed(collapsed)
+            .border_r(px(0.)) // Remove border to let resize handle act as border
+            .header(
+                h_flex()
+                    .w_full()
                     .items_center()
-                    .justify_between()
-                    .p_4()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .child("Native Chat")
-                            .font_weight(FontWeight::BOLD)
-                            .text_lg(),
-                    )
-                    .child(Icon::new(IconName::ChevronLeft).size(px(16.0))),
-            )
-            .child(
-                // Main Menu
-                div()
-                    .flex()
-                    .flex_col()
-                    .p_2()
-                    .gap_1()
-                    .child(SidebarMenuItem::new("New Chat").icon(IconName::Plus))
-                    .child(SidebarMenuItem::new("Search").icon(IconName::Search))
-                    .child(self.render_custom_item(
-                        "Library",
-                        "icons/library.svg",
-                        false,
-                        any_modal_open,
-                        theme,
-                        |_, _, _| {},
-                    ))
-                    .child(SidebarMenuItem::new("Projects").icon(IconName::Folder)),
-            )
-            .child(
-                // Chat History Header
-                div()
-                    .p_2()
-                    .pb(px(0.0))
-                    .child("Chat History")
-                    .font_weight(FontWeight::BOLD)
-                    .text_xs()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                // Chat History List
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .scrollable(ScrollbarAxis::Vertical)
-                    .child(if state.conversations.is_empty() {
-                        div()
-                            .child("No chat history yet")
-                            .text_color(theme.muted_foreground)
-                            .p_2()
-                            .text_sm()
-                    } else {
-                        div().children(state.conversations.iter().map(|c| {
-                            let id = c.id;
-                            self.render_custom_item(
-                                &c.title,
-                                "icons/session.svg",
-                                Some(id) == active_id,
-                                any_modal_open,
-                                theme,
-                                {
-                                    let state = self.state.clone();
-                                    move |_, _, cx| {
-                                        state.update(cx, |state, cx| {
-                                            state.select_conversation(id, cx);
-                                        });
-                                    }
-                                },
-                            )
-                            .into_any_element()
-                        }))
-                    }),
-            )
-            .child(
-                // Footer
-                div()
-                    .flex()
-                    .flex_col()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    // User Profile Section
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .p_4()
-                            .gap_3()
+                    .when(collapsed, |this| {
+                        this.px_2().child(
+                            SidebarMenuItem::new("Expand Sidebar")
+                                .collapsed(true)
+                                .icon(IconName::ChevronRight)
+                                .disable(any_modal_open)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.update(cx, |state, cx| {
+                                        state.toggle_sidebar(cx);
+                                    });
+                                })),
+                        )
+                    })
+                    .when(!collapsed, |this| {
+                        this.justify_between()
+                            .px_2()
+                            .py_2()
                             .child(
-                                // Avatar
-                                Avatar::new()
-                                    .src("https://avatars.githubusercontent.com/u/1?v=4")
-                                    .size(px(36.0))
-                                    .rounded_full(),
-                            )
-                            .child(
-                                // Text Info
-                                div()
-                                    .flex()
-                                    .flex_col()
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
                                     .child(
                                         div()
-                                            .child("Buggy")
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_sm(),
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(cx.theme().radius)
+                                            .bg(theme.primary)
+                                            .text_color(theme.primary_foreground)
+                                            .p_2()
+                                            .child(Icon::new(IconName::Bot).size_4()),
                                     )
                                     .child(
                                         div()
-                                            .child("buggy.d.code@gmail.com")
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground),
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .child("Native Chat"),
                                     ),
-                            ),
-                    )
-                    // Menu Items
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .p_2()
-                            .pt(px(0.0))
-                            .child({
-                                let (label, icon_name, custom_icon) =
-                                    match state.theme_mode.as_str() {
-                                        "dark" => ("Theme: Dark", Some(IconName::Moon), None),
-                                        "system" => {
-                                            ("Theme: System", None, Some("icons/system_theme.svg"))
-                                        }
-                                        _ => ("Theme: Light", Some(IconName::Sun), None),
-                                    };
-
-                                if let Some(icon) = icon_name {
-                                    self.render_menu_item(label, icon, any_modal_open, theme, {
-                                        let state = self.state.clone();
-                                        move |_, _, cx| {
-                                            println!(
-                                                "[SIDEBAR] Theme toggle (render_menu_item) clicked"
-                                            );
-                                            state.update(cx, |state, cx| {
-                                                state.toggle_theme(cx);
-                                            });
-                                        }
+                            )
+                            .child(
+                                div()
+                                    .id("sidebar-collapse-button")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(cx.theme().radius)
+                                    .when(!any_modal_open, |this| {
+                                        this.cursor_pointer()
+                                            .hover(|this| {
+                                                this.bg(cx.theme().sidebar_accent.opacity(0.8))
+                                                    .text_color(
+                                                        cx.theme().sidebar_accent_foreground,
+                                                    )
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.update(cx, |state, cx| {
+                                                    state.toggle_sidebar(cx);
+                                                });
+                                            }))
                                     })
-                                    .into_any_element()
-                                } else if let Some(path) = custom_icon {
-                                    self.render_custom_item(
-                                        label,
-                                        path,
-                                        false, // Theme toggle doesn't show "active" state in the same way as nav items
-                                        any_modal_open,
-                                        theme,
-                                        {
+                                    .p_2()
+                                    .child(Icon::new(IconName::ChevronLeft).size_4()),
+                            )
+                    }),
+            )
+            .child(
+                ui::resizable::resizable_panel()
+                    .size(min_height)
+                    .size_range(min_height..max_height)
+                    .child(
+                        SidebarGroup::new("Menu").collapsed(collapsed).child(
+                            SidebarMenu::new()
+                                .collapsed(collapsed)
+                                .child(
+                                    SidebarMenuItem::new("New Chat")
+                                        .icon(IconName::Plus)
+                                        .disable(any_modal_open),
+                                )
+                                .child(
+                                    SidebarMenuItem::new("Search")
+                                        .icon(IconName::Search)
+                                        .disable(any_modal_open),
+                                )
+                                .child(
+                                    SidebarMenuItem::new("Library")
+                                        .icon(IconName::BookOpen)
+                                        .disable(any_modal_open),
+                                )
+                                .child(
+                                    SidebarMenuItem::new("Projects")
+                                        .icon(IconName::Folder)
+                                        .disable(any_modal_open),
+                                ),
+                        ),
+                    )
+                    .into(),
+            )
+            .child(
+                SidebarGroup::new("Chat History")
+                    .collapsed(collapsed)
+                    .child(SidebarMenu::new().collapsed(collapsed).children(
+                        if state.conversations.is_empty() {
+                            vec![]
+                        } else {
+                            state
+                                .conversations
+                                .iter()
+                                .map(|c| {
+                                    let id = c.id;
+                                    let is_active = Some(id) == active_id;
+                                    SidebarMenuItem::new(&c.title)
+                                        .icon(IconName::Dash)
+                                        .active(is_active)
+                                        .disable(any_modal_open)
+                                        .on_click({
                                             let state = self.state.clone();
                                             move |_, _, cx| {
-                                                println!("[SIDEBAR] Theme toggle (Custom) clicked");
+                                                state.update(cx, |state, cx| {
+                                                    state.select_conversation(id, cx);
+                                                });
+                                            }
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    ))
+                    .into(),
+            )
+            .footer(
+                SidebarFooter::new().child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            // User Profile Section
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .items_center()
+                                .when(!collapsed, |this| this.p_2())
+                                .when(collapsed, |this| this.justify_center())
+                                .gap_3()
+                                .when(!collapsed, |this| {
+                                    this.child(
+                                        Avatar::new()
+                                            .src("images/buggy_d_clown.png")
+                                            .size(px(36.0))
+                                            .rounded_full(),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .child("Buggy")
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_sm(),
+                                            )
+                                            .child(
+                                                div()
+                                                    .child("buggy.d.code@gmail.com")
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground),
+                                            ),
+                                    )
+                                })
+                                .when(collapsed, |this| {
+                                    this.child(
+                                        Avatar::new()
+                                            .src("images/buggy_d_clown.png")
+                                            .size(px(36.0))
+                                            .rounded_full(),
+                                    )
+                                }),
+                        )
+                        .child(
+                            SidebarMenu::new()
+                                .collapsed(collapsed)
+                                .child({
+                                    let (label, icon_name) = match state.theme_mode.as_str() {
+                                        "dark" => ("Theme: Dark", IconName::Moon),
+                                        _ => ("Theme: Light", IconName::Sun),
+                                    };
+                                    SidebarMenuItem::new(label)
+                                        .icon(icon_name)
+                                        .disable(any_modal_open)
+                                        .on_click({
+                                            let state = self.state.clone();
+                                            move |_, _, cx| {
                                                 state.update(cx, |state, cx| {
                                                     state.toggle_theme(cx);
                                                 });
                                             }
-                                        },
-                                    )
-                                    .into_any_element()
-                                } else {
-                                    div().into_any_element()
-                                }
-                            })
-                            .child(self.render_custom_item(
-                                "Account Settings",
-                                "icons/account_settings.svg",
-                                false,
-                                any_modal_open,
-                                theme,
-                                {
-                                    let state = self.state.clone();
-                                    move |_, _, cx| {
-                                        state.update(cx, |state, cx| {
-                                            state.toggle_account_settings(cx);
-                                        });
-                                    }
-                                },
-                            ))
-                            .child(self.render_menu_item(
-                                "Profile Settings",
-                                IconName::Settings,
-                                any_modal_open,
-                                theme,
-                                {
-                                    let state = self.state.clone();
-                                    move |_, _, cx| {
-                                        state.update(cx, |state, cx| {
-                                            state.toggle_profile_settings(cx);
-                                        });
-                                    }
-                                },
-                            ))
-                            .child(self.render_custom_item(
-                                "Sign Out",
-                                "icons/signout.svg",
-                                false,
-                                any_modal_open,
-                                theme,
-                                |_, _, _| {
-                                    // TODO: Implement sign out logic
-                                    println!("Sign out clicked");
-                                },
-                            )),
-                    ),
+                                        })
+                                })
+                                .child(
+                                    SidebarMenuItem::new("Account Settings")
+                                        .icon(IconName::Settings)
+                                        .disable(any_modal_open)
+                                        .on_click({
+                                            let state = self.state.clone();
+                                            move |_, _, cx| {
+                                                state.update(cx, |state, cx| {
+                                                    state.toggle_account_settings(cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    SidebarMenuItem::new("Profile Settings")
+                                        .icon(IconName::User)
+                                        .disable(any_modal_open)
+                                        .on_click({
+                                            let state = self.state.clone();
+                                            move |_, _, cx| {
+                                                state.update(cx, |state, cx| {
+                                                    state.toggle_profile_settings(cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    SidebarMenuItem::new("Sign Out")
+                                        .icon(IconName::CircleX)
+                                        .disable(any_modal_open)
+                                        .on_click(|_, _, _| {
+                                            println!("Sign out clicked");
+                                        }),
+                                ),
+                        ),
+                ),
             )
     }
 }

@@ -1,12 +1,10 @@
 use crate::{
     button::{Button, ButtonVariants},
-    h_flex,
-    scroll::ScrollbarAxis,
-    v_flex, ActiveTheme, Collapsible, Icon, IconName, Side, Sizable, StyledExt,
+    v_flex, ActiveTheme, Collapsible, Icon, IconName, Side, Sizable,
 };
 use gpui::{
-    div, prelude::FluentBuilder, px, AnyElement, App, ClickEvent, EdgesRefinement,
-    InteractiveElement as _, IntoElement, ParentElement, Pixels, RenderOnce, StyleRefinement,
+    div, prelude::FluentBuilder, px, AnyElement, App, ClickEvent, InteractiveElement as _,
+    IntoElement, ParentElement, Pixels, RenderOnce, StatefulInteractiveElement, StyleRefinement,
     Styled, Window,
 };
 use std::rc::Rc;
@@ -20,35 +18,41 @@ pub use group::*;
 pub use header::*;
 pub use menu::*;
 
-const DEFAULT_WIDTH: Pixels = px(255.);
-const COLLAPSED_WIDTH: Pixels = px(48.);
-
 /// A Sidebar element that can contain collapsible child elements.
-#[derive(IntoElement)]
-pub struct Sidebar<E: Collapsible + IntoElement + 'static> {
-    style: StyleRefinement,
+pub struct Sidebar<E: Collapsible + IntoElement + Into<crate::resizable::ResizablePanel> + 'static>
+{
+    side: Side,
     content: Vec<E>,
     /// header view
     header: Option<AnyElement>,
     /// footer view
     footer: Option<AnyElement>,
-    /// The side of the sidebar
-    side: Side,
     collapsible: bool,
     collapsed: bool,
+    style: StyleRefinement,
 }
 
-impl<E: Collapsible + IntoElement> Sidebar<E> {
+impl<E: Collapsible + IntoElement + Into<crate::resizable::ResizablePanel>> IntoElement
+    for Sidebar<E>
+{
+    type Element = gpui::Component<Self>;
+
+    fn into_element(self) -> Self::Element {
+        gpui::Component::new(self)
+    }
+}
+
+impl<E: Collapsible + IntoElement + Into<crate::resizable::ResizablePanel>> Sidebar<E> {
     /// Create a new Sidebar on the given [`Side`].
     pub fn new(side: Side) -> Self {
         Self {
-            style: StyleRefinement::default(),
-            content: vec![],
+            side,
+            content: Vec::new(),
             header: None,
             footer: None,
-            side,
             collapsible: true,
             collapsed: false,
+            style: StyleRefinement::default(),
         }
     }
 
@@ -151,7 +155,7 @@ impl SidebarToggleButton {
 }
 
 impl RenderOnce for SidebarToggleButton {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let collapsed = self.collapsed;
         let on_click = self.on_click.clone();
 
@@ -169,78 +173,75 @@ impl RenderOnce for SidebarToggleButton {
             }
         };
 
-        self.btn
+        div()
+            .id("sidebar-toggle")
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .p_2()
+            .cursor_pointer()
+            .hover(|this| {
+                this.bg(cx.theme().sidebar_accent.opacity(0.8))
+                    .text_color(cx.theme().sidebar_accent_foreground)
+            })
+            .text_color(cx.theme().sidebar_foreground)
             .when_some(on_click, |this, on_click| {
                 this.on_click(move |ev, window, cx| {
                     on_click(ev, window, cx);
                 })
             })
-            .icon(Icon::new(icon).size_4())
+            .child(Icon::new(icon).size_4())
     }
 }
 
-impl<E: Collapsible + IntoElement> Styled for Sidebar<E> {
+impl<E: Collapsible + IntoElement + Into<crate::resizable::ResizablePanel>> Styled for Sidebar<E> {
     fn style(&mut self) -> &mut StyleRefinement {
         &mut self.style
     }
 }
 
-impl<E: Collapsible + IntoElement> RenderOnce for Sidebar<E> {
-    fn render(mut self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        self.style.padding = EdgesRefinement::default();
-
+impl<E: Collapsible + IntoElement + Into<crate::resizable::ResizablePanel>> RenderOnce
+    for Sidebar<E>
+{
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         v_flex()
             .id("sidebar")
-            .w(DEFAULT_WIDTH)
-            .flex_shrink_0()
             .h_full()
-            .overflow_hidden()
-            .relative()
+            .w_full()
             .bg(cx.theme().sidebar)
-            .text_color(cx.theme().sidebar_foreground)
             .border_color(cx.theme().sidebar_border)
-            .map(|this| match self.side {
-                Side::Left => this.border_r_1(),
-                Side::Right => this.border_l_1(),
-            })
-            .refine_style(&self.style)
-            .when(self.collapsed, |this| this.w(COLLAPSED_WIDTH).gap_2())
-            .when_some(self.header.take(), |this, header| {
-                this.child(
-                    h_flex()
-                        .id("header")
-                        .pt_3()
-                        .px_3()
-                        .gap_2()
-                        .when(self.collapsed, |this| this.pt_2().px_2())
-                        .child(header),
-                )
-            })
+            .text_color(cx.theme().sidebar_foreground)
+            .when(self.side.is_left(), |this| this.border_r_1())
+            .when(self.side.is_right(), |this| this.border_l_1())
             .child(
-                v_flex().id("content").flex_1().min_h_0().child(
-                    v_flex()
-                        .gap_3()
-                        .p_3()
-                        .when(self.collapsed, |this| this.p_2())
-                        .children(
-                            self.content
-                                .into_iter()
-                                .enumerate()
-                                .map(|(ix, c)| div().id(ix).child(c.collapsed(self.collapsed))),
+                v_flex()
+                    .flex_1()
+                    .gap_y_4()
+                    .overflow_hidden()
+                    .when_some(self.header, |this, header| {
+                        this.child(
+                            div()
+                                .id("sidebar-header")
+                                .flex_shrink_0()
+                                .h_12()
+                                .flex()
+                                .items_center()
+                                .child(header),
                         )
-                        .scrollable(ScrollbarAxis::Vertical),
-                ),
+                    })
+                    .child(
+                        div().flex_1().overflow_hidden().child(
+                            crate::resizable::v_resizable("sidebar-content").children(
+                                self.content
+                                    .into_iter()
+                                    .map(|c| c.collapsed(self.collapsed).into()),
+                            ),
+                        ),
+                    )
+                    .when_some(self.footer, |this, footer| {
+                        this.child(div().id("sidebar-footer").flex_shrink_0().child(footer))
+                    }),
             )
-            .when_some(self.footer.take(), |this, footer| {
-                this.child(
-                    h_flex()
-                        .id("footer")
-                        .pb_3()
-                        .px_3()
-                        .gap_2()
-                        .when(self.collapsed, |this| this.pt_2().px_2())
-                        .child(footer),
-                )
-            })
     }
 }

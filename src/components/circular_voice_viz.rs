@@ -1,11 +1,11 @@
 use crate::state::AppState;
 use gpui::prelude::*;
 use gpui::*;
-use ui::ActiveTheme;
 use std::f32::consts::PI;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+use ui::ActiveTheme;
 
 const CIRCLE_RADIUS: f32 = 150.0;
 

@@ -1,0 +1,66 @@
+---
+title: "Colors & typography"
+description: "Use GPUI’s color helpers, text utilities, and shadows to match your brand."
+---
+
+## Color helpers
+
+- `rgb(0xff0000)` / `rgba(0x111827, 0.75)` – quick inline colors.
+- `hsla(210., 100., 56., 1.0)` – when you want to animate hue or lightness.
+- Semantic helpers such as `gpui::red()`, `gpui::slate(500)` mirror the Zed theme palette.
+
+```rust
+div()
+    .bg(rgb(0x0f172a))
+    .border_1()
+    .border_color(gpui::slate(700))
+    .shadow_lg()
+```
+
+## Text utilities
+
+| Helper | Effect |
+| --- | --- |
+| `.text_xs()` … `.text_4xl()` | Font-size scale. |
+| `.font_medium()`, `.font_semibold()`, `.font_bold()` | Weight adjustments. |
+| `.text_color(rgb(...))` | Override foreground color. |
+| `.text_left()`, `.text_center()`, `.text_right()` | Alignment. |
+| `.truncate()`, `.line_clamp(3)` | Control overflow. |
+
+```rust
+div()
+    .text_sm()
+    .text_color(gpui::slate(200))
+    .line_clamp(2)
+    .child(long_message)
+```
+
+## Rounded corners & shadows
+
+- `.rounded_sm()`, `.rounded_md()`, `.rounded_lg()`, `.rounded_full()`
+- `.shadow_sm()`, `.shadow_md()`, `.shadow_lg()`, `.shadow_xl()`
+
+## Gradients and images
+
+`bg()` accepts any `Fill` implementation. Use `linear_gradient` for gradients:
+
+```rust
+div()
+    .bg(linear_gradient(90.0, gpui::purple(), gpui::blue()))
+```
+
+## Cursor states
+
+Make interactive regions obvious:
+
+```rust
+div()
+    .cursor_pointer()
+    .hover(|btn| btn.bg(rgb(0x1d4ed8)))
+    .active(|btn| btn.bg(rgb(0x1e40af)))
+    .child("Click me")
+```
+
+<Tip>
+When sharing colors between views, create a tiny helper module (e.g., `theme.rs`) that returns `Fill` or `Hsla` values so you only tweak the palette in one place.
+</Tip>

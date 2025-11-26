@@ -1,0 +1,71 @@
+---
+title: "Spacing & alignment"
+description: "Memorize the most common gap, padding, margin, and alignment helpers."
+---
+
+GPUI borrows Tailwind’s naming to keep things guessable. Values ending in `_0`–`_12` use a rem-based scale, while suffixes like `_0p5` mean “half a step”.
+
+## Gap & padding
+
+| Helper | Description |
+| --- | --- |
+| `.gap_0()` … `.gap_8()` | Set spacing between flex/grid children. `_0p5`, `_1p5`, `_2p5` are available for tighter control. |
+| `.p_4()`, `.px_6()`, `.py_2()` | Shorthand padding for all sides, x-axis, y-axis. Works with fractional suffixes too. |
+| `.pl_3()`, `.pr_6()`, `.pt_1()`, `.pb_5()` | Individual sides. |
+
+Example:
+
+```rust
+div()
+    .flex_col()
+    .gap_2()
+    .p_5()
+    .child("Header")
+    .child("Body")
+```
+
+## Margin and auto layout
+
+| Helper | Description |
+| --- | --- |
+| `.m_auto()` | Center element horizontally/vertically when combined with fixed width/height. |
+| `.ml_auto()` / `.mr_auto()` | Push siblings apart inside flex layouts (e.g., align right). |
+| `.mt_4()`, `.mb_1p5()` | Block-level spacing for stacked sections. |
+
+```rust
+div()
+    .flex()
+    .child("Logo")
+    .child(div().ml_auto().child("Profile"));
+```
+
+## Aligning children
+
+| Helper | Maps to |
+| --- | --- |
+| `.items_start()`, `.items_center()`, `.items_end()`, `.items_baseline()` | `align-items` on the cross axis. |
+| `.justify_start()`, `.justify_center()`, `.justify_between()`, `.justify_evenly()` | `justify-content` on the main axis. |
+| `.content_center()`, `.content_between()`, `.content_stretch()` | `align-content` when wrapping. |
+
+Combine them for precise control:
+
+```rust
+div()
+    .flex()
+    .items_center()
+    .justify_between()
+    .gap_3()
+    .child("Label")
+    .child(cta_button())
+```
+
+## Width & height helpers
+
+- `.w_full()`, `.h_full()` — fill the parent.
+- `.w(px(320.))`, `.h(px(48.))` — explicit pixels via the `px` helper.
+- `.min_w(px(200.))`, `.max_h(px(360.))` — constrain bounds.
+- `.flex_1()` — make the element grow to consume remaining space.
+
+<Tip>
+Most helpers are chainable, so you can set `.flex_1().min_w(px(200.)).max_w(px(420.))` to get a responsive column.
+</Tip>

@@ -208,7 +208,7 @@ impl RenderOnce for SidebarMenuItem {
                     .rounded(cx.theme().radius)
                     .text_sm()
                     .when(is_hoverable, |this| {
-                        this.hover(|this| {
+                        this.cursor_pointer().hover(|this| {
                             this.bg(cx.theme().sidebar_accent.opacity(0.8))
                                 .text_color(cx.theme().sidebar_accent_foreground)
                         })

@@ -1,0 +1,48 @@
+---
+title: "Typography utilities"
+description: "Scale text, control wrapping, and handle overflow."
+---
+
+## Sizes & weight
+
+| Helper | Result |
+| --- | --- |
+| `.text_xs()` → `.text_5xl()` | Predefined font-size scale. |
+| `.text_base()` | 1rem (default). |
+| `.font_light()` / `.font_medium()` / `.font_semibold()` / `.font_bold()` | Weight presets. |
+| `.italic()` | Italic text. |
+
+## Color & emphasis
+
+| Helper | Result |
+| --- | --- |
+| `.text_color(hsla)` | Override color. |
+| `.opacity(0.6)` | Subdue text without new colors. |
+| `.underline()` / `.line_through()` | Decoration helpers. |
+
+## Alignment & spacing
+
+- `.text_left()`, `.text_center()`, `.text_right()` map to CSS `text-align`.
+- Set custom line height through the style: `element.text_style().get_or_insert_default().line_height = rems(1.5);`
+
+## Wrapping & overflow
+
+| Helper | Effect |
+| --- | --- |
+| `.whitespace_normal()` | Default wrapping. |
+| `.whitespace_nowrap()` | Keep text on one line. |
+| `.text_ellipsis()` | Add an ellipsis when truncated. |
+| `.truncate()` | Sets `overflow_hidden`, `whitespace_nowrap`, `text_ellipsis`. |
+| `.line_clamp(n)` | Limit lines before truncating. |
+
+```rust
+div()
+    .text_sm()
+    .font_medium()
+    .truncate()
+    .child("This line will end with … if it overflows the container")
+```
+
+<Note>
+GPUI reuses the OS text system, so fonts must exist locally. Use `window.text_style()` inside your view to inspect the active font size and family.
+</Note>
