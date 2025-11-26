@@ -86,7 +86,8 @@
           {
             "group": "Elements & views",
             "pages": [
-              "modules/element"
+              "modules/element",
+              "modules/elements"
             ]
           },
           {

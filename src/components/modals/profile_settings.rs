@@ -1,11 +1,13 @@
+use crate::services::model_registry::{ModelProfile, Provider};
 use crate::state::AppState;
 use gpui::InteractiveElement;
 use gpui::prelude::*;
 use gpui::{
     Context, Entity, FontWeight, IntoElement, MouseButton, Render, Styled, Window, div, px,
 };
+use std::collections::HashMap;
 use ui::{
-    ActiveTheme, Icon, IconName, Sizable, StyledExt,
+    ActiveTheme, Icon, IconName, IndexPath, Sizable, StyledExt, SearchableVec, Select, SelectEvent, SelectState,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
     scroll::ScrollbarAxis,
@@ -14,12 +16,12 @@ use ui::{
 pub struct ProfileSettingsModal {
     state: Entity<AppState>,
     profile_name_input: Entity<InputState>,
-    provider_input: Entity<InputState>,
-    model_input: Entity<InputState>,
-    embedding_provider_input: Entity<InputState>,
-    embedding_model_input: Entity<InputState>,
-    image_provider_input: Entity<InputState>,
-    image_model_input: Entity<InputState>,
+    provider_select: Entity<SelectState<SearchableVec<Provider>>>,
+    model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
+    embedding_provider_select: Entity<SelectState<SearchableVec<Provider>>>,
+    embedding_model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
+    image_provider_select: Entity<SelectState<SearchableVec<Provider>>>,
+    image_model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
     api_key_input: Entity<InputState>,
 }
 
@@ -30,53 +32,102 @@ impl ProfileSettingsModal {
             input.set_value("Default".to_string(), window, cx);
             input
         });
-        let provider_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Provider");
-            input.set_value("Google Gemini".to_string(), window, cx);
-            input
+        
+        // Trigger model fetch with empty keys (will use env vars)
+        state.update(cx, |state, cx| {
+            state.fetch_models(HashMap::new(), cx);
         });
-        let model_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Model");
-            input.set_value("Gemini 2.5 Flash".to_string(), window, cx);
-            input
+
+        let providers = SearchableVec::new(vec![Provider::Gemini, Provider::OpenAI, Provider::Anthropic]);
+        
+        let provider_select = cx.new(|cx| {
+            SelectState::new(providers.clone(), Some(IndexPath::default()), window, cx).searchable(true)
         });
-        let embedding_provider_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Provider");
-            input.set_value("Google Gemini".to_string(), window, cx);
-            input
+        let model_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
         });
-        let embedding_model_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Model");
-            input.set_value("Text Embedding 004".to_string(), window, cx);
-            input
+        let embedding_provider_select = cx.new(|cx| {
+            SelectState::new(providers.clone(), Some(IndexPath::default()), window, cx).searchable(true)
         });
-        let image_provider_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Provider");
-            input.set_value("Google Gemini".to_string(), window, cx);
-            input
+        let embedding_model_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
         });
-        let image_model_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Model");
-            input.set_value("Gemini 2.5 Flash Image Preview".to_string(), window, cx);
-            input
+        let image_provider_select = cx.new(|cx| {
+            SelectState::new(providers.clone(), Some(IndexPath::default()), window, cx).searchable(true)
         });
+        let image_model_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
+        });
+
         let api_key_input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("API Key");
-            input.set_value("Configured".to_string(), window, cx);
+            let input = InputState::new(window, cx).placeholder("API Key");
             input.masked(true)
         });
+
+        cx.subscribe(&provider_select, |this, _, event: &SelectEvent<SearchableVec<Provider>>, cx| {
+            if let SelectEvent::Confirm(Some(provider)) = event {
+                let model_select = this.model_select.clone();
+                this.update_model_list(model_select, provider, |m| m.capabilities.supports_text_generation, cx);
+            }
+        }).detach();
+
+        cx.subscribe(&embedding_provider_select, |this, _, event: &SelectEvent<SearchableVec<Provider>>, cx| {
+            if let SelectEvent::Confirm(Some(provider)) = event {
+                let model_select = this.embedding_model_select.clone();
+                this.update_model_list(model_select, provider, |m| m.capabilities.supports_embedding, cx);
+            }
+        }).detach();
+
+        cx.subscribe(&image_provider_select, |this, _, event: &SelectEvent<SearchableVec<Provider>>, cx| {
+            if let SelectEvent::Confirm(Some(provider)) = event {
+                let model_select = this.image_model_select.clone();
+                this.update_model_list(model_select, provider, |m| m.capabilities.supports_image_generation, cx);
+            }
+        }).detach();
+
+        cx.observe(&state, |this: &mut Self, _, cx| {
+            let provider = this.provider_select.read(cx).selected_value().cloned();
+            if let Some(provider) = provider {
+                let model_select = this.model_select.clone();
+                this.update_model_list(model_select, &provider, |m| m.capabilities.supports_text_generation, cx);
+            }
+            
+            let embedding_provider = this.embedding_provider_select.read(cx).selected_value().cloned();
+            if let Some(provider) = embedding_provider {
+                let model_select = this.embedding_model_select.clone();
+                this.update_model_list(model_select, &provider, |m| m.capabilities.supports_embedding, cx);
+            }
+
+            let image_provider = this.image_provider_select.read(cx).selected_value().cloned();
+            if let Some(provider) = image_provider {
+                let model_select = this.image_model_select.clone();
+                this.update_model_list(model_select, &provider, |m| m.capabilities.supports_image_generation, cx);
+            }
+        }).detach();
 
         Self {
             state,
             profile_name_input,
-            provider_input,
-            model_input,
-            embedding_provider_input,
-            embedding_model_input,
-            image_provider_input,
-            image_model_input,
+            provider_select,
+            model_select,
+            embedding_provider_select,
+            embedding_model_select,
+            image_provider_select,
+            image_model_select,
             api_key_input,
         }
+    }
+
+    fn update_model_list(&mut self, select: Entity<SelectState<SearchableVec<ModelProfile>>>, provider: &Provider, capability_filter: impl Fn(&ModelProfile) -> bool, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let models: Vec<ModelProfile> = state.available_models.iter()
+            .filter(|m| m.provider == *provider && capability_filter(m))
+            .cloned()
+            .collect();
+        
+        select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(models), cx);
+        });
     }
 }
 
@@ -214,14 +265,14 @@ impl Render for ProfileSettingsModal {
                                                             .flex_1()
                                                             .gap_1()
                                                             .child(div().child("Provider").font_weight(FontWeight::BOLD).text_sm())
-                                                            .child(Input::new(&self.provider_input))
+                                                            .child(Select::new(&self.provider_select).placeholder("Select Provider").w_full())
                                                     )
                                                     .child(
                                                         div().flex().flex_col()
                                                             .flex_1()
                                                             .gap_1()
                                                             .child(div().child("Default chat model").font_weight(FontWeight::BOLD).text_sm())
-                                                            .child(Input::new(&self.model_input))
+                                                            .child(Select::new(&self.model_select).placeholder("Select Model").w_full().search_placeholder("Search models..."))
                                                     )
                                             )
                                             .child(
@@ -232,14 +283,14 @@ impl Render for ProfileSettingsModal {
                                                             .flex_1()
                                                             .gap_1()
                                                             .child(div().child("Embedding provider").font_weight(FontWeight::BOLD).text_sm())
-                                                            .child(Input::new(&self.embedding_provider_input))
+                                                            .child(Select::new(&self.embedding_provider_select).placeholder("Select Provider").w_full())
                                                     )
                                                     .child(
                                                         div().flex().flex_col()
                                                             .flex_1()
                                                             .gap_1()
                                                             .child(div().child("Embedding model").font_weight(FontWeight::BOLD).text_sm())
-                                                            .child(Input::new(&self.embedding_model_input))
+                                                            .child(Select::new(&self.embedding_model_select).placeholder("Select Model").w_full().search_placeholder("Search models..."))
                                                     )
                                             )
                                             .child(
@@ -250,14 +301,14 @@ impl Render for ProfileSettingsModal {
                                                             .flex_1()
                                                             .gap_1()
                                                             .child(div().child("Image provider").font_weight(FontWeight::BOLD).text_sm())
-                                                            .child(Input::new(&self.image_provider_input))
+                                                            .child(Select::new(&self.image_provider_select).placeholder("Select Provider").w_full())
                                                     )
                                                     .child(
                                                         div().flex().flex_col()
                                                             .flex_1()
                                                             .gap_1()
                                                             .child(div().child("Image model").font_weight(FontWeight::BOLD).text_sm())
-                                                            .child(Input::new(&self.image_model_input))
+                                                            .child(Select::new(&self.image_model_select).placeholder("Select Model").w_full().search_placeholder("Search models..."))
                                                     )
                                             )
                                             .child(
@@ -300,6 +351,19 @@ impl Render for ProfileSettingsModal {
                                                             .label("Save credentials")
                                                             .bg(theme.foreground.clone())
                                                             .text_color(theme.background.clone())
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                let api_key = this.api_key_input.read(cx).text().to_string();
+                                                                
+                                                                // Get selected provider from select state  
+                                                                if let Some(provider) = this.provider_select.read(cx).selected_value() {
+                                                                    let mut api_keys = HashMap::new();
+                                                                    api_keys.insert(provider.clone(), api_key);
+                                                                    
+                                                                    this.state.update(cx, |state, cx| {
+                                                                        state.fetch_models(api_keys, cx);
+                                                                    });
+                                                                }
+                                                            }))
                                                     )
                                             )
                                     )

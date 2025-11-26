@@ -12,6 +12,12 @@ use ui::Root;
 use nativechat::state::AppState;
 
 fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+
     Application::new()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {

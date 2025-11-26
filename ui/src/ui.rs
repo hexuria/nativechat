@@ -20,6 +20,7 @@ pub mod kbd;
 pub mod list;
 pub mod menu;
 pub mod notification;
+pub mod select;
 pub mod sheet;
 pub mod skeleton;
 pub mod spinner;
@@ -30,6 +31,7 @@ pub mod window_border;
 
 pub fn init(cx: &mut gpui::App) {
     components::init(cx);
+    select::init(cx);
     theme::init(cx);
 }
 
@@ -52,6 +54,9 @@ pub use colors::*;
 
 // Re-export commonly needed support types
 pub use input::RopeExt;
+pub use select::{
+    SearchableVec, Select, SelectDelegate, SelectEvent, SelectGroup, SelectItem, SelectState,
+};
 pub use virtual_list::{v_virtual_list, VirtualListScrollHandle};
 
 // Re-export common traits from styled

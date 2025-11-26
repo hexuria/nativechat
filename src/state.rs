@@ -1,7 +1,9 @@
 use crate::audio::AudioInput;
 
 use crate::services::gemini_client::GeminiLiveClient;
+use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
 use gpui::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::SystemTime;
@@ -105,6 +107,8 @@ pub struct AppState {
     pub selected_apps: Vec<String>,
     pub capabilities: Vec<AppCapability>,
     pub sidebar_collapsed: bool,
+    pub model_registry: Arc<ModelRegistry>,
+    pub available_models: Vec<ModelProfile>,
 }
 
 impl Default for AppState {
@@ -273,7 +277,25 @@ impl AppState {
             selected_apps: Vec::new(),
             capabilities,
             sidebar_collapsed: false,
+            model_registry: Arc::new(ModelRegistry::new()),
+            available_models: Vec::new(),
         }
+    }
+
+    pub fn fetch_models(&mut self, api_keys: HashMap<Provider, String>, cx: &mut Context<Self>) {
+        let registry = self.model_registry.clone();
+        cx.spawn(|this: WeakEntity<AppState>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let models = registry.get_all_models(&api_keys).await;
+                this.update(&mut cx, |state: &mut AppState, cx| {
+                    state.available_models = models;
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     pub fn select_conversation(&mut self, conversation_id: usize, cx: &mut Context<Self>) {

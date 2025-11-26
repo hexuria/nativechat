@@ -1,0 +1,90 @@
+---
+title: "Built-in elements"
+description: "Overview of GPUI’s stock elements (div, text, img, lists, overlays, animation, etc.) and how to compose them."
+---
+
+The `gpui::elements` module exports the batteries-included building blocks that most views are composed from. Each file under `elements/` defines either a concrete widget (`div`, `text`, `img`, `svg`, `canvas`, `surface`) or an infrastructure wrapper (`image_cache`, `list`, `uniform_list`, `anchored`, `deferred`, `animation`) that implements [`Element`](modules/element). Everything re-exports through `gpui.rs`, so you can `use gpui::*` in views.
+
+## Cheat sheet
+
+| Module | Purpose | Key APIs |
+| --- | --- | --- |
+| `div` | General-purpose container with Tailwind-like `StyleRefinement` and DOM-like `Interactivity` | `div()`, `.child()/.children()`, `.on_click()`, `.bg()`, `Stateful<T>` |
+| `text` | Inline and block text rendering, runs, highlights, tooltips | `"literal"`, `SharedString`, `StyledText::new()` |
+| `img` + `image_cache` | Async image loading, caching, fallbacks, object-fit | `img(src)`, `.with_loading()`, `.image_cache()`, `image_cache(provider)`, `RetainAllImageCache` |
+| `list` | Virtualized list for heterogenous item heights | `list(state, render_fn)`, `ListState`, `ListScrollEvent`, `ListSizingBehavior` |
+| `uniform_list` | Faster list where every row is the same height | `uniform_list(id, count, render_range)`, `UniformListScrollHandle`, `ScrollStrategy` |
+| `anchored` | Popup/tooltip positioning with window bounds fitting | `anchored().position(...)`, `.snap_to_window_with_margin()` |
+| `deferred` | Delay painting child until after ancestors (overlays, portals) | `deferred(child).with_priority(n)` |
+| `animation` | Wrap any element/component in timed animations | `element.with_animation(id, animation, animator)` |
+| `canvas` / `surface` / `svg` | Escape hatches into the renderer: custom paint, CoreVideo surfaces, vector icons | `canvas(prepaint, paint)`, `surface(pixel_buffer)`, `svg().path("icons/logo.svg")` |
+
+## `div`: container + event system
+
+- Core idea: `div.rs` merges `Interactivity` (event dispatch, focus, drag/drop, tooltips) with `StyleRefinement` (Tailwind-ish builder) into a single fluent API.
+- Interactivity exposes imperative listeners for every DOM-style hook: `.on_mouse_down`, `.on_scroll_wheel`, `.capture_action::<A>()`, `.on_key_down`, `.on_action_boxed`, `.on_drag_move<T>`, `.with_tooltip(...)`, etc. Each callback gets `(event, &mut Window, &mut App)` so you can read/update view state via `Context::listener`.
+- Styling mirrors CSS: `.flex()`, `.gap(px(4.))`, `.bg(hsla(...))`, `.border_radius(...)`, `.hover(|style| ...)`. These refinements feed directly into `Style` before layout.
+- `Stateful<E>` emerges when you assign an `ElementId`: it wraps any element so GPUI can persist per-element data (scroll handles, tooltips) keyed by the resulting `GlobalElementId`.
+
+### Scroll handles & anchors
+
+`div` exports `ScrollHandle` and `ScrollAnchor` helpers:
+
+```rust
+let mut handle = ScrollHandle::new();
+div().id("chat-panel").scroll_handle(&mut handle);
+// Later: handle.scroll_to_active_item(window, ScrollStrategy::Center);
+```
+
+Anchors remember the last bounds reported in `prepaint` so you can call `.scroll_to()` on the next frame even if the target is deeply nested.
+
+## Text, SVG, canvas, and surfaces
+
+- **Text**: Strings, `SharedString`, or `StyledText` automatically shape via `text_system`. `StyledText::with_runs` lets you supply `TextRun`s; `with_default_highlights` builds runs from `(Range, HighlightStyle)` pairs. `TextLayout` (available via `StyledText::layout()`) maps character indices ↔ pixel rects for selections/tooltips.
+- **SVG**: `svg()` shares the interactivity stack so you can attach hover/click handlers. Paths can be embedded (`.path("app:///icons/add.svg")`) or loaded from assets (`.external_path("assets/icons/add.svg")`). Optional `Transformation` (scale/translate/rotate) applies in paint without affecting layout.
+- **Canvas**: `canvas(prepaint, paint)` gives two closures. The first runs in `prepaint` (good for hitbox registration or to compute geometry); the second receives that data plus the same bounds to issue custom draw calls—handy for lightweight sparklines without making a bespoke element type.
+- **Surface**: macOS-only hook for painting `CVPixelBuffer`s (e.g., video frames) with `ObjectFit` options similar to `<img>`. Useful when bridging to native capture APIs.
+
+## Images & caches
+
+- `Img` accepts `ImageSource` variants (URI, embedded path, `Arc<RenderImage>`, custom loader). Layout is aware of intrinsic dimensions and `ObjectFit`; animated formats (GIF/WebP) keep per-element `ImgState` (frame index + timers) and request animation frames automatically.
+- Loading workflow:
+  1. Pick an `ImageCache` (global default, nearest ancestor `image_cache()`, or explicit `.image_cache(&entity)`).
+  2. Each `img` calls `ImageSource::use_data` to fetch the bitmap, returning `None` while pending, `Err` on failure.
+  3. The element can render `.with_loading(|| …)` and `.with_fallback(|| …)` replacements while fetches occur or fail.
+- `image_cache(provider)` pushes an `ImageCacheElement` that scopes caching for its subtree. Providers can be any `Entity<T: ImageCache>`; `retain_all(id)` stores a cache in per-element state and keeps every decoded image until you call `.clear()`/`.remove()`.
+
+## Lists & virtualization
+
+### `list`
+
+- Designed for heterogeneous heights. Views keep a `ListState` (essentially a `SumTree` of item metrics) and pass it back every frame: `let mut state = ListState::new(); list(state.clone(), |ix, window, cx| render_row(ix, window, cx))`.
+- The state tracks measured sizes, scroll alignment (`Top` vs `Bottom` for chat logs), and optional scroll handlers. Call `state.splice(range, len, window, cx)` when the data set changes size or item heights shift; `state.reset()` forces re-measurement.
+- `ListSizingBehavior::{Infer,Auto}` lets the list either compute its own height (sum of items) or stretch. Horizontal sizing can be constrained/flexible. When `Overflow::Scroll` is set, the element only instantiates children intersecting the viewport plus overdraw.
+
+### `uniform_list`
+
+- Optimized path when every row height is constant. Instead of measuring each row via Taffy, the element measures one item and multiples it by `item_count`. The render closure receives a `Range<usize>` so you can batch-generate visible rows.
+- `UniformListScrollHandle` exposes imperative scrolling (`scroll_to_item`, `scroll_to_item_strict`, `scroll_to_item_with_offset`). The handle also reports whether the list is Y-flipped (useful for reversed chat timelines) and whether contents overflow.
+
+## Overlays, deferrals, animation
+
+- **Anchored**: Positions popovers/tooltips near an anchor while preventing window overflow. Choose an anchor corner, supply optional absolute/relative positions, and decide how to fit (`SwitchAnchor`, `SnapToWindow`, or `SnapToWindowWithMargin`). During `prepaint` it inspects child bounds and offsets them before painting.
+- **Deferred**: Keeps layout in place but defers painting of its child via `Window::defer_draw`. This is how menus/tooltips render above other layers without reparenting; `.with_priority(n)` sets draw stacking order.
+- **AnimationElement**: Wrap any `IntoElement` (component or concrete element) and provide an `Animation` (duration + easing + optional repeat). Your `animator` closure receives `(element, animation_index, eased_delta)` and returns the mutated element to render; the wrapper stores `AnimationState` in element state and auto-requests animation frames while running.
+
+## Supporting infrastructure
+
+- **Stateful / StatefulInteractiveElement**: produced by `div` when you call `.stateful(id, element)` (or via derive macros). This wrapper owns the element plus its `ElementId`, allowing `window.with_element_state` to persist data (image caches, animation clocks, etc.) between frames.
+- **ImageCache traits**: `ImageCacheProvider` returns an `AnyImageCache`, while `ImageCache` implementors decide how bitmaps are stored (LRU, retain-all, streaming). `RetainAllImageCache` ships as a simple `HashMap` that keeps everything until cleared.
+- **Interactivity + Styled** traits propagate through most elements via delegation, so containers like `image_cache` or `animation` can forward `.style()` and `.interactivity()` to their children transparently.
+
+## Tips
+
+- Prefer `div` + `Interactivity` whenever you need DOM-like input handling; the trait mirrors GPUI’s dispatch phases (`Capture`, `Bubble`) so you can mimic browser behavior.
+- Reach for `list`/`uniform_list` over manually managing scroll offsets once item counts exceed a few hundred—both virtualization strategies dramatically reduce layout/paint work.
+- Wrap expensive child trees in `deferred()` when they need to render above siblings; this avoids rebuilding hitboxes for the overlay container each frame.
+- Scope image caches: e.g., `image_cache(retain_all("chat-avatars")).child(img(url))` prevents every avatar from thrashing the global cache.
+- Use `Animation::repeat().with_easing(...)` for subtle breathing/pulsing effects and keep the animator pure (derive the new element from the eased value without mutating external state).
+
+Together, these elements let you stay declarative for 90% of UI needs while still having escape hatches (canvas/svg/deferred) for the bespoke 10%.

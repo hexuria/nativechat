@@ -3,8 +3,8 @@ use crate::{
     v_flex, ActiveTheme, Collapsible, Icon, IconName, Side, Sizable,
 };
 use gpui::{
-    div, prelude::FluentBuilder, px, AnyElement, App, ClickEvent, InteractiveElement as _,
-    IntoElement, ParentElement, Pixels, RenderOnce, StatefulInteractiveElement, StyleRefinement,
+    div, prelude::FluentBuilder, AnyElement, App, ClickEvent, InteractiveElement as _,
+    IntoElement, ParentElement, RenderOnce, StatefulInteractiveElement, StyleRefinement,
     Styled, Window,
 };
 use std::rc::Rc;
