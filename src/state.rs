@@ -272,7 +272,7 @@ impl AppState {
             available_apps,
             selected_apps: Vec::new(),
             capabilities,
-            sidebar_collapsed: true,
+            sidebar_collapsed: false,
         }
     }
 

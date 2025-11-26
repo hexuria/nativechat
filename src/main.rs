@@ -41,12 +41,12 @@ fn main() {
             // Set up menus
             set_menus(cx);
 
+            let displays = cx.displays();
+            let display = displays.first().expect("No display found");
+            let bounds = display.bounds();
+
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1200.0), px(800.0)),
-                    cx,
-                ))),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("NativeChat".into()),
                     ..TitlebarOptions::default()
