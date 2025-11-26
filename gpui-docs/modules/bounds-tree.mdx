@@ -1,0 +1,45 @@
+---
+title: "Bounds tree"
+description: "Spatial tree used by `scene.rs` to assign deterministic draw orders without per-primitive z-indices."
+---
+
+`gpui.rs` re-exports the rendering primitives built on top of `bounds_tree.rs`. Inside the renderer (`scene.rs`) every quad, path, underline, sprite, or shadow pushes its bounds into a `BoundsTree<ScaledPixels>` to derive an integer draw order. This replaces ad hoc z-indices with a structure that understands overlaps, keeping batching predictable while avoiding overdrawing artifacts.
+
+## What the tree stores
+
+- A binary tree (`Node::Internal` / `Node::Leaf`) where each node stores the union of its children’s axis-aligned bounds and the maximum `order` observed in its subtree.
+- Insertions walk down the tree choosing the child whose bounds would grow the least (surface-area heuristic), similar to an R-tree.
+- Whenever a new bounds intersects existing leaves, the resulting `order` is bumped so overlapping primitives maintain relative paint order.
+
+```rust
+let order = scene.primitive_bounds.insert(bounds);
+// `order` is the layer key applied to shadows/quads/paths.
+```
+
+The `Half` trait constraint (implemented for `Pixels`, `ScaledPixels`, etc.) lets the tree compute half-perimeters cheaply (`half_perimeter()`). Combined with `Add`/`Sub` bounds arithmetic, the tree decides how much each candidate branch would expand.
+
+## Lifecycle inside the renderer
+
+1. `Scene::clear()` empties the paint buffers and calls `primitive_bounds.clear()`.
+2. Every call to `Scene::insert_primitive` intersects the primitive’s bounds with its content mask. If non-empty, the bounds tree yields either:
+   - The current layer stack’s order (when a layer is active), or
+   - A fresh order derived from intersection depth.
+3. Primitives record that order before they’re appended to their respective vectors, and `Scene::finish()` sorts by the saved order.
+
+Because the tree only stores bounding boxes and a vec-backed node list, it’s cache-friendly and easy to reset between frames.
+
+## Why not per-primitive z-index?
+
+- **Determinism**: Insert order plus overlap detection ensures that two quads that don’t intersect can reuse the same order (allowing batching) while intersecting quads automatically get distinct orders.
+- **Performance**: Computing and sorting explicit z-values per primitive would require extra bookkeeping in every caller. The tree centralizes it without leaking implementation details into UI code.
+- **Layer support**: `Scene::push_layer` simply inserts the layer bounds and pushes the resulting order on `layer_stack`. Child primitives reuse that order, guaranteeing masks/clip stacks behave like CSS stacking contexts.
+
+## Extending or reusing the tree
+
+Although `BoundsTree` is currently `pub(crate)`, understanding its design helps when contributing to rendering features:
+
+- **Batch-friendly ordering**: If you add a new primitive type (e.g., GPU particles), use the same pattern: compute clipped bounds → assign an order via the tree → sort buffers by that order before issuing draw calls.
+- **Conflict resolution**: When debugging flickering layers, inspect the `order` assigned to conflicting primitives. If two elements should overlap but don’t, check whether their bounds intersect; if not, add padding or content masks to force the expected relationship.
+- **Future hooks**: Should we need spatial queries (hit tests, visibility culling) during paint, `BoundsTree` already stores the unions required for coarse rejection. The `find_max_ordering` helper shows how to traverse only branches whose bounds intersect the query.
+
+For an implementation deep-dive, open `bounds_tree.rs`—it’s ~300 lines of well-commented Rust and unit tests exercising overlap heuristics and randomized insertions. The module’s tight coupling to `scene.rs` keeps every window draw lightweight while GPUI rebuilds the UI tree each frame.

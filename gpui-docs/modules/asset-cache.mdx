@@ -1,0 +1,100 @@
+---
+title: "Asset cache"
+description: "Asynchronous resource loading via `Asset`, `Resource`, and the shared cache managed by `App`/`Window`."
+---
+
+`gpui.rs` re-exports the types defined in `asset_cache.rs` so every part of the runtime (windows, elements, image caches, SVG renderer) can speak a common language when loading external data. The module is intentionally small—just enough abstraction to deduplicate asynchronous work and keep I/O off the render thread.
+
+## Core types
+
+| Type | Purpose |
+| --- | --- |
+| `Resource` | Uniform handle for URIs, filesystem paths, or embedded bytes (`SharedUri`, `Arc<Path>`, or `SharedString>`). Useful when your loader can accept multiple origins. |
+| `Asset` trait | Describes how to asynchronously load a resource. You implement it for your own loader types and drive actual I/O in `Asset::load`. |
+| `AssetLogger<T>` | Wrapper that delegates to another `Asset` implementation but logs the `Err` variant of `Result` outputs. `ImageAssetLoader` and other built-ins use this to surface decoding errors. |
+| `hash` helper | Non-cryptographic hashing (FxHasher) to generate stable cache keys for `App::fetch_asset`. |
+
+The `Asset` trait is simple:
+
+```rust
+pub trait Asset: 'static {
+    type Source: Clone + Hash + Send;
+    type Output: Clone + Send;
+
+    fn load(source: Self::Source, cx: &mut App) -> impl Future<Output = Self::Output> + Send + 'static;
+}
+```
+
+- `Source` is whatever uniquely identifies your resource (often a `SharedString`, `Arc<Path>`, or `Resource`).
+- `Output` is the result you want to cache (e.g., `Result<DecodedImage, ImageCacheError>`).
+- `load` runs on a background thread via `App::background_executor`. Use the provided `cx` to access globals or asset sources as needed.
+
+## App-level caching
+
+`App` keeps an `FxHashMap<(TypeId, u64), Box<dyn Any>>` called `loading_assets`. The key combines the concrete `Asset` type and the hash of your source value, so distinct loaders (images, SVGs, fonts…) don’t collide even if they share the same path.
+
+```rust
+let (task, is_first) = app.fetch_asset::<MyAsset>(&source);
+```
+
+- Returns a `Shared<Task<A::Output>>` plus a flag showing whether this call kicked off the actual load.
+- Subsequent `fetch_asset` calls reuse the same future until it completes, after which the cached value is still available via `Task::now_or_never()`.
+- `remove_asset::<A>(&source)` evicts a single entry, useful when you know the source has changed or want to reclaim memory.
+
+## Window helpers (`use_asset` vs `get_asset`)
+
+During rendering you rarely call `fetch_asset` directly; instead, `Window` exposes two ergonomic wrappers:
+
+| Method | Behavior |
+| --- | --- |
+| `use_asset::<A>(&source, cx)` | Returns `Some(output)` if already loaded; otherwise spawns a task (only once) and schedules a view re-render once the task resolves. Ideal for images, fonts, or other inline resources. |
+| `get_asset::<A>(&source, cx)` | Same cache lookup but never schedules a repaint. Helpful for opportunistic fetches where you’ll manually re-render later. |
+
+Under the hood `use_asset` clones the shared task returned by `fetch_asset`, waits for completion with `now_or_never()`, and when `is_first` it spawns a job that notifies the current entity on the next frame. That’s why your element simply calls `window.use_asset(..)` inside `Render::render` and reacts to `None`/`Some` without juggling state machines.
+
+### Example: image loading
+
+`elements/img.rs` wires everything together:
+
+```rust
+pub struct ImageAssetLoader;
+
+impl Asset for ImageAssetLoader {
+    type Source = Resource; // e.g. URI, path, or embedded bytes
+    type Output = Result<RenderImage, ImageCacheError>;
+
+    fn load(source: Self::Source, cx: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+        async move {
+            let bytes = match source {
+                Resource::Uri(uri) => uri.fetch().await?,
+                Resource::Path(path) => tokio::fs::read(path).await?,
+                Resource::Embedded(name) => cx.asset_source().load(&name)?.unwrap().into_owned(),
+            };
+            decode_render_image(bytes)
+        }
+    }
+}
+
+type ImgResourceLoader = AssetLogger<ImageAssetLoader>; // log errors automatically
+
+fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if let Some(Ok(image)) = window.use_asset::<ImgResourceLoader>(&self.source, cx) {
+        // Paint the image
+    }
+}
+```
+
+## Embedded vs dynamic assets
+
+- **Embedded**: call `App::asset_source().load(path)` or use `Resource::Embedded` for data compiled into the binary. Handy for icons, fonts, or default themes packaged alongside the app.
+- **Dynamic**: provide a `SharedUri`, `PathBuf`, or custom `Source` type. Just make sure it implements `Clone + Hash + Send` so the cache key works.
+
+## Tips & best practices
+
+- Wrap your loaders in `AssetLogger` during development so decoding/IO errors bubble up via `log::error!`.
+- Keep `Output` small and cloneable; large buffers (like `RenderImage`) should live behind `Arc` to avoid copies when the cache hands them out.
+- If a resource may change at runtime (e.g., user-provided theme file), call `App::remove_asset::<A>(&source)` before the next `use_asset` to force a refresh.
+- Prefer `Resource` when exposing APIs to user code—it lets them pass URIs, filesystem paths, or embedded names without separate helper functions.
+- Remember that `Asset::load` runs off the UI thread; you can perform blocking IO there, but still prefer async-friendly libraries (`tokio::fs`, `reqwest`, etc.) to keep executors responsive.
+
+Together, these primitives let GPUI lazily fetch everything from SVGs and bitmaps to syntax definition files, all while keeping render loops pure and deterministic.

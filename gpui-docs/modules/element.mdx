@@ -1,0 +1,123 @@
+---
+title: "Element lifecycle"
+description: "How `Element`, `IntoElement`, and `Render` knit together to turn views into pixels every frame."
+---
+
+`element.rs` is the low-level contract between view state and the renderer. Every `Render` implementation ultimately produces a tree of `Element`s; GPUI drives each node through `request_layout → prepaint → paint`, dropping the whole tree before the next frame. This section explains the traits, helper types, and state machines that make that cycle deterministic.
+
+## Frame phases & state slots
+
+```text
+Render::render() → Element::request_layout() → Element::prepaint() → Element::paint()
+```
+
+Each element owns two scratch buffers:
+
+| Associated type | When it’s created | Typical contents |
+| --- | --- | --- |
+| `RequestLayoutState` | Returned from `request_layout` | Child `LayoutId`s, cached measurements, handles for async work |
+| `PrepaintState` | Returned from `prepaint` | Hit-test metadata, animation progress, `FocusHandle`s |
+
+- `request_layout` receives `Window` & `App`, picks a `Style`, and stores any state needed later. It may ask Taffy for children with `Window::request_layout` or call `child.request_layout(...)`.
+- `prepaint` runs after the `LayoutId` is resolved to pixel bounds; it can register hit regions (`DispatchTree`) and autoscroll requests.
+- `paint` is the final draw pass; GPUI reuses the mutable references to both state structs so you can accumulate data across phases without reallocations.
+
+Because elements are re-created every frame, only data stored in an entity’s `Context`/`App` state or keyed off `GlobalElementId` survives.
+
+## Identifiers & inspector integration
+
+- `Element::id` lets you supply a stable `ElementId` (namespaced per parent id). When present, `Window` pushes it onto `element_id_stack` and produces a `GlobalElementId` (the path of ids) that is handed to every phase.
+- `source_location()` routes `#[track_caller]` info into the inspector so dev tools can show “Rendered by `my_button.rs:42`”.
+- `InspectorElementId` is only compiled with `feature = "inspector"` or in debug builds; the module guards for that automatically.
+
+Use global ids for cross-frame caches (e.g., remembering scroll offsets or animation states in a `Global` keyed by `GlobalElementId`).
+
+## Building elements from views
+
+- `Render` is implemented by view entities (`impl Render for MyView`), and must return something `IntoElement`.
+- `RenderOnce` plus `#[derive(IntoElement)]` power component-style helpers that own their inputs. `Component<C>` is the glue type that the derive macro emits; it renders the component exactly once per frame and forwards lifecycle calls to the inner element.
+- `IntoElement` gives you the fluent builder ergonomics familiar from SwiftUI/React. Anything implementing it automatically gains `FluentBuilder`, so you can write `button().child(text("Save"))`.
+- `ParentElement` provides `child()` / `children()` for containers that accept heterogenous child iterators.
+
+Example custom element skeleton:
+
+```rust
+use gpui::{Bounds, Context, Element, ElementId, LayoutId, Pixels, Style, Window};
+
+pub struct CapsuleButton {
+    pub label: String,
+}
+
+impl Element for CapsuleButton {
+    type RequestLayoutState = gpui::LayoutId; // store child layout id
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(ElementId::Name("capsule".into()))
+    }
+
+    fn request_layout(
+        &mut self,
+        _global: Option<&gpui::GlobalElementId>,
+        _inspector: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let layout = window.request_layout(Style::default(), None, cx);
+        (layout, layout)
+    }
+
+    fn prepaint(
+        &mut self,
+        _global: Option<&gpui::GlobalElementId>,
+        _inspector: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut LayoutId,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+        window.commit_bounds(*layout, bounds, cx);
+        ()
+    }
+
+    fn paint(
+        &mut self,
+        _global: Option<&gpui::GlobalElementId>,
+        _inspector: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _layout: &mut LayoutId,
+        _prepaint: &mut (),
+        window: &mut Window,
+        _cx: &mut gpui::App,
+    ) {
+        window.paint_quad(bounds, gpui::solid_background(gpui::white()));
+    }
+}
+```
+
+In real components you would forward to child `AnyElement`s, but the structure illustrates how state flows.
+
+## `Drawable` & `AnyElement`
+
+Runtime polymorphism is provided by:
+
+- `Drawable<E>`: wraps a concrete element and tracks its `ElementDrawPhase` (Start → RequestLayout → LayoutComputed → Prepaint → Painted). This state machine enforces the correct call order and carries the cached states between phases.
+- `AnyElement`: an arena-allocated (`ELEMENT_ARENA`) trait object storing `Drawable<dyn Element>`. It exposes `request_layout`, `prepaint`, `paint`, `layout_as_root`, and helpers like `prepaint_at` that temporarily offset the window’s coordinate space.
+- `ArenaBox`: ensures elements live long enough for the whole frame without heap churn; once the frame ends the arena is cleared (see [`modules/arena`](modules/arena)).
+- Focus integration: `AnyElement::prepaint` returns a `FocusHandle` if any child claimed focus; containers typically bubble this up to decide where keyboard events go.
+
+Whenever you call `.into_any_element()`, you’re creating this boxed wrapper so parent containers can store heterogenous children.
+
+## Empty & utility elements
+
+- `Empty` implements `Element` but requests a `display: none` layout and no-op prepaint/paint; useful as a default placeholder.
+- `AnyElement` also implements `Element`, so you can treat boxed subtrees exactly like regular nodes (e.g., in `Component<C>`).
+
+## Practical tips
+
+- Keep `RequestLayoutState`/`PrepaintState` cheap to clone/move; they are moved through the phase enum every call.
+- Refrain from storing `Window` or `App` references inside those states—GPUI will drop them each frame anyway.
+- Use `Window::with_global_id` helpers (as `Component<C>` does) to scope child ids when you’re composing reusable pieces.
+- If you need to measure an element without painting it, call `AnyElement::layout_as_root` with the desired `AvailableSpace`; this powers intrinsic size calculations.
+
+Armed with these APIs you can implement bespoke layout engines (e.g., a code editor or minimap) while still playing nicely with GPUI’s rendering, focus, and inspection tooling.

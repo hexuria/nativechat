@@ -1,0 +1,85 @@
+---
+title: "Color primitives"
+description: "Foundational color types (RGB/HSLA, gradients, backgrounds) exported via `gpui.rs`."
+---
+
+GPUI’s color story starts in `color.rs` and then fans out through `style.rs`, `styled.rs`, and the scene renderer. `gpui.rs` re-exports everything so you can construct colors fluently in views, define gradients for backgrounds, or feed the renderer custom fills. This guide complements the higher-level [Colors module](modules/colors) by focusing on the core types and helpers.
+
+## RGB helpers
+
+- `rgb(0xffcc00)` / `rgba(0xffcc00ff)` turn hex literals into linear `Rgba` values in the `0.0‑1.0` range.
+- `Rgba` implements `Serialize`, `Deserialize`, `JsonSchema`, and `TryFrom<&str>` so you can round-trip colors through JSON (`#rrggbb`/`#rrggbbaa` plus the short `#rgb` forms).
+- `Rgba::blend` mixes two colors based on the top color’s alpha; the bottom color’s alpha is preserved, which is perfect for text highlight effects and layered fills.
+
+Example:
+
+```rust
+use gpui::{rgb, rgba, Rgba};
+
+let base = rgb(0x1e1e2e);
+let hover = rgba(0xffffff40);
+let blended: Rgba = base.blend(hover);
+```
+
+## HSLA ergonomics
+
+`Hsla` mirrors CSS’s `hsla()` function with helpers like `hsla(h, s, l, a)` plus semantic constructors: `black()`, `white()`, `red()`, `green()`, `yellow()`, `transparent_black()`, etc. Highlights:
+
+- `Hsla::blend`, `grayscale`, `fade_out`, `alpha`, and `opacity` make it easy to derive hover/active states.
+- Conversions are lossless in float space: `Hsla -> Rgba -> Hsla` retains values, and every `Hsla` is hashable/sortable (useful for caching or deduping).
+
+Example:
+
+```rust
+use gpui::{hsla, Hsla};
+
+let primary = hsla(0.62, 0.75, 0.56, 1.0);
+let muted = primary.grayscale().opacity(0.2);
+let on_dark = primary.blend(Hsla::black().alpha(0.25));
+```
+
+## Backgrounds, gradients, and patterns
+
+`Background` is the low-level struct behind `Style::background` and `Fill::Color`. You typically build it via helpers:
+
+| Helper | Description |
+| --- | --- |
+| `solid_background(color)` or `Background::from(Hsla)` | Plain fill |
+| `linear_gradient(angle_deg, from, to)` | Two-stop gradient; `LinearColorStop` accepts a color plus percentage (0→1). |
+| `pattern_slash(color, width, interval)` | Hash-pattern fill for diagnostics/debug UI. |
+| `.color_space(ColorSpace::Oklab)` | Opt into perceptual interpolation (`sRGB` is default). |
+- `.opacity(f32)` applies alpha to the solid color *and* every gradient stop.
+- `.is_transparent()` tells the renderer whether it can skip blending work.
+
+Example gradient:
+
+```rust
+use gpui::{linear_color_stop, linear_gradient, hsla};
+
+let bg = linear_gradient(
+    135.0,
+    linear_color_stop(hsla(0.58, 0.7, 0.55, 1.0), 0.0),
+    linear_color_stop(hsla(0.80, 0.6, 0.65, 1.0), 1.0),
+);
+```
+
+## Resource-friendly conversions
+
+- Every background can become a `Fill` (`Fill::Color(Background)`) which powers `Style::background`, `Canvas`, and SVG rendering.
+- `Background` implements `Serialize`/`Deserialize`, so you can store gradients in settings or theming files with clear JSON representations.
+- `swap_rgba_pa_to_bgra` ensures decoded textures move between GPU APIs safely by converting premultiplied RGBA data to BGRA in place.
+
+## Interplay with higher-level modules
+
+- **`modules/colors`** (already documented) focuses on palette management and `GlobalColors`. Use those APIs to produce the `Hsla` values described here.
+- **`style.rs` / `styled.rs`** turn `Hsla` into CSS-like utility methods: `.text_color`, `.bg(hsla(...))`, `.border_color`, etc. The color module itself just provides the math/serialization.
+- **`scene.rs`** stores colors inside `Quad`, `Shadow`, `Surface`, and sprite primitives. During batching, colors pass through `Background` → GPU uniforms without conversion hiccups thanks to the strongly typed structs here.
+
+## Tips
+
+- Keep hex literals in canonical upper-case for readability (`0xFF00CCAA`) and let `rgb`/`rgba` expand them into floats.
+- When exposing theming hooks, accept `String` + `TryFrom<&str> for Rgba` so user configs stay familiar with CSS hex syntax.
+- Prefer `Hsla::opacity()` when scaling alpha; `fade_out` modifies the color in place, which is handy when reusing a mutable palette.
+- Use `ColorSpace::Oklab` for gradients that should look perceptually linear (e.g., heatmaps) and sRGB for UI tints to match CSS.
+
+With these primitives, every layer of GPUI—from style utilities to the renderer—shares a consistent, ergonomic color foundation.

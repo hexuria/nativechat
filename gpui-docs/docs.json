@@ -71,21 +71,42 @@
         "tab": "Modules",
         "groups": [
           {
-            "group": "Rendering & colors",
+            "group": "Assets & media",
             "pages": [
-              "modules/colors"
+              "modules/assets",
+              "modules/asset-cache"
             ]
           },
           {
-            "group": "Assets & media",
+            "group": "Interaction & commands",
             "pages": [
-              "modules/assets"
+              "modules/actions"
+            ]
+          },
+          {
+            "group": "Elements & views",
+            "pages": [
+              "modules/element"
             ]
           },
           {
             "group": "Input & text",
             "pages": [
               "modules/input"
+            ]
+          },
+          {
+            "group": "Rendering & colors",
+            "pages": [
+              "modules/colors",
+              "modules/bounds-tree"
+            ]
+          },
+          {
+            "group": "Runtime & windows",
+            "pages": [
+              "modules/app",
+              "modules/arena"
             ]
           }
         ]
@@ -147,3 +168,4 @@
     }
   }
 }
+

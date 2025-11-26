@@ -1,0 +1,154 @@
+---
+title: "Action system"
+description: "Define, register, and dispatch GPUI actions so keymaps stay strongly typed."
+---
+
+`gpui.rs` re-exports the action subsystem so every crate sees the same API surface: the `Action` trait, the `actions!` macro, registration helpers, and the runtime `ActionRegistry`. These pieces wire keyboard input into the element tree while keeping commands type-safe and discoverable.
+
+## Where actions fit in GPUI
+
+1. `keymap.rs` matches `Keystroke`s to action *names*.
+2. `App::build_action` asks the `ActionRegistry` (populated at startup by `inventory` hooks) to instantiate the concrete type.
+3. `key_dispatch.rs` delivers that boxed action through `Window::dispatch_action`, first in capture phase and then in bubble phase (see `DispatchPhase` in `window.rs`).
+4. View code registers listeners with `Context::on_action`, `Window::on_action`, or the fluent builders on `Div`/`Interactivity`.
+5. If nothing cancels propagation, `App::on_action` provides a global fallback.
+
+Because this pipeline is centralized in `gpui.rs`, you can reason about ownership and data flow alongside the rest of the runtime (see `_ownership_and_data_flow.rs` for a deeper dive).
+
+## Declaring actions
+
+Use the zero-cost `actions!` macro for simple unit structs:
+
+```rust
+use gpui::actions;
+
+actions!(editor, [MoveUp, MoveDown, MoveLeft, MoveRight]);
+```
+
+For parameterized actions derive `Action` and opt into JSON + schema support:
+
+```rust
+use gpui::Action;
+
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, Action)]
+#[action(namespace = editor, name = "editor::SelectNext")]
+pub struct SelectNext {
+    pub replace_selection: bool,
+}
+```
+
+`#[action(...)]` accepts:
+
+- `namespace = path` (required for Zed’s shipped keymaps).
+- `name = "override"` to decouple the Rust type name from the public identifier.
+- `no_json` to skip `serde`/`schemars` requirements.
+- `no_register` to implement `Action` without making it addressable by name.
+- `deprecated_aliases = ["old::Name"]` so legacy keymaps keep working.
+- `deprecated = "Why"` to surface warnings in generated schemas.
+
+Need full control? Implement `Action` manually and finish by calling `register_action!(Type)` so the type joins the registry.
+
+## Registration & the ActionRegistry
+
+`ActionRegistry` (see `action.rs`) owns:
+
+- `by_name`: maps every canonical or deprecated string to the builder function.
+- `names_by_type_id`: enables `App::build_action_type::<A>()` for programmatic creation.
+- `deprecated_aliases` / `deprecation_messages`: fed to `App::deprecated_actions_to_preferred_actions()` and UI warnings.
+- `documentation`: populated from doc comments via the derive macro.
+
+The registry is filled at startup by iterating `inventory::iter::<MacroActionBuilder>`. Registering the same name twice (either canonical or alias) panics immediately, which keeps the namespace clean.
+
+## JSON, schemas, and errors
+
+`Action::build` receives JSON originating from keymap files. Implementations usually delegate to `serde_json::from_value`. If deserialization fails, return `anyhow::Error`; GPUI wraps it in `ActionBuildError::BuildError` so editors can show a human-friendly message. An unknown name yields `ActionBuildError::NotFound`.
+
+Schema generation (`Action::action_json_schema`) powers `App::action_schemas(...)`, letting you export validation metadata or drive UIs that edit keymaps.
+
+## Dispatch phases and propagation
+
+Actions travel through the same capture → bubble phases described in `window.rs`:
+
+- **Capture**: root → focused element, useful for global overrides.
+- **Bubble**: focused element → root, the default for most listeners.
+
+Handlers stop propagation by default in bubble; call `cx.propagate()` inside your listener to keep dispatching upward. Conversely, capture handlers must explicitly call `cx.stop_propagation()` to short-circuit.
+
+`Window::on_action` and `Window::on_action_when` let you install capture listeners or conditionally register handlers (for instance, only when the window is active). `App::on_action` subscribes globally but only runs if no window/view consumed the action.
+
+## Listening inside views
+
+Every interactive element exposes ergonomic helpers via `styled.rs` → `Interactivity`:
+
+```rust
+use gpui::{actions, div, Context, IntoElement, Render, Window};
+
+actions!(editor, [MoveUp, MoveDown]);
+
+pub struct EditorView {
+    cursor: usize,
+}
+
+impl Render for EditorView {
+    fn render(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .focusable()
+            .on_action(cx.listener(Self::on_move_up))
+            .on_action(cx.listener(Self::on_move_down))
+    }
+}
+
+impl EditorView {
+    fn on_move_up(&mut self, _: &MoveUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor = self.cursor.saturating_sub(1);
+        cx.request_paint();
+    }
+
+    fn on_move_down(&mut self, _: &MoveDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor += 1;
+        cx.request_paint();
+    }
+}
+```
+
+Prefer `cx.listener` (or `App::listener`) so GPUI can automatically manage lifetimes and entity borrowing.
+
+## Working with keymaps
+
+Tie everything together in `App::new`:
+
+```rust
+use gpui::{Key, KeyBinding};
+
+app.bind_keys([
+    KeyBinding::new([Key::ArrowUp.into()], "editor::MoveUp"),
+    KeyBinding::new([Key::ArrowDown.into()], "editor::MoveDown"),
+]);
+
+app.on_action(|action: &MoveUp, cx| {
+    // Global fallback if focused views didn’t handle it.
+    cx.log("global move up");
+});
+```
+
+- Use `App::all_action_names()` to populate key-binding pickers.
+- `App::build_action("editor::SelectNext", Some(json!({"replace_selection": true})))` mirrors what the keymap loader does internally.
+- `App::all_bindings_for_input(&[keystroke])` reports what will run for the currently-focused element.
+
+## Deprecated and “No Action” bindings
+
+`deprecated_aliases` let you continue accepting legacy names while warning users via `App::action_deprecation_messages()`. For hard removals, bind a key to `NoAction` (provided by `action.rs::no_action`) or return `is_no_action(action)` at runtime to detect “unbind” entries.
+
+## Tooling hooks
+
+- `generate_list_of_all_registered_actions()` streams the registry so you can build docs or schemas from outside the runtime.
+- `ActionRegistry::action_schemas()` returns `(name, schema)` pairs ready to merge into Mintlify or other docs.
+
+## Tips
+
+- Keep namespaces short and descriptive (`editor`, `terminal`, `workspace`).
+- Favor doc comments on action structs—the derive macro captures them for display in keymap UIs.
+- When migrating names, leave the old identifiers in `deprecated_aliases` until all published keymaps are updated.
+- Treat `App::intercept_keystrokes` as a last resort; prefer typed actions so focus, propagation, and tooling keep working.
+
+With actions documented alongside `gpui.rs`, you now have a single source of truth for commanding views, whether the action originates from a physical keyboard, palette entry, or automation script.

@@ -1,0 +1,124 @@
+---
+title: "App runtime"
+description: "How `app.rs` wires Application startup, entities, windows, globals, and the effect pipeline exposed via `gpui.rs`."
+---
+
+`gpui.rs` re-exports the entire `app` module so every crate interacts with the same `Application`, `App`, `AppContext`, and `Context` types. Together they own the platform event loop, entity graph, window stack, keymap/action dispatch, and the effect queue described in `_ownership_and_data_flow.rs`.
+
+## Bootstrapping with `Application`
+
+`Application` wraps the shared `AppCell`/`RefCell<App>` combo so startup code can safely borrow the runtime before the platform loop begins.
+
+```rust
+use gpui::{Application, WindowOptions};
+
+fn main() {
+    Application::new()
+        .with_quit_mode(gpui::QuitMode::LastWindowClosed)
+        .run(|app| {
+            app.init_colors();
+            app.open_window(WindowOptions::default(), |window, cx| {
+                cx.new(|cx| RootView::new(window, cx))
+            }).expect("window");
+        });
+}
+```
+
+- `Application::new()`/`headless()` choose the platform backend (`Platform::run`).
+- `with_assets` swaps the `AssetSource` and reinitializes the shared `SvgRenderer`.
+- `with_http_client` injects a custom network stack.
+- `run` hands you `&mut App` once the platform is ready; register windows, bind keys, etc. here.
+- `on_open_urls`, `on_reopen`, and `with_quit_mode` connect platform signals back into GPUI before `App` takes over.
+
+## What `App` owns
+
+`App` itself is the authoritative runtime state. Its fields (see `app.rs`) reveal the core responsibilities:
+
+- **Entities & contexts**: `entities: EntityMap`, `window_update_stack`, `Context::new_context`, and the `AppContext` impl provide `new`, `update_entity`, `reserve_entity`, `insert_entity`, and `read_entity` so views remain type-safe through diff cycles.
+- **Globals**: `globals_by_type` plus helpers like `set_global`, `global<T>`, `update_global`, and `BorrowAppContext::update_default_global` implement the refinement flow explained in `_ownership_and_data_flow.rs`.
+- **Effects & notifications**: `pending_effects`, `pending_notifications`, `pending_global_notifications`, and the internal `Effect` enum guarantee deterministic processing after each UI frame (notify observers, emit events, refresh windows, run deferred closures, announce entity creation).
+- **Input & actions**: `keymap`, `global_action_listeners`, `keystroke_observers`, `keystroke_interceptors`, and the `ActionRegistry` wire keyboard input → actions → listeners. See the [Action system](modules/actions) page for the full story.
+- **Windows & focus**: `windows`, `window_handles`, `focus_handles`, and `window_invalidators_by_entity` coordinate layout/paint work across OS windows. `SystemWindowTabController` (a `Global`) keeps platform tab groups in sync.
+- **Executors & async plumbing**: `BackgroundExecutor`, `ForegroundExecutor`, and helpers like `AppContext::background_spawn`, `Window::defer`, and `Context::task` keep async work off the render thread while still marshaling results through the effect queue.
+- **Platform integrations**: `platform: Rc<dyn Platform>` exposes displays, clipboard, credential store, URL handlers, prompt modals, screen capture sources, etc., all funneled through typed `App` methods.
+
+## Traits exported via `gpui.rs`
+
+| Trait | Where defined | Purpose |
+| --- | --- | --- |
+| `AppContext` | `gpui.rs` (implemented by `App`, `Context`, and async contexts) | Unified API (`new`, `update_entity`, `read_global`, `background_spawn`, …) so both synchronous and asynchronous code manipulate entities the same way. |
+| `VisualContext` | `gpui.rs` (`Window` implements it) | Extends `AppContext` with a concrete window handle (`window_handle`, `update_window_entity`, `focus`, `replace_root_view`). |
+| `BorrowAppContext` | `gpui.rs` | Blanket-implemented for anything that `BorrowMut<App>` to forward global mutations (`set_global`, `update_global`). |
+
+These traits are re-exported to enforce that every context (widgets, async callbacks, inspector tooling) follows the same borrowing and ownership rules described in `_ownership_and_data_flow.rs`.
+
+## Entity lifecycle & contexts
+
+- `App::new` reserves a slot, builds the entity via a closure receiving `Context<T>`, inserts it into the `EntityMap`, and queues an `Effect::EntityCreated`.
+- `App::reserve_entity`/`insert_entity` split that process for multi-stage builders.
+- `App::update_entity` (and its `Context::update` wrapper) guarantee exclusive access and supply a `Context<T>` with helper APIs: observing other entities, subscribing to events, watching globals, deferring work, or registering release callbacks.
+- `GpuiBorrow` lets you temporarily borrow an entity outside the normal closure when you only have a handle.
+
+## Windows, tabs, and platform state
+
+- `App::open_window(WindowOptions, builder)` creates the OS window, pushes it on the `window_update_stack`, builds the root view (an `Entity<V>`), schedules an initial draw, then stores the `WindowHandle<V>`.
+- `App::windows()`, `window_stack()`, and `active_window()` expose handles for enumeration or diagnostics.
+- `SystemWindowTabController` (global) keeps per-platform tab groups synced. Helpers like `select_next_tab`, `select_previous_tab`, and `get_next_tab_group_window` wrap the common UX flows.
+- Platform convenience methods (`activate`, `hide`, `displays`, `primary_display`, `register_url_scheme`, `prompt_for_paths`, `write_credentials`, etc.) all forward to the underlying `Platform` object but keep the API surface centralized in `App`.
+
+## Input, actions, and keymaps
+
+Within `App` you can:
+
+- `bind_keys` / `clear_key_bindings` to mutate the shared `Keymap`.
+- `on_action::<A>` to install a bubble-phase fallback that only runs if no view handled the action.
+- `intercept_keystrokes` to peek at raw `KeystrokeEvent`s before keymap resolution (use sparingly—these fire before action dispatch and can stop propagation entirely).
+- `observe_keystrokes` (from `Context`) for post-dispatch logging.
+- `build_action`, `all_action_names`, `action_schemas`, `deprecated_actions_to_preferred_actions`, and `action_deprecation_messages` to power keymap editors or diagnostics.
+
+See [modules/actions](modules/actions) for full details on declaring, registering, and handling actions; the app module simply hosts the registry and dispatch hooks.
+
+## Effects, subscriptions, and globals
+
+- `SubscriberSet` + `Subscription` power `App::observe`, `Context::observe`, `subscribe`, `observe_global`, `on_app_quit`, `on_app_restart`, etc. The effect queue ensures observer callbacks run after the current update finishes, preventing re-entrant borrows.
+- `App::defer` (via `Effect::Defer`) runs closures at the tail of the frame; `Context::defer` scopes those to an entity.
+- `App::init_colors` seeds the default `GlobalColors`. Any custom global can be stored with `set_global` and later updated with `update_global` / `update_default_global`.
+
+## Assets, networking, and tasks
+
+- `asset_source`, `svg_renderer`, and `loading_assets` keep texture/font loading centralized; `App::load_asset` helpers (see `assets.rs`) lean on this state.
+- `http_client: Arc<dyn HttpClient>` is plumbed through `Application::with_http_client` so background tasks or elements can reuse a preconfigured client.
+- `background_executor` / `foreground_executor` implement `Task<R>` spawning (`background_spawn`) so long-running work doesn’t block the UI thread.
+
+## Example: registering globals and actions during launch
+
+```rust
+use gpui::{actions, App, Application, Global, WindowOptions};
+
+actions!(app, [TogglePalette]);
+
+#[derive(Default)]
+struct AppState {
+    palette_open: bool,
+}
+
+impl Global for AppState {}
+
+fn main() {
+    Application::new().run(|app| {
+        app.set_global(AppState::default());
+
+        app.bind_keys([gpui::KeyBinding::new([gpui::Key::P.with_mods(gpui::Modifiers::COMMAND)], "app::TogglePalette")]);
+
+        app.on_action(|_: &TogglePalette, cx| {
+            cx.update_global::<AppState, _>(|state, _| state.palette_open = !state.palette_open);
+        });
+
+        app.open_window(WindowOptions::default(), |window, cx| {
+            cx.new(|cx| RootView::new(window, cx))
+        }).unwrap();
+    });
+}
+```
+
+The example touches most of the app-layer responsibilities: global state, key bindings, actions, and window creation—all mediated by the `App` struct exported from `gpui.rs`.
