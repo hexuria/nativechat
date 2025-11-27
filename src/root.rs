@@ -153,13 +153,7 @@ impl Render for RootView {
                                 .shadow_lg()
                                 .child(self.credentials_modal.clone().unwrap())
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
-                        )
-                        .on_mouse_down(MouseButton::Left, {
-                            let state = self.state.clone();
-                            move |_, _, cx| {
-                                state.update(cx, |state, cx| state.toggle_credentials_modal(cx));
-                            }
-                        }),
+                        ),
                 )
             } else {
                 self.credentials_modal = None;

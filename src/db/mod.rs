@@ -23,9 +23,8 @@ pub async fn create_pool(database_url: &str) -> Result<DbPool> {
     Ok(pool)
 }
 
-pub async fn run_migrations(_pool: &DbPool) -> Result<()> {
-    // Migrations will be handled separately for now
-    // sqlx::migrate!("./migrations").run(pool).await?;
+pub async fn run_migrations(pool: &DbPool) -> Result<()> {
+    sqlx::migrate!("./migrations").run(pool).await?;
     println!("Database ready");
     Ok(())
 }

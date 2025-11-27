@@ -124,8 +124,9 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("right", MoveRight, Some(CONTEXT)),
         KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
         KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
-        KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
         KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
+        KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
+        KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
         KeyBinding::new("tab", IndentInline, Some(MULTI_LINE_CONTEXT)),
         KeyBinding::new("shift-tab", OutdentInline, Some(MULTI_LINE_CONTEXT)),
         #[cfg(target_os = "macos")]
@@ -416,6 +417,11 @@ impl InputState {
             _context_menu_task: Task::ready(Ok(())),
             _pending_update: false,
         }
+    }
+
+    /// Get the focus handle of the input.
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus_handle
     }
 
     /// Set Input to use [`InputMode::MultiLine`] mode.

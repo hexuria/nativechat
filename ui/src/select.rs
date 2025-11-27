@@ -638,6 +638,11 @@ where
         self.focus_handle.focus(window);
     }
 
+    /// Get the focus handle of the select.
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus_handle
+    }
+
     fn update_selected_value(&mut self, _: &Window, cx: &App) {
         self.selected_value = self
             .selected_index(cx)
@@ -917,6 +922,12 @@ where
             state: state.clone(),
             options: SelectOptions::default(),
         }
+    }
+
+    /// Set the id of the select.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Set the width of the dropdown menu, default: Length::Auto

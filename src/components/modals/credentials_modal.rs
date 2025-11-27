@@ -1,7 +1,7 @@
 use crate::services::database::Credential;
 use crate::state::AppState;
 use gpui::prelude::*;
-use gpui::*;
+use gpui::{InteractiveElement, *};
 use ui::Icon;
 use ui::IconName;
 use ui::IndexPath;
@@ -113,8 +113,10 @@ impl CredentialsModal {
 
             let provider_items =
                 SearchableVec::new(PROVIDERS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-            let provider_select =
-                cx.new(|cx| SelectState::new(provider_items, None, window, cx).searchable(true));
+            let provider_select = cx.new(|cx| {
+                SelectState::new(provider_items, Some(IndexPath::default()), window, cx)
+                    .searchable(true)
+            });
             let api_key_input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("API Key")
@@ -179,7 +181,13 @@ impl CredentialsModal {
             .unwrap_or_default();
         let api_key = self.api_key_input.read(cx).value().to_string();
 
+        println!(
+            "Attempting to add credential: name='{}', provider='{}', api_key='{}'",
+            name, provider, api_key
+        );
+
         if name.trim().is_empty() || provider.trim().is_empty() || api_key.trim().is_empty() {
+            println!("Validation failed: fields are empty");
             self.error_message = Some("All fields are required.".to_string());
             cx.notify();
             return;
@@ -258,6 +266,7 @@ impl Render for CredentialsModal {
         let is_mobile = window.viewport_size().width < px(768.);
 
         div()
+            .id("credentials_modal")
             .flex()
             .flex_col()
             .size_full()
@@ -275,25 +284,15 @@ impl Render for CredentialsModal {
                             .text_xl(),
                     )
                     .child(
-                        div()
+                        gpui::div()
+                            .id("close-credentials-modal")
                             .cursor_pointer()
                             .child(Icon::new(IconName::Close))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                // We need to define ToggleCredentialsModal action or use the state method.
-                                // Since we are in a closure, we can't easily call state method without cloning state entity.
-                                // Let's define the action in root.rs or use a callback.
-                                // For now, let's just print "Close" to verify UI, and fix the action later.
-                                // Actually, we can just use `cx.dispatch_action(crate::actions::ToggleSidebar)` as a placeholder if we want to compile,
-                                // but the user wants it fixed.
-                                // Let's check `src/root.rs` to see if `ToggleCredentialsModal` is defined as an action.
-                                // It was used in `root.rs` as `state.update(cx, |state, cx| state.toggle_credentials_modal(cx));` inside `on_mouse_down`.
-                                // So it's a state method.
-                                // We can define a local action `CloseModal` and handle it in `CredentialsModal` or `RootView`.
-                                // But `CredentialsModal` is inside `RootView`.
-                                // Let's define `CloseCredentialsModal` action in `src/actions.rs` or `src/root.rs`.
-                                // For now, let's use a new action defined here: `actions!(CloseCredentialsModal);`
-                                cx.dispatch_action(&crate::actions::ToggleCredentialsModal);
-                            }),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.toggle_credentials_modal(cx);
+                                });
+                            })),
                     ),
             )
             .child(
@@ -307,12 +306,14 @@ impl Render for CredentialsModal {
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .child(Input::new(&self.name_input))
+                            .child(Input::new(&self.name_input).id("name-input"))
                             .child(
                                 Select::new(&self.provider_select)
+                                    .id("provider-select")
+                                    .placeholder("Select Provider")
                                     .search_placeholder("Search provider..."),
                             )
-                            .child(Input::new(&self.api_key_input))
+                            .child(Input::new(&self.api_key_input).id("api-key-input"))
                             .child(if let Some(error) = &self.error_message {
                                 div().child(
                                     Label::new(error.clone())
@@ -322,11 +323,18 @@ impl Render for CredentialsModal {
                                 div()
                             })
                             .child(
-                                Button::new("add")
+                                Button::new("add-credential-btn")
                                     .label("Add Credential")
                                     .w_full()
-                                    .on_click(|_, _, cx| cx.dispatch_action(&SubmitCredential)),
-                            ),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_credential(window, cx);
+                                    })),
+                            )
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.key == "Enter" {
+                                    this.add_credential(window, cx);
+                                }
+                            })),
                     ),
             )
             .child(
@@ -340,6 +348,7 @@ impl Render for CredentialsModal {
                     .child(
                         div()
                             .flex_1()
+                            .min_h_0()
                             .child(div().size_full().child(List::new(&self.list_state))),
                     ),
             )

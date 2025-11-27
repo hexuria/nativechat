@@ -1,6 +1,6 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, relative, AnyElement, App, DefiniteLength, Edges, EdgesRefinement, Entity,
+    div, px, relative, AnyElement, App, DefiniteLength, Edges, EdgesRefinement, ElementId, Entity,
     InteractiveElement as _, IntoElement, IsZero, MouseButton, ParentElement as _, Pixels, Rems,
     RenderOnce, StyleRefinement, Styled, Window,
 };
@@ -33,7 +33,9 @@ pub struct Input {
     bordered: bool,
     focus_bordered: bool,
     tab_index: isize,
+
     selected: bool,
+    id: Option<ElementId>,
 }
 
 impl Sizable for Input {
@@ -71,7 +73,9 @@ impl Input {
             bordered: true,
             focus_bordered: true,
             tab_index: 0,
+
             selected: false,
+            id: None,
         }
     }
 
@@ -136,6 +140,12 @@ impl Input {
     /// Set the tab index for the input, default is 0.
     pub fn tab_index(mut self, index: isize) -> Self {
         self.tab_index = index;
+        self
+    }
+
+    /// Set the id of the input.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
         self
     }
 
@@ -277,7 +287,10 @@ impl RenderOnce for Input {
         let has_suffix = suffix.is_some() || state.loading || self.mask_toggle || show_clear_button;
 
         div()
-            .id(("input", self.state.entity_id()))
+            .id(self
+                .id
+                .clone()
+                .unwrap_or_else(|| ("input", self.state.entity_id()).into()))
             .flex()
             .key_context(crate::input::CONTEXT)
             .track_focus(&state.focus_handle.clone())
