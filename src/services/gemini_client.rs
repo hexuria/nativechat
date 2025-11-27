@@ -170,7 +170,7 @@ impl GeminiLiveClient {
             };
 
             println!("[GeminiClient] Connecting to {}...", url);
-            let ws_stream = match connect_async(url).await {
+            let ws_stream = match connect_async(url.as_str()).await {
                 Ok((s, _)) => s,
                 Err(e) => {
                     eprintln!("[GeminiClient] Connection failed: {}", e);
@@ -215,7 +215,7 @@ impl GeminiLiveClient {
             println!("[GeminiClient] Sending setup message: {}", setup_msg);
             if let Err(e) = write
                 .send(tokio_tungstenite::tungstenite::Message::Text(
-                    setup_msg.to_string(),
+                    setup_msg.to_string().into(),
                 ))
                 .await
             {
@@ -230,9 +230,11 @@ impl GeminiLiveClient {
             while let Some(msg) = read.next().await {
                 // println!("[GeminiClient] Received raw message: {:?}", msg);
                 let text_msg = match msg {
-                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => Some(text),
+                    Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                        Some(text.to_string())
+                    }
                     Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
-                        String::from_utf8(bin).ok()
+                        String::from_utf8(bin.to_vec()).ok()
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(close)) => {
                         eprintln!("[GeminiClient] Connection closed during setup: {:?}", close);
@@ -271,7 +273,7 @@ impl GeminiLiveClient {
                 while let Some(msg) = rx.recv().await {
                     // println!("[GeminiClient] Sending message to WebSocket (len: {})", msg.len());
                     if write
-                        .send(tokio_tungstenite::tungstenite::Message::Text(msg))
+                        .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
                         .await
                         .is_err()
                     {
@@ -291,9 +293,11 @@ impl GeminiLiveClient {
                 println!("[GeminiClient] Reader task started");
                 while let Some(msg) = read.next().await {
                     let text_msg = match msg {
-                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => Some(text),
+                        Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                            Some(text.to_string())
+                        }
                         Ok(tokio_tungstenite::tungstenite::Message::Binary(bin)) => {
-                            String::from_utf8(bin).ok()
+                            String::from_utf8(bin.to_vec()).ok()
                         }
                         Ok(tokio_tungstenite::tungstenite::Message::Close(close)) => {
                             eprintln!("[GeminiClient] Connection closed by server: {:?}", close);

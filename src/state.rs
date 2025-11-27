@@ -1,5 +1,7 @@
 use crate::audio::AudioInput;
-
+use crate::config::Config;
+use crate::llm::{ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential};
+use crate::services::database::{Credential as DbCredential, DatabaseService, Profile as DbProfile};
 use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
 use gpui::*;
@@ -99,6 +101,7 @@ pub struct AppState {
     pub more_menu_open: bool,
     pub is_account_settings_open: bool,
     pub is_profile_settings_open: bool,
+    pub is_credentials_modal_open: bool,
     pub audio_input: Option<AudioInput>,
     pub gemini_client: Option<GeminiLiveClient>,
     pub profiles: Vec<Profile>,
@@ -109,6 +112,14 @@ pub struct AppState {
     pub sidebar_collapsed: bool,
     pub model_registry: Arc<ModelRegistry>,
     pub available_models: Vec<ModelProfile>,
+    pub database_service: Option<DatabaseService>,
+    pub llm_provider: Option<Arc<dyn LlmProvider>>,
+    pub config: Option<Config>,
+    pub is_ai_responding: bool,
+    // Database profile and credential fields
+    pub db_profiles: Vec<DbProfile>,
+    pub db_credentials: Vec<DbCredential>,
+    pub active_profile_id: Option<i64>,
 }
 
 impl Default for AppState {
@@ -269,6 +280,7 @@ impl AppState {
             more_menu_open: false,
             is_account_settings_open: false,
             is_profile_settings_open: false,
+            is_credentials_modal_open: false,
             audio_input: None,
             gemini_client: None,
             profiles,
@@ -279,7 +291,173 @@ impl AppState {
             sidebar_collapsed: false,
             model_registry: Arc::new(ModelRegistry::new()),
             available_models: Vec::new(),
+            database_service: None,
+            llm_provider: None,
+            config: None,
+            is_ai_responding: false,
+            db_profiles: Vec::new(),
+            db_credentials: Vec::new(),
+            active_profile_id: None,
         }
+    }
+
+    pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
+        // Initialize LLM provider based on config
+        match create_provider(&config) {
+            Ok(provider) => {
+                println!("[LLM] Initialized {} provider", config.default_provider);
+                self.llm_provider = Some(Arc::from(provider));
+            }
+            Err(e) => {
+                eprintln!("[LLM] Failed to create provider: {}", e);
+            }
+        }
+        self.config = Some(config);
+        cx.notify();
+    }
+
+    pub fn set_database_service(&mut self, service: DatabaseService, cx: &mut Context<Self>) {
+        self.database_service = Some(service);
+        cx.notify();
+    }
+
+    /// Load all profiles and credentials from the database into AppState.
+    pub async fn load_profiles_and_credentials(db: &DatabaseService) -> anyhow::Result<(Vec<DbProfile>, Vec<DbCredential>)> {
+        let profiles = db.get_profiles().await?;
+        let credentials = db.get_credentials().await?;
+        Ok((profiles, credentials))
+    }
+
+    /// Set the loaded profiles and credentials into AppState.
+    pub fn set_profiles_and_credentials(
+        &mut self,
+        profiles: Vec<DbProfile>,
+        credentials: Vec<DbCredential>,
+        cx: &mut Context<Self>,
+    ) {
+        self.db_profiles = profiles;
+        self.db_credentials = credentials;
+        cx.notify();
+    }
+
+    /// Select a database profile by ID and update the active profile.
+    /// This also updates the LLM provider to use the profile's credential.
+    /// Persists the selection to the settings table.
+    /// Requirements: 2.2, 5.1
+    pub fn select_db_profile(&mut self, profile_id: i64, cx: &mut Context<Self>) {
+        // Verify the profile exists before setting
+        if self.db_profiles.iter().any(|p| p.id == profile_id) {
+            self.active_profile_id = Some(profile_id);
+            self.update_llm_provider(cx);
+            
+            // Persist the selection asynchronously
+            if let Some(db) = self.database_service.clone() {
+                cx.spawn(move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
+                    if let Err(e) = Self::persist_selected_profile(&db, Some(profile_id)).await {
+                        eprintln!("Failed to persist selected profile: {}", e);
+                    }
+                })
+                .detach();
+            }
+            
+            cx.notify();
+        }
+    }
+
+    /// Get the currently active database profile.
+    pub fn active_profile(&self) -> Option<&DbProfile> {
+        self.active_profile_id
+            .and_then(|id| self.db_profiles.iter().find(|p| p.id == id))
+    }
+
+    /// Get the text credential for the active profile.
+    pub fn active_credential(&self) -> Option<&DbCredential> {
+        self.active_profile()
+            .and_then(|profile| profile.text_credential_id)
+            .and_then(|cred_id| self.db_credentials.iter().find(|c| c.id == cred_id))
+    }
+
+    /// Persist the selected profile ID to the settings table.
+    /// Requirements: 5.1
+    pub async fn persist_selected_profile(db: &DatabaseService, profile_id: Option<i64>) -> anyhow::Result<()> {
+        const SETTING_KEY: &str = "selected_profile_id";
+        match profile_id {
+            Some(id) => {
+                db.set_setting(SETTING_KEY, &id.to_string()).await?;
+            }
+            None => {
+                db.delete_setting(SETTING_KEY).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the selected profile from settings on startup.
+    /// Validates that the profile still exists, clears if not.
+    /// Requirements: 5.2, 5.3
+    pub async fn restore_selected_profile(
+        db: &DatabaseService,
+        profiles: &[DbProfile],
+    ) -> anyhow::Result<Option<i64>> {
+        const SETTING_KEY: &str = "selected_profile_id";
+        
+        if let Some(value) = db.get_setting(SETTING_KEY).await? {
+            if let Ok(profile_id) = value.parse::<i64>() {
+                // Validate profile still exists
+                if profiles.iter().any(|p| p.id == profile_id) {
+                    return Ok(Some(profile_id));
+                } else {
+                    // Profile no longer exists, clear the setting
+                    db.delete_setting(SETTING_KEY).await?;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Update the LLM provider based on the active profile's credential.
+    /// Falls back to Config-based provider if no profile/credential is selected.
+    pub fn update_llm_provider(&mut self, cx: &mut Context<Self>) {
+        // Try to create provider from active profile's credential
+        if let Some(credential) = self.active_credential() {
+            let model_id = self.active_profile()
+                .and_then(|p| p.text_model_id.as_deref());
+            
+            match create_provider_from_credential(credential, model_id) {
+                Ok(provider) => {
+                    println!(
+                        "[LLM] Initialized {} provider from profile credential",
+                        credential.provider
+                    );
+                    self.llm_provider = Some(Arc::from(provider));
+                    cx.notify();
+                    return;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[LLM] Failed to create provider from credential: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        // Fall back to Config-based provider
+        if let Some(config) = &self.config {
+            match create_provider(config) {
+                Ok(provider) => {
+                    println!(
+                        "[LLM] Initialized {} provider from config (fallback)",
+                        config.default_provider
+                    );
+                    self.llm_provider = Some(Arc::from(provider));
+                }
+                Err(e) => {
+                    eprintln!("[LLM] Failed to create provider from config: {}", e);
+                }
+            }
+        }
+        cx.notify();
     }
 
     pub fn fetch_models(&mut self, api_keys: HashMap<Provider, String>, cx: &mut Context<Self>) {
@@ -329,22 +507,119 @@ impl AppState {
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
-        if let Some(conversation_id) = self.active_conversation_id
-            && let Some(conversation) = self
-                .conversations
-                .iter_mut()
-                .find(|c| c.id == conversation_id)
-        {
+        let conversation_id = match self.active_conversation_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        // Add user message
+        if let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == conversation_id) {
             let message = Message {
                 id: conversation.messages.len() + 1,
                 sender: "Me".to_string(),
-                content,
+                content: content.clone(),
                 sent_at: SystemTime::now(),
                 is_me: true,
             };
             conversation.messages.push(message);
-            cx.notify();
         }
+        cx.notify();
+
+        // Get AI response
+        let provider = match &self.llm_provider {
+            Some(p) => p.clone(),
+            None => {
+                eprintln!("[LLM] No provider configured");
+                return;
+            }
+        };
+
+        // Build chat history for context
+        let chat_messages: Vec<ChatMessage> = self
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| {
+                c.messages
+                    .iter()
+                    .map(|m| ChatMessage {
+                        role: if m.is_me { "user".to_string() } else { "assistant".to_string() },
+                        content: m.content.clone(),
+                        images: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Use active profile's text_model_id if set, otherwise fall back to provider default
+        // Requirements 4.1, 4.2
+        let model = self.active_profile()
+            .and_then(|p| p.text_model_id.clone())
+            .unwrap_or_else(|| provider.default_model().to_string());
+
+        let request = ChatRequest {
+            model,
+            messages: chat_messages,
+            system_prompt: Some("You are a helpful AI assistant.".to_string()),
+            temperature: 0.7,
+            max_tokens: Some(2048),
+            stream: false,
+        };
+
+        self.is_ai_responding = true;
+        cx.notify();
+
+        cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                println!("[LLM] Sending request to AI...");
+                match provider.chat(request).await {
+                    Ok(response) => {
+                        println!("[LLM] Got response: {:.100}...", response.content);
+                        let _ = this.update(&mut cx, |state, cx| {
+                            if let Some(conversation) = state
+                                .conversations
+                                .iter_mut()
+                                .find(|c| c.id == conversation_id)
+                            {
+                                let ai_message = Message {
+                                    id: conversation.messages.len() + 1,
+                                    sender: "AI".to_string(),
+                                    content: response.content,
+                                    sent_at: SystemTime::now(),
+                                    is_me: false,
+                                };
+                                conversation.messages.push(ai_message);
+                            }
+                            state.is_ai_responding = false;
+                            cx.notify();
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[LLM] Error: {}", e);
+                        let _ = this.update(&mut cx, |state, cx| {
+                            if let Some(conversation) = state
+                                .conversations
+                                .iter_mut()
+                                .find(|c| c.id == conversation_id)
+                            {
+                                let error_message = Message {
+                                    id: conversation.messages.len() + 1,
+                                    sender: "System".to_string(),
+                                    content: format!("Error: {}", e),
+                                    sent_at: SystemTime::now(),
+                                    is_me: false,
+                                };
+                                conversation.messages.push(error_message);
+                            }
+                            state.is_ai_responding = false;
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -424,6 +699,11 @@ impl AppState {
 
     pub fn toggle_profile_settings(&mut self, cx: &mut Context<Self>) {
         self.is_profile_settings_open = !self.is_profile_settings_open;
+        cx.notify();
+    }
+
+    pub fn toggle_credentials_modal(&mut self, cx: &mut Context<Self>) {
+        self.is_credentials_modal_open = !self.is_credentials_modal_open;
         cx.notify();
     }
 

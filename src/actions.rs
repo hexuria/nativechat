@@ -34,6 +34,7 @@ actions!(
         Projects,
         OpenAccountSettings,
         OpenProfileSettings,
-        SignOut
+        SignOut,
+        ToggleCredentialsModal
     ]
 );

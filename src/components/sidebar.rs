@@ -254,6 +254,19 @@ impl Render for SidebarView {
                                         }),
                                 )
                                 .child(
+                                    SidebarMenuItem::new("Credentials")
+                                        .icon(IconName::Asterisk)
+                                        .disable(any_modal_open)
+                                        .on_click({
+                                            let state = self.state.clone();
+                                            move |_, _, cx| {
+                                                state.update(cx, |state, cx| {
+                                                    state.toggle_credentials_modal(cx);
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
                                     SidebarMenuItem::new("Profile Settings")
                                         .icon(IconName::User)
                                         .disable(any_modal_open)

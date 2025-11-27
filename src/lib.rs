@@ -1,8 +1,11 @@
 pub mod actions;
 pub mod assets;
-
 pub mod audio;
 pub mod components;
+pub mod config;
+pub mod db;
+pub mod error;
+pub mod llm;
 pub mod root;
 pub mod services;
 pub mod state;

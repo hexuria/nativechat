@@ -97,6 +97,7 @@ pub enum InputEvent {
 }
 
 pub(super) const CONTEXT: &str = "Input";
+pub(super) const MULTI_LINE_CONTEXT: &str = "InputMultiLine";
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
@@ -124,7 +125,9 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
         KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
         KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
-        KeyBinding::new("shift-tab", OutdentInline, Some(CONTEXT)),
+        KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
+        KeyBinding::new("tab", IndentInline, Some(MULTI_LINE_CONTEXT)),
+        KeyBinding::new("shift-tab", OutdentInline, Some(MULTI_LINE_CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]

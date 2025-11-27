@@ -2,11 +2,13 @@ use crate::actions::{
     About, Hide, HideOthers, Minimize, ShowAll, ToggleSidebar, ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
-use gpui::*;
+use gpui::prelude::*;
+use gpui::{InteractiveElement, *};
 
 use crate::state::AppState;
 
 use crate::components::circular_voice_viz::CircularVoiceViz;
+use crate::components::modals::credentials_modal::CredentialsModal;
 use crate::components::voice_mode_modal::render_voice_mode_modal;
 use ui::{ActiveTheme, Root};
 
@@ -15,6 +17,7 @@ pub struct RootView {
     layout: Entity<Layout>,
     state: Entity<AppState>,
     circular_viz: Option<Entity<CircularVoiceViz>>,
+    credentials_modal: Option<Entity<CredentialsModal>>,
     pub focus_handle: FocusHandle,
 }
 
@@ -27,6 +30,7 @@ impl RootView {
             layout,
             state,
             circular_viz: None,
+            credentials_modal: None,
             focus_handle,
         }
     }
@@ -34,11 +38,16 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.state.read(cx);
-        let is_voice_mode_open = state.is_voice_mode_open;
-        let amplitude = state.amplitude.clone();
-        let ai_amplitude = state.ai_amplitude.clone();
-        let app_state = self.state.clone();
+        let (is_voice_mode_open, amplitude, ai_amplitude, is_credentials_modal_open) = {
+            let app_state = self.state.read(cx);
+            (
+                app_state.is_voice_mode_open,
+                app_state.amplitude.clone(),
+                app_state.ai_amplitude.clone(),
+                app_state.is_credentials_modal_open,
+            )
+        };
+        let app_state_entity = self.state.clone();
 
         // Manage CircularVoiceViz lifecycle
         if is_voice_mode_open {
@@ -46,7 +55,7 @@ impl Render for RootView {
                 self.circular_viz = Some(CircularVoiceViz::new(
                     amplitude,
                     ai_amplitude,
-                    app_state.clone(),
+                    app_state_entity.clone(),
                     cx,
                 ));
             }
@@ -57,6 +66,7 @@ impl Render for RootView {
         let viz = self.circular_viz.clone();
 
         div()
+            .relative()
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("Root")
@@ -97,14 +107,62 @@ impl Render for RootView {
             .on_action(|_: &About, _window: &mut Window, _cx: &mut App| {
                 println!("About NativeChat");
             })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &crate::actions::ToggleCredentialsModal,
+                      _window: &mut Window,
+                      cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_credentials_modal(cx));
+                }
+            })
             // Voice Mode Modal Overlay
             .children(if is_voice_mode_open {
                 if let Some(viz) = viz {
-                    Some(render_voice_mode_modal(app_state, viz, cx))
+                    Some(render_voice_mode_modal(app_state_entity.clone(), viz, cx))
                 } else {
                     None
                 }
             } else {
+                None
+            })
+            // Credentials Modal
+            .children(if is_credentials_modal_open {
+                if self.credentials_modal.is_none() {
+                    self.credentials_modal =
+                        Some(CredentialsModal::new(app_state_entity.clone(), window, cx));
+                }
+                Some(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .occlude()
+                        .bg(cx.theme().background.opacity(0.8))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w_1_2()
+                                .h_3_4()
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .rounded_lg()
+                                .shadow_lg()
+                                .child(self.credentials_modal.clone().unwrap())
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                        )
+                        .on_mouse_down(MouseButton::Left, {
+                            let state = self.state.clone();
+                            move |_, _, cx| {
+                                state.update(cx, |state, cx| state.toggle_credentials_modal(cx));
+                            }
+                        }),
+                )
+            } else {
+                self.credentials_modal = None;
                 None
             })
             // Root overlay layers

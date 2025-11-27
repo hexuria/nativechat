@@ -5,18 +5,25 @@ use nativechat::actions::{
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
+use nativechat::config::Config;
+use nativechat::db::{create_pool, run_migrations};
 use nativechat::root::RootView;
+use nativechat::services::database::DatabaseService;
+use nativechat::state::AppState;
 use nativechat::theme;
 use ui::Root;
 
-use nativechat::state::AppState;
-
 fn main() {
+    // Create tokio runtime for async operations
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .expect("Failed to create tokio runtime");
     let _guard = runtime.enter();
+
+    // Load environment variables
+    dotenv::from_filename(".env.local").ok();
+    dotenv::dotenv().ok();
 
     Application::new()
         .with_assets(CombinedAssets)
@@ -24,7 +31,7 @@ fn main() {
             cx.bind_keys([
                 // Enter to submit in MessageInput context
                 KeyBinding::new("enter", SubmitMessage, Some("MessageInput")),
-                // Cmd+Enter to submit in Editor context (to override default behavior or ensure it works)
+                // Cmd+Enter to submit in Editor context
                 KeyBinding::new("cmd-enter", SubmitMessage, Some("Editor")),
                 KeyBinding::new("ctrl-enter", SubmitMessage, Some("Editor")),
                 // Global shortcuts
@@ -37,8 +44,7 @@ fn main() {
             // Register actions
             cx.on_action(quit);
 
-            // Initialize GPUI Components
-            // Initialize GPUI Components
+            // Initialize UI Components
             ui::init(cx);
 
             // Initialize Theme
@@ -62,6 +68,78 @@ fn main() {
 
             cx.open_window(options, |window, cx| {
                 let state = cx.new(|_| AppState::new());
+
+                // Initialize config and LLM provider
+                let state_clone = state.clone();
+                cx.spawn(|cx: &mut AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        // Load config
+                        let config = match Config::load() {
+                            Ok(config) => config,
+                            Err(e) => {
+                                eprintln!("Failed to load config: {}", e);
+                                return;
+                            }
+                        };
+
+                        println!("Debug: Database URL: {}", config.database_url);
+                        println!("Debug: Default provider: {}", config.default_provider);
+
+                        // Create connection pool
+                        let pool = match create_pool(&config.database_url).await {
+                            Ok(pool) => pool,
+                            Err(e) => {
+                                eprintln!("Failed to create database pool: {}", e);
+                                return;
+                            }
+                        };
+
+                        // Run migrations
+                        if let Err(e) = run_migrations(&pool).await {
+                            eprintln!("Failed to run migrations: {}", e);
+                            return;
+                        }
+
+                        // Create DatabaseService
+                        let db_service = DatabaseService::new(pool);
+
+                        // Load profiles and credentials from database
+                        let (profiles, credentials) = match AppState::load_profiles_and_credentials(&db_service).await {
+                            Ok(data) => data,
+                            Err(e) => {
+                                eprintln!("Failed to load profiles and credentials: {}", e);
+                                (Vec::new(), Vec::new())
+                            }
+                        };
+
+                        // Restore selected profile from settings
+                        let restored_profile_id = match AppState::restore_selected_profile(&db_service, &profiles).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("Failed to restore selected profile: {}", e);
+                                None
+                            }
+                        };
+
+                        // Update state with config and services
+                        let _ = state_clone.update(&mut cx, |state, cx| {
+                            state.set_database_service(db_service, cx);
+                            state.set_profiles_and_credentials(profiles, credentials, cx);
+                            
+                            // Set the restored profile and update LLM provider
+                            if let Some(profile_id) = restored_profile_id {
+                                state.active_profile_id = Some(profile_id);
+                                state.update_llm_provider(cx);
+                            }
+                            
+                            state.set_config(config, cx);
+                        });
+
+                        println!("App initialized successfully!");
+                    }
+                })
+                .detach();
 
                 let view = cx.new(|cx| RootView::new(window, state, cx));
                 view.update(cx, |view, _cx| {
@@ -94,13 +172,7 @@ fn set_menus(cx: &mut App) {
         Menu {
             name: "Edit".into(),
             items: vec![
-                // MenuItem::os_submenu("Undo", SystemMenuType::Undo),
-                // MenuItem::os_submenu("Redo", SystemMenuType::Redo),
                 MenuItem::separator(),
-                // MenuItem::os_submenu("Cut", SystemMenuType::Cut),
-                // MenuItem::os_submenu("Copy", SystemMenuType::Copy),
-                // MenuItem::os_submenu("Paste", SystemMenuType::Paste),
-                // MenuItem::os_submenu("Select All", SystemMenuType::SelectAll),
             ],
         },
         Menu {
@@ -109,7 +181,6 @@ fn set_menus(cx: &mut App) {
                 MenuItem::action("Minimize", Minimize),
                 MenuItem::action("Zoom", Zoom),
                 MenuItem::separator(),
-                // MenuItem::os_submenu("Bring All to Front", SystemMenuType::BringAllToFront),
             ],
         },
         Menu {

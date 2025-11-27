@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "ui"]
+members = [".", "ui", "chat"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -16,19 +16,30 @@ edition = "2024"
 gpui.workspace = true
 anyhow.workspace = true
 rust-embed.workspace = true
-rand = "0.8"
-cpal = "0.15"
+rand = "0.9.2"
+cpal = "0.16.0"
 coreaudio-sys = "0.2.17"
 tokio = { version = "1.36", features = ["full"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-base64 = "0.21"
+base64 = "0.22.1"
 futures = "0.3"
 url = "2.5"
 log = "0.4"
 ui = { path = "ui" }
-reqwest = { version = "0.12.24", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.24", features = ["json", "rustls-tls", "stream"] }
+dotenv = "0.15.0"
+thiserror = "2.0"
+directories = "6"
+async-trait = "0.1"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+[dev-dependencies]
+proptest = "1.4"
+tempfile = "3.10"
 
 [package.metadata.bundle]
 name = "NativeChat"
