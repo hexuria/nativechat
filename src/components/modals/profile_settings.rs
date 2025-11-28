@@ -1,4 +1,4 @@
-use crate::services::database::Credential;
+use crate::services::database::{Credential, Profile};
 use crate::services::model_registry::{ModelCapabilities, ModelProfile, Provider};
 use crate::state::AppState;
 use gpui::prelude::*;
@@ -34,12 +34,12 @@ impl SelectItem for CredentialItem {
 }
 
 pub struct ProfileListDelegate {
-    profiles: Vec<String>,
+    pub profiles: Vec<Profile>,
     selected_index: Option<usize>,
 }
 
 impl ProfileListDelegate {
-    pub fn new(profiles: Vec<String>) -> Self {
+    pub fn new(profiles: Vec<Profile>) -> Self {
         Self {
             profiles,
             selected_index: None,
@@ -66,7 +66,7 @@ impl ListDelegate for ProfileListDelegate {
                 .when(is_selected, |s| s.bg(theme.secondary))
                 .child(
                     div()
-                        .child(profile.clone())
+                        .child(profile.name.clone())
                         .font_weight(FontWeight::BOLD)
                         .text_sm(),
                 )
@@ -106,6 +106,7 @@ pub struct ProfileSettingsModal {
     error_message: Option<String>,
     sidebar_open: bool,
     last_window_width: Option<Pixels>,
+    pending_name_update: Option<String>,
 }
 
 impl ProfileSettingsModal {
@@ -210,11 +211,7 @@ impl ProfileSettingsModal {
         let image_credential_select =
             cx.new(|cx| SelectState::new(SearchableVec::new(vec![]), None, window, cx));
 
-        let list_delegate = ProfileListDelegate::new(vec![
-            "Default".to_string(),
-            "Gemini CLI".to_string(),
-            "Untitled Profile".to_string(),
-        ]);
+        let list_delegate = ProfileListDelegate::new(vec![]);
         let list_state = cx.new(|cx| ListState::new(list_delegate, window, cx));
 
         let window_width = window.viewport_size().width;
@@ -236,11 +233,86 @@ impl ProfileSettingsModal {
             error_message: None,
             sidebar_open: window_width >= px(650.0),
             last_window_width: Some(window_width),
+            pending_name_update: None,
         };
 
         this.fetch_credentials(cx);
+        this.fetch_profiles(cx);
         this.subscribe_to_selects(cx);
+
+        // Use observe instead
+        cx.observe(&this.list_state, |this, list, cx| {
+            let selected_index = list.read(cx).delegate().selected_index;
+            if selected_index != this.selected_index {
+                this.selected_index = selected_index;
+                if let Some(ix) = selected_index {
+                    this.load_profile(ix, cx);
+                }
+            }
+        })
+        .detach();
+
         this
+    }
+
+    fn load_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+        let profile = {
+            let list_state = self.list_state.read(cx);
+            let delegate = list_state.delegate();
+            delegate.profiles.get(index).cloned()
+        };
+
+        if let Some(profile) = profile {
+            self.pending_name_update = Some(profile.name.clone());
+            cx.notify();
+        }
+    }
+
+    fn fetch_profiles(&mut self, cx: &mut Context<Self>) {
+        let db = self.state.read(cx).database_service.clone();
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let profiles = if let Some(db) = db {
+                    db.get_profiles().await.ok()
+                } else {
+                    None
+                };
+
+                if let Some(profiles) = profiles {
+                    this.update(&mut cx, |this, cx| {
+                        this.list_state.update(cx, |list, cx| {
+                            list.delegate_mut().profiles = profiles;
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn create_new_profile(&mut self, cx: &mut Context<Self>) {
+        let db = self.state.read(cx).database_service.clone();
+        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let result = if let Some(db) = db {
+                    db.create_profile("Untitled Profile").await.ok()
+                } else {
+                    None
+                };
+
+                if result.is_some() {
+                    this.update(&mut cx, |this, cx| {
+                        this.fetch_profiles(cx);
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -407,6 +479,12 @@ impl ProfileSettingsModal {
 
 impl Render for ProfileSettingsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(name) = self.pending_name_update.take() {
+            self.profile_name_input.update(cx, |input, cx| {
+                input.set_value(name, window, cx);
+            });
+        }
+
         let theme = cx.theme();
 
         let window_width = window.viewport_size().width;
@@ -431,13 +509,22 @@ impl Render for ProfileSettingsModal {
                 .flex()
                 .flex_col()
                 .child(
-                    div().p_4().border_b_1().border_color(theme.border).child(
-                        Button::new("new_profile")
-                            .label("New Profile")
-                            .icon(IconName::Plus)
-                            .w_full()
-                            .on_click(|_, _, _| {}),
-                    ),
+                    div()
+                        .p_4()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(Label::new("Profiles").font_weight(FontWeight::BOLD))
+                        .child(
+                            Button::new("new_profile")
+                                .label("New")
+                                .icon(IconName::Plus)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.create_new_profile(cx)),
+                                ),
+                        ),
                 )
                 .child(
                     List::new(&self.list_state)
