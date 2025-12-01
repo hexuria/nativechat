@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 /// Credential stored in the database.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Default)]
 pub struct Credential {
     pub id: i64,
     pub name: String,
@@ -29,6 +29,21 @@ pub struct Profile {
     pub created_at: String,
 }
 
+/// Model stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ModelEntity {
+    pub id: String,
+    pub provider: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub model_type: String,
+    pub input_token_limit: Option<i64>,
+    pub output_token_limit: Option<i64>,
+    pub capabilities: String,
+    pub is_thinking: bool,
+    pub created_at: String,
+}
+
 /// Database service for credential and profile operations.
 #[derive(Clone)]
 pub struct DatabaseService {
@@ -42,9 +57,14 @@ impl DatabaseService {
     }
 
     /// Creates a new credential and returns its ID.
-    pub async fn create_credential(&self, name: &str, provider: &str, api_key: &str) -> Result<i64> {
+    pub async fn create_credential(
+        &self,
+        name: &str,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<i64> {
         let result = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO credentials (name, provider, api_key) VALUES (?, ?, ?) RETURNING id"
+            "INSERT INTO credentials (name, provider, api_key) VALUES (?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(provider)
@@ -75,12 +95,11 @@ impl DatabaseService {
 
     /// Creates a new profile.
     pub async fn create_profile(&self, name: &str) -> Result<i64> {
-        let result = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO profiles (name) VALUES (?) RETURNING id"
-        )
-        .bind(name)
-        .fetch_one(&self.pool)
-        .await?;
+        let result =
+            sqlx::query_scalar::<_, i64>("INSERT INTO profiles (name) VALUES (?) RETURNING id")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(result)
     }
 
@@ -89,10 +108,48 @@ impl DatabaseService {
         let rows = sqlx::query_as::<_, Profile>(
             "SELECT id, name, text_credential_id, embedding_credential_id, image_credential_id, 
              text_model_id, embedding_model_id, image_model_id, created_at 
-             FROM profiles ORDER BY created_at DESC"
+             FROM profiles ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    /// Saves a model to the database.
+    pub async fn save_model(&self, model: &ModelEntity) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO models (id, provider, name, description, model_type, input_token_limit, output_token_limit, capabilities, is_thinking, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                provider = excluded.provider,
+                name = excluded.name,
+                description = excluded.description,
+                model_type = excluded.model_type,
+                input_token_limit = excluded.input_token_limit,
+                output_token_limit = excluded.output_token_limit,
+                capabilities = excluded.capabilities,
+                is_thinking = excluded.is_thinking"
+        )
+        .bind(&model.id)
+        .bind(&model.provider)
+        .bind(&model.name)
+        .bind(&model.description)
+        .bind(&model.model_type)
+        .bind(model.input_token_limit)
+        .bind(model.output_token_limit)
+        .bind(&model.capabilities)
+        .bind(model.is_thinking)
+        .bind(&model.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns all models.
+    pub async fn get_models_list(&self) -> Result<Vec<ModelEntity>> {
+        let rows = sqlx::query_as::<_, ModelEntity>("SELECT * FROM models ORDER BY provider, name")
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 
@@ -101,7 +158,7 @@ impl DatabaseService {
         sqlx::query(
             "UPDATE profiles SET name = ?, text_credential_id = ?, embedding_credential_id = ?,
              image_credential_id = ?, text_model_id = ?, embedding_model_id = ?, image_model_id = ?
-             WHERE id = ?"
+             WHERE id = ?",
         )
         .bind(&profile.name)
         .bind(profile.text_credential_id)
@@ -130,7 +187,7 @@ impl DatabaseService {
         let profile = sqlx::query_as::<_, Profile>(
             "SELECT id, name, text_credential_id, embedding_credential_id, image_credential_id,
              text_model_id, embedding_model_id, image_model_id, created_at
-             FROM profiles WHERE id = ?"
+             FROM profiles WHERE id = ?",
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -141,7 +198,7 @@ impl DatabaseService {
     /// Gets a credential by ID.
     pub async fn get_credential(&self, id: i64) -> Result<Credential> {
         let credential = sqlx::query_as::<_, Credential>(
-            "SELECT id, name, provider, api_key, created_at FROM credentials WHERE id = ?"
+            "SELECT id, name, provider, api_key, created_at FROM credentials WHERE id = ?",
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -151,12 +208,10 @@ impl DatabaseService {
 
     /// Gets a setting value by key.
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let result = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM settings WHERE key = ?"
-        )
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await?;
+        let result = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(result)
     }
 
@@ -164,7 +219,7 @@ impl DatabaseService {
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')"
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
         )
         .bind(key)
         .bind(value)

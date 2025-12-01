@@ -154,8 +154,8 @@ impl Render for RootView {
                         .justify_center()
                         .child(
                             div()
-                                .w_1_2()
-                                .h_3_4()
+                                .w_4_5()
+                                .h_4_5()
                                 .bg(cx.theme().background)
                                 .border_1()
                                 .border_color(cx.theme().border)

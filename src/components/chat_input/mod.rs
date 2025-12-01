@@ -1,4 +1,6 @@
 mod items;
+#[macro_use]
+mod sync_macros;
 
 pub use items::{render_flyout_item, render_popover_item};
 
@@ -35,6 +37,11 @@ pub struct MessageInput {
     voice_wave: Option<Entity<VoiceWave>>,
     audio_input: Option<AudioInput>,
     state: Entity<AppState>,
+    // Cached state to avoid re-rendering on every AppState change
+    selected_apps: Vec<String>,
+    is_voice_mode_open: bool,
+    is_account_settings_open: bool,
+    is_profile_settings_open: bool,
 }
 
 impl MessageInput {
@@ -43,9 +50,44 @@ impl MessageInput {
             InputState::new(window, cx)
                 .placeholder("Type a message...")
                 .multi_line()
-                .auto_grow(1, 11) // Max 11 lines as per screenshot
-                .clean_on_escape()
+                .auto_grow(1, 20)
         });
+
+        // Cache initial values from AppState
+        let app_state = state.read(cx);
+        let selected_apps = app_state.selected_apps.clone();
+        let is_voice_mode_open = app_state.is_voice_mode_open;
+        let is_account_settings_open = app_state.is_account_settings_open;
+        let is_profile_settings_open = app_state.is_profile_settings_open;
+
+        let this = Self {
+            state: state.clone(),
+            input_state: input_state.clone(),
+            selected_apps,
+            is_voice_mode_open,
+            is_account_settings_open,
+            is_profile_settings_open,
+            on_submit: None,
+            voice_mode: false,
+            voice_wave: None,
+            audio_input: None,
+        };
+
+        // Subscribe to state changes to update cached values and notify only when relevant fields change
+        cx.observe(&state, |this: &mut Self, state, cx| {
+            let state = state.read(cx);
+            let mut changed = false;
+
+            sync_field_clone!(this, state, selected_apps, changed);
+            sync_field_copy!(this, state, is_voice_mode_open, changed);
+            sync_field_copy!(this, state, is_account_settings_open, changed);
+            sync_field_copy!(this, state, is_profile_settings_open, changed);
+
+            if changed {
+                cx.notify();
+            }
+        })
+        .detach();
 
         // Subscribe to input events to handle Enter key
         cx.subscribe_in(&input_state, window, |this, _state, event, window, cx| {
@@ -59,14 +101,7 @@ impl MessageInput {
         })
         .detach();
 
-        Self {
-            input_state,
-            on_submit: None,
-            voice_mode: false,
-            voice_wave: None,
-            audio_input: None,
-            state,
-        }
+        this
     }
 
     pub fn on_submit(mut self, handler: impl Fn(String, &mut Context<Self>) + 'static) -> Self {
@@ -129,19 +164,19 @@ impl MessageInput {
 
 impl Render for MessageInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        println!("MessageInput::render called");
         let theme = cx.theme();
         let secondary = theme.secondary;
         let secondary_foreground = theme.secondary_foreground;
         let border = theme.border;
         let state_model = self.state.clone();
-        let app_state = state_model.read(cx);
-        let selected_apps = app_state.selected_apps.clone();
+        // Removed direct state read to prevent excessive re-renders
+        // let app_state = state_model.read(cx);
+        let selected_apps = self.selected_apps.clone();
 
-        // Check if any modal is open
-        let any_modal_open = app_state.is_voice_mode_open
-            || app_state.is_account_settings_open
-            || app_state.is_profile_settings_open;
+        // Check if any modal is open using cached state
+        let any_modal_open = self.is_voice_mode_open
+            || self.is_account_settings_open
+            || self.is_profile_settings_open;
 
         // ChatGPT-style: centered container with max-width
         h_flex().w_full().justify_center().p_4().child(

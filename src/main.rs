@@ -104,17 +104,30 @@ fn main() {
                         // Create DatabaseService
                         let db_service = DatabaseService::new(pool);
 
+                        // Seed models
+                        if let Err(e) =
+                            nativechat::services::model_seeder::seed_models(&db_service).await
+                        {
+                            eprintln!("Failed to seed models: {}", e);
+                        }
+
                         // Load profiles and credentials from database
-                        let (profiles, credentials) = match AppState::load_profiles_and_credentials(&db_service).await {
-                            Ok(data) => data,
-                            Err(e) => {
-                                eprintln!("Failed to load profiles and credentials: {}", e);
-                                (Vec::new(), Vec::new())
-                            }
-                        };
+                        let (profiles, credentials) =
+                            match AppState::load_profiles_and_credentials(&db_service).await {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    eprintln!("Failed to load profiles and credentials: {}", e);
+                                    (Vec::new(), Vec::new())
+                                }
+                            };
 
                         // Restore selected profile from settings
-                        let restored_profile_id = match AppState::restore_selected_profile(&db_service, &profiles).await {
+                        let restored_profile_id = match AppState::restore_selected_profile(
+                            &db_service,
+                            &profiles,
+                        )
+                        .await
+                        {
                             Ok(id) => id,
                             Err(e) => {
                                 eprintln!("Failed to restore selected profile: {}", e);
@@ -126,13 +139,13 @@ fn main() {
                         let _ = state_clone.update(&mut cx, |state, cx| {
                             state.set_database_service(db_service, cx);
                             state.set_profiles_and_credentials(profiles, credentials, cx);
-                            
+
                             // Set the restored profile and update LLM provider
                             if let Some(profile_id) = restored_profile_id {
                                 state.active_profile_id = Some(profile_id);
                                 state.update_llm_provider(cx);
                             }
-                            
+
                             state.set_config(config, cx);
                         });
 
@@ -171,9 +184,7 @@ fn set_menus(cx: &mut App) {
         },
         Menu {
             name: "Edit".into(),
-            items: vec![
-                MenuItem::separator(),
-            ],
+            items: vec![MenuItem::separator()],
         },
         Menu {
             name: "Window".into(),

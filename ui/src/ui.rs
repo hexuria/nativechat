@@ -25,6 +25,7 @@ pub mod sheet;
 pub mod skeleton;
 pub mod spinner;
 pub mod text;
+pub mod time;
 pub mod title_bar;
 pub mod virtual_list;
 pub mod window_border;
@@ -33,6 +34,7 @@ pub fn init(cx: &mut gpui::App) {
     components::init(cx);
     select::init(cx);
     theme::init(cx);
+    time::date_picker::init(cx);
 }
 
 // Re-export commonly used items
@@ -45,6 +47,7 @@ pub use theme::{
     ActiveTheme, Theme, ThemeColor, ThemeConfig, ThemeMode, ThemeRegistry, ThemeSet,
     DEFAULT_THEME_COLORS,
 };
+pub use time::{calendar, date_picker};
 
 mod index_path;
 pub use index_path::*;

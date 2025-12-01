@@ -144,9 +144,11 @@ impl InputState {
         if event.modifiers.secondary() {
             self.handle_hover_definition(offset, window, cx);
         } else {
-            self.hover_definition.clear();
+            if !self.hover_definition.is_empty() {
+                self.hover_definition.clear();
+                cx.notify();
+            }
             self.handle_hover_popover(offset, window, cx);
         }
-        cx.notify();
     }
 }

@@ -10,6 +10,45 @@ pub enum Provider {
     Anthropic,
 }
 
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Provider::Gemini => write!(f, "Google Gemini"),
+            Provider::OpenAI => write!(f, "OpenAI"),
+            Provider::Anthropic => write!(f, "Anthropic"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ModelType {
+    TextGeneration,
+    ImageGeneration,
+    TextEmbedding,
+    AudioGeneration,
+    SpeechRecognition,
+    Moderation,
+}
+
+impl Default for ModelType {
+    fn default() -> Self {
+        Self::TextGeneration
+    }
+}
+
+impl std::fmt::Display for ModelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelType::TextGeneration => write!(f, "Text Generation"),
+            ModelType::ImageGeneration => write!(f, "Image Generation"),
+            ModelType::TextEmbedding => write!(f, "Text Embedding"),
+            ModelType::AudioGeneration => write!(f, "Audio Generation"),
+            ModelType::SpeechRecognition => write!(f, "Speech Recognition"),
+            ModelType::Moderation => write!(f, "Moderation"),
+        }
+    }
+}
+
 impl ui::SelectItem for Provider {
     type Value = Self;
 
@@ -68,6 +107,8 @@ pub struct ModelProfile {
     pub input_token_limit: Option<u32>,
     pub output_token_limit: Option<u32>,
     pub capabilities: ModelCapabilities,
+    pub model_type: ModelType,
+    pub is_thinking: bool,
 }
 
 impl ui::SelectItem for ModelProfile {
@@ -103,7 +144,7 @@ impl ModelRegistry {
         model_id: &str,
         provider: &Provider,
         supported_methods: Option<&[String]>,
-    ) -> ModelCapabilities {
+    ) -> (ModelCapabilities, ModelType) {
         let id_lower = model_id.to_lowercase();
 
         // Check if it's an embedding model
@@ -129,25 +170,38 @@ impl ModelRegistry {
             || id_lower.contains("transcribe");
 
         if is_embedding {
-            return ModelCapabilities {
-                supports_text_generation: false,
-                supports_embedding: true,
-                supports_streaming: false,
-                ..Default::default()
-            };
+            return (
+                ModelCapabilities {
+                    supports_text_generation: false,
+                    supports_embedding: true,
+                    supports_streaming: false,
+                    ..Default::default()
+                },
+                ModelType::TextEmbedding,
+            );
         }
 
         if is_image_gen {
-            return ModelCapabilities {
-                supports_text_generation: false,
-                supports_image_generation: true,
-                supports_streaming: false,
-                ..Default::default()
-            };
+            return (
+                ModelCapabilities {
+                    supports_text_generation: false,
+                    supports_image_generation: true,
+                    supports_streaming: false,
+                    ..Default::default()
+                },
+                ModelType::ImageGeneration,
+            );
         }
 
         if is_utility {
-            return ModelCapabilities::default();
+            let model_type = if id_lower.contains("whisper") {
+                ModelType::SpeechRecognition
+            } else if id_lower.contains("tts") {
+                ModelType::AudioGeneration
+            } else {
+                ModelType::Moderation
+            };
+            return (ModelCapabilities::default(), model_type);
         }
 
         // Default to text generation model with provider-specific features
@@ -156,6 +210,7 @@ impl ModelRegistry {
             supports_streaming: true,
             ..Default::default()
         };
+        let model_type = ModelType::TextGeneration;
 
         // Enhanced capabilities based on model name patterns
         match provider {
@@ -246,7 +301,7 @@ impl ModelRegistry {
             }
         }
 
-        caps
+        (caps, model_type)
     }
 
     pub async fn get_all_models(&self, api_keys: &HashMap<Provider, String>) -> Vec<ModelProfile> {
@@ -299,47 +354,68 @@ impl ModelRegistry {
 
         #[derive(Deserialize)]
         struct ListModelsResponse {
-            models: Vec<GeminiModel>,
+            models: Option<Vec<GeminiModel>>,
+            #[serde(rename = "nextPageToken")]
+            next_page_token: Option<String>,
         }
 
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-            api_key
-        );
+        let mut all_models = Vec::new();
+        let mut next_page_token: Option<String> = None;
 
-        let response: ListModelsResponse = self.client.get(&url).send().await?.json().await?;
+        loop {
+            let mut url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                api_key
+            );
+            if let Some(token) = &next_page_token {
+                url.push_str(&format!("&pageToken={}", token));
+            }
 
-        let models = response
-            .models
-            .into_iter()
-            .filter_map(|m| {
-                // name is like "models/gemini-pro"
-                let id = m.name.replace("models/", "");
+            let response: ListModelsResponse = self.client.get(&url).send().await?.json().await?;
 
-                // Filter out non-generative models
-                if id.to_lowercase().contains("embedding-gecko") {
-                    return None;
-                }
+            if let Some(models) = response.models {
+                let mapped_models: Vec<ModelProfile> = models
+                    .into_iter()
+                    .filter_map(|m| {
+                        // name is like "models/gemini-pro"
+                        let id = m.name.replace("models/", "");
 
-                let capabilities = Self::classify_model_capabilities(
-                    &id,
-                    &Provider::Gemini,
-                    m.supported_generation_methods.as_deref(),
-                );
+                        // Filter out non-generative models
+                        if id.to_lowercase().contains("embedding-gecko") {
+                            return None;
+                        }
 
-                Some(ModelProfile {
-                    provider: Provider::Gemini,
-                    id: id.clone(),
-                    display_name: m.display_name.unwrap_or(id),
-                    created_at: None,
-                    input_token_limit: m.input_token_limit,
-                    output_token_limit: m.output_token_limit,
-                    capabilities,
-                })
-            })
-            .collect();
+                        let (capabilities, model_type) = Self::classify_model_capabilities(
+                            &id,
+                            &Provider::Gemini,
+                            m.supported_generation_methods.as_deref(),
+                        );
 
-        Ok(models)
+                        let is_thinking = capabilities.supports_reasoning;
+
+                        Some(ModelProfile {
+                            provider: Provider::Gemini,
+                            id: id.clone(),
+                            display_name: m.display_name.unwrap_or(id),
+                            created_at: None,
+                            input_token_limit: m.input_token_limit,
+                            output_token_limit: m.output_token_limit,
+                            capabilities,
+                            model_type,
+                            is_thinking,
+                        })
+                    })
+                    .collect();
+                all_models.extend(mapped_models);
+            }
+
+            next_page_token = response.next_page_token;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(all_models)
     }
 
     async fn fetch_openai_models(&self, api_key: Option<String>) -> Result<Vec<ModelProfile>> {
@@ -387,8 +463,10 @@ impl ModelRegistry {
                     return None;
                 }
 
-                let capabilities =
+                let (capabilities, model_type) =
                     Self::classify_model_capabilities(&m.id, &Provider::OpenAI, None);
+
+                let is_thinking = capabilities.supports_reasoning;
 
                 Some(ModelProfile {
                     provider: Provider::OpenAI,
@@ -398,6 +476,8 @@ impl ModelRegistry {
                     input_token_limit: None, // Not provided in models API
                     output_token_limit: None,
                     capabilities,
+                    model_type,
+                    is_thinking,
                 })
             })
             .collect();
@@ -439,17 +519,21 @@ impl ModelRegistry {
             .data
             .into_iter()
             .map(|m| {
-                let capabilities =
+                let (capabilities, model_type) =
                     Self::classify_model_capabilities(&m.id, &Provider::Anthropic, None);
+
+                let is_thinking = capabilities.supports_reasoning;
 
                 ModelProfile {
                     provider: Provider::Anthropic,
-                    id: m.id,
+                    id: m.id.clone(),
                     display_name: m.display_name,
-                    created_at: None, // created_at is a string in ISO format, would need parsing
+                    created_at: None, // TODO: Parse timestamp
                     input_token_limit: None,
                     output_token_limit: None,
                     capabilities,
+                    model_type,
+                    is_thinking,
                 }
             })
             .collect();
@@ -470,11 +554,11 @@ mod tests {
             Some(&["generateContent".to_string(), "countTokens".to_string()]),
         );
 
-        assert!(caps.supports_text_generation);
-        assert!(caps.supports_vision);
-        assert!(caps.supports_function_calling);
-        assert!(!caps.supports_embedding);
-        assert!(!caps.supports_image_generation);
+        assert!(caps.0.supports_text_generation);
+        assert!(caps.0.supports_vision);
+        assert!(caps.0.supports_function_calling);
+        assert!(!caps.0.supports_embedding);
+        assert!(!caps.0.supports_image_generation);
     }
 
     #[test]
@@ -485,18 +569,18 @@ mod tests {
             Some(&["embedContent".to_string()]),
         );
 
-        assert!(!caps.supports_text_generation);
-        assert!(caps.supports_embedding);
-        assert!(!caps.supports_streaming);
+        assert!(!caps.0.supports_text_generation);
+        assert!(caps.0.supports_embedding);
+        assert!(!caps.0.supports_streaming);
     }
 
     #[test]
     fn test_classify_openai_text_models() {
         let caps = ModelRegistry::classify_model_capabilities("gpt-4o", &Provider::OpenAI, None);
 
-        assert!(caps.supports_text_generation);
-        assert!(caps.supports_vision);
-        assert!(caps.supports_function_calling);
+        assert!(caps.0.supports_text_generation);
+        assert!(caps.0.supports_vision);
+        assert!(caps.0.supports_function_calling);
     }
 
     #[test]
@@ -507,16 +591,16 @@ mod tests {
             None,
         );
 
-        assert!(!caps.supports_text_generation);
-        assert!(caps.supports_embedding);
+        assert!(!caps.0.supports_text_generation);
+        assert!(caps.0.supports_embedding);
     }
 
     #[test]
     fn test_classify_openai_image_models() {
         let caps = ModelRegistry::classify_model_capabilities("dall-e-3", &Provider::OpenAI, None);
 
-        assert!(!caps.supports_text_generation);
-        assert!(caps.supports_image_generation);
+        assert!(!caps.0.supports_text_generation);
+        assert!(caps.0.supports_image_generation);
     }
 
     #[test]
@@ -527,17 +611,17 @@ mod tests {
             None,
         );
 
-        assert!(caps.supports_text_generation);
-        assert!(caps.supports_vision);
-        assert!(caps.supports_function_calling);
-        assert!(!caps.supports_embedding);
+        assert!(caps.0.supports_text_generation);
+        assert!(caps.0.supports_vision);
+        assert!(caps.0.supports_function_calling);
+        assert!(!caps.0.supports_embedding);
     }
 
     #[test]
     fn test_classify_reasoning_models() {
         let caps = ModelRegistry::classify_model_capabilities("o3-mini", &Provider::OpenAI, None);
 
-        assert!(caps.supports_text_generation);
-        assert!(caps.supports_reasoning);
+        assert!(caps.0.supports_text_generation);
+        assert!(caps.0.supports_reasoning);
     }
 }

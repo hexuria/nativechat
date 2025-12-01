@@ -1,22 +1,29 @@
 use crate::services::database::{Credential, Profile};
-use crate::services::model_registry::{ModelCapabilities, ModelProfile, Provider};
+use crate::services::model_registry::{ModelProfile, ModelType, Provider};
 use crate::state::AppState;
+
 use gpui::prelude::*;
 use gpui::*;
 use std::collections::HashMap;
-use ui::IndexPath;
+use std::rc::Rc;
 use ui::button::ButtonVariants;
 use ui::list::ListItem;
+use ui::notification::Notification;
+
+use ui::root::root::WindowExt;
 use ui::scroll::ScrollbarAxis;
 use ui::{
-    Icon, IconName, Sizable, Size as UiSize, StyleSized, StyledExt, WindowExt,
-    button::Button,
+    Disableable, Icon, IconName, Sizable, Size as UiSize, StyledExt,
+    button::{Button, ButtonVariant},
+    dialog::DialogButtonProps,
+    h_flex,
     input::{Input, InputState},
     label::Label,
     list::{List, ListDelegate, ListState},
     select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
     theme::ActiveTheme,
 };
+use ui::{IndexPath, StyleSized};
 
 #[derive(Clone)]
 pub struct CredentialItem(pub Credential);
@@ -36,13 +43,15 @@ impl SelectItem for CredentialItem {
 pub struct ProfileListDelegate {
     pub profiles: Vec<Profile>,
     selected_index: Option<usize>,
+    on_click: Rc<dyn Fn(usize, &mut Window, &mut App)>,
 }
 
 impl ProfileListDelegate {
-    pub fn new(profiles: Vec<Profile>) -> Self {
+    pub fn new(profiles: Vec<Profile>, on_click: Rc<dyn Fn(usize, &mut Window, &mut App)>) -> Self {
         Self {
             profiles,
             selected_index: None,
+            on_click,
         }
     }
 }
@@ -58,24 +67,47 @@ impl ListDelegate for ProfileListDelegate {
         let profile = self.profiles.get(ix.row)?;
         let theme = cx.theme();
         let is_selected = self.selected_index == Some(ix.row);
+        let on_click = self.on_click.clone();
 
         Some(
             ListItem::new(ix)
-                .p_2()
-                .rounded_md()
-                .when(is_selected, |s| s.bg(theme.secondary))
+                .p_1()
                 .child(
                     div()
-                        .child(profile.name.clone())
-                        .font_weight(FontWeight::BOLD)
-                        .text_sm(),
+                        .w_full()
+                        .p_2()
+                        .rounded_md()
+                        .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+                        .when(is_selected, |s| s.bg(theme.secondary))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .child(profile.name.clone())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_sm()
+                                .text_color(if is_selected {
+                                    theme.foreground
+                                } else {
+                                    theme.foreground
+                                }),
+                        )
+                        .child(
+                            div()
+                                .child(if let Some(model_id) = &profile.text_model_id {
+                                    model_id.clone()
+                                } else {
+                                    "No model selected".to_string()
+                                })
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .text_ellipsis(),
+                        ),
                 )
-                .child(
-                    div()
-                        .child("Google Gemini")
-                        .text_xs()
-                        .text_color(theme.muted_foreground),
-                ),
+                .on_click(move |_, window, cx| {
+                    on_click(ix.row, window, cx);
+                }),
         )
     }
 
@@ -87,6 +119,12 @@ impl ListDelegate for ProfileListDelegate {
     ) {
         self.selected_index = ix.map(|ix| ix.row);
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProfileMode {
+    Editing(i64),
+    Creating,
 }
 
 pub struct ProfileSettingsModal {
@@ -106,7 +144,23 @@ pub struct ProfileSettingsModal {
     error_message: Option<String>,
     sidebar_open: bool,
     last_window_width: Option<Pixels>,
-    pending_name_update: Option<String>,
+    credentials: Vec<Credential>,
+    mode: ProfileMode,
+    needs_reset: bool,
+    creating_chat_cred: bool,
+    creating_embedding_cred: bool,
+    creating_image_cred: bool,
+    new_chat_cred_input: Entity<InputState>,
+    new_embedding_cred_input: Entity<InputState>,
+    new_image_cred_input: Entity<InputState>,
+    pending_credential_id: Option<i64>,
+    should_focus_chat: bool,
+    should_focus_embedding: bool,
+    should_focus_image: bool,
+    is_saving: bool,
+    show_form: bool,
+    is_new_mode: bool,
+    pending_success_message: Option<String>,
 }
 
 impl ProfileSettingsModal {
@@ -119,88 +173,26 @@ impl ProfileSettingsModal {
             state.fetch_models(HashMap::new(), cx);
         });
 
-        let provider_items = SearchableVec::new(vec![
-            Provider::Gemini,
-            Provider::Anthropic,
-            Provider::OpenAI,
-        ]);
+        let provider_items = SearchableVec::new(vec![]);
+        let provider_select = cx.new(|cx| SelectState::new(provider_items, None, window, cx));
 
-        let provider_select = cx.new(|cx| {
-            let mut state = SelectState::new(provider_items.clone(), None, window, cx);
-            state.set_selected_value(&Provider::Gemini, window, cx);
-            state
-        });
+        let model_items = SearchableVec::new(vec![]);
+        let model_select = cx.new(|cx| SelectState::new(model_items, None, window, cx));
 
-        let model_items = SearchableVec::new(vec![
-            ModelProfile {
-                provider: Provider::Gemini,
-                id: "gemini-2.0-flash-exp".into(),
-                display_name: "Gemini 2.0 Flash".into(),
-                created_at: None,
-                input_token_limit: None,
-                output_token_limit: None,
-                capabilities: ModelCapabilities::default(),
-            },
-            ModelProfile {
-                provider: Provider::Gemini,
-                id: "gemini-1.5-pro".into(),
-                display_name: "Gemini 1.5 Pro".into(),
-                created_at: None,
-                input_token_limit: None,
-                output_token_limit: None,
-                capabilities: ModelCapabilities::default(),
-            },
-        ]);
+        let embedding_provider_items = SearchableVec::new(vec![]);
+        let embedding_provider_select =
+            cx.new(|cx| SelectState::new(embedding_provider_items, None, window, cx));
 
-        let model_select = cx.new(|cx| {
-            let mut state = SelectState::new(model_items.clone(), None, window, cx);
-            state.set_selected_value(&"gemini-2.0-flash-exp".to_string(), window, cx);
-            state
-        });
+        let embedding_model_items = SearchableVec::new(vec![]);
+        let embedding_model_select =
+            cx.new(|cx| SelectState::new(embedding_model_items, None, window, cx));
 
-        let embedding_provider_select = cx.new(|cx| {
-            let mut state = SelectState::new(provider_items.clone(), None, window, cx);
-            state.set_selected_value(&Provider::Gemini, window, cx);
-            state
-        });
+        let image_provider_items = SearchableVec::new(vec![]);
+        let image_provider_select =
+            cx.new(|cx| SelectState::new(image_provider_items, None, window, cx));
 
-        let embedding_model_items = SearchableVec::new(vec![ModelProfile {
-            provider: Provider::Gemini,
-            id: "embedding-001".into(),
-            display_name: "Embedding 001".into(),
-            created_at: None,
-            input_token_limit: None,
-            output_token_limit: None,
-            capabilities: ModelCapabilities::default(),
-        }]);
-
-        let embedding_model_select = cx.new(|cx| {
-            let mut state = SelectState::new(embedding_model_items, None, window, cx);
-            state.set_selected_value(&"embedding-001".to_string(), window, cx);
-            state
-        });
-
-        let image_provider_select = cx.new(|cx| {
-            let mut state = SelectState::new(provider_items.clone(), None, window, cx);
-            state.set_selected_value(&Provider::Gemini, window, cx);
-            state
-        });
-
-        let image_model_items = SearchableVec::new(vec![ModelProfile {
-            provider: Provider::Gemini,
-            id: "nano-banana-pro".into(),
-            display_name: "Nano Banana Pro".into(),
-            created_at: None,
-            input_token_limit: None,
-            output_token_limit: None,
-            capabilities: ModelCapabilities::default(),
-        }]);
-
-        let image_model_select = cx.new(|cx| {
-            let mut state = SelectState::new(image_model_items, None, window, cx);
-            state.set_selected_value(&"nano-banana-pro".to_string(), window, cx);
-            state
-        });
+        let image_model_items = SearchableVec::new(vec![]);
+        let image_model_select = cx.new(|cx| SelectState::new(image_model_items, None, window, cx));
 
         let chat_credential_select =
             cx.new(|cx| SelectState::new(SearchableVec::new(vec![]), None, window, cx));
@@ -211,10 +203,28 @@ impl ProfileSettingsModal {
         let image_credential_select =
             cx.new(|cx| SelectState::new(SearchableVec::new(vec![]), None, window, cx));
 
-        let list_delegate = ProfileListDelegate::new(vec![]);
+        let weak_self = cx.entity().downgrade();
+        let on_click = Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+            weak_self
+                .update(cx, |this, cx| {
+                    this.load_profile(index, window, cx);
+                    this.list_state.update(cx, |list, cx| {
+                        list.delegate_mut().selected_index = Some(index);
+                        cx.notify();
+                    });
+                })
+                .ok();
+        });
+
+        let list_delegate = ProfileListDelegate::new(vec![], on_click);
         let list_state = cx.new(|cx| ListState::new(list_delegate, window, cx));
 
-        let window_width = window.viewport_size().width;
+        let new_chat_cred_input = cx.new(|cx| InputState::new(window, cx).placeholder("API Key"));
+        let new_embedding_cred_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("API Key"));
+        let new_image_cred_input = cx.new(|cx| InputState::new(window, cx).placeholder("API Key"));
+
+        let _window_width = window.viewport_size().width;
 
         let mut this = Self {
             state,
@@ -231,31 +241,49 @@ impl ProfileSettingsModal {
             list_state,
             selected_index: None,
             error_message: None,
-            sidebar_open: window_width >= px(650.0),
-            last_window_width: Some(window_width),
-            pending_name_update: None,
+            sidebar_open: true,
+            last_window_width: None,
+            credentials: Vec::new(),
+            mode: ProfileMode::Creating,
+            needs_reset: false,
+            creating_chat_cred: false,
+            creating_embedding_cred: false,
+            creating_image_cred: false,
+            new_chat_cred_input,
+            new_embedding_cred_input,
+            new_image_cred_input,
+            pending_credential_id: None,
+            should_focus_chat: false,
+            should_focus_embedding: false,
+            should_focus_image: false,
+            is_saving: false,
+            show_form: false,
+            is_new_mode: false,
+            pending_success_message: None,
         };
 
         this.fetch_credentials(cx);
-        this.fetch_profiles(cx);
+        this.fetch_profiles(None, cx);
         this.subscribe_to_selects(cx);
 
-        // Use observe instead
+        // Observe list state for other things if needed, but not for dirty check on selection
         cx.observe(&this.list_state, |this, list, cx| {
+            // Keep selected_index in sync if needed, but we handle it manually now
             let selected_index = list.read(cx).delegate().selected_index;
             if selected_index != this.selected_index {
                 this.selected_index = selected_index;
-                if let Some(ix) = selected_index {
-                    this.load_profile(ix, cx);
-                }
+                // We don't load profile here anymore, we do it in on_click
             }
         })
         .detach();
 
+        // Update provider selects after models are fetched
+        this.update_provider_selects(cx);
+
         this
     }
 
-    fn load_profile(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn load_profile(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let profile = {
             let list_state = self.list_state.read(cx);
             let delegate = list_state.delegate();
@@ -263,14 +291,149 @@ impl ProfileSettingsModal {
         };
 
         if let Some(profile) = profile {
-            self.pending_name_update = Some(profile.name.clone());
+            self.mode = ProfileMode::Editing(profile.id);
+            self.show_form = true;
+            self.is_new_mode = false;
+
+            // Populate profile name
+            self.profile_name_input.update(cx, |input, cx| {
+                input.set_value(&profile.name, window, cx);
+            });
+
+            // Set providers based on model IDs
+            if let Some(mid) = &profile.text_model_id {
+                let state = self.state.read(cx);
+                if let Some(model) = state.available_models.iter().find(|m| &m.id == mid) {
+                    let provider = model.provider.clone();
+                    self.provider_select
+                        .update(cx, |s, cx| s.set_selected_value(&provider, window, cx));
+                }
+            }
+
+            if let Some(mid) = &profile.embedding_model_id {
+                let state = self.state.read(cx);
+                if let Some(model) = state.available_models.iter().find(|m| &m.id == mid) {
+                    let provider = model.provider.clone();
+                    self.embedding_provider_select
+                        .update(cx, |s, cx| s.set_selected_value(&provider, window, cx));
+                }
+            }
+
+            if let Some(mid) = &profile.image_model_id {
+                let state = self.state.read(cx);
+                if let Some(model) = state.available_models.iter().find(|m| &m.id == mid) {
+                    let provider = model.provider.clone();
+                    self.image_provider_select
+                        .update(cx, |s, cx| s.set_selected_value(&provider, window, cx));
+                }
+            }
+
+            // Update model and credential selects based on providers
+            self.update_model_selects(cx, false);
+            self.update_credential_selects(cx);
+
+            // Set models
+            if let Some(model_id) = &profile.text_model_id {
+                self.model_select
+                    .update(cx, |s, cx| s.set_selected_value(model_id, window, cx));
+            }
+            if let Some(model_id) = &profile.embedding_model_id {
+                self.embedding_model_select
+                    .update(cx, |s, cx| s.set_selected_value(model_id, window, cx));
+            }
+            if let Some(model_id) = &profile.image_model_id {
+                self.image_model_select
+                    .update(cx, |s, cx| s.set_selected_value(model_id, window, cx));
+            }
+
+            // Update credential selects again after models are set
+            self.update_credential_selects(cx);
+
+            // Set chat credential
+            if let Some(cred_id) = profile.text_credential_id {
+                if let Some(cred) = self.credentials.iter().find(|c| c.id == cred_id) {
+                    let item = CredentialItem(cred.clone());
+                    self.chat_credential_select
+                        .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                }
+            } else {
+                // Try to use system credential as fallback
+                if let Some(model_id) = self.model_select.read(cx).selected_value() {
+                    let state = self.state.read(cx);
+                    if let Some(model) = state.available_models.iter().find(|m| &m.id == model_id) {
+                        let provider_str = format!("{:?}", model.provider);
+                        if let Some(sys_cred) = self
+                            .credentials
+                            .iter()
+                            .find(|c| c.id < 0 && c.provider == provider_str)
+                        {
+                            let item = CredentialItem(sys_cred.clone());
+                            self.chat_credential_select
+                                .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                        }
+                    }
+                }
+            }
+
+            // Set embedding credential
+            if let Some(cred_id) = profile.embedding_credential_id {
+                if let Some(cred) = self.credentials.iter().find(|c| c.id == cred_id) {
+                    let item = CredentialItem(cred.clone());
+                    self.embedding_credential_select
+                        .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                }
+            } else {
+                // Try to use system credential as fallback
+                if let Some(model_id) = self.embedding_model_select.read(cx).selected_value() {
+                    let state = self.state.read(cx);
+                    if let Some(model) = state.available_models.iter().find(|m| &m.id == model_id) {
+                        let provider_str = format!("{:?}", model.provider);
+                        if let Some(sys_cred) = self
+                            .credentials
+                            .iter()
+                            .find(|c| c.id < 0 && c.provider == provider_str)
+                        {
+                            let item = CredentialItem(sys_cred.clone());
+                            self.embedding_credential_select
+                                .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                        }
+                    }
+                }
+            }
+
+            // Set image credential
+            if let Some(cred_id) = profile.image_credential_id {
+                if let Some(cred) = self.credentials.iter().find(|c| c.id == cred_id) {
+                    let item = CredentialItem(cred.clone());
+                    self.image_credential_select
+                        .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                }
+            } else {
+                // Try to use system credential as fallback
+                if let Some(model_id) = self.image_model_select.read(cx).selected_value() {
+                    let state = self.state.read(cx);
+                    if let Some(model) = state.available_models.iter().find(|m| &m.id == model_id) {
+                        let provider_str = format!("{:?}", model.provider);
+                        if let Some(sys_cred) = self
+                            .credentials
+                            .iter()
+                            .find(|c| c.id < 0 && c.provider == provider_str)
+                        {
+                            let item = CredentialItem(sys_cred.clone());
+                            self.image_credential_select
+                                .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                        }
+                    }
+                }
+            }
+
             cx.notify();
         }
     }
 
-    fn fetch_profiles(&mut self, cx: &mut Context<Self>) {
+    fn fetch_profiles(&mut self, select_id: Option<i64>, cx: &mut Context<Self>) {
         let db = self.state.read(cx).database_service.clone();
-        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let profiles = if let Some(db) = db {
@@ -283,8 +446,23 @@ impl ProfileSettingsModal {
                     this.update(&mut cx, |this, cx| {
                         this.list_state.update(cx, |list, cx| {
                             list.delegate_mut().profiles = profiles;
-                            cx.notify();
+
+                            // Only select a profile if we're explicitly given an ID to select
+                            // (e.g., after saving a profile). Don't auto-select first profile.
+                            if let Some(id) = select_id {
+                                if let Some(index) =
+                                    list.delegate().profiles.iter().position(|p| p.id == id)
+                                {
+                                    list.delegate_mut().selected_index = Some(index);
+                                    cx.notify();
+                                }
+                            }
                         });
+
+                        // If we have a specific profile to select, load it
+                        // Note: We can't call load_profile here because we don't have a Window reference
+                        // The profile will be loaded when the user clicks it in the sidebar
+                        // No auto-load on initial open - user must click a profile
                     })
                     .ok();
                 }
@@ -293,23 +471,246 @@ impl ProfileSettingsModal {
         .detach();
     }
 
-    fn create_new_profile(&mut self, cx: &mut Context<Self>) {
+    fn delete_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = match self.mode {
+            ProfileMode::Editing(id) => id,
+            _ => return,
+        };
+
         let db = self.state.read(cx).database_service.clone();
-        cx.spawn(|this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        let weak_self = cx.entity().downgrade();
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Delete Profile")
+                .child(div().child(
+                    "Are you sure you want to delete this profile? This action cannot be undone.",
+                ))
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_variant(ButtonVariant::Danger)
+                        .ok_text("Delete"),
+                )
+                .on_ok({
+                    let db = db.clone();
+                    let weak_self = weak_self.clone();
+                    move |_, _, cx| {
+                        let db = db.clone();
+                        let weak_self = weak_self.clone();
+                        cx.spawn(move |cx: &mut AsyncApp| {
+                            let mut cx = cx.clone();
+                            async move {
+                                if let Some(db) = db {
+                                    if let Err(e) = db.delete_profile(id).await {
+                                        eprintln!("Failed to delete profile: {}", e);
+                                    } else {
+                                        weak_self
+                                            .update(&mut cx, |this, cx| {
+                                                this.fetch_profiles(None, cx);
+                                                this.needs_reset = true;
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    }
+                                }
+                            }
+                        })
+                        .detach();
+
+                        true
+                    }
+                })
+        });
+    }
+
+    fn create_new_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mode = ProfileMode::Creating;
+        self.selected_index = None;
+        self.show_form = true;
+        self.is_new_mode = true;
+        self.error_message = None;
+
+        // Clear inputs
+        self.profile_name_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+
+        // Clear all provider selects
+        self.provider_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.embedding_provider_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.image_provider_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+
+        // Clear all model selects
+        self.model_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.embedding_model_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.image_model_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+
+        // Clear all credential selects
+        self.chat_credential_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.embedding_credential_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.image_credential_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+
+        // Deselect in sidebar
+        self.list_state.update(cx, |list, cx| {
+            list.delegate_mut().selected_index = None;
+            cx.notify();
+        });
+
+        cx.notify();
+    }
+
+    fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(msg) = self.validate_profile(cx) {
+            self.error_message = Some(msg.clone());
+            window.push_notification(Notification::error(msg), cx);
+            cx.notify();
+            return;
+        }
+        self.error_message = None;
+        self.is_saving = true;
+        cx.notify();
+
+        let name = self.profile_name_input.read(cx).value().to_string();
+
+        let text_credential_id = self
+            .chat_credential_select
+            .read(cx)
+            .selected_value()
+            .map(|c| if c.id < 0 { None } else { Some(c.id) })
+            .flatten();
+        let embedding_credential_id = self
+            .embedding_credential_select
+            .read(cx)
+            .selected_value()
+            .map(|c| if c.id < 0 { None } else { Some(c.id) })
+            .flatten();
+        let image_credential_id = self
+            .image_credential_select
+            .read(cx)
+            .selected_value()
+            .map(|c| if c.id < 0 { None } else { Some(c.id) })
+            .flatten();
+
+        let text_model_id = self
+            .model_select
+            .read(cx)
+            .selected_value()
+            .map(|m| m.clone());
+        let embedding_model_id = self
+            .embedding_model_select
+            .read(cx)
+            .selected_value()
+            .map(|m| m.clone());
+        let image_model_id = self
+            .image_model_select
+            .read(cx)
+            .selected_value()
+            .map(|m| m.clone());
+
+        let mode = self.mode.clone();
+        let db = self.state.read(cx).database_service.clone();
+
+        println!("Saving profile. Mode: {:?}, Name: {}", mode, name);
+        println!(
+            "IDs - Chat: {:?}/{:?}, Embed: {:?}/{:?}, Image: {:?}/{:?}",
+            text_model_id,
+            text_credential_id,
+            embedding_model_id,
+            embedding_credential_id,
+            image_model_id,
+            image_credential_id
+        );
+
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let result = if let Some(db) = db {
-                    db.create_profile("Untitled Profile").await.ok()
+                    match mode {
+                        ProfileMode::Creating => {
+                            // Create profile first to get ID
+                            match db.create_profile(&name).await {
+                                Ok(id) => {
+                                    // Now update with other fields
+                                    let profile = Profile {
+                                        id,
+                                        name,
+                                        text_model_id,
+                                        text_credential_id,
+                                        embedding_model_id,
+                                        embedding_credential_id,
+                                        image_model_id,
+                                        image_credential_id,
+                                        created_at: String::new(),
+                                    };
+
+                                    if let Err(e) = db.update_profile(&profile).await {
+                                        Err(format!("Failed to update new profile: {}", e))
+                                    } else {
+                                        Ok(Some(id))
+                                    }
+                                }
+                                Err(e) => Err(format!("Failed to create profile: {}", e)),
+                            }
+                        }
+                        ProfileMode::Editing(id) => {
+                            let profile = Profile {
+                                id,
+                                name,
+                                text_model_id,
+                                text_credential_id,
+                                embedding_model_id,
+                                embedding_credential_id,
+                                image_model_id,
+                                image_credential_id,
+                                created_at: String::new(),
+                            };
+
+                            if let Err(e) = db.update_profile(&profile).await {
+                                Err(format!("Failed to update profile: {}", e))
+                            } else {
+                                Ok(Some(id))
+                            }
+                        }
+                    }
                 } else {
-                    None
+                    Err("Database service not available".to_string())
                 };
 
-                if result.is_some() {
-                    this.update(&mut cx, |this, cx| {
-                        this.fetch_profiles(cx);
-                    })
-                    .ok();
-                }
+                this.update(&mut cx, |this, cx| {
+                    match result {
+                        Ok(Some(id)) => {
+                            println!("Profile saved successfully. ID: {}", id);
+                            this.mode = ProfileMode::Editing(id);
+                            this.is_new_mode = false;
+                            this.pending_success_message =
+                                Some("Profile saved successfully".to_string());
+                            this.fetch_profiles(Some(id), cx);
+                        }
+                        Ok(None) => {
+                            // Should not happen with current logic but handle anyway
+                            println!("Profile saved (no ID change).");
+                            this.pending_success_message = Some("Profile saved".to_string());
+                            this.fetch_profiles(None, cx);
+                        }
+                        Err(e) => {
+                            eprintln!("Save failed: {}", e);
+                            this.error_message = Some(e);
+                        }
+                    }
+                    this.is_saving = false;
+                    cx.notify();
+                })
+                .ok();
             }
         })
         .detach();
@@ -321,121 +722,352 @@ impl ProfileSettingsModal {
     }
 
     fn subscribe_to_selects(&mut self, cx: &mut Context<Self>) {
+        // Observe input changes
+        cx.observe(&self.profile_name_input, |_, _, _| {}).detach();
+
+        // Subscribe to model selects to update credential lists
+        let subscribe_model_select = |select: &Entity<SelectState<SearchableVec<ModelProfile>>>,
+                                      cx: &mut Context<Self>| {
+            cx.subscribe(
+                select,
+                |this, _, _event: &SelectEvent<SearchableVec<ModelProfile>>, cx| {
+                    this.update_credential_selects(cx);
+                },
+            )
+            .detach();
+        };
+
+        subscribe_model_select(&self.model_select, cx);
+        subscribe_model_select(&self.embedding_model_select, cx);
+        subscribe_model_select(&self.image_model_select, cx);
+
+        // Subscribe to credential selects to handle "Create New"
+        cx.subscribe(
+            &self.chat_credential_select,
+            |this, _, event: &SelectEvent<SearchableVec<CredentialItem>>, cx| {
+                if let SelectEvent::Confirm(Some(cred)) = event {
+                    if cred.id == -999 {
+                        this.creating_chat_cred = true;
+                        this.should_focus_chat = true;
+                        cx.notify();
+                    }
+                }
+            },
+        )
+        .detach();
+
+        cx.subscribe(
+            &self.embedding_credential_select,
+            |this, _, event: &SelectEvent<SearchableVec<CredentialItem>>, cx| {
+                if let SelectEvent::Confirm(Some(cred)) = event {
+                    if cred.id == -999 {
+                        this.creating_embedding_cred = true;
+                        this.should_focus_embedding = true;
+                        cx.notify();
+                    }
+                }
+            },
+        )
+        .detach();
+
+        cx.subscribe(
+            &self.image_credential_select,
+            |this, _, event: &SelectEvent<SearchableVec<CredentialItem>>, cx| {
+                if let SelectEvent::Confirm(Some(cred)) = event {
+                    if cred.id == -999 {
+                        this.creating_image_cred = true;
+                        this.should_focus_image = true;
+                        cx.notify();
+                    }
+                }
+            },
+        )
+        .detach();
+
+        // Subscribe to chat provider select - reset model and credential on change
         cx.subscribe(
             &self.provider_select,
-            |this, _, event: &SelectEvent<SearchableVec<Provider>>, cx| {
-                if let SelectEvent::Confirm(Some(provider)) = event {
-                    let provider = provider.clone();
-                    let model_select = this.model_select.clone();
-                    this.update_model_list(
-                        model_select,
-                        &provider,
-                        |m| m.capabilities.supports_text_generation,
-                        cx,
-                    );
-                }
+            |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
+                // Reset model and credential when provider changes
+                this.model_select.update(cx, |s, cx| s.reset_selection(cx));
+                this.chat_credential_select
+                    .update(cx, |s, cx| s.reset_selection(cx));
+                this.update_model_selects(cx, true);
             },
         )
         .detach();
 
+        // Subscribe to embedding provider select - reset model and credential on change
         cx.subscribe(
             &self.embedding_provider_select,
-            |this, _, event: &SelectEvent<SearchableVec<Provider>>, cx| {
-                if let SelectEvent::Confirm(Some(provider)) = event {
-                    let provider = provider.clone();
-                    let model_select = this.embedding_model_select.clone();
-                    this.update_model_list(
-                        model_select,
-                        &provider,
-                        |m| m.capabilities.supports_embedding,
-                        cx,
-                    );
-                }
+            |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
+                this.embedding_model_select
+                    .update(cx, |s, cx| s.reset_selection(cx));
+                this.embedding_credential_select
+                    .update(cx, |s, cx| s.reset_selection(cx));
+                this.update_model_selects(cx, true);
             },
         )
         .detach();
 
+        // Subscribe to image provider select - reset model and credential on change
         cx.subscribe(
             &self.image_provider_select,
-            |this, _, event: &SelectEvent<SearchableVec<Provider>>, cx| {
-                if let SelectEvent::Confirm(Some(provider)) = event {
-                    let provider = provider.clone();
-                    let model_select = this.image_model_select.clone();
-                    this.update_model_list(
-                        model_select,
-                        &provider,
-                        |m| m.capabilities.supports_image_generation,
-                        cx,
-                    );
-                }
+            |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
+                this.image_model_select
+                    .update(cx, |s, cx| s.reset_selection(cx));
+                this.image_credential_select
+                    .update(cx, |s, cx| s.reset_selection(cx));
+                this.update_model_selects(cx, true);
             },
         )
         .detach();
 
-        // Observe state changes to update lists if providers are already selected
-        let state = self.state.clone();
-        cx.observe(&state, |this: &mut Self, _, cx| {
-            let provider = this.provider_select.read(cx).selected_value().cloned();
-            if let Some(provider) = provider {
-                let model_select = this.model_select.clone();
-                this.update_model_list(
-                    model_select,
-                    &provider,
-                    |m| m.capabilities.supports_text_generation,
-                    cx,
-                );
-            }
-
-            let embedding_provider = this
-                .embedding_provider_select
-                .read(cx)
-                .selected_value()
-                .cloned();
-            if let Some(provider) = embedding_provider {
-                let model_select = this.embedding_model_select.clone();
-                this.update_model_list(
-                    model_select,
-                    &provider,
-                    |m| m.capabilities.supports_embedding,
-                    cx,
-                );
-            }
-
-            let image_provider = this
-                .image_provider_select
-                .read(cx)
-                .selected_value()
-                .cloned();
-            if let Some(provider) = image_provider {
-                let model_select = this.image_model_select.clone();
-                this.update_model_list(
-                    model_select,
-                    &provider,
-                    |m| m.capabilities.supports_image_generation,
-                    cx,
-                );
-            }
-        })
-        .detach();
+        // Note: We don't observe state to update selects - they're updated via provider select subscriptions above
     }
 
-    fn update_model_list(
-        &mut self,
-        select: Entity<SelectState<SearchableVec<ModelProfile>>>,
-        provider: &Provider,
-        capability_filter: impl Fn(&ModelProfile) -> bool,
-        cx: &mut Context<Self>,
-    ) {
-        let state = self.state.read(cx);
-        let models: Vec<ModelProfile> = state
-            .available_models
-            .iter()
-            .filter(|m| m.provider == *provider && capability_filter(m))
-            .cloned()
-            .collect();
+    fn update_provider_selects(&mut self, cx: &mut Context<Self>) {
+        let (chat_providers, embedding_providers, image_providers) = {
+            let state = self.state.read(cx);
+            let models = &state.available_models;
 
-        select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(models), cx);
+            let get_providers = |m_type: ModelType| {
+                let mut providers: Vec<Provider> = models
+                    .iter()
+                    .filter(|m| m.model_type == m_type)
+                    .map(|m| m.provider.clone())
+                    .collect();
+                providers.sort_by_key(|p| p.to_string());
+                providers.dedup();
+                providers
+            };
+
+            (
+                get_providers(ModelType::TextGeneration),
+                get_providers(ModelType::TextEmbedding),
+                get_providers(ModelType::ImageGeneration),
+            )
+        };
+
+        println!(
+            "Updating provider selects: Chat={}, Embedding={}, Image={}",
+            chat_providers.len(),
+            embedding_providers.len(),
+            image_providers.len()
+        );
+
+        self.provider_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(chat_providers), cx);
+        });
+
+        self.embedding_provider_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(embedding_providers), cx);
+        });
+
+        self.image_provider_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(image_providers), cx);
+        });
+    }
+
+    fn update_model_selects(&mut self, cx: &mut Context<Self>, reset_selection: bool) {
+        let chat_provider = self.provider_select.read(cx).selected_value().cloned();
+        let embedding_provider = self
+            .embedding_provider_select
+            .read(cx)
+            .selected_value()
+            .cloned();
+        let image_provider = self
+            .image_provider_select
+            .read(cx)
+            .selected_value()
+            .cloned();
+
+        let (chat_models, embedding_models, image_models) = {
+            let state = self.state.read(cx);
+            let models = &state.available_models;
+
+            let filter_models = |m_type: ModelType, provider: Option<&Provider>| {
+                models
+                    .iter()
+                    .filter(|m| m.model_type == m_type)
+                    .filter(|m| provider.map_or(true, |p| m.provider == *p))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+
+            (
+                filter_models(ModelType::TextGeneration, chat_provider.as_ref()),
+                filter_models(ModelType::TextEmbedding, embedding_provider.as_ref()),
+                filter_models(ModelType::ImageGeneration, image_provider.as_ref()),
+            )
+        };
+
+        println!(
+            "Updating model selects: Chat={}, Embedding={}, Image={}",
+            chat_models.len(),
+            embedding_models.len(),
+            image_models.len()
+        );
+
+        self.model_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(chat_models), cx);
+            if reset_selection {
+                select.reset_selection(cx);
+            }
+        });
+
+        self.embedding_model_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(embedding_models), cx);
+            if reset_selection {
+                select.reset_selection(cx);
+            }
+        });
+
+        self.image_model_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(image_models), cx);
+            if reset_selection {
+                select.reset_selection(cx);
+            }
+        });
+    }
+    fn validate_profile(&self, cx: &App) -> Result<(), String> {
+        let name = self.profile_name_input.read(cx).value();
+        if name.trim().is_empty() {
+            return Err("Profile name cannot be empty".to_string());
+        }
+
+        // Check Chat Model
+        if self.model_select.read(cx).selected_value().is_none() {
+            return Err("Please select a Chat Model".to_string());
+        }
+        if self
+            .chat_credential_select
+            .read(cx)
+            .selected_value()
+            .is_none()
+        {
+            return Err("Please select a Chat Credential".to_string());
+        }
+
+        // Check Embedding Model
+        if self
+            .embedding_model_select
+            .read(cx)
+            .selected_value()
+            .is_none()
+        {
+            return Err("Please select an Embedding Model".to_string());
+        }
+        if self
+            .embedding_credential_select
+            .read(cx)
+            .selected_value()
+            .is_none()
+        {
+            return Err("Please select an Embedding Credential".to_string());
+        }
+
+        // Check Image Model
+        if self.image_model_select.read(cx).selected_value().is_none() {
+            return Err("Please select an Image Model".to_string());
+        }
+        if self
+            .image_credential_select
+            .read(cx)
+            .selected_value()
+            .is_none()
+        {
+            return Err("Please select an Image Credential".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn update_credential_selects(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let chat_provider = self.model_select.read(cx).selected_value().and_then(|id| {
+            state
+                .available_models
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.provider.clone())
+        });
+
+        let embedding_provider = self
+            .embedding_model_select
+            .read(cx)
+            .selected_value()
+            .and_then(|id| {
+                state
+                    .available_models
+                    .iter()
+                    .find(|m| &m.id == id)
+                    .map(|m| m.provider.clone())
+            });
+
+        let image_provider = self
+            .image_model_select
+            .read(cx)
+            .selected_value()
+            .and_then(|id| {
+                state
+                    .available_models
+                    .iter()
+                    .find(|m| &m.id == id)
+                    .map(|m| m.provider.clone())
+            });
+
+        println!(
+            "Updating credential selects. Providers: Chat={:?}, Embedding={:?}, Image={:?}",
+            chat_provider, embedding_provider, image_provider
+        );
+
+        let all_creds = self.credentials.clone();
+
+        // Helper to filter and add "Create New"
+        let filter_creds = |provider: Option<Provider>| {
+            if provider.is_none() {
+                return SearchableVec::new(vec![]);
+            }
+
+            let mut filtered: Vec<CredentialItem> = all_creds
+                .iter()
+                .filter(|c| {
+                    if let Some(p) = &provider {
+                        c.provider.eq_ignore_ascii_case(&format!("{:?}", p))
+                    } else {
+                        false
+                    }
+                })
+                .map(|c| CredentialItem(c.clone()))
+                .collect();
+
+            if let Some(p) = provider {
+                filtered.push(CredentialItem(Credential {
+                    id: -999,
+                    name: format!("Create new {:?} credential...", p),
+                    provider: format!("{:?}", p),
+                    api_key: String::new(),
+                    created_at: String::new(),
+                }));
+            }
+
+            SearchableVec::new(filtered)
+        };
+
+        let chat_creds = filter_creds(chat_provider);
+        self.chat_credential_select.update(cx, |select, cx| {
+            select.set_items(chat_creds, cx);
+        });
+
+        let embedding_creds = filter_creds(embedding_provider);
+        self.embedding_credential_select.update(cx, |select, cx| {
+            select.set_items(embedding_creds, cx);
+        });
+
+        let image_creds = filter_creds(image_provider);
+        self.image_credential_select.update(cx, |select, cx| {
+            select.set_items(image_creds, cx);
         });
     }
 
@@ -449,21 +1081,48 @@ impl ProfileSettingsModal {
                     let mut cx = cx.clone();
                     async move {
                         match db.get_credentials().await {
-                            Ok(creds) => {
-                                view.update(&mut cx, |this, cx| {
-                                    let items: Vec<CredentialItem> =
-                                        creds.into_iter().map(CredentialItem).collect();
-                                    let creds_vec = SearchableVec::new(items);
+                            Ok(mut creds_vec) => {
+                                // Add system credentials
+                                let system_keys = [
+                                    ("GEMINI_API_KEY", "Gemini"),
+                                    ("ANTHROPIC_API_KEY", "Anthropic"),
+                                    ("OPENAI_API_KEY", "OpenAI"),
+                                    ("GROQ_API_KEY", "Groq"),
+                                ];
 
-                                    this.chat_credential_select.update(cx, |select, cx| {
-                                        select.set_items(creds_vec.clone(), cx);
-                                    });
-                                    this.embedding_credential_select.update(cx, |select, cx| {
-                                        select.set_items(creds_vec.clone(), cx);
-                                    });
-                                    this.image_credential_select.update(cx, |select, cx| {
-                                        select.set_items(creds_vec, cx);
-                                    });
+                                let mut system_id = -1;
+                                for (env_key, provider) in system_keys {
+                                    if let Ok(api_key) = std::env::var(env_key) {
+                                        if !api_key.is_empty() {
+                                            creds_vec.push(Credential {
+                                                id: system_id,
+                                                name: format!("{} (System)", provider),
+                                                provider: provider.to_string(),
+                                                api_key,
+                                                created_at: String::new(),
+                                            });
+                                            system_id -= 1;
+                                        }
+                                    }
+                                }
+
+                                let creds_vec = SearchableVec::new(
+                                    creds_vec
+                                        .into_iter()
+                                        .map(CredentialItem)
+                                        .collect::<Vec<_>>(),
+                                );
+
+                                view.update(&mut cx, |this, cx| {
+                                    this.credentials = creds_vec
+                                        .items()
+                                        .iter()
+                                        .map(|item: &CredentialItem| item.0.clone())
+                                        .collect();
+
+                                    println!("Fetched {} credentials", this.credentials.len());
+                                    this.update_credential_selects(cx);
+                                    cx.notify();
                                 })
                                 .ok();
                             }
@@ -475,17 +1134,255 @@ impl ProfileSettingsModal {
             .detach();
         }
     }
+    fn save_new_credential(
+        &mut self,
+        input: Entity<InputState>,
+        model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
+        _cred_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let api_key = input.read(cx).value();
+        if api_key.trim().is_empty() {
+            return;
+        }
+
+        let state = self.state.read(cx);
+        let provider = model_select.read(cx).selected_value().and_then(|id| {
+            state
+                .available_models
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.provider.clone())
+        });
+
+        if let Some(provider) = provider {
+            if let Some(db) = &state.database_service {
+                let db = db.clone();
+                let provider_str = format!("{:?}", provider);
+                let name = format!("{} Credential", provider_str);
+                let api_key = api_key.to_string();
+
+                cx.spawn(move |view: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        match db.create_credential(&name, &provider_str, &api_key).await {
+                            Ok(id) => {
+                                view.update(&mut cx, |this, cx| {
+                                    this.creating_chat_cred = false;
+                                    this.creating_embedding_cred = false;
+                                    this.creating_image_cred = false;
+                                    this.pending_credential_id = Some(id);
+                                    this.fetch_credentials(cx);
+                                })
+                                .ok();
+                            }
+                            Err(e) => eprintln!("Failed to create credential: {}", e),
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn render_model_section(
+        title: impl Into<SharedString>,
+        provider_select: Entity<SelectState<SearchableVec<Provider>>>,
+        model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
+        credential_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
+        creating_cred: bool,
+        new_cred_input: Entity<InputState>,
+        save_action: &'static str,
+        cancel_action: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(Label::new(title).font_weight(FontWeight::MEDIUM))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_4()
+                    .child(
+                        div().flex_1().min_w_64().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    Label::new("Provider")
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .child(
+                                    Select::new(&provider_select).placeholder("Select Provider"),
+                                ),
+                        ),
+                    )
+                    .child(
+                        div().flex_1().min_w_64().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    Label::new("Model")
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .child(Select::new(&model_select).placeholder("Select Model")),
+                        ),
+                    )
+                    .child(
+                        div().flex_1().min_w_64().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    Label::new("Credential")
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .child(if creating_cred {
+                                    h_flex()
+                                        .gap_2()
+                                        .child(Input::new(&new_cred_input).flex_1())
+                                        .child(Button::new(save_action).label("Save").on_click(
+                                            cx.listener(
+                                                move |this, _, window, cx| match save_action {
+                                                    "save_chat_cred" => this.save_chat_cred(
+                                                        &ClickEvent::default(),
+                                                        window,
+                                                        cx,
+                                                    ),
+                                                    "save_embedding_cred" => {
+                                                        this.save_embedding_cred(
+                                                            &ClickEvent::default(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    }
+                                                    "save_image_cred" => this.save_image_cred(
+                                                        &ClickEvent::default(),
+                                                        window,
+                                                        cx,
+                                                    ),
+                                                    _ => {}
+                                                },
+                                            ),
+                                        ))
+                                        .child(
+                                            Button::new(cancel_action)
+                                                .label("Cancel")
+                                                .ghost()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    match cancel_action {
+                                                        "cancel_chat_cred" => {
+                                                            this.creating_chat_cred = false;
+                                                            cx.notify();
+                                                        }
+                                                        "cancel_embedding_cred" => {
+                                                            this.creating_embedding_cred = false;
+                                                            cx.notify();
+                                                        }
+                                                        "cancel_image_cred" => {
+                                                            this.creating_image_cred = false;
+                                                            cx.notify();
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                })),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    Select::new(&credential_select)
+                                        .placeholder("Select Credential")
+                                        .into_any_element()
+                                }),
+                        ),
+                    ),
+            )
+    }
+
+    fn save_chat_cred(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.new_chat_cred_input.clone();
+        let model_select = self.model_select.clone();
+        let cred_select = self.chat_credential_select.clone();
+        self.save_new_credential(input, model_select, cred_select, cx);
+    }
+
+    fn save_embedding_cred(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.new_embedding_cred_input.clone();
+        let model_select = self.embedding_model_select.clone();
+        let cred_select = self.embedding_credential_select.clone();
+        self.save_new_credential(input, model_select, cred_select, cx);
+    }
+
+    fn save_image_cred(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.new_image_cred_input.clone();
+        let model_select = self.image_model_select.clone();
+        let cred_select = self.image_credential_select.clone();
+        self.save_new_credential(input, model_select, cred_select, cx);
+    }
 }
 
 impl Render for ProfileSettingsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(name) = self.pending_name_update.take() {
-            self.profile_name_input.update(cx, |input, cx| {
-                input.set_value(name, window, cx);
-            });
+        // Handle pending success notification
+        if let Some(msg) = self.pending_success_message.take() {
+            window.push_notification(Notification::success(msg), cx);
         }
 
-        let theme = cx.theme();
+        if self.needs_reset {
+            self.create_new_profile(window, cx);
+            self.needs_reset = false;
+        }
+
+        // Handle focus requests
+        if self.should_focus_chat {
+            self.new_chat_cred_input
+                .read(cx)
+                .focus_handle()
+                .focus(window);
+            self.should_focus_chat = false;
+        }
+        if self.should_focus_embedding {
+            self.new_embedding_cred_input
+                .read(cx)
+                .focus_handle()
+                .focus(window);
+            self.should_focus_embedding = false;
+        }
+        if self.should_focus_image {
+            self.new_image_cred_input
+                .read(cx)
+                .focus_handle()
+                .focus(window);
+            self.should_focus_image = false;
+        }
+
+        // Handle pending credential selection
+        if let Some(id) = self.pending_credential_id {
+            if let Some(cred) = self.credentials.iter().find(|c| c.id == id) {
+                let item = CredentialItem(cred.clone());
+                self.chat_credential_select
+                    .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                self.embedding_credential_select
+                    .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                self.image_credential_select
+                    .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+            }
+            self.pending_credential_id = None;
+        }
 
         let window_width = window.viewport_size().width;
         let is_small_screen = window_width < px(650.0);
@@ -502,36 +1399,64 @@ impl Render for ProfileSettingsModal {
 
         let sidebar = if self.sidebar_open {
             let mut sidebar_div = div()
-                .w_64()
+                .w_72()
                 .border_r_1()
-                .border_color(theme.border)
-                .bg(theme.background)
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
                 .flex()
                 .flex_col()
                 .child(
                     div()
                         .p_4()
                         .border_b_1()
-                        .border_color(theme.border)
+                        .border_color(cx.theme().border)
                         .flex()
                         .justify_between()
                         .items_center()
                         .child(Label::new("Profiles").font_weight(FontWeight::BOLD))
                         .child(
                             Button::new("new_profile")
-                                .label("New")
                                 .icon(IconName::Plus)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.create_new_profile(cx)),
-                                ),
+                                .ghost()
+                                .tooltip("Create New Profile")
+                                .disabled(self.is_new_mode)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.create_new_profile(window, cx);
+                                })),
                         ),
                 )
-                .child(
-                    List::new(&self.list_state)
-                        .list_size(UiSize::Small)
-                        .with_size(UiSize::Small)
-                        .h_full(),
-                );
+                .child(div().flex_1().child(
+                    if self.list_state.read(cx).delegate().profiles.len() > 0 {
+                        List::new(&self.list_state)
+                            .list_size(UiSize::Small)
+                            .with_size(UiSize::Small)
+                            .h_full()
+                            .w_full()
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .h_full()
+                            .p_4()
+                            .gap_2()
+                            .child(
+                                Label::new("No profiles yet")
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                Label::new("Create a new profile to get started")
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .text_align(TextAlign::Center),
+                            )
+                            .into_any_element()
+                    },
+                ));
 
             if is_small_screen {
                 sidebar_div = sidebar_div
@@ -539,7 +1464,7 @@ impl Render for ProfileSettingsModal {
                     .top_0()
                     .left_0()
                     .h_full()
-                    .occlude() // Block clicks on elements below
+                    .occlude()
                     .shadow_lg();
             }
 
@@ -548,126 +1473,184 @@ impl Render for ProfileSettingsModal {
             div().hidden()
         };
 
-        let main_content = div()
-            .flex_1()
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_6()
-            .scrollable(ScrollbarAxis::Vertical)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(Input::new(&self.profile_name_input).with_size(UiSize::Large)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_6()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(Label::new("Chat Model").font_weight(FontWeight::BOLD))
-                            .child(
+        let main_content = if self.show_form {
+            div()
+                .flex_1()
+                .p_6()
+                .flex()
+                .flex_col()
+                .gap_8()
+                .scrollable(ScrollbarAxis::Vertical)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            Label::new("General")
+                                .font_weight(FontWeight::BOLD)
+                                .text_lg(),
+                        )
+                        .child(
+                            div().child(
                                 div()
                                     .flex()
-                                    .flex_wrap()
-                                    .gap_4()
+                                    .flex_col()
+                                    .gap_2()
+                                    .when_some(self.error_message.clone(), |div, msg| {
+                                        div.child(Label::new(msg).text_color(cx.theme().danger))
+                                    })
                                     .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.provider_select)
-                                                .placeholder("Select Provider"),
-                                        ),
+                                        Label::new("Profile Name")
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM),
                                     )
-                                    .child(div().flex_1().min_w_64().child(
-                                        Select::new(&self.model_select).placeholder("Select Model"),
-                                    ))
-                                    .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.chat_credential_select)
-                                                .placeholder("Select Credential"),
-                                        ),
-                                    ),
+                                    .child(Input::new(&self.profile_name_input)),
                             ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(Label::new("Embedding Model").font_weight(FontWeight::BOLD))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_4()
-                                    .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.embedding_provider_select)
-                                                .placeholder("Select Provider"),
-                                        ),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.embedding_model_select)
-                                                .placeholder("Select Model"),
-                                        ),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.embedding_credential_select)
-                                                .placeholder("Select Credential"),
-                                        ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(Label::new("Image Model").font_weight(FontWeight::BOLD))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap_4()
-                                    .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.image_provider_select)
-                                                .placeholder("Select Provider"),
-                                        ),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.image_model_select)
-                                                .placeholder("Select Model"),
-                                        ),
-                                    )
-                                    .child(
-                                        div().flex_1().min_w_64().child(
-                                            Select::new(&self.image_credential_select)
-                                                .placeholder("Select Credential"),
-                                        ),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div().flex().justify_end().gap_2().child(
-                    Button::new("save")
-                        .label("Save Changes")
-                        .primary()
-                        .on_click(|_, _, _| {}),
-                ),
-            );
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            Label::new("Model Configuration")
+                                .font_weight(FontWeight::BOLD)
+                                .text_lg(),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_6()
+                                .child(Self::render_model_section(
+                                    "Chat Model",
+                                    self.provider_select.clone(),
+                                    self.model_select.clone(),
+                                    self.chat_credential_select.clone(),
+                                    self.creating_chat_cred,
+                                    self.new_chat_cred_input.clone(),
+                                    "save_chat_cred",
+                                    "cancel_chat_cred",
+                                    cx,
+                                ))
+                                .child(Self::render_model_section(
+                                    "Embedding Model",
+                                    self.embedding_provider_select.clone(),
+                                    self.embedding_model_select.clone(),
+                                    self.embedding_credential_select.clone(),
+                                    self.creating_embedding_cred,
+                                    self.new_embedding_cred_input.clone(),
+                                    "save_embedding_cred",
+                                    "cancel_embedding_cred",
+                                    cx,
+                                ))
+                                .child(Self::render_model_section(
+                                    "Image Model",
+                                    self.image_provider_select.clone(),
+                                    self.image_model_select.clone(),
+                                    self.image_credential_select.clone(),
+                                    self.creating_image_cred,
+                                    self.new_image_cred_input.clone(),
+                                    "save_image_cred",
+                                    "cancel_image_cred",
+                                    cx,
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .children(if let ProfileMode::Editing(_) = self.mode {
+                            Some(
+                                Button::new("delete_profile_btn")
+                                    .label("Delete Profile")
+                                    .danger()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.delete_profile(window, cx)
+                                    })),
+                            )
+                        } else {
+                            None
+                        })
+                        .child(
+                            Button::new("save_profile_btn")
+                                .label(if self.is_saving {
+                                    "Saving..."
+                                } else {
+                                    "Save Changes"
+                                })
+                                .primary()
+                                .disabled(self.is_saving)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.save_profile(window, cx)
+                                    }),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            // Empty state - show when no profile is selected and not in new mode
+            div()
+                .flex_1()
+                .bg(cx.theme().background)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_6()
+                        .child(
+                            div()
+                                .p_6()
+                                .rounded_full()
+                                .bg(cx.theme().secondary)
+                                .child(
+                                    Icon::new(IconName::User)
+                                        .text_color(cx.theme().muted_foreground)
+                                        .with_size(UiSize::Large), // Use a larger size if possible or scale it
+                                )
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Label::new("Select a Profile")
+                                        .text_xl()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(cx.theme().foreground),
+                                )
+                                .child(
+                                    Label::new("Choose a profile from the sidebar to edit settings\nor create a new one to get started.")
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .text_align(TextAlign::Center),
+                                ),
+                        )
+                        .child(
+                            Button::new("empty_state_new_profile")
+                                .label("Create New Profile")
+                                .icon(IconName::Plus)
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.create_new_profile(window, cx);
+                                })),
+                        ),
+                )
+                .into_any_element()
+        };
 
-        let container = div().flex().flex_1().relative();
+        let container = div().flex().flex_1().h_full().overflow_hidden();
 
         let content_area = if is_small_screen {
             container.child(main_content).child(sidebar)
@@ -676,9 +1659,10 @@ impl Render for ProfileSettingsModal {
         };
 
         div()
-            .absolute()
-            .inset_0()
-            .bg(gpui::black().opacity(0.5))
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(cx.theme().background)
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -688,9 +1672,6 @@ impl Render for ProfileSettingsModal {
             .on_mouse_down(MouseButton::Middle, |_, _, cx| {
                 cx.stop_propagation();
             })
-            .flex()
-            .flex_col()
-            .bg(theme.background)
             .child(
                 div()
                     .flex()
@@ -698,7 +1679,7 @@ impl Render for ProfileSettingsModal {
                     .justify_between()
                     .p_4()
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(cx.theme().border)
                     .child(
                         div()
                             .flex()

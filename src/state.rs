@@ -1,7 +1,11 @@
 use crate::audio::AudioInput;
 use crate::config::Config;
-use crate::llm::{ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential};
-use crate::services::database::{Credential as DbCredential, DatabaseService, Profile as DbProfile};
+use crate::llm::{
+    ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
+};
+use crate::services::database::{
+    Credential as DbCredential, DatabaseService, Profile as DbProfile,
+};
 use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
 use gpui::*;
@@ -322,7 +326,9 @@ impl AppState {
     }
 
     /// Load all profiles and credentials from the database into AppState.
-    pub async fn load_profiles_and_credentials(db: &DatabaseService) -> anyhow::Result<(Vec<DbProfile>, Vec<DbCredential>)> {
+    pub async fn load_profiles_and_credentials(
+        db: &DatabaseService,
+    ) -> anyhow::Result<(Vec<DbProfile>, Vec<DbCredential>)> {
         let profiles = db.get_profiles().await?;
         let credentials = db.get_credentials().await?;
         Ok((profiles, credentials))
@@ -349,17 +355,20 @@ impl AppState {
         if self.db_profiles.iter().any(|p| p.id == profile_id) {
             self.active_profile_id = Some(profile_id);
             self.update_llm_provider(cx);
-            
+
             // Persist the selection asynchronously
             if let Some(db) = self.database_service.clone() {
-                cx.spawn(move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
-                    if let Err(e) = Self::persist_selected_profile(&db, Some(profile_id)).await {
-                        eprintln!("Failed to persist selected profile: {}", e);
-                    }
-                })
+                cx.spawn(
+                    move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
+                        if let Err(e) = Self::persist_selected_profile(&db, Some(profile_id)).await
+                        {
+                            eprintln!("Failed to persist selected profile: {}", e);
+                        }
+                    },
+                )
                 .detach();
             }
-            
+
             cx.notify();
         }
     }
@@ -379,7 +388,10 @@ impl AppState {
 
     /// Persist the selected profile ID to the settings table.
     /// Requirements: 5.1
-    pub async fn persist_selected_profile(db: &DatabaseService, profile_id: Option<i64>) -> anyhow::Result<()> {
+    pub async fn persist_selected_profile(
+        db: &DatabaseService,
+        profile_id: Option<i64>,
+    ) -> anyhow::Result<()> {
         const SETTING_KEY: &str = "selected_profile_id";
         match profile_id {
             Some(id) => {
@@ -400,7 +412,7 @@ impl AppState {
         profiles: &[DbProfile],
     ) -> anyhow::Result<Option<i64>> {
         const SETTING_KEY: &str = "selected_profile_id";
-        
+
         if let Some(value) = db.get_setting(SETTING_KEY).await? {
             if let Ok(profile_id) = value.parse::<i64>() {
                 // Validate profile still exists
@@ -420,9 +432,10 @@ impl AppState {
     pub fn update_llm_provider(&mut self, cx: &mut Context<Self>) {
         // Try to create provider from active profile's credential
         if let Some(credential) = self.active_credential() {
-            let model_id = self.active_profile()
+            let model_id = self
+                .active_profile()
                 .and_then(|p| p.text_model_id.as_deref());
-            
+
             match create_provider_from_credential(credential, model_id) {
                 Ok(provider) => {
                     println!(
@@ -434,10 +447,7 @@ impl AppState {
                     return;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[LLM] Failed to create provider from credential: {}",
-                        e
-                    );
+                    eprintln!("[LLM] Failed to create provider from credential: {}", e);
                 }
             }
         }
@@ -513,7 +523,11 @@ impl AppState {
         };
 
         // Add user message
-        if let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == conversation_id) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+        {
             let message = Message {
                 id: conversation.messages.len() + 1,
                 sender: "Me".to_string(),
@@ -543,7 +557,11 @@ impl AppState {
                 c.messages
                     .iter()
                     .map(|m| ChatMessage {
-                        role: if m.is_me { "user".to_string() } else { "assistant".to_string() },
+                        role: if m.is_me {
+                            "user".to_string()
+                        } else {
+                            "assistant".to_string()
+                        },
                         content: m.content.clone(),
                         images: None,
                     })
@@ -553,7 +571,8 @@ impl AppState {
 
         // Use active profile's text_model_id if set, otherwise fall back to provider default
         // Requirements 4.1, 4.2
-        let model = self.active_profile()
+        let model = self
+            .active_profile()
             .and_then(|p| p.text_model_id.clone())
             .unwrap_or_else(|| provider.default_model().to_string());
 

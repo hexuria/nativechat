@@ -340,6 +340,7 @@ pub struct SelectState<D: SelectDelegate + 'static> {
     open: bool,
     selected_value: Option<<D::Item as SelectItem>::Value>,
     final_selected_index: Option<IndexPath>,
+    pending_reset: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -362,6 +363,10 @@ impl<T: Clone> SearchableVec<T> {
     pub fn push(&mut self, item: T) {
         self.items.push(item.clone());
         self.matched_items.push(item);
+    }
+
+    pub fn items(&self) -> &Vec<T> {
+        &self.items
     }
 }
 
@@ -567,6 +572,7 @@ where
             bounds: Bounds::default(),
             empty: None,
             final_selected_index: None,
+            pending_reset: false,
             _subscriptions,
         };
         this.set_selected_index(selected_index, window, cx);
@@ -593,6 +599,13 @@ where
         });
         self.final_selected_index = selected_index;
         self.update_selected_value(window, cx);
+    }
+
+    /// Reset the selection without needing a Window immediately.
+    /// The reset will be applied during the next render.
+    pub fn reset_selection(&mut self, cx: &mut Context<Self>) {
+        self.pending_reset = true;
+        cx.notify();
     }
 
     /// Set selected value for the select.
@@ -776,6 +789,11 @@ where
     D: SelectDelegate + 'static,
 {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_reset {
+            self.set_selected_index(None, window, cx);
+            self.pending_reset = false;
+        }
+
         let searchable = self.searchable;
         let is_focused = self.focus_handle.is_focused(window);
         let show_clean = self.options.cleanable && self.selected_index(cx).is_some();

@@ -1,107 +1,129 @@
 use crate::services::database::Credential;
 use crate::state::AppState;
+use chrono::NaiveDate;
 use gpui::prelude::*;
 use gpui::{InteractiveElement, *};
+use std::rc::Rc;
 use ui::Icon;
 use ui::IconName;
 use ui::IndexPath;
 use ui::SearchableVec;
-use ui::button::{Button, ButtonVariants};
+use ui::button::{Button, ButtonVariant, ButtonVariants};
+use ui::calendar::Date;
+use ui::date_picker::{DatePicker, DatePickerEvent, DatePickerState};
+use ui::input::InputEvent;
 use ui::input::{Input, InputState};
 use ui::label::Label;
 use ui::list::{List, ListDelegate, ListItem, ListState};
+use ui::scroll::ScrollbarAxis;
 use ui::select::{Select, SelectState};
 use ui::theme::ActiveTheme;
+use ui::{Sizable, Size, StyledExt};
 
 actions!(credentials_modal, [SubmitCredential]);
 
-const PROVIDERS: &[&str] = &["Gemini", "OpenAI", "Anthropic", "Ollama", "Groq"];
+#[derive(Debug, Clone, PartialEq)]
+pub enum CredentialMode {
+    Editing(i64),
+    Creating,
+}
 
 pub struct CredentialsModal {
     state: Entity<AppState>,
     credentials: Vec<Credential>,
     list_state: Entity<ListState<CredentialsListDelegate>>,
     name_input: Entity<InputState>,
-
     provider_select: Entity<SelectState<SearchableVec<String>>>,
     api_key_input: Entity<InputState>,
+
     should_clear_inputs: bool,
     error_message: Option<String>,
+
+    // New fields for Master-Detail layout
+    sidebar_open: bool,
+    selected_index: Option<usize>,
+    mode: CredentialMode,
+    last_window_width: Option<Pixels>,
+    is_saving: bool,
+    show_form: bool,
+    search_input: Entity<InputState>,
+    date_picker: Entity<DatePickerState>,
+    expiration_date: Option<NaiveDate>,
 }
 
 #[derive(Clone)]
 pub struct CredentialsListDelegate {
-    view: WeakEntity<CredentialsModal>,
+    credentials: Vec<Credential>,
+    selected_index: Option<usize>,
+    on_click: Rc<dyn Fn(usize, &mut Window, &mut App)>,
 }
 
 impl CredentialsListDelegate {
-    fn new(view: WeakEntity<CredentialsModal>) -> Self {
-        Self { view }
+    pub fn new(
+        credentials: Vec<Credential>,
+        on_click: Rc<dyn Fn(usize, &mut Window, &mut App)>,
+    ) -> Self {
+        Self {
+            credentials,
+            selected_index: None,
+            on_click,
+        }
     }
 }
 
 impl ListDelegate for CredentialsListDelegate {
-    type Item = ui::list::ListItem;
+    type Item = ListItem;
 
     fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.view
-            .upgrade()
-            .map(|view| view.read(_cx).credentials.len())
-            .unwrap_or(0)
+        self.credentials.len()
     }
 
     fn render_item(&self, ix: IndexPath, _window: &mut Window, cx: &mut App) -> Option<Self::Item> {
-        let entity = self.view.upgrade()?;
-        let modal = entity.read(cx);
-        let credential = modal.credentials.get(ix.row)?;
-        let id = credential.id;
-        let view_weak = self.view.clone();
+        let credential = self.credentials.get(ix.row)?;
+        let theme = cx.theme();
+        let is_selected = self.selected_index == Some(ix.row);
+        let on_click = self.on_click.clone();
 
         Some(
-            ListItem::new(ix).child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .w_full()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                Label::new(credential.name.clone()).font_weight(FontWeight::BOLD),
-                            )
-                            .child(
-                                Label::new(format!(
-                                    "{} • Created: {}",
-                                    credential.provider, credential.created_at
-                                ))
+            ListItem::new(ix)
+                .p_1()
+                .child(
+                    div()
+                        .w_full()
+                        .p_2()
+                        .rounded_md()
+                        .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+                        .when(is_selected, |s| s.bg(theme.secondary))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .child(credential.name.clone())
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_sm()
+                                .text_color(theme.foreground),
+                        )
+                        .child(
+                            div()
+                                .child(credential.provider.clone())
                                 .text_xs()
-                                .text_color(cx.theme().muted_foreground),
-                            ),
-                    )
-                    .child(
-                        Button::new("delete")
-                            .icon(IconName::Delete)
-                            .ghost()
-                            .on_click(move |_, window, cx| {
-                                if let Some(view) = view_weak.upgrade() {
-                                    view.update(cx, |this, cx| {
-                                        this.delete_credential(id, window, cx)
-                                    });
-                                }
-                            }),
-                    ),
-            ),
+                                .text_color(theme.muted_foreground),
+                        ),
+                )
+                .on_click(move |_, window, cx| {
+                    on_click(ix.row, window, cx);
+                }),
         )
     }
 
     fn set_selected_index(
         &mut self,
-        _ix: Option<IndexPath>,
+        ix: Option<IndexPath>,
         _window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) {
+        self.selected_index = ix.map(|ix| ix.row);
     }
 }
 
@@ -111,8 +133,19 @@ impl CredentialsModal {
             let name_input =
                 cx.new(|cx| InputState::new(window, cx).placeholder("Name (e.g. My Gemini Key)"));
 
-            let provider_items =
-                SearchableVec::new(PROVIDERS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            let mut providers: Vec<String> = state
+                .read(cx)
+                .available_models
+                .iter()
+                .map(|m| m.provider.to_string())
+                .collect();
+
+            // Removed hardcoded defaults as per user request
+            // Providers should be seeded from backend/database
+            providers.sort();
+            providers.dedup();
+
+            let provider_items = SearchableVec::new(providers);
             let provider_select = cx.new(|cx| {
                 SelectState::new(provider_items, Some(IndexPath::default()), window, cx)
                     .searchable(true)
@@ -123,8 +156,26 @@ impl CredentialsModal {
                     .masked(true)
             });
 
-            let delegate = CredentialsListDelegate::new(cx.entity().downgrade());
+            let weak_self = cx.entity().downgrade();
+            let on_click = Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                weak_self
+                    .update(cx, |this: &mut CredentialsModal, cx| {
+                        this.load_credential(index, window, cx);
+                        this.list_state.update(cx, |list, cx| {
+                            list.delegate_mut().selected_index = Some(index);
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+            });
+
+            let delegate = CredentialsListDelegate::new(vec![], on_click);
             let list_state = cx.new(|cx| ListState::new(delegate, window, cx));
+
+            let search_input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Search credentials..."));
+
+            let date_picker = cx.new(|cx| DatePickerState::new(window, cx).date_format("%Y-%m-%d"));
 
             let mut this = Self {
                 state,
@@ -133,12 +184,95 @@ impl CredentialsModal {
                 name_input,
                 provider_select,
                 api_key_input,
+                // Keeping this for now to avoid breaking other code immediately, but will replace usage
                 should_clear_inputs: false,
                 error_message: None,
+                sidebar_open: true,
+                selected_index: None,
+                mode: CredentialMode::Creating,
+                last_window_width: None,
+                is_saving: false,
+                show_form: false,
+                search_input,
+                date_picker,
+                expiration_date: None,
             };
+
+            // Subscribe to search input changes
+            cx.subscribe(&this.search_input, |this, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    this.filter_credentials(cx);
+                }
+            })
+            .detach();
+
+            // Subscribe to date picker changes
+            cx.subscribe(&this.date_picker, |this, _, event: &DatePickerEvent, _| {
+                if let DatePickerEvent::Change(date) = event {
+                    if let Some(naive_date) = date.start() {
+                        this.expiration_date = Some(naive_date);
+                    } else {
+                        this.expiration_date = None;
+                    }
+                }
+            })
+            .detach();
+
             this.fetch_credentials(cx);
             this
         })
+    }
+
+    fn filter_credentials(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).value().to_lowercase();
+        let filtered: Vec<Credential> = self
+            .credentials
+            .iter()
+            .filter(|c| {
+                c.name.to_lowercase().contains(&query) || c.provider.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+
+        self.list_state.update(cx, |list, cx| {
+            list.delegate_mut().credentials = filtered;
+            cx.notify();
+        });
+    }
+
+    fn load_credential(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // Get the actual credential from the filtered list in the delegate
+        let credential = self
+            .list_state
+            .read(cx)
+            .delegate()
+            .credentials
+            .get(index)
+            .cloned();
+
+        if let Some(cred) = credential {
+            self.mode = CredentialMode::Editing(cred.id);
+            self.selected_index = Some(index);
+            self.show_form = true;
+
+            // Populate form
+            self.name_input.update(cx, |input, cx| {
+                input.set_value(cred.name.clone(), window, cx)
+            });
+            self.api_key_input.update(cx, |input, cx| {
+                input.set_value(cred.api_key.clone(), window, cx)
+            });
+
+            // Set provider
+            self.provider_select.update(cx, |select, cx| {
+                select.set_selected_value(&cred.provider, window, cx);
+            });
+
+            // Set expiration if we had it (currently not in DB model, but preparing UI)
+            // self.date_picker.update(cx, |picker, cx| picker.set_date(...));
+
+            cx.notify();
+        }
     }
 
     fn fetch_credentials(&mut self, cx: &mut Context<Self>) {
@@ -153,9 +287,9 @@ impl CredentialsModal {
                         match db.get_credentials().await {
                             Ok(creds) => {
                                 view.update(&mut cx, |this, cx| {
-                                    this.credentials = creds;
-                                    this.list_state.update(cx, |_list, cx| {
-                                        // list.reset_delegate(cx);
+                                    this.credentials = creds.clone();
+                                    this.list_state.update(cx, |list, cx| {
+                                        list.delegate_mut().credentials = creds;
                                         cx.notify();
                                     });
                                     cx.notify();
@@ -250,110 +384,366 @@ impl CredentialsModal {
 
 impl Render for CredentialsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.should_clear_inputs {
-            self.should_clear_inputs = false;
-            self.name_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            self.api_key_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            self.provider_select.update(cx, |select, cx| {
-                select.set_selected_index(Some(ui::IndexPath::default()), window, cx);
-            });
-        }
+        let window_width = window.viewport_size().width;
+        let is_small_screen = window_width < px(650.0);
 
-        let is_mobile = window.viewport_size().width < px(768.);
+        // Auto-hide/show sidebar on resize
+        if let Some(last_width) = self.last_window_width {
+            if last_width >= px(650.0) && window_width < px(650.0) {
+                self.sidebar_open = false;
+            } else if last_width < px(650.0) && window_width >= px(650.0) {
+                self.sidebar_open = true;
+            }
+        }
+        self.last_window_width = Some(window_width);
+
+        let sidebar = if self.sidebar_open {
+            let mut sidebar_div = div()
+                .w_72()
+                .border_r_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .p_4()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .child(Label::new("Credentials").font_weight(FontWeight::BOLD))
+                        .child(
+                            Button::new("new_credential")
+                                .icon(IconName::Plus)
+                                .ghost()
+                                .hover(|s| s.bg(cx.theme().secondary))
+                                .tooltip("Create New Credential")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.mode = CredentialMode::Creating;
+                                    this.show_form = true;
+                                    // Clear inputs
+                                    // Clear inputs
+                                    this.name_input
+                                        .update(cx, |i, cx| i.set_value("", window, cx));
+                                    this.api_key_input
+                                        .update(cx, |i, cx| i.set_value("", window, cx));
+                                    this.provider_select
+                                        .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+                                    this.date_picker.update(cx, |d, cx| {
+                                        d.set_date(Date::Single(None), window, cx)
+                                    });
+                                    this.expiration_date = None;
+
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div().p_2().child(
+                        Input::new(&self.search_input)
+                            .prefix(
+                                Icon::new(IconName::Search).text_color(cx.theme().muted_foreground),
+                            )
+                            .appearance(false)
+                            .border_color(cx.theme().border)
+                            .border_1()
+                            .rounded(cx.theme().radius)
+                            .focus_bordered(false)
+                            .when(
+                                self.search_input.read(cx).focus_handle().is_focused(window),
+                                |this| this.border_color(cx.theme().primary),
+                            ),
+                    ),
+                )
+                .child(div().flex_1().child(if !self.credentials.is_empty() {
+                    List::new(&self.list_state)
+                        .with_size(Size::Small)
+                        .h_full()
+                        .w_full()
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .h_full()
+                        .p_4()
+                        .gap_2()
+                        .child(
+                            Label::new("No credentials yet")
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .child(
+                            Label::new("Create a new credential to get started")
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .text_align(TextAlign::Center),
+                        )
+                        .into_any_element()
+                }));
+
+            if is_small_screen {
+                sidebar_div = sidebar_div
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h_full()
+                    .occlude()
+                    .shadow_lg();
+            }
+
+            sidebar_div
+        } else {
+            div().hidden()
+        };
+
+        let main_content = if self.show_form {
+            div()
+                .flex_1()
+                .p_6()
+                .flex()
+                .flex_col()
+                .gap_8()
+                .scrollable(ScrollbarAxis::Vertical)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(
+                            Label::new(match self.mode {
+                                CredentialMode::Creating => "Add New Credential",
+                                CredentialMode::Editing(_) => "Edit Credential",
+                            })
+                            .font_weight(FontWeight::BOLD)
+                            .text_lg(),
+                        )
+                        .child(
+                            div()
+                                .p_4()
+                                // Removed extra border and background as per user request
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_4()
+                                        .when_some(self.error_message.clone(), |div, msg| {
+                                            div.child(Label::new(msg).text_color(cx.theme().danger))
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    Label::new("Name")
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::MEDIUM),
+                                                )
+                                                .child(
+                                                    Input::new(&self.name_input).id("name-input"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    Label::new("Provider")
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::MEDIUM),
+                                                )
+                                                .child(
+                                                    Select::new(&self.provider_select)
+                                                        .id("provider-select")
+                                                        .placeholder("Select Provider")
+                                                        .search_placeholder("Search provider..."),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    Label::new("API Key")
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::MEDIUM),
+                                                )
+                                                .child(
+                                                    Input::new(&self.api_key_input)
+                                                        .id("api-key-input"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_2()
+                                                .child(
+                                                    Label::new("Expiration Date")
+                                                        .text_sm()
+                                                        .font_weight(FontWeight::MEDIUM),
+                                                )
+                                                .child(
+                                                    DatePicker::new(&self.date_picker)
+                                                        .cleanable(true),
+                                                ),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .children(if let CredentialMode::Editing(id) = self.mode {
+                                    Some(
+                                        Button::new("delete-btn")
+                                            .label("Delete")
+                                            .danger()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.delete_credential(id, window, cx);
+                                            })),
+                                    )
+                                } else {
+                                    None
+                                })
+                                .child(
+                                    Button::new("save-btn")
+                                        .label("Save Credential")
+                                        .primary()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.add_credential(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .bg(cx.theme().background)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_6()
+                        .child(
+                            div()
+                                .p_6()
+                                .rounded_full()
+                                .bg(cx.theme().secondary)
+                                .child(
+                                    Icon::new(IconName::Asterisk)
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Label::new("Select a Credential")
+                                        .text_xl()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(cx.theme().foreground),
+                                )
+                                .child(
+                                    Label::new("Choose a credential from the sidebar to edit\nor create a new one to get started.")
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .text_align(TextAlign::Center),
+                                ),
+                        )
+                        .child(
+                            Button::new("create-first-credential")
+                                .label("Create New Credential")
+                                .icon(IconName::Plus)
+                                .with_variant(ButtonVariant::Primary)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.mode = CredentialMode::Creating;
+                                    this.show_form = true;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element()
+        };
+
+        let container = div().flex().flex_1().relative();
+
+        let content_area = if is_small_screen {
+            container.child(main_content).child(sidebar)
+        } else {
+            container.child(sidebar).child(main_content)
+        };
 
         div()
-            .id("credentials_modal")
+            .absolute()
+            .inset_0()
+            .bg(gpui::black().opacity(0.5))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Middle, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .flex()
             .flex_col()
-            .size_full()
-            .p_4()
-            .gap_4()
-            .when(is_mobile, |this| this.size_full())
+            .bg(cx.theme().background)
             .child(
                 div()
                     .flex()
-                    .justify_between()
                     .items_center()
-                    .child(
-                        Label::new("API Credentials")
-                            .font_weight(FontWeight::BOLD)
-                            .text_xl(),
-                    )
-                    .child(
-                        gpui::div()
-                            .id("close-credentials-modal")
-                            .cursor_pointer()
-                            .child(Icon::new(IconName::Close))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.update(cx, |state, cx| {
-                                    state.toggle_credentials_modal(cx);
-                                });
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(Label::new("Add New Credential"))
+                    .justify_between()
+                    .p_4()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         div()
                             .flex()
-                            .flex_col()
+                            .items_center()
                             .gap_2()
-                            .child(Input::new(&self.name_input).id("name-input"))
                             .child(
-                                Select::new(&self.provider_select)
-                                    .id("provider-select")
-                                    .placeholder("Select Provider")
-                                    .search_placeholder("Search provider..."),
-                            )
-                            .child(Input::new(&self.api_key_input).id("api-key-input"))
-                            .child(if let Some(error) = &self.error_message {
-                                div().child(
-                                    Label::new(error.clone())
-                                        .text_color(cx.theme().danger_foreground),
-                                )
-                            } else {
-                                div()
-                            })
-                            .child(
-                                Button::new("add-credential-btn")
-                                    .label("Add Credential")
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_credential(window, cx);
+                                Button::new("toggle_sidebar")
+                                    .icon(IconName::Menu)
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.sidebar_open = !this.sidebar_open;
+                                        cx.notify();
                                     })),
                             )
-                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                                if event.keystroke.key == "Enter" {
-                                    this.add_credential(window, cx);
-                                }
-                            })),
-                    ),
+                            .child(Icon::new(IconName::SquareTerminal).with_size(Size::Small))
+                            .child(
+                                Label::new("Credentials")
+                                    .text_lg()
+                                    .font_weight(FontWeight::BOLD),
+                            ),
+                    )
+                    .child(Button::new("close").icon(IconName::Close).ghost().on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.state.update(cx, |state, cx| {
+                                state.toggle_credentials_modal(cx);
+                            });
+                        }),
+                    )),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .flex_1()
-                    .min_h_0()
-                    .child(Label::new("Existing Credentials"))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .child(div().size_full().child(List::new(&self.list_state))),
-                    ),
-            )
-            .on_action(cx.listener(|this, _: &SubmitCredential, window, cx| {
-                this.add_credential(window, cx);
-            }))
+            .child(content_area)
     }
 }

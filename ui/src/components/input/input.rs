@@ -254,7 +254,14 @@ impl RenderOnce for Input {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         const LINE_HEIGHT: Rems = Rems(1.25);
         let font = window.text_style().font();
-        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let rem_size = window.rem_size();
+        let font_size = match self.size {
+            Size::XSmall => rem_size * 0.75,
+            Size::Small => rem_size * 0.875,
+            Size::Medium => rem_size,
+            Size::Large => rem_size * 1.125,
+            Size::Size(px) => px,
+        };
 
         self.state.update(cx, |state, cx| {
             state.text_wrapper.set_font(font, font_size, cx);
