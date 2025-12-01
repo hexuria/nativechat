@@ -451,12 +451,14 @@ impl Render for MessageInput {
                                 )
                                 .child(
                                     div()
-                                        .w(px(160.0))
+                                        .min_w(px(160.0))
+                                        .max_w(px(300.0))
                                         .child(
                                             Select::new(&self.profile_select)
                                                 .id("profile-select")
                                                 .placeholder("Select Profile")
                                                 .search_placeholder("Search profile...")
+                                                .anchor(Corner::BottomLeft)
                                         )
                                 )
                                 .child(

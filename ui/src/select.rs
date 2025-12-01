@@ -1,9 +1,9 @@
 use gpui::{
     anchored, canvas, deferred, div, prelude::FluentBuilder, px, rems, AnyElement, App, AppContext,
-    Bounds, ClickEvent, Context, DismissEvent, Edges, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, KeyBinding, Length, ParentElement, Pixels, Render,
-    RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Subscription,
-    Task, WeakEntity, Window,
+    Bounds, ClickEvent, Context, Corner, DismissEvent, Edges, ElementId, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, Length, ParentElement,
+    Pixels, Point, Render, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement,
+    Styled, Subscription, Task, WeakEntity, Window,
 };
 use rust_i18n::t;
 
@@ -308,6 +308,7 @@ struct SelectOptions {
     menu_width: Length,
     disabled: bool,
     appearance: bool,
+    anchor: Corner,
 }
 
 impl Default for SelectOptions {
@@ -324,6 +325,7 @@ impl Default for SelectOptions {
             disabled: false,
             appearance: true,
             search_placeholder: None,
+            anchor: Corner::TopLeft,
         }
     }
 }
@@ -634,6 +636,7 @@ where
         self.list.update(cx, |list, _| {
             list.delegate_mut().delegate = items;
         });
+        cx.notify();
     }
 
     /// Get the selected index of the select.
@@ -890,39 +893,47 @@ where
             .when(self.open, |this| {
                 this.child(
                     deferred(
-                        anchored().snap_to_window_with_margin(px(8.)).child(
-                            div()
-                                .occlude()
-                                .map(|this| match self.options.menu_width {
-                                    Length::Auto => this.w(bounds.size.width + px(2.)),
-                                    Length::Definite(w) => this.w(w),
-                                })
-                                .child(
-                                    v_flex()
-                                        .occlude()
-                                        .mt_1p5()
-                                        .bg(cx.theme().background)
-                                        .border_1()
-                                        .border_color(cx.theme().border)
-                                        .rounded(popup_radius)
-                                        .shadow_md()
-                                        .child(
-                                            List::new(&self.list)
-                                                .when_some(
-                                                    self.options.search_placeholder.clone(),
-                                                    |this, placeholder| {
-                                                        this.search_placeholder(placeholder)
-                                                    },
-                                                )
-                                                .with_size(self.options.size)
-                                                .max_h(rems(20.))
-                                                .paddings(Edges::all(px(4.))),
-                                        ),
+                        anchored()
+                            .snap_to_window_with_margin(px(8.))
+                            .anchor(self.options.anchor)
+                            .when(self.options.anchor == Corner::BottomLeft, |this| {
+                                this.position(
+                                    bounds.origin + Point::new(px(0.), -bounds.size.height),
                                 )
-                                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                                    this.escape(&Cancel, window, cx);
-                                })),
-                        ),
+                            })
+                            .child(
+                                div()
+                                    .occlude()
+                                    .map(|this| match self.options.menu_width {
+                                        Length::Auto => this.w(bounds.size.width + px(2.)),
+                                        Length::Definite(w) => this.w(w),
+                                    })
+                                    .child(
+                                        v_flex()
+                                            .occlude()
+                                            .mt_1p5()
+                                            .bg(cx.theme().background)
+                                            .border_1()
+                                            .border_color(cx.theme().border)
+                                            .rounded(popup_radius)
+                                            .shadow_md()
+                                            .child(
+                                                List::new(&self.list)
+                                                    .when_some(
+                                                        self.options.search_placeholder.clone(),
+                                                        |this, placeholder| {
+                                                            this.search_placeholder(placeholder)
+                                                        },
+                                                    )
+                                                    .with_size(self.options.size)
+                                                    .max_h(rems(20.))
+                                                    .paddings(Edges::all(px(4.))),
+                                            ),
+                                    )
+                                    .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                                        this.escape(&Cancel, window, cx);
+                                    })),
+                            ),
                     )
                     .with_priority(1),
                 )
@@ -1003,6 +1014,12 @@ where
     /// Set the appearance of the select, if false the select input will no border, background.
     pub fn appearance(mut self, appearance: bool) -> Self {
         self.options.appearance = appearance;
+        self
+    }
+
+    /// Set the anchor corner of the dropdown menu, default is `Corner::TopLeft`.
+    pub fn anchor(mut self, anchor: Corner) -> Self {
+        self.options.anchor = anchor;
         self
     }
 }
