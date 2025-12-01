@@ -237,7 +237,7 @@ impl AppState {
             },
         ];
 
-        Self {
+        let mut state = Self {
             conversations: vec![
                 Conversation {
                     id: 1,
@@ -302,7 +302,20 @@ impl AppState {
             db_profiles: Vec::new(),
             db_credentials: Vec::new(),
             active_profile_id: None,
+        };
+
+        // Synchronously load cached state to avoid startup delay
+        if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
+            println!(
+                "Loaded cached state: ID {:?}, {} profiles",
+                cached_id,
+                cached_profiles.len()
+            );
+            state.active_profile_id = cached_id;
+            state.db_profiles = cached_profiles;
         }
+
+        state
     }
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
@@ -341,8 +354,12 @@ impl AppState {
         credentials: Vec<DbCredential>,
         cx: &mut Context<Self>,
     ) {
-        self.db_profiles = profiles;
+        self.db_profiles = profiles.clone();
         self.db_credentials = credentials;
+
+        // Update cache with fresh data from DB
+        Self::save_cached_state(self.active_profile_id, self.db_profiles.clone());
+
         cx.notify();
     }
 
@@ -356,7 +373,10 @@ impl AppState {
             self.active_profile_id = Some(profile_id);
             self.update_llm_provider(cx);
 
-            // Persist the selection asynchronously
+            // Persist to local cache immediately
+            Self::save_cached_state(Some(profile_id), self.db_profiles.clone());
+
+            // Persist the selection asynchronously to DB
             if let Some(db) = self.database_service.clone() {
                 cx.spawn(
                     move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
@@ -402,6 +422,63 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    /// Save the selected profile ID and profile list to a local JSON file for instant startup.
+    pub fn save_cached_state(profile_id: Option<i64>, profiles: Vec<DbProfile>) {
+        use std::fs;
+        use std::path::PathBuf;
+
+        // Determine config directory
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("nativechat");
+
+        if !config_dir.exists() {
+            let _ = fs::create_dir_all(&config_dir);
+        }
+
+        let cache_file = config_dir.join("last_profile.json");
+
+        #[derive(serde::Serialize)]
+        struct CachedState {
+            profile_id: Option<i64>,
+            profiles: Vec<DbProfile>,
+        }
+
+        let data = CachedState {
+            profile_id,
+            profiles,
+        };
+
+        if let Ok(json) = serde_json::to_string(&data) {
+            let _ = fs::write(cache_file, json);
+        }
+    }
+
+    /// Load the cached profile ID and profile list from the local JSON file.
+    pub fn load_cached_state() -> Option<(Option<i64>, Vec<DbProfile>)> {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("nativechat");
+        let cache_file = config_dir.join("last_profile.json");
+
+        #[derive(serde::Deserialize)]
+        struct CachedState {
+            profile_id: Option<i64>,
+            profiles: Vec<DbProfile>,
+        }
+
+        if let Ok(content) = fs::read_to_string(cache_file) {
+            if let Ok(data) = serde_json::from_str::<CachedState>(&content) {
+                return Some((data.profile_id, data.profiles));
+            }
+        }
+
+        None
     }
 
     /// Restore the selected profile from settings on startup.

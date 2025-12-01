@@ -25,9 +25,31 @@ fn main() {
     dotenv::from_filename(".env.local").ok();
     dotenv::dotenv().ok();
 
+    // Initialize Database and Config before starting the app
+    let (config, db_service) = runtime.block_on(async {
+        // Load config
+        let config = Config::load().expect("Failed to load config");
+        println!("Debug: Database URL: {}", config.database_url);
+
+        // Create connection pool
+        let pool = create_pool(&config.database_url)
+            .await
+            .expect("Failed to create database pool");
+
+        // Run migrations
+        run_migrations(&pool)
+            .await
+            .expect("Failed to run migrations");
+
+        // Create DatabaseService
+        let db_service = DatabaseService::new(pool);
+
+        (config, db_service)
+    });
+
     Application::new()
         .with_assets(CombinedAssets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             cx.bind_keys([
                 // Enter to submit in MessageInput context
                 KeyBinding::new("enter", SubmitMessage, Some("MessageInput")),
@@ -69,87 +91,39 @@ fn main() {
             cx.open_window(options, |window, cx| {
                 let state = cx.new(|_| AppState::new());
 
-                // Initialize config and LLM provider
+                // Set initial config and DB service
+                state.update(cx, |state, cx| {
+                    state.set_config(config.clone(), cx);
+                    state.set_database_service(db_service.clone(), cx);
+                });
+
+                // Spawn background task to refresh data from DB
                 let state_clone = state.clone();
+                let db_service_clone = db_service.clone();
                 cx.spawn(|cx: &mut AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
-                        // Load config
-                        let config = match Config::load() {
-                            Ok(config) => config,
-                            Err(e) => {
-                                eprintln!("Failed to load config: {}", e);
-                                return;
-                            }
-                        };
-
-                        println!("Debug: Database URL: {}", config.database_url);
-                        println!("Debug: Default provider: {}", config.default_provider);
-
-                        // Create connection pool
-                        let pool = match create_pool(&config.database_url).await {
-                            Ok(pool) => pool,
-                            Err(e) => {
-                                eprintln!("Failed to create database pool: {}", e);
-                                return;
-                            }
-                        };
-
-                        // Run migrations
-                        if let Err(e) = run_migrations(&pool).await {
-                            eprintln!("Failed to run migrations: {}", e);
-                            return;
-                        }
-
-                        // Create DatabaseService
-                        let db_service = DatabaseService::new(pool);
-
                         // Seed models
                         if let Err(e) =
-                            nativechat::services::model_seeder::seed_models(&db_service).await
+                            nativechat::services::model_seeder::seed_models(&db_service_clone).await
                         {
                             eprintln!("Failed to seed models: {}", e);
                         }
 
                         // Load profiles and credentials from database
-                        let (profiles, credentials) =
-                            match AppState::load_profiles_and_credentials(&db_service).await {
-                                Ok(data) => data,
-                                Err(e) => {
-                                    eprintln!("Failed to load profiles and credentials: {}", e);
-                                    (Vec::new(), Vec::new())
-                                }
-                            };
-
-                        // Restore selected profile from settings
-                        let restored_profile_id = match AppState::restore_selected_profile(
-                            &db_service,
-                            &profiles,
-                        )
-                        .await
-                        {
-                            Ok(id) => id,
+                        // This acts as a "refresh" for the cached state
+                        match AppState::load_profiles_and_credentials(&db_service_clone).await {
+                            Ok((profiles, credentials)) => {
+                                let _ = state_clone.update(&mut cx, |state, cx| {
+                                    state.set_profiles_and_credentials(profiles, credentials, cx);
+                                });
+                            }
                             Err(e) => {
-                                eprintln!("Failed to restore selected profile: {}", e);
-                                None
+                                eprintln!("Failed to load profiles and credentials: {}", e);
                             }
-                        };
+                        }
 
-                        // Update state with config and services
-                        let _ = state_clone.update(&mut cx, |state, cx| {
-                            state.set_database_service(db_service, cx);
-                            state.set_profiles_and_credentials(profiles, credentials, cx);
-
-                            // Set the restored profile and update LLM provider
-                            if let Some(profile_id) = restored_profile_id {
-                                state.active_profile_id = Some(profile_id);
-                                state.update_llm_provider(cx);
-                            }
-
-                            state.set_config(config, cx);
-                        });
-
-                        println!("App initialized successfully!");
+                        println!("App data refreshed from DB successfully!");
                     }
                 })
                 .detach();

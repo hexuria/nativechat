@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::provider::{ChatChunk, ChatMessage, ChatRequest, ChatResponse, ChatStream, LlmProvider, Usage};
+use super::provider::{
+    ChatChunk, ChatMessage, ChatRequest, ChatResponse, ChatStream, LlmProvider, Usage,
+};
 use crate::error::{AppError, Result};
 
 const GEMINI_API_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -31,8 +33,14 @@ impl GeminiProvider {
             .iter()
             .filter(|m| m.role != "system")
             .map(|msg| {
-                let role = if msg.role == "assistant" { "model" } else { "user" };
-                let mut parts = vec![GeminiPart::Text { text: msg.content.clone() }];
+                let role = if msg.role == "assistant" {
+                    "model"
+                } else {
+                    "user"
+                };
+                let mut parts = vec![GeminiPart::Text {
+                    text: msg.content.clone(),
+                }];
                 if let Some(images) = &msg.images {
                     for img in images {
                         parts.push(GeminiPart::InlineData {
@@ -43,19 +51,47 @@ impl GeminiProvider {
                         });
                     }
                 }
-                GeminiContent { role: role.to_string(), parts }
+                GeminiContent {
+                    role: role.to_string(),
+                    parts,
+                }
             })
             .collect()
     }
 
-    fn get_system_instruction(&self, messages: &[ChatMessage], system_prompt: Option<&str>) -> Option<GeminiContent> {
+    fn get_system_instruction(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: Option<&str>,
+    ) -> Option<GeminiContent> {
         let system = system_prompt.map(|s| s.to_string()).or_else(|| {
-            messages.iter().find(|m| m.role == "system").map(|m| m.content.clone())
+            messages
+                .iter()
+                .find(|m| m.role == "system")
+                .map(|m| m.content.clone())
         });
         system.map(|text| GeminiContent {
             role: "user".to_string(),
             parts: vec![GeminiPart::Text { text }],
         })
+    }
+
+    fn parse_error(&self, error_text: &str) -> String {
+        #[derive(Deserialize)]
+        struct GeminiErrorResponse {
+            error: GeminiError,
+        }
+
+        #[derive(Deserialize)]
+        struct GeminiError {
+            message: String,
+        }
+
+        if let Ok(json_error) = serde_json::from_str::<GeminiErrorResponse>(error_text) {
+            json_error.error.message
+        } else {
+            error_text.to_string()
+        }
     }
 }
 
@@ -123,13 +159,20 @@ struct GeminiUsageMetadata {
 
 #[async_trait]
 impl LlmProvider for GeminiProvider {
-    fn name(&self) -> &'static str { "gemini" }
-    fn default_model(&self) -> &'static str { "gemini-2.0-flash" }
-    fn supports_vision(&self) -> bool { true }
+    fn name(&self) -> &'static str {
+        "gemini"
+    }
+    fn default_model(&self) -> &'static str {
+        "gemini-2.0-flash"
+    }
+    fn supports_vision(&self) -> bool {
+        true
+    }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let contents = self.convert_messages(&request.messages);
-        let system_instruction = self.get_system_instruction(&request.messages, request.system_prompt.as_deref());
+        let system_instruction =
+            self.get_system_instruction(&request.messages, request.system_prompt.as_deref());
 
         let req = GeminiRequest {
             contents,
@@ -141,24 +184,46 @@ impl LlmProvider for GeminiProvider {
             }),
         };
 
-        let url = format!("{}/{}:generateContent?key={}", GEMINI_API_URL, request.model, self.api_key);
-        let response = self.client.post(&url).header("Content-Type", "application/json").json(&req).send().await?;
+        let url = format!(
+            "{}/{}:generateContent?key={}",
+            GEMINI_API_URL, request.model, self.api_key
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&req)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(AppError::LlmProvider(format!("Gemini API error: {}", error_text)));
+            let message = self.parse_error(&error_text);
+            return Err(AppError::LlmProvider(format!(
+                "Gemini API error: {}",
+                message
+            )));
         }
 
         let data: GeminiResponse = response.json().await?;
-        let candidate = data.candidates.and_then(|c| c.into_iter().next())
+        let candidate = data
+            .candidates
+            .and_then(|c| c.into_iter().next())
             .ok_or_else(|| AppError::LlmProvider("No response from Gemini".into()))?;
 
-        let content = candidate.content.map(|c| {
-            c.parts.into_iter().filter_map(|p| match p {
-                GeminiPart::Text { text } => Some(text),
-                _ => None,
-            }).collect::<Vec<_>>().join("")
-        }).unwrap_or_default();
+        let content = candidate
+            .content
+            .map(|c| {
+                c.parts
+                    .into_iter()
+                    .filter_map(|p| match p {
+                        GeminiPart::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
 
         Ok(ChatResponse {
             id: Uuid::new_v4().to_string(),
@@ -174,7 +239,8 @@ impl LlmProvider for GeminiProvider {
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream> {
         let contents = self.convert_messages(&request.messages);
-        let system_instruction = self.get_system_instruction(&request.messages, request.system_prompt.as_deref());
+        let system_instruction =
+            self.get_system_instruction(&request.messages, request.system_prompt.as_deref());
 
         let req = GeminiRequest {
             contents,
@@ -186,12 +252,25 @@ impl LlmProvider for GeminiProvider {
             }),
         };
 
-        let url = format!("{}/{}:streamGenerateContent?key={}&alt=sse", GEMINI_API_URL, request.model, self.api_key);
-        let response = self.client.post(&url).header("Content-Type", "application/json").json(&req).send().await?;
+        let url = format!(
+            "{}/{}:streamGenerateContent?key={}&alt=sse",
+            GEMINI_API_URL, request.model, self.api_key
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&req)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(AppError::LlmProvider(format!("Gemini API error: {}", error_text)));
+            let message = self.parse_error(&error_text);
+            return Err(AppError::LlmProvider(format!(
+                "Gemini API error: {}",
+                message
+            )));
         }
 
         let (tx, rx) = mpsc::channel(100);
@@ -200,7 +279,7 @@ impl LlmProvider for GeminiProvider {
         tokio::spawn(async move {
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
-            
+
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
@@ -218,9 +297,13 @@ impl LlmProvider for GeminiProvider {
                                                         let chunk = ChatChunk {
                                                             id: response_id.clone(),
                                                             delta: text,
-                                                            finish_reason: candidate.finish_reason.clone(),
+                                                            finish_reason: candidate
+                                                                .finish_reason
+                                                                .clone(),
                                                         };
-                                                        if tx.send(Ok(chunk)).await.is_err() { return; }
+                                                        if tx.send(Ok(chunk)).await.is_err() {
+                                                            return;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -231,7 +314,9 @@ impl LlmProvider for GeminiProvider {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(AppError::LlmProvider(format!("Stream error: {}", e)))).await;
+                        let _ = tx
+                            .send(Err(AppError::LlmProvider(format!("Stream error: {}", e))))
+                            .await;
                         break;
                     }
                 }
