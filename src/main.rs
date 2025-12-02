@@ -81,6 +81,7 @@ fn main() {
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(520.), px(400.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("NativeChat".into()),
                     ..TitlebarOptions::default()
