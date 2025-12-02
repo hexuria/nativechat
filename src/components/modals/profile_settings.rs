@@ -207,11 +207,15 @@ impl ProfileSettingsModal {
         let on_click = Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
             weak_self
                 .update(cx, |this, cx| {
-                    this.load_profile(index, window, cx);
+                    // Update selection state FIRST to avoid input observer overwriting old profile
+                    this.selected_index = Some(index);
                     this.list_state.update(cx, |list, cx| {
                         list.delegate_mut().selected_index = Some(index);
                         cx.notify();
                     });
+
+                    // THEN load the profile (which updates inputs and triggers observers)
+                    this.load_profile(index, window, cx);
                 })
                 .ok();
         });
@@ -295,10 +299,39 @@ impl ProfileSettingsModal {
     }
 
     fn load_profile(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // If we were creating a profile and switched away, remove the ephemeral one
+        if self.mode == ProfileMode::Creating {
+            self.list_state.update(cx, |list, cx| {
+                let delegate = list.delegate_mut();
+                if let Some(pos) = delegate.profiles.iter().position(|p| p.id == -1) {
+                    if pos != index {
+                        delegate.profiles.remove(pos);
+                        cx.notify();
+                    }
+                }
+            });
+        }
+
         let profile = {
             let list_state = self.list_state.read(cx);
             let delegate = list_state.delegate();
-            delegate.profiles.get(index).cloned()
+            // Adjust index if we removed an item
+            let adjusted_index = if self.mode == ProfileMode::Creating {
+                // If we removed the last item (ephemeral), and the requested index was before it, it's fine.
+                // If the requested index was the ephemeral one (which shouldn't happen here as we're loading *another*),
+                // we need to be careful.
+                // Actually, since we remove by ID -1, and that's usually at the end,
+                // indices of existing profiles shouldn't shift unless -1 was inserted in the middle (unlikely).
+                // However, if we clicked the ephemeral profile itself, we shouldn't remove it.
+                // The check `pos != index` above handles that.
+                // But wait, if we remove an item, the `index` passed in might be invalid if it was > pos.
+                // Since ephemeral is added to the end, existing items are safe.
+                index
+            } else {
+                index
+            };
+
+            delegate.profiles.get(adjusted_index).cloned()
         };
 
         if let Some(profile) = profile {
@@ -366,13 +399,17 @@ impl ProfileSettingsModal {
                     let item = CredentialItem(cred.clone());
                     self.chat_credential_select
                         .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                } else {
+                    self.chat_credential_select
+                        .update(cx, |s, cx| s.reset_selection(cx));
                 }
             } else {
                 // Try to use system credential as fallback
+                let mut found = false;
                 if let Some(model_id) = self.model_select.read(cx).selected_value() {
                     let state = self.state.read(cx);
                     if let Some(model) = state.available_models.iter().find(|m| &m.id == model_id) {
-                        let provider_str = format!("{:?}", model.provider);
+                        let provider_str = model.provider.to_string();
                         if let Some(sys_cred) = self
                             .credentials
                             .iter()
@@ -381,8 +418,13 @@ impl ProfileSettingsModal {
                             let item = CredentialItem(sys_cred.clone());
                             self.chat_credential_select
                                 .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                            found = true;
                         }
                     }
+                }
+                if !found {
+                    self.chat_credential_select
+                        .update(cx, |s, cx| s.reset_selection(cx));
                 }
             }
 
@@ -392,13 +434,17 @@ impl ProfileSettingsModal {
                     let item = CredentialItem(cred.clone());
                     self.embedding_credential_select
                         .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                } else {
+                    self.embedding_credential_select
+                        .update(cx, |s, cx| s.reset_selection(cx));
                 }
             } else {
                 // Try to use system credential as fallback
+                let mut found = false;
                 if let Some(model_id) = self.embedding_model_select.read(cx).selected_value() {
                     let state = self.state.read(cx);
                     if let Some(model) = state.available_models.iter().find(|m| &m.id == model_id) {
-                        let provider_str = format!("{:?}", model.provider);
+                        let provider_str = model.provider.to_string();
                         if let Some(sys_cred) = self
                             .credentials
                             .iter()
@@ -407,8 +453,13 @@ impl ProfileSettingsModal {
                             let item = CredentialItem(sys_cred.clone());
                             self.embedding_credential_select
                                 .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                            found = true;
                         }
                     }
+                }
+                if !found {
+                    self.embedding_credential_select
+                        .update(cx, |s, cx| s.reset_selection(cx));
                 }
             }
 
@@ -418,13 +469,17 @@ impl ProfileSettingsModal {
                     let item = CredentialItem(cred.clone());
                     self.image_credential_select
                         .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                } else {
+                    self.image_credential_select
+                        .update(cx, |s, cx| s.reset_selection(cx));
                 }
             } else {
                 // Try to use system credential as fallback
+                let mut found = false;
                 if let Some(model_id) = self.image_model_select.read(cx).selected_value() {
                     let state = self.state.read(cx);
                     if let Some(model) = state.available_models.iter().find(|m| &m.id == model_id) {
-                        let provider_str = format!("{:?}", model.provider);
+                        let provider_str = model.provider.to_string();
                         if let Some(sys_cred) = self
                             .credentials
                             .iter()
@@ -433,8 +488,13 @@ impl ProfileSettingsModal {
                             let item = CredentialItem(sys_cred.clone());
                             self.image_credential_select
                                 .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
+                            found = true;
                         }
                     }
+                }
+                if !found {
+                    self.image_credential_select
+                        .update(cx, |s, cx| s.reset_selection(cx));
                 }
             }
             cx.notify();
@@ -586,7 +646,6 @@ impl ProfileSettingsModal {
 
     fn create_new_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = ProfileMode::Creating;
-        self.selected_index = None;
         self.show_form = true;
         self.is_new_mode = true;
         self.error_message = None;
@@ -620,9 +679,30 @@ impl ProfileSettingsModal {
         self.image_credential_select
             .update(cx, |s, cx| s.set_selected_index(None, window, cx));
 
-        // Deselect in sidebar
+        // Add ephemeral "Untitled" profile
         self.list_state.update(cx, |list, cx| {
-            list.delegate_mut().selected_index = None;
+            let delegate = list.delegate_mut();
+
+            // Remove any existing ephemeral profiles first
+            delegate.profiles.retain(|p| p.id != -1);
+
+            let new_profile = Profile {
+                id: -1,
+                name: "Untitled".to_string(),
+                text_model_id: None,
+                text_credential_id: None,
+                embedding_model_id: None,
+                embedding_credential_id: None,
+                image_model_id: None,
+                image_credential_id: None,
+                created_at: String::new(),
+            };
+
+            delegate.profiles.push(new_profile);
+            let new_index = delegate.profiles.len() - 1;
+            delegate.selected_index = Some(new_index);
+            self.selected_index = Some(new_index);
+
             cx.notify();
         });
 
@@ -792,8 +872,23 @@ impl ProfileSettingsModal {
     }
 
     fn subscribe_to_selects(&mut self, cx: &mut Context<Self>) {
-        // Observe input changes
-        cx.observe(&self.profile_name_input, |_, _, _| {}).detach();
+        // Observe input changes for live name update
+        cx.observe(&self.profile_name_input, |this, input, cx| {
+            let name = input.read(cx).value();
+            if let Some(selected_index) = this.selected_index {
+                this.list_state.update(cx, |list, cx| {
+                    if let Some(profile) = list.delegate_mut().profiles.get_mut(selected_index) {
+                        profile.name = if name.is_empty() {
+                            "Untitled".to_string()
+                        } else {
+                            name.to_string()
+                        };
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
 
         // Subscribe to model selects to update credential lists
         let subscribe_model_select = |select: &Entity<SelectState<SearchableVec<ModelProfile>>>,
