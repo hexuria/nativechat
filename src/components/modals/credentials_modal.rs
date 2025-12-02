@@ -160,11 +160,15 @@ impl CredentialsModal {
             let on_click = Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
                 weak_self
                     .update(cx, |this: &mut CredentialsModal, cx| {
-                        this.load_credential(index, window, cx);
+                        // Update selection state FIRST to avoid input observer overwriting old credential
+                        this.selected_index = Some(index);
                         this.list_state.update(cx, |list, cx| {
                             list.delegate_mut().selected_index = Some(index);
                             cx.notify();
                         });
+
+                        // THEN load the credential
+                        this.load_credential(index, window, cx);
                     })
                     .ok();
             });
@@ -204,6 +208,25 @@ impl CredentialsModal {
             cx.subscribe(&this.search_input, |this, _, event: &InputEvent, cx| {
                 if let InputEvent::Change = event {
                     this.filter_credentials(cx);
+                }
+            })
+            .detach();
+
+            // Observe name input changes for live update
+            cx.observe(&this.name_input, |this, input, cx| {
+                let name = input.read(cx).value();
+                if let Some(selected_index) = this.selected_index {
+                    this.list_state.update(cx, |list, cx| {
+                        if let Some(cred) = list.delegate_mut().credentials.get_mut(selected_index)
+                        {
+                            cred.name = if name.is_empty() {
+                                "Untitled".to_string()
+                            } else {
+                                name.to_string()
+                            };
+                            cx.notify();
+                        }
+                    });
                 }
             })
             .detach();
@@ -270,14 +293,33 @@ impl CredentialsModal {
     }
 
     fn load_credential(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // If we were creating a credential and switched away, remove the ephemeral one
+        if let CredentialMode::Creating = self.mode {
+            self.list_state.update(cx, |list, cx| {
+                let delegate = list.delegate_mut();
+                if let Some(pos) = delegate.credentials.iter().position(|c| c.id == -1) {
+                    if pos != index {
+                        delegate.credentials.remove(pos);
+                        cx.notify();
+                    }
+                }
+            });
+        }
+
         // Get the actual credential from the filtered list in the delegate
-        let credential = self
-            .list_state
-            .read(cx)
-            .delegate()
-            .credentials
-            .get(index)
-            .cloned();
+        let credential = {
+            let list_state = self.list_state.read(cx);
+            let delegate = list_state.delegate();
+
+            // Adjust index if we removed an item
+            let adjusted_index = if let CredentialMode::Creating = self.mode {
+                index
+            } else {
+                index
+            };
+
+            delegate.credentials.get(adjusted_index).cloned()
+        };
 
         if let Some(cred) = credential {
             self.mode = CredentialMode::Editing(cred.id);
@@ -467,7 +509,7 @@ impl Render for CredentialsModal {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.mode = CredentialMode::Creating;
                                     this.show_form = true;
-                                    // Clear inputs
+
                                     // Clear inputs
                                     this.name_input
                                         .update(cx, |i, cx| i.set_value("", window, cx));
@@ -479,6 +521,29 @@ impl Render for CredentialsModal {
                                         d.set_date(Date::Single(None), window, cx)
                                     });
                                     this.expiration_date = None;
+
+                                    // Add ephemeral "Untitled" credential
+                                    this.list_state.update(cx, |list, cx| {
+                                        let delegate = list.delegate_mut();
+
+                                        // Remove any existing ephemeral credentials first
+                                        delegate.credentials.retain(|c| c.id != -1);
+
+                                        let new_cred = Credential {
+                                            id: -1,
+                                            name: "Untitled".to_string(),
+                                            provider: "".to_string(),
+                                            api_key: "".to_string(),
+                                            created_at: String::new(),
+                                        };
+
+                                        delegate.credentials.push(new_cred);
+                                        let new_index = delegate.credentials.len() - 1;
+                                        delegate.selected_index = Some(new_index);
+                                        this.selected_index = Some(new_index);
+
+                                        cx.notify();
+                                    });
 
                                     cx.notify();
                                 })),
