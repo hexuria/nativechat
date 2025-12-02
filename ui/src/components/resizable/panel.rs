@@ -206,6 +206,7 @@ pub struct ResizablePanel {
     size_range: Range<Pixels>,
     children: Vec<AnyElement>,
     visible: bool,
+    fixed_width: bool,
 }
 
 impl ResizablePanel {
@@ -219,6 +220,7 @@ impl ResizablePanel {
             axis: Axis::Horizontal,
             children: vec![],
             visible: true,
+            fixed_width: false,
         }
     }
 
@@ -239,6 +241,12 @@ impl ResizablePanel {
     /// Default is [`PANEL_MIN_SIZE`] to [`Pixels::MAX`].
     pub fn size_range(mut self, range: impl Into<Range<Pixels>>) -> Self {
         self.size_range = range.into();
+        self
+    }
+
+    /// Set whether the panel should have a fixed width (flex_none).
+    pub fn fixed_width(mut self, fixed: bool) -> Self {
+        self.fixed_width = fixed;
         self
     }
 }
@@ -278,7 +286,8 @@ impl RenderOnce for ResizablePanel {
         div()
             .id(("resizable-panel", self.panel_ix))
             .flex()
-            .flex_grow()
+            .when(self.fixed_width, |this| this.flex_none())
+            .when(!self.fixed_width, |this| this.flex_grow())
             .size_full()
             .relative()
             .when(self.axis.is_vertical(), |this| {

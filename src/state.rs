@@ -114,6 +114,7 @@ pub struct AppState {
     pub selected_apps: Vec<String>,
     pub capabilities: Vec<AppCapability>,
     pub sidebar_collapsed: bool,
+    pub auto_collapsed: bool,
     pub model_registry: Arc<ModelRegistry>,
     pub available_models: Vec<ModelProfile>,
     pub database_service: Option<DatabaseService>,
@@ -293,6 +294,7 @@ impl AppState {
             selected_apps: Vec::new(),
             capabilities,
             sidebar_collapsed: false,
+            auto_collapsed: false,
             model_registry: Arc::new(ModelRegistry::new()),
             available_models: Vec::new(),
             database_service: None,
@@ -720,6 +722,14 @@ impl AppState {
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        // If user manually toggles, reset auto_collapsed to false so we don't auto-restore unexpectedly
+        self.auto_collapsed = false;
+        cx.notify();
+    }
+
+    pub fn set_sidebar_collapsed(&mut self, collapsed: bool, auto: bool, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = collapsed;
+        self.auto_collapsed = auto;
         cx.notify();
     }
 

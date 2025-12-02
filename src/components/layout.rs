@@ -38,7 +38,34 @@ impl Layout {
 }
 
 impl Render for Layout {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (sidebar_collapsed, auto_collapsed) = {
+            let state = self.state.read(cx);
+            (state.sidebar_collapsed, state.auto_collapsed)
+        };
+        let window_width = window.viewport_size().width;
+
+        // Auto-collapse logic
+        if window_width < px(800.0) {
+            if !sidebar_collapsed {
+                let state_entity = self.state.clone();
+                cx.defer(move |cx| {
+                    state_entity.update(cx, |state, cx| {
+                        state.set_sidebar_collapsed(true, true, cx);
+                    });
+                });
+            }
+        } else {
+            if sidebar_collapsed && auto_collapsed {
+                let state_entity = self.state.clone();
+                cx.defer(move |cx| {
+                    state_entity.update(cx, |state, cx| {
+                        state.set_sidebar_collapsed(false, false, cx);
+                    });
+                });
+            }
+        }
+
         let state = self.state.read(cx);
 
         div()

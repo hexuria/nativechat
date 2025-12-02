@@ -110,6 +110,7 @@ impl Render for SidebarView {
                 ui::resizable::resizable_panel()
                     .size(min_height)
                     .size_range(min_height..max_height)
+                    .fixed_width(true) // Ensure fixed width behavior
                     .child(
                         SidebarGroup::new("Menu").collapsed(collapsed).child(
                             SidebarMenu::new()
@@ -181,7 +182,6 @@ impl Render for SidebarView {
                             div()
                                 .flex()
                                 .flex_row()
-                                .items_center()
                                 .items_center()
                                 .when(!collapsed, |this| this.p_2())
                                 .when(collapsed, |this| this.justify_center())

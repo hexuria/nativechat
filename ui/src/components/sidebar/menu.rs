@@ -225,6 +225,7 @@ impl RenderOnce for SidebarMenuItem {
                                 .text_color(cx.theme().sidebar_accent_foreground)
                         })
                     })
+                    .items_center()
                     .when(!is_collapsed, |this| {
                         this.h_7()
                             .child(
