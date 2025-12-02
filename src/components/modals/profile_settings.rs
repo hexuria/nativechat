@@ -226,6 +226,8 @@ impl ProfileSettingsModal {
 
         let _window_width = window.viewport_size().width;
 
+        let state_clone = state.clone();
+
         let mut this = Self {
             state,
             profile_name_input,
@@ -279,6 +281,15 @@ impl ProfileSettingsModal {
 
         // Update provider selects after models are fetched
         this.update_provider_selects(cx);
+
+        // Subscribe to modal open state to refresh data
+        cx.observe(&state_clone, |this: &mut Self, state, cx| {
+            if state.read(cx).is_profile_settings_open {
+                this.fetch_credentials(cx);
+                this.fetch_profiles(None, cx);
+            }
+        })
+        .detach();
 
         this
     }
@@ -426,11 +437,60 @@ impl ProfileSettingsModal {
                     }
                 }
             }
-
             cx.notify();
         }
     }
 
+    fn fetch_credentials(&mut self, cx: &mut Context<Self>) {
+        let db = self.state.read(cx).database_service.clone();
+        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let mut credentials = if let Some(db) = db {
+                    db.get_credentials().await.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                // Inject System Credentials from Env Vars
+                if std::env::var("GEMINI_API_KEY").is_ok() {
+                    credentials.push(Credential {
+                        id: -1,
+                        name: "Gemini (System)".to_string(),
+                        provider: "Google Gemini".to_string(),
+                        api_key: String::new(), // Not needed for display/logic here
+                        created_at: String::new(),
+                    });
+                }
+                if std::env::var("OPENAI_API_KEY").is_ok() {
+                    credentials.push(Credential {
+                        id: -2,
+                        name: "OpenAI (System)".to_string(),
+                        provider: "OpenAI".to_string(),
+                        api_key: String::new(),
+                        created_at: String::new(),
+                    });
+                }
+                if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+                    credentials.push(Credential {
+                        id: -3,
+                        name: "Anthropic (System)".to_string(),
+                        provider: "Anthropic".to_string(),
+                        api_key: String::new(),
+                        created_at: String::new(),
+                    });
+                }
+
+                this.update(&mut cx, |this, cx| {
+                    this.credentials = credentials;
+                    this.update_credential_selects(cx);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
     fn fetch_profiles(&mut self, select_id: Option<i64>, cx: &mut Context<Self>) {
         let db = self.state.read(cx).database_service.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -695,12 +755,22 @@ impl ProfileSettingsModal {
                             this.pending_success_message =
                                 Some("Profile saved successfully".to_string());
                             this.fetch_profiles(Some(id), cx);
+
+                            // Reload global state to ensure credentials and profile names are updated everywhere
+                            this.state.update(cx, |state, cx| {
+                                state.reload_from_db(cx);
+                            });
                         }
                         Ok(None) => {
                             // Should not happen with current logic but handle anyway
                             println!("Profile saved (no ID change).");
                             this.pending_success_message = Some("Profile saved".to_string());
                             this.fetch_profiles(None, cx);
+
+                            // Reload global state
+                            this.state.update(cx, |state, cx| {
+                                state.reload_from_db(cx);
+                            });
                         }
                         Err(e) => {
                             eprintln!("Save failed: {}", e);
@@ -1037,7 +1107,7 @@ impl ProfileSettingsModal {
                 .iter()
                 .filter(|c| {
                     if let Some(p) = &provider {
-                        c.provider.eq_ignore_ascii_case(&format!("{:?}", p))
+                        c.provider.eq_ignore_ascii_case(&p.to_string())
                     } else {
                         false
                     }
@@ -1074,69 +1144,6 @@ impl ProfileSettingsModal {
         });
     }
 
-    fn fetch_credentials(&mut self, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-
-        if let Some(db) = &state.database_service {
-            let db = db.clone();
-            cx.spawn(
-                move |view: WeakEntity<ProfileSettingsModal>, cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
-                        match db.get_credentials().await {
-                            Ok(mut creds_vec) => {
-                                // Add system credentials
-                                let system_keys = [
-                                    ("GEMINI_API_KEY", "Gemini"),
-                                    ("ANTHROPIC_API_KEY", "Anthropic"),
-                                    ("OPENAI_API_KEY", "OpenAI"),
-                                    ("GROQ_API_KEY", "Groq"),
-                                ];
-
-                                let mut system_id = -1;
-                                for (env_key, provider) in system_keys {
-                                    if let Ok(api_key) = std::env::var(env_key) {
-                                        if !api_key.is_empty() {
-                                            creds_vec.push(Credential {
-                                                id: system_id,
-                                                name: format!("{} (System)", provider),
-                                                provider: provider.to_string(),
-                                                api_key,
-                                                created_at: String::new(),
-                                            });
-                                            system_id -= 1;
-                                        }
-                                    }
-                                }
-
-                                let creds_vec = SearchableVec::new(
-                                    creds_vec
-                                        .into_iter()
-                                        .map(CredentialItem)
-                                        .collect::<Vec<_>>(),
-                                );
-
-                                view.update(&mut cx, |this, cx| {
-                                    this.credentials = creds_vec
-                                        .items()
-                                        .iter()
-                                        .map(|item: &CredentialItem| item.0.clone())
-                                        .collect();
-
-                                    println!("Fetched {} credentials", this.credentials.len());
-                                    this.update_credential_selects(cx);
-                                    cx.notify();
-                                })
-                                .ok();
-                            }
-                            Err(e) => eprintln!("Failed to fetch credentials: {}", e),
-                        }
-                    }
-                },
-            )
-            .detach();
-        }
-    }
     fn save_new_credential(
         &mut self,
         input: Entity<InputState>,

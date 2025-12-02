@@ -362,7 +362,31 @@ impl AppState {
         // Update cache with fresh data from DB
         Self::save_cached_state(self.active_profile_id, self.db_profiles.clone());
 
+        // Re-evaluate LLM provider with new credentials
+        self.update_llm_provider(cx);
+
         cx.notify();
+    }
+
+    /// Reload profiles and credentials from the database and update the state.
+    /// This ensures that any changes made (e.g., in settings) are reflected globally.
+    pub fn reload_from_db(&mut self, cx: &mut Context<Self>) {
+        if let Some(db) = self.database_service.clone() {
+            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    if let Ok((profiles, credentials)) =
+                        Self::load_profiles_and_credentials(&db).await
+                    {
+                        this.update(&mut cx, |state, cx| {
+                            state.set_profiles_and_credentials(profiles, credentials, cx);
+                        })
+                        .ok();
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     /// Select a database profile by ID and update the active profile.

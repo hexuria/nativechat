@@ -26,16 +26,18 @@ pub fn create_provider_from_credential(
     _model_id: Option<&str>,
 ) -> Result<Box<dyn LlmProvider>> {
     match credential.provider.to_lowercase().as_str() {
-        "gemini" => {
-            Ok(Box::new(GeminiProvider::new(credential.api_key.clone())))
-        }
+        "gemini" | "google gemini" => Ok(Box::new(GeminiProvider::new(credential.api_key.clone()))),
         "openai" => {
             // TODO: Implement OpenAI provider when available
-            Err(AppError::BadRequest("OpenAI provider not yet implemented".into()))
+            Err(AppError::BadRequest(
+                "OpenAI provider not yet implemented".into(),
+            ))
         }
         "anthropic" => {
             // TODO: Implement Anthropic provider when available
-            Err(AppError::BadRequest("Anthropic provider not yet implemented".into()))
+            Err(AppError::BadRequest(
+                "Anthropic provider not yet implemented".into(),
+            ))
         }
         _ => Err(AppError::BadRequest(format!(
             "Unknown provider: {}",
@@ -50,10 +52,15 @@ pub fn create_provider_from_credential(
 pub fn create_provider(config: &Config) -> Result<Box<dyn LlmProvider>> {
     match config.default_provider.to_lowercase().as_str() {
         "gemini" => {
-            let api_key = config.gemini_api_key.clone()
+            let api_key = config
+                .gemini_api_key
+                .clone()
                 .ok_or_else(|| AppError::Config("Gemini API key not configured".into()))?;
             Ok(Box::new(GeminiProvider::new(api_key)))
         }
-        _ => Err(AppError::BadRequest(format!("Unknown provider: {}", config.default_provider))),
+        _ => Err(AppError::BadRequest(format!(
+            "Unknown provider: {}",
+            config.default_provider
+        ))),
     }
 }

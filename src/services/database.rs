@@ -93,6 +93,24 @@ impl DatabaseService {
         Ok(())
     }
 
+    /// Updates an existing credential.
+    pub async fn update_credential(
+        &self,
+        id: i64,
+        name: &str,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE credentials SET name = ?, provider = ?, api_key = ? WHERE id = ?")
+            .bind(name)
+            .bind(provider)
+            .bind(api_key)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Creates a new profile.
     pub async fn create_profile(&self, name: &str) -> Result<i64> {
         let result =

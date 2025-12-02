@@ -177,6 +177,8 @@ impl CredentialsModal {
 
             let date_picker = cx.new(|cx| DatePickerState::new(window, cx).date_format("%Y-%m-%d"));
 
+            let state_clone = state.clone();
+
             let mut this = Self {
                 state,
                 credentials: Vec::new(),
@@ -214,6 +216,33 @@ impl CredentialsModal {
                     } else {
                         this.expiration_date = None;
                     }
+                }
+            })
+            .detach();
+
+            // Subscribe to modal open state to refresh data
+            cx.observe(&state_clone, |this: &mut Self, state, cx| {
+                let (is_open, providers) = {
+                    let state = state.read(cx);
+                    let providers: Vec<String> = state
+                        .available_models
+                        .iter()
+                        .map(|m| m.provider.to_string())
+                        .collect();
+                    (state.is_credentials_modal_open, providers)
+                };
+
+                if is_open {
+                    this.fetch_credentials(cx);
+
+                    // Update providers list
+                    let mut providers = providers;
+                    providers.sort();
+                    providers.dedup();
+
+                    this.provider_select.update(cx, |s, cx| {
+                        s.set_items(SearchableVec::new(providers), cx);
+                    });
                 }
             })
             .detach();
@@ -316,7 +345,7 @@ impl CredentialsModal {
         let api_key = self.api_key_input.read(cx).value().to_string();
 
         println!(
-            "Attempting to add credential: name='{}', provider='{}', api_key='{}'",
+            "Attempting to save credential: name='{}', provider='{}', api_key='{}'",
             name, provider, api_key
         );
 
@@ -330,6 +359,7 @@ impl CredentialsModal {
         self.error_message = None;
 
         let state = self.state.read(cx);
+        let mode = self.mode.clone();
 
         if let Some(db) = &state.database_service {
             let db = db.clone();
@@ -337,17 +367,31 @@ impl CredentialsModal {
                 move |view: WeakEntity<CredentialsModal>, cx: &mut AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
-                        match db.create_credential(&name, &provider, &api_key).await {
+                        let result = match mode {
+                            CredentialMode::Creating => db
+                                .create_credential(&name, &provider, &api_key)
+                                .await
+                                .map(|_| ()),
+                            CredentialMode::Editing(id) => {
+                                db.update_credential(id, &name, &provider, &api_key).await
+                            }
+                        };
+
+                        match result {
                             Ok(_) => {
                                 view.update(&mut cx, |this, cx| {
                                     this.should_clear_inputs = true;
-                                    // Keep provider
+                                    // Reset mode to creating after save
+                                    this.mode = CredentialMode::Creating;
+                                    this.show_form = false;
                                     this.fetch_credentials(cx);
+                                    // Trigger global state refresh to update LLM provider immediately
+                                    this.state.update(cx, |state, cx| state.reload_from_db(cx));
                                     cx.notify();
                                 })
                                 .ok();
                             }
-                            Err(e) => eprintln!("Failed to create credential: {}", e),
+                            Err(e) => eprintln!("Failed to save credential: {}", e),
                         }
                     }
                 },
