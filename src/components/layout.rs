@@ -92,6 +92,7 @@ impl Render for Layout {
                             resizable_panel()
                                 .size(px(280.))
                                 .size_range(px(0.)..px(700.))
+                                .fixed_width(true)
                                 .child(self.sidebar.clone()),
                         )
                         .on_resize({
