@@ -911,7 +911,7 @@ where
                             .snap_to_window_with_margin(px(8.))
                             .anchor(self.options.anchor)
                             .when(self.options.anchor == Corner::BottomLeft, |this| {
-                                this.position(bounds.origin + Point::new(px(0.), -px(4.)))
+                                this.position(bounds.origin + Point::new(-px(12.), -px(4.)))
                             })
                             .child(
                                 div()

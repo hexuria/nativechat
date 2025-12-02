@@ -377,6 +377,7 @@ impl Render for MessageInput {
                     h_flex()
                         .justify_between()
                         .items_start() // Align items to the top
+                        .gap_2()
                         .child(
                              // App Picker Popover (Moved out of wrapping container)
                             Button::new("add-app")
@@ -384,6 +385,7 @@ impl Render for MessageInput {
                                 .ghost()
                                 .rounded_full()
                                 .when(!any_modal_open, |this| this.cursor_pointer())
+                                .hover(move |style| style.bg(secondary)) 
                                 .dropdown_menu_with_anchor(Corner::BottomLeft, {
                                     let state_model = state_model.clone();
                                     move |menu, window, cx| {
