@@ -840,6 +840,14 @@ impl ProfileSettingsModal {
                             this.state.update(cx, |state, cx| {
                                 state.reload_from_db(cx);
                             });
+
+                            // Reset UI to empty state
+                            this.show_form = false;
+                            this.selected_index = None;
+                            this.list_state.update(cx, |list, cx| {
+                                list.delegate_mut().selected_index = None;
+                                cx.notify();
+                            });
                         }
                         Ok(None) => {
                             // Should not happen with current logic but handle anyway
@@ -850,6 +858,14 @@ impl ProfileSettingsModal {
                             // Reload global state
                             this.state.update(cx, |state, cx| {
                                 state.reload_from_db(cx);
+                            });
+
+                            // Reset UI to empty state
+                            this.show_form = false;
+                            this.selected_index = None;
+                            this.list_state.update(cx, |list, cx| {
+                                list.delegate_mut().selected_index = None;
+                                cx.notify();
                             });
                         }
                         Err(e) => {
