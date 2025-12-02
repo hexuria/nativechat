@@ -343,6 +343,7 @@ pub struct SelectState<D: SelectDelegate + 'static> {
     selected_value: Option<<D::Item as SelectItem>::Value>,
     final_selected_index: Option<IndexPath>,
     pending_reset: bool,
+    pending_selection: Option<Option<IndexPath>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -575,6 +576,7 @@ where
             empty: None,
             final_selected_index: None,
             pending_reset: false,
+            pending_selection: None,
             _subscriptions,
         };
         this.set_selected_index(selected_index, window, cx);
@@ -601,6 +603,18 @@ where
         });
         self.final_selected_index = selected_index;
         self.update_selected_value(window, cx);
+        self.update_selected_value(window, cx);
+    }
+
+    /// Set the selected index for the select without needing a Window immediately.
+    /// The selection will be applied during the next render.
+    pub fn set_selected_index_deferred(
+        &mut self,
+        selected_index: Option<IndexPath>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_selection = Some(selected_index);
+        cx.notify();
     }
 
     /// Reset the selection without needing a Window immediately.
@@ -898,7 +912,8 @@ where
                             .anchor(self.options.anchor)
                             .when(self.options.anchor == Corner::BottomLeft, |this| {
                                 this.position(
-                                    bounds.origin + Point::new(px(0.), -bounds.size.height),
+                                    bounds.origin
+                                        + Point::new(px(0.), -bounds.size.height - px(4.)),
                                 )
                             })
                             .child(
@@ -1066,7 +1081,11 @@ where
         let disabled = self.options.disabled;
         let focus_handle = self.state.focus_handle(cx);
         // If the size has change, set size to self.list, to change the QueryInput size.
-        self.state.update(cx, |this, _| {
+        // If the size has change, set size to self.list, to change the QueryInput size.
+        self.state.update(cx, |this, cx| {
+            if let Some(index) = this.pending_selection.take() {
+                this.set_selected_index(index, window, cx);
+            }
             this.options = self.options;
         });
 

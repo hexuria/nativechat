@@ -935,6 +935,9 @@ impl ProfileSettingsModal {
         if name.trim().is_empty() {
             return Err("Profile name cannot be empty".to_string());
         }
+        if name.chars().count() > 30 {
+            return Err("Profile name cannot exceed 30 characters".to_string());
+        }
 
         // Check Chat Model
         if self.model_select.read(cx).selected_value().is_none() {
@@ -1501,9 +1504,39 @@ impl Render for ProfileSettingsModal {
                                         div.child(Label::new(msg).text_color(cx.theme().danger))
                                     })
                                     .child(
-                                        Label::new("Profile Name")
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM),
+                                        h_flex()
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                Label::new("Profile Name")
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM),
+                                            )
+                                            .child(
+                                                Label::new(format!(
+                                                    "{}/30",
+                                                    self.profile_name_input
+                                                        .read(cx)
+                                                        .value()
+                                                        .chars()
+                                                        .count()
+                                                ))
+                                                .text_xs()
+                                                .text_color(
+                                                    if self
+                                                        .profile_name_input
+                                                        .read(cx)
+                                                        .value()
+                                                        .chars()
+                                                        .count()
+                                                        > 30
+                                                    {
+                                                        cx.theme().danger
+                                                    } else {
+                                                        cx.theme().muted_foreground
+                                                    },
+                                                ),
+                                            ),
                                     )
                                     .child(Input::new(&self.profile_name_input)),
                             ),

@@ -85,7 +85,7 @@ impl MessageInput {
         // Initialize profile select items
         let mut profile_items: Vec<ProfileItem> = app_state.db_profiles.iter().map(|p| ProfileItem {
             id: Some(p.id),
-            name: p.name.clone(),
+            name: p.name.chars().take(30).collect::<String>(),
         }).collect();
         
         // Add "Create New Profile" option
@@ -145,7 +145,7 @@ impl MessageInput {
             // Convert db_profiles to ProfileItems (excluding "Create New Profile" for comparison)
             let new_profile_items: Vec<ProfileItem> = profiles.iter().map(|p| ProfileItem {
                 id: Some(p.id),
-                name: p.name.clone(),
+                name: p.name.chars().take(30).collect::<String>(),
             }).collect();
 
             // Compare with cached profiles (excluding the last "Create New Profile" item if present)
@@ -179,8 +179,35 @@ impl MessageInput {
             }
 
             // Sync active profile selection
-            let current_selection = this.profile_select.read(cx).selected_value().cloned().flatten();
-            if active_id != current_selection {
+            let current_index = this.profile_select.read(cx).selected_index(cx);
+            let current_profile = current_index.and_then(|ix| this.cached_profiles.get(ix.row));
+            
+            // Find the expected profile item based on active_id
+            let expected_selection = if let Some(id) = active_id {
+                 profiles.iter().find(|p| p.id == id).map(|p| ProfileItem {
+                    id: Some(p.id),
+                    name: p.name.chars().take(30).collect::<String>(),
+                })
+            } else {
+                None
+            };
+
+            // Check if we need to update the selection (either ID changed OR name changed)
+            if let Some(expected) = &expected_selection {
+                if current_profile != Some(expected) {
+                     // Find index of this item in the cached list
+                     if let Some(index) = this.cached_profiles.iter().position(|p| p == expected) {
+                         this.profile_select.update(cx, |select, cx| {
+                             select.set_selected_index_deferred(Some(IndexPath::default().row(index)), cx);
+                         });
+                         changed = true;
+                     }
+                }
+            } else if current_profile.is_some() {
+                // Deselect if no active profile
+                this.profile_select.update(cx, |select, cx| {
+                     select.set_selected_index_deferred(None, cx);
+                });
                 changed = true;
             }
 
@@ -349,25 +376,71 @@ impl Render for MessageInput {
                     // Bottom: Toolbar
                     h_flex()
                         .justify_between()
-                        .items_center()
+                        .items_start() // Align items to the top
                         .child(
-                            // Left: App Picker Popover & Tags
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    // App Picker Popover
-                                    Button::new("add-app")
-                                        .icon(IconName::Plus)
-                                        .ghost()
-                                        .rounded_full()
-                                        .when(!any_modal_open, |this| this.cursor_pointer())
-                                        .dropdown_menu_with_anchor(Corner::BottomLeft, {
+                             // App Picker Popover (Moved out of wrapping container)
+                            Button::new("add-app")
+                                .icon(IconName::Plus)
+                                .ghost()
+                                .rounded_full()
+                                .when(!any_modal_open, |this| this.cursor_pointer())
+                                .dropdown_menu_with_anchor(Corner::BottomLeft, {
+                                    let state_model = state_model.clone();
+                                    move |menu, window, cx| {
+                                        let state = state_model.read(cx);
+                                        let capabilities = state.capabilities.clone();
+                                        
+                                        let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
                                             let state_model = state_model.clone();
-                                            move |menu, window, cx| {
-                                                let state = state_model.read(cx);
-                                                let capabilities = state.capabilities.clone();
-                                                
+                                            let label_string = label.to_string();
+                                            let app_name_string = app_name.to_string();
+                                            let icon_string = icon.to_string();
+                                            PopupMenuItem::new(label_string)
+                                                .icon(Icon::default().path(icon_string))
+                                                .on_click(move |_, window, cx| {
+                                                    state_model.update(cx, |state, cx| state.select_app(app_name_string.clone(), cx));
+                                                    window.dispatch_action(action.boxed_clone(), cx);
+                                                })
+                                        };
+
+                                        fn get_action(action_id: &str) -> Box<dyn Action> {
+                                            match action_id {
+                                                "SelectAppPhotos" => Box::new(SelectAppPhotos),
+                                                "SelectAppImageGeneration" => Box::new(SelectAppImageGeneration),
+                                                "SelectAppThinking" => Box::new(SelectAppThinking),
+                                                "SelectAppDeepResearch" => Box::new(SelectAppDeepResearch),
+                                                "SelectAppStudy" => Box::new(SelectAppStudy),
+                                                "SelectAppWebSearch" => Box::new(SelectAppWebSearch),
+                                                "SelectAppCanvas" => Box::new(SelectAppCanvas),
+                                                "SelectAppCanva" => Box::new(SelectAppCanva),
+                                                "SelectAppCoursera" => Box::new(SelectAppCoursera),
+                                                "SelectAppFigma" => Box::new(SelectAppFigma),
+                                                "SelectAppSpotify" => Box::new(SelectAppSpotify),
+                                                _ => Box::new(SelectAppWebSearch), // Fallback
+                                            }
+                                        }
+
+                                        let mut menu = menu;
+                                        
+                                        // Primary Items
+                                        for cap in capabilities.iter().filter(|c| c.is_primary) {
+                                            menu = menu.item(make_item(
+                                                &cap.label,
+                                                &cap.name,
+                                                &cap.icon,
+                                                get_action(&cap.action_id),
+                                                state_model.clone()
+                                            ));
+                                        }
+
+                                        menu = menu.separator();
+
+                                        // Secondary Items ("More" submenu)
+                                        let secondary_caps: Vec<_> = capabilities.iter().filter(|c| !c.is_primary).cloned().collect();
+                                        if !secondary_caps.is_empty() {
+                                            let state_model_submenu = state_model.clone();
+                                            let secondary_caps_for_submenu = secondary_caps.clone();
+                                            menu = menu.submenu("More", window, cx, move |menu, _, _| {
                                                 let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
                                                     let state_model = state_model.clone();
                                                     let label_string = label.to_string();
@@ -381,275 +454,230 @@ impl Render for MessageInput {
                                                         })
                                                 };
 
-                                                fn get_action(action_id: &str) -> Box<dyn Action> {
-                                                    match action_id {
-                                                        "SelectAppPhotos" => Box::new(SelectAppPhotos),
-                                                        "SelectAppImageGeneration" => Box::new(SelectAppImageGeneration),
-                                                        "SelectAppThinking" => Box::new(SelectAppThinking),
-                                                        "SelectAppDeepResearch" => Box::new(SelectAppDeepResearch),
-                                                        "SelectAppStudy" => Box::new(SelectAppStudy),
-                                                        "SelectAppWebSearch" => Box::new(SelectAppWebSearch),
-                                                        "SelectAppCanvas" => Box::new(SelectAppCanvas),
-                                                        "SelectAppCanva" => Box::new(SelectAppCanva),
-                                                        "SelectAppCoursera" => Box::new(SelectAppCoursera),
-                                                        "SelectAppFigma" => Box::new(SelectAppFigma),
-                                                        "SelectAppSpotify" => Box::new(SelectAppSpotify),
-                                                        _ => Box::new(SelectAppWebSearch), // Fallback
-                                                    }
-                                                }
-
-                                                let mut menu = menu;
-                                                
-                                                // Primary Items
-                                                for cap in capabilities.iter().filter(|c| c.is_primary) {
-                                                    menu = menu.item(make_item(
+                                                let mut submenu = menu;
+                                                for cap in secondary_caps_for_submenu.iter() {
+                                                    submenu = submenu.item(make_item(
                                                         &cap.label,
                                                         &cap.name,
                                                         &cap.icon,
                                                         get_action(&cap.action_id),
-                                                        state_model.clone()
+                                                        state_model_submenu.clone()
                                                     ));
                                                 }
-
-                                                menu = menu.separator();
-
-                                                // Secondary Items ("More" submenu)
-                                                let secondary_caps: Vec<_> = capabilities.iter().filter(|c| !c.is_primary).cloned().collect();
-                                                if !secondary_caps.is_empty() {
-                                                    let state_model_submenu = state_model.clone();
-                                                    let secondary_caps_for_submenu = secondary_caps.clone();
-                                                    menu = menu.submenu("More", window, cx, move |menu, _, _| {
-                                                        let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
-                                                            let state_model = state_model.clone();
-                                                            let label_string = label.to_string();
-                                                            let app_name_string = app_name.to_string();
-                                                            let icon_string = icon.to_string();
-                                                            PopupMenuItem::new(label_string)
-                                                                .icon(Icon::default().path(icon_string))
-                                                                .on_click(move |_, window, cx| {
-                                                                    state_model.update(cx, |state, cx| state.select_app(app_name_string.clone(), cx));
-                                                                    window.dispatch_action(action.boxed_clone(), cx);
-                                                                })
-                                                        };
-
-                                                        let mut submenu = menu;
-                                                        for cap in secondary_caps_for_submenu.iter() {
-                                                            submenu = submenu.item(make_item(
-                                                                &cap.label,
-                                                                &cap.name,
-                                                                &cap.icon,
-                                                                get_action(&cap.action_id),
-                                                                state_model_submenu.clone()
-                                                            ));
-                                                        }
-                                                        submenu
-                                                    });
-                                                }
-                                                menu
-                                            }
-                                        })
-                                )
-                                .child(
-                                    div()
-                                        .min_w(px(160.0))
-                                        .max_w(px(300.0))
-                                        .child(
-                                            Select::new(&self.profile_select)
-                                                .id("profile-select")
-                                                .placeholder("Select Profile")
-                                                .search_placeholder("Search profile...")
-                                                .anchor(Corner::BottomLeft)
-                                        )
-                                )
-                                .child(
-                                        // Tags Area (Middle)
+                                                submenu
+                                            });
+                                        }
+                                        menu
+                                    }
+                                })
+                        )
+                        .child(
+                            // Bottom Row (Profile Selector + Tags)
+                            div()
+                                .flex()
+                                .flex_1() // Allow this section to shrink/grow
+                                .min_w_0() // Allow shrinking below content size to force wrapping
+                                .flex_wrap() // Allow wrapping
+                                .items_center()
+                                .gap_2()
+                                .children(
+                                    std::iter::once(
                                         div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .children({
-                                            let (tool_calls, rest): (Vec<_>, Vec<_>) = selected_apps.iter()
-                                                .cloned()
-                                                .partition(|app| matches!(app.as_str(), "Web search" | "Deep Research" | "Image Generation" | "Photos" | "Thinking"));
+                                            .min_w(px(160.0))
+                                            .child(
+                                                Select::new(&self.profile_select)
+                                                    .id("profile-select")
+                                                    .placeholder("Select Profile")
+                                                    .search_placeholder("Search profile...")
+                                                    .anchor(Corner::BottomLeft)
+                                                    .w_full()
+                                            )
+                                            .into_any_element()
+                                    )
+                                    .chain({
+                                        let (tool_calls, rest): (Vec<_>, Vec<_>) = selected_apps.iter()
+                                            .cloned()
+                                            .partition(|app| matches!(app.as_str(), "Web search" | "Deep Research" | "Image Generation" | "Photos" | "Thinking"));
 
-                                            let (skills, mini_apps): (Vec<_>, Vec<_>) = rest.into_iter()
-                                                .partition(|app| matches!(app.as_str(), "Study" | "Canvas"));
+                                        let (skills, mini_apps): (Vec<_>, Vec<_>) = rest.into_iter()
+                                            .partition(|app| matches!(app.as_str(), "Study" | "Canvas"));
 
-                                            let groups = vec![
-                                                ("Tools", tool_calls, "icons/wrench.svg"),
-                                                ("Skills", skills, "icons/wizard_hat.svg"),
-                                                ("Apps", mini_apps, "icons/plugins.svg"),
-                                            ];
+                                        let groups = vec![
+                                            ("Tools", tool_calls, "icons/wrench.svg"),
+                                            ("Skills", skills, "icons/wizard_hat.svg"),
+                                            ("Apps", mini_apps, "icons/plugins.svg"),
+                                        ];
 
-                                            let state_model = state_model.clone();
-                                            groups.into_iter().flat_map(move |(group_name, apps, icon_path)| -> Box<dyn Iterator<Item = AnyElement>> {
-                                                if apps.len() >= 2 {
-                                                    let apps_clone = apps.clone();
-                                                    let state_model = state_model.clone();
-                                                    let group_name = group_name.to_string();
-                                                    let icon_path = icon_path.to_string();
-                                                    
-                                                    Box::new(std::iter::once(
-                                                        Popover::new(SharedString::from(format!("aggregated-{}-popover", group_name.to_lowercase())))
-                                                            .anchor(gpui::Corner::BottomLeft)
-                                                            .trigger(
-                                                                Button::new(SharedString::from(format!("aggregated-{}-btn", group_name.to_lowercase())))
-                                                                    .ghost()
-                                                                    .bg(secondary)
-                                                                    .rounded_md()
-                                                                    .px_2()
-                                                                    .py_1()
-                                                                    .child(
-                                                                        h_flex()
-                                                                            .gap_1()
-                                                                            .items_center()
-                                                                            .child(
-                                                                                svg()
-                                                                                    .path(icon_path.clone())
-                                                                                    .size(px(12.0))
-                                                                                    .text_color(secondary_foreground)
-                                                                            )
-                                                                            .child(
-                                                                                div()
-                                                                                    .child(format!("{} {}", apps.len(), group_name.to_lowercase()))
-                                                                                    .text_size(px(12.0)),
-                                                                            )
-                                                                            .child(
-                                                                                Icon::new(IconName::ChevronDown)
-                                                                                    .size(px(12.0))
-                                                                                    .text_color(secondary_foreground)
-                                                                            )
-                                                                    )
-                                                            )
-                                                            .content(move |_, _, cx| {
-                                                                let theme = cx.theme();
-                                                                v_flex()
-                                                                    .w(px(200.0))
-                                                                    .p_1()
-                                                                    .gap_1()
-                                                                    .children(
-                                                                        apps_clone.iter().enumerate().map(|(i, app)| {
-                                                                            let app_name = app.clone();
-                                                                            let icon_path = match app_name.as_str() {
-                                                                                "Image Generation" => "icons/create_image.svg",
-                                                                                "Thinking" => "icons/thinking.svg",
-                                                                                "Deep Research" => "icons/deep_search.svg",
-                                                                                "Study" => "icons/study.svg",
-                                                                                "Web search" => "icons/web_search.svg",
-                                                                                "Canvas" => "icons/canvas.svg",
-                                                                                "Canva" => "icons/canva.svg",
-                                                                                "Coursera" => "icons/coursera.svg",
-                                                                                "Figma" => "icons/figma.svg",
-                                                                                "Spotify" => "icons/spotify.svg",
-                                                                                _ => "icons/clip.svg",
-                                                                            };
-
-                                                                            h_flex()
-                                                                                .gap_2()
-                                                                                .items_center()
-                                                                                .px_2()
-                                                                                .py_1()
-                                                                                .rounded_sm()
-                                                                                .hover(move |s| s.bg(theme.secondary))
-                                                                                .cursor_pointer()
-                                                                                .id(SharedString::from(format!("remove-{}-aggregated-{}", group_name.to_lowercase(), i)))
-                                                                                .on_click({
-                                                                                    let state_model = state_model.clone();
-                                                                                    move |_event, _window, cx| {
-                                                                                        state_model.update(cx, |state, cx| {
-                                                                                            state.remove_app(app_name.clone(), cx);
-                                                                                        });
-                                                                                    }
-                                                                                })
-                                                                                .child(
-                                                                                    svg()
-                                                                                        .path(icon_path)
-                                                                                        .size(px(12.0))
-                                                                                        .text_color(theme.secondary_foreground)
-                                                                                )
-                                                                                .child(
-                                                                                    div()
-                                                                                        .child(app.clone())
-                                                                                        .text_size(px(12.0))
-                                                                                )
-                                                                                .child(
-                                                                                    div().flex_grow() // Spacer
-                                                                                )
-                                                                                .child(
-                                                                                    Icon::new(IconName::Close)
-                                                                                        .size(px(12.0))
-                                                                                        .text_color(theme.secondary_foreground)
-                                                                                )
-                                                                        })
-                                                                    )
-                                                            })
-                                                            .into_any_element()
-                                                    ))
-                                                } else {
-                                                    // Render individual tags
-                                                    let state_model = state_model.clone();
-                                                    Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
-                                                            let app_name = app.clone();
-                                                            let icon_path = match app_name.as_str() {
-                                                                "Image Generation" => "icons/create_image.svg",
-                                                                "Thinking" => "icons/thinking.svg",
-                                                                "Deep Research" => "icons/deep_search.svg",
-                                                                "Study" => "icons/study.svg",
-                                                                "Web search" => "icons/web_search.svg",
-                                                                "Canvas" => "icons/canvas.svg",
-                                                                "Canva" => "icons/canva.svg",
-                                                                "Coursera" => "icons/coursera.svg",
-                                                                "Figma" => "icons/figma.svg",
-                                                                "Spotify" => "icons/spotify.svg",
-                                                                _ => "icons/clip.svg",
-                                                            };
-
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_1()
+                                        let state_model = state_model.clone();
+                                        groups.into_iter().flat_map(move |(group_name, apps, icon_path)| -> Box<dyn Iterator<Item = AnyElement>> {
+                                            if apps.len() >= 2 {
+                                                let apps_clone = apps.clone();
+                                                let state_model = state_model.clone();
+                                                let group_name = group_name.to_string();
+                                                let icon_path = icon_path.to_string();
+                                                
+                                                Box::new(std::iter::once(
+                                                    Popover::new(SharedString::from(format!("aggregated-{}-popover", group_name.to_lowercase())))
+                                                        .anchor(gpui::Corner::BottomLeft)
+                                                        .trigger(
+                                                            Button::new(SharedString::from(format!("aggregated-{}-btn", group_name.to_lowercase())))
+                                                                .ghost()
                                                                 .bg(secondary)
                                                                 .rounded_md()
                                                                 .px_2()
                                                                 .py_1()
                                                                 .child(
-                                                                    svg()
-                                                                        .path(icon_path)
-                                                                        .size(px(12.0))
-                                                                        .text_color(secondary_foreground)
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .child(app_name.clone())
-                                                                        .text_size(px(12.0)),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .id(SharedString::from(format!("remove-{}-{}", app_name.to_lowercase(), i)))
-                                                                        .cursor_pointer()
-                                                                        .on_click({
-                                                                            let state_model = state_model.clone();
-                                                                            move |_event, _window, cx| {
-                                                                                state_model.update(cx, |state, cx| {
-                                                                                    state.remove_app(app_name.clone(), cx);
-                                                                                });
-                                                                            }
-                                                                        })
+                                                                    h_flex()
+                                                                        .gap_1()
+                                                                        .items_center()
                                                                         .child(
-                                                                            Icon::new(IconName::Close)
-                                                                                .size(px(14.0)),
-                                                                        ),
+                                                                            svg()
+                                                                                .path(icon_path.clone())
+                                                                                .size(px(12.0))
+                                                                                .text_color(secondary_foreground)
+                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .child(format!("{} {}", apps.len(), group_name.to_lowercase()))
+                                                                                .text_size(px(12.0)),
+                                                                        )
+                                                                        .child(
+                                                                            Icon::new(IconName::ChevronDown)
+                                                                                .size(px(12.0))
+                                                                                .text_color(secondary_foreground)
+                                                                        )
                                                                 )
-                                                                .into_any_element()
-                                                        }))
-                                                }
-                                            })
-                                        }),
+                                                        )
+                                                        .content(move |_, _, cx| {
+                                                            let theme = cx.theme();
+                                                            v_flex()
+                                                                .w(px(200.0))
+                                                                .p_1()
+                                                                .gap_1()
+                                                                .children(
+                                                                    apps_clone.iter().enumerate().map(|(i, app)| {
+                                                                        let app_name = app.clone();
+                                                                        let icon_path = match app_name.as_str() {
+                                                                            "Image Generation" => "icons/create_image.svg",
+                                                                            "Thinking" => "icons/thinking.svg",
+                                                                            "Deep Research" => "icons/deep_search.svg",
+                                                                            "Study" => "icons/study.svg",
+                                                                            "Web search" => "icons/web_search.svg",
+                                                                            "Canvas" => "icons/canvas.svg",
+                                                                            "Canva" => "icons/canva.svg",
+                                                                            "Coursera" => "icons/coursera.svg",
+                                                                            "Figma" => "icons/figma.svg",
+                                                                            "Spotify" => "icons/spotify.svg",
+                                                                            _ => "icons/clip.svg",
+                                                                        };
+
+                                                                        h_flex()
+                                                                            .gap_2()
+                                                                            .items_center()
+                                                                            .px_2()
+                                                                            .py_1()
+                                                                            .rounded_sm()
+                                                                            .hover(move |s| s.bg(theme.secondary))
+                                                                            .cursor_pointer()
+                                                                            .id(SharedString::from(format!("remove-{}-aggregated-{}", group_name.to_lowercase(), i)))
+                                                                            .on_click({
+                                                                                let state_model = state_model.clone();
+                                                                                move |_event, _window, cx| {
+                                                                                    state_model.update(cx, |state, cx| {
+                                                                                        state.remove_app(app_name.clone(), cx);
+                                                                                    });
+                                                                                }
+                                                                            })
+                                                                            .child(
+                                                                                svg()
+                                                                                    .path(icon_path)
+                                                                                    .size(px(12.0))
+                                                                                    .text_color(theme.secondary_foreground)
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .child(app.clone())
+                                                                                    .text_size(px(12.0))
+                                                                            )
+                                                                            .child(
+                                                                                div().flex_grow() // Spacer
+                                                                            )
+                                                                            .child(
+                                                                                Icon::new(IconName::Close)
+                                                                                    .size(px(12.0))
+                                                                                    .text_color(theme.secondary_foreground)
+                                                                            )
+                                                                    })
+                                                                )
+                                                        })
+                                                        .into_any_element()
+                                                ))
+                                            } else {
+                                                // Render individual tags
+                                                let state_model = state_model.clone();
+                                                Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
+                                                        let app_name = app.clone();
+                                                        let icon_path = match app_name.as_str() {
+                                                            "Image Generation" => "icons/create_image.svg",
+                                                            "Thinking" => "icons/thinking.svg",
+                                                            "Deep Research" => "icons/deep_search.svg",
+                                                            "Study" => "icons/study.svg",
+                                                            "Web search" => "icons/web_search.svg",
+                                                            "Canvas" => "icons/canvas.svg",
+                                                            "Canva" => "icons/canva.svg",
+                                                            "Coursera" => "icons/coursera.svg",
+                                                            "Figma" => "icons/figma.svg",
+                                                            "Spotify" => "icons/spotify.svg",
+                                                            _ => "icons/clip.svg",
+                                                        };
+
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_1()
+                                                            .bg(secondary)
+                                                            .rounded_md()
+                                                            .px_2()
+                                                            .py_1()
+                                                            .child(
+                                                                svg()
+                                                                    .path(icon_path)
+                                                                    .size(px(12.0))
+                                                                    .text_color(secondary_foreground)
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .child(app_name.clone())
+                                                                    .text_size(px(12.0)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .id(SharedString::from(format!("remove-{}-{}", app_name.to_lowercase(), i)))
+                                                                    .cursor_pointer()
+                                                                    .on_click({
+                                                                        let state_model = state_model.clone();
+                                                                        move |_event, _window, cx| {
+                                                                            state_model.update(cx, |state, cx| {
+                                                                                state.remove_app(app_name.clone(), cx);
+                                                                            });
+                                                                        }
+                                                                    })
+                                                                    .child(
+                                                                        Icon::new(IconName::Close)
+                                                                            .size(px(14.0)),
+                                                                    ),
+                                                            )
+                                                            .into_any_element()
+                                                    }))
+                                            }
+                                        })
+                                    })
                                 )
                                 )
                         .child(
                             // Right: Action Icons
                             h_flex()
+                                .flex_none() // Prevent this section from shrinking
                                 .gap_1()
                                 .items_center()
                                 .when(self.voice_mode, |this| {
