@@ -226,47 +226,47 @@ impl RenderOnce for SidebarMenuItem {
                         })
                     })
                     .items_center()
+                    .h_7()
                     .when(!is_collapsed, |this| {
-                        this.h_7()
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .gap_x_2()
-                                    .justify_between()
-                                    .overflow_x_hidden()
-                                    .child(
-                                        h_flex()
-                                            .flex_1()
-                                            .overflow_x_hidden()
-                                            .child(self.label.clone()),
-                                    )
-                                    .when_some(self.suffix, |this, suffix| this.child(suffix)),
-                            )
-                            .when(is_submenu, |this| {
-                                this.child(
-                                    Button::new("caret")
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(
-                                            Icon::new(IconName::ChevronRight)
-                                                .size_4()
-                                                .when(is_open, |this| {
-                                                    this.rotate(percentage(90. / 360.))
-                                                }),
-                                        )
-                                        .on_click({
-                                            let open_state = open_state.clone();
-                                            move |_, _, cx| {
-                                                // Avoid trigger item click, just expand/collapse submenu
-                                                cx.stop_propagation();
-                                                open_state.update(cx, |is_open, cx| {
-                                                    *is_open = !*is_open;
-                                                    cx.notify();
-                                                })
-                                            }
-                                        }),
+                        this.child(
+                            h_flex()
+                                .flex_1()
+                                .gap_x_2()
+                                .justify_between()
+                                .overflow_x_hidden()
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .overflow_x_hidden()
+                                        .child(self.label.clone()),
                                 )
-                            })
+                                .when_some(self.suffix, |this, suffix| this.child(suffix)),
+                        )
+                        .when(is_submenu, |this| {
+                            this.child(
+                                Button::new("caret")
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(
+                                        Icon::new(IconName::ChevronRight)
+                                            .size_4()
+                                            .when(is_open, |this| {
+                                                this.rotate(percentage(90. / 360.))
+                                            }),
+                                    )
+                                    .on_click({
+                                        let open_state = open_state.clone();
+                                        move |_, _, cx| {
+                                            // Avoid trigger item click, just expand/collapse submenu
+                                            cx.stop_propagation();
+                                            open_state.update(cx, |is_open, cx| {
+                                                *is_open = !*is_open;
+                                                cx.notify();
+                                            })
+                                        }
+                                    }),
+                            )
+                        })
                     })
                     .when(is_disabled, |this| {
                         this.text_color(cx.theme().muted_foreground)

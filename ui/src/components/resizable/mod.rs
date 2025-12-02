@@ -126,6 +126,7 @@ impl ResizableState {
         panel_ix: usize,
         bounds: Bounds<Pixels>,
         size_range: Range<Pixels>,
+        fixed: bool,
         cx: &mut Context<Self>,
     ) {
         let size = bounds.size.along(self.axis);
@@ -141,6 +142,7 @@ impl ResizableState {
         }
         self.panels[panel_ix].bounds = bounds;
         self.panels[panel_ix].size_range = size_range;
+        self.panels[panel_ix].fixed = fixed;
         cx.notify();
     }
 
@@ -274,12 +276,42 @@ impl ResizableState {
         }
 
         let container_size = self.container_size();
-        let total_size = px(self.sizes.iter().map(|s| s.as_f32()).sum::<f32>());
+
+        // Calculate the total size of fixed panels
+        let mut fixed_size = px(0.);
+        let mut flexible_size = px(0.);
+
+        for (i, panel) in self.panels.iter().enumerate() {
+            if panel.fixed {
+                fixed_size += self.sizes[i];
+            } else {
+                flexible_size += self.sizes[i];
+            }
+        }
+
+        // If all panels are fixed, we just clamp them to the container size if needed
+        // Or if there is no flexible space, we might have an issue, but let's just handle the flexible ones.
+        let available_flexible_space = (container_size - fixed_size).max(px(0.));
 
         for i in 0..self.panels.len() {
+            if self.panels[i].fixed {
+                // For fixed panels, we try to keep their size, but clamp if container is too small
+                // Ideally fixed panels should stay fixed.
+                // If container is smaller than fixed size, we might need to shrink them?
+                // For now let's assume they stay fixed unless container is really small.
+                // Actually, if we have multiple fixed panels and they exceed container, we probably need to shrink them proportionally?
+                // But the requirement is "don't resize fixed width sidebar".
+                // So we keep `self.sizes[i]` as is for fixed panels.
+                continue;
+            }
+
             let size = self.sizes[i];
-            let ratio = size / total_size;
-            let new_size = container_size * ratio;
+            let ratio = if flexible_size > px(0.) {
+                size / flexible_size
+            } else {
+                0.
+            };
+            let new_size = available_flexible_space * ratio;
 
             self.sizes[i] = new_size;
             self.panels[i].size = Some(new_size);
@@ -294,5 +326,6 @@ impl EventEmitter<ResizablePanelEvent> for ResizableState {}
 pub(crate) struct ResizablePanelState {
     pub size: Option<Pixels>,
     pub size_range: Range<Pixels>,
+    pub fixed: bool,
     bounds: Bounds<Pixels>,
 }

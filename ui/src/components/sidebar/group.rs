@@ -61,18 +61,17 @@ impl<E: Collapsible + IntoElement> RenderOnce for SidebarGroup<E> {
         v_flex()
             .relative()
             .w_full()
-            .when(!self.collapsed, |this| {
-                this.child(
-                    div()
-                        .flex_shrink_0()
-                        .px_2()
-                        .rounded(cx.theme().radius)
-                        .text_xs()
-                        .text_color(cx.theme().sidebar_foreground.opacity(0.7))
-                        .h_8()
-                        .child(self.label),
-                )
-            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .rounded(cx.theme().radius)
+                    .text_xs()
+                    .text_color(cx.theme().sidebar_foreground.opacity(0.7))
+                    .h_8()
+                    .when(self.collapsed, |this| this.invisible())
+                    .child(self.label),
+            )
             .child(
                 self.base.children(
                     self.children
