@@ -700,7 +700,9 @@ impl ProfileSettingsModal {
 
             delegate.profiles.push(new_profile);
             let new_index = delegate.profiles.len() - 1;
-            delegate.selected_index = Some(new_index);
+
+            // Update ListState's selected_index via set_selected_index
+            list.set_selected_index(Some(IndexPath::default().row(new_index)), window, cx);
             self.selected_index = Some(new_index);
 
             cx.notify();

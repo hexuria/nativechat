@@ -539,12 +539,17 @@ impl Render for CredentialsModal {
 
                                         delegate.credentials.push(new_cred);
                                         let new_index = delegate.credentials.len() - 1;
-                                        delegate.selected_index = Some(new_index);
+
+                                        // Update ListState's selected_index via set_selected_index
+                                        list.set_selected_index(
+                                            Some(IndexPath::default().row(new_index)),
+                                            window,
+                                            cx,
+                                        );
                                         this.selected_index = Some(new_index);
 
                                         cx.notify();
                                     });
-
                                     cx.notify();
                                 })),
                         ),
