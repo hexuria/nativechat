@@ -345,10 +345,10 @@ impl Render for MessageInput {
             || self.is_profile_settings_open;
 
         // ChatGPT-style: centered container with max-width
-        h_flex().w_full().justify_center().p_4().child(
+        h_flex().w_full().justify_center().child(
             // Input container - rounded pill shape with shadow
             v_flex()
-                .max_w(px(800.0)) // Max width like ChatGPT
+                .max_w(px(800.0)) // Max width like Cha2tGPT
                 .w_full()
                 .gap_2()
                 .px_4()
