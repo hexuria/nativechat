@@ -1,6 +1,6 @@
 use crate::components::message_actions::MessageActions;
 use gpui::{prelude::FluentBuilder, *};
-use ui::{ActiveTheme, h_flex, v_flex};
+use ui::{ActiveTheme, h_flex, text::Text, v_flex};
 
 #[derive(Clone, IntoElement)]
 pub struct MessageBubble {
@@ -49,6 +49,8 @@ impl RenderOnce for MessageBubble {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         if self.is_me {
             // User message: gray bubble on the right (ChatGPT style)
+            // For now, keep user messages as plain text or also use Markdown if desired.
+            // Let's use Markdown for consistency but keep the bubble styling.
             h_flex().w_full().justify_end().child(
                 div()
                     .max_w(px(360.0))
@@ -63,7 +65,7 @@ impl RenderOnce for MessageBubble {
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().secondary_foreground)
-                                    .child(self.text),
+                                    .child(self.text), // User text usually doesn't need complex markdown, but we could swap this too.
                             )
                             .when_some(self.timestamp, |this, timestamp| {
                                 this.child(
@@ -79,26 +81,33 @@ impl RenderOnce for MessageBubble {
             // AI message: plain text with action buttons (No background, no padding)
             h_flex().w_full().justify_start().child(
                 v_flex()
-                    .max_w_3_4()
+                    .flex_1() // Use flex_1 instead of w_full to allow proper shrinking
                     .gap_2() // Space between message and actions
-                    // Message content - Plain text
+                    // Message content - Markdown
                     .child(
                         div()
+                            .flex_1() // Use flex_1 for proper flex behavior
                             .pr_4() // Add some right padding for readability
                             .child(
                                 v_flex()
+                                    .w_full()
                                     .gap_0p5()
                                     .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().foreground)
-                                            .child(self.text),
+                                        div().w_full().child(
+                                            ui::text::TextView::markdown(
+                                                ElementId::Name(self.message_id.clone().into()),
+                                                self.text.clone(),
+                                                _window,
+                                                cx,
+                                            )
+                                            .selectable(false),
+                                        ),
                                     )
                                     .when_some(self.timestamp, |this, timestamp| {
                                         this.child(
                                             div()
                                                 .text_xs()
-                                                .text_color(cx.theme().foreground.opacity(0.6))
+                                                .text_color(cx.theme().muted_foreground)
                                                 .child(timestamp),
                                         )
                                     }),

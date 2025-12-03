@@ -96,22 +96,18 @@ impl Render for RootView {
                 }
             })
             .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {
-                // cx.minimize_window(); // Not available on App
                 println!("Minimize action triggered");
             })
             .on_action(|_: &Zoom, _window: &mut Window, _cx: &mut App| {
-                // cx.zoom_window(); // Not available on App
                 println!("Zoom action triggered");
             })
             .on_action(|_: &Hide, _window: &mut Window, cx: &mut App| {
                 cx.hide();
             })
             .on_action(|_: &HideOthers, _window: &mut Window, _cx: &mut App| {
-                // cx.hide_others();
                 println!("Hide Others action triggered");
             })
             .on_action(|_: &ShowAll, _window: &mut Window, _cx: &mut App| {
-                // cx.show_all();
                 println!("Show All action triggered");
             })
             .on_action(|_: &About, _window: &mut Window, _cx: &mut App| {

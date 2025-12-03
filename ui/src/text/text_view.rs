@@ -612,7 +612,7 @@ impl Element for TextView {
 
         let mut el = div()
             .key_context(CONTEXT)
-            .track_focus(focus_handle)
+            .when(self.selectable, |el| el.track_focus(focus_handle))
             .size_full()
             .relative()
             .on_action({

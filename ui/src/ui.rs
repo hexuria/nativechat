@@ -31,6 +31,7 @@ pub mod virtual_list;
 pub mod window_border;
 
 pub fn init(cx: &mut gpui::App) {
+    global_state::init(cx);
     components::init(cx);
     select::init(cx);
     theme::init(cx);
