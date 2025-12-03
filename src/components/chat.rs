@@ -4,15 +4,12 @@ use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::state::AppState;
 use gpui::*;
-use ui::{
-    ActiveTheme, VirtualListScrollHandle, avatar::Avatar, h_flex, label::Label, v_flex,
-    v_virtual_list,
-};
+use ui::{ActiveTheme, avatar::Avatar, h_flex, label::Label, v_flex, v_virtual_list};
 
 pub struct ChatView {
     input: Entity<MessageInput>,
     state: Entity<AppState>,
-    scroll_handle: VirtualListScrollHandle,
+    scroll_handle: ScrollHandle,
     item_sizes: Rc<Vec<Size<Pixels>>>,
     last_layout_width: Option<Pixels>,
 }
@@ -30,7 +27,7 @@ impl ChatView {
             })
         });
 
-        let scroll_handle = VirtualListScrollHandle::new();
+        let scroll_handle = ScrollHandle::new();
 
         cx.observe(&state, {
             let scroll_handle = scroll_handle.clone();
@@ -151,6 +148,7 @@ impl Render for ChatView {
                         // Messages Area - simple scrollable list (testing)
                         div()
                             .id("chat-scroll-container")
+                            .track_scroll(&self.scroll_handle)
                             .absolute()
                             .top_0()
                             .left_0()
