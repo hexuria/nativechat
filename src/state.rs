@@ -4,7 +4,7 @@ use crate::llm::{
     ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
 };
 use crate::services::database::{
-    ChatMessage as DbChatMessage, Credential as DbCredential, DatabaseService, Profile as DbProfile,
+    Credential as DbCredential, DatabaseService, Profile as DbProfile,
 };
 use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
@@ -14,7 +14,7 @@ use gpui::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -65,8 +65,45 @@ impl Message {
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    pub created_at: String,
     pub messages: Vec<Message>,
     pub unread_count: usize,
+}
+
+impl Conversation {
+    pub fn relative_time(&self) -> String {
+        let now = SystemTime::now();
+
+        // Parse the ISO 8601 string or fallback to now
+        let created_at = NaiveDateTime::parse_from_str(&self.created_at, "%Y-%m-%d %H:%M:%S")
+            .map(|dt| SystemTime::from(dt.and_utc()))
+            .unwrap_or(SystemTime::now());
+
+        let duration = now.duration_since(created_at).unwrap_or_default();
+        let secs = duration.as_secs();
+
+        if secs < 60 {
+            "Just now".to_string()
+        } else if secs < 3600 {
+            let mins = secs / 60;
+            format!("{}m ago", mins)
+        } else if secs < 86400 {
+            let hours = secs / 3600;
+            format!("{}h ago", hours)
+        } else if secs < 604800 {
+            let days = secs / 86400;
+            format!("{}d ago", days)
+        } else if secs < 2592000 {
+            let weeks = secs / 604800;
+            format!("{}w ago", weeks)
+        } else if secs < 31536000 {
+            let months = secs / 2592000;
+            format!("{}mo ago", months)
+        } else {
+            let years = secs / 31536000;
+            format!("{}y ago", years)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -324,6 +361,7 @@ impl AppState {
                                     .map(|s| Conversation {
                                         id: s.id,
                                         title: s.title,
+                                        created_at: s.created_at,
                                         messages: Vec::new(), // Messages loaded on demand
                                         unread_count: 0,
                                     })
@@ -361,6 +399,9 @@ impl AppState {
                                     Conversation {
                                         id: id.clone(),
                                         title: "New Chat".to_string(),
+                                        created_at: chrono::Local::now()
+                                            .format("%Y-%m-%d %H:%M:%S")
+                                            .to_string(),
                                         messages: Vec::new(),
                                         unread_count: 0,
                                     },
@@ -374,6 +415,51 @@ impl AppState {
                 }
             })
             .detach();
+        }
+    }
+
+    pub fn rename_session(&mut self, id: String, new_title: String, cx: &mut Context<Self>) {
+        if let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == id) {
+            conversation.title = new_title.clone();
+            cx.notify();
+
+            if let Some(db) = self.database_service.clone() {
+                cx.spawn(
+                    move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
+                        if let Err(e) = db.update_session_title(&id, &new_title).await {
+                            eprintln!("Failed to rename session: {}", e);
+                        }
+                    },
+                )
+                .detach();
+            }
+        }
+    }
+
+    pub fn delete_session(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Some(index) = self.conversations.iter().position(|c| c.id == id) {
+            self.conversations.remove(index);
+
+            // If we deleted the active conversation, select another one
+            if self.active_conversation_id.as_ref() == Some(&id) {
+                self.active_conversation_id = self.conversations.first().map(|c| c.id.clone());
+                if let Some(new_id) = self.active_conversation_id.clone() {
+                    self.load_session_messages(new_id, cx);
+                }
+            }
+
+            cx.notify();
+
+            if let Some(db) = self.database_service.clone() {
+                cx.spawn(
+                    move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
+                        if let Err(e) = db.delete_session(&id).await {
+                            eprintln!("Failed to delete session: {}", e);
+                        }
+                    },
+                )
+                .detach();
+            }
         }
     }
 
