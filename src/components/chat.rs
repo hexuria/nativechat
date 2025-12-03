@@ -239,7 +239,8 @@ impl Render for ChatView {
         let state = self.state.read(cx);
         let active_conversation = state
             .active_conversation_id
-            .and_then(|id| state.conversations.iter().find(|c| c.id == id));
+            .as_ref()
+            .and_then(|id| state.conversations.iter().find(|c| &c.id == id));
 
         let messages = if let Some(conversation) = active_conversation {
             conversation.messages.clone()

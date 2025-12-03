@@ -21,7 +21,7 @@ impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let collapsed = state.sidebar_collapsed;
-        let active_id = state.active_conversation_id;
+        let active_id = state.active_conversation_id.clone();
 
         let theme = cx.theme();
 
@@ -118,7 +118,12 @@ impl Render for SidebarView {
                                 .child(
                                     SidebarMenuItem::new("New Chat")
                                         .icon(IconName::Plus)
-                                        .disable(any_modal_open),
+                                        .disable(any_modal_open)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.update(cx, |state, cx| {
+                                                state.create_new_session(cx);
+                                            });
+                                        })),
                                 )
                                 .child(
                                     SidebarMenuItem::new("Search")
@@ -150,17 +155,18 @@ impl Render for SidebarView {
                                 .conversations
                                 .iter()
                                 .map(|c| {
-                                    let id = c.id;
-                                    let is_active = Some(id) == active_id;
+                                    let id = c.id.clone();
+                                    let is_active = Some(id.clone()) == active_id.clone();
                                     SidebarMenuItem::new(&c.title)
                                         .icon(IconName::Dash)
                                         .active(is_active)
                                         .disable(any_modal_open)
                                         .on_click({
                                             let state = self.state.clone();
+                                            let id = id.clone();
                                             move |_, _, cx| {
                                                 state.update(cx, |state, cx| {
-                                                    state.select_conversation(id, cx);
+                                                    state.select_conversation(id.clone(), cx);
                                                 });
                                             }
                                         })

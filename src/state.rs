@@ -4,20 +4,21 @@ use crate::llm::{
     ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
 };
 use crate::services::database::{
-    Credential as DbCredential, DatabaseService, Profile as DbProfile,
+    ChatMessage as DbChatMessage, Credential as DbCredential, DatabaseService, Profile as DbProfile,
 };
 use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
+use chrono::NaiveDateTime;
 use futures::StreamExt;
 use gpui::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct Message {
-    pub id: usize,
+    pub id: String,
     pub sender: String,
     pub content: String,
     pub sent_at: SystemTime,
@@ -62,7 +63,7 @@ impl Message {
 
 #[derive(Clone, Debug)]
 pub struct Conversation {
-    pub id: usize,
+    pub id: String,
     pub title: String,
     pub messages: Vec<Message>,
     pub unread_count: usize,
@@ -95,7 +96,7 @@ pub struct AppCapability {
 
 pub struct AppState {
     pub conversations: Vec<Conversation>,
-    pub active_conversation_id: Option<usize>,
+    pub active_conversation_id: Option<String>,
     pub theme_mode: String,
     pub amplitude: Arc<AtomicU32>,
     pub ai_amplitude: Arc<AtomicU32>, // New field for AI voice viz
@@ -240,42 +241,8 @@ impl AppState {
         ];
 
         let mut state = Self {
-            conversations: vec![
-                Conversation {
-                    id: 1,
-                    title: "John Doe".to_string(),
-                    messages: vec![
-                        Message {
-                            id: 1,
-                            sender: "John Doe".to_string(),
-                            content: "Hello there!".to_string(),
-                            sent_at: std::time::SystemTime::now(),
-                            is_me: false,
-                        },
-                        Message {
-                            id: 2,
-                            sender: "Me".to_string(),
-                            content: "Hi John!".to_string(),
-                            sent_at: std::time::SystemTime::now(),
-                            is_me: true,
-                        },
-                    ],
-                    unread_count: 0,
-                },
-                Conversation {
-                    id: 2,
-                    title: "Jane Smith".to_string(),
-                    messages: vec![Message {
-                        id: 1,
-                        sender: "Jane Smith".to_string(),
-                        content: "Meeting at 3?".to_string(),
-                        sent_at: std::time::SystemTime::now(),
-                        is_me: false,
-                    }],
-                    unread_count: 1,
-                },
-            ],
-            active_conversation_id: Some(1),
+            conversations: Vec::new(),
+            active_conversation_id: None,
             theme_mode: "light".to_string(),
             amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             ai_amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -337,8 +304,127 @@ impl AppState {
     }
 
     pub fn set_database_service(&mut self, service: DatabaseService, cx: &mut Context<Self>) {
-        self.database_service = Some(service);
+        self.database_service = Some(service.clone());
         cx.notify();
+
+        // Load sessions when DB service is set
+        self.load_sessions(cx);
+    }
+
+    pub fn load_sessions(&mut self, cx: &mut Context<Self>) {
+        if let Some(db) = self.database_service.clone() {
+            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    match db.get_sessions().await {
+                        Ok(sessions) => {
+                            this.update(&mut cx, |state, cx| {
+                                state.conversations = sessions
+                                    .into_iter()
+                                    .map(|s| Conversation {
+                                        id: s.id,
+                                        title: s.title,
+                                        messages: Vec::new(), // Messages loaded on demand
+                                        unread_count: 0,
+                                    })
+                                    .collect();
+
+                                // If no active conversation, select the most recent one
+                                if state.active_conversation_id.is_none() {
+                                    if let Some(first) = state.conversations.first() {
+                                        let id = first.id.clone();
+                                        state.select_conversation(id, cx);
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Err(e) => eprintln!("Failed to load sessions: {}", e),
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    pub fn create_new_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(db) = self.database_service.clone() {
+            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    match db.create_session("New Chat").await {
+                        Ok(id) => {
+                            this.update(&mut cx, |state, cx| {
+                                state.conversations.insert(
+                                    0,
+                                    Conversation {
+                                        id: id.clone(),
+                                        title: "New Chat".to_string(),
+                                        messages: Vec::new(),
+                                        unread_count: 0,
+                                    },
+                                );
+                                state.select_conversation(id, cx);
+                            })
+                            .ok();
+                        }
+                        Err(e) => eprintln!("Failed to create session: {}", e),
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    pub fn load_session_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
+        if let Some(db) = self.database_service.clone() {
+            let session_id_clone = session_id.clone();
+            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    match db.get_messages(&session_id_clone).await {
+                        Ok(db_messages) => {
+                            this.update(&mut cx, |state, cx| {
+                                if let Some(conversation) = state
+                                    .conversations
+                                    .iter_mut()
+                                    .find(|c| c.id == session_id_clone)
+                                {
+                                    conversation.messages = db_messages
+                                        .into_iter()
+                                        .map(|m| {
+                                            let sent_at = NaiveDateTime::parse_from_str(
+                                                &m.created_at,
+                                                "%Y-%m-%d %H:%M:%S",
+                                            )
+                                            .map(|dt| SystemTime::from(dt.and_utc()))
+                                            .unwrap_or(SystemTime::now());
+
+                                            Message {
+                                                id: m.id,
+                                                sender: if m.role == "user" {
+                                                    "Me".to_string()
+                                                } else {
+                                                    "AI".to_string()
+                                                },
+                                                content: m.content,
+                                                sent_at,
+                                                is_me: m.role == "user",
+                                            }
+                                        })
+                                        .collect();
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        }
+                        Err(e) => eprintln!("Failed to load messages: {}", e),
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     /// Load all profiles and credentials from the database into AppState.
@@ -590,8 +676,9 @@ impl AppState {
         .detach();
     }
 
-    pub fn select_conversation(&mut self, conversation_id: usize, cx: &mut Context<Self>) {
-        self.active_conversation_id = Some(conversation_id);
+    pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
+        self.active_conversation_id = Some(conversation_id.clone());
+        self.load_session_messages(conversation_id, cx);
         cx.notify();
     }
 
@@ -621,19 +708,19 @@ impl AppState {
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
-        let conversation_id = match self.active_conversation_id {
-            Some(id) => id,
+        let conversation_id = match &self.active_conversation_id {
+            Some(id) => id.clone(),
             None => return,
         };
 
-        // Add user message
+        // Add user message to UI immediately
         if let Some(conversation) = self
             .conversations
             .iter_mut()
             .find(|c| c.id == conversation_id)
         {
             let message = Message {
-                id: conversation.messages.len() + 1,
+                id: "temp".to_string(), // Temporary ID
                 sender: "Me".to_string(),
                 content: content.clone(),
                 sent_at: SystemTime::now(),
@@ -642,6 +729,40 @@ impl AppState {
             conversation.messages.push(message);
         }
         cx.notify();
+
+        // Save to DB
+        if let Some(db) = self.database_service.clone() {
+            let content_clone = content.clone();
+            let conversation_id_clone = conversation_id.clone();
+            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    match db
+                        .save_message(&conversation_id_clone, "user", &content_clone, None, None)
+                        .await
+                    {
+                        Ok(id) => {
+                            this.update(&mut cx, |state, cx| {
+                                if let Some(conversation) = state
+                                    .conversations
+                                    .iter_mut()
+                                    .find(|c| c.id == conversation_id_clone)
+                                {
+                                    if let Some(msg) = conversation.messages.last_mut() {
+                                        if msg.id == "temp" {
+                                            msg.id = id;
+                                        }
+                                    }
+                                }
+                            })
+                            .ok();
+                        }
+                        Err(e) => eprintln!("Failed to save user message: {}", e),
+                    }
+                }
+            })
+            .detach();
+        }
 
         // Get AI response
         let provider = match &self.llm_provider {
@@ -681,7 +802,7 @@ impl AppState {
             .unwrap_or_else(|| provider.default_model().to_string());
 
         let request = ChatRequest {
-            model,
+            model: model.clone(),
             messages: chat_messages,
             system_prompt: Some("You are a helpful AI assistant.".to_string()),
             temperature: 0.7,
@@ -705,7 +826,7 @@ impl AppState {
                         .find(|c| c.id == conversation_id)
                     {
                         let ai_message = Message {
-                            id: conversation.messages.len() + 1,
+                            id: "temp".to_string(), // Temporary ID
                             sender: "AI".to_string(),
                             content: String::new(), // Start empty
                             sent_at: SystemTime::now(),
@@ -716,6 +837,8 @@ impl AppState {
                     cx.notify();
                 });
 
+                let mut full_response = String::new();
+
                 match provider.chat_stream(request).await {
                     Ok(mut stream) => {
                         println!("[LLM] Stream started");
@@ -723,21 +846,23 @@ impl AppState {
                         while let Some(chunk_result) = stream.next().await {
                             match chunk_result {
                                 Ok(chunk) => {
-                                    let _ = this.update(&mut cx, |state, cx| {
-                                        if let Some(conversation) = state
-                                            .conversations
-                                            .iter_mut()
-                                            .find(|c| c.id == conversation_id)
-                                        {
-                                            if let Some(last_msg) = conversation.messages.last_mut()
+                                    if !chunk.delta.is_empty() {
+                                        full_response.push_str(&chunk.delta);
+                                        let _ = this.update(&mut cx, |state, cx| {
+                                            if let Some(conversation) = state
+                                                .conversations
+                                                .iter_mut()
+                                                .find(|c| c.id == conversation_id)
                                             {
-                                                if !chunk.delta.is_empty() {
+                                                if let Some(last_msg) =
+                                                    conversation.messages.last_mut()
+                                                {
                                                     last_msg.content.push_str(&chunk.delta);
                                                     cx.notify();
                                                 }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                                 Err(e) => {
                                     eprintln!("[LLM] Stream error: {}", e);
@@ -748,6 +873,48 @@ impl AppState {
 
                         let _ = this.update(&mut cx, |state, cx| {
                             state.is_ai_responding = false;
+                            // Save AI response to DB
+                            if let Some(db) = state.database_service.clone() {
+                                let response_clone = full_response.clone();
+                                let model_clone = model.clone();
+                                let conversation_id_clone = conversation_id.clone();
+                                cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
+                                    let mut cx = cx.clone();
+                                    async move {
+                                        match db
+                                            .save_message(
+                                                &conversation_id_clone,
+                                                "assistant",
+                                                &response_clone,
+                                                Some(model_clone),
+                                                None,
+                                            )
+                                            .await
+                                        {
+                                            Ok(id) => {
+                                                this.update(&mut cx, |state, cx| {
+                                                    if let Some(conversation) = state
+                                                        .conversations
+                                                        .iter_mut()
+                                                        .find(|c| c.id == conversation_id_clone)
+                                                    {
+                                                        if let Some(msg) =
+                                                            conversation.messages.last_mut()
+                                                        {
+                                                            if msg.id == "temp" {
+                                                                msg.id = id;
+                                                            }
+                                                        }
+                                                    }
+                                                })
+                                                .ok();
+                                            }
+                                            Err(e) => eprintln!("Failed to save AI message: {}", e),
+                                        }
+                                    }
+                                })
+                                .detach();
+                            }
                             cx.notify();
                         });
                         println!("[LLM] Stream finished");
