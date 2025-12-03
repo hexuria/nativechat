@@ -135,6 +135,12 @@ impl Render for ChatView {
                             ),
                     ),
             )
-            .child(h_flex().flex_shrink_0().child(self.input.clone())) // Removed p_4 to avoid double padding
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_4()
+                    .pb_4()
+                    .child(self.input.clone()),
+            )
     }
 }
