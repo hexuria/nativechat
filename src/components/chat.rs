@@ -1,17 +1,13 @@
-use std::rc::Rc;
-
 use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::state::AppState;
 use gpui::*;
-use ui::{ActiveTheme, avatar::Avatar, h_flex, label::Label, v_flex, v_virtual_list};
+use ui::{ActiveTheme, avatar::Avatar, h_flex, label::Label, v_flex};
 
 pub struct ChatView {
     input: Entity<MessageInput>,
     state: Entity<AppState>,
     scroll_handle: ScrollHandle,
-    item_sizes: Rc<Vec<Size<Pixels>>>,
-    last_layout_width: Option<Pixels>,
 }
 
 impl ChatView {
@@ -46,78 +42,12 @@ impl ChatView {
             input,
             state,
             scroll_handle,
-            item_sizes: Rc::new(Vec::new()),
-            last_layout_width: None,
         }
-    }
-
-    fn measure_messages(
-        &mut self,
-        container_width: Pixels,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let state = self.state.read(cx);
-        let active_conversation = state
-            .active_conversation_id
-            .and_then(|id| state.conversations.iter().find(|c| c.id == id));
-
-        let messages = if let Some(conversation) = active_conversation {
-            &conversation.messages
-        } else {
-            self.item_sizes = Rc::new(Vec::new());
-            return;
-        };
-
-        // If messages count hasn't changed and width hasn't changed, skip
-        if messages.len() == self.item_sizes.len()
-            && Some(container_width) == self.last_layout_width
-        {
-            return;
-        }
-
-        let theme = cx.theme().clone();
-        let mut sizes = Vec::with_capacity(messages.len());
-
-        // We need to clone messages to iterate because we need mutable access to cx for layout
-        let messages_clone = messages.clone();
-
-        for msg in messages_clone {
-            let (bg_color, text_color) = if msg.is_me {
-                (theme.primary, theme.primary_foreground)
-            } else {
-                (theme.secondary, theme.secondary_foreground)
-            };
-
-            let mut element = MessageBubble::new(msg.content.clone())
-                .is_me(msg.is_me)
-                .bg_color(bg_color)
-                .text_color(text_color)
-                .timestamp(msg.formatted_time())
-                .into_any_element();
-
-            let available_space = size(
-                AvailableSpace::Definite(container_width),
-                AvailableSpace::MinContent,
-            );
-
-            let element_size = element.layout_as_root(available_space, window, cx);
-
-            // Add gap between items (16px for gap_4) plus the element height
-            let item_height = element_size.height + px(16.0);
-            sizes.push(size(container_width, item_height));
-        }
-
-        self.item_sizes = Rc::new(sizes);
-        self.last_layout_width = Some(container_width);
     }
 }
 
 impl Render for ChatView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Measure messages before rendering to avoid borrow checker issues
-        self.measure_messages(px(800.0), window, cx); // Assuming max width 800 for now, ideally dynamic
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let state = self.state.read(cx);
 
