@@ -9,6 +9,7 @@ use ui::{
 pub struct ChatView {
     input: Entity<MessageInput>,
     state: Entity<AppState>,
+    scroll_handle: ScrollHandle,
 }
 
 impl ChatView {
@@ -24,9 +25,26 @@ impl ChatView {
             })
         });
 
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        let scroll_handle = ScrollHandle::new();
 
-        Self { input, state }
+        cx.observe(&state, {
+            let scroll_handle = scroll_handle.clone();
+            move |_, state, cx| {
+                let state = state.read(cx);
+                if state.is_ai_responding {
+                    // Scroll to bottom during streaming
+                    scroll_handle.scroll_to_bottom();
+                }
+                cx.notify();
+            }
+        })
+        .detach();
+
+        Self {
+            input,
+            state,
+            scroll_handle,
+        }
     }
 }
 
@@ -60,29 +78,39 @@ impl Render for ChatView {
                     .relative()
                     .child(
                         // Messages Area - Full width/height, scrollable
-                        v_flex()
+                        div()
+                            .id("chat-scroll-container")
+                            .track_scroll(&self.scroll_handle)
                             .size_full()
-                            .scrollable(ScrollbarAxis::Vertical)
-                            .pt(px(80.0)) // Padding top to clear the absolute header (60px header + 20px padding)
-                            .pb_4()
-                            .items_center() // Center the message content wrapper
+                            .overflow_scroll()
                             .child(
-                                // Message Content Wrapper - Max width constraint
-                                div().w_full().max_w(px(800.0)).px_4().child(
-                                    v_flex().gap_4().children(messages.into_iter().map(|msg| {
-                                        let (bg_color, text_color) = if msg.is_me {
-                                            (theme.primary, theme.primary_foreground)
-                                        } else {
-                                            (theme.secondary, theme.secondary_foreground)
-                                        };
+                                v_flex()
+                                    .pt(px(80.0)) // Padding top to clear the absolute header (60px header + 20px padding)
+                                    .pb_4()
+                                    .items_center() // Center the message content wrapper
+                                    .child(
+                                        // Message Content Wrapper - Max width constraint
+                                        div().w_full().max_w(px(800.0)).px_4().child(
+                                            v_flex().gap_4().children(messages.into_iter().map(
+                                                |msg| {
+                                                    let (bg_color, text_color) = if msg.is_me {
+                                                        (theme.primary, theme.primary_foreground)
+                                                    } else {
+                                                        (
+                                                            theme.secondary,
+                                                            theme.secondary_foreground,
+                                                        )
+                                                    };
 
-                                        MessageBubble::new(msg.content.clone())
-                                            .is_me(msg.is_me)
-                                            .bg_color(bg_color)
-                                            .text_color(text_color)
-                                            .timestamp(msg.formatted_time())
-                                    })),
-                                ),
+                                                    MessageBubble::new(msg.content.clone())
+                                                        .is_me(msg.is_me)
+                                                        .bg_color(bg_color)
+                                                        .text_color(text_color)
+                                                        .timestamp(msg.formatted_time())
+                                                },
+                                            )),
+                                        ),
+                                    ),
                             ),
                     )
                     .child(
