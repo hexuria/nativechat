@@ -8,6 +8,7 @@ use crate::services::database::{
 };
 use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
+use futures::StreamExt;
 use gpui::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -685,7 +686,7 @@ impl AppState {
             system_prompt: Some("You are a helpful AI assistant.".to_string()),
             temperature: 0.7,
             max_tokens: Some(2048),
-            stream: false,
+            stream: true,
         };
 
         self.is_ai_responding = true;
@@ -695,44 +696,75 @@ impl AppState {
             let mut cx = cx.clone();
             async move {
                 println!("[LLM] Sending request to AI...");
-                match provider.chat(request).await {
-                    Ok(response) => {
-                        println!("[LLM] Got response: {:.100}...", response.content);
-                        let _ = this.update(&mut cx, |state, cx| {
-                            if let Some(conversation) = state
-                                .conversations
-                                .iter_mut()
-                                .find(|c| c.id == conversation_id)
-                            {
-                                let ai_message = Message {
-                                    id: conversation.messages.len() + 1,
-                                    sender: "AI".to_string(),
-                                    content: response.content,
-                                    sent_at: SystemTime::now(),
-                                    is_me: false,
-                                };
-                                conversation.messages.push(ai_message);
+
+                // Create the AI message placeholder first
+                let _ = this.update(&mut cx, |state, cx| {
+                    if let Some(conversation) = state
+                        .conversations
+                        .iter_mut()
+                        .find(|c| c.id == conversation_id)
+                    {
+                        let ai_message = Message {
+                            id: conversation.messages.len() + 1,
+                            sender: "AI".to_string(),
+                            content: String::new(), // Start empty
+                            sent_at: SystemTime::now(),
+                            is_me: false,
+                        };
+                        conversation.messages.push(ai_message);
+                    }
+                    cx.notify();
+                });
+
+                match provider.chat_stream(request).await {
+                    Ok(mut stream) => {
+                        println!("[LLM] Stream started");
+
+                        while let Some(chunk_result) = stream.next().await {
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    let _ = this.update(&mut cx, |state, cx| {
+                                        if let Some(conversation) = state
+                                            .conversations
+                                            .iter_mut()
+                                            .find(|c| c.id == conversation_id)
+                                        {
+                                            if let Some(last_msg) = conversation.messages.last_mut()
+                                            {
+                                                if !chunk.delta.is_empty() {
+                                                    last_msg.content.push_str(&chunk.delta);
+                                                    cx.notify();
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("[LLM] Stream error: {}", e);
+                                    // Append error to message or show error
+                                }
                             }
+                        }
+
+                        let _ = this.update(&mut cx, |state, cx| {
                             state.is_ai_responding = false;
                             cx.notify();
                         });
+                        println!("[LLM] Stream finished");
                     }
                     Err(e) => {
-                        eprintln!("[LLM] Error: {}", e);
+                        eprintln!("[LLM] Error starting stream: {}", e);
                         let _ = this.update(&mut cx, |state, cx| {
                             if let Some(conversation) = state
                                 .conversations
                                 .iter_mut()
                                 .find(|c| c.id == conversation_id)
                             {
-                                let error_message = Message {
-                                    id: conversation.messages.len() + 1,
-                                    sender: "System".to_string(),
-                                    content: format!("Error: {}", e),
-                                    sent_at: SystemTime::now(),
-                                    is_me: false,
-                                };
-                                conversation.messages.push(error_message);
+                                // If we failed to start stream, we might want to remove the empty message
+                                // or update it with error
+                                if let Some(last_msg) = conversation.messages.last_mut() {
+                                    last_msg.content = format!("Error: {}", e);
+                                }
                             }
                             state.is_ai_responding = false;
                             cx.notify();

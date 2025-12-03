@@ -284,9 +284,26 @@ impl LlmProvider for GeminiProvider {
                 match chunk_result {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(pos) = buffer.find("\n\n") {
+                        loop {
+                            let p1 = buffer.find("\n\n");
+                            let p2 = buffer.find("\r\n\r\n");
+
+                            let (pos, len) = match (p1, p2) {
+                                (Some(i), Some(j)) => {
+                                    if i < j {
+                                        (i, 2)
+                                    } else {
+                                        (j, 4)
+                                    }
+                                }
+                                (Some(i), None) => (i, 2),
+                                (None, Some(j)) => (j, 4),
+                                (None, None) => break,
+                            };
+
                             let event = buffer[..pos].to_string();
-                            buffer = buffer[pos + 2..].to_string();
+                            buffer = buffer[pos + len..].to_string();
+
                             if let Some(data) = event.strip_prefix("data: ") {
                                 if let Ok(resp) = serde_json::from_str::<GeminiResponse>(data) {
                                     if let Some(candidates) = resp.candidates {
