@@ -25,26 +25,9 @@ use ui::{
     tooltip::Tooltip,
     v_flex,
 };
-use ui::select::{Select, SelectState, SelectItem, SearchableVec, SelectEvent};
 use ui::IndexPath;
 
-#[derive(Clone, PartialEq, Debug)]
-struct ProfileItem {
-    id: Option<i64>, // None for "Create New Profile", Some(id) for actual profiles
-    name: String,
-}
 
-impl SelectItem for ProfileItem {
-    type Value = Option<i64>;
-
-    fn title(&self) -> SharedString {
-        SharedString::from(self.name.clone())
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.id
-    }
-}
 
 actions!(chat, [SubmitMessage]);
 
@@ -62,8 +45,6 @@ pub struct MessageInput {
     is_voice_mode_open: bool,
     is_account_settings_open: bool,
     is_profile_settings_open: bool,
-    profile_select: Entity<SelectState<SearchableVec<ProfileItem>>>,
-    cached_profiles: Vec<ProfileItem>,
 }
 
 impl MessageInput {
@@ -82,31 +63,6 @@ impl MessageInput {
         let is_account_settings_open = app_state.is_account_settings_open;
         let is_profile_settings_open = app_state.is_profile_settings_open;
 
-        // Initialize profile select items
-        let mut profile_items: Vec<ProfileItem> = app_state.db_profiles.iter().map(|p| ProfileItem {
-            id: Some(p.id),
-            name: p.name.chars().take(30).collect::<String>(),
-        }).collect();
-        
-        // Add "Create New Profile" option
-        profile_items.push(ProfileItem {
-            id: None,
-            name: "Create New Profile...".to_string(),
-        });
-
-        let profile_items_vec = SearchableVec::new(profile_items.clone());
-        
-        // Determine initial selection
-        let initial_selection = if let Some(active_id) = app_state.active_profile_id {
-             profile_items_vec.items().iter().position(|p| p.id == Some(active_id)).map(|ix| IndexPath::default().row(ix))
-        } else {
-            None
-        };
-
-        let profile_select = cx.new(|cx| {
-            SelectState::new(profile_items_vec, initial_selection, window, cx)
-                .searchable(true)
-        });
 
         let this = Self {
             state: state.clone(),
@@ -119,96 +75,17 @@ impl MessageInput {
             voice_mode: false,
             voice_wave: None,
             audio_input: None,
-            profile_select: profile_select.clone(),
-            cached_profiles: profile_items,
         };
 
         // Subscribe to state changes to update cached values and notify only when relevant fields change
         cx.observe(&state, |this: &mut Self, state, cx| {
             let mut changed = false;
-            let profiles;
-            let active_id;
-            
             {
                 let state = state.read(cx);
                 sync_field_clone!(this, state, selected_apps, changed);
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_account_settings_open, changed);
                 sync_field_copy!(this, state, is_profile_settings_open, changed);
-                
-                // Clone profiles to use after dropping state read lock
-                profiles = state.db_profiles.clone();
-                active_id = state.active_profile_id;
-            }
-
-            // Sync profiles
-            // Convert db_profiles to ProfileItems (excluding "Create New Profile" for comparison)
-            let new_profile_items: Vec<ProfileItem> = profiles.iter().map(|p| ProfileItem {
-                id: Some(p.id),
-                name: p.name.chars().take(30).collect::<String>(),
-            }).collect();
-
-            // Compare with cached profiles (excluding the last "Create New Profile" item if present)
-            // Actually, cached_profiles includes "Create New Profile".
-            // So we should compare `new_profile_items` with `cached_profiles` excluding the last one.
-            let cached_len = this.cached_profiles.len();
-            let profiles_changed = if cached_len > 0 {
-                let cached_real_profiles = &this.cached_profiles[0..cached_len - 1];
-                if cached_real_profiles.len() != new_profile_items.len() {
-                    true
-                } else {
-                    cached_real_profiles.iter().zip(new_profile_items.iter()).any(|(a, b)| a != b)
-                }
-            } else {
-                true // Should not happen as we always add "Create New Profile"
-            };
-
-            if profiles_changed {
-                let mut full_items = new_profile_items.clone();
-                full_items.push(ProfileItem {
-                    id: None,
-                    name: "Create New Profile...".to_string(),
-                });
-                
-                this.cached_profiles = full_items.clone();
-                let profile_items_vec = SearchableVec::new(full_items);
-                this.profile_select.update(cx, |select, cx| {
-                    select.set_items(profile_items_vec, cx);
-                });
-                changed = true;
-            }
-
-            // Sync active profile selection
-            let current_index = this.profile_select.read(cx).selected_index(cx);
-            let current_profile = current_index.and_then(|ix| this.cached_profiles.get(ix.row));
-            
-            // Find the expected profile item based on active_id
-            let expected_selection = if let Some(id) = active_id {
-                 profiles.iter().find(|p| p.id == id).map(|p| ProfileItem {
-                    id: Some(p.id),
-                    name: p.name.chars().take(30).collect::<String>(),
-                })
-            } else {
-                None
-            };
-
-            // Check if we need to update the selection (either ID changed OR name changed)
-            if let Some(expected) = &expected_selection {
-                if current_profile != Some(expected) {
-                     // Find index of this item in the cached list
-                     if let Some(index) = this.cached_profiles.iter().position(|p| p == expected) {
-                         this.profile_select.update(cx, |select, cx| {
-                             select.set_selected_index_deferred(Some(IndexPath::default().row(index)), cx);
-                         });
-                         changed = true;
-                     }
-                }
-            } else if current_profile.is_some() {
-                // Deselect if no active profile
-                this.profile_select.update(cx, |select, cx| {
-                     select.set_selected_index_deferred(None, cx);
-                });
-                changed = true;
             }
 
             if changed {
@@ -229,25 +106,7 @@ impl MessageInput {
         })
         .detach();
 
-        // Subscribe to profile select events
-        cx.subscribe(&profile_select, |this, _, event: &SelectEvent<SearchableVec<ProfileItem>>, cx| {
-            if let SelectEvent::Confirm(Some(value)) = event {
-                if let Some(profile_id) = value {
-                    // Selected an existing profile
-                    this.state.update(cx, |state, cx| {
-                        state.select_db_profile(*profile_id, cx);
-                    });
-                } else {
-                    // Selected "Create New Profile..."
-                    this.state.update(cx, |state, cx| {
-                        if !state.is_profile_settings_open {
-                             state.toggle_profile_settings(cx);
-                        }
-                    });
-                }
-            }
-        })
-        .detach();
+
 
         this
     }
@@ -321,15 +180,7 @@ impl Render for MessageInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state_model = self.state.clone();
         
-        // Sync active profile selection if needed
-        // We do this before getting theme to avoid immutable borrow of cx
-        let active_id = state_model.read(cx).active_profile_id;
-        let current_selection = self.profile_select.read(cx).selected_value().cloned().flatten();
-        if active_id != current_selection {
-            self.profile_select.update(cx, |select, cx| {
-                select.set_selected_value(&active_id, _window, cx);
-            });
-        }
+
 
         let theme = cx.theme();
         let secondary = theme.secondary;
@@ -484,17 +335,7 @@ impl Render for MessageInput {
                                 .gap_2()
                                 .children(
                                     std::iter::once(
-                                        div()
-                                            .min_w(px(160.0))
-                                            .child(
-                                                Select::new(&self.profile_select)
-                                                    .id("profile-select")
-                                                    .placeholder("Select Profile")
-                                                    .search_placeholder("Search profile...")
-                                                    .anchor(Corner::BottomLeft)
-                                                    .w_full()
-                                            )
-                                            .into_any_element()
+                                        div().into_any_element() // Placeholder or remove entirely if not needed
                                     )
                                     .chain({
                                         let (tool_calls, rest): (Vec<_>, Vec<_>) = selected_apps.iter()

@@ -2,12 +2,33 @@ use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::state::AppState;
 use gpui::*;
-use ui::{ActiveTheme, avatar::Avatar, h_flex, label::Label, v_flex};
+use ui::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
+use ui::{ActiveTheme, IndexPath, h_flex, v_flex};
+
+#[derive(Clone, PartialEq, Debug)]
+struct ProfileItem {
+    id: Option<i64>, // None for "Create New Profile", Some(id) for actual profiles
+    name: String,
+}
+
+impl SelectItem for ProfileItem {
+    type Value = Option<i64>;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(self.name.clone())
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+}
 
 pub struct ChatView {
     input: Entity<MessageInput>,
     state: Entity<AppState>,
     scroll_handle: ScrollHandle,
+    profile_select: Entity<SelectState<SearchableVec<ProfileItem>>>,
+    cached_profiles: Vec<ProfileItem>,
 }
 
 impl ChatView {
@@ -25,6 +46,48 @@ impl ChatView {
 
         let scroll_handle = ScrollHandle::new();
 
+        // Initialize profile select items
+        let app_state = state.read(cx);
+        let mut profile_items: Vec<ProfileItem> = app_state
+            .db_profiles
+            .iter()
+            .map(|p| ProfileItem {
+                id: Some(p.id),
+                name: p.name.chars().take(30).collect::<String>(),
+            })
+            .collect();
+
+        // Add "Create New Profile" option
+        profile_items.push(ProfileItem {
+            id: None,
+            name: "Create New Profile...".to_string(),
+        });
+
+        let profile_items_vec = SearchableVec::new(profile_items.clone());
+
+        // Determine initial selection
+        let initial_selection = if let Some(active_id) = app_state.active_profile_id {
+            profile_items_vec
+                .items()
+                .iter()
+                .position(|p| p.id == Some(active_id))
+                .map(|ix| IndexPath::default().row(ix))
+        } else {
+            None
+        };
+
+        let profile_select = cx.new(|cx| {
+            SelectState::new(profile_items_vec, initial_selection, window, cx).searchable(true)
+        });
+
+        let this = Self {
+            input,
+            state: state.clone(),
+            scroll_handle: scroll_handle.clone(),
+            profile_select: profile_select.clone(),
+            cached_profiles: profile_items,
+        };
+
         cx.observe(&state, {
             let scroll_handle = scroll_handle.clone();
             move |_, state, cx| {
@@ -38,19 +101,142 @@ impl ChatView {
         })
         .detach();
 
-        Self {
-            input,
-            state,
-            scroll_handle,
-        }
+        // Subscribe to state changes to update cached values and notify only when relevant fields change
+        cx.observe(&state, |this: &mut Self, state, cx| {
+            let mut changed = false;
+            let profiles;
+            let active_id;
+
+            {
+                let state = state.read(cx);
+                // Clone profiles to use after dropping state read lock
+                profiles = state.db_profiles.clone();
+                active_id = state.active_profile_id;
+            }
+
+            // Sync profiles
+            let new_profile_items: Vec<ProfileItem> = profiles
+                .iter()
+                .map(|p| ProfileItem {
+                    id: Some(p.id),
+                    name: p.name.chars().take(30).collect::<String>(),
+                })
+                .collect();
+
+            let cached_len = this.cached_profiles.len();
+            let profiles_changed = if cached_len > 0 {
+                let cached_real_profiles = &this.cached_profiles[0..cached_len - 1];
+                if cached_real_profiles.len() != new_profile_items.len() {
+                    true
+                } else {
+                    cached_real_profiles
+                        .iter()
+                        .zip(new_profile_items.iter())
+                        .any(|(a, b)| a != b)
+                }
+            } else {
+                true
+            };
+
+            if profiles_changed {
+                let mut full_items = new_profile_items.clone();
+                full_items.push(ProfileItem {
+                    id: None,
+                    name: "Create New Profile...".to_string(),
+                });
+
+                this.cached_profiles = full_items.clone();
+                let profile_items_vec = SearchableVec::new(full_items);
+                this.profile_select.update(cx, |select, cx| {
+                    select.set_items(profile_items_vec, cx);
+                });
+                changed = true;
+            }
+
+            // Sync active profile selection
+            let current_index = this.profile_select.read(cx).selected_index(cx);
+            let current_profile = current_index.and_then(|ix| this.cached_profiles.get(ix.row));
+
+            let expected_selection = if let Some(id) = active_id {
+                profiles.iter().find(|p| p.id == id).map(|p| ProfileItem {
+                    id: Some(p.id),
+                    name: p.name.chars().take(30).collect::<String>(),
+                })
+            } else {
+                None
+            };
+
+            if let Some(expected) = &expected_selection {
+                if current_profile != Some(expected) {
+                    if let Some(index) = this.cached_profiles.iter().position(|p| p == expected) {
+                        this.profile_select.update(cx, |select, cx| {
+                            select.set_selected_index_deferred(
+                                Some(IndexPath::default().row(index)),
+                                cx,
+                            );
+                        });
+                        changed = true;
+                    }
+                }
+            } else if current_profile.is_some() {
+                this.profile_select.update(cx, |select, cx| {
+                    select.set_selected_index_deferred(None, cx);
+                });
+                changed = true;
+            }
+
+            if changed {
+                cx.notify();
+            }
+        })
+        .detach();
+
+        // Subscribe to profile select events
+        cx.subscribe(
+            &profile_select,
+            |this: &mut Self, _, event: &SelectEvent<SearchableVec<ProfileItem>>, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    if let Some(profile_id) = value {
+                        // Selected an existing profile
+                        this.state.update(cx, |state, cx| {
+                            state.select_db_profile(*profile_id, cx);
+                        });
+                    } else {
+                        // Selected "Create New Profile..."
+                        this.state.update(cx, |state, cx| {
+                            if !state.is_profile_settings_open {
+                                state.toggle_profile_settings(cx);
+                            }
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+
+        this
     }
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let state = self.state.read(cx);
 
+        // Sync active profile selection if needed
+        let active_id = self.state.read(cx).active_profile_id;
+        let current_selection = self
+            .profile_select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .flatten();
+        if active_id != current_selection {
+            self.profile_select.update(cx, |select, cx| {
+                select.set_selected_value(&active_id, window, cx);
+            });
+        }
+
+        let state = self.state.read(cx);
         let active_conversation = state
             .active_conversation_id
             .and_then(|id| state.conversations.iter().find(|c| c.id == id));
@@ -60,10 +246,6 @@ impl Render for ChatView {
         } else {
             vec![]
         };
-
-        let title = active_conversation
-            .map(|c| c.title.clone())
-            .unwrap_or_else(|| "Select a conversation".to_string());
 
         v_flex()
             .size_full()
@@ -124,11 +306,16 @@ impl Render for ChatView {
                             .px_4()
                             .bg(theme.background.opacity(0.9)) // Slight transparency for glass effect if desired, or solid
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(Avatar::new())
-                                    .child(Label::new(title)),
+                                h_flex().gap_2().items_center().child(
+                                    div().w(px(200.0)).child(
+                                        Select::new(&self.profile_select)
+                                            .id("profile-select")
+                                            .placeholder("Select Profile")
+                                            .search_placeholder("Search profile...")
+                                            .anchor(Corner::TopLeft)
+                                            .w_full(),
+                                    ),
+                                ),
                             )
                             .child(
                                 h_flex().gap_2().items_center(), // Add other header actions here if needed
