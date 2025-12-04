@@ -389,6 +389,7 @@ impl CodeBlock {
 /// A context for rendering nodes, contains link references.
 #[derive(Default, Clone, PartialEq)]
 pub(crate) struct NodeContext {
+    pub(crate) id: SharedString,
     pub(crate) link_refs: HashMap<SharedString, LinkMark>,
     pub(crate) style: TextViewStyle,
 }
@@ -912,7 +913,6 @@ impl Node {
                                 items.push(
                                     h_flex()
                                         .w_full()
-                                        .flex_wrap()
                                         .relative()
                                         .items_start()
                                         .content_start()
@@ -1105,7 +1105,7 @@ impl Node {
         }
 
         div()
-            .id(SharedString::from(format!("markdown-list-{}", width)))
+            .id(SharedString::from(format!("markdown-list-{}", node_cx.id)))
             .size_full()
             .child(
                 gpui::list(list_state, move |ix, window, cx| {

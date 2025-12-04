@@ -116,6 +116,7 @@ enum Update {
 }
 
 struct UpdateFuture {
+    id: SharedString,
     type_: TextViewType,
     highlight_theme: Arc<HighlightTheme>,
     current_style: TextViewStyle,
@@ -128,6 +129,7 @@ struct UpdateFuture {
 
 impl UpdateFuture {
     fn new(
+        id: SharedString,
         type_: TextViewType,
         style: TextViewStyle,
         text: SharedString,
@@ -137,6 +139,7 @@ impl UpdateFuture {
         delay: Duration,
     ) -> Self {
         Self {
+            id,
             type_,
             highlight_theme,
             current_style: style,
@@ -180,6 +183,7 @@ impl Future for UpdateFuture {
             match self.timer.poll_next(cx) {
                 Poll::Ready(Some(_)) => {
                     let res = parse_content(
+                        self.id.clone(),
                         self.type_,
                         &self.current_text,
                         self.current_style.clone(),
@@ -562,7 +566,13 @@ impl Element for TextView {
             let (tx, rx) = smol::channel::unbounded::<Update>();
             let (tx_result, rx_result) =
                 smol::channel::unbounded::<Result<ParsedContent, SharedString>>();
-            let parsed_result = parse_content(type_, &text, style.clone(), &highlight_theme);
+            let parsed_result = parse_content(
+                SharedString::from(self.id.to_string()),
+                type_,
+                &text,
+                style.clone(),
+                &highlight_theme,
+            );
 
             self.state.update(cx, {
                 let tx = tx.clone();
@@ -595,6 +605,7 @@ impl Element for TextView {
             .detach();
 
             cx.background_spawn(UpdateFuture::new(
+                SharedString::from(self.id.to_string()),
                 type_,
                 style,
                 text,
@@ -769,12 +780,14 @@ impl Element for TextView {
 }
 
 fn parse_content(
+    id: SharedString,
     type_: TextViewType,
     text: &str,
     style: TextViewStyle,
     highlight_theme: &HighlightTheme,
 ) -> Result<ParsedContent, SharedString> {
     let mut node_cx = NodeContext {
+        id,
         style: style.clone(),
         ..NodeContext::default()
     };
