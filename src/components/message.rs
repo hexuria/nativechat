@@ -88,7 +88,7 @@ impl RenderOnce for MessageBubble {
                         div()
                             .flex_1()
                             .w_full()
-                            .overflow_x_hidden()
+                            .overflow_hidden()
                             .child(
                                 ui::text::TextView::markdown(
                                     ElementId::Name(self.message_id.clone().into()),
