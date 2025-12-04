@@ -1,6 +1,6 @@
 use crate::components::message_actions::MessageActions;
 use gpui::{prelude::FluentBuilder, *};
-use ui::{ActiveTheme, h_flex, text::Text, v_flex};
+use ui::{ActiveTheme, h_flex, v_flex};
 
 #[derive(Clone, IntoElement)]
 pub struct MessageBubble {
@@ -46,18 +46,18 @@ impl MessageBubble {
 }
 
 impl RenderOnce for MessageBubble {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         if self.is_me {
             // User message: gray bubble on the right (ChatGPT style)
             // For now, keep user messages as plain text or also use Markdown if desired.
             // Let's use Markdown for consistency but keep the bubble styling.
             h_flex().w_full().justify_end().child(
                 div()
-                    .max_w(px(360.0))
                     .px_4()
                     .py_2p5()
                     .rounded(px(20.0))
                     .bg(cx.theme().secondary) // Use theme secondary (grayish)
+                    .max_w_full()
                     .child(
                         v_flex()
                             .gap_0p5()
@@ -65,6 +65,7 @@ impl RenderOnce for MessageBubble {
                                 div()
                                     .text_sm()
                                     .text_color(cx.theme().secondary_foreground)
+                                    .overflow_x_hidden()
                                     .child(self.text), // User text usually doesn't need complex markdown, but we could swap this too.
                             )
                             .when_some(self.timestamp, |this, timestamp| {
@@ -78,42 +79,34 @@ impl RenderOnce for MessageBubble {
                     ),
             )
         } else {
-            // AI message: plain text with action buttons (No background, no padding)
             h_flex().w_full().justify_start().child(
                 v_flex()
-                    .flex_1() // Use flex_1 instead of w_full to allow proper shrinking
-                    .gap_2() // Space between message and actions
-                    // Message content - Markdown
+                    .flex_1()
+                    .gap_2()
+                    .max_w_full()
                     .child(
                         div()
-                            .flex_1() // Use flex_1 for proper flex behavior
-                            .pr_4() // Add some right padding for readability
+                            .flex_1()
+                            .w_full()
+                            .overflow_x_hidden()
                             .child(
-                                v_flex()
-                                    .w_full()
-                                    .gap_0p5()
-                                    .child(
-                                        div().w_full().child(
-                                            ui::text::TextView::markdown(
-                                                ElementId::Name(self.message_id.clone().into()),
-                                                self.text.clone(),
-                                                _window,
-                                                cx,
-                                            )
-                                            .selectable(false),
-                                        ),
-                                    )
-                                    .when_some(self.timestamp, |this, timestamp| {
-                                        this.child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(timestamp),
-                                        )
-                                    }),
-                            ),
+                                ui::text::TextView::markdown(
+                                    ElementId::Name(self.message_id.clone().into()),
+                                    self.text.clone(),
+                                    window,
+                                    cx,
+                                )
+                                .selectable(true),
+                            )
+                            .when_some(self.timestamp, |this, timestamp| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(timestamp),
+                                )
+                            }),
                     )
-                    // Action buttons
                     .child(MessageActions::new(self.message_id)),
             )
         }
