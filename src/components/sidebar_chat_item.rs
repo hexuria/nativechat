@@ -3,7 +3,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
 };
 use std::rc::Rc;
-use ui::{ActiveTheme, Icon, IconName, StyledExt, h_flex, input::Input, v_flex};
+use ui::{ActiveTheme, Icon, IconName, StyledExt, colors, h_flex, input::Input, v_flex};
 
 #[derive(IntoElement)]
 pub struct ChatSessionItem {
@@ -164,7 +164,7 @@ impl RenderOnce for ChatSessionItem {
                     this.on_click(move |_, window, cx| callback(window, cx))
                 })
                 .child(
-                    Icon::new(IconName::SquareTerminal)
+                    Icon::new(IconName::Session)
                         .size_4()
                         .when(self.is_active, |s| {
                             s.text_color(theme.sidebar_accent_foreground)
@@ -225,7 +225,7 @@ impl RenderOnce for ChatSessionItem {
                                         .py_1()
                                         .rounded_md()
                                         .bg(theme.danger)
-                                        .text_color(theme.danger_foreground)
+                                        .text_color(colors::white())
                                         .text_xs()
                                         .child("Delete")
                                         .on_click({
@@ -263,7 +263,7 @@ impl RenderOnce for ChatSessionItem {
                         .gap_2()
                         .items_center()
                         .child(div().flex_1().when_some(self.input, |this, state| {
-                            this.child(Input::new(&state).appearance(false))
+                            this.child(Input::new(&state).bordered(false))
                         }))
                         .child(
                             div()
@@ -272,7 +272,7 @@ impl RenderOnce for ChatSessionItem {
                                 .p_1()
                                 .rounded_md()
                                 .hover(|s| s.bg(theme.sidebar_accent))
-                                .child(Icon::new(IconName::Check).size_3())
+                                .child(Icon::new(IconName::Check).size_4())
                                 .on_click({
                                     let callback = self.on_submit_edit.clone();
                                     move |_, window, cx| {
@@ -290,7 +290,7 @@ impl RenderOnce for ChatSessionItem {
                                 .p_1()
                                 .rounded_md()
                                 .hover(|s| s.bg(theme.sidebar_accent))
-                                .child(Icon::new(IconName::Close).size_3())
+                                .child(Icon::new(IconName::Close).size_4())
                                 .on_click({
                                     let callback = self.on_cancel_edit.clone();
                                     move |_, window, cx| {
@@ -334,7 +334,7 @@ impl RenderOnce for ChatSessionItem {
                             .items_center()
                             .overflow_hidden()
                             .child(
-                                Icon::new(IconName::SquareTerminal)
+                                Icon::new(IconName::Session)
                                     .size_4()
                                     .text_color(theme.muted_foreground),
                             )
@@ -365,15 +365,13 @@ impl RenderOnce for ChatSessionItem {
                                             .p_1()
                                             .rounded_md()
                                             .hover(|s| s.bg(theme.background))
-                                            .child(Icon::new(IconName::Replace).size_3())
+                                            .child(Icon::new(IconName::Replace).size_4())
                                             .on_click({
                                                 let callback = self.on_edit.clone();
                                                 move |_, window, cx| {
-                                                    println!("[DEBUG] Edit button clicked");
                                                     cx.stop_propagation();
                                                     if let Some(cb) = callback.as_ref() {
                                                         cb(window, cx);
-                                                        println!("[DEBUG] Edit callback invoked");
                                                     }
                                                 }
                                             }),
@@ -384,19 +382,14 @@ impl RenderOnce for ChatSessionItem {
                                             .cursor_pointer()
                                             .p_1()
                                             .rounded_md()
-                                            .hover(|s| {
-                                                s.bg(theme.danger)
-                                                    .text_color(theme.danger_foreground)
-                                            })
-                                            .child(Icon::new(IconName::Delete).size_3())
+                                            .hover(|s| s.bg(colors::red_400().opacity(0.9)))
+                                            .child(Icon::new(IconName::Delete).size_4())
                                             .on_click({
                                                 let callback = self.on_delete.clone();
                                                 move |_, window, cx| {
-                                                    println!("[DEBUG] Delete button clicked");
                                                     cx.stop_propagation();
                                                     if let Some(cb) = callback.as_ref() {
                                                         cb(window, cx);
-                                                        println!("[DEBUG] Delete callback invoked");
                                                     }
                                                 }
                                             }),
