@@ -1,5 +1,5 @@
 use crate::actions::{
-    About, Hide, HideOthers, Minimize, ShowAll, ToggleSidebar, ToggleTheme, Zoom,
+    About, Hide, HideOthers, Minimize, NewChat, ShowAll, ToggleSidebar, ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
 use gpui::prelude::*;
@@ -93,6 +93,12 @@ impl Render for RootView {
                 let state = self.state.clone();
                 move |_: &ToggleTheme, _window: &mut Window, cx: &mut App| {
                     state.update(cx, |state, cx| state.toggle_theme(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &NewChat, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.create_new_session(cx));
                 }
             })
             .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {
