@@ -7,7 +7,7 @@ use std::{
 use gpui::{
     div, img, prelude::FluentBuilder as _, px, relative, rems, AnyElement, App, DefiniteLength,
     Div, Element, ElementId, FontStyle, FontWeight, Half, HighlightStyle, InteractiveElement as _,
-    IntoElement, Length, ListState, ObjectFit, ParentElement, SharedString, SharedUri,
+    IntoElement, Length, ListState, ObjectFit, ParentElement, Pixels, SharedString, SharedUri,
     StatefulInteractiveElement, Styled, StyledImage as _, Window,
 };
 use markdown::mdast;
@@ -656,7 +656,10 @@ impl Paragraph {
                 .push(Inline::new(ix, self.state.clone(), links, highlights).into_any_element());
         }
 
-        div().id(span.unwrap_or_default()).children(child_nodes)
+        div()
+            .flex_wrap()
+            .id(span.unwrap_or_default())
+            .children(child_nodes)
     }
 }
 
@@ -874,6 +877,7 @@ impl Node {
                 checked,
             } => v_flex()
                 .id("li")
+                .w_full()
                 .when(*spread, |this| this.child(div()))
                 .children({
                     let mut items: Vec<Div> = Vec::with_capacity(children.len());
@@ -899,17 +903,16 @@ impl Node {
                                 // merge content into last item.
                                 if last_not_list {
                                     if let Some(item_item) = items.last_mut() {
-                                        item_item.extend(vec![div()
-                                            .overflow_hidden()
-                                            .child(text)
-                                            .into_any_element()]);
+                                        item_item
+                                            .extend(vec![div().child(text).into_any_element()]);
                                         continue;
                                     }
                                 }
 
                                 items.push(
                                     h_flex()
-                                        .flex_1()
+                                        .w_full()
+                                        .flex_wrap()
                                         .relative()
                                         .items_start()
                                         .content_start()
@@ -943,7 +946,7 @@ impl Node {
                                                     }),
                                             )
                                         })
-                                        .child(div().overflow_hidden().child(text)),
+                                        .child(div().flex_1().min_w_0().child(text)),
                                 );
                             }
                             Node::List { .. } => {
@@ -1073,6 +1076,7 @@ impl Node {
     pub(super) fn render_root(
         &self,
         list_state: Option<ListState>,
+        width: Pixels,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -1100,14 +1104,19 @@ impl Node {
             list_state.reset(children.len());
         }
 
-        gpui::list(list_state, move |ix, window, cx| {
-            let is_last = ix + 1 == children.len();
-            children[ix]
-                .render_block(options.is_last(is_last), &node_cx, window, cx)
-                .into_any_element()
-        })
-        .size_full()
-        .into_any()
+        div()
+            .id(SharedString::from(format!("markdown-list-{}", width)))
+            .size_full()
+            .child(
+                gpui::list(list_state, move |ix, window, cx| {
+                    let is_last = ix + 1 == children.len();
+                    children[ix]
+                        .render_block(options.is_last(is_last), &node_cx, window, cx)
+                        .into_any_element()
+                })
+                .size_full(),
+            )
+            .into_any()
     }
 
     fn render_block(

@@ -47,10 +47,11 @@ impl RenderOnce for TextViewElement {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         self.state.update(cx, |state, cx| {
             v_flex()
-                .size_full()
+                .w_full()
                 .map(|this| match &mut state.parsed_result {
                     Some(Ok(content)) => this.child(content.root_node.render_root(
                         self.list_state.clone(),
+                        state.bounds.size.width,
                         &content.node_cx,
                         window,
                         cx,
@@ -212,7 +213,7 @@ pub(crate) struct TextViewState {
     parsed_result: Option<Result<ParsedContent, SharedString>>,
     focus_handle: Option<FocusHandle>,
     /// The bounds of the text view
-    bounds: Bounds<Pixels>,
+    pub bounds: Bounds<Pixels>,
     /// The local (in TextView) position of the selection.
     selection_positions: (Option<Point<Pixels>>, Option<Point<Pixels>>),
     /// Is current in selection.
@@ -242,11 +243,18 @@ impl TextViewState {
 
 impl TextViewState {
     /// Save bounds and unselect if bounds changed.
-    fn update_bounds(&mut self, bounds: Bounds<Pixels>) {
+    /// Save bounds and unselect if bounds changed.
+    /// Returns true if width changed.
+    fn update_bounds(&mut self, bounds: Bounds<Pixels>) -> bool {
+        let width_changed = self.bounds.size.width != bounds.size.width;
         if self.bounds.size != bounds.size {
             self.clear_selection();
         }
+        if width_changed {
+            self.list_state.reset(self.list_state.item_count());
+        }
         self.bounds = bounds;
+        width_changed
     }
 
     fn clear_selection(&mut self) {
@@ -613,7 +621,7 @@ impl Element for TextView {
         let mut el = div()
             .key_context(CONTEXT)
             .when(self.selectable, |el| el.track_focus(focus_handle))
-            .size_full()
+            .w_full()
             .relative()
             .on_action({
                 let state = self.state.clone();
@@ -671,11 +679,18 @@ impl Element for TextView {
         let entity_id = window.current_view();
         let is_selectable = self.selectable;
 
+        let mut needs_notify = false;
         self.state.update(cx, |state, _| {
             state.parent_entity = Some(entity_id);
-            state.update_bounds(bounds);
+            if state.update_bounds(bounds) {
+                needs_notify = true;
+            }
             state.is_selectable = is_selectable;
         });
+
+        if needs_notify {
+            cx.notify(entity_id);
+        }
 
         GlobalState::global_mut(cx)
             .text_view_state_stack
