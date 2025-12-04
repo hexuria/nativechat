@@ -365,7 +365,7 @@ impl RenderOnce for ChatSessionItem {
                                             .p_1()
                                             .rounded_md()
                                             .hover(|s| s.bg(theme.background))
-                                            .child(Icon::new(IconName::Replace).size_4())
+                                            .child(Icon::new(IconName::Pencil).size_4())
                                             .on_click({
                                                 let callback = self.on_edit.clone();
                                                 move |_, window, cx| {
@@ -383,7 +383,7 @@ impl RenderOnce for ChatSessionItem {
                                             .p_1()
                                             .rounded_md()
                                             .hover(|s| s.bg(colors::red_400().opacity(0.9)))
-                                            .child(Icon::new(IconName::Delete).size_4())
+                                            .child(Icon::new(IconName::Trash).size_4())
                                             .on_click({
                                                 let callback = self.on_delete.clone();
                                                 move |_, window, cx| {
