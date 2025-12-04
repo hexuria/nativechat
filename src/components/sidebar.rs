@@ -46,10 +46,7 @@ impl Collapsible for ChatList {
 
 impl gpui::RenderOnce for ChatList {
     fn render(self, _window: &mut Window, _cx: &mut gpui::App) -> impl IntoElement {
-        v_flex()
-            .gap_1()
-            .children(self.children)
-            .when(self.collapsed, |this| this.hidden())
+        v_flex().gap_1().children(self.children)
     }
 }
 
@@ -369,6 +366,7 @@ impl Render for SidebarView {
                                                 c.created_at.clone(),
                                                 is_active,
                                             )
+                                            .collapsed(collapsed)
                                             .is_editing(is_editing)
                                             .is_deleting(is_deleting)
                                             .input(input)

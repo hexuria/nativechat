@@ -13,6 +13,7 @@ pub struct ChatSessionItem {
     is_active: bool,
     is_editing: bool,
     is_deleting: bool,
+    collapsed: bool,
     input: Option<Entity<ui::input::InputState>>,
     on_select: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_edit: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
@@ -32,6 +33,7 @@ impl ChatSessionItem {
             is_active,
             is_editing: false,
             is_deleting: false,
+            collapsed: false,
             input: None,
             on_select: None,
             on_edit: None,
@@ -50,6 +52,11 @@ impl ChatSessionItem {
 
     pub fn is_deleting(mut self, is_deleting: bool) -> Self {
         self.is_deleting = is_deleting;
+        self
+    }
+
+    pub fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
         self
     }
 
@@ -132,6 +139,40 @@ impl ChatSessionItem {
 impl RenderOnce for ChatSessionItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
+
+        // In collapsed mode, render a simple icon button (skip editing/deleting states)
+        if self.collapsed {
+            return div()
+                .id(gpui::SharedString::from(format!(
+                    "collapsed-{}",
+                    self.id.clone()
+                )))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_2()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.sidebar_accent))
+                .when(self.is_active, |s| {
+                    s.bg(theme.sidebar_accent)
+                        .text_color(theme.sidebar_accent_foreground)
+                })
+                .when(!self.is_active, |s| s.text_color(theme.sidebar_foreground))
+                .when_some(self.on_select.clone(), |this, callback| {
+                    this.on_click(move |_, window, cx| callback(window, cx))
+                })
+                .child(
+                    Icon::new(IconName::SquareTerminal)
+                        .size_4()
+                        .when(self.is_active, |s| {
+                            s.text_color(theme.sidebar_accent_foreground)
+                        })
+                        .when(!self.is_active, |s| s.text_color(theme.muted_foreground)),
+                )
+                .into_any_element();
+        }
 
         if self.is_deleting {
             return div()
