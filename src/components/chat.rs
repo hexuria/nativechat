@@ -29,6 +29,7 @@ pub struct ChatView {
     scroll_handle: ScrollHandle,
     profile_select: Entity<SelectState<SearchableVec<ProfileItem>>>,
     cached_profiles: Vec<ProfileItem>,
+    should_focus_input: bool,
 }
 
 impl ChatView {
@@ -86,6 +87,7 @@ impl ChatView {
             scroll_handle: scroll_handle.clone(),
             profile_select: profile_select.clone(),
             cached_profiles: profile_items,
+            should_focus_input: false,
         };
 
         cx.observe(&state, {
@@ -214,6 +216,25 @@ impl ChatView {
         )
         .detach();
 
+        // Focus input when conversation changes (especially on new chat creation)
+        cx.observe(&state, {
+            let mut last_conversation_id: Option<String> =
+                state.read(cx).active_conversation_id.clone();
+
+            move |this: &mut Self, state, cx| {
+                let state = state.read(cx);
+                let current_id = state.active_conversation_id.clone();
+
+                // If conversation changed, trigger focus on next render
+                if current_id != last_conversation_id {
+                    last_conversation_id = current_id;
+                    this.should_focus_input = true;
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
+
         this
     }
 }
@@ -221,6 +242,14 @@ impl ChatView {
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+
+        // Handle auto-focus
+        if self.should_focus_input {
+            self.should_focus_input = false;
+            self.input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        }
 
         // Sync active profile selection if needed
         let active_id = self.state.read(cx).active_profile_id;

@@ -116,6 +116,12 @@ impl MessageInput {
         self
     }
 
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.input_state.update(cx, |state, _| {
+            state.focus_handle().focus(window);
+        });
+    }
+
     fn trigger_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Check if a profile is selected
         if self.state.read(cx).active_profile_id.is_none() {
