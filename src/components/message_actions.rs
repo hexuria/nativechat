@@ -1,7 +1,14 @@
+use crate::actions::{BranchInNewChat, ReadAloud, ReportMessage};
 use gpui::{prelude::FluentBuilder, *};
 use std::rc::Rc;
 use std::time::Duration;
-use ui::{ActiveTheme, Icon, IconName, h_flex, tooltip::Tooltip};
+use ui::{
+    ActiveTheme, Icon, IconName, Sizable, Size,
+    button::{Button, ButtonVariants},
+    h_flex,
+    menu::DropdownMenu,
+    tooltip::Tooltip,
+};
 
 #[derive(IntoElement)]
 pub struct MessageActions {
@@ -191,6 +198,27 @@ impl RenderOnce for MessageActions {
                 "Try again",
                 cx,
             ))
-            .child(self.action_button("more", IconSource::Name(IconName::Menu), "More actions", cx))
+            .child(
+                Button::new(ElementId::Name(format!("more-{}", self.message_id).into()))
+                    .icon(IconName::Ellipsis)
+                    .ghost()
+                    .with_size(Size::Size(px(32.0)))
+                    .rounded(px(6.0))
+                    .tooltip("More actions")
+                    .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _, _| {
+                        menu.menu_with_icon(
+                            "Branch in new chat",
+                            IconName::Branch,
+                            Box::new(BranchInNewChat),
+                        )
+                        .menu_with_icon("Read aloud", IconName::ReadAloud, Box::new(ReadAloud))
+                        .separator()
+                        .menu_with_icon(
+                            "Report message",
+                            IconName::Report,
+                            Box::new(ReportMessage),
+                        )
+                    }),
+            )
     }
 }
