@@ -1,7 +1,7 @@
 use gpui::*;
 use nativechat::actions::{
-    About, CopyMessage, Hide, HideOthers, Minimize, NewChat, OpenSettings, Quit, ShowAll,
-    ToggleDebugMarkdown, ToggleSidebar, ToggleTheme, Zoom,
+    About, BranchInNewChat, CopyMessage, Hide, HideOthers, Minimize, NewChat, OpenSettings, Quit,
+    ReadAloud, ReportMessage, ShowAll, ToggleDebugMarkdown, ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
@@ -104,6 +104,20 @@ fn main() {
                 // Spawn background task to refresh data from DB
                 let state_clone = state.clone();
                 let db_service_clone = db_service.clone();
+                cx.on_action(|_: &CopyMessage, cx: &mut App| {
+                    // This is a global handler, but the specific handler on MessageBubble will take precedence if focused.
+                    // If we want a global fallback, we can implement it here, but for now let's just leave it empty
+                    // or maybe notify the user to select a message.
+                });
+                cx.on_action(|_: &BranchInNewChat, cx: &mut App| {
+                    println!("Branch in new chat action triggered");
+                });
+                cx.on_action(|_: &ReadAloud, cx: &mut App| {
+                    println!("Read aloud action triggered");
+                });
+                cx.on_action(|_: &ReportMessage, cx: &mut App| {
+                    println!("Report message action triggered");
+                });
                 cx.spawn(|cx: &mut AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
@@ -115,7 +129,6 @@ fn main() {
                         }
 
                         // Load profiles and credentials from database
-                        // This acts as a "refresh" for the cached state
                         match AppState::load_profiles_and_credentials(&db_service_clone).await {
                             Ok((profiles, credentials)) => {
                                 let _ = state_clone.update(&mut cx, |state, cx| {

@@ -330,7 +330,7 @@ impl Render for MessageInput {
                                 })
                         )
                         .child(
-                            // Bottom Row (Profile Selector + Tags)
+                            // Bottom Row
                             div()
                                 .flex()
                                 .flex_1() // Allow this section to shrink/grow

@@ -37,7 +37,10 @@ actions!(
         SignOut,
         ToggleCredentialsModal,
         ToggleDebugMarkdown,
-        CopyMessage
+        CopyMessage,
+        BranchInNewChat,
+        ReadAloud,
+        ReportMessage
     ]
 );
 
