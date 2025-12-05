@@ -1,4 +1,7 @@
-use crate::actions::{BranchInNewChat, ReportMessage, ToggleReadAloud};
+use crate::{
+    actions::{BranchInNewChat, ReportMessage, ToggleReadAloud},
+    state::AppState,
+};
 use gpui::{prelude::FluentBuilder, *};
 use std::rc::Rc;
 use std::time::Duration;
@@ -6,7 +9,6 @@ use ui::{
     ActiveTheme, Icon, IconName, Sizable, Size,
     button::{Button, ButtonVariants},
     h_flex,
-    menu::DropdownMenu,
     tooltip::Tooltip,
 };
 
@@ -37,6 +39,7 @@ impl MessageActions {
             is_speaking: false,
             is_paused: false,
             is_loading: false,
+            state: None,
         }
     }
 
