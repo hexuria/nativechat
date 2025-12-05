@@ -405,18 +405,18 @@ impl Render for MessageInput {
                                                                 .children(
                                                                     apps_clone.iter().enumerate().map(|(i, app)| {
                                                                         let app_name = app.clone();
-                                                                        let icon_path = match app_name.as_str() {
-                                                                            "Image Generation" => "icons/create_image.svg",
-                                                                            "Thinking" => "icons/thinking.svg",
-                                                                            "Deep Research" => "icons/deep_search.svg",
-                                                                            "Study" => "icons/study.svg",
-                                                                            "Web search" => "icons/web_search.svg",
-                                                                            "Canvas" => "icons/canvas.svg",
-                                                                            "Canva" => "icons/canva.svg",
-                                                                            "Coursera" => "icons/coursera.svg",
-                                                                            "Figma" => "icons/figma.svg",
-                                                                            "Spotify" => "icons/spotify.svg",
-                                                                            _ => "icons/clip.svg",
+                                                                        let icon = match app_name.as_str() {
+                                                                            "Image Generation" => IconName::CreateImage,
+                                                                            "Thinking" => IconName::Thinking,
+                                                                            "Deep Research" => IconName::DeepSearch,
+                                                                            "Study" => IconName::Study,
+                                                                            "Web search" => IconName::WebSearch,
+                                                                            "Canvas" => IconName::Canvas,
+                                                                            "Canva" => IconName::Canva,
+                                                                            "Coursera" => IconName::Coursera,
+                                                                            "Figma" => IconName::Figma,
+                                                                            "Spotify" => IconName::Spotify,
+                                                                            _ => IconName::Clip,
                                                                         };
 
                                                                         h_flex()
@@ -437,8 +437,7 @@ impl Render for MessageInput {
                                                                                 }
                                                                             })
                                                                             .child(
-                                                                                svg()
-                                                                                    .path(icon_path)
+                                                                                Icon::new(icon)
                                                                                     .size(px(12.0))
                                                                                     .text_color(theme.secondary_foreground)
                                                                             )
@@ -465,18 +464,18 @@ impl Render for MessageInput {
                                                 let state_model = state_model.clone();
                                                 Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
                                                         let app_name = app.clone();
-                                                        let icon_path = match app_name.as_str() {
-                                                            "Image Generation" => "icons/create_image.svg",
-                                                            "Thinking" => "icons/thinking.svg",
-                                                            "Deep Research" => "icons/deep_search.svg",
-                                                            "Study" => "icons/study.svg",
-                                                            "Web search" => "icons/web_search.svg",
-                                                            "Canvas" => "icons/canvas.svg",
-                                                            "Canva" => "icons/canva.svg",
-                                                            "Coursera" => "icons/coursera.svg",
-                                                            "Figma" => "icons/figma.svg",
-                                                            "Spotify" => "icons/spotify.svg",
-                                                            _ => "icons/clip.svg",
+                                                        let icon = match app_name.as_str() {
+                                                            "Image Generation" => IconName::CreateImage,
+                                                            "Thinking" => IconName::Thinking,
+                                                            "Deep Research" => IconName::DeepSearch,
+                                                            "Study" => IconName::Study,
+                                                            "Web search" => IconName::WebSearch,
+                                                            "Canvas" => IconName::Canvas,
+                                                            "Canva" => IconName::Canva,
+                                                            "Coursera" => IconName::Coursera,
+                                                            "Figma" => IconName::Figma,
+                                                            "Spotify" => IconName::Spotify,
+                                                            _ => IconName::Clip,
                                                         };
 
                                                         div()
@@ -488,8 +487,7 @@ impl Render for MessageInput {
                                                             .px_2()
                                                             .py_1()
                                                             .child(
-                                                                svg()
-                                                                    .path(icon_path)
+                                                                Icon::new(icon)
                                                                     .size(px(12.0))
                                                                     .text_color(secondary_foreground)
                                                             )
