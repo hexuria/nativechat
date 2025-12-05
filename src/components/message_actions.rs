@@ -1,9 +1,13 @@
-use gpui::*;
+use gpui::{prelude::FluentBuilder, *};
+use std::rc::Rc;
+use std::time::Duration;
 use ui::{ActiveTheme, Icon, IconName, h_flex, tooltip::Tooltip};
 
 #[derive(IntoElement)]
 pub struct MessageActions {
-    _message_id: String,
+    message_id: String,
+    message_text: String,
+    on_copy: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 enum IconSource {
@@ -14,8 +18,25 @@ enum IconSource {
 impl MessageActions {
     pub fn new(message_id: impl Into<String>) -> Self {
         Self {
-            _message_id: message_id.into(),
+            message_id: message_id.into(),
+            message_text: String::new(),
+            on_copy: None,
         }
+    }
+
+    /// Set the message text to copy when the copy button is clicked
+    pub fn message_text(mut self, text: impl Into<String>) -> Self {
+        self.message_text = text.into();
+        self
+    }
+
+    /// Set a callback to be invoked after copying
+    pub fn on_copy<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&mut Window, &mut App) + 'static,
+    {
+        self.on_copy = Some(Rc::new(handler));
+        self
     }
 
     fn action_button(
@@ -55,14 +76,102 @@ impl MessageActions {
             .tooltip(move |w, cx| Tooltip::new(tooltip_text).build(w, cx))
             .child(icon_element)
     }
+
+    fn copy_button(
+        &self,
+        id: impl Into<ElementId>,
+        tooltip_text: &'static str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let secondary = theme.secondary;
+        let secondary_foreground = theme.secondary_foreground;
+        let success = theme.success;
+
+        let id = id.into();
+        let state = window.use_keyed_state(id.clone(), cx, |_, _| CopyState::default());
+        let copied = state.read(cx).copied;
+
+        let icon_name = if copied {
+            IconName::Check
+        } else {
+            IconName::Copy
+        };
+        let icon_color = if copied {
+            success
+        } else {
+            secondary_foreground
+        };
+
+        let message_text = self.message_text.clone();
+        let on_copy = self.on_copy.clone();
+
+        div()
+            .id(id)
+            .w(px(32.0))
+            .h(px(32.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .text_color(icon_color)
+            .hover(move |style| style.bg(secondary))
+            .cursor_pointer()
+            .tooltip(move |w, cx| {
+                Tooltip::new(if copied { "Copied!" } else { tooltip_text }).build(w, cx)
+            })
+            .child(Icon::new(icon_name).size(px(18.0)).text_color(icon_color))
+            .when(!copied, move |this| {
+                this.on_click({
+                    let state = state.clone();
+                    let message_text = message_text.clone();
+                    let on_copy = on_copy.clone();
+                    move |_, window, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(message_text.clone()));
+
+                        state.update(cx, |state, cx| {
+                            state.copied = true;
+                            cx.notify();
+                        });
+
+                        // Reset after 2 seconds
+                        let state = state.clone();
+                        cx.spawn(async move |cx| {
+                            cx.background_executor().timer(Duration::from_secs(2)).await;
+                            _ = state.update(cx, |state, cx| {
+                                state.copied = false;
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+
+                        if let Some(on_copy) = &on_copy {
+                            on_copy(window, cx);
+                        }
+                    }
+                })
+            })
+    }
+}
+
+#[derive(Default)]
+struct CopyState {
+    copied: bool,
 }
 
 impl RenderOnce for MessageActions {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         h_flex()
             .gap_1()
             .items_center()
-            .child(self.action_button("copy", IconSource::Name(IconName::Copy), "Copy", cx))
+            .child(self.copy_button(
+                ElementId::Name(format!("copy-{}", self.message_id).into()),
+                "Copy",
+                window,
+                cx,
+            ))
             .child(self.action_button(
                 "like",
                 IconSource::Path("icons/thumbs_up.svg"),

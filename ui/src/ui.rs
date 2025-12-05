@@ -36,6 +36,7 @@ pub fn init(cx: &mut gpui::App) {
     select::init(cx);
     theme::init(cx);
     time::date_picker::init(cx);
+    text::init(cx);
 }
 
 // Re-export commonly used items

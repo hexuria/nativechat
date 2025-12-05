@@ -36,7 +36,8 @@ actions!(
         OpenProfileSettings,
         SignOut,
         ToggleCredentialsModal,
-        ToggleDebugMarkdown
+        ToggleDebugMarkdown,
+        CopyMessage
     ]
 );
 

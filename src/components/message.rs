@@ -1,4 +1,4 @@
-use crate::components::message_actions::MessageActions;
+use crate::{actions::CopyMessage, components::message_actions::MessageActions};
 use gpui::{prelude::FluentBuilder, *};
 use ui::{ActiveTheme, h_flex, v_flex};
 
@@ -21,9 +21,14 @@ impl MessageBubble {
             bg_color: gpui::white(),
             text_color: gpui::black(),
             timestamp: None,
-            message_id: text.len().to_string(), // Simple ID for now
+            message_id: text.len().to_string(), // Default ID, should be overridden
             debug_mode: false,
         }
+    }
+
+    pub fn message_id(mut self, id: impl Into<String>) -> Self {
+        self.message_id = id.into();
+        self
     }
 
     pub fn is_me(mut self, is_me: bool) -> Self {
@@ -58,82 +63,104 @@ impl RenderOnce for MessageBubble {
             // User message: gray bubble on the right (ChatGPT style)
             // For now, keep user messages as plain text or also use Markdown if desired.
             // Let's use Markdown for consistency but keep the bubble styling.
-            h_flex().w_full().justify_end().child(
-                div()
-                    .px_4()
-                    .py_2p5()
-                    .rounded(px(20.0))
-                    .bg(cx.theme().secondary) // Use theme secondary (grayish)
-                    .max_w_full()
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().secondary_foreground)
-                                    .overflow_x_hidden()
-                                    .child(self.text), // User text usually doesn't need complex markdown, but we could swap this too.
-                            )
-                            .when_some(self.timestamp, |this, timestamp| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().secondary_foreground.opacity(0.7))
-                                        .child(timestamp),
-                                )
-                            }),
-                    ),
-            )
-        } else {
-            h_flex().w_full().justify_start().child(
-                v_flex()
-                    .flex_1()
-                    .gap_2()
-                    .max_w_full()
-                    .child(
-                        div()
-                            .flex_1()
-                            .w_full()
-                            .overflow_hidden()
-                            .when(self.debug_mode, |this| {
-                                // Debug mode: plain text with styling for visibility
-                                this.child(
+            h_flex()
+                .w_full()
+                .justify_end()
+                .on_action({
+                    let text = self.text.clone();
+                    move |_: &CopyMessage, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    }
+                })
+                .child(
+                    div()
+                        .px_4()
+                        .py_2p5()
+                        .rounded(px(20.0))
+                        .bg(cx.theme().secondary) // Use theme secondary (grayish)
+                        .max_w_full()
+                        .child(
+                            v_flex()
+                                .gap_0p5()
+                                .child(
                                     div()
                                         .text_sm()
-                                        .text_color(cx.theme().foreground)
-                                        .p_2()
-                                        .bg(cx.theme().muted.opacity(0.3))
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(cx.theme().border)
-                                        .font_family("monospace")
-                                        .child(self.text.clone()),
+                                        .text_color(cx.theme().secondary_foreground)
+                                        .overflow_x_hidden()
+                                        .child(self.text), // User text usually doesn't need complex markdown, but we could swap this too.
                                 )
-                            })
-                            .when(!self.debug_mode, |this| {
-                                // Normal mode: markdown rendering
-                                this.child(
-                                    ui::text::TextView::markdown(
-                                        ElementId::Name(self.message_id.clone().into()),
-                                        self.text.clone(),
-                                        window,
-                                        cx,
+                                .when_some(self.timestamp, |this, timestamp| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(
+                                                cx.theme().secondary_foreground.opacity(0.7),
+                                            )
+                                            .child(timestamp),
                                     )
-                                    .selectable(true),
-                                )
-                            })
-                            .when_some(self.timestamp, |this, timestamp| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(timestamp),
-                                )
-                            }),
-                    )
-                    .child(MessageActions::new(self.message_id)),
-            )
+                                }),
+                        ),
+                )
+        } else {
+            h_flex()
+                .w_full()
+                .justify_start()
+                .on_action({
+                    let text = self.text.clone();
+                    move |_: &CopyMessage, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    }
+                })
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .gap_2()
+                        .max_w_full()
+                        .child(
+                            div()
+                                .flex_1()
+                                .w_full()
+                                .overflow_hidden()
+                                .when(self.debug_mode, |this| {
+                                    // Debug mode: plain text with styling for visibility
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().foreground)
+                                            .p_2()
+                                            .bg(cx.theme().muted.opacity(0.3))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(cx.theme().border)
+                                            .font_family("monospace")
+                                            .child(self.text.clone()),
+                                    )
+                                })
+                                .when(!self.debug_mode, |this| {
+                                    // Normal mode: markdown rendering
+                                    this.child(
+                                        ui::text::TextView::markdown(
+                                            ElementId::Name(self.message_id.clone().into()),
+                                            self.text.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                        .selectable(true),
+                                    )
+                                })
+                                .when_some(self.timestamp, |this, timestamp| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(timestamp),
+                                    )
+                                }),
+                        )
+                        .child(
+                            MessageActions::new(self.message_id).message_text(self.text.clone()),
+                        ),
+                )
         }
     }
 }

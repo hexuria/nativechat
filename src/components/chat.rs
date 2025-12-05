@@ -316,6 +316,7 @@ impl Render for ChatView {
                                         };
 
                                         MessageBubble::new(msg.content.clone())
+                                            .message_id(msg.id.clone())
                                             .is_me(msg.is_me)
                                             .bg_color(bg_color)
                                             .text_color(text_color)
