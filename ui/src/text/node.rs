@@ -962,6 +962,20 @@ impl Node {
                                     cx,
                                 )));
                             }
+                            Node::CodeBlock(_) => {
+                                // Handle code blocks inside list items
+                                items.push(div().w_full().child(child.render_block(
+                                    NodeRenderOptions {
+                                        depth: options.depth + 1,
+                                        todo: checked.is_some(),
+                                        is_last: child_ix == children.len() - 1,
+                                        ..options
+                                    },
+                                    node_cx,
+                                    window,
+                                    cx,
+                                )));
+                            }
                             _ => {}
                         }
                     }
