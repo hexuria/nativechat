@@ -1273,21 +1273,56 @@ impl AppState {
                 cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
-                        let result = service
-                            .speak(&text, &message_id_clone, &model_id, &api_key)
+                        // Phase 1: Start audio playback (returns immediately after queuing)
+                        let start_result = service
+                            .start_speaking(&text, &message_id_clone, &model_id, &api_key)
                             .await;
 
-                        this.update(&mut cx, |state, cx| {
-                            state.loading_message_id = None;
-                            if result.is_ok() {
-                                state.speaking_message_id = Some(message_id_clone);
-                                state.is_paused = false;
-                            } else {
-                                eprintln!("TTS Error: {:?}", result.err());
+                        match start_result {
+                            Ok(true) => {
+                                // Audio started - update state to "playing"
+                                let message_id_for_completion = message_id_clone.clone();
+                                this.update(&mut cx, |state, cx| {
+                                    state.loading_message_id = None;
+                                    state.speaking_message_id = Some(message_id_clone);
+                                    state.is_paused = false;
+                                    cx.notify();
+                                })
+                                .ok();
+
+                                // Phase 2: Wait for audio to finish playing
+                                service.wait_until_finished().await;
+
+                                // Audio finished - clear speaking state
+                                this.update(&mut cx, |state, cx| {
+                                    // Only clear if still speaking the same message
+                                    if state.speaking_message_id.as_ref()
+                                        == Some(&message_id_for_completion)
+                                    {
+                                        state.speaking_message_id = None;
+                                        state.is_paused = false;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
                             }
-                            cx.notify();
-                        })
-                        .ok();
+                            Ok(false) => {
+                                // Nothing to play
+                                this.update(&mut cx, |state, cx| {
+                                    state.loading_message_id = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                            Err(e) => {
+                                eprintln!("TTS Error: {:?}", e);
+                                this.update(&mut cx, |state, cx| {
+                                    state.loading_message_id = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                        }
                     }
                 })
                 .detach();
