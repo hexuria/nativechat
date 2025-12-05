@@ -8,12 +8,13 @@ use crate::services::database::{
 };
 use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
+use crate::services::tts_service::TtsService;
 use chrono::NaiveDateTime;
 use futures::StreamExt;
 use gpui::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::SystemTime;
 
 #[derive(Clone, Debug)]
@@ -137,6 +138,7 @@ pub struct AppState {
     pub theme_mode: String,
     pub amplitude: Arc<AtomicU32>,
     pub ai_amplitude: Arc<AtomicU32>, // New field for AI voice viz
+    pub is_ai_speaking: Arc<AtomicBool>,
     pub is_voice_mode_open: bool,
     pub is_sidebar_open: bool,
     pub is_voice_muted: bool,
@@ -166,6 +168,10 @@ pub struct AppState {
     pub active_profile_id: Option<i64>,
     // Debug mode for markdown rendering
     pub debug_markdown_disabled: bool,
+    pub tts_service: Option<TtsService>,
+    pub speaking_message_id: Option<String>,
+    pub loading_message_id: Option<String>,
+    pub is_paused: bool,
 }
 
 impl Default for AppState {
@@ -285,6 +291,7 @@ impl AppState {
             theme_mode: "light".to_string(),
             amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             ai_amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            is_ai_speaking: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_voice_mode_open: false,
             is_voice_muted: false,
             is_sidebar_open: true,
@@ -312,6 +319,10 @@ impl AppState {
             db_credentials: Vec::new(),
             active_profile_id: None,
             debug_markdown_disabled: false,
+            tts_service: None,
+            speaking_message_id: None,
+            loading_message_id: None,
+            is_paused: false,
         };
 
         // Synchronously load cached state to avoid startup delay
@@ -1218,5 +1229,110 @@ impl AppState {
         self.audio_input = None; // Drops AudioInput, stops capture
 
         cx.notify();
+    }
+
+    pub fn read_aloud(&mut self, text: String, message_id: String, cx: &mut Context<Self>) {
+        // Initialize TTS service if needed
+        if self.tts_service.is_none() {
+            match TtsService::new(self.is_ai_speaking.clone(), self.ai_amplitude.clone()) {
+                Ok(service) => self.tts_service = Some(service),
+                Err(e) => {
+                    eprintln!("Failed to initialize TTS service: {}", e);
+                    return;
+                }
+            }
+        }
+
+        if let Some(service) = &self.tts_service {
+            // Stop previous speech if any
+            service.stop();
+
+            // Set loading state
+            self.loading_message_id = Some(message_id.clone());
+            self.speaking_message_id = None;
+            self.is_paused = false;
+            cx.notify();
+
+            // Get current profile's TTS model
+            let tts_model_id = self
+                .active_profile()
+                .and_then(|p| p.tts_model_id.as_deref());
+
+            // Get API key
+            let api_key = self
+                .active_credential()
+                .map(|c| c.api_key.clone())
+                .or_else(|| self.config.as_ref().and_then(|c| c.gemini_api_key.clone()));
+
+            if let (Some(model_id), Some(api_key)) = (tts_model_id, api_key) {
+                let service = service.clone();
+                let model_id = model_id.to_string();
+                let message_id_clone = message_id.clone();
+                let text = text.clone();
+
+                cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let result = service
+                            .speak(&text, &message_id_clone, &model_id, &api_key)
+                            .await;
+
+                        this.update(&mut cx, |state, cx| {
+                            state.loading_message_id = None;
+                            if result.is_ok() {
+                                state.speaking_message_id = Some(message_id_clone);
+                                state.is_paused = false;
+                            } else {
+                                eprintln!("TTS Error: {:?}", result.err());
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+            } else {
+                self.loading_message_id = None;
+                cx.notify();
+                eprintln!("Missing TTS model or API key");
+            }
+        }
+    }
+
+    pub fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
+        if let Some(service) = &self.tts_service {
+            service.stop();
+            self.speaking_message_id = None;
+            self.is_paused = false;
+            cx.notify();
+        }
+    }
+
+    pub fn pause_read_aloud(&mut self, cx: &mut Context<Self>) {
+        if let Some(service) = &self.tts_service {
+            service.pause();
+            self.is_paused = true;
+            cx.notify();
+        }
+    }
+
+    pub fn resume_read_aloud(&mut self, cx: &mut Context<Self>) {
+        if let Some(service) = &self.tts_service {
+            service.resume();
+            self.is_paused = false;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_read_aloud(&mut self, message_id: String, text: String, cx: &mut Context<Self>) {
+        if self.speaking_message_id.as_ref() == Some(&message_id) {
+            if self.is_paused {
+                self.resume_read_aloud(cx);
+            } else {
+                self.pause_read_aloud(cx);
+            }
+        } else {
+            self.read_aloud(text, message_id, cx);
+        }
     }
 }

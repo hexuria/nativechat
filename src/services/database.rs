@@ -26,6 +26,7 @@ pub struct Profile {
     pub text_model_id: Option<String>,
     pub embedding_model_id: Option<String>,
     pub image_model_id: Option<String>,
+    pub tts_model_id: Option<String>,
     pub created_at: String,
 }
 
@@ -125,7 +126,7 @@ impl DatabaseService {
     pub async fn get_profiles(&self) -> Result<Vec<Profile>> {
         let rows = sqlx::query_as::<_, Profile>(
             "SELECT id, name, text_credential_id, embedding_credential_id, image_credential_id, 
-             text_model_id, embedding_model_id, image_model_id, created_at 
+             text_model_id, embedding_model_id, image_model_id, tts_model_id, created_at 
              FROM profiles ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -175,7 +176,7 @@ impl DatabaseService {
     pub async fn update_profile(&self, profile: &Profile) -> Result<()> {
         sqlx::query(
             "UPDATE profiles SET name = ?, text_credential_id = ?, embedding_credential_id = ?,
-             image_credential_id = ?, text_model_id = ?, embedding_model_id = ?, image_model_id = ?
+             image_credential_id = ?, text_model_id = ?, embedding_model_id = ?, image_model_id = ?, tts_model_id = ?
              WHERE id = ?",
         )
         .bind(&profile.name)
@@ -185,6 +186,7 @@ impl DatabaseService {
         .bind(&profile.text_model_id)
         .bind(&profile.embedding_model_id)
         .bind(&profile.image_model_id)
+        .bind(&profile.tts_model_id)
         .bind(profile.id)
         .execute(&self.pool)
         .await?;
@@ -204,7 +206,7 @@ impl DatabaseService {
     pub async fn get_profile(&self, id: i64) -> Result<Profile> {
         let profile = sqlx::query_as::<_, Profile>(
             "SELECT id, name, text_credential_id, embedding_credential_id, image_credential_id,
-             text_model_id, embedding_model_id, image_model_id, created_at
+             text_model_id, embedding_model_id, image_model_id, tts_model_id, created_at
              FROM profiles WHERE id = ?",
         )
         .bind(id)

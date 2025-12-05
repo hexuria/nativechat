@@ -1,4 +1,7 @@
-use crate::{actions::CopyMessage, components::message_actions::MessageActions};
+use crate::{
+    actions::{CopyMessage, ToggleReadAloud},
+    components::message_actions::MessageActions,
+};
 use gpui::{prelude::FluentBuilder, *};
 use ui::{ActiveTheme, h_flex, v_flex};
 
@@ -11,6 +14,10 @@ pub struct MessageBubble {
     timestamp: Option<String>,
     message_id: String,
     debug_mode: bool,
+    can_read_aloud: bool,
+    is_speaking: bool,
+    is_paused: bool,
+    is_loading: bool,
 }
 
 impl MessageBubble {
@@ -23,6 +30,10 @@ impl MessageBubble {
             timestamp: None,
             message_id: text.len().to_string(), // Default ID, should be overridden
             debug_mode: false,
+            can_read_aloud: false,
+            is_speaking: false,
+            is_paused: false,
+            is_loading: false,
         }
     }
 
@@ -53,6 +64,26 @@ impl MessageBubble {
 
     pub fn debug_mode(mut self, enabled: bool) -> Self {
         self.debug_mode = enabled;
+        self
+    }
+
+    pub fn can_read_aloud(mut self, can: bool) -> Self {
+        self.can_read_aloud = can;
+        self
+    }
+
+    pub fn is_speaking(mut self, is_speaking: bool) -> Self {
+        self.is_speaking = is_speaking;
+        self
+    }
+
+    pub fn is_paused(mut self, is_paused: bool) -> Self {
+        self.is_paused = is_paused;
+        self
+    }
+
+    pub fn is_loading(mut self, is_loading: bool) -> Self {
+        self.is_loading = is_loading;
         self
     }
 }
@@ -113,6 +144,20 @@ impl RenderOnce for MessageBubble {
                 })
                 .child(
                     v_flex()
+                        .id(ElementId::Name(self.message_id.clone().into()))
+                        .focusable()
+                        .on_key_down({
+                            let message_id = self.message_id.clone();
+                            let text = self.text.clone();
+                            move |event, _window, cx| {
+                                if event.keystroke.key == "f8" {
+                                    cx.dispatch_action(&ToggleReadAloud {
+                                        message_id: message_id.clone(),
+                                        text: text.clone(),
+                                    });
+                                }
+                            }
+                        })
                         .flex_1()
                         .gap_2()
                         .max_w_full()
@@ -158,8 +203,25 @@ impl RenderOnce for MessageBubble {
                                 }),
                         )
                         .child(
-                            MessageActions::new(self.message_id).message_text(self.text.clone()),
-                        ),
+                            MessageActions::new(self.message_id.clone())
+                                .message_text(self.text.clone())
+                                .can_read_aloud(self.can_read_aloud)
+                                .is_speaking(self.is_speaking)
+                                .is_paused(self.is_paused)
+                                .is_loading(self.is_loading),
+                        )
+                        .on_key_down({
+                            let text = self.text.clone();
+                            let message_id = self.message_id.clone();
+                            move |event: &KeyDownEvent, _window: &mut Window, cx: &mut App| {
+                                if event.keystroke.key == "f8" {
+                                    cx.dispatch_action(&ToggleReadAloud {
+                                        text: text.clone(),
+                                        message_id: message_id.clone(),
+                                    });
+                                }
+                            }
+                        }),
                 )
         }
     }

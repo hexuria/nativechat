@@ -39,8 +39,10 @@ actions!(
         ToggleDebugMarkdown,
         CopyMessage,
         BranchInNewChat,
-        ReadAloud,
-        ReportMessage
+        ReportMessage,
+        PauseReadAloud,
+        ResumeReadAloud,
+        StopReadAloud
     ]
 );
 
@@ -110,6 +112,60 @@ impl gpui::Action for DeleteSession {
     }
     fn name_for_type() -> &'static str {
         "DeleteSession"
+    }
+    fn boxed_clone(&self) -> Box<dyn gpui::Action> {
+        Box::new(self.clone())
+    }
+    fn partial_eq(&self, other: &dyn gpui::Action) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .map_or(false, |s| self == s)
+    }
+    fn build(value: serde_json::Value) -> gpui::Result<Box<dyn gpui::Action>> {
+        Ok(Box::new(serde_json::from_value::<Self>(value)?))
+    }
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct ReadAloud {
+    pub text: String,
+    pub message_id: String,
+}
+
+impl gpui::Action for ReadAloud {
+    fn name(&self) -> &'static str {
+        "ReadAloud"
+    }
+    fn name_for_type() -> &'static str {
+        "ReadAloud"
+    }
+    fn boxed_clone(&self) -> Box<dyn gpui::Action> {
+        Box::new(self.clone())
+    }
+    fn partial_eq(&self, other: &dyn gpui::Action) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .map_or(false, |s| self == s)
+    }
+    fn build(value: serde_json::Value) -> gpui::Result<Box<dyn gpui::Action>> {
+        Ok(Box::new(serde_json::from_value::<Self>(value)?))
+    }
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct ToggleReadAloud {
+    pub text: String,
+    pub message_id: String,
+}
+
+impl gpui::Action for ToggleReadAloud {
+    fn name(&self) -> &'static str {
+        "ToggleReadAloud"
+    }
+    fn name_for_type() -> &'static str {
+        "ToggleReadAloud"
     }
     fn boxed_clone(&self) -> Box<dyn gpui::Action> {
         Box::new(self.clone())

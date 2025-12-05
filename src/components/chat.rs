@@ -1,3 +1,4 @@
+use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
 use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::state::AppState;
@@ -278,10 +279,48 @@ impl Render for ChatView {
         };
 
         let debug_mode = state.debug_markdown_disabled;
+        let can_read_aloud = state
+            .active_profile()
+            .and_then(|p| p.tts_model_id.as_ref())
+            .is_some();
+        let speaking_message_id = state.speaking_message_id.clone();
+        let is_paused = state.is_paused;
 
         v_flex()
             .size_full()
             .bg(theme.background)
+            .on_action({
+                let state = self.state.clone();
+                move |action: &ToggleReadAloud, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| {
+                        state.toggle_read_aloud(action.message_id.clone(), action.text.clone(), cx);
+                    });
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &PauseReadAloud, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| {
+                        state.pause_read_aloud(cx);
+                    });
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &ResumeReadAloud, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| {
+                        state.resume_read_aloud(cx);
+                    });
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &StopReadAloud, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| {
+                        state.stop_read_aloud(cx);
+                    });
+                }
+            })
             .child(
                 // Main Content Area (Header + Messages)
                 div()
@@ -315,6 +354,11 @@ impl Render for ChatView {
                                             (theme.secondary, theme.secondary_foreground)
                                         };
 
+                                        let is_speaking =
+                                            speaking_message_id.as_ref() == Some(&msg.id);
+                                        let is_loading =
+                                            state.loading_message_id.as_ref() == Some(&msg.id);
+
                                         MessageBubble::new(msg.content.clone())
                                             .message_id(msg.id.clone())
                                             .is_me(msg.is_me)
@@ -322,6 +366,10 @@ impl Render for ChatView {
                                             .text_color(text_color)
                                             .timestamp(msg.formatted_time())
                                             .debug_mode(debug_mode)
+                                            .can_read_aloud(can_read_aloud)
+                                            .is_speaking(is_speaking)
+                                            .is_paused(is_paused)
+                                            .is_loading(is_loading)
                                     })),
                             ),
                     )

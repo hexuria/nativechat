@@ -112,8 +112,11 @@ fn main() {
                 cx.on_action(|_: &BranchInNewChat, cx: &mut App| {
                     println!("Branch in new chat action triggered");
                 });
-                cx.on_action(|_: &ReadAloud, cx: &mut App| {
-                    println!("Read aloud action triggered");
+                let state_read_aloud = state.clone();
+                cx.on_action(move |action: &ReadAloud, cx: &mut App| {
+                    state_read_aloud.update(cx, |state, cx| {
+                        state.read_aloud(action.text.clone(), action.message_id.clone(), cx);
+                    });
                 });
                 cx.on_action(|_: &ReportMessage, cx: &mut App| {
                     println!("Report message action triggered");

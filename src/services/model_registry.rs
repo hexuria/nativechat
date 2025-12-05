@@ -78,6 +78,7 @@ pub struct ModelCapabilities {
     pub supports_reasoning: bool,
     pub supports_text_generation: bool,
     pub supports_embedding: bool,
+    pub supports_text_to_speech: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -94,6 +95,7 @@ impl Default for ModelCapabilities {
             supports_reasoning: false,
             supports_text_generation: true,
             supports_embedding: false,
+            supports_text_to_speech: false,
         }
     }
 }
@@ -201,7 +203,15 @@ impl ModelRegistry {
             } else {
                 ModelType::Moderation
             };
-            return (ModelCapabilities::default(), model_type);
+
+            let mut caps = ModelCapabilities::default();
+            caps.supports_text_generation = false;
+
+            if model_type == ModelType::AudioGeneration {
+                caps.supports_text_to_speech = true;
+            }
+
+            return (caps, model_type);
         }
 
         // Default to text generation model with provider-specific features
@@ -223,7 +233,11 @@ impl ModelRegistry {
                     caps.supports_function_calling = true;
                     caps.supports_web_search = true;
                     caps.supports_file_search = true;
+                    caps.supports_file_search = true;
                     caps.supports_code_interpreter = true;
+                    if id_lower.contains("tts") {
+                        caps.supports_text_to_speech = true;
+                    }
                 }
 
                 // Check for thinking/reasoning models
@@ -453,8 +467,8 @@ impl ModelRegistry {
                 let id_lower = m.id.to_lowercase();
 
                 // Filter out utility models (TTS, moderation, transcription)
-                if id_lower.contains("tts-")
-                    || id_lower.contains("whisper")
+                // We want to keep TTS models now
+                if id_lower.contains("whisper")
                     || id_lower.contains("moderation")
                     || id_lower.contains("transcribe")
                     || id_lower.contains("davinci-002")

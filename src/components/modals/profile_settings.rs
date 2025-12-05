@@ -136,6 +136,8 @@ pub struct ProfileSettingsModal {
     embedding_model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
     image_provider_select: Entity<SelectState<SearchableVec<Provider>>>,
     image_model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
+    tts_provider_select: Entity<SelectState<SearchableVec<Provider>>>,
+    tts_model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
     chat_credential_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
     embedding_credential_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
     image_credential_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
@@ -194,6 +196,13 @@ impl ProfileSettingsModal {
         let image_model_items = SearchableVec::new(vec![]);
         let image_model_select = cx.new(|cx| SelectState::new(image_model_items, None, window, cx));
 
+        let tts_provider_items = SearchableVec::new(vec![]);
+        let tts_provider_select =
+            cx.new(|cx| SelectState::new(tts_provider_items, None, window, cx));
+
+        let tts_model_items = SearchableVec::new(vec![]);
+        let tts_model_select = cx.new(|cx| SelectState::new(tts_model_items, None, window, cx));
+
         let chat_credential_select =
             cx.new(|cx| SelectState::new(SearchableVec::new(vec![]), None, window, cx));
 
@@ -241,6 +250,8 @@ impl ProfileSettingsModal {
             embedding_model_select,
             image_provider_select,
             image_model_select,
+            tts_provider_select,
+            tts_model_select,
             chat_credential_select,
             embedding_credential_select,
             image_credential_select,
@@ -372,6 +383,15 @@ impl ProfileSettingsModal {
                 }
             }
 
+            if let Some(mid) = &profile.tts_model_id {
+                let state = self.state.read(cx);
+                if let Some(model) = state.available_models.iter().find(|m| &m.id == mid) {
+                    let provider = model.provider.clone();
+                    self.tts_provider_select
+                        .update(cx, |s, cx| s.set_selected_value(&provider, window, cx));
+                }
+            }
+
             // Update model and credential selects based on providers
             self.update_model_selects(cx, false);
             self.update_credential_selects(cx);
@@ -387,6 +407,10 @@ impl ProfileSettingsModal {
             }
             if let Some(model_id) = &profile.image_model_id {
                 self.image_model_select
+                    .update(cx, |s, cx| s.set_selected_value(model_id, window, cx));
+            }
+            if let Some(model_id) = &profile.tts_model_id {
+                self.tts_model_select
                     .update(cx, |s, cx| s.set_selected_value(model_id, window, cx));
             }
 
@@ -670,6 +694,10 @@ impl ProfileSettingsModal {
             .update(cx, |s, cx| s.set_selected_index(None, window, cx));
         self.image_model_select
             .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.tts_provider_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.tts_model_select
+            .update(cx, |s, cx| s.set_selected_index(None, window, cx));
 
         // Clear all credential selects
         self.chat_credential_select
@@ -695,6 +723,7 @@ impl ProfileSettingsModal {
                 embedding_credential_id: None,
                 image_model_id: None,
                 image_credential_id: None,
+                tts_model_id: None,
                 created_at: String::new(),
             };
 
@@ -758,6 +787,11 @@ impl ProfileSettingsModal {
             .read(cx)
             .selected_value()
             .map(|m| m.clone());
+        let tts_model_id = self
+            .tts_model_select
+            .read(cx)
+            .selected_value()
+            .map(|m| m.clone());
 
         let mode = self.mode.clone();
         let db = self.state.read(cx).database_service.clone();
@@ -792,6 +826,7 @@ impl ProfileSettingsModal {
                                         embedding_credential_id,
                                         image_model_id,
                                         image_credential_id,
+                                        tts_model_id,
                                         created_at: String::new(),
                                     };
 
@@ -814,6 +849,7 @@ impl ProfileSettingsModal {
                                 embedding_credential_id,
                                 image_model_id,
                                 image_credential_id,
+                                tts_model_id: tts_model_id.clone(),
                                 created_at: String::new(),
                             };
 
@@ -1010,7 +1046,7 @@ impl ProfileSettingsModal {
     }
 
     fn update_provider_selects(&mut self, cx: &mut Context<Self>) {
-        let (chat_providers, embedding_providers, image_providers) = {
+        let (chat_providers, embedding_providers, image_providers, tts_providers) = {
             let state = self.state.read(cx);
             let models = &state.available_models;
 
@@ -1025,18 +1061,31 @@ impl ProfileSettingsModal {
                 providers
             };
 
+            let get_tts_providers = || {
+                let mut providers: Vec<Provider> = models
+                    .iter()
+                    .filter(|m| m.capabilities.supports_text_to_speech)
+                    .map(|m| m.provider.clone())
+                    .collect();
+                providers.sort_by_key(|p| p.to_string());
+                providers.dedup();
+                providers
+            };
+
             (
                 get_providers(ModelType::TextGeneration),
                 get_providers(ModelType::TextEmbedding),
                 get_providers(ModelType::ImageGeneration),
+                get_tts_providers(),
             )
         };
 
         println!(
-            "Updating provider selects: Chat={}, Embedding={}, Image={}",
+            "Updating provider selects: Chat={}, Embedding={}, Image={}, TTS={}",
             chat_providers.len(),
             embedding_providers.len(),
-            image_providers.len()
+            image_providers.len(),
+            tts_providers.len()
         );
 
         self.provider_select.update(cx, |select, cx| {
@@ -1049,6 +1098,10 @@ impl ProfileSettingsModal {
 
         self.image_provider_select.update(cx, |select, cx| {
             select.set_items(SearchableVec::new(image_providers), cx);
+        });
+
+        self.tts_provider_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(tts_providers), cx);
         });
     }
 
@@ -1064,8 +1117,9 @@ impl ProfileSettingsModal {
             .read(cx)
             .selected_value()
             .cloned();
+        let tts_provider = self.tts_provider_select.read(cx).selected_value().cloned();
 
-        let (chat_models, embedding_models, image_models) = {
+        let (chat_models, embedding_models, image_models, tts_models) = {
             let state = self.state.read(cx);
             let models = &state.available_models;
 
@@ -1078,18 +1132,29 @@ impl ProfileSettingsModal {
                     .collect::<Vec<_>>()
             };
 
+            let filter_tts_models = |provider: Option<&Provider>| {
+                models
+                    .iter()
+                    .filter(|m| m.capabilities.supports_text_to_speech)
+                    .filter(|m| provider.map_or(true, |p| m.provider == *p))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+
             (
                 filter_models(ModelType::TextGeneration, chat_provider.as_ref()),
                 filter_models(ModelType::TextEmbedding, embedding_provider.as_ref()),
                 filter_models(ModelType::ImageGeneration, image_provider.as_ref()),
+                filter_tts_models(tts_provider.as_ref()),
             )
         };
 
         println!(
-            "Updating model selects: Chat={}, Embedding={}, Image={}",
+            "Updating model selects: Chat={}, Embedding={}, Image={}, TTS={}",
             chat_models.len(),
             embedding_models.len(),
-            image_models.len()
+            image_models.len(),
+            tts_models.len()
         );
 
         self.model_select.update(cx, |select, cx| {
@@ -1108,6 +1173,13 @@ impl ProfileSettingsModal {
 
         self.image_model_select.update(cx, |select, cx| {
             select.set_items(SearchableVec::new(image_models), cx);
+            if reset_selection {
+                select.reset_selection(cx);
+            }
+        });
+
+        self.tts_model_select.update(cx, |select, cx| {
+            select.set_items(SearchableVec::new(tts_models), cx);
             if reset_selection {
                 select.reset_selection(cx);
             }
@@ -1709,7 +1781,62 @@ impl Render for ProfileSettingsModal {
                                     "save_image_cred",
                                     "cancel_image_cred",
                                     cx,
-                                )),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_3()
+                                        .child(
+                                            Label::new("TTS Model").font_weight(FontWeight::MEDIUM),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_wrap()
+                                                .gap_4()
+                                                .child(
+                                                    div().flex_1().min_w_64().child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_1()
+                                                            .child(
+                                                                Label::new("Provider")
+                                                                    .text_xs()
+                                                                    .text_color(
+                                                                        cx.theme().muted_foreground,
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                Select::new(
+                                                                    &self.tts_provider_select,
+                                                                )
+                                                                .placeholder("Select Provider"),
+                                                            ),
+                                                    ),
+                                                )
+                                                .child(
+                                                    div().flex_1().min_w_64().child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_1()
+                                                            .child(
+                                                                Label::new("Model")
+                                                                    .text_xs()
+                                                                    .text_color(
+                                                                        cx.theme().muted_foreground,
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                Select::new(&self.tts_model_select)
+                                                                    .placeholder("Select Model"),
+                                                            ),
+                                                    ),
+                                                ),
+                                        ),
+                                ),
                         ),
                 )
                 .child(

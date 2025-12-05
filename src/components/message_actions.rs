@@ -1,4 +1,4 @@
-use crate::actions::{BranchInNewChat, ReadAloud, ReportMessage};
+use crate::actions::{BranchInNewChat, ReportMessage, ToggleReadAloud};
 use gpui::{prelude::FluentBuilder, *};
 use std::rc::Rc;
 use std::time::Duration;
@@ -15,6 +15,11 @@ pub struct MessageActions {
     message_id: String,
     message_text: String,
     on_copy: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    can_read_aloud: bool,
+    is_speaking: bool,
+    is_paused: bool,
+    is_loading: bool,
+    state: Option<WeakEntity<AppState>>,
 }
 
 enum IconSource {
@@ -28,6 +33,10 @@ impl MessageActions {
             message_id: message_id.into(),
             message_text: String::new(),
             on_copy: None,
+            can_read_aloud: false,
+            is_speaking: false,
+            is_paused: false,
+            is_loading: false,
         }
     }
 
@@ -43,6 +52,26 @@ impl MessageActions {
         F: Fn(&mut Window, &mut App) + 'static,
     {
         self.on_copy = Some(Rc::new(handler));
+        self
+    }
+
+    pub fn can_read_aloud(mut self, can: bool) -> Self {
+        self.can_read_aloud = can;
+        self
+    }
+
+    pub fn is_speaking(mut self, is_speaking: bool) -> Self {
+        self.is_speaking = is_speaking;
+        self
+    }
+
+    pub fn is_paused(mut self, is_paused: bool) -> Self {
+        self.is_paused = is_paused;
+        self
+    }
+
+    pub fn is_loading(mut self, is_loading: bool) -> Self {
+        self.is_loading = is_loading;
         self
     }
 
@@ -211,7 +240,47 @@ impl RenderOnce for MessageActions {
                             IconName::Branch,
                             Box::new(BranchInNewChat),
                         )
-                        .menu_with_icon("Read aloud", IconName::ReadAloud, Box::new(ReadAloud))
+                        .when(self.can_read_aloud, |menu| {
+                            if self.is_loading {
+                                menu.menu_with_icon(
+                                    "Loading...",
+                                    IconName::Loader, // Assuming Loader icon exists, or use another
+                                    Box::new(ToggleReadAloud {
+                                        text: self.message_text.clone(),
+                                        message_id: self.message_id.clone(),
+                                    }),
+                                )
+                            } else if self.is_speaking {
+                                if self.is_paused {
+                                    menu.menu_with_icon(
+                                        "Resume",
+                                        IconName::Play,
+                                        Box::new(ToggleReadAloud {
+                                            text: self.message_text.clone(),
+                                            message_id: self.message_id.clone(),
+                                        }),
+                                    )
+                                } else {
+                                    menu.menu_with_icon(
+                                        "Pause",
+                                        IconName::Pause,
+                                        Box::new(ToggleReadAloud {
+                                            text: self.message_text.clone(),
+                                            message_id: self.message_id.clone(),
+                                        }),
+                                    )
+                                }
+                            } else {
+                                menu.menu_with_icon(
+                                    "Read aloud",
+                                    IconName::ReadAloud,
+                                    Box::new(ToggleReadAloud {
+                                        text: self.message_text.clone(),
+                                        message_id: self.message_id.clone(),
+                                    }),
+                                )
+                            }
+                        })
                         .separator()
                         .menu_with_icon(
                             "Report message",
