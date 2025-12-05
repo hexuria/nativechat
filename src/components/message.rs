@@ -10,6 +10,7 @@ pub struct MessageBubble {
     text_color: Hsla,
     timestamp: Option<String>,
     message_id: String,
+    debug_mode: bool,
 }
 
 impl MessageBubble {
@@ -21,6 +22,7 @@ impl MessageBubble {
             text_color: gpui::black(),
             timestamp: None,
             message_id: text.len().to_string(), // Simple ID for now
+            debug_mode: false,
         }
     }
 
@@ -41,6 +43,11 @@ impl MessageBubble {
 
     pub fn timestamp(mut self, timestamp: impl Into<String>) -> Self {
         self.timestamp = Some(timestamp.into());
+        self
+    }
+
+    pub fn debug_mode(mut self, enabled: bool) -> Self {
+        self.debug_mode = enabled;
         self
     }
 }
@@ -89,15 +96,33 @@ impl RenderOnce for MessageBubble {
                             .flex_1()
                             .w_full()
                             .overflow_hidden()
-                            .child(
-                                ui::text::TextView::markdown(
-                                    ElementId::Name(self.message_id.clone().into()),
-                                    self.text.clone(),
-                                    window,
-                                    cx,
+                            .when(self.debug_mode, |this| {
+                                // Debug mode: plain text with styling for visibility
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().foreground)
+                                        .p_2()
+                                        .bg(cx.theme().muted.opacity(0.3))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .font_family("monospace")
+                                        .child(self.text.clone()),
                                 )
-                                .selectable(true),
-                            )
+                            })
+                            .when(!self.debug_mode, |this| {
+                                // Normal mode: markdown rendering
+                                this.child(
+                                    ui::text::TextView::markdown(
+                                        ElementId::Name(self.message_id.clone().into()),
+                                        self.text.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                    .selectable(true),
+                                )
+                            })
                             .when_some(self.timestamp, |this, timestamp| {
                                 this.child(
                                     div()

@@ -164,6 +164,8 @@ pub struct AppState {
     pub db_profiles: Vec<DbProfile>,
     pub db_credentials: Vec<DbCredential>,
     pub active_profile_id: Option<i64>,
+    // Debug mode for markdown rendering
+    pub debug_markdown_disabled: bool,
 }
 
 impl Default for AppState {
@@ -309,6 +311,7 @@ impl AppState {
             db_profiles: Vec::new(),
             db_credentials: Vec::new(),
             active_profile_id: None,
+            debug_markdown_disabled: false,
         };
 
         // Synchronously load cached state to avoid startup delay
@@ -1039,6 +1042,19 @@ impl AppState {
     pub fn set_sidebar_collapsed(&mut self, collapsed: bool, auto: bool, cx: &mut Context<Self>) {
         self.sidebar_collapsed = collapsed;
         self.auto_collapsed = auto;
+        cx.notify();
+    }
+
+    pub fn toggle_debug_markdown(&mut self, cx: &mut Context<Self>) {
+        self.debug_markdown_disabled = !self.debug_markdown_disabled;
+        println!(
+            "[DEBUG] Markdown rendering: {}",
+            if self.debug_markdown_disabled {
+                "DISABLED (plain text)"
+            } else {
+                "ENABLED"
+            }
+        );
         cx.notify();
     }
 

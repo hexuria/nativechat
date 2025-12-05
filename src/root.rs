@@ -1,5 +1,6 @@
 use crate::actions::{
-    About, Hide, HideOthers, Minimize, NewChat, ShowAll, ToggleSidebar, ToggleTheme, Zoom,
+    About, Hide, HideOthers, Minimize, NewChat, ShowAll, ToggleDebugMarkdown, ToggleSidebar,
+    ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
 use gpui::prelude::*;
@@ -125,6 +126,12 @@ impl Render for RootView {
                       _window: &mut Window,
                       cx: &mut App| {
                     state.update(cx, |state, cx| state.toggle_credentials_modal(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &ToggleDebugMarkdown, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_debug_markdown(cx));
                 }
             })
             // Voice Mode Modal Overlay

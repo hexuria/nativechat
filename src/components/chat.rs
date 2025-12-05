@@ -277,6 +277,8 @@ impl Render for ChatView {
             vec![]
         };
 
+        let debug_mode = state.debug_markdown_disabled;
+
         v_flex()
             .size_full()
             .bg(theme.background)
@@ -318,6 +320,7 @@ impl Render for ChatView {
                                             .bg_color(bg_color)
                                             .text_color(text_color)
                                             .timestamp(msg.formatted_time())
+                                            .debug_mode(debug_mode)
                                     })),
                             ),
                     )

@@ -1,7 +1,7 @@
 use gpui::*;
 use nativechat::actions::{
-    About, Hide, HideOthers, Minimize, NewChat, OpenSettings, Quit, ShowAll, ToggleSidebar,
-    ToggleTheme, Zoom,
+    About, Hide, HideOthers, Minimize, NewChat, OpenSettings, Quit, ShowAll, ToggleDebugMarkdown,
+    ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
@@ -62,6 +62,7 @@ fn main() {
                 KeyBinding::new("cmd-n", NewChat, None),
                 KeyBinding::new("cmd-,", OpenSettings, None),
                 KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-f12", ToggleDebugMarkdown, None),
             ]);
 
             // Register actions

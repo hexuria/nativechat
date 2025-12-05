@@ -35,7 +35,8 @@ actions!(
         OpenAccountSettings,
         OpenProfileSettings,
         SignOut,
-        ToggleCredentialsModal
+        ToggleCredentialsModal,
+        ToggleDebugMarkdown
     ]
 );
 
