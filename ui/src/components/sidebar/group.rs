@@ -1,6 +1,6 @@
-use crate::{v_flex, ActiveTheme, Collapsible};
+use crate::{v_flex, ActiveTheme, Collapsible, StyledExt as _};
 use gpui::{
-    div, prelude::FluentBuilder as _, App, Div, IntoElement, ParentElement, RenderOnce,
+    div, prelude::FluentBuilder as _, App, Axis, Div, IntoElement, ParentElement, RenderOnce,
     SharedString, Styled as _, Window,
 };
 
@@ -59,8 +59,8 @@ impl<E: Collapsible + IntoElement> From<SidebarGroup<E>> for crate::resizable::R
 impl<E: Collapsible + IntoElement> RenderOnce for SidebarGroup<E> {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         v_flex()
+            .size_full()
             .relative()
-            .w_full()
             .child(
                 div()
                     .flex_shrink_0()
@@ -73,11 +73,14 @@ impl<E: Collapsible + IntoElement> RenderOnce for SidebarGroup<E> {
                     .child(self.label),
             )
             .child(
-                self.base.children(
-                    self.children
-                        .into_iter()
-                        .map(|child| child.collapsed(self.collapsed)),
-                ),
+                self.base
+                    .flex_1()
+                    .children(
+                        self.children
+                            .into_iter()
+                            .map(|child| child.collapsed(self.collapsed)),
+                    )
+                    .scrollable(Axis::Vertical),
             )
     }
 }

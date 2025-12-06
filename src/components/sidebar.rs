@@ -3,14 +3,10 @@ use crate::actions::{
     StartRenameSession, SubmitRenameSession,
 };
 use crate::state::AppState;
-use gpui::AppContext;
-use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
-};
+use gpui::{Axis, prelude::FluentBuilder, *};
 use ui::{
-    ActiveTheme, Collapsible, Icon, IconName, Side, avatar::Avatar, h_flex, input::InputState,
-    sidebar::*, v_flex,
+    ActiveTheme, Collapsible, Icon, IconName, Side, StyledExt, avatar::Avatar, h_flex,
+    input::InputState, sidebar::*, v_flex,
 };
 
 #[derive(IntoElement)]
