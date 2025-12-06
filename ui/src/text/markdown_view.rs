@@ -13,7 +13,9 @@ use gpui::{
     TextRun, TextStyle, UnderlineStyle, Window,
 };
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ropey::Rope;
 
+use crate::highlighter::SyntaxHighlighter;
 use crate::{h_flex, v_flex, ActiveTheme};
 
 /// Parse options for pulldown-cmark with GFM extensions
@@ -565,6 +567,39 @@ impl ElementBuilder {
             text.hash(&mut hasher);
             let id = format!("md-codeblock-copy-{}", hasher.finish());
 
+            // Apply syntax highlighting if language is specified
+            let highlight_theme = &cx.theme().highlight_theme;
+            let styled_content = if !lang.is_empty() {
+                let mut highlighter = SyntaxHighlighter::new(&lang);
+                highlighter.update(None, &Rope::from_str(&text));
+                let styles = highlighter.styles(&(0..text.len()), highlight_theme);
+
+                // Convert highlight styles to TextRuns
+                let runs: Vec<TextRun> = styles
+                    .iter()
+                    .map(|(range, style)| {
+                        let base_style = TextStyle {
+                            color: style.color.unwrap_or(cx.theme().foreground),
+                            font_family: cx.theme().mono_font_family.clone(),
+                            font_weight: style.font_weight.unwrap_or_default(),
+                            font_style: style.font_style.unwrap_or_default(),
+                            ..Default::default()
+                        };
+                        base_style.to_run(range.len())
+                    })
+                    .collect();
+
+                StyledText::new(text.clone()).with_runs(runs)
+            } else {
+                // No language specified - use plain monospace text
+                let base_style = TextStyle {
+                    color: cx.theme().foreground,
+                    font_family: cx.theme().mono_font_family.clone(),
+                    ..Default::default()
+                };
+                StyledText::new(text.clone()).with_runs(vec![base_style.to_run(text.len())])
+            };
+
             self.blocks.push(
                 div()
                     .w_full()
@@ -593,14 +628,8 @@ impl ElementBuilder {
                                     .value(text.clone()),
                             ),
                     )
-                    // Code content
-                    .child(
-                        div()
-                            .p_3()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_size(cx.theme().mono_font_size)
-                            .child(text),
-                    )
+                    // Code content with syntax highlighting
+                    .child(div().p_3().child(styled_content).text_xs())
                     .into_any_element(),
             );
         }
