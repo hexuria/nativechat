@@ -18,6 +18,7 @@ pub struct MessageBubble {
     is_speaking: bool,
     is_paused: bool,
     is_loading: bool,
+    is_cached: bool,
 }
 
 impl MessageBubble {
@@ -34,6 +35,7 @@ impl MessageBubble {
             is_speaking: false,
             is_paused: false,
             is_loading: false,
+            is_cached: false,
         }
     }
 
@@ -84,6 +86,11 @@ impl MessageBubble {
 
     pub fn is_loading(mut self, is_loading: bool) -> Self {
         self.is_loading = is_loading;
+        self
+    }
+
+    pub fn is_cached(mut self, is_cached: bool) -> Self {
+        self.is_cached = is_cached;
         self
     }
 }
@@ -208,7 +215,8 @@ impl RenderOnce for MessageBubble {
                                 .can_read_aloud(self.can_read_aloud)
                                 .is_speaking(self.is_speaking)
                                 .is_paused(self.is_paused)
-                                .is_loading(self.is_loading),
+                                .is_loading(self.is_loading)
+                                .is_cached(self.is_cached),
                         )
                         .on_key_down({
                             let text = self.text.clone();

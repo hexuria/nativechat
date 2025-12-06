@@ -21,6 +21,7 @@ pub struct MessageActions {
     is_speaking: bool,
     is_paused: bool,
     is_loading: bool,
+    is_cached: bool,
     state: Option<WeakEntity<AppState>>,
 }
 
@@ -39,6 +40,7 @@ impl MessageActions {
             is_speaking: false,
             is_paused: false,
             is_loading: false,
+            is_cached: false,
             state: None,
         }
     }
@@ -75,6 +77,11 @@ impl MessageActions {
 
     pub fn is_loading(mut self, is_loading: bool) -> Self {
         self.is_loading = is_loading;
+        self
+    }
+
+    pub fn is_cached(mut self, is_cached: bool) -> Self {
+        self.is_cached = is_cached;
         self
     }
 
@@ -274,8 +281,14 @@ impl RenderOnce for MessageActions {
                                     )
                                 }
                             } else {
+                                // Show "Play (saved)" if cached, "Read aloud" if not
+                                let label = if self.is_cached {
+                                    "Play (saved)"
+                                } else {
+                                    "Read aloud"
+                                };
                                 menu.menu_with_icon(
-                                    "Read aloud",
+                                    label,
                                     IconName::ReadAloud,
                                     Box::new(ToggleReadAloud {
                                         text: self.message_text.clone(),

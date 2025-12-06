@@ -1,25 +1,44 @@
+use super::live_tts_provider::LiveTtsProvider;
+use super::rest_tts_provider::RestTtsProvider;
+use super::tts_provider::TtsProvider;
 use crate::services::audio_output::{AudioCommand, AudioOutput};
-use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose};
-use futures::StreamExt;
-use reqwest::Client;
-use serde_json::json;
+use anyhow::Result;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[derive(Clone)]
 pub struct TtsService {
-    client: Client,
+    live_provider: Arc<LiveTtsProvider>,
+    rest_provider: Arc<RestTtsProvider>,
     audio_output: Arc<AudioOutput>,
+    /// Used to cancel ongoing streaming when stop() is called
+    cancelled: Arc<AtomicBool>,
 }
 
 impl TtsService {
     pub fn new(is_ai_speaking: Arc<AtomicBool>, ai_amplitude: Arc<AtomicU32>) -> Result<Self> {
         let audio_output = Arc::new(AudioOutput::new(is_ai_speaking, ai_amplitude)?);
+
         Ok(Self {
-            client: Client::new(),
+            live_provider: Arc::new(LiveTtsProvider::new()),
+            rest_provider: Arc::new(RestTtsProvider::new()),
             audio_output,
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Check if a model should use the Live API (streaming WebSocket)
+    fn is_live_api_model(model_id: &str) -> bool {
+        model_id.to_lowercase().contains("native-audio")
+    }
+
+    /// Get the appropriate provider for the given model
+    fn get_provider(&self, model_id: &str) -> Arc<dyn TtsProvider> {
+        if Self::is_live_api_model(model_id) {
+            self.live_provider.clone()
+        } else {
+            self.rest_provider.clone()
+        }
     }
 
     fn get_cache_path(message_id: &str) -> Option<std::path::PathBuf> {
@@ -46,24 +65,10 @@ impl TtsService {
         samples
     }
 
-    /// Extract audio data from a Gemini TTS response JSON
-    fn extract_audio_data(response_json: &serde_json::Value) -> Option<Vec<u8>> {
-        response_json
-            .get("candidates")?
-            .get(0)?
-            .get("content")?
-            .get("parts")?
-            .get(0)?
-            .get("inlineData")?
-            .get("data")?
-            .as_str()
-            .and_then(|base64_str| general_purpose::STANDARD.decode(base64_str).ok())
-    }
-
     /// Start speaking with streaming - audio plays as chunks arrive.
-    /// Returns Ok(true) if audio started (caller should set speaking state),
+    /// Returns Ok(true) as soon as audio starts playing (first chunk received),
     /// Returns Ok(false) if nothing to play.
-    /// The audio will continue playing in the background.
+    /// The audio continues playing in the background.
     pub async fn start_speaking(
         &self,
         text: &str,
@@ -71,6 +76,9 @@ impl TtsService {
         model_id: &str,
         api_key: &str,
     ) -> Result<bool> {
+        // Reset cancellation flag for new request
+        self.cancelled.store(false, Ordering::SeqCst);
+
         // Check cache first - if cached, play immediately without network request
         if let Some(path) = Self::get_cache_path(message_id) {
             if path.exists() {
@@ -85,104 +93,55 @@ impl TtsService {
             }
         }
 
-        // Use streaming endpoint for better UX with long text
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
-            model_id, api_key
-        );
+        // Use the appropriate provider based on model_id
+        let provider = self.get_provider(model_id);
+        let mut rx = provider.stream_audio(text, model_id, api_key).await?;
 
-        let payload = json!({
-            "contents": [{
-                "parts":[{
-                    "text": text
-                }]
-            }],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {
-                            "voiceName": "Kore"
-                        }
-                    }
-                }
-            }
-        });
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .context("Failed to send TTS request")?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("TTS API error: {}", error_text));
-        }
-
-        // Stream audio chunks as they arrive (SSE format)
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut all_audio_bytes: Vec<u8> = Vec::new();
         let mut audio_started = false;
+        let mut all_samples: Vec<f32> = Vec::new();
+        let mut was_cancelled = false;
 
-        while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+        // Process audio chunks as they arrive
+        while let Some(result) = rx.recv().await {
+            // Check cancellation
+            if self.cancelled.load(Ordering::SeqCst) {
+                was_cancelled = true;
+                break;
+            }
 
-                    // Parse SSE events (same pattern as chat_stream in gemini.rs)
-                    loop {
-                        let p1 = buffer.find("\n\n");
-                        let p2 = buffer.find("\r\n\r\n");
+            match result {
+                Ok(chunk) => {
+                    if !chunk.samples.is_empty() {
+                        // Play immediately
+                        if !self.cancelled.load(Ordering::SeqCst) {
+                            self.audio_output
+                                .process_command(AudioCommand::Samples(chunk.samples.clone()));
 
-                        let (pos, len) = match (p1, p2) {
-                            (Some(i), Some(j)) => {
-                                if i < j {
-                                    (i, 2)
-                                } else {
-                                    (j, 4)
-                                }
-                            }
-                            (Some(i), None) => (i, 2),
-                            (None, Some(j)) => (j, 4),
-                            (None, None) => break,
-                        };
-
-                        let event = buffer[..pos].to_string();
-                        buffer = buffer[pos + len..].to_string();
-
-                        if let Some(data) = event.strip_prefix("data: ") {
-                            if let Ok(resp) = serde_json::from_str::<serde_json::Value>(data) {
-                                if let Some(audio_bytes) = Self::extract_audio_data(&resp) {
-                                    // Accumulate for caching
-                                    all_audio_bytes.extend_from_slice(&audio_bytes);
-
-                                    // Play immediately for low latency
-                                    let samples = Self::bytes_to_samples(&audio_bytes);
-                                    if !samples.is_empty() {
-                                        self.audio_output
-                                            .process_command(AudioCommand::Samples(samples));
-                                        audio_started = true;
-                                    }
-                                }
-                            }
+                            all_samples.extend(chunk.samples);
+                            audio_started = true;
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("TTS stream error: {}", e);
+                    // Error means stream broken, don't cache partial audio
+                    was_cancelled = true;
                     break;
                 }
             }
         }
 
-        // Save complete audio to cache for future playback
-        if !all_audio_bytes.is_empty() {
+        // Only save complete audio to cache (not cancelled or errored)
+        if !was_cancelled && !all_samples.is_empty() {
+            // Convert back to i16 PCM bytes for storage
+            let mut bytes = Vec::with_capacity(all_samples.len() * 2);
+            for sample in all_samples {
+                let s = (sample * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+
             if let Some(path) = Self::get_cache_path(message_id) {
-                let _ = std::fs::write(path, &all_audio_bytes);
+                let _ = std::fs::write(path, &bytes);
             }
         }
 
@@ -212,6 +171,8 @@ impl TtsService {
     }
 
     pub fn stop(&self) {
+        // Signal cancellation to any ongoing streaming
+        self.cancelled.store(true, Ordering::SeqCst);
         self.audio_output.process_command(AudioCommand::Stop);
     }
 

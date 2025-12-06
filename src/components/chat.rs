@@ -1,6 +1,7 @@
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
 use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
+use crate::services::tts_service::TtsService;
 use crate::state::AppState;
 use gpui::*;
 use ui::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
@@ -354,10 +355,28 @@ impl Render for ChatView {
                                             (theme.secondary, theme.secondary_foreground)
                                         };
 
-                                        let is_speaking =
-                                            speaking_message_id.as_ref() == Some(&msg.id);
-                                        let is_loading =
+                                        // Determine speaking state from both:
+                                        // 1. speaking_message_id (set after stream completes)
+                                        // 2. OR loading_message_id + is_ai_speaking (during streaming)
+                                        let is_this_message_loading =
                                             state.loading_message_id.as_ref() == Some(&msg.id);
+                                        let is_this_message_speaking =
+                                            speaking_message_id.as_ref() == Some(&msg.id);
+
+                                        // is_ai_speaking is set by AudioOutput when audio buffer has samples
+                                        let is_ai_speaking = state
+                                            .is_ai_speaking
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+
+                                        // If we're loading this message AND audio has started playing,
+                                        // treat it as "speaking" not "loading"
+                                        let is_speaking = is_this_message_speaking
+                                            || (is_this_message_loading && is_ai_speaking);
+
+                                        // Only show loading if we're loading AND audio hasn't started yet
+                                        let is_loading = is_this_message_loading && !is_ai_speaking;
+
+                                        let is_cached = TtsService::is_cached(&msg.id);
 
                                         MessageBubble::new(msg.content.clone())
                                             .message_id(msg.id.clone())
@@ -370,6 +389,7 @@ impl Render for ChatView {
                                             .is_speaking(is_speaking)
                                             .is_paused(is_paused)
                                             .is_loading(is_loading)
+                                            .is_cached(is_cached)
                                     })),
                             ),
                     )

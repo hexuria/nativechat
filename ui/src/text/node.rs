@@ -364,6 +364,7 @@ impl CodeBlock {
         let style = &node_cx.style;
 
         div()
+            .w_full()
             .when(!options.is_last, |this| this.pb(style.paragraph_gap))
             .child(
                 div()
@@ -1157,6 +1158,7 @@ impl Node {
                 .into_any_element(),
             Node::Paragraph(paragraph) => div()
                 .id("p")
+                .w_full()
                 .pb(mb)
                 .child(paragraph.render(node_cx, window, cx))
                 .into_any_element(),

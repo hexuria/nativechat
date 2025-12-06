@@ -166,10 +166,14 @@ impl ModelRegistry {
             || id_lower.contains("nano-banana");
 
         // Check if it's a moderation or transcription model (should be filtered out)
+        // Also check for TTS and native-audio (Live API) models
         let is_utility = id_lower.contains("moderation")
             || id_lower.contains("whisper")
             || id_lower.contains("tts-")
             || id_lower.contains("transcribe");
+
+        // Check if it's a TTS model (including Live API native-audio models)
+        let is_tts = id_lower.contains("tts") || id_lower.contains("native-audio-preview");
 
         if is_embedding {
             return (
@@ -195,21 +199,28 @@ impl ModelRegistry {
             );
         }
 
+        // Handle TTS models specifically (both REST and Live API models)
+        if is_tts {
+            return (
+                ModelCapabilities {
+                    supports_text_generation: false,
+                    supports_text_to_speech: true,
+                    supports_streaming: id_lower.contains("native-audio"), // Live API streams
+                    ..Default::default()
+                },
+                ModelType::AudioGeneration,
+            );
+        }
+
         if is_utility {
             let model_type = if id_lower.contains("whisper") {
                 ModelType::SpeechRecognition
-            } else if id_lower.contains("tts") {
-                ModelType::AudioGeneration
             } else {
                 ModelType::Moderation
             };
 
             let mut caps = ModelCapabilities::default();
             caps.supports_text_generation = false;
-
-            if model_type == ModelType::AudioGeneration {
-                caps.supports_text_to_speech = true;
-            }
 
             return (caps, model_type);
         }

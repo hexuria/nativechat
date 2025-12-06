@@ -1232,6 +1232,7 @@ impl AppState {
     }
 
     pub fn read_aloud(&mut self, text: String, message_id: String, cx: &mut Context<Self>) {
+        println!("[State] read_aloud called for message: {}", message_id);
         // Initialize TTS service if needed
         if self.tts_service.is_none() {
             match TtsService::new(self.is_ai_speaking.clone(), self.ai_amplitude.clone()) {
@@ -1264,18 +1265,24 @@ impl AppState {
                 .map(|c| c.api_key.clone())
                 .or_else(|| self.config.as_ref().and_then(|c| c.gemini_api_key.clone()));
 
-            if let (Some(model_id), Some(api_key)) = (tts_model_id, api_key) {
+            if let (Some(model_id), Some(api_key_ref)) = (tts_model_id, &api_key) {
+                println!(
+                    "[State] Starting TTS with model: {} (key length: {})",
+                    model_id,
+                    api_key_ref.len()
+                );
                 let service = service.clone();
                 let model_id = model_id.to_string();
                 let message_id_clone = message_id.clone();
                 let text = text.clone();
+                let api_key_str = api_key_ref.clone();
 
                 cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
                         // Phase 1: Start audio playback (returns immediately after queuing)
                         let start_result = service
-                            .start_speaking(&text, &message_id_clone, &model_id, &api_key)
+                            .start_speaking(&text, &message_id_clone, &model_id, &api_key_str)
                             .await;
 
                         match start_result {
@@ -1299,25 +1306,22 @@ impl AppState {
                                     if state.speaking_message_id.as_ref()
                                         == Some(&message_id_for_completion)
                                     {
+                                        println!("[State] TTS finished normally");
                                         state.speaking_message_id = None;
-                                        state.is_paused = false;
+                                        cx.notify();
                                     }
-                                    cx.notify();
                                 })
                                 .ok();
                             }
                             Ok(false) => {
-                                // Nothing to play
-                                this.update(&mut cx, |state, cx| {
-                                    state.loading_message_id = None;
-                                    cx.notify();
-                                })
-                                .ok();
+                                println!("[State] TTS started returned false (nothing to play)");
                             }
                             Err(e) => {
-                                eprintln!("TTS Error: {:?}", e);
+                                eprintln!("[State] TTS failed: {}", e);
+                                // Also clear loading state on error
                                 this.update(&mut cx, |state, cx| {
                                     state.loading_message_id = None;
+                                    state.speaking_message_id = None;
                                     cx.notify();
                                 })
                                 .ok();
@@ -1327,9 +1331,11 @@ impl AppState {
                 })
                 .detach();
             } else {
-                self.loading_message_id = None;
-                cx.notify();
-                eprintln!("Missing TTS model or API key");
+                eprintln!(
+                    "[State] TTS Config Missing! Model: {:?}, API Key present: {}",
+                    tts_model_id,
+                    api_key.is_some()
+                );
             }
         }
     }
