@@ -190,15 +190,12 @@ impl RenderOnce for MessageBubble {
                                 })
                                 .when(!self.debug_mode, |this| {
                                     // Normal mode: markdown rendering
-                                    this.child(
-                                        ui::text::TextView::markdown(
-                                            ElementId::Name(self.message_id.clone().into()),
-                                            self.text.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .selectable(true),
-                                    )
+                                    this.child(ui::text::MarkdownView::new(
+                                        ElementId::Name(self.message_id.clone().into()),
+                                        self.text.clone(),
+                                        window,
+                                        cx,
+                                    ))
                                 })
                                 .when_some(self.timestamp, |this, timestamp| {
                                     this.child(

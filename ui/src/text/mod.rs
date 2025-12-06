@@ -1,11 +1,13 @@
 mod format;
 mod inline;
+pub mod markdown_view;
 mod node;
 mod style;
 mod text_view;
 mod utils;
 
 use gpui::App;
+pub use markdown_view::MarkdownView;
 pub use style::*;
 pub use text_view::*;
 
