@@ -362,6 +362,8 @@ impl CodeBlock {
         cx: &mut App,
     ) -> AnyElement {
         let style = &node_cx.style;
+        let code_content = self.code();
+        let lang_label = self.lang.clone().unwrap_or_default();
 
         div()
             .w_full()
@@ -369,19 +371,52 @@ impl CodeBlock {
             .child(
                 div()
                     .id("codeblock")
-                    .p_3()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().secondary.opacity(0.85))
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(cx.theme().mono_font_size)
                     .relative()
                     .refine_style(&style.code_block)
-                    .child(Inline::new(
-                        "code",
-                        self.state.clone(),
-                        vec![],
-                        self.styles.clone(),
-                    )),
+                    // Header with language label and copy button
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_h_8()
+                            .justify_between()
+                            .items_center()
+                            .px_3()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.5))
+                            // Language label on the left
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(lang_label),
+                            )
+                            // Copy button on the right
+                            .child({
+                                // Generate unique ID from code content hash
+                                use std::collections::hash_map::DefaultHasher;
+                                use std::hash::{Hash, Hasher};
+                                let mut hasher = DefaultHasher::new();
+                                code_content.hash(&mut hasher);
+                                let id = format!("codeblock-copy-{}", hasher.finish());
+                                crate::clipboard::Clipboard::new(ElementId::Name(id.into()))
+                                    .value(code_content.clone())
+                            }),
+                    )
+                    // Code content
+                    .child(
+                        div()
+                            .p_3()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(cx.theme().mono_font_size)
+                            .child(Inline::new(
+                                "code",
+                                self.state.clone(),
+                                vec![],
+                                self.styles.clone(),
+                            )),
+                    ),
             )
             .into_any_element()
     }

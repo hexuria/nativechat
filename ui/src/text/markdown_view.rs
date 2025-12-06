@@ -246,8 +246,8 @@ impl MarkdownView {
                     MarkdownTag::BlockQuote => {
                         builder.start_blockquote();
                     }
-                    MarkdownTag::CodeBlock(_lang) => {
-                        builder.start_code_block();
+                    MarkdownTag::CodeBlock(lang) => {
+                        builder.start_code_block(lang.clone());
                     }
                     MarkdownTag::List(start) => {
                         builder.start_list(*start);
@@ -427,6 +427,8 @@ struct ElementBuilder {
     in_code_block: bool,
     /// Code block content accumulator
     code_block_text: String,
+    /// Code block language
+    code_block_lang: Option<SharedString>,
 }
 
 enum BuilderContext {
@@ -446,6 +448,7 @@ impl ElementBuilder {
             heading_level: 0,
             in_code_block: false,
             code_block_text: String::new(),
+            code_block_lang: None,
         }
     }
 
@@ -543,25 +546,61 @@ impl ElementBuilder {
         }
     }
 
-    fn start_code_block(&mut self) {
+    fn start_code_block(&mut self, lang: Option<SharedString>) {
         self.in_code_block = true;
         self.code_block_text.clear();
+        self.code_block_lang = lang;
     }
 
     fn end_code_block(&mut self, cx: &App) {
         self.in_code_block = false;
         let text = std::mem::take(&mut self.code_block_text);
+        let lang = self.code_block_lang.take().unwrap_or_default();
 
         if !text.is_empty() {
+            // Generate unique ID from code content hash
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            text.hash(&mut hasher);
+            let id = format!("md-codeblock-copy-{}", hasher.finish());
+
             self.blocks.push(
                 div()
                     .w_full()
-                    .p_3()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().secondary.opacity(0.85))
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(cx.theme().mono_font_size)
-                    .child(text)
+                    // Header with language label and copy button
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_h_8()
+                            .justify_between()
+                            .items_center()
+                            .px_3()
+                            .border_b_1()
+                            .border_color(cx.theme().border.opacity(0.5))
+                            // Language label on left
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(lang),
+                            )
+                            // Copy button on right
+                            .child(
+                                crate::clipboard::Clipboard::new(gpui::ElementId::Name(id.into()))
+                                    .value(text.clone()),
+                            ),
+                    )
+                    // Code content
+                    .child(
+                        div()
+                            .p_3()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(cx.theme().mono_font_size)
+                            .child(text),
+                    )
                     .into_any_element(),
             );
         }
