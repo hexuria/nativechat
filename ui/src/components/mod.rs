@@ -2,6 +2,7 @@
 
 pub mod avatar;
 pub mod button;
+pub mod checkbox;
 pub mod clipboard;
 pub mod icon;
 pub mod input;
@@ -15,6 +16,7 @@ pub mod tooltip;
 // Re-export main types
 pub use avatar::Avatar;
 pub use button::Button;
+pub use checkbox::Checkbox;
 pub use clipboard::Clipboard;
 pub use icon::{Icon, IconName};
 pub use input::{Input, InputEvent, InputState};

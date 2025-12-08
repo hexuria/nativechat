@@ -58,6 +58,7 @@ pub use index_path::*;
 pub use colors::*;
 
 // Re-export commonly needed support types
+pub use components::checkbox::Selection; // Export Selection enum
 pub use input::RopeExt;
 pub use select::{
     SearchableVec, Select, SelectDelegate, SelectEvent, SelectGroup, SelectItem, SelectState,

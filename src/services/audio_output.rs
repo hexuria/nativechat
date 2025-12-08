@@ -15,7 +15,7 @@ pub enum AudioCommand {
 pub struct AudioOutput {
     _stream: cpal::Stream,
     buffer: Arc<Mutex<VecDeque<f32>>>,
-    is_ai_speaking: Arc<AtomicBool>,
+    pub is_ai_speaking: Arc<AtomicBool>,
     is_paused: Arc<AtomicBool>,
     completion_notify: Arc<Notify>,
 }

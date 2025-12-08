@@ -3,6 +3,7 @@ use super::rest_tts_provider::RestTtsProvider;
 use super::tts_provider::TtsProvider;
 use crate::services::audio_output::{AudioCommand, AudioOutput};
 use anyhow::Result;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -13,17 +14,34 @@ pub struct TtsService {
     audio_output: Arc<AudioOutput>,
     /// Used to cancel ongoing streaming when stop() is called
     cancelled: Arc<AtomicBool>,
+    native_provider: Option<Arc<parking_lot::Mutex<tts::Tts>>>,
 }
 
 impl TtsService {
     pub fn new(is_ai_speaking: Arc<AtomicBool>, ai_amplitude: Arc<AtomicU32>) -> Result<Self> {
         let audio_output = Arc::new(AudioOutput::new(is_ai_speaking, ai_amplitude)?);
 
+        let native_provider = if cfg!(target_os = "macos") {
+            match tts::Tts::default() {
+                Ok(tts) => {
+                    println!("[TTS Service] Native TTS initialized");
+                    Some(Arc::new(parking_lot::Mutex::new(tts)))
+                }
+                Err(e) => {
+                    eprintln!("[TTS Service] Failed to initialize native TTS: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             live_provider: Arc::new(LiveTtsProvider::new()),
             rest_provider: Arc::new(RestTtsProvider::new()),
             audio_output,
             cancelled: Arc::new(AtomicBool::new(false)),
+            native_provider,
         })
     }
 
@@ -78,6 +96,52 @@ impl TtsService {
     ) -> Result<bool> {
         // Reset cancellation flag for new request
         self.cancelled.store(false, Ordering::SeqCst);
+
+        // **NATIVE TTS FAST PATH** - Speak immediately without streaming
+        // This is triggered if model_id is "native" (which can be forced via settings)
+        // or if model_id is empty (fallback).
+        if model_id.is_empty() || model_id == "native" {
+            if let Some(native_provider_arc) = self.native_provider.clone() {
+                // Use stored provider
+                let native_provider = native_provider_arc.clone();
+                let text_owned = text.to_string();
+                let is_ai_speaking = self.audio_output.is_ai_speaking.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    // Set speaking flag
+                    is_ai_speaking.store(true, Ordering::Relaxed);
+
+                    // Lock and speak
+                    {
+                        let mut tts = native_provider.lock();
+                        if let Err(e) = tts.speak(&text_owned, false) {
+                            eprintln!("[TTS] Native speak failed: {}", e);
+                        }
+                    }
+
+                    // Poll for completion (re-locking to check status)
+                    // We re-lock in loop to not hold lock indefinitely if that matters,
+                    // but tts methods likely need lock.
+                    // Note: holding lock for duration of speech might block other calls but we only have one stream here.
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        let is_speaking = {
+                            let tts = native_provider.lock();
+                            tts.is_speaking().unwrap_or(false)
+                        };
+                        if !is_speaking {
+                            break;
+                        }
+                    }
+
+                    // Clear speaking flag
+                    is_ai_speaking.store(false, Ordering::Relaxed);
+                });
+
+                // Return true immediately so UI knows we started "playing"
+                return Ok(true);
+            }
+        }
 
         // Check cache first - if cached, play immediately without network request
         if let Some(path) = Self::get_cache_path(message_id) {

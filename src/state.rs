@@ -172,6 +172,7 @@ pub struct AppState {
     pub speaking_message_id: Option<String>,
     pub loading_message_id: Option<String>,
     pub is_paused: bool,
+    pub force_native_tts: bool,
 }
 
 impl Default for AppState {
@@ -323,8 +324,8 @@ impl AppState {
             speaking_message_id: None,
             loading_message_id: None,
             is_paused: false,
+            force_native_tts: true, // Default to Native TTS for speed
         };
-
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
             println!(
@@ -919,7 +920,7 @@ impl AppState {
                 println!("[LLM] Sending request to AI...");
 
                 // Create the AI message placeholder first
-                let _ = this.update(&mut cx, |state, cx| {
+                let _ = this.update(&mut cx, |state, model_cx| {
                     if let Some(conversation) = state
                         .conversations
                         .iter_mut()
@@ -934,7 +935,7 @@ impl AppState {
                         };
                         conversation.messages.push(ai_message);
                     }
-                    cx.notify();
+                    model_cx.notify();
                 });
 
                 let mut full_response = String::new();
@@ -1254,28 +1255,37 @@ impl AppState {
             self.is_paused = false;
             cx.notify();
 
-            // Get current profile's TTS model
-            let tts_model_id = self
-                .active_profile()
-                .and_then(|p| p.tts_model_id.as_deref());
+            // Get current profile's TTS model (default to "native" if not set OR if forced)
+            let force_native = self.force_native_tts;
+            let tts_model_id = if force_native {
+                Some("native")
+            } else {
+                self.active_profile()
+                    .and_then(|p| p.tts_model_id.as_deref())
+            }
+            .unwrap_or("native");
 
-            // Get API key
+            // Get API key (only needed for API-based models, not native)
             let api_key = self
                 .active_credential()
                 .map(|c| c.api_key.clone())
                 .or_else(|| self.config.as_ref().and_then(|c| c.gemini_api_key.clone()));
 
-            if let (Some(model_id), Some(api_key_ref)) = (tts_model_id, &api_key) {
+            let should_speak = tts_model_id == "native" || api_key.is_some();
+            if should_speak {
+                let model_id = tts_model_id.to_string();
+                let api_key_string = api_key.unwrap_or_default();
+
                 println!(
                     "[State] Starting TTS with model: {} (key length: {})",
                     model_id,
-                    api_key_ref.len()
+                    api_key_string.len()
                 );
                 let service = service.clone();
                 let model_id = model_id.to_string();
                 let message_id_clone = message_id.clone();
                 let text = text.clone();
-                let api_key_str = api_key_ref.clone();
+                let api_key_str = api_key_string.clone();
 
                 cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
                     let mut cx = cx.clone();

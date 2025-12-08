@@ -5,14 +5,17 @@ use gpui::{
     Context, Entity, FontWeight, IntoElement, MouseButton, Render, Styled, Window, div, px,
 };
 use ui::{
-    ActiveTheme, Icon, IconName,
+    ActiveTheme,
+    Icon,
+    IconName,
     button::Button,
+    checkbox::Checkbox, // Add Checkbox
     input::{Input, InputState},
 };
 
 pub struct AccountSettingsModal {
     state: Entity<AppState>,
-    active_tab: usize, // 0: Profile, 1: Security
+    active_tab: usize, // 0: Profile, 1: Security, 2: Advanced
     name_input: Entity<InputState>,
     email_input: Entity<InputState>,
     current_password_input: Entity<InputState>,
@@ -141,6 +144,56 @@ impl AccountSettingsModal {
                     .w_full(),
             )
     }
+
+    fn render_advanced_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        let force_native = state.force_native_tts;
+
+        div().flex().flex_col().gap_4().child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().child("Text-to-Speech").font_weight(FontWeight::BOLD))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().child("Force Native TTS"))
+                                .child(
+                                    div()
+                                        .child("Use offline macOS voices for instant playback")
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground),
+                                ),
+                        )
+                        .child(
+                            Checkbox::new("force-native-tts-checkbox")
+                                .checked(if force_native {
+                                    ui::checkbox::Selection::Selected
+                                } else {
+                                    ui::checkbox::Selection::Unselected
+                                })
+                                .on_click({
+                                    let state = self.state.clone();
+                                    move |selection, _window, cx| {
+                                        let checked =
+                                            matches!(selection, ui::checkbox::Selection::Selected);
+                                        state.update(cx, |state, cx| {
+                                            state.force_native_tts = checked;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                ),
+        )
+    }
 }
 
 impl Render for AccountSettingsModal {
@@ -218,17 +271,20 @@ impl Render for AccountSettingsModal {
                                             cx.notify();
                                         }))
                                         .child(ui::tab::Tab::new().flex_1().label("Profile"))
-                                        .child(ui::tab::Tab::new().flex_1().label("Security")),
+                                        .child(ui::tab::Tab::new().flex_1().label("Security"))
+                                        .child(ui::tab::Tab::new().flex_1().label("Advanced")),
                                 ),
                             )
                             .child(
                                 // Content
-                                div().p_4().child(if self.active_tab == 0 {
-                                    self.render_profile_tab(foreground, background, cx)
-                                        .into_any_element()
-                                } else {
-                                    self.render_security_tab(foreground, background, cx)
-                                        .into_any_element()
+                                div().p_4().child(match self.active_tab {
+                                    0 => self
+                                        .render_profile_tab(foreground, background, cx)
+                                        .into_any_element(),
+                                    1 => self
+                                        .render_security_tab(foreground, background, cx)
+                                        .into_any_element(),
+                                    _ => self.render_advanced_tab(cx).into_any_element(),
                                 }),
                             ),
                     ),
