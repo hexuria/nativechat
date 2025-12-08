@@ -1,11 +1,19 @@
-use super::live_tts_provider::LiveTtsProvider;
-use super::rest_tts_provider::RestTtsProvider;
-use super::tts_provider::TtsProvider;
 use crate::services::audio_output::{AudioCommand, AudioOutput};
+use crate::services::live_tts_provider::LiveTtsProvider;
+use crate::services::macos_tts_bridge::{MacTtsBridge, TtsEvent};
+use crate::services::rest_tts_provider::RestTtsProvider;
+use crate::services::tts_provider::TtsProvider;
 use anyhow::Result;
-use parking_lot::Mutex;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
+
+#[derive(Clone, Copy, PartialEq)]
+enum TtsMode {
+    Native,
+    Streaming,
+    None,
+}
 
 #[derive(Clone)]
 pub struct TtsService {
@@ -14,24 +22,40 @@ pub struct TtsService {
     audio_output: Arc<AudioOutput>,
     /// Used to cancel ongoing streaming when stop() is called
     cancelled: Arc<AtomicBool>,
-    native_provider: Option<Arc<parking_lot::Mutex<tts::Tts>>>,
+    #[cfg(target_os = "macos")]
+    native_provider: Option<Arc<MacTtsBridge>>,
+    active_mode: Arc<Mutex<TtsMode>>,
+    native_completion_notify: Arc<Notify>,
+    native_paused: Arc<AtomicBool>,
+    last_word_index: Arc<AtomicUsize>,
 }
 
 impl TtsService {
     pub fn new(is_ai_speaking: Arc<AtomicBool>, ai_amplitude: Arc<AtomicU32>) -> Result<Self> {
         let audio_output = Arc::new(AudioOutput::new(is_ai_speaking, ai_amplitude)?);
 
+        let native_completion = Arc::new(Notify::new());
+        let last_word_index = Arc::new(AtomicUsize::new(0));
+
         let native_provider = if cfg!(target_os = "macos") {
-            match tts::Tts::default() {
-                Ok(tts) => {
-                    println!("[TTS Service] Native TTS initialized");
-                    Some(Arc::new(parking_lot::Mutex::new(tts)))
+            let bridge = Arc::new(MacTtsBridge::new());
+            let completion = native_completion.clone();
+            let index = last_word_index.clone();
+
+            bridge.set_callback(move |event| match event {
+                TtsEvent::Start => {
+                    println!("[TTS Service] Native TTS Started");
                 }
-                Err(e) => {
-                    eprintln!("[TTS Service] Failed to initialize native TTS: {}", e);
-                    None
+                TtsEvent::Word { start, length: _ } => {
+                    index.store(start, Ordering::SeqCst);
                 }
-            }
+                TtsEvent::Finish => {
+                    println!("[TTS Service] Native TTS Finished");
+                    completion.notify_waiters();
+                }
+            });
+
+            Some(bridge)
         } else {
             None
         };
@@ -42,6 +66,10 @@ impl TtsService {
             audio_output,
             cancelled: Arc::new(AtomicBool::new(false)),
             native_provider,
+            active_mode: Arc::new(Mutex::new(TtsMode::None)),
+            native_completion_notify: native_completion,
+            native_paused: Arc::new(AtomicBool::new(false)),
+            last_word_index,
         })
     }
 
@@ -63,7 +91,9 @@ impl TtsService {
         let cache_dir = dirs::cache_dir()?;
         let app_cache_dir = cache_dir.join("nativechat").join("tts_cache");
         std::fs::create_dir_all(&app_cache_dir).ok()?;
-        Some(app_cache_dir.join(format!("{}.bin", message_id)))
+        let path = app_cache_dir.join(format!("{}.bin", message_id));
+        println!("[TTS Service] Cache Path for {}: {:?}", message_id, path);
+        Some(path)
     }
 
     /// Check if audio is cached for a message
@@ -97,63 +127,54 @@ impl TtsService {
         // Reset cancellation flag for new request
         self.cancelled.store(false, Ordering::SeqCst);
 
-        // **NATIVE TTS FAST PATH** - Speak immediately without streaming
-        // This is triggered if model_id is "native" (which can be forced via settings)
-        // or if model_id is empty (fallback).
-        if model_id.is_empty() || model_id == "native" {
-            if let Some(native_provider_arc) = self.native_provider.clone() {
-                // Use stored provider
-                let native_provider = native_provider_arc.clone();
-                let text_owned = text.to_string();
-                let is_ai_speaking = self.audio_output.is_ai_speaking.clone();
+        // Reset audio output state to clear any previous stuck signals or data
+        self.audio_output.process_command(AudioCommand::Stop);
 
-                tokio::task::spawn_blocking(move || {
-                    // Set speaking flag
-                    is_ai_speaking.store(true, Ordering::Relaxed);
+        // **NATIVE TTS FAST PATH**
+        if model_id == "native" {
+            #[cfg(target_os = "macos")]
+            if let Some(bridge) = &self.native_provider {
+                println!(
+                    "[TTS Service] Using Native Bridge for message {}",
+                    message_id
+                );
 
-                    // Lock and speak
-                    {
-                        let mut tts = native_provider.lock();
-                        if let Err(e) = tts.speak(&text_owned, false) {
-                            eprintln!("[TTS] Native speak failed: {}", e);
-                        }
-                    }
+                // Stop any previous speech
+                bridge.stop();
 
-                    // Poll for completion (re-locking to check status)
-                    // We re-lock in loop to not hold lock indefinitely if that matters,
-                    // but tts methods likely need lock.
-                    // Note: holding lock for duration of speech might block other calls but we only have one stream here.
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        let is_speaking = {
-                            let tts = native_provider.lock();
-                            tts.is_speaking().unwrap_or(false)
-                        };
-                        if !is_speaking {
-                            break;
-                        }
-                    }
+                // Reset state
+                *self.active_mode.lock().unwrap() = TtsMode::Native;
+                self.native_paused.store(false, Ordering::SeqCst);
+                self.last_word_index.store(0, Ordering::SeqCst);
 
-                    // Clear speaking flag
-                    is_ai_speaking.store(false, Ordering::Relaxed);
-                });
+                // Speak immediately
+                bridge.speak(text);
 
-                // Return true immediately so UI knows we started "playing"
                 return Ok(true);
             }
         }
 
+        // Fallback or Streaming
+        *self.active_mode.lock().unwrap() = TtsMode::Streaming;
+
         // Check cache first - if cached, play immediately without network request
         if let Some(path) = Self::get_cache_path(message_id) {
             if path.exists() {
+                println!("[TTS Service] Cache HIT for {}", message_id);
                 if let Ok(bytes) = std::fs::read(&path) {
                     let samples = Self::bytes_to_samples(&bytes);
                     if !samples.is_empty() {
+                        println!(
+                            "[TTS Service] Playing from cache ({} samples)",
+                            samples.len()
+                        );
                         self.audio_output
                             .process_command(AudioCommand::Samples(samples));
                         return Ok(true);
                     }
                 }
+            } else {
+                println!("[TTS Service] Cache MISS for {}", message_id);
             }
         }
 
@@ -214,7 +235,19 @@ impl TtsService {
 
     /// Wait for audio playback to complete
     pub async fn wait_until_finished(&self) {
-        self.audio_output.wait_until_finished().await;
+        let mode = *self.active_mode.lock().unwrap();
+        match mode {
+            TtsMode::Native => {
+                self.native_completion_notify.notified().await;
+            }
+            _ => {
+                // Check if audio is actually playing before waiting
+                if !self.audio_output.is_ai_speaking.load(Ordering::Relaxed) {
+                    return;
+                }
+                self.audio_output.wait_until_finished().await;
+            }
+        }
     }
 
     /// Legacy speak method - queues audio and waits for completion
@@ -234,17 +267,61 @@ impl TtsService {
         Ok(())
     }
 
-    pub fn stop(&self) {
-        // Signal cancellation to any ongoing streaming
+    pub fn stop(&self) -> Result<()> {
         self.cancelled.store(true, Ordering::SeqCst);
         self.audio_output.process_command(AudioCommand::Stop);
+
+        let mode = *self.active_mode.lock().unwrap();
+        match mode {
+            TtsMode::Native => {
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &self.native_provider {
+                    bridge.stop();
+                    *self.active_mode.lock().unwrap() = TtsMode::None; // Reset mode
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn pause(&self) {
-        self.audio_output.process_command(AudioCommand::Pause);
+        let mode = *self.active_mode.lock().unwrap();
+        match mode {
+            TtsMode::Native =>
+            {
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &self.native_provider {
+                    bridge.pause();
+                    self.native_paused.store(true, Ordering::SeqCst);
+                }
+            }
+            TtsMode::Streaming => {
+                self.audio_output.process_command(AudioCommand::Pause);
+            }
+            _ => {}
+        }
     }
 
     pub fn resume(&self) {
-        self.audio_output.process_command(AudioCommand::Resume);
+        let mode = *self.active_mode.lock().unwrap();
+        match mode {
+            TtsMode::Native =>
+            {
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &self.native_provider {
+                    bridge.resume();
+                    self.native_paused.store(false, Ordering::SeqCst);
+                }
+            }
+            TtsMode::Streaming => {
+                self.audio_output.process_command(AudioCommand::Resume);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn is_native_active(&self) -> bool {
+        *self.active_mode.lock().unwrap() == TtsMode::Native
     }
 }

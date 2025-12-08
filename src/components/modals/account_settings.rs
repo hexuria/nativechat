@@ -186,6 +186,8 @@ impl AccountSettingsModal {
                                             matches!(selection, ui::checkbox::Selection::Selected);
                                         state.update(cx, |state, cx| {
                                             state.force_native_tts = checked;
+                                            // Stop any active playback so the next play uses the new setting
+                                            state.stop_read_aloud(cx);
                                             cx.notify();
                                         });
                                     }
