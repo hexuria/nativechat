@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::{
     actions::{CopyMessage, ToggleReadAloud},
     components::message_actions::MessageActions,
@@ -19,6 +21,7 @@ pub struct MessageBubble {
     is_paused: bool,
     is_loading: bool,
     is_cached: bool,
+    on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl MessageBubble {
@@ -36,7 +39,16 @@ impl MessageBubble {
             is_paused: false,
             is_loading: false,
             is_cached: false,
+            on_read_aloud: None,
         }
+    }
+
+    pub fn on_read_aloud(
+        mut self,
+        on_read_aloud: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_read_aloud = Some(Rc::new(on_read_aloud));
+        self
     }
 
     pub fn message_id(mut self, id: impl Into<String>) -> Self {
@@ -161,6 +173,7 @@ impl RenderOnce for MessageBubble {
                                     cx.dispatch_action(&ToggleReadAloud {
                                         message_id: message_id.clone(),
                                         text: text.clone(),
+                                        mode: crate::actions::TtsSource::Native,
                                     });
                                 }
                             }
@@ -213,7 +226,10 @@ impl RenderOnce for MessageBubble {
                                 .is_speaking(self.is_speaking)
                                 .is_paused(self.is_paused)
                                 .is_loading(self.is_loading)
-                                .is_cached(self.is_cached),
+                                .is_cached(self.is_cached)
+                                .when_some(self.on_read_aloud, |this, cb| {
+                                    this.on_read_aloud(move |w, cx| cb(w, cx))
+                                }),
                         )
                         .on_key_down({
                             let text = self.text.clone();
@@ -223,6 +239,7 @@ impl RenderOnce for MessageBubble {
                                     cx.dispatch_action(&ToggleReadAloud {
                                         text: text.clone(),
                                         message_id: message_id.clone(),
+                                        mode: crate::actions::TtsSource::Native,
                                     });
                                 }
                             }

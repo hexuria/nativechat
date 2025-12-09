@@ -293,8 +293,27 @@ impl Render for ChatView {
             .on_action({
                 let state = self.state.clone();
                 move |action: &ToggleReadAloud, _window: &mut Window, cx: &mut App| {
+                    println!(
+                        "[Chat] ToggleReadAloud action received. ID: {}, Mode: {:?}",
+                        action.message_id, action.mode
+                    );
                     state.update(cx, |state, cx| {
-                        state.toggle_read_aloud(action.message_id.clone(), action.text.clone(), cx);
+                        state.toggle_read_aloud(
+                            action.message_id.clone(),
+                            action.text.clone(),
+                            action.mode.clone(),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |action: &crate::actions::RegenerateAudio,
+                      _window: &mut Window,
+                      cx: &mut App| {
+                    state.update(cx, |state, cx| {
+                        state.regenerate_audio(action.message_id.clone(), action.text.clone(), cx);
                     });
                 }
             })
@@ -390,6 +409,24 @@ impl Render for ChatView {
                                             .is_paused(is_paused)
                                             .is_loading(is_loading)
                                             .is_cached(is_cached)
+                                            .on_read_aloud({
+                                                let state = self.state.clone();
+                                                let message_id = msg.id.clone();
+                                                let text = msg.content.clone();
+                                                move |_, cx| {
+                                                    println!(
+                                                        "[ChatView] Read Aloud Callback Triggered"
+                                                    );
+                                                    state.update(cx, |state, cx| {
+                                                        state.toggle_read_aloud(
+                                                            message_id.clone(),
+                                                            text.clone(),
+                                                            crate::actions::TtsSource::Native,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            })
                                     })),
                             ),
                     )

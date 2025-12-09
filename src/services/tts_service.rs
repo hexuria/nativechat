@@ -87,12 +87,12 @@ impl TtsService {
         }
     }
 
-    fn get_cache_path(message_id: &str) -> Option<std::path::PathBuf> {
+    pub fn get_cache_path(message_id: &str) -> Option<std::path::PathBuf> {
         let cache_dir = dirs::cache_dir()?;
         let app_cache_dir = cache_dir.join("nativechat").join("tts_cache");
         std::fs::create_dir_all(&app_cache_dir).ok()?;
         let path = app_cache_dir.join(format!("{}.bin", message_id));
-        println!("[TTS Service] Cache Path for {}: {:?}", message_id, path);
+        // println!("[TTS Service] Cache Path for {}: {:?}", message_id, path);
         Some(path)
     }
 
@@ -111,6 +111,50 @@ impl TtsService {
             samples.push(sample);
         }
         samples
+    }
+
+    pub fn start_speaking_native(&self, text: &str, message_id: &str) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &self.native_provider {
+            // Stop any previous speech
+            bridge.stop();
+
+            // Reset state
+            *self.active_mode.lock().unwrap() = TtsMode::Native;
+            self.native_paused.store(false, Ordering::SeqCst);
+            self.last_word_index.store(0, Ordering::SeqCst);
+
+            // Speak immediately
+            bridge.speak(text);
+            return true;
+        }
+
+        println!("[TTS Service] Native TTS requested but not supported/available.");
+        false
+    }
+
+    pub fn pause_native(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &self.native_provider {
+            bridge.pause();
+            self.native_paused.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn resume_native(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &self.native_provider {
+            bridge.resume();
+            self.native_paused.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub fn stop_native(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &self.native_provider {
+            bridge.stop();
+            self.native_paused.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Start speaking with streaming - audio plays as chunks arrive.
@@ -132,26 +176,7 @@ impl TtsService {
 
         // **NATIVE TTS FAST PATH**
         if model_id == "native" {
-            #[cfg(target_os = "macos")]
-            if let Some(bridge) = &self.native_provider {
-                println!(
-                    "[TTS Service] Using Native Bridge for message {}",
-                    message_id
-                );
-
-                // Stop any previous speech
-                bridge.stop();
-
-                // Reset state
-                *self.active_mode.lock().unwrap() = TtsMode::Native;
-                self.native_paused.store(false, Ordering::SeqCst);
-                self.last_word_index.store(0, Ordering::SeqCst);
-
-                // Speak immediately
-                bridge.speak(text);
-
-                return Ok(true);
-            }
+            return Ok(self.start_speaking_native(text, message_id));
         }
 
         // Fallback or Streaming

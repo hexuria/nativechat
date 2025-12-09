@@ -48,6 +48,12 @@ actions!(
 
 use serde::Deserialize;
 
+#[derive(Clone, PartialEq, Debug, Deserialize)]
+pub enum TtsSource {
+    Native,
+    AI,
+}
+
 #[derive(Clone, PartialEq, Deserialize)]
 pub struct SelectSession {
     pub id: String,
@@ -158,6 +164,7 @@ impl gpui::Action for ReadAloud {
 pub struct ToggleReadAloud {
     pub text: String,
     pub message_id: String,
+    pub mode: TtsSource,
 }
 
 impl gpui::Action for ToggleReadAloud {
@@ -166,6 +173,33 @@ impl gpui::Action for ToggleReadAloud {
     }
     fn name_for_type() -> &'static str {
         "ToggleReadAloud"
+    }
+    fn boxed_clone(&self) -> Box<dyn gpui::Action> {
+        Box::new(self.clone())
+    }
+    fn partial_eq(&self, other: &dyn gpui::Action) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .map_or(false, |s| self == s)
+    }
+    fn build(value: serde_json::Value) -> gpui::Result<Box<dyn gpui::Action>> {
+        Ok(Box::new(serde_json::from_value::<Self>(value)?))
+    }
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+pub struct RegenerateAudio {
+    pub text: String,
+    pub message_id: String,
+}
+
+impl gpui::Action for RegenerateAudio {
+    fn name(&self) -> &'static str {
+        "RegenerateAudio"
+    }
+    fn name_for_type() -> &'static str {
+        "RegenerateAudio"
     }
     fn boxed_clone(&self) -> Box<dyn gpui::Action> {
         Box::new(self.clone())

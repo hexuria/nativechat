@@ -17,11 +17,13 @@ pub struct MessageActions {
     message_id: String,
     message_text: String,
     on_copy: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     can_read_aloud: bool,
     is_speaking: bool,
     is_paused: bool,
     is_loading: bool,
     is_cached: bool,
+    #[allow(dead_code)]
     state: Option<WeakEntity<AppState>>,
 }
 
@@ -36,6 +38,7 @@ impl MessageActions {
             message_id: message_id.into(),
             message_text: String::new(),
             on_copy: None,
+            on_read_aloud: None,
             can_read_aloud: false,
             is_speaking: false,
             is_paused: false,
@@ -51,12 +54,16 @@ impl MessageActions {
         self
     }
 
-    /// Set a callback to be invoked after copying
-    pub fn on_copy<F>(mut self, handler: F) -> Self
-    where
-        F: Fn(&mut Window, &mut App) + 'static,
-    {
-        self.on_copy = Some(Rc::new(handler));
+    pub fn on_copy(mut self, on_copy: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_copy = Some(Rc::new(on_copy));
+        self
+    }
+
+    pub fn on_read_aloud(
+        mut self,
+        on_read_aloud: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_read_aloud = Some(Rc::new(on_read_aloud));
         self
     }
 
@@ -87,26 +94,24 @@ impl MessageActions {
 
     fn action_button(
         &self,
-        id: impl Into<ElementId>,
+        id: &str,
         icon: IconSource,
-        tooltip_text: &'static str,
+        tooltip_text: &str,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         cx: &mut App,
     ) -> impl IntoElement {
         let theme = cx.theme();
         let secondary = theme.secondary;
-        let secondary_foreground = theme.secondary_foreground;
+        // matching copy_button icon color logic (using secondary_foreground as default)
+        let icon_color = theme.secondary_foreground;
 
-        let icon_element = match icon {
-            IconSource::Name(name) => Icon::new(name)
-                .size(px(18.0))
-                .text_color(secondary_foreground)
-                .into_any_element(),
-            IconSource::Path(path) => svg()
-                .path(path)
-                .size(px(18.0))
-                .text_color(secondary_foreground)
-                .into_any_element(),
+        let icon: Icon = match icon {
+            IconSource::Name(name) => name.into(),
+            IconSource::Path(path) => Icon::default().path(path),
         };
+
+        let id = gpui::SharedString::from(id.to_string());
+        let tooltip_text = tooltip_text.to_string();
 
         div()
             .id(id)
@@ -116,11 +121,12 @@ impl MessageActions {
             .items_center()
             .justify_center()
             .rounded(px(6.0))
-            .text_color(secondary_foreground)
+            .text_color(icon_color)
             .hover(move |style| style.bg(secondary))
             .cursor_pointer()
-            .tooltip(move |w, cx| Tooltip::new(tooltip_text).build(w, cx))
-            .child(icon_element)
+            .tooltip(move |w, cx| Tooltip::new(tooltip_text.clone()).build(w, cx))
+            .child(icon.size(px(18.0)).text_color(icon_color))
+            .on_click(on_click)
     }
 
     fn copy_button(
@@ -222,27 +228,56 @@ impl RenderOnce for MessageActions {
                 "like",
                 IconSource::Path("icons/thumbs_up.svg"),
                 "Good response",
+                |_, _, _| {},
                 cx,
             ))
             .child(self.action_button(
                 "dislike",
                 IconSource::Path("icons/thumbs_down.svg"),
                 "Bad response",
+                |_, _, _| {},
                 cx,
             ))
-            .child(self.action_button("share", IconSource::Path("icons/share.svg"), "Share", cx))
+            .child(self.action_button(
+                "share",
+                IconSource::Path("icons/share.svg"),
+                "Share",
+                |_, _, _| {},
+                cx,
+            ))
             .child(self.action_button(
                 "regenerate",
                 IconSource::Path("icons/reset.svg"),
                 "Try again",
+                |_, _, _| {},
+                cx,
+            ))
+            .child(self.action_button(
+                &format!("native-tts-{}", self.message_id),
+                IconSource::Name(IconName::ReadAloud),
+                "Read aloud (Native)",
+                {
+                    let on_read_aloud = self.on_read_aloud.clone();
+                    let message_id = self.message_id.clone();
+                    move |_, window, cx| {
+                        println!(
+                            "[MessageActions] Native TTS Button Clicked for message: {}",
+                            message_id
+                        );
+                        if let Some(callback) = on_read_aloud.as_ref() {
+                            callback(window, cx);
+                        }
+                    }
+                },
                 cx,
             ))
             .child(
                 Button::new(ElementId::Name(format!("more-{}", self.message_id).into()))
                     .icon(IconName::Ellipsis)
                     .ghost()
-                    .with_size(Size::Size(px(32.0)))
-                    .rounded(px(6.0))
+                    .with_size(Size::Medium)
+                    .compact()
+                    .rounded(ui::button::ButtonRounded::Size(px(6.0)))
                     .tooltip("More actions")
                     .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _, _| {
                         menu.menu_with_icon(
@@ -254,48 +289,56 @@ impl RenderOnce for MessageActions {
                             if self.is_loading {
                                 menu.menu_with_icon(
                                     "Loading...",
-                                    IconName::Loader, // Assuming Loader icon exists, or use another
+                                    IconName::Loader,
                                     Box::new(ToggleReadAloud {
                                         text: self.message_text.clone(),
                                         message_id: self.message_id.clone(),
+                                        mode: crate::actions::TtsSource::AI,
                                     }),
                                 )
                             } else if self.is_speaking {
                                 if self.is_paused {
                                     menu.menu_with_icon(
-                                        "Resume",
+                                        "Resume (AI)",
                                         IconName::Play,
                                         Box::new(ToggleReadAloud {
                                             text: self.message_text.clone(),
                                             message_id: self.message_id.clone(),
+                                            mode: crate::actions::TtsSource::AI,
                                         }),
                                     )
                                 } else {
                                     menu.menu_with_icon(
-                                        "Pause",
+                                        "Pause (AI)",
                                         IconName::Pause,
                                         Box::new(ToggleReadAloud {
                                             text: self.message_text.clone(),
                                             message_id: self.message_id.clone(),
+                                            mode: crate::actions::TtsSource::AI,
                                         }),
                                     )
                                 }
                             } else {
-                                // Show "Play (saved)" if cached, "Read aloud" if not
-                                let label = if self.is_cached {
-                                    "Play (saved)"
-                                } else {
-                                    "Read aloud"
-                                };
                                 menu.menu_with_icon(
-                                    label,
-                                    IconName::ReadAloud,
+                                    "Read with AI",
+                                    IconName::Bot,
                                     Box::new(ToggleReadAloud {
                                         text: self.message_text.clone(),
                                         message_id: self.message_id.clone(),
+                                        mode: crate::actions::TtsSource::AI,
                                     }),
                                 )
                             }
+                        })
+                        .when(self.is_cached, |menu| {
+                            menu.menu_with_icon(
+                                "Regenerate Audio",
+                                IconName::Replace,
+                                Box::new(crate::actions::RegenerateAudio {
+                                    text: self.message_text.clone(),
+                                    message_id: self.message_id.clone(),
+                                }),
+                            )
                         })
                         .separator()
                         .menu_with_icon(

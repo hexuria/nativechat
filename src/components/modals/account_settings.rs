@@ -5,11 +5,8 @@ use gpui::{
     Context, Entity, FontWeight, IntoElement, MouseButton, Render, Styled, Window, div, px,
 };
 use ui::{
-    ActiveTheme,
-    Icon,
-    IconName,
+    ActiveTheme, Icon, IconName,
     button::Button,
-    checkbox::Checkbox, // Add Checkbox
     input::{Input, InputState},
 };
 
@@ -145,55 +142,15 @@ impl AccountSettingsModal {
             )
     }
 
-    fn render_advanced_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.state.read(cx);
-        let force_native = state.force_native_tts;
-
+    fn render_advanced_tab(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().flex_col().gap_4().child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().child("Text-to-Speech").font_weight(FontWeight::BOLD))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(div().child("Force Native TTS"))
-                                .child(
-                                    div()
-                                        .child("Use offline macOS voices for instant playback")
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground),
-                                ),
-                        )
-                        .child(
-                            Checkbox::new("force-native-tts-checkbox")
-                                .checked(if force_native {
-                                    ui::checkbox::Selection::Selected
-                                } else {
-                                    ui::checkbox::Selection::Unselected
-                                })
-                                .on_click({
-                                    let state = self.state.clone();
-                                    move |selection, _window, cx| {
-                                        let checked =
-                                            matches!(selection, ui::checkbox::Selection::Selected);
-                                        state.update(cx, |state, cx| {
-                                            state.force_native_tts = checked;
-                                            // Stop any active playback so the next play uses the new setting
-                                            state.stop_read_aloud(cx);
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
-                ),
+            div().flex().flex_col().gap_1().child(
+                div()
+                    .child("No advanced settings available")
+                    .font_weight(FontWeight::BOLD)
+                    .text_sm()
+                    .text_color(gpui::white()),
+            ),
         )
     }
 }

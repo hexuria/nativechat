@@ -104,21 +104,26 @@ fn main() {
                 // Spawn background task to refresh data from DB
                 let state_clone = state.clone();
                 let db_service_clone = db_service.clone();
-                cx.on_action(|_: &CopyMessage, cx: &mut App| {
+                cx.on_action(|_: &CopyMessage, _cx: &mut App| {
                     // This is a global handler, but the specific handler on MessageBubble will take precedence if focused.
                     // If we want a global fallback, we can implement it here, but for now let's just leave it empty
                     // or maybe notify the user to select a message.
                 });
-                cx.on_action(|_: &BranchInNewChat, cx: &mut App| {
+                cx.on_action(|_: &BranchInNewChat, _cx: &mut App| {
                     println!("Branch in new chat action triggered");
                 });
                 let state_read_aloud = state.clone();
                 cx.on_action(move |action: &ReadAloud, cx: &mut App| {
                     state_read_aloud.update(cx, |state, cx| {
-                        state.read_aloud(action.text.clone(), action.message_id.clone(), cx);
+                        state.read_aloud(
+                            action.text.clone(),
+                            action.message_id.clone(),
+                            nativechat::actions::TtsSource::Native,
+                            cx,
+                        );
                     });
                 });
-                cx.on_action(|_: &ReportMessage, cx: &mut App| {
+                cx.on_action(|_: &ReportMessage, _cx: &mut App| {
                     println!("Report message action triggered");
                 });
                 cx.spawn(|cx: &mut AsyncApp| {
