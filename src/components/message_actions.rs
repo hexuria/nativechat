@@ -19,11 +19,16 @@ pub struct MessageActions {
     on_copy: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     can_read_aloud: bool,
-    is_speaking: bool,
-    is_paused: bool,
-    is_loading: bool,
+    // Native State
+    is_native_speaking: bool,
+    is_native_paused: bool,
+    is_native_loading: bool,
+    // AI State
+    is_ai_speaking: bool,
+    is_ai_paused: bool,
+    is_ai_loading: bool,
+
     is_cached: bool,
-    active_tts_source: Option<crate::actions::TtsSource>,
     #[allow(dead_code)]
     state: Option<WeakEntity<AppState>>,
 }
@@ -41,11 +46,13 @@ impl MessageActions {
             on_copy: None,
             on_read_aloud: None,
             can_read_aloud: false,
-            is_speaking: false,
-            is_paused: false,
-            is_loading: false,
+            is_native_speaking: false,
+            is_native_paused: false,
+            is_native_loading: false,
+            is_ai_speaking: false,
+            is_ai_paused: false,
+            is_ai_loading: false,
             is_cached: false,
-            active_tts_source: None,
             state: None,
         }
     }
@@ -74,28 +81,34 @@ impl MessageActions {
         self
     }
 
-    pub fn is_speaking(mut self, is_speaking: bool) -> Self {
-        self.is_speaking = is_speaking;
+    pub fn is_native_speaking(mut self, is: bool) -> Self {
+        self.is_native_speaking = is;
+        self
+    }
+    pub fn is_native_paused(mut self, is: bool) -> Self {
+        self.is_native_paused = is;
+        self
+    }
+    pub fn is_native_loading(mut self, is: bool) -> Self {
+        self.is_native_loading = is;
         self
     }
 
-    pub fn is_paused(mut self, is_paused: bool) -> Self {
-        self.is_paused = is_paused;
+    pub fn is_ai_speaking(mut self, is: bool) -> Self {
+        self.is_ai_speaking = is;
         self
     }
-
-    pub fn is_loading(mut self, is_loading: bool) -> Self {
-        self.is_loading = is_loading;
+    pub fn is_ai_paused(mut self, is: bool) -> Self {
+        self.is_ai_paused = is;
+        self
+    }
+    pub fn is_ai_loading(mut self, is: bool) -> Self {
+        self.is_ai_loading = is;
         self
     }
 
     pub fn is_cached(mut self, is_cached: bool) -> Self {
         self.is_cached = is_cached;
-        self
-    }
-
-    pub fn active_tts_source(mut self, source: Option<crate::actions::TtsSource>) -> Self {
-        self.active_tts_source = source;
         self
     }
 
@@ -222,22 +235,17 @@ struct CopyState {
 
 impl RenderOnce for MessageActions {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let (native_icon, native_tooltip) =
-            if self.active_tts_source == Some(crate::actions::TtsSource::Native) {
-                if self.is_speaking {
-                    if self.is_paused {
-                        (IconName::Play, "Resume (Native)")
-                    } else {
-                        (IconName::Pause, "Pause (Native)")
-                    }
-                } else if self.is_loading {
-                    (IconName::Loader, "Loading...")
-                } else {
-                    (IconName::ReadAloud, "Read aloud (Native)")
-                }
+        let (native_icon, native_tooltip) = if self.is_native_speaking {
+            if self.is_native_paused {
+                (IconName::Play, "Resume (Native)")
             } else {
-                (IconName::ReadAloud, "Read aloud (Native)")
-            };
+                (IconName::Pause, "Pause (Native)")
+            }
+        } else if self.is_native_loading {
+            (IconName::Loader, "Loading...")
+        } else {
+            (IconName::ReadAloud, "Read aloud (Native)")
+        };
 
         h_flex()
             .gap_1()
@@ -310,7 +318,7 @@ impl RenderOnce for MessageActions {
                             Box::new(BranchInNewChat),
                         )
                         .when(self.can_read_aloud, |menu| {
-                            if self.is_loading {
+                            if self.is_ai_loading {
                                 menu.menu_with_icon(
                                     "Loading...",
                                     IconName::Loader,
@@ -320,8 +328,8 @@ impl RenderOnce for MessageActions {
                                         mode: crate::actions::TtsSource::AI,
                                     }),
                                 )
-                            } else if self.is_speaking {
-                                if self.is_paused {
+                            } else if self.is_ai_speaking {
+                                if self.is_ai_paused {
                                     menu.menu_with_icon(
                                         "Resume (AI)",
                                         IconName::Play,

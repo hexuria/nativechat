@@ -170,10 +170,15 @@ pub struct AppState {
     // Debug mode for markdown rendering
     pub debug_markdown_disabled: bool,
     pub tts_service: Option<TtsService>,
-    pub speaking_message_id: Option<String>,
-    pub loading_message_id: Option<String>,
+    pub native_tts: SourceTtsState,
+    pub ai_tts: SourceTtsState,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SourceTtsState {
+    pub message_id: Option<String>,
     pub is_paused: bool,
-    pub active_tts_source: Option<TtsSource>,
+    pub is_loading: bool,
 }
 
 impl Default for AppState {
@@ -322,10 +327,8 @@ impl AppState {
             active_profile_id: None,
             debug_markdown_disabled: false,
             tts_service: None,
-            speaking_message_id: None,
-            loading_message_id: None,
-            is_paused: false,
-            active_tts_source: None,
+            native_tts: SourceTtsState::default(),
+            ai_tts: SourceTtsState::default(),
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -585,6 +588,9 @@ impl AppState {
     pub fn select_db_profile(&mut self, profile_id: i64, cx: &mut Context<Self>) {
         // Verify the profile exists before setting
         if self.db_profiles.iter().any(|p| p.id == profile_id) {
+            // Stop any active TTS
+            self.stop_read_aloud(cx);
+
             self.active_profile_id = Some(profile_id);
             self.update_llm_provider(cx);
 
@@ -1240,90 +1246,44 @@ impl AppState {
         source: TtsSource,
         cx: &mut Context<Self>,
     ) {
-        println!(
-            "[State] read_aloud called for message: {} (source: {:?})",
-            message_id, source
-        );
-        // Initialize TTS service if needed
         if self.tts_service.is_none() {
-            println!("[State] tts_service is None, initializing...");
             match TtsService::new(self.is_ai_speaking.clone(), self.ai_amplitude.clone()) {
-                Ok(service) => {
-                    println!("[State] tts_service initialized successfully");
-                    self.tts_service = Some(service);
-                }
+                Ok(service) => self.tts_service = Some(service),
                 Err(e) => {
                     eprintln!("Failed to initialize TTS service: {}", e);
                     return;
                 }
             }
-        } else {
-            println!("[State] tts_service already initialized");
         }
 
         if let Some(service) = &self.tts_service {
-            // Stop previous speech if any
-            println!("[State] Stopping previous speech");
-            let _ = service.stop();
+            match source {
+                TtsSource::Native => {
+                    // Pause AI if running
+                    if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
+                        service.pause();
+                        self.ai_tts.is_paused = true;
+                    }
 
-            // Set loading state
-            self.loading_message_id = Some(message_id.clone());
-            self.speaking_message_id = None;
-            self.is_paused = false;
-            self.active_tts_source = Some(source.clone());
-            cx.notify();
+                    self.native_tts.message_id = Some(message_id.clone());
+                    self.native_tts.is_paused = false;
+                    self.native_tts.is_loading = false;
+                    cx.notify();
 
-            // Determine model ID based on source
-            let tts_model_id = match source {
-                TtsSource::Native => Some("native"),
-                TtsSource::AI => self
-                    .active_profile()
-                    .and_then(|p| p.tts_model_id.as_deref()),
-            }
-            .unwrap_or("native");
+                    let service = service.clone();
+                    let message_id = message_id.clone();
+                    let text = text.clone();
 
-            // Get API key (only needed for API-based models, not native)
-            let api_key = self
-                .active_credential()
-                .map(|c| c.api_key.clone())
-                .or_else(|| self.config.as_ref().and_then(|c| c.gemini_api_key.clone()));
-
-            let should_speak = tts_model_id == "native" || api_key.is_some();
-            if should_speak {
-                let model_id = tts_model_id.to_string();
-                let api_key_string = api_key.unwrap_or_default();
-
-                println!(
-                    "[State] Starting TTS with model: {} (key length: {})",
-                    model_id,
-                    api_key_string.len()
-                );
-
-                let service = service.clone();
-                let message_id_clone = message_id.clone();
-                let text = text.clone();
-
-                if model_id == "native" {
-                    // Native TTS: Call synchronously on Main Thread
-                    if service.start_speaking_native(&text, &message_id_clone) {
-                        // Update state immediately
-                        self.loading_message_id = None;
-                        self.speaking_message_id = Some(message_id_clone.clone());
-                        self.is_paused = false;
-                        cx.notify();
-
-                        // Spawn wait task
+                    if service.start_speaking_native(&text, &message_id) {
                         cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
                             let mut cx = cx.clone();
                             async move {
-                                service.wait_until_finished().await;
+                                service.wait_until_finished_native().await;
                                 if let Some(this) = this.upgrade() {
                                     let _ = this.update(&mut cx, |state, cx| {
-                                        if state.speaking_message_id.as_ref()
-                                            == Some(&message_id_clone)
+                                        if state.native_tts.message_id.as_ref() == Some(&message_id)
                                         {
-                                            state.speaking_message_id = None;
-                                            state.active_tts_source = None;
+                                            state.native_tts.message_id = None;
                                             cx.notify();
                                         }
                                     });
@@ -1331,57 +1291,64 @@ impl AppState {
                             }
                         })
                         .detach();
-                    } else {
-                        eprintln!("Failed to start native TTS");
                     }
-                } else {
-                    // Streaming/API TTS: Call asynchronously
-                    let api_key_str = api_key_string.clone();
+                }
+                TtsSource::AI => {
+                    // Pause Native if running
+                    if self.native_tts.message_id.is_some() && !self.native_tts.is_paused {
+                        service.pause_native();
+                        self.native_tts.is_paused = true;
+                    }
+
+                    self.ai_tts.message_id = Some(message_id.clone());
+                    self.ai_tts.is_loading = true;
+                    self.ai_tts.is_paused = false;
+                    cx.notify();
+
+                    // Get Config
+                    let tts_model_id = self
+                        .active_profile()
+                        .and_then(|p| p.tts_model_id.clone())
+                        .unwrap_or_else(|| "native".to_string());
+                    let api_key = self
+                        .active_credential()
+                        .map(|c| c.api_key.clone())
+                        .or_else(|| self.config.as_ref().and_then(|c| c.gemini_api_key.clone()))
+                        .unwrap_or_default();
+
+                    let service = service.clone();
+                    let message_id = message_id.clone();
+                    let text = text.clone();
+
                     cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
                         let mut cx = cx.clone();
                         async move {
-                            // Phase 1: Start audio playback
                             let start_result = service
-                                .start_speaking(&text, &message_id_clone, &model_id, &api_key_str)
+                                .start_speaking(&text, &message_id, &tts_model_id, &api_key)
                                 .await;
-
                             match start_result {
                                 Ok(true) => {
-                                    let message_id_for_completion = message_id_clone.clone();
+                                    // Speaking started
                                     this.update(&mut cx, |state, cx| {
-                                        state.loading_message_id = None;
-                                        state.speaking_message_id = Some(message_id_for_completion);
-                                        state.is_paused = false;
+                                        state.ai_tts.is_loading = false;
                                         cx.notify();
                                     })
                                     .ok();
 
-                                    // Phase 2: Wait for finish
-                                    service.wait_until_finished().await;
+                                    service.wait_until_finished_ai().await;
 
                                     this.update(&mut cx, |state, cx| {
-                                        if state.speaking_message_id.as_ref()
-                                            == Some(&message_id_clone)
-                                        {
-                                            state.speaking_message_id = None;
-                                            state.active_tts_source = None;
+                                        if state.ai_tts.message_id.as_ref() == Some(&message_id) {
+                                            state.ai_tts.message_id = None;
                                             cx.notify();
                                         }
                                     })
                                     .ok();
                                 }
-                                Ok(false) => {
-                                    // Nothing to play
+                                Ok(false) | Err(_) => {
                                     this.update(&mut cx, |state, cx| {
-                                        state.loading_message_id = None;
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                }
-                                Err(e) => {
-                                    eprintln!("Error starting TTS: {}", e);
-                                    this.update(&mut cx, |state, cx| {
-                                        state.loading_message_id = None;
+                                        state.ai_tts.message_id = None;
+                                        state.ai_tts.is_loading = false;
                                         cx.notify();
                                     })
                                     .ok();
@@ -1391,50 +1358,44 @@ impl AppState {
                     })
                     .detach();
                 }
-            } else {
-                eprintln!(
-                    "[State] TTS Config Missing! Model: {:?}, API Key present: {}",
-                    tts_model_id,
-                    api_key.is_some()
-                );
             }
         }
     }
 
     pub fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
         if let Some(service) = &self.tts_service {
-            if self.active_tts_source == Some(TtsSource::Native) {
-                service.stop_native();
-            } else {
-                service.stop();
-            }
-            self.speaking_message_id = None;
-            self.is_paused = false;
-            self.active_tts_source = None;
+            let _ = service.stop_native();
+            let _ = service.stop();
+            self.native_tts = SourceTtsState::default();
+            self.ai_tts = SourceTtsState::default();
             cx.notify();
         }
     }
 
     pub fn pause_read_aloud(&mut self, cx: &mut Context<Self>) {
         if let Some(service) = &self.tts_service {
-            if self.active_tts_source == Some(TtsSource::Native) {
+            if self.native_tts.message_id.is_some() && !self.native_tts.is_paused {
                 service.pause_native();
-            } else {
-                service.pause();
+                self.native_tts.is_paused = true;
             }
-            self.is_paused = true;
+            if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
+                service.pause();
+                self.ai_tts.is_paused = true;
+            }
             cx.notify();
         }
     }
 
     pub fn resume_read_aloud(&mut self, cx: &mut Context<Self>) {
         if let Some(service) = &self.tts_service {
-            if self.active_tts_source == Some(TtsSource::Native) {
+            if self.native_tts.message_id.is_some() && self.native_tts.is_paused {
                 service.resume_native();
-            } else {
-                service.resume();
+                self.native_tts.is_paused = false;
             }
-            self.is_paused = false;
+            if self.ai_tts.message_id.is_some() && self.ai_tts.is_paused {
+                service.resume();
+                self.ai_tts.is_paused = false;
+            }
             cx.notify();
         }
     }
@@ -1446,36 +1407,67 @@ impl AppState {
         mode: TtsSource,
         cx: &mut Context<Self>,
     ) {
-        if self.speaking_message_id.as_ref() == Some(&message_id) {
-            // Check if same mode
-            let same_mode = self.active_tts_source.as_ref() == Some(&mode);
-
-            if same_mode {
-                if self.is_paused {
-                    self.resume_read_aloud(cx);
-                } else {
-                    self.pause_read_aloud(cx);
+        if let Some(service) = &self.tts_service {
+            match mode {
+                TtsSource::Native => {
+                    // Check if Native is active on this message
+                    if self.native_tts.message_id.as_ref() == Some(&message_id) {
+                        if self.native_tts.is_paused {
+                            // Resume Native
+                            // Ensure AI is paused first
+                            if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
+                                service.pause();
+                                self.ai_tts.is_paused = true;
+                            }
+                            service.resume_native();
+                            self.native_tts.is_paused = false;
+                        } else {
+                            // Pause Native
+                            service.pause_native();
+                            self.native_tts.is_paused = true;
+                        }
+                        cx.notify();
+                    } else {
+                        self.read_aloud(text, message_id, TtsSource::Native, cx);
+                    }
                 }
-            } else {
-                // Determine model ID based on source to check if different
-                // Actually, if modes are different (Native vs AI), we should switch.
-                // Stop current and start new
-                self.read_aloud(text, message_id, mode, cx);
+                TtsSource::AI => {
+                    // Check if AI is active on this message
+                    if self.ai_tts.message_id.as_ref() == Some(&message_id) {
+                        if self.ai_tts.is_paused {
+                            // Resume AI
+                            // Ensure Native is paused
+                            if self.native_tts.message_id.is_some() && !self.native_tts.is_paused {
+                                service.pause_native();
+                                self.native_tts.is_paused = true;
+                            }
+                            service.resume();
+                            self.ai_tts.is_paused = false;
+                        } else {
+                            // Pause AI
+                            service.pause();
+                            self.ai_tts.is_paused = true;
+                        }
+                        cx.notify();
+                    } else {
+                        self.read_aloud(text, message_id, TtsSource::AI, cx);
+                    }
+                }
             }
         } else {
+            // Initialize if needed
             self.read_aloud(text, message_id, mode, cx);
         }
     }
 
     pub fn regenerate_audio(&mut self, message_id: String, text: String, cx: &mut Context<Self>) {
-        // Clear cache
+        // Clear cache helper
         if let Some(path) = TtsService::get_cache_path(&message_id) {
             if path.exists() {
                 let _ = std::fs::remove_file(path);
                 println!("[State] Cleared cache for {}", message_id);
             }
         }
-        // Start fresh AI playback
         self.read_aloud(text, message_id, TtsSource::AI, cx);
     }
 }

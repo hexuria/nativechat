@@ -17,11 +17,16 @@ pub struct MessageBubble {
     message_id: String,
     debug_mode: bool,
     can_read_aloud: bool,
-    is_speaking: bool,
-    is_paused: bool,
-    is_loading: bool,
+    // Native State
+    is_native_speaking: bool,
+    is_native_paused: bool,
+    is_native_loading: bool,
+    // AI State
+    is_ai_speaking: bool,
+    is_ai_paused: bool,
+    is_ai_loading: bool,
+
     is_cached: bool,
-    active_tts_source: Option<crate::actions::TtsSource>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -36,11 +41,13 @@ impl MessageBubble {
             message_id: text.len().to_string(), // Default ID, should be overridden
             debug_mode: false,
             can_read_aloud: false,
-            is_speaking: false,
-            is_paused: false,
-            is_loading: false,
+            is_native_speaking: false,
+            is_native_paused: false,
+            is_native_loading: false,
+            is_ai_speaking: false,
+            is_ai_paused: false,
+            is_ai_loading: false,
             is_cached: false,
-            active_tts_source: None,
             on_read_aloud: None,
         }
     }
@@ -88,28 +95,34 @@ impl MessageBubble {
         self
     }
 
-    pub fn is_speaking(mut self, is_speaking: bool) -> Self {
-        self.is_speaking = is_speaking;
+    pub fn is_native_speaking(mut self, is: bool) -> Self {
+        self.is_native_speaking = is;
+        self
+    }
+    pub fn is_native_paused(mut self, is: bool) -> Self {
+        self.is_native_paused = is;
+        self
+    }
+    pub fn is_native_loading(mut self, is: bool) -> Self {
+        self.is_native_loading = is;
         self
     }
 
-    pub fn is_paused(mut self, is_paused: bool) -> Self {
-        self.is_paused = is_paused;
+    pub fn is_ai_speaking(mut self, is: bool) -> Self {
+        self.is_ai_speaking = is;
         self
     }
-
-    pub fn is_loading(mut self, is_loading: bool) -> Self {
-        self.is_loading = is_loading;
+    pub fn is_ai_paused(mut self, is: bool) -> Self {
+        self.is_ai_paused = is;
+        self
+    }
+    pub fn is_ai_loading(mut self, is: bool) -> Self {
+        self.is_ai_loading = is;
         self
     }
 
     pub fn is_cached(mut self, is_cached: bool) -> Self {
         self.is_cached = is_cached;
-        self
-    }
-
-    pub fn active_tts_source(mut self, source: Option<crate::actions::TtsSource>) -> Self {
-        self.active_tts_source = source;
         self
     }
 }
@@ -230,11 +243,13 @@ impl RenderOnce for MessageBubble {
                             MessageActions::new(self.message_id.clone())
                                 .message_text(self.text.clone())
                                 .can_read_aloud(self.can_read_aloud)
-                                .is_speaking(self.is_speaking)
-                                .is_paused(self.is_paused)
-                                .is_loading(self.is_loading)
+                                .is_native_speaking(self.is_native_speaking)
+                                .is_native_paused(self.is_native_paused)
+                                .is_native_loading(self.is_native_loading)
+                                .is_ai_speaking(self.is_ai_speaking)
+                                .is_ai_paused(self.is_ai_paused)
+                                .is_ai_loading(self.is_ai_loading)
                                 .is_cached(self.is_cached)
-                                .active_tts_source(self.active_tts_source)
                                 .when_some(self.on_read_aloud, |this, cb| {
                                     this.on_read_aloud(move |w, cx| cb(w, cx))
                                 }),

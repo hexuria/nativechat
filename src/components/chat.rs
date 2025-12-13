@@ -284,8 +284,6 @@ impl Render for ChatView {
             .active_profile()
             .and_then(|p| p.tts_model_id.as_ref())
             .is_some();
-        let speaking_message_id = state.speaking_message_id.clone();
-        let is_paused = state.is_paused;
 
         v_flex()
             .size_full()
@@ -375,35 +373,20 @@ impl Render for ChatView {
                                         };
 
                                         // Determine speaking state from both:
-                                        // 1. speaking_message_id (set after stream completes)
-                                        // 2. OR loading_message_id + is_ai_speaking (during streaming)
-                                        let is_this_message_loading =
-                                            state.loading_message_id.as_ref() == Some(&msg.id);
-                                        let is_this_message_speaking =
-                                            speaking_message_id.as_ref() == Some(&msg.id);
+                                        let is_native_speaking =
+                                            state.native_tts.message_id.as_ref() == Some(&msg.id);
+                                        let is_native_loading =
+                                            state.native_tts.is_loading && is_native_speaking;
+                                        let is_native_paused =
+                                            state.native_tts.is_paused && is_native_speaking;
 
-                                        // is_ai_speaking is set by AudioOutput when audio buffer has samples
-                                        let is_ai_speaking = state
-                                            .is_ai_speaking
-                                            .load(std::sync::atomic::Ordering::Relaxed);
-
-                                        // If we're loading this message AND audio has started playing,
-                                        // treat it as "speaking" not "loading"
-                                        let is_speaking = is_this_message_speaking
-                                            || (is_this_message_loading && is_ai_speaking);
-
-                                        // Only show loading if we're loading AND audio hasn't started yet
-                                        let is_loading = is_this_message_loading && !is_ai_speaking;
+                                        let is_ai_speaking =
+                                            state.ai_tts.message_id.as_ref() == Some(&msg.id);
+                                        let is_ai_loading =
+                                            state.ai_tts.is_loading && is_ai_speaking;
+                                        let is_ai_paused = state.ai_tts.is_paused && is_ai_speaking;
 
                                         let is_cached = TtsService::is_cached(&msg.id);
-
-                                        // Only pass active_tts_source if this message is interacting
-                                        let active_tts_source =
-                                            if is_speaking || is_loading || is_paused {
-                                                state.active_tts_source.clone()
-                                            } else {
-                                                None
-                                            };
 
                                         MessageBubble::new(msg.content.clone())
                                             .message_id(msg.id.clone())
@@ -413,23 +396,22 @@ impl Render for ChatView {
                                             .timestamp(msg.formatted_time())
                                             .debug_mode(debug_mode)
                                             .can_read_aloud(can_read_aloud)
-                                            .is_speaking(is_speaking)
-                                            .is_paused(is_paused)
-                                            .is_loading(is_loading)
+                                            .is_native_speaking(is_native_speaking)
+                                            .is_native_paused(is_native_paused)
+                                            .is_native_loading(is_native_loading)
+                                            .is_ai_speaking(is_ai_speaking)
+                                            .is_ai_paused(is_ai_paused)
+                                            .is_ai_loading(is_ai_loading)
                                             .is_cached(is_cached)
-                                            .active_tts_source(active_tts_source)
                                             .on_read_aloud({
                                                 let state = self.state.clone();
                                                 let message_id = msg.id.clone();
-                                                let text = msg.content.clone();
+                                                let message_text = msg.content.clone();
                                                 move |_, cx| {
-                                                    println!(
-                                                        "[ChatView] Read Aloud Callback Triggered"
-                                                    );
                                                     state.update(cx, |state, cx| {
                                                         state.toggle_read_aloud(
                                                             message_id.clone(),
-                                                            text.clone(),
+                                                            message_text.clone(),
                                                             crate::actions::TtsSource::Native,
                                                             cx,
                                                         );
