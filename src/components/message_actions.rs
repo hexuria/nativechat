@@ -2,7 +2,7 @@ use crate::{
     actions::{BranchInNewChat, ReportMessage, ToggleReadAloud},
     state::AppState,
 };
-use gpui::{prelude::FluentBuilder, *};
+use gpui::{Animation, AnimationExt, Transformation, percentage, prelude::FluentBuilder, *};
 use std::rc::Rc;
 use std::time::Duration;
 use ui::{

@@ -12,11 +12,56 @@ pub enum AudioCommand {
     Resume,
 }
 
-pub struct AudioOutput {
-    _stream: cpal::Stream,
+#[derive(Clone)]
+pub struct AudioController {
     buffer: Arc<Mutex<VecDeque<f32>>>,
     pub is_ai_speaking: Arc<AtomicBool>,
     is_paused: Arc<AtomicBool>,
+}
+
+impl AudioController {
+    pub fn new(
+        buffer: Arc<Mutex<VecDeque<f32>>>,
+        is_ai_speaking: Arc<AtomicBool>,
+        is_paused: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            buffer,
+            is_ai_speaking,
+            is_paused,
+        }
+    }
+
+    pub fn process_command(&self, cmd: AudioCommand) {
+        let mut buf = self.buffer.lock().unwrap();
+        match cmd {
+            AudioCommand::Samples(samples) => {
+                // Simple 2x upsampling (24k -> 48k)
+                for &s in &samples {
+                    buf.push_back(s);
+                    buf.push_back(s);
+                }
+                // Signal that we have data
+                self.is_ai_speaking.store(true, Ordering::Relaxed);
+            }
+            AudioCommand::Stop => {
+                buf.clear();
+                self.is_ai_speaking.store(false, Ordering::Relaxed);
+                self.is_paused.store(false, Ordering::Relaxed);
+            }
+            AudioCommand::Pause => {
+                self.is_paused.store(true, Ordering::Relaxed);
+            }
+            AudioCommand::Resume => {
+                self.is_paused.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub struct AudioOutput {
+    _stream: cpal::Stream,
+    pub controller: AudioController,
     completion_notify: Arc<Notify>,
 }
 
@@ -31,6 +76,9 @@ impl AudioOutput {
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
         let is_paused = Arc::new(AtomicBool::new(false));
         let completion_notify = Arc::new(Notify::new());
+
+        let controller =
+            AudioController::new(buffer.clone(), is_ai_speaking.clone(), is_paused.clone());
 
         let buffer_clone = buffer.clone();
         let is_paused_clone = is_paused.clone();
@@ -108,37 +156,13 @@ impl AudioOutput {
 
         Ok(Self {
             _stream: stream,
-            buffer,
-            is_ai_speaking,
-            is_paused,
+            controller,
             completion_notify,
         })
     }
 
     pub fn process_command(&self, cmd: AudioCommand) {
-        let mut buf = self.buffer.lock().unwrap();
-        match cmd {
-            AudioCommand::Samples(samples) => {
-                // Simple 2x upsampling (24k -> 48k)
-                for &s in &samples {
-                    buf.push_back(s);
-                    buf.push_back(s);
-                }
-                // Signal that we have data
-                self.is_ai_speaking.store(true, Ordering::Relaxed);
-            }
-            AudioCommand::Stop => {
-                buf.clear();
-                self.is_ai_speaking.store(false, Ordering::Relaxed);
-                self.is_paused.store(false, Ordering::Relaxed);
-            }
-            AudioCommand::Pause => {
-                self.is_paused.store(true, Ordering::Relaxed);
-            }
-            AudioCommand::Resume => {
-                self.is_paused.store(false, Ordering::Relaxed);
-            }
-        }
+        self.controller.process_command(cmd);
     }
 
     pub async fn wait_until_finished(&self) {

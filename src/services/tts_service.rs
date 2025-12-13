@@ -4,7 +4,7 @@ use crate::services::macos_tts_bridge::{MacTtsBridge, TtsEvent};
 use crate::services::rest_tts_provider::RestTtsProvider;
 use crate::services::tts_provider::TtsProvider;
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -28,6 +28,7 @@ pub struct TtsService {
     native_completion_notify: Arc<Notify>,
     native_paused: Arc<AtomicBool>,
     last_word_index: Arc<AtomicUsize>,
+    generation: Arc<AtomicU64>,
 }
 
 impl TtsService {
@@ -36,6 +37,7 @@ impl TtsService {
 
         let native_completion = Arc::new(Notify::new());
         let last_word_index = Arc::new(AtomicUsize::new(0));
+        let generation = Arc::new(AtomicU64::new(0));
 
         let native_provider = if cfg!(target_os = "macos") {
             let bridge = Arc::new(MacTtsBridge::new());
@@ -70,12 +72,14 @@ impl TtsService {
             native_completion_notify: native_completion,
             native_paused: Arc::new(AtomicBool::new(false)),
             last_word_index,
+            generation,
         })
     }
 
     /// Check if a model should use the Live API (streaming WebSocket)
     fn is_live_api_model(model_id: &str) -> bool {
-        model_id.to_lowercase().contains("native-audio")
+        let id_lower = model_id.to_lowercase();
+        id_lower.contains("native-audio") || id_lower.contains("gemini-2.0")
     }
 
     /// Get the appropriate provider for the given model
@@ -168,7 +172,10 @@ impl TtsService {
         model_id: &str,
         api_key: &str,
         voice: &Option<String>,
-    ) -> Result<bool> {
+    ) -> anyhow::Result<bool> {
+        // Increment generation to invalidate previous tasks
+        let current_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+
         // Reset cancellation flag for new request
         self.cancelled.store(false, Ordering::SeqCst);
 
@@ -179,10 +186,6 @@ impl TtsService {
         if model_id == "native" {
             return Ok(self.start_speaking_native(text, message_id));
         }
-
-        // Fallback or Streaming
-        // Fallback or Streaming
-        // *self.active_mode.lock().unwrap() = TtsMode::Streaming;
 
         // Check cache first - if cached, play immediately without network request
         if let Some(path) = Self::get_cache_path(message_id) {
@@ -211,55 +214,97 @@ impl TtsService {
             .stream_audio(text, model_id, api_key, voice)
             .await?;
 
+        // Process first chunk to confirm audio started
+        let mut first_samples = Vec::new();
         let mut audio_started = false;
-        let mut all_samples: Vec<f32> = Vec::new();
-        let mut was_cancelled = false;
 
-        // Process audio chunks as they arrive
-        while let Some(result) = rx.recv().await {
-            // Check cancellation
-            if self.cancelled.load(Ordering::SeqCst) {
-                was_cancelled = true;
-                break;
-            }
-
+        if let Some(result) = rx.recv().await {
             match result {
                 Ok(chunk) => {
                     if !chunk.samples.is_empty() {
                         // Play immediately
-                        if !self.cancelled.load(Ordering::SeqCst) {
-                            self.audio_output
-                                .process_command(AudioCommand::Samples(chunk.samples.clone()));
-
-                            all_samples.extend(chunk.samples);
-                            audio_started = true;
-                        }
+                        self.audio_output
+                            .process_command(AudioCommand::Samples(chunk.samples.clone()));
+                        first_samples = chunk.samples;
+                        audio_started = true;
                     }
                 }
                 Err(e) => {
-                    eprintln!("TTS stream error: {}", e);
-                    // Error means stream broken, don't cache partial audio
+                    eprintln!("TTS stream error on first chunk: {}", e);
+                    return Ok(false);
+                }
+            }
+        } else {
+            return Ok(false);
+        }
+
+        if !audio_started {
+            return Ok(false);
+        }
+
+        // Spawn task for the rest
+        let audio_controller = self.audio_output.controller.clone(); // Use controller which is Send
+        let cancelled = self.cancelled.clone();
+        let generation = self.generation.clone();
+        let message_id_owned = message_id.to_string();
+
+        tokio::spawn(async move {
+            let mut all_samples = first_samples;
+            let mut was_cancelled = false;
+
+            while let Some(result) = rx.recv().await {
+                // Check cancellation and generation
+                if cancelled.load(Ordering::SeqCst)
+                    || generation.load(Ordering::SeqCst) != current_gen
+                {
                     was_cancelled = true;
                     break;
                 }
-            }
-        }
 
-        // Only save complete audio to cache (not cancelled or errored)
-        if !was_cancelled && !all_samples.is_empty() {
-            // Convert back to i16 PCM bytes for storage
-            let mut bytes = Vec::with_capacity(all_samples.len() * 2);
-            for sample in all_samples {
-                let s = (sample * 32768.0).clamp(-32768.0, 32767.0) as i16;
-                bytes.extend_from_slice(&s.to_le_bytes());
+                match result {
+                    Ok(chunk) => {
+                        if !chunk.samples.is_empty() {
+                            // Play immediately
+                            if !cancelled.load(Ordering::SeqCst)
+                                && generation.load(Ordering::SeqCst) == current_gen
+                            {
+                                audio_controller
+                                    .process_command(AudioCommand::Samples(chunk.samples.clone()));
+
+                                all_samples.extend(chunk.samples);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("TTS stream error: {}", e);
+                        // Error means stream broken, don't cache partial audio
+                        was_cancelled = true;
+                        break;
+                    }
+                }
             }
 
-            if let Some(path) = Self::get_cache_path(message_id) {
-                let _ = std::fs::write(path, &bytes);
-            }
-        }
+            // Only save complete audio to cache (not cancelled or errored)
+            if !was_cancelled && !all_samples.is_empty() {
+                // Double check generation before writing cache
+                if generation.load(Ordering::SeqCst) != current_gen {
+                    return;
+                }
 
-        Ok(audio_started)
+                // Convert back to i16 PCM bytes for storage
+                let mut bytes = Vec::with_capacity(all_samples.len() * 2);
+                for sample in all_samples {
+                    let s = (sample * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+
+                if let Some(path) = Self::get_cache_path(&message_id_owned) {
+                    let _ = std::fs::write(path, &bytes);
+                }
+            }
+        });
+
+        Ok(true)
     }
 
     /// Wait for Native TTS to complete
@@ -273,7 +318,12 @@ impl TtsService {
     /// Wait for AI TTS to complete
     pub async fn wait_until_finished_ai(&self) {
         // Check if audio is actually playing before waiting
-        if !self.audio_output.is_ai_speaking.load(Ordering::Relaxed) {
+        if !self
+            .audio_output
+            .controller
+            .is_ai_speaking
+            .load(Ordering::Relaxed)
+        {
             return;
         }
         self.audio_output.wait_until_finished().await;
@@ -296,7 +346,7 @@ impl TtsService {
     pub fn is_native_active(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
-            if let Some(bridge) = &self.native_provider {
+            if let Some(_bridge) = &self.native_provider {
                 return !self.native_paused.load(Ordering::SeqCst);
             }
         }

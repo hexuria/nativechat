@@ -20,7 +20,7 @@ use ui::{
     input::{Input, InputState},
     label::Label,
     list::{List, ListDelegate, ListState},
-    select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState},
+    select::{SearchableVec, Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
     theme::ActiveTheme,
 };
 use ui::{IndexPath, StyleSized};
@@ -181,6 +181,41 @@ pub struct ProfileSettingsModal {
     pending_success_message: Option<String>,
 }
 
+// Defined constants for voices
+const LIVE_VOICES: &[&str] = &["Puck", "Charon", "Kore", "Fenrir", "Aoede"];
+const STANDARD_VOICES: &[&str] = &[
+    "Achernar",
+    "Achird",
+    "Algenib",
+    "Algieba",
+    "Alnilam",
+    "Aoede",
+    "Autonoe",
+    "Callirrhoe",
+    "Charon",
+    "Despina",
+    "Enceladus",
+    "Erinome",
+    "Fenrir",
+    "Gacrux",
+    "Iapetus",
+    "Kore",
+    "Laomedeia",
+    "Leda",
+    "Orus",
+    "Puck",
+    "Pulcherrima",
+    "Rasalgethi",
+    "Sadachbia",
+    "Sadaltager",
+    "Schedar",
+    "Sulafat",
+    "Umbriel",
+    "Vindemiatrix",
+    "Zephyr",
+    "Zubenelgenubi",
+];
+
 impl ProfileSettingsModal {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let profile_name_input =
@@ -224,41 +259,8 @@ impl ProfileSettingsModal {
         let tts_model_select =
             cx.new(|cx| SelectState::new(tts_model_items, None, window, cx).searchable(true));
 
-        let voice_names = vec![
-            // Standard/Journey Voices
-            "Kore",
-            "Fenrir",
-            "Puck",
-            "Aoede",
-            "Charon",
-            // Gemini Live Voices
-            "Capella",
-            "Pegasus",
-            "Ursa",
-            "Vega",
-            "Nova",
-            "Lyra",
-            "Orion",
-            "Orbit",
-            "Dipper",
-            "Eclipse",
-            // Other Named Voices
-            "Achernar",
-            "Achird",
-            "Algenib",
-            "Alnilam",
-            "Autonoe",
-            "Callirrhoe",
-            "Laomedeia",
-            "Leda",
-            "Orus",
-            "Pulcherrima",
-            "Rasalgethi",
-            "Umbriel",
-            "Vindemiatrix",
-        ];
         let voice_items = SearchableVec::new(
-            voice_names
+            STANDARD_VOICES
                 .iter()
                 .map(|s| VoiceItem(s.to_string()))
                 .collect::<Vec<_>>(),
@@ -1125,6 +1127,26 @@ impl ProfileSettingsModal {
         )
         .detach();
 
+        // Subscribe to TTS provider select
+        cx.subscribe(
+            &self.tts_provider_select,
+            |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
+                this.tts_model_select
+                    .update(cx, |s, cx| s.reset_selection(cx));
+                this.update_model_selects(cx, true);
+            },
+        )
+        .detach();
+
+        // Subscribe to TTS model select to filter voices
+        cx.subscribe(
+            &self.tts_model_select,
+            |this, _, _event: &SelectEvent<SearchableVec<ModelProfile>>, cx| {
+                this.update_voice_select(cx);
+            },
+        )
+        .detach();
+
         // Note: We don't observe state to update selects - they're updated via provider select subscriptions above
     }
 
@@ -1409,6 +1431,59 @@ impl ProfileSettingsModal {
         let image_creds = filter_creds(image_provider);
         self.image_credential_select.update(cx, |select, cx| {
             select.set_items(image_creds, cx);
+        });
+    }
+
+    fn update_voice_select(&mut self, cx: &mut Context<Self>) {
+        let tts_model_id = self.tts_model_select.read(cx).selected_value().cloned();
+
+        let available_voices = if let Some(model_id) = tts_model_id {
+            let id_lower = model_id.to_lowercase();
+            // Check if it's a Live API model
+            if id_lower.contains("native-audio") || id_lower.contains("gemini-2.0") {
+                LIVE_VOICES
+            } else {
+                STANDARD_VOICES
+            }
+        } else {
+            STANDARD_VOICES
+        };
+
+        let voice_items = SearchableVec::new(
+            available_voices
+                .iter()
+                .map(|s| VoiceItem(s.to_string()))
+                .collect::<Vec<_>>(),
+        );
+
+        self.tts_voice_select.update(cx, |select, cx| {
+            let current_selection = select.selected_value().cloned();
+            select.set_items(voice_items.clone(), cx);
+
+            let mut target_value = None;
+            // If current selection is valid for new list, keep it
+            if let Some(current) = current_selection {
+                if available_voices.contains(&current.as_str()) {
+                    target_value = Some(current);
+                }
+            }
+
+            // Otherwise default to first available
+            if target_value.is_none() {
+                if let Some(first) = available_voices.first() {
+                    target_value = Some(first.to_string());
+                }
+            }
+
+            if let Some(val) = target_value {
+                // Find index using SelectDelegate's position method
+                // We need to use the method from the trait
+                if let Some(index) = voice_items.position(&val) {
+                    select.set_selected_index_deferred(Some(index), cx);
+                }
+            } else {
+                select.set_selected_index_deferred(None, cx);
+            }
         });
     }
 
