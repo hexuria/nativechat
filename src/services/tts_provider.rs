@@ -18,6 +18,7 @@ pub trait TtsProvider: Send + Sync {
         text: &str,
         model_id: &str,
         api_key: &str,
+        voice: &Option<String>,
     ) -> Result<mpsc::Receiver<Result<AudioChunk>>>;
 
     /// Provider name for logging/debugging

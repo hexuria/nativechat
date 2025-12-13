@@ -167,6 +167,7 @@ impl TtsService {
         message_id: &str,
         model_id: &str,
         api_key: &str,
+        voice: &Option<String>,
     ) -> Result<bool> {
         // Reset cancellation flag for new request
         self.cancelled.store(false, Ordering::SeqCst);
@@ -206,7 +207,9 @@ impl TtsService {
 
         // Use the appropriate provider based on model_id
         let provider = self.get_provider(model_id);
-        let mut rx = provider.stream_audio(text, model_id, api_key).await?;
+        let mut rx = provider
+            .stream_audio(text, model_id, api_key, voice)
+            .await?;
 
         let mut audio_started = false;
         let mut all_samples: Vec<f32> = Vec::new();

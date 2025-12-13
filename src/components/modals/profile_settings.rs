@@ -40,6 +40,21 @@ impl SelectItem for CredentialItem {
     }
 }
 
+#[derive(Clone)]
+pub struct VoiceItem(pub String);
+
+impl SelectItem for VoiceItem {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.0.clone().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
+}
+
 pub struct ProfileListDelegate {
     pub profiles: Vec<Profile>,
     selected_index: Option<usize>,
@@ -138,6 +153,7 @@ pub struct ProfileSettingsModal {
     image_model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
     tts_provider_select: Entity<SelectState<SearchableVec<Provider>>>,
     tts_model_select: Entity<SelectState<SearchableVec<ModelProfile>>>,
+    tts_voice_select: Entity<SelectState<SearchableVec<VoiceItem>>>,
     chat_credential_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
     embedding_credential_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
     image_credential_select: Entity<SelectState<SearchableVec<CredentialItem>>>,
@@ -176,41 +192,91 @@ impl ProfileSettingsModal {
         });
 
         let provider_items = SearchableVec::new(vec![]);
-        let provider_select = cx.new(|cx| SelectState::new(provider_items, None, window, cx));
+        let provider_select =
+            cx.new(|cx| SelectState::new(provider_items, None, window, cx).searchable(true));
 
         let model_items = SearchableVec::new(vec![]);
-        let model_select = cx.new(|cx| SelectState::new(model_items, None, window, cx));
+        let model_select =
+            cx.new(|cx| SelectState::new(model_items, None, window, cx).searchable(true));
 
         let embedding_provider_items = SearchableVec::new(vec![]);
-        let embedding_provider_select =
-            cx.new(|cx| SelectState::new(embedding_provider_items, None, window, cx));
+        let embedding_provider_select = cx.new(|cx| {
+            SelectState::new(embedding_provider_items, None, window, cx).searchable(true)
+        });
 
         let embedding_model_items = SearchableVec::new(vec![]);
         let embedding_model_select =
-            cx.new(|cx| SelectState::new(embedding_model_items, None, window, cx));
+            cx.new(|cx| SelectState::new(embedding_model_items, None, window, cx).searchable(true));
 
         let image_provider_items = SearchableVec::new(vec![]);
         let image_provider_select =
-            cx.new(|cx| SelectState::new(image_provider_items, None, window, cx));
+            cx.new(|cx| SelectState::new(image_provider_items, None, window, cx).searchable(true));
 
         let image_model_items = SearchableVec::new(vec![]);
-        let image_model_select = cx.new(|cx| SelectState::new(image_model_items, None, window, cx));
+        let image_model_select =
+            cx.new(|cx| SelectState::new(image_model_items, None, window, cx).searchable(true));
 
         let tts_provider_items = SearchableVec::new(vec![]);
         let tts_provider_select =
-            cx.new(|cx| SelectState::new(tts_provider_items, None, window, cx));
+            cx.new(|cx| SelectState::new(tts_provider_items, None, window, cx).searchable(true));
 
         let tts_model_items = SearchableVec::new(vec![]);
-        let tts_model_select = cx.new(|cx| SelectState::new(tts_model_items, None, window, cx));
+        let tts_model_select =
+            cx.new(|cx| SelectState::new(tts_model_items, None, window, cx).searchable(true));
 
-        let chat_credential_select =
-            cx.new(|cx| SelectState::new(SearchableVec::new(vec![]), None, window, cx));
+        let voice_names = vec![
+            // Standard/Journey Voices
+            "Kore",
+            "Fenrir",
+            "Puck",
+            "Aoede",
+            "Charon",
+            // Gemini Live Voices
+            "Capella",
+            "Pegasus",
+            "Ursa",
+            "Vega",
+            "Nova",
+            "Lyra",
+            "Orion",
+            "Orbit",
+            "Dipper",
+            "Eclipse",
+            // Other Named Voices
+            "Achernar",
+            "Achird",
+            "Algenib",
+            "Alnilam",
+            "Autonoe",
+            "Callirrhoe",
+            "Laomedeia",
+            "Leda",
+            "Orus",
+            "Pulcherrima",
+            "Rasalgethi",
+            "Umbriel",
+            "Vindemiatrix",
+        ];
+        let voice_items = SearchableVec::new(
+            voice_names
+                .iter()
+                .map(|s| VoiceItem(s.to_string()))
+                .collect::<Vec<_>>(),
+        );
+        let tts_voice_select =
+            cx.new(|cx| SelectState::new(voice_items, None, window, cx).searchable(true));
 
-        let embedding_credential_select =
-            cx.new(|cx| SelectState::new(SearchableVec::new(vec![]), None, window, cx));
+        let chat_credential_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
+        });
 
-        let image_credential_select =
-            cx.new(|cx| SelectState::new(SearchableVec::new(vec![]), None, window, cx));
+        let embedding_credential_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
+        });
+
+        let image_credential_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(vec![]), None, window, cx).searchable(true)
+        });
 
         let weak_self = cx.entity().downgrade();
         let on_click = Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
@@ -252,6 +318,7 @@ impl ProfileSettingsModal {
             image_model_select,
             tts_provider_select,
             tts_model_select,
+            tts_voice_select,
             chat_credential_select,
             embedding_credential_select,
             image_credential_select,
@@ -412,6 +479,15 @@ impl ProfileSettingsModal {
             if let Some(model_id) = &profile.tts_model_id {
                 self.tts_model_select
                     .update(cx, |s, cx| s.set_selected_value(model_id, window, cx));
+            }
+            if let Some(voice) = &profile.tts_voice {
+                self.tts_voice_select
+                    .update(cx, |s, cx| s.set_selected_value(voice, window, cx));
+            } else {
+                // Default to Kore if not set
+                self.tts_voice_select.update(cx, |s, cx| {
+                    s.set_selected_value(&"Kore".to_string(), window, cx)
+                });
             }
 
             // Update credential selects again after models are set
@@ -698,6 +774,9 @@ impl ProfileSettingsModal {
             .update(cx, |s, cx| s.set_selected_index(None, window, cx));
         self.tts_model_select
             .update(cx, |s, cx| s.set_selected_index(None, window, cx));
+        self.tts_voice_select.update(cx, |s, cx| {
+            s.set_selected_value(&"Kore".to_string(), window, cx)
+        });
 
         // Clear all credential selects
         self.chat_credential_select
@@ -724,6 +803,7 @@ impl ProfileSettingsModal {
                 image_model_id: None,
                 image_credential_id: None,
                 tts_model_id: None,
+                tts_voice: Some("Kore".to_string()),
                 created_at: String::new(),
             };
 
@@ -792,6 +872,7 @@ impl ProfileSettingsModal {
             .read(cx)
             .selected_value()
             .map(|m| m.clone());
+        let tts_voice = self.tts_voice_select.read(cx).selected_value().cloned();
 
         let mode = self.mode.clone();
         let db = self.state.read(cx).database_service.clone();
@@ -827,6 +908,7 @@ impl ProfileSettingsModal {
                                         image_model_id,
                                         image_credential_id,
                                         tts_model_id,
+                                        tts_voice,
                                         created_at: String::new(),
                                     };
 
@@ -850,6 +932,7 @@ impl ProfileSettingsModal {
                                 image_model_id,
                                 image_credential_id,
                                 tts_model_id: tts_model_id.clone(),
+                                tts_voice: tts_voice.clone(),
                                 created_at: String::new(),
                             };
 
@@ -1413,7 +1496,9 @@ impl ProfileSettingsModal {
                                         .text_color(cx.theme().muted_foreground),
                                 )
                                 .child(
-                                    Select::new(&provider_select).placeholder("Select Provider"),
+                                    Select::new(&provider_select)
+                                        .placeholder("Select Provider")
+                                        .search_placeholder("Search provider..."),
                                 ),
                         ),
                     )
@@ -1428,7 +1513,11 @@ impl ProfileSettingsModal {
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground),
                                 )
-                                .child(Select::new(&model_select).placeholder("Select Model")),
+                                .child(
+                                    Select::new(&model_select)
+                                        .placeholder("Select Model")
+                                        .search_placeholder("Search model..."),
+                                ),
                         ),
                     )
                     .child(
@@ -1496,6 +1585,7 @@ impl ProfileSettingsModal {
                                 } else {
                                     Select::new(&credential_select)
                                         .placeholder("Select Credential")
+                                        .search_placeholder("Search credential...")
                                         .into_any_element()
                                 }),
                         ),
@@ -1812,7 +1902,10 @@ impl Render for ProfileSettingsModal {
                                                                 Select::new(
                                                                     &self.tts_provider_select,
                                                                 )
-                                                                .placeholder("Select Provider"),
+                                                                .placeholder("Select Provider")
+                                                                .search_placeholder(
+                                                                    "Search provider...",
+                                                                ),
                                                             ),
                                                     ),
                                                 )
@@ -1831,10 +1924,31 @@ impl Render for ProfileSettingsModal {
                                                             )
                                                             .child(
                                                                 Select::new(&self.tts_model_select)
-                                                                    .placeholder("Select Model"),
+                                                                    .placeholder("Select Model")
+                                                                    .search_placeholder(
+                                                                        "Search model...",
+                                                                    ),
                                                             ),
                                                     ),
                                                 ),
+                                        )
+                                        .child(
+                                            div().flex_1().min_w_64().child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        Label::new("Voice").text_xs().text_color(
+                                                            cx.theme().muted_foreground,
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        Select::new(&self.tts_voice_select)
+                                                            .placeholder("Select Voice")
+                                                            .search_placeholder("Search voice..."),
+                                                    ),
+                                            ),
                                         ),
                                 ),
                         ),

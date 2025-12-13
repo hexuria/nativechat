@@ -1310,6 +1310,7 @@ impl AppState {
                         .active_profile()
                         .and_then(|p| p.tts_model_id.clone())
                         .unwrap_or_else(|| "native".to_string());
+                    let tts_voice = self.active_profile().and_then(|p| p.tts_voice.clone());
                     let api_key = self
                         .active_credential()
                         .map(|c| c.api_key.clone())
@@ -1324,7 +1325,13 @@ impl AppState {
                         let mut cx = cx.clone();
                         async move {
                             let start_result = service
-                                .start_speaking(&text, &message_id, &tts_model_id, &api_key)
+                                .start_speaking(
+                                    &text,
+                                    &message_id,
+                                    &tts_model_id,
+                                    &api_key,
+                                    &tts_voice,
+                                )
                                 .await;
                             match start_result {
                                 Ok(true) => {

@@ -51,11 +51,14 @@ impl TtsProvider for RestTtsProvider {
         text: &str,
         model_id: &str,
         api_key: &str,
+        voice: &Option<String>,
     ) -> Result<mpsc::Receiver<Result<AudioChunk>>> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
             model_id, api_key
         );
+
+        let voice_name = voice.as_deref().unwrap_or("Kore");
 
         let payload = json!({
             "contents": [{
@@ -68,7 +71,7 @@ impl TtsProvider for RestTtsProvider {
                 "speechConfig": {
                     "voiceConfig": {
                         "prebuiltVoiceConfig": {
-                            "voiceName": "Kore"
+                            "voiceName": voice_name
                         }
                     }
                 }
