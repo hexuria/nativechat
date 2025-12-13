@@ -6,6 +6,7 @@ use crate::services::tts_provider::TtsProvider;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Notify;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -26,8 +27,11 @@ pub struct TtsService {
     native_provider: Option<Arc<MacTtsBridge>>,
     active_mode: Arc<Mutex<TtsMode>>,
     native_completion_notify: Arc<Notify>,
-    native_paused: Arc<AtomicBool>,
+    pub native_paused: Arc<AtomicBool>,
+    pub ai_paused: Arc<AtomicBool>,
+
     last_word_index: Arc<AtomicUsize>,
+    last_word_length: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
 }
 
@@ -37,23 +41,30 @@ impl TtsService {
 
         let native_completion = Arc::new(Notify::new());
         let last_word_index = Arc::new(AtomicUsize::new(0));
+        let last_word_length = Arc::new(AtomicUsize::new(0));
         let generation = Arc::new(AtomicU64::new(0));
 
         let native_provider = if cfg!(target_os = "macos") {
             let bridge = Arc::new(MacTtsBridge::new());
             let completion = native_completion.clone();
             let index = last_word_index.clone();
+            let len = last_word_length.clone();
 
             bridge.set_callback(move |event| match event {
                 TtsEvent::Start => {
                     println!("[TTS Service] Native TTS Started");
+                    index.store(0, Ordering::SeqCst);
+                    len.store(0, Ordering::SeqCst);
                 }
-                TtsEvent::Word { start, length: _ } => {
+                TtsEvent::Word { start, length } => {
                     index.store(start, Ordering::SeqCst);
+                    len.store(length, Ordering::SeqCst);
                 }
                 TtsEvent::Finish => {
                     println!("[TTS Service] Native TTS Finished");
                     completion.notify_waiters();
+                    // Reset on finish
+                    len.store(0, Ordering::SeqCst);
                 }
             });
 
@@ -71,13 +82,25 @@ impl TtsService {
             active_mode: Arc::new(Mutex::new(TtsMode::None)),
             native_completion_notify: native_completion,
             native_paused: Arc::new(AtomicBool::new(false)),
+            ai_paused: Arc::new(AtomicBool::new(false)),
             last_word_index,
+            last_word_length,
             generation,
         })
     }
 
     /// Check if a model should use the Live API (streaming WebSocket)
-    fn is_live_api_model(model_id: &str) -> bool {
+    pub fn get_active_word_range(&self) -> Option<std::ops::Range<usize>> {
+        let start = self.last_word_index.load(Ordering::SeqCst);
+        let len = self.last_word_length.load(Ordering::SeqCst);
+        if len > 0 {
+            Some(start..start + len)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_live_api_model(model_id: &str) -> bool {
         let id_lower = model_id.to_lowercase();
         id_lower.contains("native-audio") || id_lower.contains("gemini-2.0")
     }
@@ -117,7 +140,7 @@ impl TtsService {
         samples
     }
 
-    pub fn start_speaking_native(&self, text: &str, message_id: &str) -> bool {
+    pub fn start_speaking_native(&self, text: &str, _message_id: &str) -> bool {
         #[cfg(target_os = "macos")]
         if let Some(bridge) = &self.native_provider {
             // Stop any previous speech
@@ -125,6 +148,12 @@ impl TtsService {
 
             // Reset state
             // *self.active_mode.lock().unwrap() = TtsMode::Native;
+
+            // Don't kill the task, just ensure it's paused so Native can take over cleanly
+            // self.generation.fetch_add(1, Ordering::SeqCst);
+            // self.cancelled.store(true, Ordering::SeqCst); // Don't cancel, just pause!
+            self.ai_paused.store(true, Ordering::SeqCst);
+
             self.native_paused.store(false, Ordering::SeqCst);
             self.last_word_index.store(0, Ordering::SeqCst);
 
@@ -178,6 +207,13 @@ impl TtsService {
 
         // Reset cancellation flag for new request
         self.cancelled.store(false, Ordering::SeqCst);
+        self.ai_paused.store(false, Ordering::SeqCst);
+        // Reset highlighting state to prevent cross-talk
+        self.cancelled.store(false, Ordering::SeqCst);
+        self.ai_paused.store(false, Ordering::SeqCst);
+        // Reset highlighting state to prevent cross-talk
+        self.last_word_index.store(0, Ordering::SeqCst);
+        self.last_word_length.store(0, Ordering::SeqCst);
 
         // Reset audio output state to clear any previous stuck signals or data
         self.audio_output.process_command(AudioCommand::Stop);
@@ -198,8 +234,21 @@ impl TtsService {
                             "[TTS Service] Playing from cache ({} samples)",
                             samples.len()
                         );
+
+                        let duration_secs = samples.len() as f32 / 24000.0;
+                        let duration = Some(Duration::from_secs_f32(duration_secs));
+
                         self.audio_output
-                            .process_command(AudioCommand::Samples(samples));
+                            .process_command(AudioCommand::Samples(samples.clone()));
+
+                        // Spawn simulation for cached playback
+                        self.spawn_simulation_task(
+                            text.to_string(),
+                            current_gen,
+                            duration,
+                            Some(samples),
+                        );
+
                         return Ok(true);
                     }
                 }
@@ -246,14 +295,15 @@ impl TtsService {
         let audio_controller = self.audio_output.controller.clone(); // Use controller which is Send
         let cancelled = self.cancelled.clone();
         let generation = self.generation.clone();
-        let message_id_owned = message_id.to_string();
+        // Spawn simulated highlighting task
+        self.spawn_simulation_task(text.to_string(), current_gen, None, None);
 
+        let message_id_owned = message_id.to_string();
         tokio::spawn(async move {
             let mut all_samples = first_samples;
             let mut was_cancelled = false;
 
             while let Some(result) = rx.recv().await {
-                // Check cancellation and generation
                 if cancelled.load(Ordering::SeqCst)
                     || generation.load(Ordering::SeqCst) != current_gen
                 {
@@ -317,15 +367,8 @@ impl TtsService {
 
     /// Wait for AI TTS to complete
     pub async fn wait_until_finished_ai(&self) {
-        // Check if audio is actually playing before waiting
-        if !self
-            .audio_output
-            .controller
-            .is_ai_speaking
-            .load(Ordering::Relaxed)
-        {
-            return;
-        }
+        // We know we sent samples, so wait for them to finish.
+        // If we check is_ai_speaking here, it might race with the audio thread starting.
         self.audio_output.wait_until_finished().await;
     }
 
@@ -337,10 +380,12 @@ impl TtsService {
 
     pub fn pause(&self) {
         self.audio_output.process_command(AudioCommand::Pause);
+        self.ai_paused.store(true, Ordering::SeqCst);
     }
 
     pub fn resume(&self) {
         self.audio_output.process_command(AudioCommand::Resume);
+        self.ai_paused.store(false, Ordering::SeqCst);
     }
 
     pub fn is_native_active(&self) -> bool {
@@ -351,5 +396,178 @@ impl TtsService {
             }
         }
         false
+    }
+
+    fn spawn_simulation_task(
+        &self,
+        text: String,
+        current_gen: u64,
+        duration: Option<Duration>,
+        samples: Option<Vec<f32>>,
+    ) {
+        let sim_text = text;
+        let sim_last_word_index = self.last_word_index.clone();
+        let sim_last_word_length = self.last_word_length.clone();
+        let sim_cancelled = self.cancelled.clone();
+        let sim_generation = self.generation.clone();
+        let sim_paused = self.ai_paused.clone();
+
+        tokio::spawn(async move {
+            let sim_len = sim_text.len();
+            let mut chars_per_sec = 15.0; // Fallback
+            let mut active_chars_per_sec = 15.0;
+
+            // Heuristic fallback variables
+            let mut pause_time_per_comma = 0.2;
+            let mut pause_time_per_period = 0.5;
+
+            // Energy-Based Timing (if samples available)
+            let mut use_energy_timing = false;
+            let mut window_size_samples = 2400; // 100ms at 24kHz
+            let mut silent_threshold = 0.01; // RMS threshold
+
+            // Pre-calculate energy profile if samples exist
+            let mut energy_profile = Vec::new();
+
+            if let Some(audio_samples) = samples {
+                use_energy_timing = true;
+                // Calculate total active time (time where RMS > threshold)
+                let mut active_window_count = 0;
+
+                for chunk in audio_samples.chunks(window_size_samples) {
+                    let mut sum_sq = 0.0;
+                    for &s in chunk {
+                        sum_sq += s * s;
+                    }
+                    let rms = (sum_sq / chunk.len() as f32).sqrt();
+                    let is_active = rms > silent_threshold;
+                    energy_profile.push(is_active);
+                    if is_active {
+                        active_window_count += 1;
+                    }
+                }
+
+                let active_time =
+                    (active_window_count as f32 * window_size_samples as f32) / 24000.0;
+                let active_time = active_time.max(0.1);
+
+                active_chars_per_sec = sim_len as f32 / active_time;
+
+                println!(
+                    "[TTS Service] Energy Timing: Active for {:.2}s. Speed: {:.2} cps (during speech)",
+                    active_time, active_chars_per_sec
+                );
+            } else if let Some(dur) = duration {
+                // FALLBACK: Punctuation-based "Smart Timing"
+                if dur.as_secs_f32() > 0.0 {
+                    let commas = sim_text.chars().filter(|&c| c == ',' || c == ';').count();
+                    let periods = sim_text
+                        .chars()
+                        .filter(|&c| c == '.' || c == '!' || c == '?')
+                        .count();
+
+                    let estimated_pause_time = (commas as f32 * pause_time_per_comma)
+                        + (periods as f32 * pause_time_per_period);
+                    let effective_speech_time = (dur.as_secs_f32() - estimated_pause_time).max(0.1);
+
+                    chars_per_sec = sim_len as f32 / effective_speech_time;
+                    active_chars_per_sec = chars_per_sec;
+                }
+            }
+
+            let tick_rate = 50; // 50ms ticks
+            let mut current_char_index = 0.0;
+            let mut pause_remaining = 0.0;
+            let mut last_processed_idx = 0usize;
+            let mut elapsed_ms = 0u64;
+
+            // Initial delay
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            loop {
+                if sim_cancelled.load(Ordering::SeqCst)
+                    || sim_generation.load(Ordering::SeqCst) != current_gen
+                {
+                    break;
+                }
+
+                if sim_paused.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(tick_rate)).await;
+                    continue;
+                }
+
+                // --- Energy check ---
+                if use_energy_timing {
+                    // Map elapsed time to window index
+                    // 100ms windows = 2400 samples @ 24kHz
+                    // tick_rate = 50ms.
+                    let current_window_idx =
+                        (elapsed_ms as usize * 24000 / 1000) / window_size_samples;
+
+                    if current_window_idx < energy_profile.len() {
+                        if !energy_profile[current_window_idx] {
+                            // SILENCE: Do not advance index
+                            tokio::time::sleep(Duration::from_millis(tick_rate)).await;
+                            elapsed_ms += tick_rate;
+                            continue;
+                        }
+                    }
+                }
+                // --------------------
+
+                tokio::time::sleep(Duration::from_millis(tick_rate)).await;
+                elapsed_ms += tick_rate;
+
+                if !use_energy_timing && pause_remaining > 0.0 {
+                    pause_remaining -= tick_rate as f32 / 1000.0;
+                    continue;
+                }
+
+                // Update index
+                let step = active_chars_per_sec * (tick_rate as f32 / 1000.0);
+                current_char_index += step;
+
+                let idx = current_char_index as usize;
+
+                if idx >= sim_len {
+                    sim_last_word_index.store(sim_len, Ordering::SeqCst);
+                    sim_last_word_length.store(0, Ordering::SeqCst);
+                    break;
+                }
+
+                // Punctuation check (ONLY if not using energy timing)
+                if !use_energy_timing && idx > last_processed_idx {
+                    for i in last_processed_idx..idx {
+                        if i < sim_len {
+                            let c = sim_text.as_bytes()[i] as char;
+                            if c == ',' || c == ';' {
+                                pause_remaining = pause_time_per_comma;
+                            } else if c == '.' || c == '!' || c == '?' {
+                                pause_remaining = pause_time_per_period;
+                            }
+                        }
+                    }
+                    last_processed_idx = idx;
+                }
+
+                // Snap to word boundaries
+                let start_idx = sim_text[..idx]
+                    .rfind(char::is_whitespace)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+
+                let end_offset = sim_text[idx..]
+                    .find(char::is_whitespace)
+                    .unwrap_or(sim_len - idx);
+                let end_idx = idx + end_offset;
+
+                let word_len = end_idx - start_idx;
+
+                if word_len > 0 {
+                    sim_last_word_index.store(start_idx, Ordering::SeqCst);
+                    sim_last_word_length.store(word_len, Ordering::SeqCst);
+                }
+            }
+        });
     }
 }

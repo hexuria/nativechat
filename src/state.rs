@@ -1275,6 +1275,39 @@ impl AppState {
                     let text = text.clone();
 
                     if service.start_speaking_native(&text, &message_id) {
+                        let message_id_poller = message_id.clone();
+                        cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
+                            let mut cx = cx.clone();
+                            async move {
+                                loop {
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(30))
+                                        .await;
+                                    if let Some(this) = this.upgrade() {
+                                        let still_active = this
+                                            .update(&mut cx, |state, cx| {
+                                                if state.native_tts.message_id.as_ref()
+                                                    == Some(&message_id_poller)
+                                                {
+                                                    cx.notify();
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            })
+                                            .unwrap_or(false);
+
+                                        if !still_active {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                        .detach();
+
                         cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
                             let mut cx = cx.clone();
                             async move {
@@ -1320,6 +1353,41 @@ impl AppState {
                     let service = service.clone();
                     let message_id = message_id.clone();
                     let text = text.clone();
+
+                    let message_id_poller = message_id.clone();
+                    cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
+                        let mut cx = cx.clone();
+                        async move {
+                            loop {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(30))
+                                    .await;
+                                if let Some(this) = this.upgrade() {
+                                    let still_active = this
+                                        .update(&mut cx, |state, cx| {
+                                            if state.ai_tts.message_id.as_ref()
+                                                == Some(&message_id_poller)
+                                                && !state.ai_tts.is_paused
+                                            {
+                                                cx.notify();
+                                                true
+                                            } else {
+                                                state.ai_tts.message_id.as_ref()
+                                                    == Some(&message_id_poller)
+                                            }
+                                        })
+                                        .unwrap_or(false);
+
+                                    if !still_active {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                    .detach();
 
                     cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
                         let mut cx = cx.clone();
@@ -1407,6 +1475,12 @@ impl AppState {
         }
     }
 
+    pub fn active_highlight_range(&self) -> Option<std::ops::Range<usize>> {
+        self.tts_service
+            .as_ref()
+            .and_then(|s| s.get_active_word_range())
+    }
+
     pub fn toggle_read_aloud(
         &mut self,
         message_id: String,
@@ -1444,9 +1518,10 @@ impl AppState {
                         if self.ai_tts.is_paused {
                             // Resume AI
                             // Ensure Native is paused
-                            if self.native_tts.message_id.is_some() && !self.native_tts.is_paused {
-                                service.pause_native();
-                                self.native_tts.is_paused = true;
+                            // Ensure Native is stopped completely so highlight color reverts to AI
+                            if self.native_tts.message_id.is_some() {
+                                service.stop_native();
+                                self.native_tts = SourceTtsState::default();
                             }
                             service.resume();
                             self.ai_tts.is_paused = false;
@@ -1475,6 +1550,13 @@ impl AppState {
                 println!("[State] Cleared cache for {}", message_id);
             }
         }
+
+        // Force loading state immediately for reactivity
+        self.ai_tts.message_id = Some(message_id.clone());
+        self.ai_tts.is_loading = true;
+        self.ai_tts.is_paused = false;
+        cx.notify();
+
         self.read_aloud(text, message_id, TtsSource::AI, cx);
     }
 }

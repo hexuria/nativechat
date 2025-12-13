@@ -27,6 +27,8 @@ pub struct MessageBubble {
     is_ai_loading: bool,
 
     is_cached: bool,
+    highlight_range: Option<std::ops::Range<usize>>,
+    highlight_color: Option<Hsla>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -48,8 +50,20 @@ impl MessageBubble {
             is_ai_paused: false,
             is_ai_loading: false,
             is_cached: false,
+            highlight_range: None,
+            highlight_color: None,
             on_read_aloud: None,
         }
+    }
+
+    pub fn highlight_range(mut self, range: Option<std::ops::Range<usize>>) -> Self {
+        self.highlight_range = range;
+        self
+    }
+
+    pub fn highlight_color(mut self, color: Option<Hsla>) -> Self {
+        self.highlight_color = color;
+        self
     }
 
     pub fn on_read_aloud(
@@ -223,12 +237,16 @@ impl RenderOnce for MessageBubble {
                                 })
                                 .when(!self.debug_mode, |this| {
                                     // Normal mode: markdown rendering
-                                    this.child(ui::text::MarkdownView::new(
-                                        ElementId::Name(self.message_id.clone().into()),
-                                        self.text.clone(),
-                                        window,
-                                        cx,
-                                    ))
+                                    this.child(
+                                        ui::text::MarkdownView::new(
+                                            ElementId::Name(self.message_id.clone().into()),
+                                            self.text.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                        .highlight_range(self.highlight_range.clone())
+                                        .highlight_color(self.highlight_color),
+                                    )
                                 })
                                 .when_some(self.timestamp, |this, timestamp| {
                                     this.child(

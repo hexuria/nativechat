@@ -388,6 +388,22 @@ impl Render for ChatView {
 
                                         let is_cached = TtsService::is_cached(&msg.id);
 
+                                        let (is_speaking, highlight_color) = if is_native_speaking {
+                                            (true, Some(theme.yellow.opacity(0.4)))
+                                        } else if is_ai_speaking {
+                                            (true, Some(theme.green.opacity(0.4)))
+                                        } else {
+                                            (false, None)
+                                        };
+
+                                        let highlight_range = if is_speaking {
+                                            state.active_highlight_range().and_then(|range| {
+                                                map_utf16_range_to_utf8(&msg.content, range)
+                                            })
+                                        } else {
+                                            None
+                                        };
+
                                         MessageBubble::new(msg.content.clone())
                                             .message_id(msg.id.clone())
                                             .is_me(msg.is_me)
@@ -403,6 +419,8 @@ impl Render for ChatView {
                                             .is_ai_paused(is_ai_paused)
                                             .is_ai_loading(is_ai_loading)
                                             .is_cached(is_cached)
+                                            .highlight_range(highlight_range)
+                                            .highlight_color(highlight_color)
                                             .on_read_aloud({
                                                 let state = self.state.clone();
                                                 let message_id = msg.id.clone();
@@ -460,4 +478,36 @@ impl Render for ChatView {
                     .child(self.input.clone()),
             )
     }
+}
+
+fn map_utf16_range_to_utf8(
+    text: &str,
+    range: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let mut utf16_index = 0;
+    let mut utf8_start = None;
+
+    if range.start == 0 {
+        utf8_start = Some(0);
+    }
+
+    for (i, c) in text.char_indices() {
+        if utf16_index == range.start {
+            utf8_start = Some(i);
+        }
+        if utf16_index == range.end {
+            if let Some(start) = utf8_start {
+                return Some(start..i);
+            }
+        }
+        utf16_index += c.len_utf16();
+    }
+
+    if utf16_index == range.end {
+        if let Some(start) = utf8_start {
+            return Some(start..text.len());
+        }
+    }
+
+    None
 }

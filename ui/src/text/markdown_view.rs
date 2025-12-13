@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, AnyElement, App, Bounds, Element, ElementId, Entity, FocusHandle, FontStyle,
-    FontWeight, GlobalElementId, HighlightStyle, InspectorElementId, IntoElement, LayoutId,
-    ParentElement, Pixels, SharedString, StrikethroughStyle, StyleRefinement, Styled, StyledText,
-    TextRun, TextStyle, UnderlineStyle, Window,
+    FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels,
+    SharedString, StrikethroughStyle, StyleRefinement, Styled, StyledText, TextRun, TextStyle,
+    UnderlineStyle, Window,
 };
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ropey::Rope;
@@ -33,6 +33,8 @@ pub struct MarkdownView {
     source: SharedString,
     state: Entity<MarkdownViewState>,
     style: StyleRefinement,
+    highlight_range: Option<Range<usize>>,
+    highlight_color: Option<gpui::Hsla>,
 }
 
 /// Internal state for the markdown view
@@ -224,7 +226,19 @@ impl MarkdownView {
             source,
             state,
             style: StyleRefinement::default(),
+            highlight_range: None,
+            highlight_color: None,
         }
+    }
+
+    pub fn highlight_range(mut self, range: Option<Range<usize>>) -> Self {
+        self.highlight_range = range;
+        self
+    }
+
+    pub fn highlight_color(mut self, color: Option<gpui::Hsla>) -> Self {
+        self.highlight_color = color;
+        self
     }
 
     /// Build the element tree from parsed events
@@ -234,7 +248,8 @@ impl MarkdownView {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let mut builder = ElementBuilder::new(cx);
+        let mut builder =
+            ElementBuilder::new(cx, self.highlight_range.clone(), self.highlight_color);
 
         for (range, event) in parsed.events.iter() {
             match event {
@@ -298,22 +313,22 @@ impl MarkdownView {
                 },
                 MarkdownEvent::Text => {
                     let text = &parsed.source[range.clone()];
-                    builder.push_text(text);
+                    builder.push_text(text, range.clone());
                 }
                 MarkdownEvent::Code(code) => {
-                    builder.push_inline_code(code, cx);
+                    builder.push_inline_code(code, range.clone(), cx);
                 }
                 MarkdownEvent::SoftBreak => {
-                    builder.push_text(" ");
+                    builder.push_text(" ", range.clone());
                 }
                 MarkdownEvent::HardBreak => {
-                    builder.push_text("\n");
+                    builder.push_text("\n", range.clone());
                 }
                 MarkdownEvent::Rule => {
                     builder.push_rule(cx);
                 }
                 MarkdownEvent::TaskListMarker(checked) => {
-                    builder.push_task_marker(*checked);
+                    builder.push_task_marker(*checked, range.clone());
                 }
             }
         }
@@ -407,6 +422,7 @@ enum InlineStyle {
 struct TextSegment {
     text: String,
     styles: Vec<InlineStyle>,
+    range: Range<usize>,
 }
 
 /// Builder for constructing the element tree
@@ -431,6 +447,10 @@ struct ElementBuilder {
     code_block_text: String,
     /// Code block language
     code_block_lang: Option<SharedString>,
+    /// Optional range to highlight
+    highlight_range: Option<Range<usize>>,
+    /// Optional highlight color
+    highlight_color: Option<gpui::Hsla>,
 }
 
 enum BuilderContext {
@@ -440,7 +460,11 @@ enum BuilderContext {
 }
 
 impl ElementBuilder {
-    fn new(_cx: &App) -> Self {
+    fn new(
+        _cx: &App,
+        highlight_range: Option<Range<usize>>,
+        highlight_color: Option<gpui::Hsla>,
+    ) -> Self {
         Self {
             segments: Vec::new(),
             style_stack: Vec::new(),
@@ -451,27 +475,31 @@ impl ElementBuilder {
             in_code_block: false,
             code_block_text: String::new(),
             code_block_lang: None,
+            highlight_range,
+            highlight_color,
         }
     }
 
-    fn push_text(&mut self, text: &str) {
+    fn push_text(&mut self, text: &str, range: Range<usize>) {
         if self.in_code_block {
             self.code_block_text.push_str(text);
         } else {
             self.segments.push(TextSegment {
                 text: text.to_string(),
                 styles: self.style_stack.clone(),
+                range,
             });
         }
     }
 
-    fn push_inline_code(&mut self, text: &str, _cx: &App) {
+    fn push_inline_code(&mut self, text: &str, range: Range<usize>, _cx: &App) {
         // Add inline code as a segment with code style
         let mut styles = self.style_stack.clone();
         styles.push(InlineStyle::Code);
         self.segments.push(TextSegment {
             text: text.to_string(),
             styles,
+            range,
         });
     }
 
@@ -694,9 +722,9 @@ impl ElementBuilder {
         );
     }
 
-    fn push_task_marker(&mut self, checked: bool) {
+    fn push_task_marker(&mut self, checked: bool, range: Range<usize>) {
         let marker = if checked { "☑ " } else { "☐ " };
-        self.push_text(marker);
+        self.push_text(marker, range);
     }
 
     /// Convert accumulated segments into a single StyledText element
@@ -706,6 +734,7 @@ impl ElementBuilder {
         }
 
         let segments = std::mem::take(&mut self.segments);
+        let highlight_range = self.highlight_range.clone();
 
         // Build the full text
         let full_text: String = segments.iter().map(|s| s.text.as_str()).collect();
@@ -719,7 +748,9 @@ impl ElementBuilder {
             ..Default::default()
         };
         let mut runs: Vec<TextRun> = Vec::new();
-        let mut offset = 0;
+        let highlight_color = self
+            .highlight_color
+            .unwrap_or_else(|| cx.theme().accent.opacity(0.3));
 
         for segment in &segments {
             let len = segment.text.len();
@@ -760,8 +791,57 @@ impl ElementBuilder {
                 }
             }
 
+            // Highlighting logic
+            if let Some(ref h_range) = highlight_range {
+                // Check overlap between segment.range and h_range
+                let seg_start = segment.range.start;
+                let seg_end = segment.range.end;
+                let h_start = h_range.start;
+                let h_end = h_range.end;
+
+                let overlap_start = std::cmp::max(seg_start, h_start);
+                let overlap_end = std::cmp::min(seg_end, h_end);
+
+                if overlap_start < overlap_end {
+                    // Overlap exists
+                    // We need to map global start/end to local offsets 0..len based on segment.range
+                    // But wait, segment.range might be bigger than segment.text.len() if special chars?
+                    // Typically segments from push_text are direct substrings.
+                    // Except SoftBreak (" " vs newline).
+                    // Let's assume segment.text.len() matches segment.range.len().
+                    // If not (e.g. SoftBreak), we just assume full highlight if any overlap?
+
+                    let local_start = overlap_start.saturating_sub(seg_start);
+                    let local_end = overlap_end.saturating_sub(seg_start);
+
+                    // Clamp to text length just in case
+                    let local_start = std::cmp::min(local_start, len);
+                    let local_end = std::cmp::min(local_end, len);
+
+                    if local_start > 0 {
+                        // Pre-highlight
+                        runs.push(style.to_run(local_start));
+                    }
+
+                    // Highlight part
+                    let mut h_style = style.clone();
+                    h_style.background_color = Some(highlight_color);
+                    // Note: if Code style already set bg, this overrides it?
+                    // TextStyle has one bg.
+                    // If both, we might want to blend or prefer highlight.
+                    // Using highlight usually implies 'active'.
+                    runs.push(h_style.to_run(local_end - local_start));
+
+                    if local_end < len {
+                        // Post-highlight
+                        runs.push(style.to_run(len - local_end));
+                    }
+                    continue; // Done with this segment
+                }
+            }
+
+            // No highlight or no overlap
             runs.push(style.to_run(len));
-            offset += len;
         }
 
         let styled_text = StyledText::new(full_text).with_runs(runs);
