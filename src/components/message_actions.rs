@@ -23,6 +23,7 @@ pub struct MessageActions {
     is_paused: bool,
     is_loading: bool,
     is_cached: bool,
+    active_tts_source: Option<crate::actions::TtsSource>,
     #[allow(dead_code)]
     state: Option<WeakEntity<AppState>>,
 }
@@ -44,6 +45,7 @@ impl MessageActions {
             is_paused: false,
             is_loading: false,
             is_cached: false,
+            active_tts_source: None,
             state: None,
         }
     }
@@ -89,6 +91,11 @@ impl MessageActions {
 
     pub fn is_cached(mut self, is_cached: bool) -> Self {
         self.is_cached = is_cached;
+        self
+    }
+
+    pub fn active_tts_source(mut self, source: Option<crate::actions::TtsSource>) -> Self {
+        self.active_tts_source = source;
         self
     }
 
@@ -215,6 +222,23 @@ struct CopyState {
 
 impl RenderOnce for MessageActions {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (native_icon, native_tooltip) =
+            if self.active_tts_source == Some(crate::actions::TtsSource::Native) {
+                if self.is_speaking {
+                    if self.is_paused {
+                        (IconName::Play, "Resume (Native)")
+                    } else {
+                        (IconName::Pause, "Pause (Native)")
+                    }
+                } else if self.is_loading {
+                    (IconName::Loader, "Loading...")
+                } else {
+                    (IconName::ReadAloud, "Read aloud (Native)")
+                }
+            } else {
+                (IconName::ReadAloud, "Read aloud (Native)")
+            };
+
         h_flex()
             .gap_1()
             .items_center()
@@ -254,8 +278,8 @@ impl RenderOnce for MessageActions {
             ))
             .child(self.action_button(
                 &format!("native-tts-{}", self.message_id),
-                IconSource::Name(IconName::ReadAloud),
-                "Read aloud (Native)",
+                IconSource::Name(native_icon),
+                native_tooltip,
                 {
                     let on_read_aloud = self.on_read_aloud.clone();
                     let message_id = self.message_id.clone();

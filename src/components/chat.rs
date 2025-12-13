@@ -397,6 +397,14 @@ impl Render for ChatView {
 
                                         let is_cached = TtsService::is_cached(&msg.id);
 
+                                        // Only pass active_tts_source if this message is interacting
+                                        let active_tts_source =
+                                            if is_speaking || is_loading || is_paused {
+                                                state.active_tts_source.clone()
+                                            } else {
+                                                None
+                                            };
+
                                         MessageBubble::new(msg.content.clone())
                                             .message_id(msg.id.clone())
                                             .is_me(msg.is_me)
@@ -409,6 +417,7 @@ impl Render for ChatView {
                                             .is_paused(is_paused)
                                             .is_loading(is_loading)
                                             .is_cached(is_cached)
+                                            .active_tts_source(active_tts_source)
                                             .on_read_aloud({
                                                 let state = self.state.clone();
                                                 let message_id = msg.id.clone();

@@ -21,6 +21,7 @@ pub struct MessageBubble {
     is_paused: bool,
     is_loading: bool,
     is_cached: bool,
+    active_tts_source: Option<crate::actions::TtsSource>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
@@ -39,6 +40,7 @@ impl MessageBubble {
             is_paused: false,
             is_loading: false,
             is_cached: false,
+            active_tts_source: None,
             on_read_aloud: None,
         }
     }
@@ -103,6 +105,11 @@ impl MessageBubble {
 
     pub fn is_cached(mut self, is_cached: bool) -> Self {
         self.is_cached = is_cached;
+        self
+    }
+
+    pub fn active_tts_source(mut self, source: Option<crate::actions::TtsSource>) -> Self {
+        self.active_tts_source = source;
         self
     }
 }
@@ -227,6 +234,7 @@ impl RenderOnce for MessageBubble {
                                 .is_paused(self.is_paused)
                                 .is_loading(self.is_loading)
                                 .is_cached(self.is_cached)
+                                .active_tts_source(self.active_tts_source)
                                 .when_some(self.on_read_aloud, |this, cb| {
                                     this.on_read_aloud(move |w, cx| cb(w, cx))
                                 }),
