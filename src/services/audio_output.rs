@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -17,6 +17,12 @@ pub struct AudioController {
     buffer: Arc<Mutex<VecDeque<f32>>>,
     pub is_ai_speaking: Arc<AtomicBool>,
     is_paused: Arc<AtomicBool>,
+    /// Counter for samples actually played (at output sample rate)
+    pub samples_played: Arc<AtomicU64>,
+    /// Output sample rate (e.g., 48000)
+    pub output_sample_rate: u32,
+    /// Accumulator for precise resampling
+    resample_accumulator: Arc<Mutex<f32>>,
 }
 
 impl AudioController {
@@ -24,11 +30,16 @@ impl AudioController {
         buffer: Arc<Mutex<VecDeque<f32>>>,
         is_ai_speaking: Arc<AtomicBool>,
         is_paused: Arc<AtomicBool>,
+        samples_played: Arc<AtomicU64>,
+        output_sample_rate: u32,
     ) -> Self {
         Self {
             buffer,
             is_ai_speaking,
             is_paused,
+            samples_played,
+            output_sample_rate,
+            resample_accumulator: Arc::new(Mutex::new(0.0)),
         }
     }
 
@@ -36,10 +47,36 @@ impl AudioController {
         let mut buf = self.buffer.lock().unwrap();
         match cmd {
             AudioCommand::Samples(samples) => {
-                // Simple 2x upsampling (24k -> 48k)
-                for &s in &samples {
-                    buf.push_back(s);
-                    buf.push_back(s);
+                // Precise Resampling: Use accumulator to preserve exact duration
+                // This handles non-integer ratios (e.g. 24k -> 44.1k) without drift
+                let input_rate = 24000.0f32;
+                let output_rate = self.output_sample_rate as f32;
+
+                if output_rate >= input_rate {
+                    // Upsample or equal rate
+                    // If rates match exactly, fast path
+                    if (output_rate - input_rate).abs() < 0.1 {
+                        buf.extend(samples);
+                    } else {
+                        let ratio = output_rate / input_rate;
+                        let mut acc_guard = self.resample_accumulator.lock().unwrap();
+
+                        for &s in &samples {
+                            *acc_guard += ratio;
+                            while *acc_guard >= 1.0 {
+                                buf.push_back(s);
+                                *acc_guard -= 1.0;
+                            }
+                        }
+                    }
+                } else {
+                    // Downsample: skip samples (shouldn't happen normally)
+                    let ratio = input_rate / output_rate;
+                    for (i, &s) in samples.iter().enumerate() {
+                        if (i as f32 % ratio) < 1.0 {
+                            buf.push_back(s);
+                        }
+                    }
                 }
                 // Signal that we have data
                 self.is_ai_speaking.store(true, Ordering::Relaxed);
@@ -48,6 +85,8 @@ impl AudioController {
                 buf.clear();
                 self.is_ai_speaking.store(false, Ordering::Relaxed);
                 self.is_paused.store(false, Ordering::Relaxed);
+                // Reset samples played counter
+                self.samples_played.store(0, Ordering::Relaxed);
             }
             AudioCommand::Pause => {
                 self.is_paused.store(true, Ordering::Relaxed);
@@ -56,6 +95,12 @@ impl AudioController {
                 self.is_paused.store(false, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Get playback position in seconds
+    pub fn get_playback_position(&self) -> f32 {
+        let samples = self.samples_played.load(Ordering::Relaxed);
+        samples as f32 / self.output_sample_rate as f32
     }
 }
 
@@ -70,15 +115,27 @@ impl AudioOutput {
         let host = cpal::default_host();
         let device = host.default_output_device().context("No output device")?;
         let config = device.default_output_config()?;
-        let _sample_rate = config.sample_rate().0;
+        let output_sample_rate = config.sample_rate().0;
         let channels = config.channels() as usize;
+
+        println!(
+            "[AudioOutput] Device sample rate: {}Hz, channels: {}",
+            output_sample_rate, channels
+        );
 
         let buffer = Arc::new(Mutex::new(VecDeque::new()));
         let is_paused = Arc::new(AtomicBool::new(false));
         let completion_notify = Arc::new(Notify::new());
 
-        let controller =
-            AudioController::new(buffer.clone(), is_ai_speaking.clone(), is_paused.clone());
+        let samples_played = Arc::new(AtomicU64::new(0));
+
+        let controller = AudioController::new(
+            buffer.clone(),
+            is_ai_speaking.clone(),
+            is_paused.clone(),
+            samples_played.clone(),
+            output_sample_rate,
+        );
 
         let buffer_clone = buffer.clone();
         let is_paused_clone = is_paused.clone();
@@ -113,16 +170,22 @@ impl AudioOutput {
                     return;
                 }
 
+                let mut samples_in_this_callback = 0usize;
                 for frame in data.chunks_mut(channels) {
                     if let Some(sample) = buf.pop_front() {
                         for sample_out in frame.iter_mut() {
                             *sample_out = sample;
                         }
+                        samples_in_this_callback += 1;
                     } else {
                         for sample_out in frame.iter_mut() {
                             *sample_out = 0.0;
                         }
                     }
+                }
+                // Track how many samples we actually played
+                if samples_in_this_callback > 0 {
+                    samples_played.fetch_add(samples_in_this_callback as u64, Ordering::Relaxed);
                 }
 
                 // Calculate RMS for Visualizer

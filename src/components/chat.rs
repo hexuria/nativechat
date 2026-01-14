@@ -396,10 +396,17 @@ impl Render for ChatView {
                                             (false, None)
                                         };
 
-                                        let highlight_range = if is_speaking {
+                                        // Determine highlight range based on which TTS source is active
+                                        // Native TTS: uses original text with UTF-16 callbacks from macOS
+                                        // REST/AI TTS: uses stripped text with UTF-8 byte offsets
+                                        let highlight_range = if is_native_speaking {
+                                            // Native TTS uses original text - macOS callback provides UTF-16 range
                                             state.active_highlight_range().and_then(|range| {
                                                 map_utf16_range_to_utf8(&msg.content, range)
                                             })
+                                        } else if is_ai_speaking {
+                                            // REST TTS simulation uses UTF-8 byte offsets on stripped text
+                                            state.active_highlight_range()
                                         } else {
                                             None
                                         };

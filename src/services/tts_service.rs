@@ -1,11 +1,12 @@
 use crate::services::audio_output::{AudioCommand, AudioOutput};
+use crate::services::audio_transcription::{AudioTranscriptionService, WordTiming};
 use crate::services::live_tts_provider::LiveTtsProvider;
 use crate::services::macos_tts_bridge::{MacTtsBridge, TtsEvent};
 use crate::services::rest_tts_provider::RestTtsProvider;
 use crate::services::tts_provider::TtsProvider;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -33,6 +34,13 @@ pub struct TtsService {
     last_word_index: Arc<AtomicUsize>,
     last_word_length: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
+
+    /// Transcription service for getting word timestamps
+    transcription_service: Arc<AudioTranscriptionService>,
+    /// Current word timings (from transcription) - None means use simulation fallback
+    word_timings: Arc<RwLock<Option<Vec<WordTiming>>>>,
+    /// Playback start time for timestamp-based highlighting
+    playback_start_time: Arc<RwLock<Option<std::time::Instant>>>,
 }
 
 impl TtsService {
@@ -86,11 +94,63 @@ impl TtsService {
             last_word_index,
             last_word_length,
             generation,
+            transcription_service: Arc::new(AudioTranscriptionService::new()),
+            word_timings: Arc::new(RwLock::new(None)),
+            playback_start_time: Arc::new(RwLock::new(None)),
         })
     }
 
-    /// Check if a model should use the Live API (streaming WebSocket)
+    /// Get the active word range for highlighting
+    /// Uses timestamp-based highlighting when word timings are available,
+    /// falls back to simulation-based when not
     pub fn get_active_word_range(&self) -> Option<std::ops::Range<usize>> {
+        // First, try timestamp-based highlighting
+        if let Ok(timings_guard) = self.word_timings.read() {
+            if let Some(ref timings) = *timings_guard {
+                if let Ok(start_guard) = self.playback_start_time.read() {
+                    if let Some(start_time) = *start_guard {
+                        // Account for pause time
+                        if self.ai_paused.load(Ordering::SeqCst) {
+                            // While paused, keep the last word highlighted
+                            let start = self.last_word_index.load(Ordering::SeqCst);
+                            let len = self.last_word_length.load(Ordering::SeqCst);
+                            if len > 0 {
+                                return Some(start..start + len);
+                            }
+                        }
+
+                        // Signal-Driven Timing: Use actual audio samples played for precision
+                        // This eliminates drift between wall clock and audio clock
+                        // Subtract 120ms to compensate for output buffer and hardware latency
+                        let elapsed =
+                            (self.audio_output.controller.get_playback_position() - 0.12).max(0.0);
+
+                        // Find the word that should be highlighted at this time
+                        for timing in timings.iter() {
+                            if elapsed >= timing.start_time && elapsed < timing.end_time {
+                                // Update the atomic values for compatibility
+                                self.last_word_index
+                                    .store(timing.source_range.start, Ordering::SeqCst);
+                                self.last_word_length
+                                    .store(timing.source_range.len(), Ordering::SeqCst);
+                                return Some(timing.source_range.clone());
+                            }
+                        }
+
+                        // Past all words - return None (finished)
+                        if !timings.is_empty() {
+                            let last = timings.last().unwrap();
+                            if elapsed >= last.end_time {
+                                self.last_word_length.store(0, Ordering::SeqCst);
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to simulation-based highlighting
         let start = self.last_word_index.load(Ordering::SeqCst);
         let len = self.last_word_length.load(Ordering::SeqCst);
         if len > 0 {
@@ -157,7 +217,8 @@ impl TtsService {
             self.native_paused.store(false, Ordering::SeqCst);
             self.last_word_index.store(0, Ordering::SeqCst);
 
-            // Speak immediately
+            // Speak immediately - use original text, not stripped
+            // macOS provides UTF-16 word ranges into this text
             bridge.speak(text);
             return true;
         }
@@ -215,6 +276,14 @@ impl TtsService {
         self.last_word_index.store(0, Ordering::SeqCst);
         self.last_word_length.store(0, Ordering::SeqCst);
 
+        // Clear previous word timings and playback timing
+        if let Ok(mut guard) = self.word_timings.write() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.playback_start_time.write() {
+            *guard = None;
+        }
+
         // Reset audio output state to clear any previous stuck signals or data
         self.audio_output.process_command(AudioCommand::Stop);
 
@@ -238,16 +307,99 @@ impl TtsService {
                         let duration_secs = samples.len() as f32 / 24000.0;
                         let duration = Some(Duration::from_secs_f32(duration_secs));
 
+                        // Try to load cached word timings
+                        let timings_path = path.with_extension("timings.json");
+                        let mut timings_loaded = false;
+
+                        if timings_path.exists() {
+                            if let Ok(timings_bytes) = std::fs::read(&timings_path) {
+                                if let Ok(timings) =
+                                    serde_json::from_slice::<Vec<WordTiming>>(&timings_bytes)
+                                {
+                                    println!(
+                                        "[TTS Service] Loaded {} cached word timings",
+                                        timings.len()
+                                    );
+                                    // Store timings and set playback start time
+                                    if let Ok(mut guard) = self.word_timings.write() {
+                                        *guard = Some(timings);
+                                    }
+                                    if let Ok(mut guard) = self.playback_start_time.write() {
+                                        *guard = Some(std::time::Instant::now());
+                                    }
+                                    timings_loaded = true;
+                                }
+                            }
+                        } else {
+                            println!(
+                                "[TTS Service] No cached timings found, will transcribe in background"
+                            );
+                            // Spawn background task to transcribe the audio
+                            let transcription_service = self.transcription_service.clone();
+                            let samples_for_transcription = samples.clone();
+                            let text_for_transcription = text.to_string();
+                            let api_key_owned = api_key.to_string();
+                            let timings_path_owned = timings_path.clone();
+                            let word_timings_ref = self.word_timings.clone();
+                            let playback_start_time_ref = self.playback_start_time.clone();
+
+                            tokio::spawn(async move {
+                                println!("[TTS Service] Starting background transcription...");
+                                match transcription_service
+                                    .transcribe_with_timestamps(
+                                        &samples_for_transcription,
+                                        &text_for_transcription,
+                                        &api_key_owned,
+                                    )
+                                    .await
+                                {
+                                    Ok(timings) => {
+                                        if !timings.is_empty() {
+                                            println!(
+                                                "[TTS Service] Got {} word timings from transcription",
+                                                timings.len()
+                                            );
+                                            // Save to cache
+                                            if let Ok(json) = serde_json::to_vec(&timings) {
+                                                let _ = std::fs::write(&timings_path_owned, json);
+                                            }
+                                            // Update live timings (in case playback is still happening)
+                                            if let Ok(mut guard) = word_timings_ref.write() {
+                                                *guard = Some(timings);
+                                            }
+                                            if let Ok(mut guard) = playback_start_time_ref.write() {
+                                                // Reset playback start time since we now have accurate timings
+                                                // Note: This might cause a slight jump, but subsequent plays will be accurate
+                                                *guard = Some(std::time::Instant::now());
+                                            }
+                                        } else {
+                                            println!(
+                                                "[TTS Service] Transcription returned no timings"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[TTS Service] Background transcription failed: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            });
+                        }
+
                         self.audio_output
                             .process_command(AudioCommand::Samples(samples.clone()));
 
-                        // Spawn simulation for cached playback
-                        self.spawn_simulation_task(
-                            text.to_string(),
-                            current_gen,
-                            duration,
-                            Some(samples),
-                        );
+                        // Spawn simulation as fallback only if no timings loaded
+                        if !timings_loaded {
+                            self.spawn_simulation_task(
+                                text.to_string(),
+                                current_gen,
+                                duration,
+                                Some(samples),
+                            );
+                        }
 
                         return Ok(true);
                     }
@@ -299,6 +451,10 @@ impl TtsService {
         self.spawn_simulation_task(text.to_string(), current_gen, None, None);
 
         let message_id_owned = message_id.to_string();
+        let text_owned = text.to_string();
+        let api_key_owned = api_key.to_string();
+        let transcription_service = self.transcription_service.clone();
+
         tokio::spawn(async move {
             let mut all_samples = first_samples;
             let mut was_cancelled = false;
@@ -343,13 +499,37 @@ impl TtsService {
 
                 // Convert back to i16 PCM bytes for storage
                 let mut bytes = Vec::with_capacity(all_samples.len() * 2);
-                for sample in all_samples {
-                    let s = (sample * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                for sample in &all_samples {
+                    let s = (*sample * 32768.0).clamp(-32768.0, 32767.0) as i16;
                     bytes.extend_from_slice(&s.to_le_bytes());
                 }
 
-                if let Some(path) = Self::get_cache_path(&message_id_owned) {
-                    let _ = std::fs::write(path, &bytes);
+                if let Some(path) = TtsService::get_cache_path(&message_id_owned) {
+                    let _ = std::fs::write(&path, &bytes);
+
+                    // Transcribe audio to get word timings for future playback
+                    println!("[TTS Service] Transcribing audio for word timestamps...");
+                    match transcription_service
+                        .transcribe_with_timestamps(&all_samples, &text_owned, &api_key_owned)
+                        .await
+                    {
+                        Ok(timings) => {
+                            if !timings.is_empty() {
+                                println!(
+                                    "[TTS Service] Got {} word timings, caching...",
+                                    timings.len()
+                                );
+                                let timings_path = path.with_extension("timings.json");
+                                if let Ok(json) = serde_json::to_vec(&timings) {
+                                    let _ = std::fs::write(timings_path, json);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[TTS Service] Transcription failed: {}", e);
+                            // Continue without timings - simulation will still work
+                        }
+                    }
                 }
             }
         });
@@ -375,6 +555,15 @@ impl TtsService {
     pub fn stop(&self) -> Result<()> {
         self.cancelled.store(true, Ordering::SeqCst);
         self.audio_output.process_command(AudioCommand::Stop);
+
+        // Clear word timings when stopping
+        if let Ok(mut guard) = self.word_timings.write() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.playback_start_time.write() {
+            *guard = None;
+        }
+
         Ok(())
     }
 
@@ -398,6 +587,9 @@ impl TtsService {
         false
     }
 
+    /// Spawn task that updates word highlighting based on proportional word timing.
+    /// Uses the actual audio duration and distributes it proportionally across words
+    /// based on weighted length (longer words + punctuation take more time).
     fn spawn_simulation_task(
         &self,
         text: String,
@@ -405,84 +597,143 @@ impl TtsService {
         duration: Option<Duration>,
         samples: Option<Vec<f32>>,
     ) {
-        let sim_text = text;
         let sim_last_word_index = self.last_word_index.clone();
         let sim_last_word_length = self.last_word_length.clone();
         let sim_cancelled = self.cancelled.clone();
         let sim_generation = self.generation.clone();
-        let sim_paused = self.ai_paused.clone();
+        
+        // Use audio controller for precise timing
+        let samples_played = self.audio_output.controller.samples_played.clone();
+        let sample_rate = self.audio_output.controller.output_sample_rate;
 
         tokio::spawn(async move {
-            let sim_len = sim_text.len();
-            let mut chars_per_sec = 15.0; // Fallback
-            let mut active_chars_per_sec = 15.0;
+            // Calculate audio duration
+            let audio_duration = if let Some(ref s) = samples {
+                s.len() as f32 / 24000.0
+            } else if let Some(d) = duration {
+                d.as_secs_f32()
+            } else {
+                // Fallback: estimate based on CLEAN text length
+                // Use a heuristic that ignores markdown syntax for better accuracy
+                let clean_len = text.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).count();
+                clean_len as f32 / 15.0
+            };
 
-            // Heuristic fallback variables
-            let mut pause_time_per_comma = 0.2;
-            let mut pause_time_per_period = 0.5;
-
-            // Energy-Based Timing (if samples available)
-            let mut use_energy_timing = false;
-            let mut window_size_samples = 2400; // 100ms at 24kHz
-            let mut silent_threshold = 0.01; // RMS threshold
-
-            // Pre-calculate energy profile if samples exist
-            let mut energy_profile = Vec::new();
-
-            if let Some(audio_samples) = samples {
-                use_energy_timing = true;
-                // Calculate total active time (time where RMS > threshold)
-                let mut active_window_count = 0;
-
-                for chunk in audio_samples.chunks(window_size_samples) {
-                    let mut sum_sq = 0.0;
-                    for &s in chunk {
-                        sum_sq += s * s;
-                    }
-                    let rms = (sum_sq / chunk.len() as f32).sqrt();
-                    let is_active = rms > silent_threshold;
-                    energy_profile.push(is_active);
-                    if is_active {
-                        active_window_count += 1;
-                    }
-                }
-
-                let active_time =
-                    (active_window_count as f32 * window_size_samples as f32) / 24000.0;
-                let active_time = active_time.max(0.1);
-
-                active_chars_per_sec = sim_len as f32 / active_time;
-
-                println!(
-                    "[TTS Service] Energy Timing: Active for {:.2}s. Speed: {:.2} cps (during speech)",
-                    active_time, active_chars_per_sec
-                );
-            } else if let Some(dur) = duration {
-                // FALLBACK: Punctuation-based "Smart Timing"
-                if dur.as_secs_f32() > 0.0 {
-                    let commas = sim_text.chars().filter(|&c| c == ',' || c == ';').count();
-                    let periods = sim_text
-                        .chars()
-                        .filter(|&c| c == '.' || c == '!' || c == '?')
-                        .count();
-
-                    let estimated_pause_time = (commas as f32 * pause_time_per_comma)
-                        + (periods as f32 * pause_time_per_period);
-                    let effective_speech_time = (dur.as_secs_f32() - estimated_pause_time).max(0.1);
-
-                    chars_per_sec = sim_len as f32 / effective_speech_time;
-                    active_chars_per_sec = chars_per_sec;
-                }
+            // Parse words from text and calculate their byte positions
+            #[derive(Clone)]
+            struct WordInfo {
+                start_byte: usize,
+                end_byte: usize,
+                weight: f32,
             }
 
-            let tick_rate = 50; // 50ms ticks
-            let mut current_char_index = 0.0;
-            let mut pause_remaining = 0.0;
-            let mut last_processed_idx = 0usize;
-            let mut elapsed_ms = 0u64;
+            let mut words: Vec<WordInfo> = Vec::new();
+            let mut in_word = false;
+            let mut word_start = 0;
 
-            // Initial delay
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            for (i, c) in text.char_indices() {
+                if c.is_whitespace() {
+                    if in_word {
+                        // End of word
+                        let word_text = &text[word_start..i];
+                        
+                        // Calculate weight based on SPOKEN content (alphanumeric)
+                        // This ignores Markdown symbols like ** or [] which aren't spoken
+                        let clean_chars = word_text.chars().filter(|c| c.is_alphanumeric()).count();
+                        let mut weight = clean_chars as f32;
+                        
+                        // Fallback for symbols that might be spoken or just empty
+                        if weight == 0.0 && !word_text.is_empty() {
+                            weight = 0.5; 
+                        }
+
+                        // Add weight for punctuation (pauses)
+                        if word_text.contains(',') || word_text.contains(';') {
+                            weight += 3.0;
+                        }
+                        if word_text.contains('.')
+                            || word_text.contains('!')
+                            || word_text.contains('?')
+                        {
+                            weight += 5.0; // Slightly longer pause for sentences
+                        }
+                        // Longer words are spoken slower
+                        if clean_chars > 7 {
+                            weight += 2.0;
+                        }
+
+                        words.push(WordInfo {
+                            start_byte: word_start,
+                            end_byte: i,
+                            weight,
+                        });
+                        in_word = false;
+                    }
+                } else {
+                    if !in_word {
+                        word_start = i;
+                        in_word = true;
+                    }
+                }
+            }
+            // Handle last word
+            if in_word {
+                let word_text = &text[word_start..];
+                let clean_chars = word_text.chars().filter(|c| c.is_alphanumeric()).count();
+                let mut weight = clean_chars as f32;
+                
+                if weight == 0.0 && !word_text.is_empty() {
+                     weight = 0.5;
+                }
+
+                if word_text.contains(',') || word_text.contains(';') {
+                    weight += 3.0;
+                }
+                if word_text.contains('.') || word_text.contains('!') || word_text.contains('?') {
+                    weight += 5.0;
+                }
+                if clean_chars > 7 {
+                    weight += 2.0;
+                }
+                words.push(WordInfo {
+                    start_byte: word_start,
+                    end_byte: text.len(),
+                    weight,
+                });
+            }
+
+            if words.is_empty() {
+                return;
+            }
+
+            // Calculate total weight and time per unit
+            let total_weight: f32 = words.iter().map(|w| w.weight).sum();
+            let time_per_unit = audio_duration / total_weight.max(1.0);
+
+            // Calculate start and end times for each word
+            let mut word_timings: Vec<(f32, f32, usize, usize)> = Vec::new(); // (start_time, end_time, start_byte, end_byte)
+            let mut cumulative_time = 0.0;
+
+            for word in &words {
+                let word_duration = word.weight * time_per_unit;
+                word_timings.push((
+                    cumulative_time,
+                    cumulative_time + word_duration,
+                    word.start_byte,
+                    word.end_byte,
+                ));
+                cumulative_time += word_duration;
+            }
+
+            println!(
+                "[TTS Simulation] {} words, {:.2}s duration, {:.3}s per weight unit",
+                words.len(),
+                audio_duration,
+                time_per_unit
+            );
+
+            // Now run the timing loop
+            let tick_rate = 30; // 30ms for smoother updates
 
             loop {
                 if sim_cancelled.load(Ordering::SeqCst)
@@ -491,83 +742,37 @@ impl TtsService {
                     break;
                 }
 
-                if sim_paused.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(tick_rate)).await;
-                    continue;
-                }
+                // Use actual playback position from audio controller
+                // This handles pauses, buffering, and hardware latency automatically
+                // Subtract a small offset (e.g. 100ms) to sync better with output buffer
+                let playback_samples = samples_played.load(Ordering::Relaxed);
+                let elapsed = (playback_samples as f32 / sample_rate as f32 - 0.1).max(0.0);
 
-                // --- Energy check ---
-                if use_energy_timing {
-                    // Map elapsed time to window index
-                    // 100ms windows = 2400 samples @ 24kHz
-                    // tick_rate = 50ms.
-                    let current_window_idx =
-                        (elapsed_ms as usize * 24000 / 1000) / window_size_samples;
-
-                    if current_window_idx < energy_profile.len() {
-                        if !energy_profile[current_window_idx] {
-                            // SILENCE: Do not advance index
-                            tokio::time::sleep(Duration::from_millis(tick_rate)).await;
-                            elapsed_ms += tick_rate;
-                            continue;
-                        }
+                // Find the current word based on elapsed time
+                let mut found_word = false;
+                for (word_start, word_end, start_byte, end_byte) in &word_timings {
+                    if elapsed >= *word_start && elapsed < *word_end {
+                        sim_last_word_index.store(*start_byte, Ordering::SeqCst);
+                        sim_last_word_length.store(end_byte - start_byte, Ordering::SeqCst);
+                        found_word = true;
+                        break;
                     }
                 }
-                // --------------------
+
+                // Past all words - finished
+                if !found_word && elapsed >= cumulative_time {
+                    // Only finish if we've actually played enough audio
+                    if elapsed > 0.0 {
+                        sim_last_word_length.store(0, Ordering::SeqCst);
+                        break;
+                    }
+                }
 
                 tokio::time::sleep(Duration::from_millis(tick_rate)).await;
-                elapsed_ms += tick_rate;
-
-                if !use_energy_timing && pause_remaining > 0.0 {
-                    pause_remaining -= tick_rate as f32 / 1000.0;
-                    continue;
-                }
-
-                // Update index
-                let step = active_chars_per_sec * (tick_rate as f32 / 1000.0);
-                current_char_index += step;
-
-                let idx = current_char_index as usize;
-
-                if idx >= sim_len {
-                    sim_last_word_index.store(sim_len, Ordering::SeqCst);
-                    sim_last_word_length.store(0, Ordering::SeqCst);
-                    break;
-                }
-
-                // Punctuation check (ONLY if not using energy timing)
-                if !use_energy_timing && idx > last_processed_idx {
-                    for i in last_processed_idx..idx {
-                        if i < sim_len {
-                            let c = sim_text.as_bytes()[i] as char;
-                            if c == ',' || c == ';' {
-                                pause_remaining = pause_time_per_comma;
-                            } else if c == '.' || c == '!' || c == '?' {
-                                pause_remaining = pause_time_per_period;
-                            }
-                        }
-                    }
-                    last_processed_idx = idx;
-                }
-
-                // Snap to word boundaries
-                let start_idx = sim_text[..idx]
-                    .rfind(char::is_whitespace)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-
-                let end_offset = sim_text[idx..]
-                    .find(char::is_whitespace)
-                    .unwrap_or(sim_len - idx);
-                let end_idx = idx + end_offset;
-
-                let word_len = end_idx - start_idx;
-
-                if word_len > 0 {
-                    sim_last_word_index.store(start_idx, Ordering::SeqCst);
-                    sim_last_word_length.store(word_len, Ordering::SeqCst);
-                }
             }
+
+            // Clear highlighting when done
+            sim_last_word_length.store(0, Ordering::SeqCst);
         });
     }
 }

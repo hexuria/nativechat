@@ -117,6 +117,40 @@ impl MarkdownViewState {
     }
 }
 
+/// Strip markdown syntax and return plain text content.
+/// This extracts only the text, preserving spaces but removing markdown formatting.
+/// Useful for TTS simulation which needs to match what the TTS API actually speaks.
+pub fn strip_markdown(source: &str) -> String {
+    let parser = Parser::new_ext(source, PARSE_OPTIONS);
+    let mut result = String::new();
+
+    for event in parser {
+        match event {
+            Event::Text(text) => {
+                result.push_str(&text);
+            }
+            Event::Code(code) => {
+                result.push_str(&code);
+            }
+            Event::SoftBreak => {
+                result.push(' ');
+            }
+            Event::HardBreak => {
+                result.push('\n');
+            }
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {
+                // Add newline between paragraphs if not at start
+                if !result.is_empty() && !result.ends_with('\n') {
+                    result.push('\n');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    result
+}
+
 /// Parse markdown source into events
 fn parse_markdown(source: &str) -> ParsedMarkdown {
     let mut events = Vec::new();
@@ -422,7 +456,8 @@ enum InlineStyle {
 struct TextSegment {
     text: String,
     styles: Vec<InlineStyle>,
-    range: Range<usize>,
+    /// Source range in the original markdown text (for Native TTS highlighting)
+    source_range: Range<usize>,
 }
 
 /// Builder for constructing the element tree
@@ -447,7 +482,7 @@ struct ElementBuilder {
     code_block_text: String,
     /// Code block language
     code_block_lang: Option<SharedString>,
-    /// Optional range to highlight
+    /// Optional range to highlight (in source text coordinates)
     highlight_range: Option<Range<usize>>,
     /// Optional highlight color
     highlight_color: Option<gpui::Hsla>,
@@ -487,7 +522,7 @@ impl ElementBuilder {
             self.segments.push(TextSegment {
                 text: text.to_string(),
                 styles: self.style_stack.clone(),
-                range,
+                source_range: range,
             });
         }
     }
@@ -499,7 +534,7 @@ impl ElementBuilder {
         self.segments.push(TextSegment {
             text: text.to_string(),
             styles,
-            range,
+            source_range: range,
         });
     }
 
@@ -791,11 +826,12 @@ impl ElementBuilder {
                 }
             }
 
-            // Highlighting logic
+            // Highlighting logic - use source range for TTS highlighting
+            // Native TTS uses source positions from macOS callback
             if let Some(ref h_range) = highlight_range {
-                // Check overlap between segment.range and h_range
-                let seg_start = segment.range.start;
-                let seg_end = segment.range.end;
+                // Check overlap between segment's source position and the highlight range
+                let seg_start = segment.source_range.start;
+                let seg_end = segment.source_range.end;
                 let h_start = h_range.start;
                 let h_end = h_range.end;
 
@@ -803,40 +839,33 @@ impl ElementBuilder {
                 let overlap_end = std::cmp::min(seg_end, h_end);
 
                 if overlap_start < overlap_end {
-                    // Overlap exists
-                    // We need to map global start/end to local offsets 0..len based on segment.range
-                    // But wait, segment.range might be bigger than segment.text.len() if special chars?
-                    // Typically segments from push_text are direct substrings.
-                    // Except SoftBreak (" " vs newline).
-                    // Let's assume segment.text.len() matches segment.range.len().
-                    // If not (e.g. SoftBreak), we just assume full highlight if any overlap?
+                    // Overlap exists - calculate local offsets within this segment's text
+                    // Map from source position to text position proportionally
+                    let source_len = seg_end - seg_start;
+                    if source_len > 0 && len > 0 {
+                        let local_start = ((overlap_start - seg_start) * len) / source_len;
+                        let local_end = ((overlap_end - seg_start) * len) / source_len;
 
-                    let local_start = overlap_start.saturating_sub(seg_start);
-                    let local_end = overlap_end.saturating_sub(seg_start);
+                        // Clamp to text length
+                        let local_start = std::cmp::min(local_start, len);
+                        let local_end = std::cmp::min(local_end, len);
 
-                    // Clamp to text length just in case
-                    let local_start = std::cmp::min(local_start, len);
-                    let local_end = std::cmp::min(local_end, len);
+                        if local_start > 0 {
+                            // Pre-highlight
+                            runs.push(style.to_run(local_start));
+                        }
 
-                    if local_start > 0 {
-                        // Pre-highlight
-                        runs.push(style.to_run(local_start));
+                        // Highlight part
+                        let mut h_style = style.clone();
+                        h_style.background_color = Some(highlight_color);
+                        runs.push(h_style.to_run(local_end - local_start));
+
+                        if local_end < len {
+                            // Post-highlight
+                            runs.push(style.to_run(len - local_end));
+                        }
+                        continue; // Done with this segment
                     }
-
-                    // Highlight part
-                    let mut h_style = style.clone();
-                    h_style.background_color = Some(highlight_color);
-                    // Note: if Code style already set bg, this overrides it?
-                    // TextStyle has one bg.
-                    // If both, we might want to blend or prefer highlight.
-                    // Using highlight usually implies 'active'.
-                    runs.push(h_style.to_run(local_end - local_start));
-
-                    if local_end < len {
-                        // Post-highlight
-                        runs.push(style.to_run(len - local_end));
-                    }
-                    continue; // Done with this segment
                 }
             }
 

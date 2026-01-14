@@ -1,4 +1,5 @@
 pub mod audio_output;
+pub mod audio_transcription;
 pub mod database;
 pub mod gemini_client;
 pub mod live_tts_provider;
