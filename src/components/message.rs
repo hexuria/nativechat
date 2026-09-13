@@ -31,7 +31,6 @@ pub struct MessageBubble {
     is_ai_paused: bool,
     is_ai_loading: bool,
     is_cached: bool,
-    #[allow(dead_code)]
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_color: Option<Hsla>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
@@ -194,6 +193,12 @@ impl RenderOnce for MessageBubble {
                 .border_color(cx.theme().border)
                 .child(self.text.clone())
                 .into_any_element()
+        } else if self.highlight_range.is_some() {
+            highlighted_text(
+                &self.text,
+                self.highlight_range.as_ref(),
+                self.highlight_color,
+            )
         } else if self.is_me || !self.use_markdown {
             div()
                 .id(ElementId::Name(
@@ -264,4 +269,45 @@ impl RenderOnce for MessageBubble {
                     }),
             )
     }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn highlighted_text(
+    text: &str,
+    range: Option<&std::ops::Range<usize>>,
+    color: Option<Hsla>,
+) -> AnyElement {
+    let Some(range) = range else {
+        return div().text_sm().child(text.to_string()).into_any_element();
+    };
+    let start = floor_char_boundary(text, range.start.min(text.len()));
+    let end = floor_char_boundary(text, range.end.min(text.len())).max(start);
+    let hl = color.unwrap_or_else(|| gpui_kit::yellow().opacity(0.4));
+    let body = if start < end {
+        StyledText::new(SharedString::from(text.to_string())).with_highlights([(
+            start..end,
+            HighlightStyle {
+                background_color: Some(hl),
+                ..Default::default()
+            },
+        )])
+        .into_any_element()
+    } else {
+        text.to_string().into_any_element()
+    };
+    div()
+        .text_sm()
+        .w_full()
+        .min_w_0()
+        .child(body)
+        .into_any_element()
 }

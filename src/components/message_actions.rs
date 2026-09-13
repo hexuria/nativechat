@@ -1,7 +1,4 @@
-use crate::{
-    actions::{BranchInNewChat, ReportMessage, ToggleReadAloud},
-    state::AppState,
-};
+use crate::actions::{BranchInNewChat, ReportMessage, ToggleReadAloud};
 use crate::icons::NativeIcon;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, Size,
@@ -31,8 +28,6 @@ pub struct MessageActions {
     is_ai_loading: bool,
 
     is_cached: bool,
-    #[allow(dead_code)]
-    state: Option<WeakEntity<AppState>>,
 }
 
 enum IconSource {
@@ -55,7 +50,6 @@ impl MessageActions {
             is_ai_paused: false,
             is_ai_loading: false,
             is_cached: false,
-            state: None,
         }
     }
 
@@ -292,12 +286,7 @@ impl RenderOnce for MessageActions {
                 native_tooltip,
                 {
                     let on_read_aloud = self.on_read_aloud.clone();
-                    let message_id = self.message_id.clone();
                     move |_, window, cx| {
-                        println!(
-                            "[MessageActions] Native TTS Button Clicked for message: {}",
-                            message_id
-                        );
                         if let Some(callback) = on_read_aloud.as_ref() {
                             callback(window, cx);
                         }

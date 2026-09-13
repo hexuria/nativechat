@@ -7,15 +7,6 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use std::sync::OnceLock;
-use tokio::runtime::Runtime;
-
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn get_runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime for LiveTTS"))
-}
-
 #[derive(Clone)]
 pub struct LiveTtsProvider;
 
@@ -56,19 +47,16 @@ impl TtsProvider for LiveTtsProvider {
 
         // Spawn the entire WebSocket connection in a separate runtime task
         // This mirrors how GeminiClient works and avoids blocking
-        get_runtime().spawn(async move {
-            println!("[LiveTTS] Connecting to WebSocket...");
+        tokio::spawn(async move {
             let ws_stream = match connect_async(&url).await {
                 Ok((s, _)) => s,
                 Err(e) => {
-                    eprintln!("[LiveTTS] Connection failed: {}", e);
                     let _ = tx
                         .send(Err(anyhow::anyhow!("Connection failed: {}", e)))
                         .await;
                     return;
                 }
             };
-            println!("[LiveTTS] WebSocket connected!");
 
             let (mut write, mut read) = ws_stream.split();
 
@@ -90,12 +78,10 @@ impl TtsProvider for LiveTtsProvider {
                     }
                 }
             });
-            println!("[LiveTTS] Sending Setup...");
             if let Err(e) = write
                 .send(Message::Text(setup_msg.to_string().into()))
                 .await
             {
-                eprintln!("[LiveTTS] Failed to send setup: {}", e);
                 let _ = tx
                     .send(Err(anyhow::anyhow!("Failed to send setup: {}", e)))
                     .await;
@@ -103,15 +89,12 @@ impl TtsProvider for LiveTtsProvider {
             }
 
             // 2. Wait for Setup Complete
-            println!("[LiveTTS] Waiting for Setup Complete...");
             let mut setup_complete = false;
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text_msg)) => {
                         let text_str = text_msg.to_string();
-                        println!("[LiveTTS] Setup RX (Text): {}", text_str);
                         if text_str.contains("setupComplete") {
-                            println!("[LiveTTS] Setup Complete received!");
                             setup_complete = true;
                             break;
                         }
@@ -119,26 +102,21 @@ impl TtsProvider for LiveTtsProvider {
                     Ok(Message::Binary(bin)) => {
                         // Server may send JSON as Binary - convert to string
                         if let Ok(text_str) = String::from_utf8(bin.to_vec()) {
-                            println!("[LiveTTS] Setup RX (Binary->Text): {}", text_str);
                             if text_str.contains("setupComplete") {
-                                println!("[LiveTTS] Setup Complete received!");
                                 setup_complete = true;
                                 break;
                             }
                         }
                     }
-                    Ok(Message::Close(close)) => {
-                        eprintln!("[LiveTTS] Connection closed during setup: {:?}", close);
+                    Ok(Message::Close(_close)) => {
                         let _ = tx
                             .send(Err(anyhow::anyhow!("Connection closed during setup")))
                             .await;
                         return;
                     }
-                    Ok(msg_type) => {
-                        println!("[LiveTTS] Setup RX (other): {:?}", msg_type);
+                    Ok(_msg_type) => {
                     }
                     Err(e) => {
-                        eprintln!("[LiveTTS] Error during setup: {}", e);
                         let _ = tx
                             .send(Err(anyhow::anyhow!("WebSocket error: {}", e)))
                             .await;
@@ -148,7 +126,6 @@ impl TtsProvider for LiveTtsProvider {
             }
 
             if !setup_complete {
-                eprintln!("[LiveTTS] Setup failed or incomplete");
                 let _ = tx.send(Err(anyhow::anyhow!("Setup incomplete"))).await;
                 return;
             }
@@ -164,12 +141,10 @@ impl TtsProvider for LiveTtsProvider {
                     "turnComplete": true
                 }
             });
-            println!("[LiveTTS] Sending Input: {}", input_msg);
             if let Err(e) = write
                 .send(Message::Text(input_msg.to_string().into()))
                 .await
             {
-                eprintln!("[LiveTTS] Failed to send input: {}", e);
                 let _ = tx
                     .send(Err(anyhow::anyhow!("Failed to send input: {}", e)))
                     .await;
@@ -177,7 +152,6 @@ impl TtsProvider for LiveTtsProvider {
             }
 
             // 4. Read audio responses
-            println!("[LiveTTS] Listening for audio responses...");
             while let Some(msg) = read.next().await {
                 // Helper to process JSON response (works for both Text and Binary)
                 let process_json = |text_str: &str| -> (Option<Vec<f32>>, bool) {
@@ -217,19 +191,15 @@ impl TtsProvider for LiveTtsProvider {
                         let text_str = text_msg.to_string();
                         // Log small responses fully (likely errors), larger ones just size
                         if text_str.len() < 500 {
-                            println!("[LiveTTS] RX (Text): {}", text_str);
                         } else {
-                            println!("[LiveTTS] RX (Text): {} bytes", text_str.len());
                         }
                         let (samples, turn_complete) = process_json(&text_str);
                         if let Some(s) = samples {
-                            println!("[LiveTTS] Got {} audio samples", s.len());
                             if tx.send(Ok(AudioChunk { samples: s })).await.is_err() {
                                 return;
                             }
                         }
                         if turn_complete {
-                            println!("[LiveTTS] Turn Complete");
                             break;
                         }
                     }
@@ -237,29 +207,23 @@ impl TtsProvider for LiveTtsProvider {
                         if let Ok(text_str) = String::from_utf8(bin.to_vec()) {
                             // Log small responses fully (likely errors), larger ones just size
                             if text_str.len() < 500 {
-                                println!("[LiveTTS] RX (Binary): {}", text_str);
                             } else {
-                                println!("[LiveTTS] RX (Binary): {} bytes", text_str.len());
                             }
                             let (samples, turn_complete) = process_json(&text_str);
                             if let Some(s) = samples {
-                                println!("[LiveTTS] Got {} audio samples", s.len());
                                 if tx.send(Ok(AudioChunk { samples: s })).await.is_err() {
                                     return;
                                 }
                             }
                             if turn_complete {
-                                println!("[LiveTTS] Turn Complete");
                                 break;
                             }
                         }
                     }
-                    Ok(Message::Close(close)) => {
-                        println!("[LiveTTS] Connection closed: {:?}", close);
+                    Ok(Message::Close(_close)) => {
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[LiveTTS] Read error: {}", e);
                         let _ = tx.send(Err(anyhow::anyhow!("Stream error: {}", e))).await;
                         break;
                     }
@@ -267,7 +231,6 @@ impl TtsProvider for LiveTtsProvider {
                 }
             }
 
-            println!("[LiveTTS] Finished, closing connection");
             let _ = write.close().await;
         });
 

@@ -13,3 +13,4 @@ pub mod root;
 pub mod services;
 pub mod state;
 pub mod theme;
+pub mod tts_text;

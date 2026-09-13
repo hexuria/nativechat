@@ -41,9 +41,7 @@ impl MacTtsBridge {
         unsafe {
             let synthesizer: id = msg_send![class!(NSSpeechSynthesizer), new];
             if synthesizer.is_null() {
-                eprintln!("[TTS Service] Failed to create NSSpeechSynthesizer");
-            } else {
-                println!("[TTS Service] NSSpeechSynthesizer created successfully");
+                eprintln!("Failed to create NSSpeechSynthesizer");
             }
 
             static mut DELEGATE_CLASS: *const Class = 0 as *const Class;
@@ -144,10 +142,8 @@ impl MacTtsBridge {
         unsafe {
             let ns_string = NSString::alloc(nil).init_str(text);
             let success: bool = msg_send![self.synthesizer, startSpeakingString:ns_string];
-            if success {
-                println!("[TTS Service] Native Bridge: startSpeakingString returned YES");
-            } else {
-                eprintln!("[TTS Service] Native Bridge: startSpeakingString returned NO");
+            if !success {
+                eprintln!("NSSpeechSynthesizer startSpeakingString returned NO");
             }
         }
     }

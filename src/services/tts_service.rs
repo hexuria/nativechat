@@ -4,18 +4,12 @@ use crate::services::live_tts_provider::LiveTtsProvider;
 use crate::services::macos_tts_bridge::{MacTtsBridge, TtsEvent};
 use crate::services::rest_tts_provider::RestTtsProvider;
 use crate::services::tts_provider::TtsProvider;
+use crate::tts_text::is_live_tts_model;
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Notify;
-
-#[derive(Clone, Copy, PartialEq)]
-enum TtsMode {
-    Native,
-    Streaming,
-    None,
-}
 
 #[derive(Clone)]
 pub struct TtsService {
@@ -26,7 +20,6 @@ pub struct TtsService {
     cancelled: Arc<AtomicBool>,
     #[cfg(target_os = "macos")]
     native_provider: Option<Arc<MacTtsBridge>>,
-    active_mode: Arc<Mutex<TtsMode>>,
     native_completion_notify: Arc<Notify>,
     pub native_paused: Arc<AtomicBool>,
     pub ai_paused: Arc<AtomicBool>,
@@ -34,6 +27,7 @@ pub struct TtsService {
     last_word_index: Arc<AtomicUsize>,
     last_word_length: Arc<AtomicUsize>,
     generation: Arc<AtomicU64>,
+    native_generation: Arc<AtomicU64>,
 
     /// Transcription service for getting word timestamps
     transcription_service: Arc<AudioTranscriptionService>,
@@ -51,6 +45,7 @@ impl TtsService {
         let last_word_index = Arc::new(AtomicUsize::new(0));
         let last_word_length = Arc::new(AtomicUsize::new(0));
         let generation = Arc::new(AtomicU64::new(0));
+        let native_generation = Arc::new(AtomicU64::new(0));
 
         let native_provider = if cfg!(target_os = "macos") {
             let bridge = Arc::new(MacTtsBridge::new());
@@ -60,7 +55,6 @@ impl TtsService {
 
             bridge.set_callback(move |event| match event {
                 TtsEvent::Start => {
-                    println!("[TTS Service] Native TTS Started");
                     index.store(0, Ordering::SeqCst);
                     len.store(0, Ordering::SeqCst);
                 }
@@ -69,9 +63,7 @@ impl TtsService {
                     len.store(length, Ordering::SeqCst);
                 }
                 TtsEvent::Finish => {
-                    println!("[TTS Service] Native TTS Finished");
                     completion.notify_waiters();
-                    // Reset on finish
                     len.store(0, Ordering::SeqCst);
                 }
             });
@@ -87,13 +79,13 @@ impl TtsService {
             audio_output,
             cancelled: Arc::new(AtomicBool::new(false)),
             native_provider,
-            active_mode: Arc::new(Mutex::new(TtsMode::None)),
             native_completion_notify: native_completion,
             native_paused: Arc::new(AtomicBool::new(false)),
             ai_paused: Arc::new(AtomicBool::new(false)),
             last_word_index,
             last_word_length,
             generation,
+            native_generation,
             transcription_service: Arc::new(AudioTranscriptionService::new()),
             word_timings: Arc::new(RwLock::new(None)),
             playback_start_time: Arc::new(RwLock::new(None)),
@@ -161,8 +153,7 @@ impl TtsService {
     }
 
     pub fn is_live_api_model(model_id: &str) -> bool {
-        let id_lower = model_id.to_lowercase();
-        id_lower.contains("native-audio") || id_lower.contains("gemini-2.0")
+        is_live_tts_model(model_id)
     }
 
     /// Get the appropriate provider for the given model
@@ -179,7 +170,6 @@ impl TtsService {
         let app_cache_dir = cache_dir.join("nativechat").join("tts_cache");
         std::fs::create_dir_all(&app_cache_dir).ok()?;
         let path = app_cache_dir.join(format!("{}.bin", message_id));
-        // println!("[TTS Service] Cache Path for {}: {:?}", message_id, path);
         Some(path)
     }
 
@@ -203,27 +193,18 @@ impl TtsService {
     pub fn start_speaking_native(&self, text: &str, _message_id: &str) -> bool {
         #[cfg(target_os = "macos")]
         if let Some(bridge) = &self.native_provider {
-            // Stop any previous speech
+            self.native_generation.fetch_add(1, Ordering::SeqCst);
             bridge.stop();
-
-            // Reset state
-            // *self.active_mode.lock().unwrap() = TtsMode::Native;
-
-            // Don't kill the task, just ensure it's paused so Native can take over cleanly
-            // self.generation.fetch_add(1, Ordering::SeqCst);
-            // self.cancelled.store(true, Ordering::SeqCst); // Don't cancel, just pause!
+            self.audio_output.process_command(AudioCommand::Pause);
             self.ai_paused.store(true, Ordering::SeqCst);
-
             self.native_paused.store(false, Ordering::SeqCst);
             self.last_word_index.store(0, Ordering::SeqCst);
-
-            // Speak immediately - use original text, not stripped
+            self.last_word_length.store(0, Ordering::SeqCst);
             // macOS provides UTF-16 word ranges into this text
             bridge.speak(text);
             return true;
         }
 
-        println!("[TTS Service] Native TTS requested but not supported/available.");
         false
     }
 
@@ -246,8 +227,11 @@ impl TtsService {
     pub fn stop_native(&self) {
         #[cfg(target_os = "macos")]
         if let Some(bridge) = &self.native_provider {
+            self.native_generation.fetch_add(1, Ordering::SeqCst);
             bridge.stop();
             self.native_paused.store(false, Ordering::SeqCst);
+            self.last_word_length.store(0, Ordering::SeqCst);
+            self.native_completion_notify.notify_waiters();
         }
     }
 
@@ -266,13 +250,8 @@ impl TtsService {
         // Increment generation to invalidate previous tasks
         let current_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Reset cancellation flag for new request
         self.cancelled.store(false, Ordering::SeqCst);
         self.ai_paused.store(false, Ordering::SeqCst);
-        // Reset highlighting state to prevent cross-talk
-        self.cancelled.store(false, Ordering::SeqCst);
-        self.ai_paused.store(false, Ordering::SeqCst);
-        // Reset highlighting state to prevent cross-talk
         self.last_word_index.store(0, Ordering::SeqCst);
         self.last_word_length.store(0, Ordering::SeqCst);
 
@@ -295,15 +274,9 @@ impl TtsService {
         // Check cache first - if cached, play immediately without network request
         if let Some(path) = Self::get_cache_path(message_id) {
             if path.exists() {
-                println!("[TTS Service] Cache HIT for {}", message_id);
                 if let Ok(bytes) = std::fs::read(&path) {
                     let samples = Self::bytes_to_samples(&bytes);
                     if !samples.is_empty() {
-                        println!(
-                            "[TTS Service] Playing from cache ({} samples)",
-                            samples.len()
-                        );
-
                         let duration_secs = samples.len() as f32 / 24000.0;
                         let duration = Some(Duration::from_secs_f32(duration_secs));
 
@@ -316,10 +289,6 @@ impl TtsService {
                                 if let Ok(timings) =
                                     serde_json::from_slice::<Vec<WordTiming>>(&timings_bytes)
                                 {
-                                    println!(
-                                        "[TTS Service] Loaded {} cached word timings",
-                                        timings.len()
-                                    );
                                     // Store timings and set playback start time
                                     if let Ok(mut guard) = self.word_timings.write() {
                                         *guard = Some(timings);
@@ -331,9 +300,6 @@ impl TtsService {
                                 }
                             }
                         } else {
-                            println!(
-                                "[TTS Service] No cached timings found, will transcribe in background"
-                            );
                             // Spawn background task to transcribe the audio
                             let transcription_service = self.transcription_service.clone();
                             let samples_for_transcription = samples.clone();
@@ -344,7 +310,6 @@ impl TtsService {
                             let playback_start_time_ref = self.playback_start_time.clone();
 
                             tokio::spawn(async move {
-                                println!("[TTS Service] Starting background transcription...");
                                 match transcription_service
                                     .transcribe_with_timestamps(
                                         &samples_for_transcription,
@@ -355,10 +320,6 @@ impl TtsService {
                                 {
                                     Ok(timings) => {
                                         if !timings.is_empty() {
-                                            println!(
-                                                "[TTS Service] Got {} word timings from transcription",
-                                                timings.len()
-                                            );
                                             // Save to cache
                                             if let Ok(json) = serde_json::to_vec(&timings) {
                                                 let _ = std::fs::write(&timings_path_owned, json);
@@ -372,18 +333,9 @@ impl TtsService {
                                                 // Note: This might cause a slight jump, but subsequent plays will be accurate
                                                 *guard = Some(std::time::Instant::now());
                                             }
-                                        } else {
-                                            println!(
-                                                "[TTS Service] Transcription returned no timings"
-                                            );
                                         }
                                     }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[TTS Service] Background transcription failed: {}",
-                                            e
-                                        );
-                                    }
+                                    Err(_) => {}
                                 }
                             });
                         }
@@ -404,8 +356,6 @@ impl TtsService {
                         return Ok(true);
                     }
                 }
-            } else {
-                println!("[TTS Service] Cache MISS for {}", message_id);
             }
         }
 
@@ -508,27 +458,19 @@ impl TtsService {
                     let _ = std::fs::write(&path, &bytes);
 
                     // Transcribe audio to get word timings for future playback
-                    println!("[TTS Service] Transcribing audio for word timestamps...");
                     match transcription_service
                         .transcribe_with_timestamps(&all_samples, &text_owned, &api_key_owned)
                         .await
                     {
                         Ok(timings) => {
                             if !timings.is_empty() {
-                                println!(
-                                    "[TTS Service] Got {} word timings, caching...",
-                                    timings.len()
-                                );
                                 let timings_path = path.with_extension("timings.json");
                                 if let Ok(json) = serde_json::to_vec(&timings) {
                                     let _ = std::fs::write(timings_path, json);
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("[TTS Service] Transcription failed: {}", e);
-                            // Continue without timings - simulation will still work
-                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -540,8 +482,22 @@ impl TtsService {
     /// Wait for Native TTS to complete
     pub async fn wait_until_finished_native(&self) {
         #[cfg(target_os = "macos")]
-        if self.native_provider.is_some() {
-            self.native_completion_notify.notified().await;
+        if let Some(bridge) = &self.native_provider {
+            let started = self.native_generation.load(Ordering::SeqCst);
+            loop {
+                if self.native_generation.load(Ordering::SeqCst) != started {
+                    return;
+                }
+                let speaking = bridge.is_speaking();
+                let paused = self.native_paused.load(Ordering::SeqCst);
+                if !speaking && !paused {
+                    return;
+                }
+                tokio::select! {
+                    _ = self.native_completion_notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
         }
     }
 
@@ -580,8 +536,8 @@ impl TtsService {
     pub fn is_native_active(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
-            if let Some(_bridge) = &self.native_provider {
-                return !self.native_paused.load(Ordering::SeqCst);
+            if let Some(bridge) = &self.native_provider {
+                return bridge.is_speaking() && !self.native_paused.load(Ordering::SeqCst);
             }
         }
         false
@@ -724,13 +680,6 @@ impl TtsService {
                 ));
                 cumulative_time += word_duration;
             }
-
-            println!(
-                "[TTS Simulation] {} words, {:.2}s duration, {:.3}s per weight unit",
-                words.len(),
-                audio_duration,
-                time_per_unit
-            );
 
             // Now run the timing loop
             let tick_rate = 30; // 30ms for smoother updates

@@ -383,5 +383,47 @@ struct RawWordTiming {
 mod tests {
     use super::*;
 
-    // TODO: Add new tests for index-based matching
+    #[test]
+    fn proportional_timing_covers_duration() {
+        let svc = AudioTranscriptionService::new();
+        let words = vec![
+            ("hello".to_string(), 0..5),
+            ("world".to_string(), 6..11),
+        ];
+        let timings = svc.distribute_proportional_timing(&words, 2.0);
+        assert_eq!(timings.len(), 2);
+        assert!((timings[0].start_time - 0.0).abs() < f32::EPSILON);
+        assert!((timings.last().unwrap().end_time - 2.0).abs() < 0.0001);
+        assert_eq!(timings[0].source_range, 0..5);
+        assert_eq!(timings[1].source_range, 6..11);
+    }
+
+    #[test]
+    fn interpolate_fills_zero_duration_gap() {
+        let svc = AudioTranscriptionService::new();
+        let mut timings = vec![
+            WordTiming {
+                word: "a".into(),
+                start_time: 0.0,
+                end_time: 0.0,
+                source_range: 0..1,
+            },
+            WordTiming {
+                word: "b".into(),
+                start_time: 0.0,
+                end_time: 0.0,
+                source_range: 2..3,
+            },
+            WordTiming {
+                word: "c".into(),
+                start_time: 1.0,
+                end_time: 2.0,
+                source_range: 4..5,
+            },
+        ];
+        svc.interpolate_gaps(&mut timings, 2.0);
+        assert!(timings[0].end_time > timings[0].start_time);
+        assert!(timings[1].end_time > timings[1].start_time);
+        assert!((timings[1].end_time - 1.0).abs() < 0.0001);
+    }
 }

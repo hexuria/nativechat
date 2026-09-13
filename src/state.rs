@@ -1246,48 +1246,17 @@ impl AppState {
                     let text = text.clone();
 
                     if service.start_speaking_native(&text, &message_id) {
-                        let message_id_poller = message_id.clone();
                         cx.spawn(async move |this, cx| {
-                                loop {
-                                    cx.background_executor()
-                                        .timer(std::time::Duration::from_millis(30))
-                                        .await;
-                                    if let Some(this) = this.upgrade() {
-                                        let still_active = this
-                                            .update(cx, |state, cx| {
-                                                if state.native_tts.message_id.as_ref()
-                                                    == Some(&message_id_poller)
-                                                {
-                                                    cx.notify();
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            })
-                                            ;
-
-                                        if !still_active {
-                                            break;
-                                        }
-                                    } else {
-                                        break;
+                            service.wait_until_finished_native().await;
+                            if let Some(this) = this.upgrade() {
+                                let _ = this.update(cx, |state, cx| {
+                                    if state.native_tts.message_id.as_ref() == Some(&message_id) {
+                                        state.native_tts.message_id = None;
+                                        cx.notify();
                                     }
-                                }
-                            })
-                        .detach();
-
-                        cx.spawn(async move |this, cx| {
-                                service.wait_until_finished_native().await;
-                                if let Some(this) = this.upgrade() {
-                                    let _ = this.update(cx, |state, cx| {
-                                        if state.native_tts.message_id.as_ref() == Some(&message_id)
-                                        {
-                                            state.native_tts.message_id = None;
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            })
+                                });
+                            }
+                        })
                         .detach();
                     }
                 }
@@ -1318,37 +1287,6 @@ impl AppState {
                     let service = service.clone();
                     let message_id = message_id.clone();
                     let text = text.clone();
-
-                    let message_id_poller = message_id.clone();
-                    cx.spawn(async move |this, cx| {
-                            loop {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(30))
-                                    .await;
-                                if let Some(this) = this.upgrade() {
-                                    let still_active = this
-                                        .update(cx, |state, cx| {
-                                            if state.ai_tts.message_id.as_ref()
-                                                == Some(&message_id_poller)
-                                                && !state.ai_tts.is_paused
-                                            {
-                                                cx.notify();
-                                                true
-                                            } else {
-                                                state.ai_tts.message_id.as_ref()
-                                                    == Some(&message_id_poller)
-                                            }
-                                        });
-
-                                    if !still_active {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            }
-                        })
-                    .detach();
 
                     cx.spawn(async move |this, cx| {
                             let start_result = service
@@ -1505,7 +1443,6 @@ impl AppState {
         if let Some(path) = TtsService::get_cache_path(&message_id) {
             if path.exists() {
                 let _ = std::fs::remove_file(path);
-                println!("[State] Cleared cache for {}", message_id);
             }
         }
 
