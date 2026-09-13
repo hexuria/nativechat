@@ -12,7 +12,7 @@ use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
 use crate::services::tts_service::TtsService;
 use chrono::NaiveDateTime;
 use futures::StreamExt;
-use gpui::*;
+use gpui_kit::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -369,12 +369,10 @@ impl AppState {
 
     pub fn load_sessions(&mut self, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
-            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
+            cx.spawn(async move |this, cx| {
                     match db.get_sessions().await {
                         Ok(sessions) => {
-                            this.update(&mut cx, |state, cx| {
+                            this.update(cx, |state, cx| {
                                 state.conversations = sessions
                                     .into_iter()
                                     .map(|s| Conversation {
@@ -399,20 +397,17 @@ impl AppState {
                         }
                         Err(e) => eprintln!("Failed to load sessions: {}", e),
                     }
-                }
-            })
+                })
             .detach();
         }
     }
 
     pub fn create_new_session(&mut self, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
-            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
+            cx.spawn(async move |this, cx| {
                     match db.create_session("New Chat").await {
                         Ok(id) => {
-                            this.update(&mut cx, |state, cx| {
+                            this.update(cx, |state, cx| {
                                 state.conversations.insert(
                                     0,
                                     Conversation {
@@ -431,8 +426,7 @@ impl AppState {
                         }
                         Err(e) => eprintln!("Failed to create session: {}", e),
                     }
-                }
-            })
+                })
             .detach();
         }
     }
@@ -443,8 +437,7 @@ impl AppState {
             cx.notify();
 
             if let Some(db) = self.database_service.clone() {
-                cx.spawn(
-                    move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
+                cx.spawn(async move |_this, _cx| {
                         if let Err(e) = db.update_session_title(&id, &new_title).await {
                             eprintln!("Failed to rename session: {}", e);
                         }
@@ -470,8 +463,7 @@ impl AppState {
             cx.notify();
 
             if let Some(db) = self.database_service.clone() {
-                cx.spawn(
-                    move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
+                cx.spawn(async move |_this, _cx| {
                         if let Err(e) = db.delete_session(&id).await {
                             eprintln!("Failed to delete session: {}", e);
                         }
@@ -485,12 +477,10 @@ impl AppState {
     pub fn load_session_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             let session_id_clone = session_id.clone();
-            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
+            cx.spawn(async move |this, cx| {
                     match db.get_messages(&session_id_clone).await {
                         Ok(db_messages) => {
-                            this.update(&mut cx, |state, cx| {
+                            this.update(cx, |state, cx| {
                                 if let Some(conversation) = state
                                     .conversations
                                     .iter_mut()
@@ -526,8 +516,7 @@ impl AppState {
                         }
                         Err(e) => eprintln!("Failed to load messages: {}", e),
                     }
-                }
-            })
+                })
             .detach();
         }
     }
@@ -564,19 +553,16 @@ impl AppState {
     /// This ensures that any changes made (e.g., in settings) are reflected globally.
     pub fn reload_from_db(&mut self, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
-            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
+            cx.spawn(async move |this, cx| {
                     if let Ok((profiles, credentials)) =
                         Self::load_profiles_and_credentials(&db).await
                     {
-                        this.update(&mut cx, |state, cx| {
+                        this.update(cx, |state, cx| {
                             state.set_profiles_and_credentials(profiles, credentials, cx);
                         })
                         .ok();
                     }
-                }
-            })
+                })
             .detach();
         }
     }
@@ -599,8 +585,7 @@ impl AppState {
 
             // Persist the selection asynchronously to DB
             if let Some(db) = self.database_service.clone() {
-                cx.spawn(
-                    move |_this: WeakEntity<AppState>, _cx: &mut AsyncApp| async move {
+                cx.spawn(async move |_this, _cx| {
                         if let Err(e) = Self::persist_selected_profile(&db, Some(profile_id)).await
                         {
                             eprintln!("Failed to persist selected profile: {}", e);
@@ -770,17 +755,14 @@ impl AppState {
 
     pub fn fetch_models(&mut self, api_keys: HashMap<Provider, String>, cx: &mut Context<Self>) {
         let registry = self.model_registry.clone();
-        cx.spawn(|this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
+        cx.spawn(async move |this, cx| {
                 let models = registry.get_all_models(&api_keys).await;
-                this.update(&mut cx, |state: &mut AppState, cx| {
+                this.update(cx, |state: &mut AppState, cx| {
                     state.available_models = models;
                     cx.notify();
                 })
                 .ok();
-            }
-        })
+            })
         .detach();
     }
 
@@ -842,15 +824,13 @@ impl AppState {
         if let Some(db) = self.database_service.clone() {
             let content_clone = content.clone();
             let conversation_id_clone = conversation_id.clone();
-            cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
+            cx.spawn(async move |this, cx| {
                     match db
                         .save_message(&conversation_id_clone, "user", &content_clone, None, None)
                         .await
                     {
                         Ok(id) => {
-                            this.update(&mut cx, |state, cx| {
+                            this.update(cx, |state, cx| {
                                 if let Some(conversation) = state
                                     .conversations
                                     .iter_mut()
@@ -867,8 +847,7 @@ impl AppState {
                         }
                         Err(e) => eprintln!("Failed to save user message: {}", e),
                     }
-                }
-            })
+                })
             .detach();
         }
 
@@ -921,13 +900,11 @@ impl AppState {
         self.is_ai_responding = true;
         cx.notify();
 
-        cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
+        cx.spawn(async move |this, cx| {
                 println!("[LLM] Sending request to AI...");
 
                 // Create the AI message placeholder first
-                let _ = this.update(&mut cx, |state, model_cx| {
+                let _ = this.update(cx, |state, model_cx| {
                     if let Some(conversation) = state
                         .conversations
                         .iter_mut()
@@ -956,7 +933,7 @@ impl AppState {
                                 Ok(chunk) => {
                                     if !chunk.delta.is_empty() {
                                         full_response.push_str(&chunk.delta);
-                                        let _ = this.update(&mut cx, |state, cx| {
+                                        let _ = this.update(cx, |state, cx| {
                                             if let Some(conversation) = state
                                                 .conversations
                                                 .iter_mut()
@@ -979,16 +956,14 @@ impl AppState {
                             }
                         }
 
-                        let _ = this.update(&mut cx, |state, cx| {
+                        let _ = this.update(cx, |state, cx| {
                             state.is_ai_responding = false;
                             // Save AI response to DB
                             if let Some(db) = state.database_service.clone() {
                                 let response_clone = full_response.clone();
                                 let model_clone = model.clone();
                                 let conversation_id_clone = conversation_id.clone();
-                                cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-                                    let mut cx = cx.clone();
-                                    async move {
+                                cx.spawn(async move |this, cx| {
                                         match db
                                             .save_message(
                                                 &conversation_id_clone,
@@ -1000,7 +975,7 @@ impl AppState {
                                             .await
                                         {
                                             Ok(id) => {
-                                                this.update(&mut cx, |state, cx| {
+                                                this.update(cx, |state, cx| {
                                                     if let Some(conversation) = state
                                                         .conversations
                                                         .iter_mut()
@@ -1019,7 +994,6 @@ impl AppState {
                                             }
                                             Err(e) => eprintln!("Failed to save AI message: {}", e),
                                         }
-                                    }
                                 })
                                 .detach();
                             }
@@ -1029,7 +1003,7 @@ impl AppState {
                     }
                     Err(e) => {
                         eprintln!("[LLM] Error starting stream: {}", e);
-                        let _ = this.update(&mut cx, |state, cx| {
+                        let _ = this.update(cx, |state, cx| {
                             if let Some(conversation) = state
                                 .conversations
                                 .iter_mut()
@@ -1046,8 +1020,7 @@ impl AppState {
                         });
                     }
                 }
-            }
-        })
+            })
         .detach();
     }
 
@@ -1078,7 +1051,7 @@ impl AppState {
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        use ui::{Theme, ThemeRegistry};
+        use gpui_kit::component::{Theme, ThemeRegistry};
 
         println!("[THEME] Toggle called, current: {}", self.theme_mode);
 
@@ -1121,6 +1094,7 @@ impl AppState {
         {
             println!("[THEME] Found theme, applying...");
             Theme::global_mut(cx).apply_config(&theme);
+            Theme::sync_base(cx);
             println!("[THEME] Applied!");
         } else {
             println!("[THEME] ERROR: Theme not found!");
@@ -1183,14 +1157,12 @@ impl AppState {
         let ai_amplitude = self.ai_amplitude.clone();
         let amplitude = self.amplitude.clone();
 
-        cx.spawn(|this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
+        cx.spawn(async move |this, cx| {
                 println!("Connecting to Gemini...");
                 match GeminiLiveClient::connect(api_key, ai_amplitude) {
                     Ok(client) => {
                         println!("Connected to Gemini!");
-                        let _ = this.update(&mut cx, |state, _cx| {
+                        let _ = this.update(cx, |state, _cx| {
                             state.gemini_client = Some(client.clone());
                             state.voice_status = VoiceStatus::Connected;
 
@@ -1210,7 +1182,7 @@ impl AppState {
                     }
                     Err(e) => {
                         eprintln!("Failed to connect to Gemini: {}", e);
-                        let _ = this.update(&mut cx, |state, _cx| {
+                        let _ = this.update(cx, |state, _cx| {
                             state.voice_status =
                                 VoiceStatus::Error("Connection Failed".to_string());
                             // Fallback to local audio if connection fails
@@ -1221,8 +1193,7 @@ impl AppState {
                         });
                     }
                 }
-            }
-        })
+            })
         .detach();
     }
 
@@ -1276,16 +1247,14 @@ impl AppState {
 
                     if service.start_speaking_native(&text, &message_id) {
                         let message_id_poller = message_id.clone();
-                        cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-                            let mut cx = cx.clone();
-                            async move {
+                        cx.spawn(async move |this, cx| {
                                 loop {
                                     cx.background_executor()
                                         .timer(std::time::Duration::from_millis(30))
                                         .await;
                                     if let Some(this) = this.upgrade() {
                                         let still_active = this
-                                            .update(&mut cx, |state, cx| {
+                                            .update(cx, |state, cx| {
                                                 if state.native_tts.message_id.as_ref()
                                                     == Some(&message_id_poller)
                                                 {
@@ -1295,7 +1264,7 @@ impl AppState {
                                                     false
                                                 }
                                             })
-                                            .unwrap_or(false);
+                                            ;
 
                                         if !still_active {
                                             break;
@@ -1304,16 +1273,13 @@ impl AppState {
                                         break;
                                     }
                                 }
-                            }
-                        })
+                            })
                         .detach();
 
-                        cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-                            let mut cx = cx.clone();
-                            async move {
+                        cx.spawn(async move |this, cx| {
                                 service.wait_until_finished_native().await;
                                 if let Some(this) = this.upgrade() {
-                                    let _ = this.update(&mut cx, |state, cx| {
+                                    let _ = this.update(cx, |state, cx| {
                                         if state.native_tts.message_id.as_ref() == Some(&message_id)
                                         {
                                             state.native_tts.message_id = None;
@@ -1321,8 +1287,7 @@ impl AppState {
                                         }
                                     });
                                 }
-                            }
-                        })
+                            })
                         .detach();
                     }
                 }
@@ -1355,16 +1320,14 @@ impl AppState {
                     let text = text.clone();
 
                     let message_id_poller = message_id.clone();
-                    cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-                        let mut cx = cx.clone();
-                        async move {
+                    cx.spawn(async move |this, cx| {
                             loop {
                                 cx.background_executor()
                                     .timer(std::time::Duration::from_millis(30))
                                     .await;
                                 if let Some(this) = this.upgrade() {
                                     let still_active = this
-                                        .update(&mut cx, |state, cx| {
+                                        .update(cx, |state, cx| {
                                             if state.ai_tts.message_id.as_ref()
                                                 == Some(&message_id_poller)
                                                 && !state.ai_tts.is_paused
@@ -1375,8 +1338,7 @@ impl AppState {
                                                 state.ai_tts.message_id.as_ref()
                                                     == Some(&message_id_poller)
                                             }
-                                        })
-                                        .unwrap_or(false);
+                                        });
 
                                     if !still_active {
                                         break;
@@ -1385,13 +1347,10 @@ impl AppState {
                                     break;
                                 }
                             }
-                        }
-                    })
+                        })
                     .detach();
 
-                    cx.spawn(move |this: WeakEntity<AppState>, cx: &mut AsyncApp| {
-                        let mut cx = cx.clone();
-                        async move {
+                    cx.spawn(async move |this, cx| {
                             let start_result = service
                                 .start_speaking(
                                     &text,
@@ -1404,7 +1363,7 @@ impl AppState {
                             match start_result {
                                 Ok(true) => {
                                     // Speaking started
-                                    this.update(&mut cx, |state, cx| {
+                                    this.update(cx, |state, cx| {
                                         state.ai_tts.is_loading = false;
                                         cx.notify();
                                     })
@@ -1412,7 +1371,7 @@ impl AppState {
 
                                     service.wait_until_finished_ai().await;
 
-                                    this.update(&mut cx, |state, cx| {
+                                    this.update(cx, |state, cx| {
                                         if state.ai_tts.message_id.as_ref() == Some(&message_id) {
                                             state.ai_tts.message_id = None;
                                             cx.notify();
@@ -1421,7 +1380,7 @@ impl AppState {
                                     .ok();
                                 }
                                 Ok(false) | Err(_) => {
-                                    this.update(&mut cx, |state, cx| {
+                                    this.update(cx, |state, cx| {
                                         state.ai_tts.message_id = None;
                                         state.ai_tts.is_loading = false;
                                         cx.notify();
@@ -1429,8 +1388,7 @@ impl AppState {
                                     .ok();
                                 }
                             }
-                        }
-                    })
+                        })
                     .detach();
                 }
             }

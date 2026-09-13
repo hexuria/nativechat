@@ -1,7 +1,9 @@
-use gpui::*;
+use gpui_kit::component::Root;
+use gpui_kit::*;
 use nativechat::actions::{
     About, BranchInNewChat, CopyMessage, Hide, HideOthers, Minimize, NewChat, OpenSettings, Quit,
-    ReadAloud, ReportMessage, ShowAll, ToggleDebugMarkdown, ToggleSidebar, ToggleTheme, Zoom,
+    ReadAloud, ReportMessage, ShowAll, ToggleDebugMarkdown, ToggleFps, ToggleSidebar, ToggleTheme,
+    Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
@@ -11,71 +13,61 @@ use nativechat::root::RootView;
 use nativechat::services::database::DatabaseService;
 use nativechat::state::AppState;
 use nativechat::theme;
-use ui::Root;
 
 fn main() {
-    // Create tokio runtime for async operations
+    #[cfg(feature = "agent")]
+    let mailbox = nativechat::agent::maybe_start();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
     let _guard = runtime.enter();
 
-    // Load environment variables
     dotenv::from_filename(".env.local").ok();
     dotenv::dotenv().ok();
 
-    // Initialize Database and Config before starting the app
     let (config, db_service) = runtime.block_on(async {
-        // Load config
         let config = Config::load().expect("Failed to load config");
         println!("Debug: Database URL: {}", config.database_url);
 
-        // Create connection pool
         let pool = create_pool(&config.database_url)
             .await
             .expect("Failed to create database pool");
 
-        // Run migrations
         run_migrations(&pool)
             .await
             .expect("Failed to run migrations");
 
-        // Create DatabaseService
         let db_service = DatabaseService::new(pool);
 
         (config, db_service)
     });
 
-    Application::new()
+    gpui_kit::application()
         .with_assets(CombinedAssets)
         .run(move |cx: &mut App| {
+            #[cfg(feature = "agent")]
+            let mailbox = mailbox.clone();
             cx.bind_keys([
-                // Enter to submit in MessageInput context
                 KeyBinding::new("enter", SubmitMessage, Some("MessageInput")),
-                // Cmd+Enter to submit in Editor context
                 KeyBinding::new("cmd-enter", SubmitMessage, Some("Editor")),
                 KeyBinding::new("ctrl-enter", SubmitMessage, Some("Editor")),
-                // Global shortcuts
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-t", ToggleTheme, None),
                 KeyBinding::new("cmd-n", NewChat, None),
                 KeyBinding::new("cmd-,", OpenSettings, None),
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-f12", ToggleDebugMarkdown, None),
+                KeyBinding::new("cmd-shift-f", ToggleFps, None),
                 KeyBinding::new("cmd-shift-c", CopyMessage, None),
             ]);
 
-            // Register actions
             cx.on_action(quit);
 
-            // Initialize UI Components
-            ui::init(cx);
-
-            // Initialize Theme
+            gpui_kit::init(cx);
             theme::init(cx);
 
-            // Set up menus
             set_menus(cx);
 
             let displays = cx.displays();
@@ -92,54 +84,45 @@ fn main() {
                 ..WindowOptions::default()
             };
 
-            cx.open_window(options, |window, cx| {
-                let state = cx.new(|_| AppState::new());
+            cx.spawn(async move |cx| {
+                cx.open_window(options, |window, cx| {
+                    let state = cx.new(|_| AppState::new());
 
-                // Set initial config and DB service
-                state.update(cx, |state, cx| {
-                    state.set_config(config.clone(), cx);
-                    state.set_database_service(db_service.clone(), cx);
-                });
-
-                // Spawn background task to refresh data from DB
-                let state_clone = state.clone();
-                let db_service_clone = db_service.clone();
-                cx.on_action(|_: &CopyMessage, _cx: &mut App| {
-                    // This is a global handler, but the specific handler on MessageBubble will take precedence if focused.
-                    // If we want a global fallback, we can implement it here, but for now let's just leave it empty
-                    // or maybe notify the user to select a message.
-                });
-                cx.on_action(|_: &BranchInNewChat, _cx: &mut App| {
-                    println!("Branch in new chat action triggered");
-                });
-                let state_read_aloud = state.clone();
-                cx.on_action(move |action: &ReadAloud, cx: &mut App| {
-                    state_read_aloud.update(cx, |state, cx| {
-                        state.read_aloud(
-                            action.text.clone(),
-                            action.message_id.clone(),
-                            nativechat::actions::TtsSource::Native,
-                            cx,
-                        );
+                    state.update(cx, |state, cx| {
+                        state.set_config(config.clone(), cx);
+                        state.set_database_service(db_service.clone(), cx);
                     });
-                });
-                cx.on_action(|_: &ReportMessage, _cx: &mut App| {
-                    println!("Report message action triggered");
-                });
-                cx.spawn(|cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
-                        // Seed models
+
+                    let state_clone = state.clone();
+                    let db_service_clone = db_service.clone();
+                    cx.on_action(|_: &CopyMessage, _cx: &mut App| {});
+                    cx.on_action(|_: &BranchInNewChat, _cx: &mut App| {
+                        println!("Branch in new chat action triggered");
+                    });
+                    let state_read_aloud = state.clone();
+                    cx.on_action(move |action: &ReadAloud, cx: &mut App| {
+                        state_read_aloud.update(cx, |state, cx| {
+                            state.read_aloud(
+                                action.text.clone(),
+                                action.message_id.clone(),
+                                nativechat::actions::TtsSource::Native,
+                                cx,
+                            );
+                        });
+                    });
+                    cx.on_action(|_: &ReportMessage, _cx: &mut App| {
+                        println!("Report message action triggered");
+                    });
+                    cx.spawn(async move |cx| {
                         if let Err(e) =
                             nativechat::services::model_seeder::seed_models(&db_service_clone).await
                         {
                             eprintln!("Failed to seed models: {}", e);
                         }
 
-                        // Load profiles and credentials from database
                         match AppState::load_profiles_and_credentials(&db_service_clone).await {
                             Ok((profiles, credentials)) => {
-                                let _ = state_clone.update(&mut cx, |state, cx| {
+                                let _ = state_clone.update(cx, |state, cx| {
                                     state.set_profiles_and_credentials(profiles, credentials, cx);
                                 });
                             }
@@ -149,17 +132,27 @@ fn main() {
                         }
 
                         println!("App data refreshed from DB successfully!");
-                    }
-                })
-                .detach();
+                    })
+                    .detach();
 
-                let view = cx.new(|cx| RootView::new(window, state, cx));
-                view.update(cx, |view, _cx| {
-                    view.focus_handle.focus(window);
-                });
-                cx.new(|cx| Root::new(view, window, cx))
+                    let view = cx.new(|cx| {
+                        #[cfg(feature = "agent")]
+                        {
+                            RootView::new(window, state, cx).attach_agent(mailbox.clone(), cx)
+                        }
+                        #[cfg(not(feature = "agent"))]
+                        {
+                            RootView::new(window, state, cx)
+                        }
+                    });
+                    view.update(cx, |view, cx| {
+                        view.focus_handle.focus(window, cx);
+                    });
+                    cx.new(|cx| Root::new(view, window, cx))
+                })
+                .expect("Failed to open window");
             })
-            .unwrap();
+            .detach();
         });
 }
 
@@ -167,6 +160,7 @@ fn set_menus(cx: &mut App) {
     cx.set_menus(vec![
         Menu {
             name: "NativeChat".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("About NativeChat", About),
                 MenuItem::separator(),
@@ -183,10 +177,12 @@ fn set_menus(cx: &mut App) {
         },
         Menu {
             name: "Edit".into(),
+            disabled: false,
             items: vec![MenuItem::separator()],
         },
         Menu {
             name: "Window".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Minimize", Minimize),
                 MenuItem::action("Zoom", Zoom),
@@ -195,6 +191,7 @@ fn set_menus(cx: &mut App) {
         },
         Menu {
             name: "View".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Theme", ToggleTheme),

@@ -1,18 +1,15 @@
-use gpui::*;
+use gpui_kit::component::{Theme, ThemeRegistry};
+use gpui_kit::*;
 use std::path::PathBuf;
-use ui::{Theme, ThemeRegistry};
 
 /// Returns the path to the themes directory, which is different for dev and release builds.
 fn themes_path() -> PathBuf {
     #[cfg(debug_assertions)]
     {
-        // In development, load themes directly from the project's `themes` directory.
         PathBuf::from("themes")
     }
     #[cfg(not(debug_assertions))]
     {
-        // In release, themes are copied to the `Resources` directory of the app bundle.
-        // We construct the path relative to the executable.
         let exe_path = std::env::current_exe().expect("Failed to get current executable path");
         if let Some(path) = exe_path
             .parent()
@@ -24,7 +21,6 @@ fn themes_path() -> PathBuf {
             }
         }
 
-        // Fallback for running from target/release (project root is 3 levels up)
         if let Some(path) = exe_path
             .parent()
             .and_then(|p| p.parent())
@@ -36,7 +32,6 @@ fn themes_path() -> PathBuf {
             }
         }
 
-        // Fallback for unexpected bundle structure or CWD
         PathBuf::from("themes")
     }
 }
@@ -49,6 +44,7 @@ pub fn init(cx: &mut App) {
     if let Err(err) = ThemeRegistry::watch_dir(themes_path, cx, move |cx| {
         if let Some(theme) = ThemeRegistry::global(cx).themes().get(&theme_name).cloned() {
             Theme::global_mut(cx).apply_config(&theme);
+            Theme::sync_base(cx);
         } else {
             log::error!(
                 "Default theme '{}' not found after loading themes.",

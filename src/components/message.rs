@@ -4,43 +4,53 @@ use crate::{
     actions::{CopyMessage, ToggleReadAloud},
     components::message_actions::MessageActions,
 };
-use gpui::{prelude::FluentBuilder, *};
-use ui::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::bubble::{Bubble, BubbleVariant};
+use gpui_kit::component::message::{
+    Message as KitMessage, MessageAlignment, MessageContent, MessageFooter,
+};
+use gpui_kit::component::text::TextView;
+use gpui_kit::component::{ActiveTheme, h_flex};
+use gpui_kit::{prelude::FluentBuilder, *};
 
 #[derive(Clone, IntoElement)]
 pub struct MessageBubble {
     text: String,
     is_me: bool,
+    #[allow(dead_code)]
     bg_color: Hsla,
+    #[allow(dead_code)]
     text_color: Hsla,
     timestamp: Option<String>,
     message_id: String,
     debug_mode: bool,
     can_read_aloud: bool,
-    // Native State
     is_native_speaking: bool,
     is_native_paused: bool,
     is_native_loading: bool,
-    // AI State
     is_ai_speaking: bool,
     is_ai_paused: bool,
     is_ai_loading: bool,
-
     is_cached: bool,
+    #[allow(dead_code)]
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_color: Option<Hsla>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    use_markdown: bool,
+    show_footer: bool,
+    copy_text: String,
 }
 
 impl MessageBubble {
     pub fn new(text: String) -> Self {
+        let message_id = text.len().to_string();
         Self {
             text: text.clone(),
+            copy_text: text,
             is_me: false,
-            bg_color: gpui::white(),
-            text_color: gpui::black(),
+            bg_color: gpui_kit::white(),
+            text_color: gpui_kit::black(),
             timestamp: None,
-            message_id: text.len().to_string(), // Default ID, should be overridden
+            message_id,
             debug_mode: false,
             can_read_aloud: false,
             is_native_speaking: false,
@@ -53,7 +63,24 @@ impl MessageBubble {
             highlight_range: None,
             highlight_color: None,
             on_read_aloud: None,
+            use_markdown: true,
+            show_footer: true,
         }
+    }
+
+    pub fn use_markdown(mut self, use_markdown: bool) -> Self {
+        self.use_markdown = use_markdown;
+        self
+    }
+
+    pub fn show_footer(mut self, show_footer: bool) -> Self {
+        self.show_footer = show_footer;
+        self
+    }
+
+    pub fn copy_text(mut self, copy_text: impl Into<String>) -> Self {
+        self.copy_text = copy_text.into();
+        self
     }
 
     pub fn highlight_range(mut self, range: Option<std::ops::Range<usize>>) -> Self {
@@ -142,150 +169,99 @@ impl MessageBubble {
 }
 
 impl RenderOnce for MessageBubble {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        if self.is_me {
-            // User message: gray bubble on the right (ChatGPT style)
-            // For now, keep user messages as plain text or also use Markdown if desired.
-            // Let's use Markdown for consistency but keep the bubble styling.
-            h_flex()
-                .w_full()
-                .justify_end()
-                .on_action({
-                    let text = self.text.clone();
-                    move |_: &CopyMessage, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                    }
-                })
-                .child(
-                    div()
-                        .px_4()
-                        .py_2p5()
-                        .rounded(px(20.0))
-                        .bg(cx.theme().secondary) // Use theme secondary (grayish)
-                        .max_w_full()
-                        .child(
-                            v_flex()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().secondary_foreground)
-                                        .overflow_x_hidden()
-                                        .child(self.text), // User text usually doesn't need complex markdown, but we could swap this too.
-                                )
-                                .when_some(self.timestamp, |this, timestamp| {
-                                    this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(
-                                                cx.theme().secondary_foreground.opacity(0.7),
-                                            )
-                                            .child(timestamp),
-                                    )
-                                }),
-                        ),
-                )
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let alignment = if self.is_me {
+            MessageAlignment::End
         } else {
-            h_flex()
+            MessageAlignment::Start
+        };
+        let variant = if self.is_me {
+            BubbleVariant::Secondary
+        } else if self.highlight_color.is_some() {
+            BubbleVariant::Tinted
+        } else {
+            BubbleVariant::Ghost
+        };
+
+        let body = if self.debug_mode {
+            div()
+                .text_sm()
+                .font_family("monospace")
+                .p_2()
+                .bg(cx.theme().muted.opacity(0.3))
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(self.text.clone())
+                .into_any_element()
+        } else if self.is_me || !self.use_markdown {
+            div()
+                .id(ElementId::Name(
+                    format!("msg-body-{}", self.message_id).into(),
+                ))
                 .w_full()
-                .justify_start()
-                .on_action({
-                    let text = self.text.clone();
-                    move |_: &CopyMessage, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                    }
-                })
-                .child(
-                    v_flex()
-                        .id(ElementId::Name(self.message_id.clone().into()))
-                        .focusable()
-                        .on_key_down({
-                            let message_id = self.message_id.clone();
-                            let text = self.text.clone();
-                            move |event, _window, cx| {
-                                if event.keystroke.key == "f8" {
-                                    cx.dispatch_action(&ToggleReadAloud {
-                                        message_id: message_id.clone(),
-                                        text: text.clone(),
-                                        mode: crate::actions::TtsSource::Native,
-                                    });
-                                }
-                            }
-                        })
-                        .flex_1()
-                        .gap_2()
-                        .max_w_full()
-                        .child(
-                            div()
-                                .flex_1()
-                                .w_full()
-                                .overflow_hidden()
-                                .when(self.debug_mode, |this| {
-                                    // Debug mode: plain text with styling for visibility
-                                    this.child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(cx.theme().foreground)
-                                            .p_2()
-                                            .bg(cx.theme().muted.opacity(0.3))
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(cx.theme().border)
-                                            .font_family("monospace")
-                                            .child(self.text.clone()),
-                                    )
-                                })
-                                .when(!self.debug_mode, |this| {
-                                    // Normal mode: markdown rendering
-                                    this.child(
-                                        ui::text::MarkdownView::new(
-                                            ElementId::Name(self.message_id.clone().into()),
-                                            self.text.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .highlight_range(self.highlight_range.clone())
-                                        .highlight_color(self.highlight_color),
-                                    )
-                                })
+                .min_w_0()
+                .text_sm()
+                .child(self.text.clone())
+                .into_any_element()
+        } else {
+            TextView::markdown(
+                ElementId::Name(self.message_id.clone().into()),
+                self.text.clone(),
+            )
+            .into_any_element()
+        };
+
+        let actions = MessageActions::new(self.message_id.clone())
+            .message_text(self.copy_text.clone())
+            .can_read_aloud(self.can_read_aloud)
+            .is_native_speaking(self.is_native_speaking)
+            .is_native_paused(self.is_native_paused)
+            .is_native_loading(self.is_native_loading)
+            .is_ai_speaking(self.is_ai_speaking)
+            .is_ai_paused(self.is_ai_paused)
+            .is_ai_loading(self.is_ai_loading)
+            .is_cached(self.is_cached)
+            .when_some(self.on_read_aloud, |this, cb| {
+                this.on_read_aloud(move |w, cx| cb(w, cx))
+            });
+
+        let copy_text = self.copy_text.clone();
+        let message_id = self.message_id.clone();
+        let text = self.copy_text.clone();
+
+        h_flex()
+            .w_full()
+            .id(ElementId::Name(self.message_id.clone().into()))
+            .focusable()
+            .on_action(move |_: &CopyMessage, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+            })
+            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                if event.keystroke.key == "f8" {
+                    cx.dispatch_action(&ToggleReadAloud {
+                        text: text.clone(),
+                        message_id: message_id.clone(),
+                        mode: crate::actions::TtsSource::Native,
+                    });
+                }
+            })
+            .child(
+                KitMessage::new()
+                    .alignment(alignment)
+                    .content(
+                        MessageContent::new()
+                            .bubble(Bubble::new().with_variant(variant).child(body)),
+                    )
+                    .when(self.show_footer, |this| {
+                        this.footer(
+                            MessageFooter::new()
                                 .when_some(self.timestamp, |this, timestamp| {
-                                    this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(timestamp),
-                                    )
-                                }),
+                                    this.child(div().text_xs().child(timestamp))
+                                })
+                                .when(!self.is_me, |this| this.child(actions)),
                         )
-                        .child(
-                            MessageActions::new(self.message_id.clone())
-                                .message_text(self.text.clone())
-                                .can_read_aloud(self.can_read_aloud)
-                                .is_native_speaking(self.is_native_speaking)
-                                .is_native_paused(self.is_native_paused)
-                                .is_native_loading(self.is_native_loading)
-                                .is_ai_speaking(self.is_ai_speaking)
-                                .is_ai_paused(self.is_ai_paused)
-                                .is_ai_loading(self.is_ai_loading)
-                                .is_cached(self.is_cached)
-                                .when_some(self.on_read_aloud, |this, cb| {
-                                    this.on_read_aloud(move |w, cx| cb(w, cx))
-                                }),
-                        )
-                        .on_key_down({
-                            let text = self.text.clone();
-                            let message_id = self.message_id.clone();
-                            move |event: &KeyDownEvent, _window: &mut Window, cx: &mut App| {
-                                if event.keystroke.key == "f8" {
-                                    cx.dispatch_action(&ToggleReadAloud {
-                                        text: text.clone(),
-                                        message_id: message_id.clone(),
-                                        mode: crate::actions::TtsSource::Native,
-                                    });
-                                }
-                            }
-                        }),
-                )
-        }
+                    }),
+            )
     }
 }

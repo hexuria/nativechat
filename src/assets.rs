@@ -1,4 +1,4 @@
-use gpui::{AssetSource, SharedString};
+use gpui_kit::{AssetSource, Result, SharedString};
 use rust_embed::RustEmbed;
 use std::borrow::Cow;
 
@@ -11,20 +11,21 @@ pub struct LocalAssets;
 pub struct CombinedAssets;
 
 impl AssetSource for CombinedAssets {
-    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>, anyhow::Error> {
-        // Try local assets first
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some(f) = LocalAssets::get(path) {
             return Ok(Some(f.data));
         }
-        // Fallback to default assets
-        ui::assets::Assets.load(path)
+        gpui_kit::assets::Assets.load(path)
     }
 
-    fn list(&self, path: &str) -> Result<Vec<SharedString>, anyhow::Error> {
-        let mut files = ui::assets::Assets.list(path)?;
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut files = gpui_kit::assets::Assets.list(path).unwrap_or_default();
         for file in LocalAssets::iter() {
             if file.starts_with(path) {
-                files.push(file.to_string().into());
+                let name = SharedString::from(file.to_string());
+                if !files.contains(&name) {
+                    files.push(name);
+                }
             }
         }
         Ok(files)

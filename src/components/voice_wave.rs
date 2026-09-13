@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::state::AppState;
-use gpui::prelude::*;
-use gpui::{
+use gpui_kit::prelude::*;
+use gpui_kit::{
     AsyncApp, Bounds, Context, Entity, IntoElement, Render, WeakEntity, Window, canvas, fill,
     point, px, size,
 };
-use ui::ActiveTheme;
+use gpui_kit::component::ActiveTheme;
 
 pub struct VoiceWave {
     amplitude: Arc<AtomicU32>,
@@ -28,9 +28,7 @@ impl VoiceWave {
         cx: &mut Context<P>,
     ) -> Entity<Self> {
         cx.new(|cx| {
-            cx.spawn(move |view: WeakEntity<VoiceWave>, cx: &mut AsyncApp| {
-                let mut cx = cx.clone();
-                async move {
+            cx.spawn(async move |view: WeakEntity<Self>, cx: &mut AsyncApp| {
                     loop {
                         // Run at 60fps (approx 16ms) for smooth animation
                         cx.background_executor()
@@ -39,7 +37,7 @@ impl VoiceWave {
 
                         // Update view state
                         if view
-                            .update(&mut cx, |this, cx| {
+                            .update(cx, |this, cx| {
                                 let is_muted =
                                     this.state.read_with(cx, |state, _| state.is_voice_muted);
 
@@ -97,8 +95,7 @@ impl VoiceWave {
                             break;
                         }
                     }
-                }
-            })
+                })
             .detach();
 
             Self {

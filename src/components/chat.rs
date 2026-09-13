@@ -1,11 +1,416 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
 use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::services::tts_service::TtsService;
 use crate::state::AppState;
-use gpui::*;
-use ui::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
-use ui::{ActiveTheme, IndexPath, h_flex, v_flex};
+use gpui_kit::*;
+use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::{ActiveTheme, IndexPath, h_flex, v_flex};
+
+/// Cheap fingerprint so ChatView does not rebuild markdown on unrelated AppState
+/// changes (sidebar toggle, theme, amplitude, etc.).
+#[derive(Clone, PartialEq, Eq)]
+struct ChatFeedRev {
+    conversation_id: Option<String>,
+    message_count: usize,
+    last_id: Option<String>,
+    last_len: usize,
+    is_ai_responding: bool,
+    debug_mode: bool,
+    can_read_aloud: bool,
+    theme_mode: String,
+    native_speaking_id: Option<String>,
+    native_paused: bool,
+    native_loading: bool,
+    ai_speaking_id: Option<String>,
+    ai_paused: bool,
+    ai_loading: bool,
+    highlight: Option<(usize, usize)>,
+}
+
+impl ChatFeedRev {
+    fn from_state(state: &AppState) -> Self {
+        let conv = state.active_conversation_id.as_ref().and_then(|id| {
+            state.conversations.iter().find(|c| &c.id == id)
+        });
+        let last = conv.and_then(|c| c.messages.last());
+        let highlight = state
+            .active_highlight_range()
+            .map(|range| (range.start, range.end));
+        Self {
+            conversation_id: state.active_conversation_id.clone(),
+            message_count: conv.map(|c| c.messages.len()).unwrap_or(0),
+            last_id: last.map(|m| m.id.clone()),
+            last_len: last.map(|m| m.content.len()).unwrap_or(0),
+            is_ai_responding: state.is_ai_responding,
+            debug_mode: state.debug_markdown_disabled,
+            can_read_aloud: state
+                .active_profile()
+                .and_then(|p| p.tts_model_id.as_ref())
+                .is_some(),
+            theme_mode: state.theme_mode.clone(),
+            native_speaking_id: state.native_tts.message_id.clone(),
+            native_paused: state.native_tts.is_paused,
+            native_loading: state.native_tts.is_loading,
+            ai_speaking_id: state.ai_tts.message_id.clone(),
+            ai_paused: state.ai_tts.is_paused,
+            ai_loading: state.ai_tts.is_loading,
+            highlight,
+        }
+    }
+}
+
+/// Byte budget for one virtual list row. A multi-kilobyte bubble cannot be
+/// virtualized by MessageScroller (one item = full layout), and TextView
+/// parses up to 4KB on the UI thread.
+const CHAT_ROW_CHUNK_BYTES: usize = 480;
+
+#[derive(Clone)]
+struct ChatRow {
+    id: String,
+    content: SharedString,
+    is_me: bool,
+    timestamp: SharedString,
+    is_native_speaking: bool,
+    is_native_paused: bool,
+    is_native_loading: bool,
+    is_ai_speaking: bool,
+    is_ai_paused: bool,
+    is_ai_loading: bool,
+    is_cached: bool,
+    highlight_range: Option<std::ops::Range<usize>>,
+    use_markdown: bool,
+    show_footer: bool,
+    source_id: String,
+    tts_text: SharedString,
+}
+
+fn looks_like_markdown(text: &str) -> bool {
+    text.contains("```")
+        || text.contains("](")
+        || text.contains("![")
+        || text.contains("**")
+        || text.starts_with('#')
+        || text.contains("\n#")
+        || text.contains("\n- ")
+        || text.contains("\n* ")
+        || text.contains("\n1. ")
+}
+
+fn chunk_text(text: &str, budget: usize) -> Vec<SharedString> {
+    if text.len() <= budget {
+        return vec![SharedString::from(text.to_string())];
+    }
+
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    for para in text.split("\n\n") {
+        if para.len() > budget {
+            if !buf.is_empty() {
+                out.push(SharedString::from(std::mem::take(&mut buf)));
+            }
+            out.extend(chunk_wrapped(para, budget));
+            continue;
+        }
+        if !buf.is_empty() && buf.len() + 2 + para.len() > budget {
+            out.push(SharedString::from(std::mem::take(&mut buf)));
+        }
+        if !buf.is_empty() {
+            buf.push_str("\n\n");
+        }
+        buf.push_str(para);
+    }
+    if !buf.is_empty() {
+        out.push(SharedString::from(buf));
+    }
+    if out.is_empty() {
+        vec![SharedString::from(text.to_string())]
+    } else {
+        out
+    }
+}
+
+fn chunk_wrapped(text: &str, budget: usize) -> Vec<SharedString> {
+    if text.len() <= budget {
+        return vec![SharedString::from(text.to_string())];
+    }
+    if text.contains('\n') {
+        let mut out = Vec::new();
+        let mut buf = String::new();
+        for line in text.split('\n') {
+            if line.len() > budget {
+                if !buf.is_empty() {
+                    out.push(SharedString::from(std::mem::take(&mut buf)));
+                }
+                out.extend(split_hard(line, budget));
+                continue;
+            }
+            if !buf.is_empty() && buf.len() + 1 + line.len() > budget {
+                out.push(SharedString::from(std::mem::take(&mut buf)));
+            }
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(line);
+        }
+        if !buf.is_empty() {
+            out.push(SharedString::from(buf));
+        }
+        return out;
+    }
+    split_hard(text, budget)
+}
+
+fn split_hard(text: &str, budget: usize) -> Vec<SharedString> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.len() > budget {
+        let mut end = budget;
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let bytes = rest.as_bytes();
+        let mut split = end;
+        while split > 0 && bytes[split] != b' ' {
+            split -= 1;
+            while split > 0 && !rest.is_char_boundary(split) {
+                split -= 1;
+            }
+        }
+        if split == 0 {
+            split = end;
+        }
+        let (chunk, next) = rest.split_at(split);
+        let chunk = chunk.trim();
+        if !chunk.is_empty() {
+            out.push(SharedString::from(chunk.to_string()));
+        }
+        rest = next.trim_start();
+    }
+    if !rest.is_empty() {
+        out.push(SharedString::from(rest.to_string()));
+    }
+    out
+}
+
+fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
+    let Some(conv) = state.active_conversation_id.as_ref().and_then(|id| {
+        state.conversations.iter().find(|c| &c.id == id)
+    }) else {
+        return Arc::new(Vec::new());
+    };
+    let mut rows = Vec::new();
+    for msg in &conv.messages {
+        let is_native_speaking = state.native_tts.message_id.as_ref() == Some(&msg.id);
+        let is_ai_speaking = state.ai_tts.message_id.as_ref() == Some(&msg.id);
+        let highlight_range = if is_native_speaking {
+            state
+                .active_highlight_range()
+                .and_then(|range| map_utf16_range_to_utf8(&msg.content, range))
+        } else if is_ai_speaking {
+            state.active_highlight_range()
+        } else {
+            None
+        };
+        let use_markdown = !msg.is_me && looks_like_markdown(&msg.content);
+        let chunks = chunk_text(&msg.content, CHAT_ROW_CHUNK_BYTES);
+        let last = chunks.len().saturating_sub(1);
+        for (ix, content) in chunks.into_iter().enumerate() {
+            rows.push(ChatRow {
+                id: if ix == 0 {
+                    msg.id.clone()
+                } else {
+                    format!("{}:{ix}", msg.id)
+                },
+                content,
+                is_me: msg.is_me,
+                timestamp: SharedString::from(msg.formatted_time()),
+                is_native_speaking: is_native_speaking && ix == last,
+                is_native_paused: state.native_tts.is_paused && is_native_speaking && ix == last,
+                is_native_loading: state.native_tts.is_loading && is_native_speaking && ix == last,
+                is_ai_speaking: is_ai_speaking && ix == last,
+                is_ai_paused: state.ai_tts.is_paused && is_ai_speaking && ix == last,
+                is_ai_loading: state.ai_tts.is_loading && is_ai_speaking && ix == last,
+                is_cached: TtsService::is_cached(&msg.id),
+                highlight_range: if ix == last {
+                    highlight_range.clone()
+                } else {
+                    None
+                },
+                use_markdown,
+                show_footer: ix == last,
+                source_id: msg.id.clone(),
+                tts_text: if ix == last {
+                    SharedString::from(msg.content.clone())
+                } else {
+                    SharedString::default()
+                },
+            });
+        }
+    }
+    Arc::new(rows)
+}
+
+#[derive(Clone)]
+struct ChatPalette {
+    primary: Hsla,
+    primary_foreground: Hsla,
+    secondary: Hsla,
+    secondary_foreground: Hsla,
+    yellow: Hsla,
+    green: Hsla,
+}
+
+impl ChatPalette {
+    fn from_cx(cx: &App) -> Self {
+        let theme = cx.theme();
+        Self {
+            primary: theme.primary,
+            primary_foreground: theme.primary_foreground,
+            secondary: theme.secondary,
+            secondary_foreground: theme.secondary_foreground,
+            yellow: theme.yellow,
+            green: theme.green,
+        }
+    }
+}
+
+struct ChatTranscript {
+    app_state: Entity<AppState>,
+    scroller: Entity<MessageScrollerState>,
+    rows: Arc<Vec<ChatRow>>,
+    feed_rev: ChatFeedRev,
+    last_conversation_id: Option<String>,
+    debug_mode: bool,
+    can_read_aloud: bool,
+    palette: ChatPalette,
+}
+
+impl ChatTranscript {
+    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let (rows, feed_rev, debug_mode, can_read_aloud, last_conversation_id) = {
+            let app = state.read(cx);
+            let feed_rev = ChatFeedRev::from_state(&app);
+            (
+                snapshot_rows(&app),
+                feed_rev.clone(),
+                feed_rev.debug_mode,
+                feed_rev.can_read_aloud,
+                app.active_conversation_id.clone(),
+            )
+        };
+        let scroller = cx.new(|cx| MessageScrollerState::new(rows.len(), cx));
+        cx.observe(&state, |this, state, cx| {
+            let (feed, rows) = {
+                let app = state.read(cx);
+                let feed = ChatFeedRev::from_state(&app);
+                if this.feed_rev == feed {
+                    return;
+                }
+                (feed, snapshot_rows(&app))
+            };
+            let conv_changed = this.feed_rev.conversation_id != feed.conversation_id;
+            let is_ai_responding = feed.is_ai_responding;
+            this.rows = rows;
+            this.debug_mode = feed.debug_mode;
+            this.can_read_aloud = feed.can_read_aloud;
+            this.last_conversation_id = feed.conversation_id.clone();
+            this.palette = ChatPalette::from_cx(cx);
+            this.feed_rev = feed;
+            let count = this.rows.len();
+            this.scroller.update(cx, |scroller, cx| {
+                let old = scroller.item_count();
+                if conv_changed || count != old {
+                    scroller.reset(count, cx);
+                } else if is_ai_responding && count > 0 {
+                    scroller.remeasure_items(count - 1..count, cx);
+                }
+            });
+            cx.notify();
+        })
+        .detach();
+
+        Self {
+            app_state: state,
+            scroller,
+            rows,
+            feed_rev,
+            last_conversation_id,
+            debug_mode,
+            can_read_aloud,
+            palette: ChatPalette::from_cx(cx),
+        }
+    }
+}
+
+impl Render for ChatTranscript {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows.clone();
+        let app_state = self.app_state.clone();
+        let debug_mode = self.debug_mode;
+        let can_read_aloud = self.can_read_aloud;
+        let palette = self.palette.clone();
+        MessageScroller::new("chat-messages", self.scroller.clone(), move |ix, _, _cx| {
+            let Some(row) = rows.get(ix) else {
+                return div().into_any_element();
+            };
+            let highlight_color = if row.is_native_speaking {
+                Some(palette.yellow.opacity(0.4))
+            } else if row.is_ai_speaking {
+                Some(palette.green.opacity(0.4))
+            } else {
+                None
+            };
+            let (bg_color, text_color) = if row.is_me {
+                (palette.primary, palette.primary_foreground)
+            } else {
+                (palette.secondary, palette.secondary_foreground)
+            };
+            let state_entity = app_state.clone();
+            let source_id = row.source_id.clone();
+            let tts_text = row.tts_text.to_string();
+            let show_footer = row.show_footer;
+            let mut bubble = MessageBubble::new(row.content.to_string())
+                .message_id(row.id.clone())
+                .is_me(row.is_me)
+                .bg_color(bg_color)
+                .text_color(text_color)
+                .timestamp(row.timestamp.to_string())
+                .debug_mode(debug_mode)
+                .can_read_aloud(can_read_aloud && show_footer)
+                .is_native_speaking(row.is_native_speaking)
+                .is_native_paused(row.is_native_paused)
+                .is_native_loading(row.is_native_loading)
+                .is_ai_speaking(row.is_ai_speaking)
+                .is_ai_paused(row.is_ai_paused)
+                .is_ai_loading(row.is_ai_loading)
+                .is_cached(row.is_cached)
+                .highlight_range(row.highlight_range.clone())
+                .highlight_color(highlight_color)
+                .use_markdown(row.use_markdown)
+                .show_footer(show_footer);
+            if show_footer {
+                bubble = bubble.copy_text(tts_text.clone()).on_read_aloud(move |_, cx| {
+                    state_entity.update(cx, |state, cx| {
+                        state.toggle_read_aloud(
+                            source_id.clone(),
+                            tts_text.clone(),
+                            crate::actions::TtsSource::Native,
+                            cx,
+                        );
+                    });
+                });
+            }
+            bubble.into_any_element()
+        })
+        .pt(px(80.0))
+        .with_jump_button_transition(Duration::ZERO)
+    }
+}
 
 #[derive(Clone, PartialEq, Debug)]
 struct ProfileItem {
@@ -28,10 +433,14 @@ impl SelectItem for ProfileItem {
 pub struct ChatView {
     input: Entity<MessageInput>,
     state: Entity<AppState>,
-    scroll_handle: ScrollHandle,
+    transcript: Entity<ChatTranscript>,
     profile_select: Entity<SelectState<SearchableVec<ProfileItem>>>,
     cached_profiles: Vec<ProfileItem>,
     should_focus_input: bool,
+    profiles_need_sync: bool,
+    selection_need_sync: bool,
+    active_profile_id: Option<i64>,
+    last_conversation_id: Option<String>,
 }
 
 impl ChatView {
@@ -47,38 +456,40 @@ impl ChatView {
             })
         });
 
-        let scroll_handle = ScrollHandle::new();
-
-        // Initialize profile select items
-        let app_state = state.read(cx);
-        let mut profile_items: Vec<ProfileItem> = app_state
-            .db_profiles
-            .iter()
-            .map(|p| ProfileItem {
-                id: Some(p.id),
-                name: p.name.chars().take(30).collect::<String>(),
-            })
-            .collect();
-
-        // Add "Create New Profile" option
-        profile_items.push(ProfileItem {
-            id: None,
-            name: "Create New Profile...".to_string(),
-        });
-
-        let profile_items_vec = SearchableVec::new(profile_items.clone());
-
-        // Determine initial selection
-        let initial_selection = if let Some(active_id) = app_state.active_profile_id {
-            profile_items_vec
-                .items()
+        let (last_conversation_id, profile_items, initial_selection, active_profile_id) = {
+            let app_state = state.read(cx);
+            let last_conversation_id = app_state.active_conversation_id.clone();
+            let active_profile_id = app_state.active_profile_id;
+            let mut profile_items: Vec<ProfileItem> = app_state
+                .db_profiles
                 .iter()
-                .position(|p| p.id == Some(active_id))
-                .map(|ix| IndexPath::default().row(ix))
-        } else {
-            None
+                .map(|p| ProfileItem {
+                    id: Some(p.id),
+                    name: p.name.chars().take(30).collect::<String>(),
+                })
+                .collect();
+            profile_items.push(ProfileItem {
+                id: None,
+                name: "Create New Profile...".to_string(),
+            });
+            let initial_selection = if let Some(active_id) = app_state.active_profile_id {
+                profile_items
+                    .iter()
+                    .position(|p| p.id == Some(active_id))
+                    .map(IndexPath::new)
+            } else {
+                None
+            };
+            (
+                last_conversation_id,
+                profile_items,
+                initial_selection,
+                active_profile_id,
+            )
         };
 
+        let transcript = cx.new(|cx| ChatTranscript::new(state.clone(), cx));
+        let profile_items_vec = SearchableVec::new(profile_items.clone());
         let profile_select = cx.new(|cx| {
             SelectState::new(profile_items_vec, initial_selection, window, cx).searchable(true)
         });
@@ -86,20 +497,21 @@ impl ChatView {
         let this = Self {
             input,
             state: state.clone(),
-            scroll_handle: scroll_handle.clone(),
+            transcript,
             profile_select: profile_select.clone(),
             cached_profiles: profile_items,
             should_focus_input: false,
+            profiles_need_sync: false,
+            selection_need_sync: false,
+            active_profile_id,
+            last_conversation_id,
         };
 
-        cx.observe(&state, {
-            let scroll_handle = scroll_handle.clone();
-            move |_, state, cx| {
-                let state = state.read(cx);
-                if state.is_ai_responding {
-                    // Scroll to bottom during streaming
-                    scroll_handle.scroll_to_bottom();
-                }
+        cx.observe(&state, |this: &mut Self, state, cx| {
+            let current_id = state.read(cx).active_conversation_id.clone();
+            if current_id != this.last_conversation_id {
+                this.last_conversation_id = current_id;
+                this.should_focus_input = true;
                 cx.notify();
             }
         })
@@ -149,43 +561,14 @@ impl ChatView {
                     name: "Create New Profile...".to_string(),
                 });
 
-                this.cached_profiles = full_items.clone();
-                let profile_items_vec = SearchableVec::new(full_items);
-                this.profile_select.update(cx, |select, cx| {
-                    select.set_items(profile_items_vec, cx);
-                });
+                this.cached_profiles = full_items;
+                this.profiles_need_sync = true;
                 changed = true;
             }
 
-            // Sync active profile selection
-            let current_index = this.profile_select.read(cx).selected_index(cx);
-            let current_profile = current_index.and_then(|ix| this.cached_profiles.get(ix.row));
-
-            let expected_selection = if let Some(id) = active_id {
-                profiles.iter().find(|p| p.id == id).map(|p| ProfileItem {
-                    id: Some(p.id),
-                    name: p.name.chars().take(30).collect::<String>(),
-                })
-            } else {
-                None
-            };
-
-            if let Some(expected) = &expected_selection {
-                if current_profile != Some(expected) {
-                    if let Some(index) = this.cached_profiles.iter().position(|p| p == expected) {
-                        this.profile_select.update(cx, |select, cx| {
-                            select.set_selected_index_deferred(
-                                Some(IndexPath::default().row(index)),
-                                cx,
-                            );
-                        });
-                        changed = true;
-                    }
-                }
-            } else if current_profile.is_some() {
-                this.profile_select.update(cx, |select, cx| {
-                    select.set_selected_index_deferred(None, cx);
-                });
+            if this.active_profile_id != active_id {
+                this.active_profile_id = active_id;
+                this.selection_need_sync = true;
                 changed = true;
             }
 
@@ -218,25 +601,6 @@ impl ChatView {
         )
         .detach();
 
-        // Focus input when conversation changes (especially on new chat creation)
-        cx.observe(&state, {
-            let mut last_conversation_id: Option<String> =
-                state.read(cx).active_conversation_id.clone();
-
-            move |this: &mut Self, state, cx| {
-                let state = state.read(cx);
-                let current_id = state.active_conversation_id.clone();
-
-                // If conversation changed, trigger focus on next render
-                if current_id != last_conversation_id {
-                    last_conversation_id = current_id;
-                    this.should_focus_input = true;
-                    cx.notify();
-                }
-            }
-        })
-        .detach();
-
         this
     }
 }
@@ -253,37 +617,21 @@ impl Render for ChatView {
             });
         }
 
-        // Sync active profile selection if needed
-        let active_id = self.state.read(cx).active_profile_id;
-        let current_selection = self
-            .profile_select
-            .read(cx)
-            .selected_value()
-            .cloned()
-            .flatten();
-        if active_id != current_selection {
+        if self.profiles_need_sync {
+            let items = SearchableVec::new(self.cached_profiles.clone());
+            self.profile_select.update(cx, |select, cx| {
+                select.set_items(items, window, cx);
+            });
+            self.profiles_need_sync = false;
+        }
+
+        if self.selection_need_sync {
+            let active_id = self.active_profile_id;
             self.profile_select.update(cx, |select, cx| {
                 select.set_selected_value(&active_id, window, cx);
             });
+            self.selection_need_sync = false;
         }
-
-        let state = self.state.read(cx);
-        let active_conversation = state
-            .active_conversation_id
-            .as_ref()
-            .and_then(|id| state.conversations.iter().find(|c| &c.id == id));
-
-        let messages = if let Some(conversation) = active_conversation {
-            conversation.messages.clone()
-        } else {
-            vec![]
-        };
-
-        let debug_mode = state.debug_markdown_disabled;
-        let can_read_aloud = state
-            .active_profile()
-            .and_then(|p| p.tts_model_id.as_ref())
-            .is_some();
 
         v_flex()
             .size_full()
@@ -342,109 +690,14 @@ impl Render for ChatView {
             .child(
                 // Main Content Area (Header + Messages)
                 div()
-                    .flex_grow()
-                    .min_h(px(0.0)) // Ensure it can shrink/scroll properly
+                    .id("chat-transcript-slot")
+                    .flex_1()
+                    .min_h_0()
                     .relative()
                     .child(
-                        // Messages Area - simple scrollable list (testing)
-                        div()
-                            .id("chat-scroll-container")
-                            .track_scroll(&self.scroll_handle)
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .overflow_y_scroll()
-                            .px_4()
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .max_w(px(800.0))
-                                    .mx_auto()
-                                    .pt(px(80.0))
-                                    .pb(px(20.0))
-                                    .gap_4()
-                                    .children(messages.iter().map(|msg| {
-                                        let (bg_color, text_color) = if msg.is_me {
-                                            (theme.primary, theme.primary_foreground)
-                                        } else {
-                                            (theme.secondary, theme.secondary_foreground)
-                                        };
-
-                                        // Determine speaking state from both:
-                                        let is_native_speaking =
-                                            state.native_tts.message_id.as_ref() == Some(&msg.id);
-                                        let is_native_loading =
-                                            state.native_tts.is_loading && is_native_speaking;
-                                        let is_native_paused =
-                                            state.native_tts.is_paused && is_native_speaking;
-
-                                        let is_ai_speaking =
-                                            state.ai_tts.message_id.as_ref() == Some(&msg.id);
-                                        let is_ai_loading =
-                                            state.ai_tts.is_loading && is_ai_speaking;
-                                        let is_ai_paused = state.ai_tts.is_paused && is_ai_speaking;
-
-                                        let is_cached = TtsService::is_cached(&msg.id);
-
-                                        let (is_speaking, highlight_color) = if is_native_speaking {
-                                            (true, Some(theme.yellow.opacity(0.4)))
-                                        } else if is_ai_speaking {
-                                            (true, Some(theme.green.opacity(0.4)))
-                                        } else {
-                                            (false, None)
-                                        };
-
-                                        // Determine highlight range based on which TTS source is active
-                                        // Native TTS: uses original text with UTF-16 callbacks from macOS
-                                        // REST/AI TTS: uses stripped text with UTF-8 byte offsets
-                                        let highlight_range = if is_native_speaking {
-                                            // Native TTS uses original text - macOS callback provides UTF-16 range
-                                            state.active_highlight_range().and_then(|range| {
-                                                map_utf16_range_to_utf8(&msg.content, range)
-                                            })
-                                        } else if is_ai_speaking {
-                                            // REST TTS simulation uses UTF-8 byte offsets on stripped text
-                                            state.active_highlight_range()
-                                        } else {
-                                            None
-                                        };
-
-                                        MessageBubble::new(msg.content.clone())
-                                            .message_id(msg.id.clone())
-                                            .is_me(msg.is_me)
-                                            .bg_color(bg_color)
-                                            .text_color(text_color)
-                                            .timestamp(msg.formatted_time())
-                                            .debug_mode(debug_mode)
-                                            .can_read_aloud(can_read_aloud)
-                                            .is_native_speaking(is_native_speaking)
-                                            .is_native_paused(is_native_paused)
-                                            .is_native_loading(is_native_loading)
-                                            .is_ai_speaking(is_ai_speaking)
-                                            .is_ai_paused(is_ai_paused)
-                                            .is_ai_loading(is_ai_loading)
-                                            .is_cached(is_cached)
-                                            .highlight_range(highlight_range)
-                                            .highlight_color(highlight_color)
-                                            .on_read_aloud({
-                                                let state = self.state.clone();
-                                                let message_id = msg.id.clone();
-                                                let message_text = msg.content.clone();
-                                                move |_, cx| {
-                                                    state.update(cx, |state, cx| {
-                                                        state.toggle_read_aloud(
-                                                            message_id.clone(),
-                                                            message_text.clone(),
-                                                            crate::actions::TtsSource::Native,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
-                                            })
-                                    })),
-                            ),
+                        self.transcript
+                            .clone()
+                            .cached(StyleRefinement::default().absolute().size_full()),
                     )
                     .child(
                         // Header - Absolute positioned at top
@@ -467,7 +720,6 @@ impl Render for ChatView {
                                             .id("profile-select")
                                             .placeholder("Select Profile")
                                             .search_placeholder("Search profile...")
-                                            .anchor(Corner::TopLeft)
                                             .w_full(),
                                     ),
                                 ),

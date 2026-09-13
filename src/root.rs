@@ -1,10 +1,10 @@
 use crate::actions::{
-    About, Hide, HideOthers, Minimize, NewChat, ShowAll, ToggleDebugMarkdown, ToggleSidebar,
-    ToggleTheme, Zoom,
+    About, Hide, HideOthers, Minimize, NewChat, ShowAll, ToggleDebugMarkdown, ToggleFps,
+    ToggleSidebar, ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
-use gpui::prelude::*;
-use gpui::{InteractiveElement, *};
+use gpui_kit::prelude::*;
+use gpui_kit::{InteractiveElement, *};
 
 use crate::state::AppState;
 
@@ -12,7 +12,7 @@ use crate::components::circular_voice_viz::CircularVoiceViz;
 use crate::components::modals::credentials_modal::CredentialsModal;
 use crate::components::modals::profile_settings::ProfileSettingsModal;
 use crate::components::voice_mode_modal::render_voice_mode_modal;
-use ui::{ActiveTheme, Root};
+use gpui_kit::component::{ActiveTheme, Root};
 
 #[derive(Clone)]
 pub struct RootView {
@@ -22,6 +22,9 @@ pub struct RootView {
     credentials_modal: Option<Entity<CredentialsModal>>,
     profile_settings_modal: Option<Entity<ProfileSettingsModal>>,
     pub focus_handle: FocusHandle,
+    show_fps: bool,
+    #[cfg(feature = "agent")]
+    mailbox: Option<crate::agent::AgentMailbox>,
 }
 
 impl RootView {
@@ -36,12 +39,113 @@ impl RootView {
             credentials_modal: None,
             profile_settings_modal: None,
             focus_handle,
+            show_fps: true,
+            #[cfg(feature = "agent")]
+            mailbox: None,
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    pub fn attach_agent(
+        mut self,
+        mailbox: Option<crate::agent::AgentMailbox>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let poll = mailbox.clone();
+        if poll.is_some() {
+            // Do not lease RootView on the empty-mailbox poll. `update` every
+            // 16ms dirties the window and rebuilds the chat (~30fps cap).
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(16))
+                        .await;
+                    let pending = poll.as_ref().is_some_and(|mailbox| !mailbox.is_empty());
+                    if pending {
+                        if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            break;
+                        }
+                    } else if this.upgrade().is_none() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        self.mailbox = mailbox;
+        self
+    }
+
+    #[cfg(feature = "agent")]
+    fn drain_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mailbox) = self.mailbox.clone() else {
+            return;
+        };
+        for posted in mailbox.take() {
+            if let gpui_agent::Op::Screenshot {
+                path,
+                mode,
+                target,
+                ..
+            } = &posted.request.op
+            {
+                let response = if mode.is_scrolled() {
+                    gpui_agent::Response::err(
+                        &posted.request.id,
+                        gpui_agent::screenshot_unavailable(format!(
+                            "scrolled screenshot is not wired (target={})",
+                            target.as_deref().unwrap_or("?")
+                        )),
+                    )
+                } else {
+                    match crate::agent::screenshot_this_window(window, path.as_deref()) {
+                        Ok(result) => {
+                            let mut resp = gpui_agent::Response::ok(&posted.request.id);
+                            resp.result = result.value;
+                            resp
+                        }
+                        Err(error) => gpui_agent::Response::err(&posted.request.id, error),
+                    }
+                };
+                posted.reply(response);
+                cx.notify();
+                continue;
+            }
+
+            if posted.request.op.is_virtual_input() {
+                let id = posted.request.id.clone();
+                posted.reply(gpui_agent::Response::err(
+                    id,
+                    gpui_agent::virtual_unavailable("NativeChat agent host is semantic-only"),
+                ));
+                continue;
+            }
+
+            let shutdown = matches!(posted.request.op, gpui_agent::Op::Shutdown);
+            let mut host = crate::agent::NativeChatHost::from_app(self.state.read(cx));
+            let response =
+                gpui_agent::handle_request(&mut host, posted.request.clone(), None, None);
+            if let Some(cmd) = host.take_command() {
+                let quit = matches!(cmd, crate::agent::Command::Shutdown);
+                self.state.update(cx, |state, cx| cmd.apply(state, cx));
+                if quit {
+                    cx.quit();
+                }
+            }
+            posted.reply(response);
+            if shutdown {
+                cx.quit();
+            }
+            cx.notify();
         }
     }
 }
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(feature = "agent")]
+        self.drain_agent(window, cx);
+
         let (
             is_voice_mode_open,
             amplitude,
@@ -134,6 +238,10 @@ impl Render for RootView {
                     state.update(cx, |state, cx| state.toggle_debug_markdown(cx));
                 }
             })
+            .on_action(cx.listener(|this, _: &ToggleFps, _, cx| {
+                this.show_fps = !this.show_fps;
+                cx.notify();
+            }))
             // Voice Mode Modal Overlay
             .children(if is_voice_mode_open {
                 if let Some(viz) = viz {
@@ -218,5 +326,8 @@ impl Render for RootView {
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
+            .when(self.show_fps, |this| {
+                this.child(gpui_fps::fps_monitor(window, cx))
+            })
     }
 }

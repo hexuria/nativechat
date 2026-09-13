@@ -1,9 +1,10 @@
-use gpui::{
+use gpui_kit::{
     App, Entity, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, RenderOnce,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, red, white,
 };
 use std::rc::Rc;
-use ui::{ActiveTheme, Icon, IconName, StyledExt, colors, h_flex, input::Input, v_flex};
+use crate::icons::NativeIcon;
+use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt, h_flex, input::Input, v_flex};
 
 #[derive(IntoElement)]
 pub struct ChatSessionItem {
@@ -14,7 +15,7 @@ pub struct ChatSessionItem {
     is_editing: bool,
     is_deleting: bool,
     collapsed: bool,
-    input: Option<Entity<ui::input::InputState>>,
+    input: Option<Entity<gpui_kit::component::input::InputState>>,
     on_select: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_edit: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_delete: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
@@ -60,7 +61,7 @@ impl ChatSessionItem {
         self
     }
 
-    pub fn input(mut self, input: Option<Entity<ui::input::InputState>>) -> Self {
+    pub fn input(mut self, input: Option<Entity<gpui_kit::component::input::InputState>>) -> Self {
         self.input = input;
         self
     }
@@ -143,7 +144,7 @@ impl RenderOnce for ChatSessionItem {
         // In collapsed mode, render a simple icon button (skip editing/deleting states)
         if self.collapsed {
             return div()
-                .id(gpui::SharedString::from(format!(
+                .id(gpui_kit::SharedString::from(format!(
                     "collapsed-{}",
                     self.id.clone()
                 )))
@@ -164,7 +165,7 @@ impl RenderOnce for ChatSessionItem {
                     this.on_click(move |_, window, cx| callback(window, cx))
                 })
                 .child(
-                    Icon::new(IconName::Session)
+                    Icon::new(NativeIcon::Session)
                         .size_4()
                         .when(self.is_active, |s| {
                             s.text_color(theme.sidebar_accent_foreground)
@@ -225,7 +226,7 @@ impl RenderOnce for ChatSessionItem {
                                         .py_1()
                                         .rounded_md()
                                         .bg(theme.danger)
-                                        .text_color(colors::white())
+                                        .text_color(white())
                                         .text_xs()
                                         .child("Delete")
                                         .on_click({
@@ -290,7 +291,7 @@ impl RenderOnce for ChatSessionItem {
                                 .p_1()
                                 .rounded_md()
                                 .hover(|s| s.bg(theme.sidebar_accent))
-                                .child(Icon::new(IconName::Close).size_4())
+                                .child(Icon::new(NativeIcon::Close).size_4())
                                 .on_click({
                                     let callback = self.on_cancel_edit.clone();
                                     move |_, window, cx| {
@@ -308,7 +309,7 @@ impl RenderOnce for ChatSessionItem {
         let id = self.id.clone();
 
         div()
-            .id(gpui::SharedString::from(id.clone()))
+            .id(gpui_kit::SharedString::from(id.clone()))
             .group("session-item")
             .w_full()
             .rounded_md()
@@ -330,15 +331,24 @@ impl RenderOnce for ChatSessionItem {
                     .p_2()
                     .child(
                         h_flex()
+                            .flex_1()
+                            .min_w(px(0.))
                             .gap_2()
                             .items_center()
                             .overflow_hidden()
                             .child(
-                                Icon::new(IconName::Session)
+                                Icon::new(NativeIcon::Session)
                                     .size_4()
                                     .text_color(theme.muted_foreground),
                             )
-                            .child(div().text_sm().truncate().child(self.title.clone())),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_sm()
+                                    .truncate()
+                                    .child(self.title.clone()),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -365,7 +375,7 @@ impl RenderOnce for ChatSessionItem {
                                             .p_1()
                                             .rounded_md()
                                             .hover(|s| s.bg(theme.background))
-                                            .child(Icon::new(IconName::Pencil).size_4())
+                                            .child(Icon::new(NativeIcon::Pencil).size_4())
                                             .on_click({
                                                 let callback = self.on_edit.clone();
                                                 move |_, window, cx| {
@@ -382,8 +392,8 @@ impl RenderOnce for ChatSessionItem {
                                             .cursor_pointer()
                                             .p_1()
                                             .rounded_md()
-                                            .hover(|s| s.bg(colors::red_400().opacity(0.9)))
-                                            .child(Icon::new(IconName::Trash).size_4())
+                                            .hover(|s| s.bg(red().opacity(0.9)))
+                                            .child(Icon::new(NativeIcon::Trash).size_4())
                                             .on_click({
                                                 let callback = self.on_delete.clone();
                                                 move |_, window, cx| {

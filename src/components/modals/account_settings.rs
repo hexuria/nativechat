@@ -1,10 +1,11 @@
 use crate::state::AppState;
-use gpui::InteractiveElement;
-use gpui::prelude::*;
-use gpui::{
+use gpui_kit::InteractiveElement;
+use gpui_kit::prelude::*;
+use gpui_kit::{
     Context, Entity, FontWeight, IntoElement, MouseButton, Render, Styled, Window, div, px,
 };
-use ui::{
+use crate::icons::NativeIcon;
+use gpui_kit::component::{
     ActiveTheme, Icon, IconName,
     button::Button,
     input::{Input, InputState},
@@ -44,8 +45,8 @@ impl AccountSettingsModal {
 
     fn render_profile_tab(
         &self,
-        foreground: gpui::Hsla,
-        background: gpui::Hsla,
+        foreground: gpui_kit::Hsla,
+        background: gpui_kit::Hsla,
         _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -71,7 +72,7 @@ impl AccountSettingsModal {
                         div()
                             .child("Email cannot be changed")
                             .text_xs()
-                            .text_color(gpui::red()),
+                            .text_color(gpui_kit::red()),
                     ),
             )
             .child(
@@ -85,8 +86,8 @@ impl AccountSettingsModal {
 
     fn render_security_tab(
         &self,
-        foreground: gpui::Hsla,
-        background: gpui::Hsla,
+        foreground: gpui_kit::Hsla,
+        background: gpui_kit::Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -109,7 +110,7 @@ impl AccountSettingsModal {
                             .justify_between()
                             .items_center()
                             .child(div().child("Email & Password"))
-                            .child(Icon::new(IconName::Check).text_color(gpui::green())),
+                            .child(Icon::new(IconName::Check).text_color(gpui_kit::green())),
                     )
                     .child(
                         div()
@@ -120,7 +121,7 @@ impl AccountSettingsModal {
                             .justify_between()
                             .items_center()
                             .child(div().child("Google"))
-                            .child(Icon::new(IconName::Check).text_color(gpui::green())),
+                            .child(Icon::new(IconName::Check).text_color(gpui_kit::green())),
                     ),
             )
             .child(
@@ -149,7 +150,7 @@ impl AccountSettingsModal {
                     .child("No advanced settings available")
                     .font_weight(FontWeight::BOLD)
                     .text_sm()
-                    .text_color(gpui::white()),
+                    .text_color(gpui_kit::white()),
             ),
         )
     }
@@ -164,7 +165,7 @@ impl Render for AccountSettingsModal {
         div()
             .absolute()
             .inset_0()
-            .bg(gpui::black().opacity(0.5)) // Overlay
+            .bg(gpui_kit::black().opacity(0.5)) // Overlay
             // Prevent clicks from passing through to elements behind the modal
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
@@ -207,10 +208,10 @@ impl Render for AccountSettingsModal {
                                             .text_lg(),
                                     )
                                     .child(
-                                        gpui::div()
+                                        gpui_kit::div()
                                             .id("close-account-settings")
                                             .cursor_pointer()
-                                            .child(Icon::new(IconName::Close))
+                                            .child(Icon::new(NativeIcon::Close))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.state.update(cx, |state, cx| {
                                                     state.toggle_account_settings(cx);
@@ -221,7 +222,7 @@ impl Render for AccountSettingsModal {
                             .child(
                                 // Tabs - using segmented tabs with filling space
                                 div().px_4().pt_4().child(
-                                    ui::tab::TabBar::new("account-settings-tabs")
+                                    gpui_kit::component::tab::TabBar::new("account-settings-tabs")
                                         .w_full()
                                         .segmented()
                                         .selected_index(self.active_tab)
@@ -229,9 +230,9 @@ impl Render for AccountSettingsModal {
                                             this.active_tab = *ix;
                                             cx.notify();
                                         }))
-                                        .child(ui::tab::Tab::new().flex_1().label("Profile"))
-                                        .child(ui::tab::Tab::new().flex_1().label("Security"))
-                                        .child(ui::tab::Tab::new().flex_1().label("Advanced")),
+                                        .child(gpui_kit::component::tab::Tab::new().flex_1().label("Profile"))
+                                        .child(gpui_kit::component::tab::Tab::new().flex_1().label("Security"))
+                                        .child(gpui_kit::component::tab::Tab::new().flex_1().label("Advanced")),
                                 ),
                             )
                             .child(

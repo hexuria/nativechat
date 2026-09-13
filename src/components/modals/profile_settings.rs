@@ -1,21 +1,21 @@
 use crate::services::database::{Credential, Profile};
 use crate::services::model_registry::{ModelProfile, ModelType, Provider};
+use crate::icons::NativeIcon;
 use crate::state::AppState;
 
-use gpui::prelude::*;
-use gpui::*;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
 use std::collections::HashMap;
 use std::rc::Rc;
-use ui::button::ButtonVariants;
-use ui::list::ListItem;
-use ui::notification::Notification;
+use gpui_kit::component::button::ButtonVariants;
+use gpui_kit::component::list::ListItem;
+use gpui_kit::component::notification::Notification;
 
-use ui::root::root::WindowExt;
-use ui::scroll::ScrollbarAxis;
-use ui::{
+use gpui_kit::component::WindowExt;
+use gpui_kit::component::scroll::ScrollbarAxis;
+use gpui_kit::component::{
     Disableable, Icon, IconName, Sizable, Size as UiSize, StyledExt,
     button::{Button, ButtonVariant},
-    dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputState},
     label::Label,
@@ -23,7 +23,7 @@ use ui::{
     select::{SearchableVec, Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
     theme::ActiveTheme,
 };
-use ui::{IndexPath, StyleSized};
+use gpui_kit::component::{IndexPath, StyleSized};
 
 #[derive(Clone)]
 pub struct CredentialItem(pub Credential);
@@ -78,7 +78,12 @@ impl ListDelegate for ProfileListDelegate {
         self.profiles.len()
     }
 
-    fn render_item(&self, ix: IndexPath, _window: &mut Window, cx: &mut App) -> Option<Self::Item> {
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> Option<Self::Item> {
         let profile = self.profiles.get(ix.row)?;
         let theme = cx.theme();
         let is_selected = self.selected_index == Some(ix.row);
@@ -165,6 +170,8 @@ pub struct ProfileSettingsModal {
     credentials: Vec<Credential>,
     mode: ProfileMode,
     needs_reset: bool,
+    selects_dirty: bool,
+    reset_models: bool,
     creating_chat_cred: bool,
     creating_embedding_cred: bool,
     creating_image_cred: bool,
@@ -332,6 +339,8 @@ impl ProfileSettingsModal {
             credentials: Vec::new(),
             mode: ProfileMode::Creating,
             needs_reset: false,
+            selects_dirty: true,
+            reset_models: false,
             creating_chat_cred: false,
             creating_embedding_cred: false,
             creating_image_cred: false,
@@ -364,7 +373,7 @@ impl ProfileSettingsModal {
         .detach();
 
         // Update provider selects after models are fetched
-        this.update_provider_selects(cx);
+        this.update_provider_selects(window, cx);
 
         // Subscribe to modal open state to refresh data
         cx.observe(&state_clone, |this: &mut Self, state, cx| {
@@ -462,8 +471,8 @@ impl ProfileSettingsModal {
             }
 
             // Update model and credential selects based on providers
-            self.update_model_selects(cx, false);
-            self.update_credential_selects(cx);
+            self.update_model_selects(window, cx, false);
+            self.update_credential_selects(window, cx);
 
             // Set models
             if let Some(model_id) = &profile.text_model_id {
@@ -493,7 +502,7 @@ impl ProfileSettingsModal {
             }
 
             // Update credential selects again after models are set
-            self.update_credential_selects(cx);
+            self.update_credential_selects(window, cx);
 
             // Set chat credential
             if let Some(cred_id) = profile.text_credential_id {
@@ -503,7 +512,7 @@ impl ProfileSettingsModal {
                         .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
                 } else {
                     self.chat_credential_select
-                        .update(cx, |s, cx| s.reset_selection(cx));
+                        .update(cx, |s, cx| s.set_selected_index(None, window, cx));
                 }
             } else {
                 // Try to use system credential as fallback
@@ -526,7 +535,7 @@ impl ProfileSettingsModal {
                 }
                 if !found {
                     self.chat_credential_select
-                        .update(cx, |s, cx| s.reset_selection(cx));
+                        .update(cx, |s, cx| s.set_selected_index(None, window, cx));
                 }
             }
 
@@ -538,7 +547,7 @@ impl ProfileSettingsModal {
                         .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
                 } else {
                     self.embedding_credential_select
-                        .update(cx, |s, cx| s.reset_selection(cx));
+                        .update(cx, |s, cx| s.set_selected_index(None, window, cx));
                 }
             } else {
                 // Try to use system credential as fallback
@@ -561,7 +570,7 @@ impl ProfileSettingsModal {
                 }
                 if !found {
                     self.embedding_credential_select
-                        .update(cx, |s, cx| s.reset_selection(cx));
+                        .update(cx, |s, cx| s.set_selected_index(None, window, cx));
                 }
             }
 
@@ -573,7 +582,7 @@ impl ProfileSettingsModal {
                         .update(cx, |s, cx| s.set_selected_value(&item.0, window, cx));
                 } else {
                     self.image_credential_select
-                        .update(cx, |s, cx| s.reset_selection(cx));
+                        .update(cx, |s, cx| s.set_selected_index(None, window, cx));
                 }
             } else {
                 // Try to use system credential as fallback
@@ -596,7 +605,7 @@ impl ProfileSettingsModal {
                 }
                 if !found {
                     self.image_credential_select
-                        .update(cx, |s, cx| s.reset_selection(cx));
+                        .update(cx, |s, cx| s.set_selected_index(None, window, cx));
                 }
             }
             cx.notify();
@@ -605,9 +614,7 @@ impl ProfileSettingsModal {
 
     fn fetch_credentials(&mut self, cx: &mut Context<Self>) {
         let db = self.state.read(cx).database_service.clone();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
+        cx.spawn(async move |this, cx| {
                 let mut credentials = if let Some(db) = db {
                     db.get_credentials().await.unwrap_or_default()
                 } else {
@@ -643,21 +650,18 @@ impl ProfileSettingsModal {
                     });
                 }
 
-                this.update(&mut cx, |this, cx| {
+                this.update(cx, |this, cx| {
                     this.credentials = credentials;
-                    this.update_credential_selects(cx);
+                    this.selects_dirty = true;
                     cx.notify();
                 })
                 .ok();
-            }
-        })
+            })
         .detach();
     }
     fn fetch_profiles(&mut self, select_id: Option<i64>, cx: &mut Context<Self>) {
         let db = self.state.read(cx).database_service.clone();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
+        cx.spawn(async move |this, cx| {
                 let profiles = if let Some(db) = db {
                     db.get_profiles().await.ok()
                 } else {
@@ -665,7 +669,7 @@ impl ProfileSettingsModal {
                 };
 
                 if let Some(profiles) = profiles {
-                    this.update(&mut cx, |this, cx| {
+                    this.update(cx, |this, cx| {
                         this.list_state.update(cx, |list, cx| {
                             list.delegate_mut().profiles = profiles;
 
@@ -688,8 +692,7 @@ impl ProfileSettingsModal {
                     })
                     .ok();
                 }
-            }
-        })
+            })
         .detach();
     }
 
@@ -702,33 +705,26 @@ impl ProfileSettingsModal {
         let db = self.state.read(cx).database_service.clone();
         let weak_self = cx.entity().downgrade();
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_alert_dialog(cx, move |dialog, _, _| {
             dialog
                 .title("Delete Profile")
                 .child(div().child(
                     "Are you sure you want to delete this profile? This action cannot be undone.",
                 ))
                 .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_variant(ButtonVariant::Danger)
-                        .ok_text("Delete"),
-                )
                 .on_ok({
                     let db = db.clone();
                     let weak_self = weak_self.clone();
                     move |_, _, cx| {
                         let db = db.clone();
                         let weak_self = weak_self.clone();
-                        cx.spawn(move |cx: &mut AsyncApp| {
-                            let mut cx = cx.clone();
-                            async move {
+                        cx.spawn(async move |cx| {
                                 if let Some(db) = db {
                                     if let Err(e) = db.delete_profile(id).await {
                                         eprintln!("Failed to delete profile: {}", e);
                                     } else {
                                         weak_self
-                                            .update(&mut cx, |this, cx| {
+                                            .update(cx, |this, cx| {
                                                 this.fetch_profiles(None, cx);
                                                 this.needs_reset = true;
                                                 cx.notify();
@@ -736,8 +732,7 @@ impl ProfileSettingsModal {
                                             .ok();
                                     }
                                 }
-                            }
-                        })
+                            })
                         .detach();
 
                         true
@@ -813,7 +808,7 @@ impl ProfileSettingsModal {
             let new_index = delegate.profiles.len() - 1;
 
             // Update ListState's selected_index via set_selected_index
-            list.set_selected_index(Some(IndexPath::default().row(new_index)), window, cx);
+            list.set_selected_index(Some(IndexPath::new(new_index)), window, cx);
             self.selected_index = Some(new_index);
 
             cx.notify();
@@ -890,9 +885,7 @@ impl ProfileSettingsModal {
             image_credential_id
         );
 
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
+        cx.spawn(async move |this, cx| {
                 let result = if let Some(db) = db {
                     match mode {
                         ProfileMode::Creating => {
@@ -949,7 +942,7 @@ impl ProfileSettingsModal {
                     Err("Database service not available".to_string())
                 };
 
-                this.update(&mut cx, |this, cx| {
+                this.update(cx, |this, cx| {
                     match result {
                         Ok(Some(id)) => {
                             println!("Profile saved successfully. ID: {}", id);
@@ -1000,8 +993,7 @@ impl ProfileSettingsModal {
                     cx.notify();
                 })
                 .ok();
-            }
-        })
+            })
         .detach();
     }
 
@@ -1035,7 +1027,7 @@ impl ProfileSettingsModal {
             cx.subscribe(
                 select,
                 |this, _, _event: &SelectEvent<SearchableVec<ModelProfile>>, cx| {
-                    this.update_credential_selects(cx);
+                    this.selects_dirty = true;
                 },
             )
             .detach();
@@ -1092,11 +1084,9 @@ impl ProfileSettingsModal {
         cx.subscribe(
             &self.provider_select,
             |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
-                // Reset model and credential when provider changes
-                this.model_select.update(cx, |s, cx| s.reset_selection(cx));
-                this.chat_credential_select
-                    .update(cx, |s, cx| s.reset_selection(cx));
-                this.update_model_selects(cx, true);
+                this.reset_models = true;
+                this.selects_dirty = true;
+                cx.notify();
             },
         )
         .detach();
@@ -1105,11 +1095,9 @@ impl ProfileSettingsModal {
         cx.subscribe(
             &self.embedding_provider_select,
             |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
-                this.embedding_model_select
-                    .update(cx, |s, cx| s.reset_selection(cx));
-                this.embedding_credential_select
-                    .update(cx, |s, cx| s.reset_selection(cx));
-                this.update_model_selects(cx, true);
+                this.reset_models = true;
+                this.selects_dirty = true;
+                cx.notify();
             },
         )
         .detach();
@@ -1118,11 +1106,9 @@ impl ProfileSettingsModal {
         cx.subscribe(
             &self.image_provider_select,
             |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
-                this.image_model_select
-                    .update(cx, |s, cx| s.reset_selection(cx));
-                this.image_credential_select
-                    .update(cx, |s, cx| s.reset_selection(cx));
-                this.update_model_selects(cx, true);
+                this.reset_models = true;
+                this.selects_dirty = true;
+                cx.notify();
             },
         )
         .detach();
@@ -1131,9 +1117,9 @@ impl ProfileSettingsModal {
         cx.subscribe(
             &self.tts_provider_select,
             |this, _, _event: &SelectEvent<SearchableVec<Provider>>, cx| {
-                this.tts_model_select
-                    .update(cx, |s, cx| s.reset_selection(cx));
-                this.update_model_selects(cx, true);
+                this.reset_models = true;
+                this.selects_dirty = true;
+                cx.notify();
             },
         )
         .detach();
@@ -1142,7 +1128,8 @@ impl ProfileSettingsModal {
         cx.subscribe(
             &self.tts_model_select,
             |this, _, _event: &SelectEvent<SearchableVec<ModelProfile>>, cx| {
-                this.update_voice_select(cx);
+                this.selects_dirty = true;
+                cx.notify();
             },
         )
         .detach();
@@ -1150,7 +1137,7 @@ impl ProfileSettingsModal {
         // Note: We don't observe state to update selects - they're updated via provider select subscriptions above
     }
 
-    fn update_provider_selects(&mut self, cx: &mut Context<Self>) {
+    fn update_provider_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (chat_providers, embedding_providers, image_providers, tts_providers) = {
             let state = self.state.read(cx);
             let models = &state.available_models;
@@ -1194,23 +1181,28 @@ impl ProfileSettingsModal {
         );
 
         self.provider_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(chat_providers), cx);
+            select.set_items(SearchableVec::new(chat_providers), window, cx);
         });
 
         self.embedding_provider_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(embedding_providers), cx);
+            select.set_items(SearchableVec::new(embedding_providers), window, cx);
         });
 
         self.image_provider_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(image_providers), cx);
+            select.set_items(SearchableVec::new(image_providers), window, cx);
         });
 
         self.tts_provider_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(tts_providers), cx);
+            select.set_items(SearchableVec::new(tts_providers), window, cx);
         });
     }
 
-    fn update_model_selects(&mut self, cx: &mut Context<Self>, reset_selection: bool) {
+    fn update_model_selects(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        reset_selection: bool,
+    ) {
         let chat_provider = self.provider_select.read(cx).selected_value().cloned();
         let embedding_provider = self
             .embedding_provider_select
@@ -1263,30 +1255,30 @@ impl ProfileSettingsModal {
         );
 
         self.model_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(chat_models), cx);
+            select.set_items(SearchableVec::new(chat_models), window, cx);
             if reset_selection {
-                select.reset_selection(cx);
+                select.set_selected_index(None, window, cx);
             }
         });
 
         self.embedding_model_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(embedding_models), cx);
+            select.set_items(SearchableVec::new(embedding_models), window, cx);
             if reset_selection {
-                select.reset_selection(cx);
+                select.set_selected_index(None, window, cx);
             }
         });
 
         self.image_model_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(image_models), cx);
+            select.set_items(SearchableVec::new(image_models), window, cx);
             if reset_selection {
-                select.reset_selection(cx);
+                select.set_selected_index(None, window, cx);
             }
         });
 
         self.tts_model_select.update(cx, |select, cx| {
-            select.set_items(SearchableVec::new(tts_models), cx);
+            select.set_items(SearchableVec::new(tts_models), window, cx);
             if reset_selection {
-                select.reset_selection(cx);
+                select.set_selected_index(None, window, cx);
             }
         });
     }
@@ -1346,7 +1338,7 @@ impl ProfileSettingsModal {
         Ok(())
     }
 
-    fn update_credential_selects(&mut self, cx: &mut Context<Self>) {
+    fn update_credential_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let chat_provider = self.model_select.read(cx).selected_value().and_then(|id| {
             state
@@ -1420,21 +1412,21 @@ impl ProfileSettingsModal {
 
         let chat_creds = filter_creds(chat_provider);
         self.chat_credential_select.update(cx, |select, cx| {
-            select.set_items(chat_creds, cx);
+            select.set_items(chat_creds, window, cx);
         });
 
         let embedding_creds = filter_creds(embedding_provider);
         self.embedding_credential_select.update(cx, |select, cx| {
-            select.set_items(embedding_creds, cx);
+            select.set_items(embedding_creds, window, cx);
         });
 
         let image_creds = filter_creds(image_provider);
         self.image_credential_select.update(cx, |select, cx| {
-            select.set_items(image_creds, cx);
+            select.set_items(image_creds, window, cx);
         });
     }
 
-    fn update_voice_select(&mut self, cx: &mut Context<Self>) {
+    fn update_voice_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let tts_model_id = self.tts_model_select.read(cx).selected_value().cloned();
 
         let available_voices = if let Some(model_id) = tts_model_id {
@@ -1458,7 +1450,7 @@ impl ProfileSettingsModal {
 
         self.tts_voice_select.update(cx, |select, cx| {
             let current_selection = select.selected_value().cloned();
-            select.set_items(voice_items.clone(), cx);
+            select.set_items(voice_items.clone(), window, cx);
 
             let mut target_value = None;
             // If current selection is valid for new list, keep it
@@ -1476,13 +1468,9 @@ impl ProfileSettingsModal {
             }
 
             if let Some(val) = target_value {
-                // Find index using SelectDelegate's position method
-                // We need to use the method from the trait
-                if let Some(index) = voice_items.position(&val) {
-                    select.set_selected_index_deferred(Some(index), cx);
-                }
+                select.set_selected_value(&val, window, cx);
             } else {
-                select.set_selected_index_deferred(None, cx);
+                select.set_selected_index(None, window, cx);
             }
         });
     }
@@ -1515,12 +1503,10 @@ impl ProfileSettingsModal {
                 let name = format!("{} Credential", provider_str);
                 let api_key = api_key.to_string();
 
-                cx.spawn(move |view: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
+                cx.spawn(async move |view, cx| {
                         match db.create_credential(&name, &provider_str, &api_key).await {
                             Ok(id) => {
-                                view.update(&mut cx, |this, cx| {
+                                view.update(cx, |this, cx| {
                                     this.creating_chat_cred = false;
                                     this.creating_embedding_cred = false;
                                     this.creating_image_cred = false;
@@ -1531,8 +1517,7 @@ impl ProfileSettingsModal {
                             }
                             Err(e) => eprintln!("Failed to create credential: {}", e),
                         }
-                    }
-                })
+                    })
                 .detach();
             }
         }
@@ -1707,26 +1692,35 @@ impl Render for ProfileSettingsModal {
             self.needs_reset = false;
         }
 
+        if self.selects_dirty {
+            self.update_provider_selects(window, cx);
+            self.update_model_selects(window, cx, self.reset_models);
+            self.update_credential_selects(window, cx);
+            self.update_voice_select(window, cx);
+            self.selects_dirty = false;
+            self.reset_models = false;
+        }
+
         // Handle focus requests
         if self.should_focus_chat {
             self.new_chat_cred_input
                 .read(cx)
-                .focus_handle()
-                .focus(window);
+                .focus_handle(cx)
+                .focus(window, cx);
             self.should_focus_chat = false;
         }
         if self.should_focus_embedding {
             self.new_embedding_cred_input
                 .read(cx)
-                .focus_handle()
-                .focus(window);
+                .focus_handle(cx)
+                .focus(window, cx);
             self.should_focus_embedding = false;
         }
         if self.should_focus_image {
             self.new_image_cred_input
                 .read(cx)
-                .focus_handle()
-                .focus(window);
+                .focus_handle(cx)
+                .focus(window, cx);
             self.should_focus_image = false;
         }
 
@@ -1840,7 +1834,8 @@ impl Render for ProfileSettingsModal {
                 .flex()
                 .flex_col()
                 .gap_8()
-                .scrollable(ScrollbarAxis::Vertical)
+                .id("profile-form-scroll")
+                .overflow_scroll()
                 .child(
                     div()
                         .flex()
@@ -2169,7 +2164,7 @@ impl Render for ProfileSettingsModal {
                                     .font_weight(FontWeight::BOLD),
                             ),
                     )
-                    .child(Button::new("close").icon(IconName::Close).ghost().on_click(
+                    .child(Button::new("close").icon(NativeIcon::Close).ghost().on_click(
                         cx.listener(|this, _, _, cx| {
                             this.state.update(cx, |state, cx| {
                                 state.toggle_profile_settings(cx);

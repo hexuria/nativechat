@@ -11,16 +11,17 @@ use crate::actions::{
 };
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
+use crate::icons::NativeIcon;
 use crate::state::AppState;
-use gpui::InteractiveElement;
-use gpui::prelude::*;
-use gpui::*;
-use ui::{
+use gpui_kit::InteractiveElement;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+use gpui_kit::component::{
     ActiveTheme, Icon, IconName,
     button::{Button, ButtonVariants},
     h_flex,
-    input::{Input, InputEvent, InputState},
-    menu::PopupMenuItem,
+    input::{InputEvent, Textarea, TextareaState},
+    menu::{DropdownMenu, PopupMenuItem},
     popover::Popover,
     tooltip::Tooltip,
     v_flex,
@@ -33,7 +34,7 @@ actions!(chat, [SubmitMessage]);
 type SubmitCallback = Box<dyn Fn(String, &mut Context<MessageInput>)>;
 
 pub struct MessageInput {
-    input_state: Entity<InputState>,
+    input_state: Entity<TextareaState>,
     on_submit: Option<SubmitCallback>,
     voice_mode: bool,
     voice_wave: Option<Entity<VoiceWave>>,
@@ -49,9 +50,8 @@ pub struct MessageInput {
 impl MessageInput {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder("Type a message...")
-                .multi_line()
                 .auto_grow(1, 20)
         });
 
@@ -95,7 +95,7 @@ impl MessageInput {
 
         // Subscribe to input events to handle Enter key
         cx.subscribe_in(&input_state, window, |this, _state, event, window, cx| {
-            if let InputEvent::PressEnter { secondary } = event
+            if let InputEvent::PressEnter { secondary, .. } = event
                 && !secondary
             {
                 // Enter without Shift - submit the message
@@ -116,8 +116,8 @@ impl MessageInput {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        self.input_state.update(cx, |state, _| {
-            state.focus_handle().focus(window);
+        self.input_state.update(cx, |state, cx| {
+            state.focus_handle(cx).focus(window, cx);
         });
     }
 
@@ -216,14 +216,14 @@ impl Render for MessageInput {
                 .shadow_sm()
                 .child(
                     // Top: Input field (grows to fill space)
-                    div().flex_grow().child(if self.voice_mode {
+                    div().flex_grow(1.).child(if self.voice_mode {
                         if let Some(voice_wave) = &self.voice_wave {
                             voice_wave.clone().into_any_element()
                         } else {
                             div().into_any_element()
                         }
                     } else {
-                        Input::new(&self.input_state)
+                        Textarea::new(&self.input_state)
                             .appearance(false)
                             .into_any_element()
                     }),
@@ -241,8 +241,7 @@ impl Render for MessageInput {
                                 .ghost()
                                 .rounded_full()
                                 .when(!any_modal_open, |this| this.cursor_pointer())
-                                .hover(move |style| style.bg(secondary)) 
-                                .dropdown_menu_with_anchor(Corner::BottomLeft, {
+                                .dropdown_menu_with_anchor(Anchor::BottomLeft, {
                                     let state_model = state_model.clone();
                                     move |menu, window, cx| {
                                         let state = state_model.read(cx);
@@ -366,7 +365,7 @@ impl Render for MessageInput {
                                                 
                                                 Box::new(std::iter::once(
                                                     Popover::new(SharedString::from(format!("aggregated-{}-popover", group_name.to_lowercase())))
-                                                        .anchor(gpui::Corner::BottomLeft)
+                                                        .anchor(Anchor::BottomLeft)
                                                         .trigger(
                                                             Button::new(SharedString::from(format!("aggregated-{}-btn", group_name.to_lowercase())))
                                                                 .ghost()
@@ -405,19 +404,7 @@ impl Render for MessageInput {
                                                                 .children(
                                                                     apps_clone.iter().enumerate().map(|(i, app)| {
                                                                         let app_name = app.clone();
-                                                                        let icon = match app_name.as_str() {
-                                                                            "Image Generation" => IconName::CreateImage,
-                                                                            "Thinking" => IconName::Thinking,
-                                                                            "Deep Research" => IconName::DeepSearch,
-                                                                            "Study" => IconName::Study,
-                                                                            "Web search" => IconName::WebSearch,
-                                                                            "Canvas" => IconName::Canvas,
-                                                                            "Canva" => IconName::Canva,
-                                                                            "Coursera" => IconName::Coursera,
-                                                                            "Figma" => IconName::Figma,
-                                                                            "Spotify" => IconName::Spotify,
-                                                                            _ => IconName::Clip,
-                                                                        };
+                                                                        let icon = tool_icon(&app_name);
 
                                                                         h_flex()
                                                                             .gap_2()
@@ -447,10 +434,10 @@ impl Render for MessageInput {
                                                                                     .text_size(px(12.0))
                                                                             )
                                                                             .child(
-                                                                                div().flex_grow() // Spacer
+                                                                                div().flex_grow(1.) // Spacer
                                                                             )
                                                                             .child(
-                                                                                Icon::new(IconName::Close)
+                                                                                Icon::new(NativeIcon::Close)
                                                                                     .size(px(12.0))
                                                                                     .text_color(theme.secondary_foreground)
                                                                             )
@@ -464,19 +451,7 @@ impl Render for MessageInput {
                                                 let state_model = state_model.clone();
                                                 Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
                                                         let app_name = app.clone();
-                                                        let icon = match app_name.as_str() {
-                                                            "Image Generation" => IconName::CreateImage,
-                                                            "Thinking" => IconName::Thinking,
-                                                            "Deep Research" => IconName::DeepSearch,
-                                                            "Study" => IconName::Study,
-                                                            "Web search" => IconName::WebSearch,
-                                                            "Canvas" => IconName::Canvas,
-                                                            "Canva" => IconName::Canva,
-                                                            "Coursera" => IconName::Coursera,
-                                                            "Figma" => IconName::Figma,
-                                                            "Spotify" => IconName::Spotify,
-                                                            _ => IconName::Clip,
-                                                        };
+                                                        let icon = tool_icon(&app_name);
 
                                                         div()
                                                             .flex()
@@ -509,7 +484,7 @@ impl Render for MessageInput {
                                                                         }
                                                                     })
                                                                     .child(
-                                                                        Icon::new(IconName::Close)
+                                                                        Icon::new(NativeIcon::Close)
                                                                             .size(px(14.0)),
                                                                     ),
                                                             )
@@ -540,12 +515,12 @@ impl Render for MessageInput {
                                             .items_center()
                                             .justify_center()
                                             .rounded_full()
-                                            .bg(gpui::transparent_black())
+                                            .bg(gpui_kit::transparent_black())
                                             .text_color(secondary_foreground)
                                             .hover(move |style| style.bg(secondary))
                                             .tooltip(|w, cx| Tooltip::new("Cancel").build(w, cx))
                                             .child(
-                                                Icon::new(IconName::Close)
+                                                Icon::new(NativeIcon::Close)
                                                     .text_color(secondary_foreground),
                                             );
                                         
@@ -599,7 +574,7 @@ impl Render for MessageInput {
                                             .items_center()
                                             .justify_center()
                                             .rounded_full()
-                                            .bg(gpui::transparent_black()) // Transparent/White by default
+                                            .bg(gpui_kit::transparent_black()) // Transparent/White by default
                                             .text_color(secondary_foreground)
                                             .hover(move |style| style.bg(secondary)) // Gray on hover
                                             .tooltip(|w, cx| Tooltip::new("Dictate").build(w, cx))
@@ -632,7 +607,7 @@ impl Render for MessageInput {
                                                 .items_center()
                                                 .justify_center()
                                                 .rounded_full()
-                                                .bg(gpui::transparent_black())
+                                                .bg(gpui_kit::transparent_black())
                                                 .text_color(secondary_foreground)
                                                 .hover(move |style| style.bg(secondary))
                                                 .tooltip(|w, cx| {
@@ -765,5 +740,21 @@ impl Render for MessageInput {
                         state.update(cx, |state, cx| state.select_app("Study".to_string(), cx));
                     }
                 }))
+    }
+}
+
+fn tool_icon(name: &str) -> Icon {
+    match name {
+        "Image Generation" => Icon::new(NativeIcon::CreateImage),
+        "Thinking" => Icon::new(NativeIcon::Thinking),
+        "Deep Research" => Icon::new(NativeIcon::DeepSearch),
+        "Study" => Icon::new(NativeIcon::Study),
+        "Web search" => Icon::new(NativeIcon::WebSearch),
+        "Canvas" => Icon::new(NativeIcon::Canvas),
+        "Canva" => Icon::new(NativeIcon::Canva),
+        "Coursera" => Icon::new(NativeIcon::Coursera),
+        "Figma" => Icon::new(NativeIcon::Figma),
+        "Spotify" => Icon::new(NativeIcon::Spotify),
+        _ => Icon::new(NativeIcon::Clip),
     }
 }

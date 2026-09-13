@@ -3,16 +3,16 @@ use crate::actions::{
     StartRenameSession, SubmitRenameSession,
 };
 use crate::state::AppState;
-use gpui::{Axis, prelude::FluentBuilder, *};
-use ui::{
-    ActiveTheme, Collapsible, Icon, IconName, Side, StyledExt, avatar::Avatar, h_flex,
-    input::InputState, sidebar::*, v_flex,
+use gpui_kit::{prelude::FluentBuilder, *};
+use gpui_kit::component::{
+    ActiveTheme, Collapsible, Icon, IconName, StyledExt, avatar::Avatar, h_flex, input::InputState,
+    sidebar::*, v_flex,
 };
 
 #[derive(IntoElement)]
 struct ChatList {
     collapsed: bool,
-    children: Vec<gpui::AnyElement>,
+    children: Vec<gpui_kit::AnyElement>,
 }
 
 impl ChatList {
@@ -23,7 +23,7 @@ impl ChatList {
         }
     }
 
-    fn children(mut self, children: impl IntoIterator<Item = gpui::AnyElement>) -> Self {
+    fn children(mut self, children: impl IntoIterator<Item = gpui_kit::AnyElement>) -> Self {
         self.children = children.into_iter().collect();
         self
     }
@@ -40,9 +40,41 @@ impl Collapsible for ChatList {
     }
 }
 
-impl gpui::RenderOnce for ChatList {
-    fn render(self, _window: &mut Window, _cx: &mut gpui::App) -> impl IntoElement {
-        v_flex().gap_1().children(self.children)
+impl gpui_kit::RenderOnce for ChatList {
+    fn render(self, _window: &mut Window, _cx: &mut gpui_kit::App) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .gap_1()
+            .children(self.children)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SidebarRev {
+    collapsed: bool,
+    theme_mode: String,
+    active_id: Option<String>,
+    any_modal: bool,
+    sessions: Vec<(String, String, String)>,
+}
+
+impl SidebarRev {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            collapsed: state.sidebar_collapsed,
+            theme_mode: state.theme_mode.clone(),
+            active_id: state.active_conversation_id.clone(),
+            any_modal: state.is_voice_mode_open
+                || state.is_account_settings_open
+                || state.is_profile_settings_open
+                || state.is_credentials_modal_open,
+            sessions: state
+                .conversations
+                .iter()
+                .map(|c| (c.id.clone(), c.title.clone(), c.created_at.clone()))
+                .collect(),
+        }
     }
 }
 
@@ -51,17 +83,29 @@ pub struct SidebarView {
     editing_session_id: Option<String>,
     rename_input: Option<Entity<InputState>>,
     delete_confirmation_id: Option<String>,
+    list_scroll: ScrollHandle,
+    rev: SidebarRev,
 }
 
 impl SidebarView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        let rev = SidebarRev::from_state(&state.read(cx));
+        cx.observe(&state, |this, state, cx| {
+            let rev = SidebarRev::from_state(&state.read(cx));
+            if this.rev != rev {
+                this.rev = rev;
+                cx.notify();
+            }
+        })
+        .detach();
 
         Self {
             state,
             editing_session_id: None,
             rename_input: None,
             delete_confirmation_id: None,
+            list_scroll: ScrollHandle::new(),
+            rev,
         }
     }
 
@@ -75,12 +119,12 @@ impl SidebarView {
             "[DEBUG] start_editing called for id: {}, title: {}",
             action.id, action.title
         );
-        let input = cx.new(|cx| ui::input::InputState::new(window, cx));
+        let input = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
 
         // Subscribe to input events to handle Enter key
         cx.subscribe_in(&input, window, |this, _state, event, window, cx| {
             match event {
-                ui::input::InputEvent::PressEnter { secondary } if !secondary => {
+                gpui_kit::component::input::InputEvent::PressEnter { secondary, .. } if !secondary => {
                     // Enter without Shift - submit the rename
                     println!("[DEBUG] Enter pressed in rename input");
                     this.submit_rename(&crate::actions::SubmitRenameSession, window, cx);
@@ -92,7 +136,7 @@ impl SidebarView {
 
         input.update(cx, |state, cx| {
             state.set_value(action.title.clone(), window, cx);
-            state.focus_handle().focus(window);
+            state.focus_handle(cx).focus(window, cx);
         });
 
         self.editing_session_id = Some(action.id.clone());
@@ -192,16 +236,13 @@ impl Render for SidebarView {
         let state = self.state.read(cx);
         let collapsed = state.sidebar_collapsed;
         let active_id = state.active_conversation_id.clone();
-
-        let theme = cx.theme();
-
-        // Check if any modal is open
+        let conversations = state.conversations.clone();
+        let theme_mode = state.theme_mode.clone();
         let any_modal_open = state.is_voice_mode_open
             || state.is_account_settings_open
             || state.is_profile_settings_open;
 
-        let max_height = window.viewport_size().height - px(360.0);
-        let min_height = px(180.);
+        let theme = cx.theme().clone();
 
         div()
             .size_full()
@@ -213,12 +254,17 @@ impl Render for SidebarView {
             .on_action(cx.listener(Self::cancel_delete))
             .on_action(cx.listener(Self::confirm_delete))
             .child(
-                Sidebar::<ui::resizable::ResizablePanel>::new(Side::Left)
-                    .collapsed(collapsed)
-                    .border_r(px(0.)) // Remove border to let resize handle act as border
-                    .header(
+                v_flex()
+                    .id("sidebar")
+                    .size_full()
+                    .overflow_hidden()
+                    .bg(theme.sidebar)
+                    .border_r(px(0.))
+                    .child(
                         h_flex()
+                            .id("sidebar-header")
                             .w_full()
+                            .flex_shrink_0()
                             .items_center()
                             .when(collapsed, |this| {
                                 this.px_2().child(
@@ -230,7 +276,8 @@ impl Render for SidebarView {
                                             this.state.update(cx, |state, cx| {
                                                 state.toggle_sidebar(cx);
                                             });
-                                        })),
+                                        }))
+                                        .render("expand-sidebar", window, cx),
                                 )
                             })
                             .when(!collapsed, |this| {
@@ -255,7 +302,7 @@ impl Render for SidebarView {
                                             .child(
                                                 div()
                                                     .text_sm()
-                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .font_weight(gpui_kit::FontWeight::BOLD)
                                                     .child("Native Chat"),
                                             ),
                                     )
@@ -290,56 +337,55 @@ impl Render for SidebarView {
                             }),
                     )
                     .child(
-                        ui::resizable::resizable_panel()
-                            .size(min_height)
-                            .size_range(min_height..max_height)
-                            .fixed_width(true) // Ensure fixed width behavior
+                        div().id("sidebar-nav").flex_shrink_0().w_full().child(
+                        SidebarMenu::new()
+                            .collapsed(collapsed)
                             .child(
-                                SidebarGroup::new("Menu").collapsed(collapsed).child(
-                                    SidebarMenu::new()
-                                        .collapsed(collapsed)
-                                        .child(
-                                            SidebarMenuItem::new("New Chat")
-                                                .icon(IconName::Plus)
-                                                .disable(any_modal_open)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.update(cx, |state, cx| {
-                                                        state.create_new_session(cx);
-                                                    });
-                                                })),
-                                        )
-                                        .child(
-                                            SidebarMenuItem::new("Search")
-                                                .icon(IconName::Search)
-                                                .disable(any_modal_open),
-                                        )
-                                        .child(
-                                            SidebarMenuItem::new("Library")
-                                                .icon(IconName::BookOpen)
-                                                .disable(any_modal_open),
-                                        )
-                                        .child(
-                                            SidebarMenuItem::new("Projects")
-                                                .icon(IconName::Folder)
-                                                .disable(any_modal_open),
-                                        ),
-                                ),
+                                SidebarMenuItem::new("New Chat")
+                                    .icon(IconName::Plus)
+                                    .disable(any_modal_open)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |state, cx| {
+                                            state.create_new_session(cx);
+                                        });
+                                    })),
                             )
-                            .into(),
+                            .child(
+                                SidebarMenuItem::new("Search")
+                                    .icon(IconName::Search)
+                                    .disable(any_modal_open),
+                            )
+                            .child(
+                                SidebarMenuItem::new("Library")
+                                    .icon(IconName::BookOpen)
+                                    .disable(any_modal_open),
+                            )
+                            .child(
+                                SidebarMenuItem::new("Projects")
+                                    .icon(IconName::Folder)
+                                    .disable(any_modal_open),
+                            )
+                            .render("sidebar-menu", window, cx),
+                        ),
                     )
                     .child(
-                        SidebarGroup::new("Chat History")
-                            .collapsed(collapsed)
-                            .child(ChatList::new().collapsed(collapsed).children(
-                                if state.conversations.is_empty() {
+                        div()
+                            .id("sidebar-chat-list")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .w_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.list_scroll)
+                            .child(
+                            ChatList::new().collapsed(collapsed).children(
+                                if conversations.is_empty() {
                                     vec![]
                                 } else {
                                     use crate::components::sidebar_chat_item::ChatSessionItem;
 
                                     let view_entity = cx.entity().clone();
 
-                                    state
-                                        .conversations
+                                    conversations
                                         .iter()
                                         .map(|c| {
                                             let id = c.id.clone();
@@ -467,15 +513,20 @@ impl Render for SidebarView {
                                         })
                                         .collect::<Vec<_>>()
                                 },
-                            ))
-                            .into(),
+                            ),
+                            ),
                     )
-                    .footer(
-                        SidebarFooter::new().child(
+                    .child(
                             div()
+                                .id("sidebar-footer")
                                 .flex()
                                 .flex_col()
+                                .flex_shrink_0()
                                 .w_full()
+                                .overflow_hidden()
+                                .bg(theme.sidebar)
+                                .border_t_1()
+                                .border_color(theme.border)
                                 .gap_2()
                                 .child(
                                     // User Profile Section
@@ -500,7 +551,7 @@ impl Render for SidebarView {
                                                     .child(
                                                         div()
                                                             .child("Buggy")
-                                                            .font_weight(gpui::FontWeight::BOLD)
+                                                            .font_weight(gpui_kit::FontWeight::BOLD)
                                                             .text_sm(),
                                                     )
                                                     .child(
@@ -524,8 +575,7 @@ impl Render for SidebarView {
                                     SidebarMenu::new()
                                         .collapsed(collapsed)
                                         .child({
-                                            let (label, icon_name) = match state.theme_mode.as_str()
-                                            {
+                                            let (label, icon_name) = match theme_mode.as_str() {
                                                 "dark" => ("Theme: Dark", IconName::Moon),
                                                 _ => ("Theme: Light", IconName::Sun),
                                             };
@@ -587,9 +637,9 @@ impl Render for SidebarView {
                                                 .on_click(|_, _, _| {
                                                     println!("Sign out clicked");
                                                 }),
-                                        ),
+                                        )
+                                        .render("sidebar-footer", window, cx),
                                 ),
-                        ),
                     ),
             )
     }

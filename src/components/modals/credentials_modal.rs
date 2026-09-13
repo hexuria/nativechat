@@ -1,24 +1,25 @@
 use crate::services::database::Credential;
 use crate::state::AppState;
 use chrono::NaiveDate;
-use gpui::prelude::*;
-use gpui::{InteractiveElement, *};
+use gpui_kit::prelude::*;
+use gpui_kit::{InteractiveElement, *};
 use std::rc::Rc;
-use ui::Icon;
-use ui::IconName;
-use ui::IndexPath;
-use ui::SearchableVec;
-use ui::button::{Button, ButtonVariant, ButtonVariants};
-use ui::calendar::Date;
-use ui::date_picker::{DatePicker, DatePickerEvent, DatePickerState};
-use ui::input::InputEvent;
-use ui::input::{Input, InputState};
-use ui::label::Label;
-use ui::list::{List, ListDelegate, ListItem, ListState};
-use ui::scroll::ScrollbarAxis;
-use ui::select::{Select, SelectState};
-use ui::theme::ActiveTheme;
-use ui::{Sizable, Size, StyledExt};
+use crate::icons::NativeIcon;
+use gpui_kit::component::Icon;
+use gpui_kit::component::IconName;
+use gpui_kit::component::IndexPath;
+use gpui_kit::component::select::SearchableVec;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::calendar::Date;
+use gpui_kit::component::date_picker::{DatePicker, DatePickerEvent, DatePickerState};
+use gpui_kit::component::input::InputEvent;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::list::{List, ListDelegate, ListItem, ListState};
+use gpui_kit::component::scroll::ScrollbarAxis;
+use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::theme::ActiveTheme;
+use gpui_kit::component::{Sizable, Size, StyledExt};
 
 actions!(credentials_modal, [SubmitCredential]);
 
@@ -49,6 +50,7 @@ pub struct CredentialsModal {
     search_input: Entity<InputState>,
     date_picker: Entity<DatePickerState>,
     expiration_date: Option<NaiveDate>,
+    pending_providers: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -78,7 +80,12 @@ impl ListDelegate for CredentialsListDelegate {
         self.credentials.len()
     }
 
-    fn render_item(&self, ix: IndexPath, _window: &mut Window, cx: &mut App) -> Option<Self::Item> {
+    fn render_item(
+        &mut self,
+        ix: IndexPath,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> Option<Self::Item> {
         let credential = self.credentials.get(ix.row)?;
         let theme = cx.theme();
         let is_selected = self.selected_index == Some(ix.row);
@@ -147,7 +154,7 @@ impl CredentialsModal {
 
             let provider_items = SearchableVec::new(providers);
             let provider_select = cx.new(|cx| {
-                SelectState::new(provider_items, Some(IndexPath::default()), window, cx)
+                SelectState::new(provider_items, Some(IndexPath::new(0)), window, cx)
                     .searchable(true)
             });
             let api_key_input = cx.new(|cx| {
@@ -202,6 +209,7 @@ impl CredentialsModal {
                 search_input,
                 date_picker,
                 expiration_date: None,
+                pending_providers: None,
             };
 
             // Subscribe to search input changes
@@ -263,9 +271,7 @@ impl CredentialsModal {
                     providers.sort();
                     providers.dedup();
 
-                    this.provider_select.update(cx, |s, cx| {
-                        s.set_items(SearchableVec::new(providers), cx);
-                    });
+                    this.pending_providers = Some(providers);
                 }
             })
             .detach();
@@ -351,13 +357,10 @@ impl CredentialsModal {
 
         if let Some(db) = &state.database_service {
             let db = db.clone();
-            cx.spawn(
-                move |view: WeakEntity<CredentialsModal>, cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
+            cx.spawn(async move |view, cx| {
                         match db.get_credentials().await {
                             Ok(creds) => {
-                                view.update(&mut cx, |this, cx| {
+                                view.update(cx, |this, cx| {
                                     this.credentials = creds.clone();
                                     this.list_state.update(cx, |list, cx| {
                                         list.delegate_mut().credentials = creds;
@@ -369,8 +372,7 @@ impl CredentialsModal {
                             }
                             Err(e) => eprintln!("Failed to fetch credentials: {}", e),
                         }
-                    }
-                },
+                    },
             )
             .detach();
         }
@@ -405,10 +407,7 @@ impl CredentialsModal {
 
         if let Some(db) = &state.database_service {
             let db = db.clone();
-            cx.spawn(
-                move |view: WeakEntity<CredentialsModal>, cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
+            cx.spawn(async move |view, cx| {
                         let result = match mode {
                             CredentialMode::Creating => db
                                 .create_credential(&name, &provider, &api_key)
@@ -421,7 +420,7 @@ impl CredentialsModal {
 
                         match result {
                             Ok(_) => {
-                                view.update(&mut cx, |this, cx| {
+                                view.update(cx, |this, cx| {
                                     this.should_clear_inputs = true;
                                     // Reset mode to creating after save
                                     this.mode = CredentialMode::Creating;
@@ -435,8 +434,7 @@ impl CredentialsModal {
                             }
                             Err(e) => eprintln!("Failed to save credential: {}", e),
                         }
-                    }
-                },
+                    },
             )
             .detach();
         }
@@ -447,21 +445,17 @@ impl CredentialsModal {
 
         if let Some(db) = &state.database_service {
             let db = db.clone();
-            cx.spawn(
-                move |view: WeakEntity<CredentialsModal>, cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
+            cx.spawn(async move |view, cx| {
                         match db.delete_credential(id).await {
                             Ok(_) => {
-                                view.update(&mut cx, |this, cx| {
+                                view.update(cx, |this, cx| {
                                     this.fetch_credentials(cx);
                                 })
                                 .ok();
                             }
                             Err(e) => eprintln!("Failed to delete credential: {}", e),
                         }
-                    }
-                },
+                    },
             )
             .detach();
         }
@@ -470,6 +464,12 @@ impl CredentialsModal {
 
 impl Render for CredentialsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(providers) = self.pending_providers.take() {
+            self.provider_select.update(cx, |s, cx| {
+                s.set_items(SearchableVec::new(providers), window, cx);
+            });
+        }
+
         let window_width = window.viewport_size().width;
         let is_small_screen = window_width < px(650.0);
 
@@ -504,7 +504,6 @@ impl Render for CredentialsModal {
                             Button::new("new_credential")
                                 .icon(IconName::Plus)
                                 .ghost()
-                                .hover(|s| s.bg(cx.theme().secondary))
                                 .tooltip("Create New Credential")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.mode = CredentialMode::Creating;
@@ -542,7 +541,7 @@ impl Render for CredentialsModal {
 
                                         // Update ListState's selected_index via set_selected_index
                                         list.set_selected_index(
-                                            Some(IndexPath::default().row(new_index)),
+                                            Some(IndexPath::new(new_index)),
                                             window,
                                             cx,
                                         );
@@ -566,7 +565,7 @@ impl Render for CredentialsModal {
                             .rounded(cx.theme().radius)
                             .focus_bordered(false)
                             .when(
-                                self.search_input.read(cx).focus_handle().is_focused(window),
+                                self.search_input.read(cx).focus_handle(cx).is_focused(window),
                                 |this| this.border_color(cx.theme().primary),
                             ),
                     ),
@@ -623,7 +622,8 @@ impl Render for CredentialsModal {
                 .flex()
                 .flex_col()
                 .gap_8()
-                .scrollable(ScrollbarAxis::Vertical)
+                .id("credentials-form-scroll")
+                .overflow_scroll()
                 .child(
                     div()
                         .flex()
@@ -808,7 +808,7 @@ impl Render for CredentialsModal {
         div()
             .absolute()
             .inset_0()
-            .bg(gpui::black().opacity(0.5))
+            .bg(gpui_kit::black().opacity(0.5))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -850,7 +850,7 @@ impl Render for CredentialsModal {
                                     .font_weight(FontWeight::BOLD),
                             ),
                     )
-                    .child(Button::new("close").icon(IconName::Close).ghost().on_click(
+                    .child(Button::new("close").icon(NativeIcon::Close).ghost().on_click(
                         cx.listener(|this, _, _, cx| {
                             this.state.update(cx, |state, cx| {
                                 state.toggle_credentials_modal(cx);

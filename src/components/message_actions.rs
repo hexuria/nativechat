@@ -2,15 +2,17 @@ use crate::{
     actions::{BranchInNewChat, ReportMessage, ToggleReadAloud},
     state::AppState,
 };
-use gpui::{prelude::FluentBuilder, prelude::*, *};
-use std::rc::Rc;
-use std::time::Duration;
-use ui::{
+use crate::icons::NativeIcon;
+use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, Size,
     button::{Button, ButtonVariants},
     h_flex,
+    menu::DropdownMenu,
     tooltip::Tooltip,
 };
+use gpui_kit::{prelude::FluentBuilder, prelude::*, *};
+use std::rc::Rc;
+use std::time::Duration;
 
 #[derive(IntoElement)]
 pub struct MessageActions {
@@ -34,7 +36,7 @@ pub struct MessageActions {
 }
 
 enum IconSource {
-    Name(IconName),
+    Icon(Icon),
     Path(&'static str),
 }
 
@@ -126,11 +128,11 @@ impl MessageActions {
         let icon_color = theme.secondary_foreground;
 
         let icon: Icon = match icon {
-            IconSource::Name(name) => name.into(),
+            IconSource::Icon(icon) => icon,
             IconSource::Path(path) => Icon::default().path(path),
         };
 
-        let id = gpui::SharedString::from(id.to_string());
+        let id = gpui_kit::SharedString::from(id.to_string());
         let tooltip_text = tooltip_text.to_string();
 
         div()
@@ -237,14 +239,14 @@ impl RenderOnce for MessageActions {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let (native_icon, native_tooltip) = if self.is_native_speaking {
             if self.is_native_paused {
-                (IconName::Play, "Resume (Native)")
+                (Icon::new(IconName::Play), "Resume (Native)")
             } else {
-                (IconName::Pause, "Pause (Native)")
+                (Icon::new(IconName::Pause), "Pause (Native)")
             }
         } else if self.is_native_loading {
-            (IconName::Loader, "Loading...")
+            (Icon::new(IconName::Loader), "Loading...")
         } else {
-            (IconName::ReadAloud, "Read aloud (Native)")
+            (Icon::new(NativeIcon::ReadAloud), "Read aloud (Native)")
         };
 
         h_flex()
@@ -286,7 +288,7 @@ impl RenderOnce for MessageActions {
             ))
             .child(self.action_button(
                 &format!("native-tts-{}", self.message_id),
-                IconSource::Name(native_icon),
+                IconSource::Icon(native_icon),
                 native_tooltip,
                 {
                     let on_read_aloud = self.on_read_aloud.clone();
@@ -309,12 +311,12 @@ impl RenderOnce for MessageActions {
                     .ghost()
                     .with_size(Size::Medium)
                     .compact()
-                    .rounded(ui::button::ButtonRounded::Size(px(6.0)))
+                    .rounded(px(6.0))
                     .tooltip("More actions")
-                    .dropdown_menu_with_anchor(Corner::BottomLeft, move |menu, _, _| {
+                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                         menu.menu_with_icon(
                             "Branch in new chat",
-                            IconName::Branch,
+                            NativeIcon::Branch,
                             Box::new(BranchInNewChat),
                         )
                         .when(self.can_read_aloud, |menu| {
@@ -375,7 +377,7 @@ impl RenderOnce for MessageActions {
                         .separator()
                         .menu_with_icon(
                             "Report message",
-                            IconName::Report,
+                            NativeIcon::Report,
                             Box::new(ReportMessage),
                         )
                     }),

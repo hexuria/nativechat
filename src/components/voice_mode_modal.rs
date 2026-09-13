@@ -1,9 +1,9 @@
 use crate::components::circular_voice_viz::CircularVoiceViz;
 use crate::state::{AppState, VoiceStatus};
-use gpui::InteractiveElement;
-use gpui::prelude::*;
-use gpui::*;
-use ui::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::InteractiveElement;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 
 pub fn render_voice_mode_modal<V: 'static>(
     state: Entity<AppState>,
@@ -17,11 +17,11 @@ pub fn render_voice_mode_modal<V: 'static>(
     let voice_status = app_state.voice_status.clone();
 
     let (status_color, status_text) = match voice_status {
-        VoiceStatus::Ready => (gpui::hsla(0.0, 0.0, 0.5, 1.0), "READY"),
-        VoiceStatus::Connecting => (gpui::hsla(0.0, 0.0, 0.5, 1.0), "CONNECTING..."),
-        VoiceStatus::Connected => (gpui::hsla(0.3, 0.8, 0.5, 1.0), "LIVE"), // Green
-        VoiceStatus::Disconnected => (gpui::hsla(0.0, 0.8, 0.5, 1.0), "DISCONNECTED"), // Red
-        VoiceStatus::Error(_) => (gpui::hsla(0.0, 0.8, 0.5, 1.0), "ERROR"), // Red
+        VoiceStatus::Ready => (gpui_kit::hsla(0.0, 0.0, 0.5, 1.0), "READY"),
+        VoiceStatus::Connecting => (gpui_kit::hsla(0.0, 0.0, 0.5, 1.0), "CONNECTING..."),
+        VoiceStatus::Connected => (gpui_kit::hsla(0.3, 0.8, 0.5, 1.0), "LIVE"), // Green
+        VoiceStatus::Disconnected => (gpui_kit::hsla(0.0, 0.8, 0.5, 1.0), "DISCONNECTED"), // Red
+        VoiceStatus::Error(_) => (gpui_kit::hsla(0.0, 0.8, 0.5, 1.0), "ERROR"), // Red
     };
 
     // Full screen overlay
@@ -97,8 +97,8 @@ pub fn render_voice_mode_modal<V: 'static>(
                             .px_4()
                             .py_2()
                             .rounded_md()
-                            .bg(gpui::hsla(0.0, 0.0, 0.0, 1.0)) // Always black
-                            .text_color(gpui::hsla(0.0, 0.0, 1.0, 1.0)) // Always white
+                            .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 1.0)) // Always black
+                            .text_color(gpui_kit::hsla(0.0, 0.0, 1.0, 1.0)) // Always white
                             .cursor_pointer()
                             .flex()
                             .items_center()
@@ -110,9 +110,9 @@ pub fn render_voice_mode_modal<V: 'static>(
                             }))
                             .child(svg().path("icons/power.svg").size(px(16.0)).text_color(
                                 if theme.mode.is_dark() {
-                                    gpui::hsla(0.0, 0.8, 0.6, 1.0) // Red on dark
+                                    gpui_kit::hsla(0.0, 0.8, 0.6, 1.0) // Red on dark
                                 } else {
-                                    gpui::hsla(0.0, 0.0, 1.0, 1.0) // White on light
+                                    gpui_kit::hsla(0.0, 0.0, 1.0, 1.0) // White on light
                                 },
                             ))
                             .child(

@@ -1,11 +1,11 @@
 use crate::state::AppState;
-use gpui::prelude::*;
-use gpui::*;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
 use std::f32::consts::PI;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use ui::ActiveTheme;
+use gpui_kit::component::ActiveTheme;
 
 const CIRCLE_RADIUS: f32 = 150.0;
 
@@ -55,17 +55,14 @@ impl CircularVoiceViz {
     ) -> Entity<Self> {
         cx.new(|cx| {
             // Start animation loop at 60fps
-            cx.spawn(
-                move |view: WeakEntity<CircularVoiceViz>, cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
+            cx.spawn(async move |view: WeakEntity<Self>, cx: &mut AsyncApp| {
                         loop {
                             // 60 FPS target
                             cx.background_executor()
                                 .timer(Duration::from_millis(16))
                                 .await;
 
-                            let result = view.update(&mut cx, |this, cx| {
+                            let result = view.update(cx, |this, cx| {
                                 this.update_animation(cx);
                                 cx.notify();
                             });
@@ -75,8 +72,7 @@ impl CircularVoiceViz {
                                 break;
                             }
                         }
-                    }
-                },
+                    },
             )
             .detach();
 
@@ -188,9 +184,9 @@ impl Render for CircularVoiceViz {
                         let is_ai_speaking = ai_amplitude > 0.01;
                         let active_color = if is_ai_speaking {
                             if theme.is_light {
-                                gpui::hsla(220.0 / 360.0, 0.6, 0.5, 1.0) // Bluish Grey
+                                gpui_kit::hsla(220.0 / 360.0, 0.6, 0.5, 1.0) // Bluish Grey
                             } else {
-                                gpui::hsla(135.0 / 360.0, 1.0, 0.5, 1.0) // Matrix Green (#00FF41)
+                                gpui_kit::hsla(135.0 / 360.0, 1.0, 0.5, 1.0) // Matrix Green (#00FF41)
                             }
                         } else {
                             theme.primary
@@ -216,12 +212,12 @@ impl Render for CircularVoiceViz {
                             let gradient_color = if theme.is_light {
                                 // Light theme: White (100%) to Very Light Grey (96%)
                                 let lightness = 1.0 - (eased_t * 0.04);
-                                gpui::hsla(210.0 / 360.0, 0.2, lightness, 1.0)
+                                gpui_kit::hsla(210.0 / 360.0, 0.2, lightness, 1.0)
                             } else {
                                 // Dark theme: Dark Grey (8%) to Pure Black (0%)
                                 // 20/255 = ~0.08
                                 let lightness = (1.0 - eased_t) * 0.08;
-                                gpui::hsla(0.0, 0.0, lightness, 1.0)
+                                gpui_kit::hsla(0.0, 0.0, lightness, 1.0)
                             };
 
                             // Draw filled circle
@@ -298,7 +294,7 @@ impl Render for CircularVoiceViz {
                             PathBuilder::stroke(px(if theme.is_light { 12.0 } else { 4.0 }));
                         draw_arc(&mut track_path, gauge_radius, start_angle, end_angle);
                         let track_color = if theme.is_light {
-                            gpui::hsla(210.0 / 360.0, 0.16, 0.83, 0.4) // Faint slate
+                            gpui_kit::hsla(210.0 / 360.0, 0.16, 0.83, 0.4) // Faint slate
                         } else {
                             theme.secondary
                         };
@@ -352,7 +348,7 @@ impl Render for CircularVoiceViz {
                             // Layer 1: Outermost, widest blur (very soft)
                             let glow_width_1 = if theme.is_light { 28.0 } else { 24.0 };
                             let glow_color_1 = if theme.is_light && !is_ai_speaking {
-                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.15)
+                                gpui_kit::hsla(215.0 / 360.0, 0.16, 0.47, 0.15)
                             } else {
                                 base_glow_color.opacity(0.15)
                             };
@@ -368,7 +364,7 @@ impl Render for CircularVoiceViz {
                             // Layer 2: Middle blur
                             let glow_width_2 = if theme.is_light { 20.0 } else { 16.0 };
                             let glow_color_2 = if theme.is_light && !is_ai_speaking {
-                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.25)
+                                gpui_kit::hsla(215.0 / 360.0, 0.16, 0.47, 0.25)
                             } else {
                                 base_glow_color.opacity(0.25)
                             };
@@ -384,7 +380,7 @@ impl Render for CircularVoiceViz {
                             // Layer 3: Inner glow (closer to solid)
                             let glow_width_3 = if theme.is_light { 14.0 } else { 10.0 };
                             let glow_color_3 = if theme.is_light && !is_ai_speaking {
-                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 0.4)
+                                gpui_kit::hsla(215.0 / 360.0, 0.16, 0.47, 0.4)
                             } else {
                                 base_glow_color.opacity(0.4)
                             };
@@ -408,7 +404,7 @@ impl Render for CircularVoiceViz {
                             );
 
                             let needle_color = if theme.is_light && !is_ai_speaking {
-                                gpui::hsla(215.0 / 360.0, 0.16, 0.47, 1.0)
+                                gpui_kit::hsla(215.0 / 360.0, 0.16, 0.47, 1.0)
                             } else {
                                 base_glow_color
                             };

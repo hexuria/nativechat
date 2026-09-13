@@ -1,7 +1,10 @@
 pub mod actions;
+#[cfg(feature = "agent")]
+pub mod agent;
 pub mod assets;
 pub mod audio;
 pub mod components;
+pub mod icons;
 pub mod config;
 pub mod db;
 pub mod error;

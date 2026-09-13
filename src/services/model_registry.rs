@@ -49,10 +49,10 @@ impl std::fmt::Display for ModelType {
     }
 }
 
-impl ui::SelectItem for Provider {
+impl gpui_kit::component::select::SelectItem for Provider {
     type Value = Self;
 
-    fn title(&self) -> gpui::SharedString {
+    fn title(&self) -> gpui_kit::SharedString {
         match self {
             Provider::Gemini => "Google Gemini".into(),
             Provider::OpenAI => "OpenAI".into(),
@@ -113,10 +113,10 @@ pub struct ModelProfile {
     pub is_thinking: bool,
 }
 
-impl ui::SelectItem for ModelProfile {
+impl gpui_kit::component::select::SelectItem for ModelProfile {
     type Value = String;
 
-    fn title(&self) -> gpui::SharedString {
+    fn title(&self) -> gpui_kit::SharedString {
         self.display_name.clone().into()
     }
 
