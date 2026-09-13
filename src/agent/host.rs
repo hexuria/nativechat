@@ -197,6 +197,24 @@ impl NativeChatHost {
             };
         }
 
+        if self.sessions.is_empty() {
+            let mut empty = UiNode::page("empty-roster", "Create your first Bot")
+                .with_child(UiNode::button("create-first-bot", "New Bot"));
+            if let Some(error) = &self.auth_error {
+                empty = empty.with_child(UiNode::new("empty-roster-error", "status", error.clone()));
+            }
+            return UiTree {
+                app: "nativechat".into(),
+                platform: PlatformKind::Desktop,
+                ready: self.ready,
+                nodes: vec![
+                    UiNode::window(ids::WINDOW, "NativeChat")
+                        .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
+                        .with_child(empty),
+                ],
+            };
+        }
+
         let sessions: Vec<UiNode> = self
             .sessions
             .iter()
@@ -216,7 +234,7 @@ impl NativeChatHost {
 
         let sidebar = UiNode::navigation(ids::SIDEBAR, "Sidebar")
             .with_child(UiNode::button(ids::NAV_TOGGLE, "Toggle sidebar"))
-            .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Chat"))
+            .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
             .with_child(UiNode::button(ids::NAV_SEARCH, "Search"))
             .with_child(UiNode::button(ids::NAV_LIBRARY, "Library"))
             .with_child(UiNode::button(ids::NAV_PROJECTS, "Projects"))
@@ -291,7 +309,7 @@ impl NativeChatHost {
     }
 
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
-        let cmd = if target == ids::NAV_NEW_CHAT {
+        let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
         } else if target == ids::NAV_TOGGLE {
             Command::ToggleSidebar

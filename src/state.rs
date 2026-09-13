@@ -196,6 +196,7 @@ pub struct AppState {
     pub bot_status: Option<String>,
     pub model_catalogue: ModelCatalogue,
     pub is_agent_settings_open: bool,
+    pub hiring: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -365,6 +366,7 @@ impl AppState {
             bot_status: None,
             model_catalogue: ModelCatalogue::default(),
             is_agent_settings_open: false,
+            hiring: false,
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -662,24 +664,43 @@ impl AppState {
     }
 
     pub fn create_agent(&mut self, cx: &mut Context<Self>) {
+        if self.hiring {
+            return;
+        }
         let Some(client) = self.opengrok.clone() else {
-            self.create_new_session(cx);
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
             return;
         };
         if !self.is_signed_in() {
-            self.create_new_session(cx);
+            self.auth_error = Some("Sign in first".to_string());
+            cx.notify();
             return;
         }
+        self.hiring = true;
+        self.auth_error = None;
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.hire("New Bot", None).await;
             let _ = this.update(cx, |state, cx| {
+                state.hiring = false;
                 match result {
                     Ok(hired) => {
                         let id = hired.id.clone();
                         state.coworkers.insert(0, hired);
                         state.select_coworker(id, cx);
                     }
-                    Err(error) => state.auth_error = Some(error.message),
+                    Err(error) => {
+                        state.auth_error = Some(format!(
+                            "Could not create agent: {} (is OpenGrok running at {}?)",
+                            error.message,
+                            state
+                                .config
+                                .as_ref()
+                                .map(|c| c.opengrok_base_url.as_str())
+                                .unwrap_or("http://127.0.0.1:1447")
+                        ));
+                    }
                 }
                 cx.notify();
             });
@@ -1258,6 +1279,11 @@ impl AppState {
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
+        if self.is_signed_in() && self.active_coworker_id.is_none() {
+            self.auth_error = Some("Create a bot first".to_string());
+            cx.notify();
+            return;
+        }
         let conversation_id = match &self.active_conversation_id {
             Some(id) => id.clone(),
             None => return,

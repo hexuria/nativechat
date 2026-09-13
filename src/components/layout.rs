@@ -7,7 +7,10 @@ use crate::components::modals::{
 use crate::components::sidebar::SidebarView;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use gpui_kit::component::{resizable::h_resizable, resizable::resizable_panel};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{
+    ActiveTheme, Disableable, resizable::h_resizable, resizable::resizable_panel, v_flex,
+};
 
 use crate::state::AppState;
 
@@ -25,6 +28,8 @@ struct ShellRev {
     signing_in: bool,
     auth_error: Option<String>,
     agent_settings: bool,
+    has_agent: bool,
+    hiring: bool,
 }
 
 impl ShellRev {
@@ -38,6 +43,8 @@ impl ShellRev {
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
             agent_settings: state.is_agent_settings_open,
+            has_agent: state.active_coworker_id.is_some(),
+            hiring: state.hiring,
         }
     }
 }
@@ -122,6 +129,10 @@ impl Render for Layout {
         if !state.is_signed_in() {
             return div().size_full().child(self.login.clone());
         }
+        let has_agent = state.active_coworker_id.is_some();
+        let hiring = state.hiring;
+        let hire_error = state.auth_error.clone();
+        let theme = cx.theme().clone();
 
         div()
             .size_full()
@@ -144,7 +155,16 @@ impl Render for Layout {
                                 .size_full()
                                 .flex_grow(1.)
                                 .overflow_hidden()
-                                .child(self.chat.clone()),
+                                .child(if has_agent {
+                                    self.chat.clone().into_any_element()
+                                } else {
+                                    empty_agent_pane(
+                                        self.state.clone(),
+                                        hire_error.clone(),
+                                        hiring,
+                                        &theme,
+                                    )
+                                }),
                         ),
                 )
             })
@@ -178,7 +198,16 @@ impl Render for Layout {
                                 }
                             }
                         })
-                        .child(resizable_panel().child(self.chat.clone())),
+                        .child(resizable_panel().child(if has_agent {
+                            self.chat.clone().into_any_element()
+                        } else {
+                            empty_agent_pane(
+                                self.state.clone(),
+                                hire_error.clone(),
+                                hiring,
+                                &theme,
+                            )
+                        })),
                 )
             })
             .when(state.is_agent_settings_open, |this| {
@@ -202,4 +231,59 @@ impl Render for Layout {
                     .then(|| self.profile_settings_modal.clone().into_any_element()),
             )
     }
+}
+
+fn empty_agent_pane(
+    state: Entity<AppState>,
+    error: Option<String>,
+    hiring: bool,
+    theme: &gpui_kit::component::Theme,
+) -> AnyElement {
+    v_flex()
+        .id("empty-roster")
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .bg(theme.background)
+        .child(
+            div()
+                .text_lg()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Create your first Bot"),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("No agent yet. Hire one to start a chat."),
+        )
+        .when_some(error, |this, message| {
+            this.child(
+                div()
+                    .id("empty-roster-error")
+                    .max_w(px(420.))
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(message),
+            )
+        })
+        .child(
+            div().id("create-first-bot").child(
+                Button::new("create-first-bot-btn")
+                    .label(if hiring {
+                        "Creating…"
+                    } else {
+                        "New Bot"
+                    })
+                    .primary()
+                    .disabled(hiring)
+                    .on_click(move |_, _, cx| {
+                        state.update(cx, |state, cx| {
+                            state.create_agent(cx);
+                        });
+                    }),
+            ),
+        )
+        .into_any_element()
 }
