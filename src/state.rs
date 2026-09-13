@@ -1,7 +1,9 @@
 use crate::actions::TtsSource;
 use crate::audio::AudioInput;
 use crate::config::Config;
-use crate::opengrok::{Account, AguiMessage, Coworker, OpenGrokClient, ProfileUpdate};
+use crate::opengrok::{
+    activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, OpenGrokClient, ProfileUpdate,
+};
 use crate::llm::{
     ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
 };
@@ -190,6 +192,7 @@ pub struct AppState {
     pub login_password: String,
     pub coworkers: Vec<Coworker>,
     pub active_coworker_id: Option<String>,
+    pub bot_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -356,6 +359,7 @@ impl AppState {
             login_password: String::new(),
             coworkers: Vec::new(),
             active_coworker_id: None,
+            bot_status: None,
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -449,6 +453,7 @@ impl AppState {
         self.auth_error = None;
         self.coworkers.clear();
         self.active_coworker_id = None;
+        self.bot_status = None;
         self.is_account_settings_open = false;
         cx.notify();
         if let Some(client) = client {
@@ -1026,6 +1031,7 @@ impl AppState {
             });
         }
         self.is_ai_responding = true;
+        self.bot_status = Some("Thinking".into());
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1044,7 +1050,61 @@ impl AppState {
                 },
             };
             let result = match coworker {
-                Ok(id) => client.run_turn(&id, &conversation_id, &history).await,
+                Ok(id) => {
+                    let mut args_by_call: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    let mut names_by_call: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    client
+                        .run_turn(&id, &conversation_id, &history, |event| {
+                            if let Some(call_id) =
+                                event.get("toolCallId").and_then(|v| v.as_str())
+                            {
+                                if let Some(name) =
+                                    event.get("toolCallName").and_then(|v| v.as_str())
+                                {
+                                    names_by_call.insert(call_id.to_string(), name.to_string());
+                                }
+                                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                    args_by_call
+                                        .entry(call_id.to_string())
+                                        .or_default()
+                                        .push_str(delta);
+                                }
+                            }
+                            let call_id = event.get("toolCallId").and_then(|v| v.as_str());
+                            let args = call_id.and_then(|id| args_by_call.get(id)).map(String::as_str);
+                            let mut event = event.clone();
+                            if event.get("toolCallName").is_none() {
+                                if let Some(name) = call_id.and_then(|id| names_by_call.get(id)) {
+                                    event
+                                        .as_object_mut()
+                                        .map(|o| o.insert("toolCallName".into(), name.clone().into()));
+                                }
+                            }
+                            match activity_from_agui(&event, args) {
+                                ActivityTick::Keep => {}
+                                ActivityTick::Clear => {
+                                    let _ = this.update(cx, |state, cx| {
+                                        if state.bot_status.is_some() {
+                                            state.bot_status = None;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                                ActivityTick::Set(activity) => {
+                                    let _ = this.update(cx, |state, cx| {
+                                        if state.bot_status.as_deref() != Some(activity.label.as_str())
+                                        {
+                                            state.bot_status = Some(activity.label);
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            }
+                        })
+                        .await
+                }
                 Err(error) => Err(error),
             };
             let _ = this.update(cx, |state, cx| {
@@ -1068,6 +1128,7 @@ impl AppState {
                     }
                 }
                 state.is_ai_responding = false;
+                state.bot_status = None;
                 if let Err(error) = result {
                     state.auth_error = Some(error.message);
                 }

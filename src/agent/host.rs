@@ -100,6 +100,7 @@ pub struct NativeChatHost {
     login_email: String,
     login_password: String,
     last_assistant: String,
+    bot_status: Option<String>,
     pending: Option<Command>,
 }
 
@@ -145,6 +146,7 @@ impl NativeChatHost {
                 .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
+            bot_status: state.bot_status.clone(),
             pending: None,
         }
     }
@@ -205,7 +207,7 @@ impl NativeChatHost {
             .with_child(UiNode::button(ids::FOOTER_PROFILE, "Profile Settings"))
             .with_child(UiNode::button(ids::FOOTER_SIGN_OUT, "Sign Out"));
 
-        let page = UiNode::page(ids::PAGE, "Chat")
+        let mut page = UiNode::page(ids::PAGE, "Chat")
             .with_child(
                 UiNode::new(ids::PROFILE_SELECT, "combobox", "Select Profile").with_value(
                     self.profile_name
@@ -223,6 +225,9 @@ impl NativeChatHost {
                     self.last_assistant.chars().take(400).collect()
                 },
             ));
+        if let Some(status) = &self.bot_status {
+            page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
+        }
 
         UiTree {
             app: "nativechat".into(),

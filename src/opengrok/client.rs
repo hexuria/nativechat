@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use futures::StreamExt;
 use reqwest::cookie::{CookieStore, Jar};
 use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
@@ -216,12 +217,16 @@ impl OpenGrokClient {
 
     /// One turn. Desktop Grok Bot POSTs `/api/sendPrompt` then paints from `GET /events`.
     /// NativeChat is a new client: same coworker + transcript, `POST /ag-ui` SSE instead.
-    pub async fn run_turn(
+    pub async fn run_turn<F>(
         &self,
         coworker_id: &str,
         thread_id: &str,
         messages: &[AguiMessage],
-    ) -> Result<String, OpenGrokError> {
+        mut on_event: F,
+    ) -> Result<String, OpenGrokError>
+    where
+        F: FnMut(&serde_json::Value),
+    {
         let body = json!({
             "threadId": thread_id,
             "runId": uuid::Uuid::now_v7().to_string(),
@@ -234,11 +239,44 @@ impl OpenGrokClient {
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
-        let text = response
-            .text()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
-        assistant_text_from_sse(&text).map_err(OpenGrokError::message)
+        let mut stream = response.bytes_stream();
+        let mut buf = String::new();
+        let mut assistant = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| OpenGrokError::message(e.to_string()))?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(idx) = buf.find("\n\n") {
+                let frame = buf[..idx].to_string();
+                buf = buf[idx + 2..].to_string();
+                for line in frame.lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                        continue;
+                    };
+                    let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if kind == "RUN_ERROR" {
+                        let message = value
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("run failed");
+                        return Err(OpenGrokError::message(message));
+                    }
+                    if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
+                        if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                            assistant.push_str(delta);
+                        }
+                    }
+                    on_event(&value);
+                }
+            }
+        }
+        Ok(assistant)
     }
 }
 

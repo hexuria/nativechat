@@ -10,6 +10,7 @@ use crate::tts_text::{
     CHAT_ROW_CHUNK_BYTES, chunk_text, highlight_in_chunk, looks_like_markdown,
     map_utf16_range_to_utf8,
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
@@ -384,6 +385,7 @@ pub struct ChatView {
     selection_need_sync: bool,
     active_profile_id: Option<i64>,
     last_conversation_id: Option<String>,
+    bot_status: Option<String>,
 }
 
 impl ChatView {
@@ -448,6 +450,7 @@ impl ChatView {
             selection_need_sync: false,
             active_profile_id,
             last_conversation_id,
+            bot_status: None,
         };
 
         cx.observe(&state, |this: &mut Self, state, cx| {
@@ -542,6 +545,15 @@ impl ChatView {
                 }
             },
         )
+        .detach();
+
+        cx.observe(&state, |this, app, cx| {
+            let label = app.read(cx).bot_status.clone();
+            if this.bot_status != label {
+                this.bot_status = label;
+                cx.notify();
+            }
+        })
         .detach();
 
         this
@@ -673,10 +685,22 @@ impl Render for ChatView {
                     ),
             )
             .child(
-                h_flex()
+                v_flex()
                     .flex_shrink_0()
                     .px_4()
                     .pb_4()
+                    .gap_2()
+                    .when_some(self.bot_status.clone(), |this, label| {
+                        this.child(
+                            h_flex()
+                                .id("bot-status")
+                                .gap_2()
+                                .items_center()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(label),
+                        )
+                    })
                     .child(self.input.clone()),
             )
     }
