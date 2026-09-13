@@ -57,6 +57,8 @@ struct SidebarRev {
     active_id: Option<String>,
     any_modal: bool,
     sessions: Vec<(String, String, String)>,
+    coworkers: Vec<(String, String)>,
+    signed_in: bool,
 }
 
 impl SidebarRev {
@@ -64,7 +66,7 @@ impl SidebarRev {
         Self {
             collapsed: state.sidebar_collapsed,
             theme_mode: state.theme_mode.clone(),
-            active_id: state.active_conversation_id.clone(),
+            active_id: state.active_coworker_id.clone().or(state.active_conversation_id.clone()),
             any_modal: state.is_voice_mode_open
                 || state.is_account_settings_open
                 || state.is_profile_settings_open
@@ -74,6 +76,12 @@ impl SidebarRev {
                 .iter()
                 .map(|c| (c.id.clone(), c.title.clone(), c.created_at.clone()))
                 .collect(),
+            coworkers: state
+                .coworkers
+                .iter()
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect(),
+            signed_in: state.is_signed_in(),
         }
     }
 }
@@ -237,6 +245,9 @@ impl Render for SidebarView {
         let collapsed = state.sidebar_collapsed;
         let active_id = state.active_conversation_id.clone();
         let conversations = state.conversations.clone();
+        let coworkers = state.coworkers.clone();
+        let signed_in = state.is_signed_in();
+        let active_coworker = state.active_coworker_id.clone();
         let theme_mode = state.theme_mode.clone();
         let account_label = state
             .account
@@ -346,12 +357,12 @@ impl Render for SidebarView {
                         SidebarMenu::new()
                             .collapsed(collapsed)
                             .child(
-                                SidebarMenuItem::new("New Chat")
+                                SidebarMenuItem::new("New Bot")
                                     .icon(IconName::Plus)
                                     .disable(any_modal_open)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.update(cx, |state, cx| {
-                                            state.create_new_session(cx);
+                                            state.create_agent(cx);
                                         });
                                     })),
                             )
@@ -383,7 +394,71 @@ impl Render for SidebarView {
                             .track_scroll(&self.list_scroll)
                             .child(
                             ChatList::new().collapsed(collapsed).children(
-                                if conversations.is_empty() {
+                                if signed_in {
+                                    let view_entity = cx.entity().clone();
+                                    coworkers
+                                        .iter()
+                                        .map(|c| {
+                                            let id = c.id.clone();
+                                            let name = c.name.clone();
+                                            let is_active =
+                                                Some(id.clone()) == active_coworker.clone();
+                                            let glyph = name
+                                                .chars()
+                                                .next()
+                                                .map(|ch| ch.to_string())
+                                                .unwrap_or_else(|| "?".into());
+                                            div()
+                                                .id(SharedString::from(format!("coworker-{id}")))
+                                                .w_full()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .when(is_active, |this| this.bg(theme.accent))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    {
+                                                        let id = id.clone();
+                                                        let view = view_entity.clone();
+                                                        move |_, _, cx| {
+                                                            view.update(cx, |this, cx| {
+                                                                this.state.update(cx, |state, cx| {
+                                                                    state.select_coworker(
+                                                                        id.clone(),
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            });
+                                                        }
+                                                    },
+                                                )
+                                                .child(
+                                                    h_flex()
+                                                        .gap_2()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .size_8()
+                                                                .rounded_full()
+                                                                .bg(theme.primary)
+                                                                .text_color(theme.primary_foreground)
+                                                                .text_sm()
+                                                                .child(glyph),
+                                                        )
+                                                        .when(!collapsed, |this| {
+                                                            this.child(
+                                                                div().text_sm().child(name.clone()),
+                                                            )
+                                                        }),
+                                                )
+                                                .into_any_element()
+                                        })
+                                        .collect()
+                                } else if conversations.is_empty() {
                                     vec![]
                                 } else {
                                     use crate::components::sidebar_chat_item::ChatSessionItem;

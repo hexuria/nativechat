@@ -429,9 +429,6 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
-                        if state.conversations.is_empty() {
-                            state.create_new_session(cx);
-                        }
                         state.refresh_coworkers(cx);
                     }
                     Err(error) => {
@@ -469,18 +466,20 @@ impl AppState {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let result = match client.list_coworkers().await {
-                Ok(list) if !list.is_empty() => Ok(list),
-                Ok(_) => client.hire("NativeChat", None).await.map(|c| vec![c]),
-                Err(error) => Err(error),
-            };
+            let result = client.list_coworkers().await;
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(list) => {
-                        if state.active_coworker_id.is_none() {
-                            state.active_coworker_id = list.first().map(|c| c.id.clone());
-                        }
                         state.coworkers = list;
+                        if state
+                            .active_coworker_id
+                            .as_ref()
+                            .is_none_or(|id| !state.coworkers.iter().any(|c| &c.id == id))
+                        {
+                            if let Some(first) = state.coworkers.first().cloned() {
+                                state.select_coworker(first.id, cx);
+                            }
+                        }
                     }
                     Err(error) => state.auth_error = Some(error.message),
                 }
@@ -588,6 +587,54 @@ impl AppState {
                 })
             .detach();
         }
+    }
+
+    pub fn create_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            self.create_new_session(cx);
+            return;
+        };
+        if !self.is_signed_in() {
+            self.create_new_session(cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client.hire("New Bot", None).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(hired) => {
+                        let id = hired.id.clone();
+                        state.coworkers.insert(0, hired);
+                        state.select_coworker(id, cx);
+                    }
+                    Err(error) => state.auth_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn select_coworker(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(coworker) = self.coworkers.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        self.active_coworker_id = Some(id.clone());
+        if !self.conversations.iter().any(|c| c.id == id) {
+            self.conversations.insert(
+                0,
+                Conversation {
+                    id: id.clone(),
+                    title: coworker.name.clone(),
+                    created_at: chrono::Local::now()
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    messages: Vec::new(),
+                    unread_count: 0,
+                },
+            );
+        }
+        self.select_conversation(id, cx);
     }
 
     pub fn create_new_session(&mut self, cx: &mut Context<Self>) {

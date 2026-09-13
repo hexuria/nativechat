@@ -12,6 +12,7 @@ use crate::tts_text::{
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use gpui_kit::FontWeight;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::{ActiveTheme, IndexPath, h_flex, v_flex};
@@ -386,6 +387,7 @@ pub struct ChatView {
     active_profile_id: Option<i64>,
     last_conversation_id: Option<String>,
     bot_status: Option<String>,
+    coworker_name: Option<String>,
 }
 
 impl ChatView {
@@ -451,6 +453,7 @@ impl ChatView {
             active_profile_id,
             last_conversation_id,
             bot_status: None,
+            coworker_name: None,
         };
 
         cx.observe(&state, |this: &mut Self, state, cx| {
@@ -548,9 +551,23 @@ impl ChatView {
         .detach();
 
         cx.observe(&state, |this, app, cx| {
-            let label = app.read(cx).bot_status.clone();
+            let app = app.read(cx);
+            let label = app.bot_status.clone();
+            let coworker_name = app
+                .active_coworker_id
+                .as_ref()
+                .and_then(|id| app.coworkers.iter().find(|c| &c.id == id))
+                .map(|c| c.name.clone());
+            let mut changed = false;
             if this.bot_status != label {
                 this.bot_status = label;
+                changed = true;
+            }
+            if this.coworker_name != coworker_name {
+                this.coworker_name = coworker_name;
+                changed = true;
+            }
+            if changed {
                 cx.notify();
             }
         })
@@ -670,13 +687,15 @@ impl Render for ChatView {
                             .bg(theme.background.opacity(0.9)) // Slight transparency for glass effect if desired, or solid
                             .child(
                                 h_flex().gap_2().items_center().child(
-                                    div().w(px(200.0)).child(
-                                        Select::new(&self.profile_select)
-                                            .id("profile-select")
-                                            .placeholder("Select Profile")
-                                            .search_placeholder("Search profile...")
-                                            .w_full(),
-                                    ),
+                                    div()
+                                        .id("header-coworker")
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(
+                                            self.coworker_name
+                                                .clone()
+                                                .unwrap_or_else(|| "Native Chat".into()),
+                                        ),
                                 ),
                             )
                             .child(

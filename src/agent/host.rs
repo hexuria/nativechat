@@ -33,6 +33,10 @@ pub mod ids {
     pub fn session(id: &str) -> String {
         format!("session-{id}")
     }
+
+    pub fn coworker(id: &str) -> String {
+        format!("coworker-{id}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +48,7 @@ pub enum Command {
     ToggleCredentials,
     ToggleProfile,
     SelectSession(String),
+    SelectCoworker(String),
     SendMessage(String),
     Login { email: String, password: String },
     SetLoginDraft { email: Option<String>, password: Option<String> },
@@ -54,13 +59,14 @@ pub enum Command {
 impl Command {
     pub fn apply(self, state: &mut AppState, cx: &mut gpui_kit::Context<AppState>) {
         match self {
-            Self::NewChat => state.create_new_session(cx),
+            Self::NewChat => state.create_agent(cx),
             Self::ToggleSidebar => state.toggle_sidebar(cx),
             Self::ToggleTheme => state.toggle_theme(cx),
             Self::ToggleAccount => state.toggle_account_settings(cx),
             Self::ToggleCredentials => state.toggle_credentials_modal(cx),
             Self::ToggleProfile => state.toggle_profile_settings(cx),
             Self::SelectSession(id) => state.select_conversation(id, cx),
+            Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
             Self::Login { email, password } => state.login(email, password, cx),
             Self::SetLoginDraft { email, password } => {
@@ -107,15 +113,27 @@ pub struct NativeChatHost {
 impl NativeChatHost {
     pub fn from_app(state: &AppState) -> Self {
         let active = state.active_conversation_id.clone();
-        let sessions = state
-            .conversations
-            .iter()
-            .map(|c| SessionSnap {
-                active: active.as_ref() == Some(&c.id),
-                id: c.id.clone(),
-                title: c.title.clone(),
-            })
-            .collect();
+        let sessions = if state.is_signed_in() {
+            state
+                .coworkers
+                .iter()
+                .map(|c| SessionSnap {
+                    active: state.active_coworker_id.as_ref() == Some(&c.id),
+                    id: c.id.clone(),
+                    title: c.name.clone(),
+                })
+                .collect()
+        } else {
+            state
+                .conversations
+                .iter()
+                .map(|c| SessionSnap {
+                    active: active.as_ref() == Some(&c.id),
+                    id: c.id.clone(),
+                    title: c.title.clone(),
+                })
+                .collect()
+        };
         let profile_name = state
             .active_profile_id
             .and_then(|id| state.db_profiles.iter().find(|p| p.id == id))
@@ -176,7 +194,12 @@ impl NativeChatHost {
             .sessions
             .iter()
             .map(|s| {
-                let mut item = UiNode::listitem(ids::session(&s.id), s.title.clone());
+                let item_id = if self.signed_in {
+                    ids::coworker(&s.id)
+                } else {
+                    ids::session(&s.id)
+                };
+                let mut item = UiNode::listitem(item_id, s.title.clone());
                 if s.active {
                     item.states.push("selected".into());
                 }
@@ -281,6 +304,8 @@ impl NativeChatHost {
             || target == ids::NAV_PROJECTS
         {
             return Ok(DispatchResult::empty());
+        } else if let Some(id) = target.strip_prefix("coworker-") {
+            Command::SelectCoworker(id.to_string())
         } else if let Some(id) = target.strip_prefix("session-") {
             Command::SelectSession(id.to_string())
         } else {
