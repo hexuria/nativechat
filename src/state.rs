@@ -1,6 +1,7 @@
 use crate::actions::TtsSource;
 use crate::audio::AudioInput;
 use crate::config::Config;
+use crate::opengrok::{Account, OpenGrokClient, ProfileUpdate};
 use crate::llm::{
     ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
 };
@@ -117,6 +118,14 @@ pub enum VoiceStatus {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum AuthStatus {
+    #[default]
+    SignedOut,
+    SigningIn,
+    SignedIn,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub id: usize,
@@ -172,6 +181,13 @@ pub struct AppState {
     pub tts_service: Option<TtsService>,
     pub native_tts: SourceTtsState,
     pub ai_tts: SourceTtsState,
+    pub opengrok: Option<OpenGrokClient>,
+    pub account: Option<Account>,
+    pub auth_status: AuthStatus,
+    pub auth_error: Option<String>,
+    login_epoch: u64,
+    pub login_email: String,
+    pub login_password: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -329,6 +345,13 @@ impl AppState {
             tts_service: None,
             native_tts: SourceTtsState::default(),
             ai_tts: SourceTtsState::default(),
+            opengrok: None,
+            account: None,
+            auth_status: AuthStatus::SignedOut,
+            auth_error: None,
+            login_epoch: 0,
+            login_email: String::new(),
+            login_password: String::new(),
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -355,8 +378,132 @@ impl AppState {
                 eprintln!("[LLM] Failed to create provider: {}", e);
             }
         }
+        match OpenGrokClient::new(&config.opengrok_base_url) {
+            Ok(client) => self.opengrok = Some(client),
+            Err(error) => {
+                self.auth_error = Some(error.message);
+                self.opengrok = None;
+            }
+        }
         self.config = Some(config);
         cx.notify();
+    }
+
+    pub fn is_signed_in(&self) -> bool {
+        self.auth_status == AuthStatus::SignedIn && self.account.is_some()
+    }
+
+    pub fn login(&mut self, email: String, password: String, cx: &mut Context<Self>) {
+        if self.auth_status == AuthStatus::SigningIn {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        self.login_epoch += 1;
+        let epoch = self.login_epoch;
+        self.auth_status = AuthStatus::SigningIn;
+        self.auth_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = match client.login(&email, &password).await {
+                Ok(()) => client.me().await,
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |state, cx| {
+                if state.login_epoch != epoch {
+                    return;
+                }
+                match result {
+                    Ok(account) => {
+                        state.account = Some(account);
+                        state.auth_status = AuthStatus::SignedIn;
+                        state.auth_error = None;
+                    }
+                    Err(error) => {
+                        state.account = None;
+                        state.auth_status = AuthStatus::SignedOut;
+                        state.auth_error = Some(error.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn logout(&mut self, cx: &mut Context<Self>) {
+        let client = self.opengrok.clone();
+        self.account = None;
+        self.auth_status = AuthStatus::SignedOut;
+        self.auth_error = None;
+        self.is_account_settings_open = false;
+        cx.notify();
+        if let Some(client) = client {
+            cx.spawn(async move |_, _| {
+                let _ = client.logout().await;
+            })
+            .detach();
+        }
+    }
+
+    pub fn update_opengrok_profile(
+        &mut self,
+        first_name: String,
+        last_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .update_profile(&ProfileUpdate {
+                    first_name: Some(first_name),
+                    last_name: Some(last_name),
+                    avatar_url: None,
+                })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(account) => {
+                        state.account = Some(account);
+                        state.auth_error = None;
+                    }
+                    Err(error) => state.auth_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn change_opengrok_password(
+        &mut self,
+        current: String,
+        new_password: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client.change_password(&current, &new_password).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(()) => state.auth_error = None,
+                    Err(error) => state.auth_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn set_database_service(&mut self, service: DatabaseService, cx: &mut Context<Self>) {

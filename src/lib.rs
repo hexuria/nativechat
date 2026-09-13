@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod llm;
+pub mod opengrok;
 pub mod root;
 pub mod services;
 pub mod state;

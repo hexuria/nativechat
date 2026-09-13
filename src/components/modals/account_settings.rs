@@ -9,6 +9,7 @@ use gpui_kit::component::{
     ActiveTheme, Icon, IconName,
     button::Button,
     input::{Input, InputState},
+    v_flex,
 };
 
 pub struct AccountSettingsModal {
@@ -47,7 +48,7 @@ impl AccountSettingsModal {
         &self,
         foreground: gpui_kit::Hsla,
         background: gpui_kit::Hsla,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
             .flex()
@@ -70,9 +71,13 @@ impl AccountSettingsModal {
                     .child(Input::new(&self.email_input)) // Disabled not supported on Input view yet?
                     .child(
                         div()
-                            .child("Email cannot be changed")
+                            .child("Email cannot be changed (OpenGrok identity)")
                             .text_xs()
                             .text_color(gpui_kit::red()),
+                    )
+                    .when_some(
+                        self.state.read(cx).account.as_ref().map(|a| a.email.clone()),
+                        |this, email| this.child(div().text_xs().child(email)),
                     ),
             )
             .child(
@@ -80,7 +85,17 @@ impl AccountSettingsModal {
                     .label("Update Profile")
                     .bg(foreground)
                     .text_color(background)
-                    .w_full(),
+                    .w_full()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let name = this.name_input.read(cx).value().to_string();
+                        if name.trim().is_empty() {
+                            return;
+                        }
+                        let (first, last) = split_display_name(&name);
+                        this.state.update(cx, |state, cx| {
+                            state.update_opengrok_profile(first, last, cx);
+                        });
+                    })),
             )
     }
 
@@ -139,7 +154,23 @@ impl AccountSettingsModal {
                     .label("Change Password")
                     .bg(foreground)
                     .text_color(background)
-                    .w_full(),
+                    .w_full()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let current = this.current_password_input.read(cx).value().to_string();
+                        let new_password = this.new_password_input.read(cx).value().to_string();
+                        let confirm = this.confirm_password_input.read(cx).value().to_string();
+                        if new_password != confirm {
+                            this.state.update(cx, |state, cx| {
+                                state.auth_error =
+                                    Some("New password and confirmation do not match".into());
+                                cx.notify();
+                            });
+                            return;
+                        }
+                        this.state.update(cx, |state, cx| {
+                            state.change_opengrok_password(current, new_password, cx);
+                        });
+                    })),
             )
     }
 
@@ -237,7 +268,22 @@ impl Render for AccountSettingsModal {
                             )
                             .child(
                                 // Content
-                                div().p_4().child(match self.active_tab {
+                                div().p_4().child(
+                                    v_flex()
+                                        .gap_3()
+                                        .when_some(
+                                            self.state.read(cx).auth_error.clone(),
+                                            |this, message| {
+                                                this.child(
+                                                    div()
+                                                        .id("account-error")
+                                                        .text_sm()
+                                                        .text_color(cx.theme().danger)
+                                                        .child(message),
+                                                )
+                                            },
+                                        )
+                                        .child(match self.active_tab {
                                     0 => self
                                         .render_profile_tab(foreground, background, cx)
                                         .into_any_element(),
@@ -246,8 +292,17 @@ impl Render for AccountSettingsModal {
                                         .into_any_element(),
                                     _ => self.render_advanced_tab(cx).into_any_element(),
                                 }),
+                                ),
                             ),
                     ),
             )
+    }
+}
+
+fn split_display_name(name: &str) -> (String, String) {
+    let name = name.trim();
+    match name.split_once(' ') {
+        Some((first, last)) => (first.to_string(), last.trim().to_string()),
+        None => (name.to_string(), String::new()),
     }
 }

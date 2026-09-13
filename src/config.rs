@@ -16,6 +16,7 @@ pub struct Config {
     pub openai_base_url: String,
     pub default_provider: String,
     pub default_model: Option<String>,
+    pub opengrok_base_url: String,
 }
 
 impl Config {
@@ -52,6 +53,8 @@ impl Config {
         });
 
         let default_model = std::env::var("DEFAULT_MODEL").ok();
+        let opengrok_base_url = std::env::var("OPENGROK_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:1447".to_string());
 
         Ok(Self {
             database_url,
@@ -62,6 +65,7 @@ impl Config {
             openai_base_url,
             default_provider,
             default_model,
+            opengrok_base_url,
         })
     }
 }

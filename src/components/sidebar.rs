@@ -238,6 +238,11 @@ impl Render for SidebarView {
         let active_id = state.active_conversation_id.clone();
         let conversations = state.conversations.clone();
         let theme_mode = state.theme_mode.clone();
+        let account_label = state
+            .account
+            .as_ref()
+            .map(|a| a.display_name())
+            .unwrap_or_else(|| "Account Settings".into());
         let any_modal_open = state.is_voice_mode_open
             || state.is_account_settings_open
             || state.is_profile_settings_open;
@@ -592,7 +597,7 @@ impl Render for SidebarView {
                                                 })
                                         })
                                         .child(
-                                            SidebarMenuItem::new("Account Settings")
+                                            SidebarMenuItem::new(account_label.clone())
                                                 .icon(IconName::Settings)
                                                 .disable(any_modal_open)
                                                 .on_click({
@@ -634,8 +639,13 @@ impl Render for SidebarView {
                                             SidebarMenuItem::new("Sign Out")
                                                 .icon(IconName::CircleX)
                                                 .disable(any_modal_open)
-                                                .on_click(|_, _, _| {
-                                                    println!("Sign out clicked");
+                                                .on_click({
+                                                    let state = self.state.clone();
+                                                    move |_, _, cx| {
+                                                        state.update(cx, |state, cx| {
+                                                            state.logout(cx);
+                                                        });
+                                                    }
                                                 }),
                                         )
                                         .render("sidebar-footer", window, cx),

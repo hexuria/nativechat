@@ -1,4 +1,5 @@
 use crate::components::chat::ChatView;
+use crate::components::login::LoginView;
 use crate::components::modals::{
     account_settings::AccountSettingsModal, profile_settings::ProfileSettingsModal,
 };
@@ -13,12 +14,15 @@ fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
     view.cached(StyleRefinement::default().absolute().size_full())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ShellRev {
     collapsed: bool,
     auto_collapsed: bool,
     account: bool,
     profile: bool,
+    signed_in: bool,
+    signing_in: bool,
+    auth_error: Option<String>,
 }
 
 impl ShellRev {
@@ -28,6 +32,9 @@ impl ShellRev {
             auto_collapsed: state.auto_collapsed,
             account: state.is_account_settings_open,
             profile: state.is_profile_settings_open,
+            signed_in: state.is_signed_in(),
+            signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
+            auth_error: state.auth_error.clone(),
         }
     }
 }
@@ -36,6 +43,7 @@ impl ShellRev {
 pub struct Layout {
     sidebar: Entity<SidebarView>,
     chat: Entity<ChatView>,
+    login: Entity<LoginView>,
     account_settings_modal: Entity<AccountSettingsModal>,
     profile_settings_modal: Entity<ProfileSettingsModal>,
     state: Entity<AppState>,
@@ -47,6 +55,7 @@ impl Layout {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let sidebar = cx.new(|cx| SidebarView::new(state.clone(), cx));
         let chat = cx.new(|cx| ChatView::new(window, state.clone(), cx));
+        let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let account_settings_modal =
             cx.new(|cx| AccountSettingsModal::new(window, state.clone(), cx));
         let profile_settings_modal =
@@ -65,6 +74,7 @@ impl Layout {
         Self {
             sidebar,
             chat,
+            login,
             account_settings_modal,
             profile_settings_modal,
             state,
@@ -103,6 +113,9 @@ impl Render for Layout {
         }
 
         let state = self.state.read(cx);
+        if !state.is_signed_in() {
+            return div().size_full().child(self.login.clone());
+        }
 
         div()
             .size_full()
