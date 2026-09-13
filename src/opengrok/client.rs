@@ -1,17 +1,21 @@
 use std::sync::Arc;
 
-use reqwest::cookie::Jar;
+use reqwest::cookie::{CookieStore, Jar};
 use reqwest::{Client, StatusCode, Url};
 use serde::Serialize;
 use serde_json::json;
 
 use super::error::OpenGrokError;
-use super::types::{error_message_from_body, Account, ProfileUpdate};
+use super::types::{
+    assistant_text_from_sse, error_message_from_body, Account, AguiMessage, Coworker,
+    ProfileUpdate,
+};
 
 #[derive(Clone)]
 pub struct OpenGrokClient {
     base: Url,
     http: Client,
+    jar: Arc<Jar>,
 }
 
 impl OpenGrokClient {
@@ -21,10 +25,27 @@ impl OpenGrokClient {
         })?;
         let jar = Arc::new(Jar::default());
         let http = Client::builder()
-            .cookie_provider(jar)
+            .cookie_provider(jar.clone())
             .build()
             .map_err(|e| OpenGrokError::message(e.to_string()))?;
-        Ok(Self { base, http })
+        Ok(Self { base, http, jar })
+    }
+
+    /// AG-UI `principal_from_bearer` only reads `Authorization`, not cookies.
+    /// The console login stores the same JWT as `og_access`; send it as Bearer
+    /// the way the desktop sends it as `x-opengrok-account` on Seam A.
+    fn access_token(&self) -> Option<String> {
+        let header = CookieStore::cookies(self.jar.as_ref(), &self.base)?;
+        let raw = header.to_str().ok()?;
+        for pair in raw.split(';') {
+            let pair = pair.trim();
+            if let Some((name, value)) = pair.split_once('=')
+                && name.trim() == "og_access"
+            {
+                return Some(value.trim().to_string());
+            }
+        }
+        None
     }
 
     fn url(&self, path: &str) -> Result<Url, OpenGrokError> {
@@ -41,6 +62,9 @@ impl OpenGrokClient {
     ) -> Result<reqwest::Response, OpenGrokError> {
         let url = self.url(path)?;
         let mut req = self.http.request(method, url);
+        if let Some(token) = self.access_token() {
+            req = req.bearer_auth(token);
+        }
         if let Some(body) = body {
             req = req.json(body);
         }
@@ -155,6 +179,67 @@ impl OpenGrokClient {
             Err(Self::read_error(response).await)
         }
     }
+
+    pub async fn list_coworkers(&self) -> Result<Vec<Coworker>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/coworkers", None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
+    pub async fn hire(
+        &self,
+        name: &str,
+        model: Option<&str>,
+    ) -> Result<Coworker, OpenGrokError> {
+        let mut body = json!({ "name": name });
+        if let Some(model) = model.filter(|m| !m.is_empty()) {
+            body["model"] = json!(model);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, "/coworkers", Some(&body))
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
+    /// One turn. Desktop Grok Bot POSTs `/api/sendPrompt` then paints from `GET /events`.
+    /// NativeChat is a new client: same coworker + transcript, `POST /ag-ui` SSE instead.
+    pub async fn run_turn(
+        &self,
+        coworker_id: &str,
+        thread_id: &str,
+        messages: &[AguiMessage],
+    ) -> Result<String, OpenGrokError> {
+        let body = json!({
+            "threadId": thread_id,
+            "runId": uuid::Uuid::now_v7().to_string(),
+            "messages": messages,
+            "forwardedProps": { "coworkerId": coworker_id },
+        });
+        let response = self
+            .send_json(reqwest::Method::POST, "/ag-ui", Some(&body))
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        assistant_text_from_sse(&text).map_err(OpenGrokError::message)
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +321,50 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let err = client.refresh().await.unwrap_err();
         assert!(err.is_unauthorized());
+    }
+
+    #[tokio::test]
+    async fn empty_roster_is_empty_vec() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let list = client.list_coworkers().await.unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hire_posts_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/coworkers"))
+            .and(body_json(json!({"name":"NativeChat"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "cw_1",
+                "name": "NativeChat",
+                "model": "xai/grok-4.6"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let hired = client.hire("NativeChat", None).await.unwrap();
+        assert_eq!(hired.id, "cw_1");
+        assert_eq!(hired.model, "xai/grok-4.6");
+    }
+
+    #[test]
+    fn sse_collects_text_deltas() {
+        let body = concat!(
+            "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m1\",\"role\":\"assistant\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\"Hello\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\" world\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"m1\"}\n\n",
+            "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n",
+        );
+        assert_eq!(assistant_text_from_sse(body).unwrap(), "Hello world");
     }
 }

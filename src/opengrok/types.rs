@@ -51,6 +51,57 @@ struct ErrorBody {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Coworker {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AguiMessage {
+    pub id: String,
+    pub role: String,
+    pub content: String,
+}
+
+/// Pull assistant `delta` fields out of an AG-UI SSE body (desktop Seam A
+/// paints from `/events`; we consume the same TEXT_MESSAGE_CONTENT frames
+/// on the `POST /ag-ui` stream).
+pub fn assistant_text_from_sse(body: &str) -> Result<String, String> {
+    let mut out = String::new();
+    for block in body.split("\n\n") {
+        for line in block.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if kind == "RUN_ERROR" {
+                let message = value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("run failed");
+                return Err(message.to_string());
+            }
+            if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
+                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                    out.push_str(delta);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn error_message_from_body(body: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<ErrorBody>(body) {
         if let Some(error) = parsed.error {

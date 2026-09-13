@@ -43,6 +43,8 @@ See `migration-v2/` for the phased plan (login → roster/pin → turn → look)
    ```
 
    Sign in with the admin email/password. Session cookies stay in memory (sign in again after quit).
+   After login the app hires a coworker if you have none, and composer send goes to
+   `POST /ag-ui` (same turn machinery as desktop `POST /api/sendPrompt`, cookie JWT sent as Bearer).
 
 Agent-driven verification (optional):
 

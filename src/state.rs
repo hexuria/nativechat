@@ -1,7 +1,7 @@
 use crate::actions::TtsSource;
 use crate::audio::AudioInput;
 use crate::config::Config;
-use crate::opengrok::{Account, OpenGrokClient, ProfileUpdate};
+use crate::opengrok::{Account, AguiMessage, Coworker, OpenGrokClient, ProfileUpdate};
 use crate::llm::{
     ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
 };
@@ -188,6 +188,8 @@ pub struct AppState {
     login_epoch: u64,
     pub login_email: String,
     pub login_password: String,
+    pub coworkers: Vec<Coworker>,
+    pub active_coworker_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -352,6 +354,8 @@ impl AppState {
             login_epoch: 0,
             login_email: String::new(),
             login_password: String::new(),
+            coworkers: Vec::new(),
+            active_coworker_id: None,
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -421,6 +425,10 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        if state.conversations.is_empty() {
+                            state.create_new_session(cx);
+                        }
+                        state.refresh_coworkers(cx);
                     }
                     Err(error) => {
                         state.account = None;
@@ -439,6 +447,8 @@ impl AppState {
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.auth_error = None;
+        self.coworkers.clear();
+        self.active_coworker_id = None;
         self.is_account_settings_open = false;
         cx.notify();
         if let Some(client) = client {
@@ -447,6 +457,32 @@ impl AppState {
             })
             .detach();
         }
+    }
+
+    pub fn refresh_coworkers(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = match client.list_coworkers().await {
+                Ok(list) if !list.is_empty() => Ok(list),
+                Ok(_) => client.hire("NativeChat", None).await.map(|c| vec![c]),
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(list) => {
+                        if state.active_coworker_id.is_none() {
+                            state.active_coworker_id = list.first().map(|c| c.id.clone());
+                        }
+                        state.coworkers = list;
+                    }
+                    Err(error) => state.auth_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn update_opengrok_profile(
@@ -944,6 +980,103 @@ impl AppState {
         }
     }
 
+    fn send_opengrok_turn(
+        &mut self,
+        conversation_id: String,
+        _content: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        let coworker_id = self.active_coworker_id.clone();
+        let history: Vec<AguiMessage> = self
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| {
+                c.messages
+                    .iter()
+                    .map(|m| AguiMessage {
+                        id: m.id.clone(),
+                        role: if m.is_me {
+                            "user".to_string()
+                        } else {
+                            "assistant".to_string()
+                        },
+                        content: m.content.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+        {
+            conversation.messages.push(Message {
+                id: "temp-ai".to_string(),
+                sender: "AI".to_string(),
+                content: String::new(),
+                sent_at: SystemTime::now(),
+                is_me: false,
+            });
+        }
+        self.is_ai_responding = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let coworker = match coworker_id {
+                Some(id) => Ok(id),
+                None => match client.hire("NativeChat", None).await {
+                    Ok(hired) => {
+                        let id = hired.id.clone();
+                        let _ = this.update(cx, |state, _| {
+                            state.active_coworker_id = Some(id.clone());
+                            state.coworkers = vec![hired];
+                        });
+                        Ok(id)
+                    }
+                    Err(error) => Err(error),
+                },
+            };
+            let result = match coworker {
+                Ok(id) => client.run_turn(&id, &conversation_id, &history).await,
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |state, cx| {
+                if let Some(conversation) = state
+                    .conversations
+                    .iter_mut()
+                    .find(|c| c.id == conversation_id)
+                {
+                    if let Some(last) = conversation.messages.last_mut() {
+                        if last.id == "temp-ai" {
+                            match &result {
+                                Ok(text) if !text.is_empty() => last.content = text.clone(),
+                                Ok(_) => {
+                                    last.content =
+                                        "(OpenGrok returned no assistant text.)".to_string()
+                                }
+                                Err(error) => last.content = format!("OpenGrok: {}", error.message),
+                            }
+                            last.id = uuid::Uuid::now_v7().to_string();
+                        }
+                    }
+                }
+                state.is_ai_responding = false;
+                if let Err(error) = result {
+                    state.auth_error = Some(error.message);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
         let conversation_id = match &self.active_conversation_id {
             Some(id) => id.clone(),
@@ -996,6 +1129,11 @@ impl AppState {
                     }
                 })
             .detach();
+        }
+
+        if self.is_signed_in() {
+            self.send_opengrok_turn(conversation_id, content, cx);
+            return;
         }
 
         // Get AI response

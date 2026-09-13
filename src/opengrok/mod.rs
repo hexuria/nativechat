@@ -6,4 +6,6 @@ mod types;
 
 pub use client::OpenGrokClient;
 pub use error::OpenGrokError;
-pub use types::{Account, ProfileUpdate};
+pub use types::{
+    assistant_text_from_sse, Account, AguiMessage, Coworker, ProfileUpdate,
+};

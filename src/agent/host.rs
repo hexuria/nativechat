@@ -44,6 +44,7 @@ pub enum Command {
     ToggleCredentials,
     ToggleProfile,
     SelectSession(String),
+    SendMessage(String),
     Login { email: String, password: String },
     SetLoginDraft { email: Option<String>, password: Option<String> },
     Logout,
@@ -60,6 +61,7 @@ impl Command {
             Self::ToggleCredentials => state.toggle_credentials_modal(cx),
             Self::ToggleProfile => state.toggle_profile_settings(cx),
             Self::SelectSession(id) => state.select_conversation(id, cx),
+            Self::SendMessage(text) => state.send_message(text, cx),
             Self::Login { email, password } => state.login(email, password, cx),
             Self::SetLoginDraft { email, password } => {
                 if let Some(email) = email {
@@ -97,6 +99,7 @@ pub struct NativeChatHost {
     auth_error: Option<String>,
     login_email: String,
     login_password: String,
+    last_assistant: String,
     pending: Option<Command>,
 }
 
@@ -135,6 +138,13 @@ impl NativeChatHost {
             auth_error: state.auth_error.clone(),
             login_email: state.login_email.clone(),
             login_password: state.login_password.clone(),
+            last_assistant: state
+                .conversations
+                .iter()
+                .find(|c| Some(&c.id) == state.active_conversation_id.as_ref())
+                .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
+                .map(|m| m.content.clone())
+                .unwrap_or_default(),
             pending: None,
         }
     }
@@ -203,7 +213,16 @@ impl NativeChatHost {
                         .unwrap_or_else(|| "Select Profile".into()),
                 ),
             )
-            .with_child(UiNode::textbox(ids::COMPOSER, "Type a message..."));
+            .with_child(UiNode::textbox(ids::COMPOSER, "Type a message..."))
+            .with_child(UiNode::new(
+                "transcript-tail",
+                "status",
+                if self.last_assistant.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    self.last_assistant.chars().take(400).collect()
+                },
+            ));
 
         UiTree {
             app: "nativechat".into(),
@@ -288,6 +307,14 @@ impl NativeChatHost {
                 Command::Login { email, password }
             }
             "auth.logout" => Command::Logout,
+            "chat.send" => {
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "chat.send requires arg text".to_string())?
+                    .to_string();
+                Command::SendMessage(text)
+            }
             "session.select" => {
                 let id = args
                     .get("id")
