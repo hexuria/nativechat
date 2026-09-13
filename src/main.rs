@@ -2,8 +2,8 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
     About, BranchInNewChat, CopyMessage, Hide, HideOthers, Minimize, NewChat, OpenSettings, Quit,
-    ReadAloud, ReportMessage, ShowAll, ToggleDebugMarkdown, ToggleFps, ToggleSidebar, ToggleTheme,
-    Zoom,
+    ReadAloud, ReportMessage, ShowAll, ToggleAgentSettings, ToggleDebugMarkdown, ToggleFps,
+    ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
@@ -54,6 +54,8 @@ fn main() {
                 KeyBinding::new("cmd-enter", SubmitMessage, Some("Editor")),
                 KeyBinding::new("ctrl-enter", SubmitMessage, Some("Editor")),
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
+                KeyBinding::new("cmd-shift-h", ToggleMiniSidebar, None),
+                KeyBinding::new("cmd-shift-b", ToggleAgentSettings, None),
                 KeyBinding::new("cmd-t", ToggleTheme, None),
                 KeyBinding::new("cmd-n", NewChat, None),
                 KeyBinding::new("cmd-,", OpenSettings, None),
@@ -194,6 +196,8 @@ fn set_menus(cx: &mut App) {
             disabled: false,
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Toggle Mini Sidebar", ToggleMiniSidebar),
+                MenuItem::action("Toggle Agent Settings", ToggleAgentSettings),
                 MenuItem::action("Toggle Theme", ToggleTheme),
             ],
         },

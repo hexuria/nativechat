@@ -8,10 +8,9 @@ use crate::components::sidebar::SidebarView;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{
-    ActiveTheme, Disableable, resizable::h_resizable, resizable::resizable_panel, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Disableable, v_flex};
 
+use crate::chrome::{sidebar_width, INFO_PANE_WIDTH};
 use crate::state::AppState;
 
 fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
@@ -21,6 +20,8 @@ fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
 #[derive(Clone, PartialEq, Eq)]
 struct ShellRev {
     collapsed: bool,
+    hidden: bool,
+    expanded_width: i32,
     auto_collapsed: bool,
     account: bool,
     profile: bool,
@@ -28,6 +29,8 @@ struct ShellRev {
     signing_in: bool,
     auth_error: Option<String>,
     agent_settings: bool,
+    model_picker: bool,
+    avatar_editor: bool,
     has_agent: bool,
     hiring: bool,
 }
@@ -36,6 +39,8 @@ impl ShellRev {
     fn from_state(state: &AppState) -> Self {
         Self {
             collapsed: state.sidebar_collapsed,
+            hidden: state.sidebar_hidden,
+            expanded_width: state.sidebar_expanded_width.round() as i32,
             auto_collapsed: state.auto_collapsed,
             account: state.is_account_settings_open,
             profile: state.is_profile_settings_open,
@@ -43,6 +48,8 @@ impl ShellRev {
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
             agent_settings: state.is_agent_settings_open,
+            model_picker: state.model_picker_open,
+            avatar_editor: state.avatar_editor_open,
             has_agent: state.active_coworker_id.is_some(),
             hiring: state.hiring,
         }
@@ -60,6 +67,7 @@ pub struct Layout {
     state: Entity<AppState>,
     shell: ShellRev,
     last_window_width: Option<Pixels>,
+    resize_drag: Option<(f32, f32)>,
 }
 
 impl Layout {
@@ -93,36 +101,22 @@ impl Layout {
             state,
             shell,
             last_window_width: None,
+            resize_drag: None,
         }
     }
 }
 
 impl Render for Layout {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (sidebar_collapsed, auto_collapsed) = {
-            let state = self.state.read(cx);
-            (state.sidebar_collapsed, state.auto_collapsed)
-        };
         let window_width = window.viewport_size().width;
         if self.last_window_width != Some(window_width) {
             self.last_window_width = Some(window_width);
-            if window_width < px(800.0) {
-                if !sidebar_collapsed {
-                    let state_entity = self.state.clone();
-                    cx.defer(move |cx| {
-                        state_entity.update(cx, |state, cx| {
-                            state.set_sidebar_collapsed(true, true, cx);
-                        });
-                    });
-                }
-            } else if sidebar_collapsed && auto_collapsed {
-                let state_entity = self.state.clone();
-                cx.defer(move |cx| {
-                    state_entity.update(cx, |state, cx| {
-                        state.set_sidebar_collapsed(false, false, cx);
-                    });
+            let state_entity = self.state.clone();
+            cx.defer(move |cx| {
+                state_entity.update(cx, |state, cx| {
+                    state.apply_responsive_sidebar(f32::from(window_width), cx);
                 });
-            }
+            });
         }
 
         let state = self.state.read(cx);
@@ -132,26 +126,71 @@ impl Render for Layout {
         let has_agent = state.active_coworker_id.is_some();
         let hiring = state.hiring;
         let hire_error = state.auth_error.clone();
+        let hidden = state.sidebar_hidden;
+        let collapsed = state.sidebar_collapsed;
+        let expanded_width = state.sidebar_expanded_width;
+        let settings_open = state.is_agent_settings_open;
         let theme = cx.theme().clone();
         let main = if has_agent {
             self.chat.clone().into_any_element()
         } else {
             empty_agent_pane(self.state.clone(), hire_error, hiring, &theme)
         };
+        let left = sidebar_width(hidden, collapsed, expanded_width);
+        let dragging = self.resize_drag.is_some();
 
         div()
             .size_full()
             .flex()
             .relative()
-            .child(
-                div()
-                    .id("sidebar-slot")
-                    .w(px(64.))
-                    .flex_shrink_0()
-                    .h_full()
-                    .relative()
-                    .child(cached_fill(self.sidebar.clone())),
-            )
+            .when(dragging, |this| {
+                this.cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                        let Some((origin_x, origin_w)) = this.resize_drag else {
+                            return;
+                        };
+                        let width = origin_w + f32::from(ev.position.x) - origin_x;
+                        this.state.update(cx, |state, cx| {
+                            state.resize_sidebar(width, cx);
+                        });
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.resize_drag = None;
+                            cx.notify();
+                        }),
+                    )
+            })
+            .when(left > 0.0, |this| {
+                this.child(
+                    div()
+                        .id("sidebar-slot")
+                        .w(px(left))
+                        .flex_shrink_0()
+                        .h_full()
+                        .relative()
+                        .child(cached_fill(self.sidebar.clone()))
+                        .child(
+                            div()
+                                .id("sidebar-resize")
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .w(px(6.))
+                                .cursor(CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                        this.resize_drag =
+                                            Some((f32::from(ev.position.x), left));
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -160,13 +199,14 @@ impl Render for Layout {
                     .overflow_hidden()
                     .child(main),
             )
-            .when(state.is_agent_settings_open, |this| {
+            .when(settings_open, |this| {
                 this.child(
                     div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
+                        .id("agent-settings-slot")
+                        .w(px(INFO_PANE_WIDTH))
+                        .flex_shrink_0()
+                        .h_full()
+                        .overflow_hidden()
                         .child(self.agent_settings.clone()),
                 )
             })

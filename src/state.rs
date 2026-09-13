@@ -1,8 +1,12 @@
 use crate::actions::TtsSource;
 use crate::audio::AudioInput;
 use crate::config::Config;
+use crate::chrome::{
+    collapse_for_width, remember_choice, sidebar_from_resize, ResponsiveCollapse, SidebarChrome,
+    SIDEBAR_EXPANDED,
+};
 use crate::opengrok::{
-    activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, ModelCatalogue,
+    activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue,
     OpenGrokClient, ProfileUpdate,
 };
 use crate::llm::{
@@ -168,6 +172,9 @@ pub struct AppState {
     pub selected_apps: Vec<String>,
     pub capabilities: Vec<AppCapability>,
     pub sidebar_collapsed: bool,
+    pub sidebar_hidden: bool,
+    pub sidebar_expanded_width: f32,
+    pub sidebar_responsive: ResponsiveCollapse,
     pub auto_collapsed: bool,
     pub model_registry: Arc<ModelRegistry>,
     pub available_models: Vec<ModelProfile>,
@@ -196,6 +203,8 @@ pub struct AppState {
     pub bot_status: Option<String>,
     pub model_catalogue: ModelCatalogue,
     pub is_agent_settings_open: bool,
+    pub model_picker_open: bool,
+    pub avatar_editor_open: bool,
     pub hiring: bool,
 }
 
@@ -340,6 +349,9 @@ impl AppState {
             selected_apps: Vec::new(),
             capabilities,
             sidebar_collapsed: false,
+            sidebar_hidden: false,
+            sidebar_expanded_width: SIDEBAR_EXPANDED,
+            sidebar_responsive: ResponsiveCollapse::default(),
             auto_collapsed: false,
             model_registry: Arc::new(ModelRegistry::new()),
             available_models: Vec::new(),
@@ -366,6 +378,8 @@ impl AppState {
             bot_status: None,
             model_catalogue: ModelCatalogue::default(),
             is_agent_settings_open: false,
+            model_picker_open: false,
+            avatar_editor_open: false,
             hiring: false,
         };
         // Synchronously load cached state to avoid startup delay
@@ -436,7 +450,6 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
-                        state.is_agent_settings_open = true;
                         state.refresh_coworkers(cx);
                     }
                     Err(error) => {
@@ -518,6 +531,41 @@ impl AppState {
 
     pub fn toggle_agent_settings(&mut self, cx: &mut Context<Self>) {
         self.is_agent_settings_open = !self.is_agent_settings_open;
+        if !self.is_agent_settings_open {
+            self.model_picker_open = false;
+            self.avatar_editor_open = false;
+        }
+        cx.notify();
+    }
+
+    pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
+        if !self.model_picker_open && !self.avatar_editor_open {
+            return;
+        }
+        self.model_picker_open = false;
+        self.avatar_editor_open = false;
+        cx.notify();
+    }
+
+    pub fn set_model_picker_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.model_picker_open == open && (!open || !self.avatar_editor_open) {
+            return;
+        }
+        self.model_picker_open = open;
+        if open {
+            self.avatar_editor_open = false;
+        }
+        cx.notify();
+    }
+
+    pub fn set_avatar_editor_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.avatar_editor_open == open && (!open || !self.model_picker_open) {
+            return;
+        }
+        self.avatar_editor_open = open;
+        if open {
+            self.model_picker_open = false;
+        }
         cx.notify();
     }
 
@@ -527,6 +575,17 @@ impl AppState {
         role: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        self.patch_active_agent(
+            CoworkerPatch {
+                model,
+                role,
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+
+    pub fn patch_active_agent(&mut self, patch: CoworkerPatch, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             self.auth_error = Some("OpenGrok is not configured".into());
             cx.notify();
@@ -537,22 +596,65 @@ impl AppState {
             cx.notify();
             return;
         };
+        if let Some(existing) = self.coworkers.iter_mut().find(|c| c.id == id) {
+            if let Some(name) = patch.name.clone() {
+                existing.name = name;
+            }
+            if let Some(model) = patch.model.clone() {
+                existing.model = model;
+            }
+            if let Some(role) = patch.role.clone() {
+                existing.role = if role.trim().is_empty() {
+                    None
+                } else {
+                    Some(role)
+                };
+            }
+            if let Some(title) = patch.title.clone() {
+                existing.title = if title.trim().is_empty() {
+                    None
+                } else {
+                    Some(title)
+                };
+            }
+            if let Some(shape) = patch.avatar_shape.clone() {
+                existing.avatar_shape = if shape.is_empty() { None } else { Some(shape) };
+            }
+            if let Some(color) = patch.avatar_color.clone() {
+                existing.avatar_color = if color.is_empty() { None } else { Some(color) };
+            }
+            if let Some(notify) = patch.notify_on_updates {
+                existing.notify_on_updates = Some(notify);
+            }
+        }
+        cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = client
-                .patch_coworker(
-                    &id,
-                    model.as_deref(),
-                    role.as_deref(),
-                )
-                .await;
+            let result = client.patch_coworker(&id, &patch).await;
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(updated) => {
                         if let Some(existing) = state.coworkers.iter_mut().find(|c| c.id == id) {
+                            if !updated.name.is_empty() {
+                                existing.name = updated.name;
+                            }
                             if !updated.model.is_empty() {
                                 existing.model = updated.model;
                             }
-                            existing.role = updated.role;
+                            if updated.role.is_some() {
+                                existing.role = updated.role;
+                            }
+                            if updated.title.is_some() {
+                                existing.title = updated.title;
+                            }
+                            if updated.avatar_shape.is_some() {
+                                existing.avatar_shape = updated.avatar_shape;
+                            }
+                            if updated.avatar_color.is_some() {
+                                existing.avatar_color = updated.avatar_color;
+                            }
+                            if updated.notify_on_updates.is_some() {
+                                existing.notify_on_updates = updated.notify_on_updates;
+                            }
                         }
                         state.auth_error = None;
                     }
@@ -714,7 +816,6 @@ impl AppState {
             return;
         };
         self.active_coworker_id = Some(id.clone());
-        self.is_agent_settings_open = true;
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(
                 0,
@@ -1518,16 +1619,62 @@ impl AppState {
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
-        // If user manually toggles, reset auto_collapsed to false so we don't auto-restore unexpectedly
+        self.sidebar_hidden = !self.sidebar_hidden;
+        cx.notify();
+    }
+
+    pub fn toggle_mini_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_hidden {
+            self.sidebar_hidden = false;
+            self.sidebar_collapsed = false;
+        } else {
+            self.sidebar_collapsed = !self.sidebar_collapsed;
+        }
         self.auto_collapsed = false;
+        self.sidebar_responsive = remember_choice(self.sidebar_responsive, self.sidebar_collapsed);
+        cx.notify();
+    }
+
+    pub fn resize_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
+        let next = sidebar_from_resize(
+            SidebarChrome {
+                hidden: self.sidebar_hidden,
+                collapsed: self.sidebar_collapsed,
+                expanded_width: self.sidebar_expanded_width,
+            },
+            width,
+        );
+        self.sidebar_hidden = next.hidden;
+        self.sidebar_collapsed = next.collapsed;
+        self.sidebar_expanded_width = next.expanded_width;
+        self.auto_collapsed = false;
+        if !next.hidden {
+            self.sidebar_responsive = remember_choice(self.sidebar_responsive, next.collapsed);
+        }
         cx.notify();
     }
 
     pub fn set_sidebar_collapsed(&mut self, collapsed: bool, auto: bool, cx: &mut Context<Self>) {
         self.sidebar_collapsed = collapsed;
         self.auto_collapsed = auto;
+        self.sidebar_responsive = remember_choice(self.sidebar_responsive, collapsed);
         cx.notify();
+    }
+
+    pub fn apply_responsive_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
+        let result = collapse_for_width(
+            self.sidebar_responsive,
+            width,
+            self.sidebar_collapsed,
+        );
+        self.sidebar_responsive = result.next;
+        if let Some(apply) = result.apply {
+            if self.sidebar_collapsed != apply {
+                self.sidebar_collapsed = apply;
+                self.auto_collapsed = true;
+                cx.notify();
+            }
+        }
     }
 
     pub fn toggle_debug_markdown(&mut self, cx: &mut Context<Self>) {

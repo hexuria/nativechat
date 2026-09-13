@@ -9,7 +9,7 @@ use serde_json::json;
 use super::error::OpenGrokError;
 use super::types::{
     assistant_text_from_sse, error_message_from_body, Account, AguiMessage, Coworker,
-    ModelCatalogue, ProfileUpdate,
+    CoworkerPatch, ModelCatalogue, ProfileUpdate,
 };
 
 #[derive(Clone)]
@@ -231,32 +231,16 @@ impl OpenGrokClient {
     pub async fn patch_coworker(
         &self,
         coworker_id: &str,
-        model: Option<&str>,
-        role: Option<&str>,
+        patch: &CoworkerPatch,
     ) -> Result<Coworker, OpenGrokError> {
-        let mut body = serde_json::Map::new();
-        if let Some(model) = model {
-            body.insert("model".into(), json!(model));
-        }
-        if let Some(role) = role {
-            if role.trim().is_empty() {
-                body.insert("role".into(), serde_json::Value::Null);
-            } else {
-                body.insert("role".into(), json!(role));
-            }
-        }
-        if body.is_empty() {
+        if patch.is_empty() {
             return Err(OpenGrokError::message(
-                "nothing to change: name a model, a role, or both".to_string(),
+                "nothing to change".to_string(),
             ));
         }
         let path = format!("/coworkers/{coworker_id}");
         let response = self
-            .send_json(
-                reqwest::Method::PATCH,
-                &path,
-                Some(&serde_json::Value::Object(body)),
-            )
+            .send_json(reqwest::Method::PATCH, &path, Some(patch))
             .await?;
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
@@ -494,7 +478,14 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let updated = client
-            .patch_coworker("cw_1", Some("xai/grok-4.6@sub"), Some("Research, marketing, admin"))
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    model: Some("xai/grok-4.6@sub".into()),
+                    role: Some("Research, marketing, admin".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.model, "xai/grok-4.6@sub");

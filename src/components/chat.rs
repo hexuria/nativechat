@@ -606,9 +606,17 @@ impl Render for ChatView {
             self.selection_need_sync = false;
         }
 
+        let app = self.state.clone();
         v_flex()
             .size_full()
             .bg(theme.background)
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    if state.model_picker_open || state.avatar_editor_open {
+                        state.dismiss_popovers(cx);
+                    }
+                });
+            })
             .on_action({
                 let state = self.state.clone();
                 move |action: &ToggleReadAloud, _window: &mut Window, cx: &mut App| {

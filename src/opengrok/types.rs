@@ -61,6 +61,45 @@ pub struct Coworker {
     pub model: String,
     #[serde(default)]
     pub role: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub avatar_shape: Option<String>,
+    #[serde(default)]
+    pub avatar_color: Option<String>,
+    #[serde(default)]
+    pub notify_on_updates: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoworkerPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_shape: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_on_updates: Option<bool>,
+}
+
+impl CoworkerPatch {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.model.is_none()
+            && self.role.is_none()
+            && self.title.is_none()
+            && self.avatar_shape.is_none()
+            && self.avatar_color.is_none()
+            && self.notify_on_updates.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

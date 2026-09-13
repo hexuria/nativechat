@@ -1,6 +1,6 @@
 use crate::actions::{
     About, Hide, HideOthers, Minimize, NewChat, ShowAll, ToggleDebugMarkdown, ToggleFps,
-    ToggleSidebar, ToggleTheme, Zoom,
+    ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
 use gpui_kit::prelude::*;
@@ -196,6 +196,18 @@ impl Render for RootView {
             })
             .on_action({
                 let state = self.state.clone();
+                move |_: &ToggleMiniSidebar, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_mini_sidebar(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &ToggleAgentSettings, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_agent_settings(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
                 move |_: &ToggleTheme, _window: &mut Window, cx: &mut App| {
                     state.update(cx, |state, cx| state.toggle_theme(cx));
                 }
@@ -203,7 +215,7 @@ impl Render for RootView {
             .on_action({
                 let state = self.state.clone();
                 move |_: &NewChat, _window: &mut Window, cx: &mut App| {
-                    state.update(cx, |state, cx| state.create_new_session(cx));
+                    state.update(cx, |state, cx| state.create_agent(cx));
                 }
             })
             .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {

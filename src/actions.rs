@@ -7,6 +7,8 @@ actions!(
     nativechat,
     [
         ToggleSidebar,
+        ToggleMiniSidebar,
+        ToggleAgentSettings,
         ToggleTheme,
         OpenSettings,
         Minimize,

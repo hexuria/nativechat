@@ -1,6 +1,7 @@
 use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
+use crate::opengrok::CoworkerPatch;
 use crate::state::AppState;
 
 pub mod ids {
@@ -46,11 +47,17 @@ pub mod ids {
 pub enum Command {
     NewChat,
     ToggleSidebar,
+    ToggleMiniSidebar,
     ToggleTheme,
     ToggleAccount,
     ToggleCredentials,
     ToggleProfile,
     ToggleAgentSettings,
+    ToggleModelPicker,
+    SetModelPicker(bool),
+    ToggleAvatarEditor,
+    SetAvatarEditor(bool),
+    SetAvatarColor(String),
     SelectSession(String),
     SelectCoworker(String),
     SendMessage(String),
@@ -65,11 +72,29 @@ impl Command {
         match self {
             Self::NewChat => state.create_agent(cx),
             Self::ToggleSidebar => state.toggle_sidebar(cx),
+            Self::ToggleMiniSidebar => state.toggle_mini_sidebar(cx),
             Self::ToggleTheme => state.toggle_theme(cx),
             Self::ToggleAccount => state.toggle_account_settings(cx),
             Self::ToggleCredentials => state.toggle_credentials_modal(cx),
             Self::ToggleProfile => state.toggle_profile_settings(cx),
             Self::ToggleAgentSettings => state.toggle_agent_settings(cx),
+            Self::ToggleModelPicker => {
+                let open = !state.model_picker_open;
+                state.set_model_picker_open(open, cx);
+            }
+            Self::SetModelPicker(open) => state.set_model_picker_open(open, cx),
+            Self::ToggleAvatarEditor => {
+                let open = !state.avatar_editor_open;
+                state.set_avatar_editor_open(open, cx);
+            }
+            Self::SetAvatarEditor(open) => state.set_avatar_editor_open(open, cx),
+            Self::SetAvatarColor(id) => state.patch_active_agent(
+                CoworkerPatch {
+                    avatar_color: Some(id),
+                    ..Default::default()
+                },
+                cx,
+            ),
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
@@ -113,6 +138,8 @@ pub struct NativeChatHost {
     last_assistant: String,
     bot_status: Option<String>,
     agent_settings_open: bool,
+    model_picker_open: bool,
+    avatar_editor_open: bool,
     pending: Option<Command>,
 }
 
@@ -172,6 +199,8 @@ impl NativeChatHost {
                 .unwrap_or_default(),
             bot_status: state.bot_status.clone(),
             agent_settings_open: state.is_agent_settings_open,
+            model_picker_open: state.model_picker_open,
+            avatar_editor_open: state.avatar_editor_open,
             pending: None,
         }
     }
@@ -302,8 +331,20 @@ impl NativeChatHost {
                     )
                     .with_child(
                         UiNode::dialog(ids::AGENT_SETTINGS, "Agent Settings")
-                            .with_visible(self.agent_settings_open),
-                    ),
+                            .with_visible(self.agent_settings_open)
+                            .with_child(UiNode::button("avatar-trigger", "Edit avatar"))
+                            .with_child(
+                                UiNode::new("avatar-editor", "dialog", "Avatar editor")
+                                    .with_visible(self.avatar_editor_open),
+                            )
+                            .with_child(UiNode::button("agent-model-field", "Model"))
+                            .with_child(
+                                UiNode::new("agent-model-list", "list", "Models")
+                                    .with_visible(self.model_picker_open),
+                            ),
+                    )
+                    .with_child(UiNode::button("agent-model-dismiss", "Dismiss model picker"))
+                    .with_child(UiNode::button("avatar-editor-dismiss", "Dismiss avatar editor")),
             ],
         }
     }
@@ -323,6 +364,10 @@ impl NativeChatHost {
             Command::ToggleProfile
         } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
             Command::ToggleAgentSettings
+        } else if target == "agent-model-field" || target == "agent-model-dismiss" {
+            Command::ToggleModelPicker
+        } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
+            Command::ToggleAvatarEditor
         } else if target == ids::LOGIN_SUBMIT {
             Command::Login {
                 email: self.login_email.clone(),
@@ -350,6 +395,21 @@ impl NativeChatHost {
         let cmd = match name {
             "chat.new" => Command::NewChat,
             "sidebar.toggle" => Command::ToggleSidebar,
+            "sidebar.mini" => Command::ToggleMiniSidebar,
+            "model.picker" => Command::ToggleModelPicker,
+            "model.picker.open" => Command::SetModelPicker(true),
+            "model.picker.close" => Command::SetModelPicker(false),
+            "avatar.editor" => Command::ToggleAvatarEditor,
+            "avatar.editor.open" => Command::SetAvatarEditor(true),
+            "avatar.editor.close" => Command::SetAvatarEditor(false),
+            "avatar.color" => {
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "avatar.color requires arg id".to_string())?
+                    .to_string();
+                Command::SetAvatarColor(id)
+            },
             "theme.toggle" => Command::ToggleTheme,
             "settings.account" => Command::ToggleAccount,
             "settings.credentials" => Command::ToggleCredentials,

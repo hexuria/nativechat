@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod chrome;
 #[cfg(feature = "agent")]
 pub mod agent;
 pub mod assets;
