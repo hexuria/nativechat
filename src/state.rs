@@ -125,6 +125,24 @@ pub enum VoiceStatus {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SubmitChord {
+    /// Enter sends; Shift+Enter inserts a newline.
+    #[default]
+    Enter,
+    /// ⌘Enter sends; Enter inserts a newline.
+    CommandEnter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AppSettingsTab {
+    #[default]
+    General,
+    Profile,
+    Appearance,
+    Shortcuts,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AuthStatus {
     #[default]
@@ -164,6 +182,9 @@ pub struct AppState {
     pub is_account_settings_open: bool,
     pub is_profile_settings_open: bool,
     pub is_credentials_modal_open: bool,
+    pub is_app_settings_open: bool,
+    pub app_settings_tab: AppSettingsTab,
+    pub submit_chord: SubmitChord,
     pub audio_input: Option<AudioInput>,
     pub gemini_client: Option<GeminiLiveClient>,
     pub profiles: Vec<Profile>,
@@ -341,6 +362,9 @@ impl AppState {
             is_account_settings_open: false,
             is_profile_settings_open: false,
             is_credentials_modal_open: false,
+            is_app_settings_open: false,
+            app_settings_tab: AppSettingsTab::General,
+            submit_chord: SubmitChord::Enter,
             audio_input: None,
             gemini_client: None,
             profiles,
@@ -1691,56 +1715,55 @@ impl AppState {
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        use gpui_kit::component::{Theme, ThemeRegistry};
-
-        println!("[THEME] Toggle called, current: {}", self.theme_mode);
-
-        // Cycle: light → dark → system → light
-        self.theme_mode = match self.theme_mode.as_str() {
+        let next = match self.theme_mode.as_str() {
             "light" => "dark",
             "dark" => "system",
             _ => "light",
-        }
-        .to_string();
+        };
+        self.set_theme_mode(next, cx);
+    }
 
-        println!("[THEME] New mode: {}", self.theme_mode);
+    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        use gpui_kit::component::{Theme, ThemeRegistry};
 
-        // Determine which theme to apply
+        self.theme_mode = mode.to_string();
         let theme_name = match self.theme_mode.as_str() {
             "light" => "macOS Classic Light",
             "dark" => "macOS Classic Dark",
-            "system" => {
-                // TODO: Detect actual system appearance
-                // For now, default to dark
-                println!("[THEME] System mode - defaulting to dark");
-                "macOS Classic Dark"
-            }
+            "system" => "macOS Classic Dark",
             _ => "macOS Classic Light",
         };
-
-        println!("[THEME] Loading theme: {}", theme_name);
-        println!(
-            "[THEME] Available themes: {:?}",
-            ThemeRegistry::global(cx)
-                .themes()
-                .keys()
-                .collect::<Vec<_>>()
-        );
-
         if let Some(theme) = ThemeRegistry::global(cx)
             .themes()
             .get(&SharedString::from(theme_name))
             .cloned()
         {
-            println!("[THEME] Found theme, applying...");
             Theme::global_mut(cx).apply_config(&theme);
             Theme::sync_base(cx);
-            println!("[THEME] Applied!");
-        } else {
-            println!("[THEME] ERROR: Theme not found!");
         }
-
         cx.notify();
+    }
+
+    pub fn toggle_app_settings(&mut self, cx: &mut Context<Self>) {
+        self.is_app_settings_open = !self.is_app_settings_open;
+        if self.is_app_settings_open {
+            self.dismiss_popovers(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn set_app_settings_tab(&mut self, tab: AppSettingsTab, cx: &mut Context<Self>) {
+        if self.app_settings_tab != tab {
+            self.app_settings_tab = tab;
+            cx.notify();
+        }
+    }
+
+    pub fn set_submit_chord(&mut self, chord: SubmitChord, cx: &mut Context<Self>) {
+        if self.submit_chord != chord {
+            self.submit_chord = chord;
+            cx.notify();
+        }
     }
 
     pub fn set_voice_mode(&mut self, open: bool, cx: &mut Context<Self>) {

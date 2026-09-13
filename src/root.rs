@@ -1,6 +1,6 @@
 use crate::actions::{
-    About, Hide, HideOthers, Minimize, NewChat, ShowAll, ToggleDebugMarkdown, ToggleFps,
-    ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
+    About, Hide, HideOthers, Minimize, NewChat, OpenSettings, ShowAll, ToggleDebugMarkdown,
+    ToggleFps, ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
 use gpui_kit::prelude::*;
@@ -204,6 +204,12 @@ impl Render for RootView {
                 let state = self.state.clone();
                 move |_: &ToggleAgentSettings, _window: &mut Window, cx: &mut App| {
                     state.update(cx, |state, cx| state.toggle_agent_settings(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                move |_: &OpenSettings, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_app_settings(cx));
                 }
             })
             .on_action({

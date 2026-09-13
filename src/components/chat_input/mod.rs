@@ -12,7 +12,7 @@ use crate::actions::{
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
-use crate::state::AppState;
+use crate::state::{AppState, SubmitChord};
 use gpui_kit::InteractiveElement;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -45,6 +45,7 @@ pub struct MessageInput {
     is_voice_mode_open: bool,
     is_account_settings_open: bool,
     is_profile_settings_open: bool,
+    submit_chord: SubmitChord,
 }
 
 impl MessageInput {
@@ -53,6 +54,7 @@ impl MessageInput {
             TextareaState::new(window, cx)
                 .placeholder("Type a message...")
                 .auto_grow(1, 20)
+                .submit_on_enter(true)
         });
 
         // Cache initial values from AppState
@@ -61,7 +63,7 @@ impl MessageInput {
         let is_voice_mode_open = app_state.is_voice_mode_open;
         let is_account_settings_open = app_state.is_account_settings_open;
         let is_profile_settings_open = app_state.is_profile_settings_open;
-
+        let submit_chord = app_state.submit_chord;
 
         let this = Self {
             state: state.clone(),
@@ -70,6 +72,7 @@ impl MessageInput {
             is_voice_mode_open,
             is_account_settings_open,
             is_profile_settings_open,
+            submit_chord,
             on_submit: None,
             voice_mode: false,
             voice_wave: None,
@@ -85,23 +88,32 @@ impl MessageInput {
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_account_settings_open, changed);
                 sync_field_copy!(this, state, is_profile_settings_open, changed);
+                if this.submit_chord != state.submit_chord {
+                    this.submit_chord = state.submit_chord;
+                    changed = true;
+                }
             }
 
             if changed {
+                let send_on_enter = this.submit_chord == SubmitChord::Enter;
+                this.input_state.update(cx, |input, cx| {
+                    input.set_submit_on_enter(send_on_enter, cx);
+                });
                 cx.notify();
             }
         })
         .detach();
 
-        // Subscribe to input events to handle Enter key
         cx.subscribe_in(&input_state, window, |this, _state, event, window, cx| {
-            if let InputEvent::PressEnter { secondary, .. } = event
-                && !secondary
-            {
-                // Enter without Shift - submit the message
-                this.trigger_submit(window, cx);
+            if let InputEvent::PressEnter { secondary, shift } = event {
+                let send = match this.submit_chord {
+                    SubmitChord::Enter => !shift && !secondary,
+                    SubmitChord::CommandEnter => *secondary,
+                };
+                if send {
+                    this.trigger_submit(window, cx);
+                }
             }
-            // Shift+Enter is handled by the editor (newline)
         })
         .detach();
 

@@ -1,7 +1,8 @@
 use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
-    About, BranchInNewChat, CopyMessage, Hide, HideOthers, Minimize, NewChat, OpenSettings, Quit,
+    About, BranchInNewChat, CloseSettings, CopyMessage, Hide, HideOthers, Minimize, NewChat,
+    OpenSettings, Quit,
     ReadAloud, ReportMessage, ShowAll, ToggleAgentSettings, ToggleDebugMarkdown, ToggleFps,
     ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
@@ -59,6 +60,7 @@ fn main() {
                 KeyBinding::new("cmd-t", ToggleTheme, None),
                 KeyBinding::new("cmd-n", NewChat, None),
                 KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("escape", CloseSettings, Some("AppSettings")),
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("cmd-f12", ToggleDebugMarkdown, None),
                 KeyBinding::new("cmd-shift-f", ToggleFps, None),

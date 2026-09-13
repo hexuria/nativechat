@@ -11,6 +11,7 @@ actions!(
         ToggleAgentSettings,
         ToggleTheme,
         OpenSettings,
+        CloseSettings,
         Minimize,
         Zoom,
         Hide,

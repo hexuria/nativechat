@@ -1,4 +1,5 @@
 use crate::components::agent_settings::AgentSettings;
+use crate::components::app_settings::AppSettings;
 use crate::components::chat::ChatView;
 use crate::components::login::LoginView;
 use crate::components::modals::{
@@ -31,6 +32,7 @@ struct ShellRev {
     agent_settings: bool,
     model_picker: bool,
     avatar_editor: bool,
+    app_settings: bool,
     has_agent: bool,
     hiring: bool,
 }
@@ -50,6 +52,7 @@ impl ShellRev {
             agent_settings: state.is_agent_settings_open,
             model_picker: state.model_picker_open,
             avatar_editor: state.avatar_editor_open,
+            app_settings: state.is_app_settings_open,
             has_agent: state.active_coworker_id.is_some(),
             hiring: state.hiring,
         }
@@ -64,6 +67,7 @@ pub struct Layout {
     agent_settings: Entity<AgentSettings>,
     account_settings_modal: Entity<AccountSettingsModal>,
     profile_settings_modal: Entity<ProfileSettingsModal>,
+    app_settings: Entity<AppSettings>,
     state: Entity<AppState>,
     shell: ShellRev,
     last_window_width: Option<Pixels>,
@@ -80,6 +84,7 @@ impl Layout {
             cx.new(|cx| AccountSettingsModal::new(window, state.clone(), cx));
         let profile_settings_modal =
             cx.new(|cx| ProfileSettingsModal::new(window, state.clone(), cx));
+        let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
         let shell = ShellRev::from_state(&state.read(cx));
 
         cx.observe(&state, |this, state, cx| {
@@ -98,6 +103,7 @@ impl Layout {
             agent_settings,
             account_settings_modal,
             profile_settings_modal,
+            app_settings,
             state,
             shell,
             last_window_width: None,
@@ -120,8 +126,22 @@ impl Render for Layout {
         }
 
         let state = self.state.read(cx);
+        let app_settings_open = state.is_app_settings_open;
         if !state.is_signed_in() {
-            return div().size_full().child(self.login.clone());
+            return div()
+                .size_full()
+                .relative()
+                .child(self.login.clone())
+                .when(app_settings_open, |this| {
+                    this.child(
+                        div()
+                            .id("app-settings-overlay")
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .child(self.app_settings.clone()),
+                    )
+                });
         }
         let has_agent = state.active_coworker_id.is_some();
         let hiring = state.hiring;
@@ -220,6 +240,16 @@ impl Render for Layout {
                     .is_profile_settings_open
                     .then(|| self.profile_settings_modal.clone().into_any_element()),
             )
+            .when(app_settings_open, |this| {
+                this.child(
+                    div()
+                        .id("app-settings-overlay")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .child(self.app_settings.clone()),
+                )
+            })
     }
 }
 
