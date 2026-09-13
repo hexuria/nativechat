@@ -29,6 +29,9 @@ pub mod ids {
     pub const DIALOG_PROFILE: &str = "dialog-profile";
     pub const DIALOG_CREDENTIALS: &str = "dialog-credentials";
     pub const DIALOG_VOICE: &str = "dialog-voice";
+    pub const HEADER_SETTINGS: &str = "header-settings";
+    pub const AGENT_SETTINGS: &str = "agent-settings";
+    pub const AGENT_SAVE: &str = "agent-save";
 
     pub fn session(id: &str) -> String {
         format!("session-{id}")
@@ -47,6 +50,7 @@ pub enum Command {
     ToggleAccount,
     ToggleCredentials,
     ToggleProfile,
+    ToggleAgentSettings,
     SelectSession(String),
     SelectCoworker(String),
     SendMessage(String),
@@ -65,6 +69,7 @@ impl Command {
             Self::ToggleAccount => state.toggle_account_settings(cx),
             Self::ToggleCredentials => state.toggle_credentials_modal(cx),
             Self::ToggleProfile => state.toggle_profile_settings(cx),
+            Self::ToggleAgentSettings => state.toggle_agent_settings(cx),
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
@@ -107,6 +112,7 @@ pub struct NativeChatHost {
     login_password: String,
     last_assistant: String,
     bot_status: Option<String>,
+    agent_settings_open: bool,
     pending: Option<Command>,
 }
 
@@ -165,6 +171,7 @@ impl NativeChatHost {
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
             bot_status: state.bot_status.clone(),
+            agent_settings_open: state.is_agent_settings_open,
             pending: None,
         }
     }
@@ -274,6 +281,10 @@ impl NativeChatHost {
                     )
                     .with_child(
                         UiNode::dialog(ids::DIALOG_VOICE, "Voice Mode").with_visible(self.voice_open),
+                    )
+                    .with_child(
+                        UiNode::dialog(ids::AGENT_SETTINGS, "Agent Settings")
+                            .with_visible(self.agent_settings_open),
                     ),
             ],
         }
@@ -292,6 +303,8 @@ impl NativeChatHost {
             Command::ToggleCredentials
         } else if target == ids::FOOTER_PROFILE {
             Command::ToggleProfile
+        } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
+            Command::ToggleAgentSettings
         } else if target == ids::LOGIN_SUBMIT {
             Command::Login {
                 email: self.login_email.clone(),

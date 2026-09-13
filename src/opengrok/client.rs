@@ -9,7 +9,7 @@ use serde_json::json;
 use super::error::OpenGrokError;
 use super::types::{
     assistant_text_from_sse, error_message_from_body, Account, AguiMessage, Coworker,
-    ProfileUpdate,
+    ModelCatalogue, ProfileUpdate,
 };
 
 #[derive(Clone)]
@@ -215,6 +215,58 @@ impl OpenGrokClient {
             .map_err(|e| OpenGrokError::message(e.to_string()))
     }
 
+    pub async fn list_models(&self) -> Result<ModelCatalogue, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/models", None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
+    pub async fn patch_coworker(
+        &self,
+        coworker_id: &str,
+        model: Option<&str>,
+        role: Option<&str>,
+    ) -> Result<Coworker, OpenGrokError> {
+        let mut body = serde_json::Map::new();
+        if let Some(model) = model {
+            body.insert("model".into(), json!(model));
+        }
+        if let Some(role) = role {
+            if role.trim().is_empty() {
+                body.insert("role".into(), serde_json::Value::Null);
+            } else {
+                body.insert("role".into(), json!(role));
+            }
+        }
+        if body.is_empty() {
+            return Err(OpenGrokError::message(
+                "nothing to change: name a model, a role, or both".to_string(),
+            ));
+        }
+        let path = format!("/coworkers/{coworker_id}");
+        let response = self
+            .send_json(
+                reqwest::Method::PATCH,
+                &path,
+                Some(&serde_json::Value::Object(body)),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
     /// One turn. Desktop Grok Bot POSTs `/api/sendPrompt` then paints from `GET /events`.
     /// NativeChat is a new client: same coworker + transcript, `POST /ag-ui` SSE instead.
     pub async fn run_turn<F>(
@@ -404,5 +456,48 @@ mod tests {
             "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n",
         );
         assert_eq!(assistant_text_from_sse(body).unwrap(), "Hello world");
+    }
+
+    #[tokio::test]
+    async fn list_models_reads_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"id":"xai/grok-4.6@sub"},{"id":"oag/auto"}],
+                "note": null
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let cat = client.list_models().await.unwrap();
+        assert_eq!(cat.models.len(), 2);
+        assert_eq!(cat.models[0].id, "xai/grok-4.6@sub");
+    }
+
+    #[tokio::test]
+    async fn patch_coworker_sends_model_and_role() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_1"))
+            .and(body_json(json!({
+                "model": "xai/grok-4.6@sub",
+                "role": "Research, marketing, admin"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "cw_1",
+                "model": "xai/grok-4.6@sub",
+                "role": "Research, marketing, admin",
+                "visibility": "private"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let updated = client
+            .patch_coworker("cw_1", Some("xai/grok-4.6@sub"), Some("Research, marketing, admin"))
+            .await
+            .unwrap();
+        assert_eq!(updated.model, "xai/grok-4.6@sub");
+        assert_eq!(updated.role.as_deref(), Some("Research, marketing, admin"));
     }
 }

@@ -1,3 +1,4 @@
+use crate::components::agent_settings::AgentSettings;
 use crate::components::chat::ChatView;
 use crate::components::login::LoginView;
 use crate::components::modals::{
@@ -23,6 +24,7 @@ struct ShellRev {
     signed_in: bool,
     signing_in: bool,
     auth_error: Option<String>,
+    agent_settings: bool,
 }
 
 impl ShellRev {
@@ -35,6 +37,7 @@ impl ShellRev {
             signed_in: state.is_signed_in(),
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
+            agent_settings: state.is_agent_settings_open,
         }
     }
 }
@@ -44,6 +47,7 @@ pub struct Layout {
     sidebar: Entity<SidebarView>,
     chat: Entity<ChatView>,
     login: Entity<LoginView>,
+    agent_settings: Entity<AgentSettings>,
     account_settings_modal: Entity<AccountSettingsModal>,
     profile_settings_modal: Entity<ProfileSettingsModal>,
     state: Entity<AppState>,
@@ -56,6 +60,7 @@ impl Layout {
         let sidebar = cx.new(|cx| SidebarView::new(state.clone(), cx));
         let chat = cx.new(|cx| ChatView::new(window, state.clone(), cx));
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
+        let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
         let account_settings_modal =
             cx.new(|cx| AccountSettingsModal::new(window, state.clone(), cx));
         let profile_settings_modal =
@@ -75,6 +80,7 @@ impl Layout {
             sidebar,
             chat,
             login,
+            agent_settings,
             account_settings_modal,
             profile_settings_modal,
             state,
@@ -119,6 +125,7 @@ impl Render for Layout {
 
         div()
             .size_full()
+            .relative()
             .when(state.sidebar_collapsed, |this| {
                 this.child(
                     div()
@@ -172,6 +179,16 @@ impl Render for Layout {
                             }
                         })
                         .child(resizable_panel().child(self.chat.clone())),
+                )
+            })
+            .when(state.is_agent_settings_open, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(self.agent_settings.clone()),
                 )
             })
             .children(

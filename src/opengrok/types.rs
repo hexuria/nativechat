@@ -55,9 +55,25 @@ struct ErrorBody {
 #[serde(rename_all = "camelCase")]
 pub struct Coworker {
     pub id: String,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ModelEntry {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModelCatalogue {
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

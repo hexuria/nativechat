@@ -15,6 +15,7 @@ use gpui_kit::*;
 use gpui_kit::FontWeight;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme, IndexPath, h_flex, v_flex};
 
 /// Cheap fingerprint so ChatView does not rebuild markdown on unrelated AppState
@@ -699,7 +700,21 @@ impl Render for ChatView {
                                 ),
                             )
                             .child(
-                                h_flex().gap_2().items_center(), // Add other header actions here if needed
+                                h_flex().gap_2().items_center().child(
+                                    div().id("header-settings").child(
+                                        Button::new("header-settings-btn")
+                                            .label("Settings")
+                                            .ghost()
+                                            .on_click({
+                                                let state = self.state.clone();
+                                                move |_, _, cx| {
+                                                    state.update(cx, |state, cx| {
+                                                        state.toggle_agent_settings(cx);
+                                                    });
+                                                }
+                                            }),
+                                    ),
+                                ),
                             ),
                     ),
             )

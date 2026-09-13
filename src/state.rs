@@ -2,7 +2,8 @@ use crate::actions::TtsSource;
 use crate::audio::AudioInput;
 use crate::config::Config;
 use crate::opengrok::{
-    activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, OpenGrokClient, ProfileUpdate,
+    activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, ModelCatalogue,
+    OpenGrokClient, ProfileUpdate,
 };
 use crate::llm::{
     ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
@@ -193,6 +194,8 @@ pub struct AppState {
     pub coworkers: Vec<Coworker>,
     pub active_coworker_id: Option<String>,
     pub bot_status: Option<String>,
+    pub model_catalogue: ModelCatalogue,
+    pub is_agent_settings_open: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -360,6 +363,8 @@ impl AppState {
             coworkers: Vec::new(),
             active_coworker_id: None,
             bot_status: None,
+            model_catalogue: ModelCatalogue::default(),
+            is_agent_settings_open: false,
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -452,6 +457,7 @@ impl AppState {
         self.active_coworker_id = None;
         self.bot_status = None;
         self.is_account_settings_open = false;
+        self.is_agent_settings_open = false;
         cx.notify();
         if let Some(client) = client {
             cx.spawn(async move |_, _| {
@@ -480,6 +486,72 @@ impl AppState {
                                 state.select_coworker(first.id, cx);
                             }
                         }
+                    }
+                    Err(error) => state.auth_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        self.refresh_models(cx);
+    }
+
+    pub fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client.list_models().await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(catalogue) => state.model_catalogue = catalogue,
+                    Err(error) => state.auth_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn toggle_agent_settings(&mut self, cx: &mut Context<Self>) {
+        self.is_agent_settings_open = !self.is_agent_settings_open;
+        cx.notify();
+    }
+
+    pub fn patch_active_coworker(
+        &mut self,
+        model: Option<String>,
+        role: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".into());
+            cx.notify();
+            return;
+        };
+        let Some(id) = self.active_coworker_id.clone() else {
+            self.auth_error = Some("No agent selected".into());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .patch_coworker(
+                    &id,
+                    model.as_deref(),
+                    role.as_deref(),
+                )
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(updated) => {
+                        if let Some(existing) = state.coworkers.iter_mut().find(|c| c.id == id) {
+                            if !updated.model.is_empty() {
+                                existing.model = updated.model;
+                            }
+                            existing.role = updated.role;
+                        }
+                        state.auth_error = None;
                     }
                     Err(error) => state.auth_error = Some(error.message),
                 }
