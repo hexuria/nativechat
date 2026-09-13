@@ -133,83 +133,33 @@ impl Render for Layout {
         let hiring = state.hiring;
         let hire_error = state.auth_error.clone();
         let theme = cx.theme().clone();
+        let main = if has_agent {
+            self.chat.clone().into_any_element()
+        } else {
+            empty_agent_pane(self.state.clone(), hire_error, hiring, &theme)
+        };
 
         div()
             .size_full()
+            .flex()
             .relative()
-            .when(state.sidebar_collapsed, |this| {
-                this.child(
-                    div()
-                        .size_full()
-                        .flex()
-                        .child(
-                            div()
-                                .id("sidebar-slot")
-                                .w(px(64.))
-                                .flex_shrink_0()
-                                .relative()
-                                .child(cached_fill(self.sidebar.clone())),
-                        )
-                        .child(
-                            div()
-                                .size_full()
-                                .flex_grow(1.)
-                                .overflow_hidden()
-                                .child(if has_agent {
-                                    self.chat.clone().into_any_element()
-                                } else {
-                                    empty_agent_pane(
-                                        self.state.clone(),
-                                        hire_error.clone(),
-                                        hiring,
-                                        &theme,
-                                    )
-                                }),
-                        ),
-                )
-            })
-            .when(!state.sidebar_collapsed, |this| {
-                this.child(
-                    h_resizable("main-layout")
-                        .child(
-                            resizable_panel()
-                                .size(px(280.))
-                                .size_range(px(0.)..px(700.))
-                                .child(
-                                    div()
-                                        .id("sidebar-slot")
-                                        .size_full()
-                                        .relative()
-                                        .child(cached_fill(self.sidebar.clone())),
-                                ),
-                        )
-                        .on_resize({
-                            let state = self.state.clone();
-                            move |resizable_state, _, cx| {
-                                let sizes = resizable_state.read(cx).sizes();
-                                if let Some(sidebar_width) = sizes.get(0) {
-                                    if *sidebar_width < px(180.0) {
-                                        state.update(cx, |state, cx| {
-                                            if !state.sidebar_collapsed {
-                                                state.toggle_sidebar(cx);
-                                            }
-                                        });
-                                    }
-                                }
-                            }
-                        })
-                        .child(resizable_panel().child(if has_agent {
-                            self.chat.clone().into_any_element()
-                        } else {
-                            empty_agent_pane(
-                                self.state.clone(),
-                                hire_error.clone(),
-                                hiring,
-                                &theme,
-                            )
-                        })),
-                )
-            })
+            .child(
+                div()
+                    .id("sidebar-slot")
+                    .w(px(64.))
+                    .flex_shrink_0()
+                    .h_full()
+                    .relative()
+                    .child(cached_fill(self.sidebar.clone())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(main),
+            )
             .when(state.is_agent_settings_open, |this| {
                 this.child(
                     div()

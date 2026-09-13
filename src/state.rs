@@ -436,6 +436,7 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        state.is_agent_settings_open = true;
                         state.refresh_coworkers(cx);
                     }
                     Err(error) => {
@@ -713,6 +714,7 @@ impl AppState {
             return;
         };
         self.active_coworker_id = Some(id.clone());
+        self.is_agent_settings_open = true;
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(
                 0,

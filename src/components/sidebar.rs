@@ -239,9 +239,159 @@ impl SidebarView {
     }
 }
 
+impl SidebarView {
+    fn agent_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        let coworkers = state.coworkers.clone();
+        let active_coworker = state.active_coworker_id.clone();
+        let any_modal_open = state.is_voice_mode_open
+            || state.is_account_settings_open
+            || state.is_profile_settings_open;
+        let theme = cx.theme().clone();
+        let view = cx.entity().clone();
+        let initials: Vec<(String, String, bool, Hsla)> = coworkers
+            .iter()
+            .enumerate()
+            .map(|(ix, c)| {
+                let glyph = c
+                    .name
+                    .chars()
+                    .next()
+                    .map(|ch| ch.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".into());
+                (
+                    c.id.clone(),
+                    glyph,
+                    Some(c.id.clone()) == active_coworker,
+                    rail_avatar_color(ix),
+                )
+            })
+            .collect();
+
+        v_flex()
+            .id("sidebar")
+            .size_full()
+            .items_center()
+            .py_3()
+            .gap_2()
+            .bg(rgb(0x111111))
+            .child(
+                div()
+                    .id("sidebar-chat-list")
+                    .flex_1()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_2()
+                            .children(initials.into_iter().map(|(id, glyph, is_active, color)| {
+                                let view = view.clone();
+                                div()
+                                    .id(SharedString::from(format!("coworker-{id}")))
+                                    .size_10()
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(color)
+                                    .text_color(white())
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
+                                    .when(is_active, |this| {
+                                        this.border_2().border_color(white())
+                                    })
+                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                        let id = id.clone();
+                                        view.update(cx, |this, cx| {
+                                            this.state.update(cx, |state, cx| {
+                                                state.select_coworker(id, cx);
+                                            });
+                                        });
+                                    })
+                                    .child(glyph)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("nav-new-chat")
+                    .size_10()
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0xaaaaaa))
+                    .cursor_pointer()
+                    .when(!any_modal_open, |this| {
+                        this.on_mouse_down(MouseButton::Left, {
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.state.update(cx, |state, cx| {
+                                        state.create_agent(cx);
+                                    });
+                                });
+                            }
+                        })
+                    })
+                    .child(Icon::new(IconName::Plus).size_5()),
+            )
+            .child(
+                div()
+                    .id("footer-account")
+                    .size_10()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x1a1a1a))
+                    .text_color(white())
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, {
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.toggle_account_settings(cx);
+                                });
+                            });
+                        }
+                    })
+                    .child(
+                        state
+                            .account
+                            .as_ref()
+                            .map(|a| {
+                                a.display_name()
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.to_uppercase().to_string())
+                                    .unwrap_or_else(|| "U".into())
+                            })
+                            .unwrap_or_else(|| "U".into()),
+                    ),
+            )
+    }
+}
+
+fn rail_avatar_color(ix: usize) -> Hsla {
+    const COLORS: [u32; 8] = [
+        0x7c5cbf, 0x3dba7a, 0x4aa3d9, 0x9b59d0, 0x3ecfcf, 0xd4a017, 0xe24b4b, 0xe67e22,
+    ];
+    rgb(COLORS[ix % COLORS.len()]).into()
+}
+
 impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
+        if state.is_signed_in() {
+            return self.agent_rail(cx).into_any_element();
+        }
         let collapsed = state.sidebar_collapsed;
         let active_id = state.active_conversation_id.clone();
         let conversations = state.conversations.clone();
@@ -727,5 +877,6 @@ impl Render for SidebarView {
                                 ),
                     ),
             )
+            .into_any_element()
     }
 }

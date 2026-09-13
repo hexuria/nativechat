@@ -7,17 +7,22 @@ use gpui_kit::*;
 
 pub struct AgentSettings {
     state: Entity<AppState>,
+    label_input: Entity<InputState>,
     role_input: Entity<InputState>,
     model_input: Entity<InputState>,
 }
 
 impl AgentSettings {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let role_input = cx.new(|cx| InputState::new(window, cx).placeholder("Standing role"));
+        let label_input = cx.new(|cx| InputState::new(window, cx).placeholder("Research, marketing, admin"));
+        let role_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("What this agent is for")
+        });
         let model_input = cx.new(|cx| InputState::new(window, cx).placeholder("xai/grok-4.6@sub"));
         cx.observe(&state, |this, _, cx| cx.notify()).detach();
         Self {
             state,
+            label_input,
             role_input,
             model_input,
         }
@@ -59,6 +64,12 @@ impl Render for AgentSettings {
             )
         };
 
+        let glyph = name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".into());
+
         v_flex()
             .id("agent-settings")
             .h_full()
@@ -66,7 +77,8 @@ impl Render for AgentSettings {
             .flex_shrink_0()
             .border_l_1()
             .border_color(theme.border)
-            .bg(theme.background)
+            .bg(rgb(0x1a1a1a))
+            .text_color(white())
             .p_4()
             .gap_3()
             .child(
@@ -75,12 +87,48 @@ impl Render for AgentSettings {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Settings"),
             )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size_16()
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(0x3ecfcf))
+                            .text_color(white())
+                            .text_lg()
+                            .child(glyph),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x888888))
+                    .child("Name"),
+            )
             .child(div().id("agent-settings-name").text_sm().child(name))
             .child(
                 div()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Role"),
+                    .text_color(rgb(0x888888))
+                    .child("Label (optional)"),
+            )
+            .child(
+                div()
+                    .id("agent-label")
+                    .w_full()
+                    .child(Input::new(&self.label_input)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x888888))
+                    .child("Description"),
             )
             .child(
                 div()
@@ -91,14 +139,8 @@ impl Render for AgentSettings {
             .child(
                 div()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("Current pin: {model}")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Model"),
+                    .text_color(rgb(0x888888))
+                    .child(format!("Model · {model}")),
             )
             .child(
                 div()
