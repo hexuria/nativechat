@@ -1,6 +1,7 @@
 use crate::actions::{
-    About, ClearSearch, CloseBotFinder, CloseCommandPalette, FocusChatInput, Hide, HideOthers,
-    Minimize, NavBack, NavForward, NewChat, OpenCommandPalette, OpenSettings, Search, ShowAll,
+    About, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind, FindNext, FindPrev,
+    FocusChatInput, Hide, HideOthers, Minimize, NavBack, NavForward, NewChat, OpenCommandPalette,
+    OpenSettings, Search, ShowAll,
     ToggleComputerPane,
     ToggleDebugMarkdown, ToggleFps, ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar,
     ToggleTheme, Zoom,
@@ -277,6 +278,37 @@ impl Render for RootView {
                     } else {
                         state.update(cx, |state, cx| state.open_command_palette(cx));
                     }
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                let layout = self.layout.clone();
+                move |_: &Search, window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| {
+                        state.close_bot_finder(cx);
+                        state.close_command_palette(cx);
+                    });
+                    layout.update(cx, |layout, cx| {
+                        layout.open_find_in_chat(window, cx);
+                    });
+                }
+            })
+            .on_action({
+                let layout = self.layout.clone();
+                move |_: &FindNext, _, cx: &mut App| {
+                    layout.update(cx, |layout, cx| layout.find_next_in_chat(cx));
+                }
+            })
+            .on_action({
+                let layout = self.layout.clone();
+                move |_: &FindPrev, _, cx: &mut App| {
+                    layout.update(cx, |layout, cx| layout.find_prev_in_chat(cx));
+                }
+            })
+            .on_action({
+                let layout = self.layout.clone();
+                move |_: &CloseFind, window: &mut Window, cx: &mut App| {
+                    layout.update(cx, |layout, cx| layout.close_find_in_chat(window, cx));
                 }
             })
             .on_action({

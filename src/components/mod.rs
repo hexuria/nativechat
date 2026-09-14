@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod chat_find;
 pub mod app_settings;
 pub mod persona;
 pub mod chat_input;

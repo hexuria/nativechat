@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
+use crate::components::chat_find::find_bar_element;
+use crate::find_text::{marks_for_row, project_hits, FindHit};
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::chrome::{chat_column_width, timestamps_fit, CHAT_CONTENT_MAX};
@@ -197,6 +199,9 @@ struct ChatTranscript {
     highlight_pump: bool,
     ts_peek: f32,
     peek_epoch: u64,
+    find_query: String,
+    find_hits: Vec<FindHit>,
+    find_current: Option<usize>,
 }
 
 impl ChatTranscript {
@@ -244,6 +249,7 @@ impl ChatTranscript {
             {
                 this.start_highlight_pump(cx);
             }
+            this.recompute_find(false, cx);
             cx.notify();
         })
         .detach();
@@ -261,12 +267,90 @@ impl ChatTranscript {
             highlight_pump: false,
             ts_peek: 0.0,
             peek_epoch: 0,
+            find_query: String::new(),
+            find_hits: Vec::new(),
+            find_current: None,
         };
         if this.feed_rev.native_speaking_id.is_some() || this.feed_rev.ai_speaking_id.is_some()
         {
             this.start_highlight_pump(cx);
         }
         this
+    }
+
+    fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.find_query == query {
+            return;
+        }
+        self.find_query = query;
+        self.recompute_find(true, cx);
+    }
+
+    fn step_find(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.find_hits.is_empty() {
+            return;
+        }
+        let len = self.find_hits.len() as i32;
+        let index = match self.find_current {
+            Some(current) => (current as i32 + delta).rem_euclid(len) as usize,
+            None if delta < 0 => self.find_hits.len() - 1,
+            None => 0,
+        };
+        self.find_current = Some(index);
+        self.scroll_to_hit(index, cx);
+        cx.notify();
+    }
+
+    fn clear_find(&mut self, cx: &mut Context<Self>) {
+        self.find_query.clear();
+        self.find_hits.clear();
+        self.find_current = None;
+        cx.notify();
+    }
+
+    fn find_status(&self) -> (Option<usize>, usize, bool) {
+        (
+            self.find_current,
+            self.find_hits.len(),
+            !self.find_query.trim().is_empty(),
+        )
+    }
+
+    fn recompute_find(&mut self, land: bool, cx: &mut Context<Self>) {
+        let hits = project_hits(self.rows.iter().map(|row| row.content.as_ref()), &self.find_query);
+        if hits.is_empty() {
+            self.find_hits = hits;
+            self.find_current = None;
+            cx.notify();
+            return;
+        }
+        if land {
+            self.find_current = Some(0);
+        } else if let Some(current) = self.find_current {
+            if current >= hits.len() {
+                self.find_current = Some(hits.len() - 1);
+            }
+        } else {
+            self.find_current = Some(0);
+        }
+        self.find_hits = hits;
+        if land {
+            if let Some(index) = self.find_current {
+                self.scroll_to_hit(index, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn scroll_to_hit(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(hit) = self.find_hits.get(index) else {
+            return;
+        };
+        let row = hit.row;
+        self.scroller.update(cx, |scroller, cx| {
+            scroller.scroll_to_item(row, cx);
+            let _ = scroller.remeasure_items(row..row + 1, cx);
+        });
     }
 
     fn arm_peek_release(&mut self, cx: &mut Context<Self>) {
@@ -372,6 +456,8 @@ impl Render for ChatTranscript {
             .as_ref()
             .map(|p| p.message_id.clone());
         let ts_peek = self.ts_peek;
+        let find_hits = self.find_hits.clone();
+        let find_current = self.find_current;
         let timestamps_ok = {
             let win = f32::from(_window.viewport_size().width);
             let app = self.app_state.read(cx);
@@ -428,6 +514,7 @@ impl Render for ChatTranscript {
                 .is_cached(row.is_cached)
                 .highlight_range(row.highlight_range.clone())
                 .highlight_color(highlight_color)
+                .find_marks(marks_for_row(ix, &find_hits, find_current))
                 .use_markdown(row.use_markdown)
                 .show_footer(show_footer)
                 .reply_preview(row.reply_preview.clone())
@@ -503,6 +590,9 @@ pub struct ChatView {
     emoji_full: bool,
     emoji_category: usize,
     emoji_open: Option<EmojiPickerOpen>,
+    find_open: bool,
+    find_input: Entity<InputState>,
+    find_pending_focus: bool,
 }
 
 impl ChatView {
@@ -510,6 +600,53 @@ impl ChatView {
         self.input.update(cx, |input, cx| {
             input.focus(window, cx);
         });
+    }
+
+    pub fn open_find(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = true;
+        self.find_pending_focus = true;
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_open && self.find_input.read(cx).value().is_empty() {
+            return;
+        }
+        self.find_open = false;
+        self.find_pending_focus = false;
+        self.find_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.clear_find(cx);
+        });
+        cx.notify();
+    }
+
+    pub fn find_next(&mut self, cx: &mut Context<Self>) {
+        if !self.find_open {
+            self.find_open = true;
+            self.find_pending_focus = true;
+            cx.notify();
+            return;
+        }
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.step_find(1, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn find_prev(&mut self, cx: &mut Context<Self>) {
+        if !self.find_open {
+            self.find_open = true;
+            self.find_pending_focus = true;
+            cx.notify();
+            return;
+        }
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.step_find(-1, cx);
+        });
+        cx.notify();
     }
 
     fn render_emoji_overlay(
@@ -642,6 +779,9 @@ impl ChatView {
         let emoji_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search emoji")
         });
+        let find_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Find in chat")
+        });
 
         let this = Self {
             input,
@@ -663,6 +803,9 @@ impl ChatView {
             emoji_full: false,
             emoji_category: 0,
             emoji_open: None,
+            find_open: false,
+            find_input: find_input.clone(),
+            find_pending_focus: false,
         };
 
         cx.observe(&state, |this: &mut Self, state, cx| {
@@ -820,12 +963,41 @@ impl ChatView {
         )
         .detach();
 
+        cx.subscribe(
+            &find_input,
+            |this: &mut Self, input, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    let query = input.read(cx).value().to_string();
+                    this.transcript.update(cx, |transcript, cx| {
+                        transcript.set_find_query(query, cx);
+                    });
+                    cx.notify();
+                }
+                InputEvent::PressEnter { shift, .. } => {
+                    let delta = if *shift { -1 } else { 1 };
+                    this.transcript.update(cx, |transcript, cx| {
+                        transcript.step_find(delta, cx);
+                    });
+                    cx.notify();
+                }
+                _ => {}
+            },
+        )
+        .detach();
+
         this
     }
 }
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.find_pending_focus {
+            self.find_pending_focus = false;
+            self.find_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.select_all(window, cx);
+            });
+        }
         let theme = cx.theme().clone();
 
         if self.profiles_need_sync {
@@ -845,6 +1017,8 @@ impl Render for ChatView {
         }
 
         let app = self.state.clone();
+        let view = cx.entity();
+        let (find_current, find_total, find_has_query) = self.transcript.read(cx).find_status();
         v_flex()
             .size_full()
             .bg(theme.background)
@@ -988,7 +1162,37 @@ impl Render for ChatView {
                                 ),
                             )
                             .child(
-                                h_flex().gap_2().items_center().child(
+                                h_flex().gap_2().items_center()
+                                    .when(self.find_open, |this| {
+                                        this.child(find_bar_element(
+                                            &self.find_input,
+                                            find_current,
+                                            find_total,
+                                            find_has_query,
+                                            {
+                                                let view = view.clone();
+                                                move |_, cx| {
+                                                    view.update(cx, |this, cx| this.find_prev(cx));
+                                                }
+                                            },
+                                            {
+                                                let view = view.clone();
+                                                move |_, cx| {
+                                                    view.update(cx, |this, cx| this.find_next(cx));
+                                                }
+                                            },
+                                            {
+                                                let view = view.clone();
+                                                move |window, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        this.close_find(window, cx);
+                                                    });
+                                                }
+                                            },
+                                            cx,
+                                        ))
+                                    })
+                                    .child(
                                     div()
                                         .id("header-monitor")
                                         .size(px(28.))

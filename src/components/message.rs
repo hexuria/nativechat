@@ -21,6 +21,7 @@ pub struct MessageBubble {
     debug_mode: bool,
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_color: Option<Hsla>,
+    find_marks: Vec<(std::ops::Range<usize>, bool)>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_reply: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     use_markdown: bool,
@@ -47,6 +48,7 @@ impl MessageBubble {
             debug_mode: false,
             highlight_range: None,
             highlight_color: None,
+            find_marks: Vec::new(),
             on_read_aloud: None,
             on_reply: None,
             use_markdown: true,
@@ -117,6 +119,11 @@ impl MessageBubble {
 
     pub fn highlight_color(mut self, color: Option<Hsla>) -> Self {
         self.highlight_color = color;
+        self
+    }
+
+    pub fn find_marks(mut self, marks: Vec<(std::ops::Range<usize>, bool)>) -> Self {
+        self.find_marks = marks;
         self
     }
 
@@ -273,6 +280,8 @@ impl RenderOnce for MessageBubble {
                 self.highlight_range.as_ref(),
                 self.highlight_color,
             )
+        } else if !self.find_marks.is_empty() {
+            find_highlighted_text(&self.text, &self.find_marks)
         } else if self.is_me || !self.use_markdown {
             div()
                 .id(ElementId::Name(format!("msg-body-{row_key}").into()))
@@ -522,6 +531,44 @@ fn highlighted_text(
             .into_any_element()
     } else {
         text.to_string().into_any_element()
+    };
+    div().text_sm().child(body).into_any_element()
+}
+
+/// Grok find: dim amber on every hit, solid `--cursor-warn` on the current one.
+fn find_highlighted_text(text: &str, marks: &[(std::ops::Range<usize>, bool)]) -> AnyElement {
+    let match_bg: Hsla = rgb(0xFFC000).opacity(0.3).into();
+    let current_bg: Hsla = rgb(0xFFC000).into();
+    let current_fg: Hsla = rgb(0x1F1F1F).into();
+    let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = marks
+        .iter()
+        .filter_map(|(range, is_current)| {
+            let start = floor_char_boundary(text, range.start.min(text.len()));
+            let end = floor_char_boundary(text, range.end.min(text.len())).max(start);
+            if start >= end {
+                return None;
+            }
+            let style = if *is_current {
+                HighlightStyle {
+                    background_color: Some(current_bg),
+                    color: Some(current_fg),
+                    ..Default::default()
+                }
+            } else {
+                HighlightStyle {
+                    background_color: Some(match_bg),
+                    ..Default::default()
+                }
+            };
+            Some((start..end, style))
+        })
+        .collect();
+    let body = if highlights.is_empty() {
+        text.to_string().into_any_element()
+    } else {
+        StyledText::new(SharedString::from(text.to_string()))
+            .with_highlights(highlights)
+            .into_any_element()
     };
     div().text_sm().child(body).into_any_element()
 }

@@ -151,6 +151,30 @@ impl Layout {
         });
     }
 
+    pub fn open_find_in_chat(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| {
+            chat.open_find(window, cx);
+        });
+    }
+
+    pub fn close_find_in_chat(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| {
+            chat.close_find(window, cx);
+        });
+    }
+
+    pub fn find_next_in_chat(&self, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| {
+            chat.find_next(cx);
+        });
+    }
+
+    pub fn find_prev_in_chat(&self, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| {
+            chat.find_prev(cx);
+        });
+    }
+
     pub fn blur_chat_input(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.blur(cx);
     }
