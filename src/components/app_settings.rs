@@ -86,8 +86,13 @@ impl Render for AppSettings {
                                 )
                                 .into_any_element(),
                                 AppSettingsTab::Appearance => {
-                                    appearance_page(&theme_mode, muted, app.clone())
-                                        .into_any_element()
+                                    appearance_page(
+                                        &theme_mode,
+                                        muted,
+                                        theme.foreground,
+                                        app.clone(),
+                                    )
+                                    .into_any_element()
                                 }
                                 AppSettingsTab::Shortcuts => {
                                     shortcuts_page(chord, muted, &theme).into_any_element()
@@ -363,6 +368,7 @@ fn profile_page(
 fn appearance_page(
     theme_mode: &str,
     muted: Hsla,
+    foreground: Hsla,
     app: Entity<AppState>,
 ) -> impl IntoElement {
     v_flex()
@@ -376,9 +382,21 @@ fn appearance_page(
         .child(
             h_flex()
                 .gap(px(10.))
-                .child(theme_chip("light", "Light", theme_mode, app.clone()))
-                .child(theme_chip("dark", "Dark", theme_mode, app.clone()))
-                .child(theme_chip("system", "System", theme_mode, app)),
+                .child(theme_chip(
+                    "light",
+                    "Light",
+                    theme_mode,
+                    foreground,
+                    app.clone(),
+                ))
+                .child(theme_chip(
+                    "dark",
+                    "Dark",
+                    theme_mode,
+                    foreground,
+                    app.clone(),
+                ))
+                .child(theme_chip("system", "System", theme_mode, foreground, app)),
         )
 }
 
@@ -386,6 +404,7 @@ fn theme_chip(
     mode: &'static str,
     label: &'static str,
     current: &str,
+    foreground: Hsla,
     app: Entity<AppState>,
 ) -> impl IntoElement {
     let selected = current == mode;
@@ -403,7 +422,7 @@ fn theme_chip(
         .rounded(px(12.))
         .border_1()
         .border_color(if selected {
-            rgb(0x1084FE)
+            foreground
         } else {
             rgb(0x777777).opacity(0.3).into()
         })

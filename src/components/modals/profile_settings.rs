@@ -1,3 +1,4 @@
+use crate::components::fields::field_input;
 use crate::services::database::{Credential, Profile};
 use crate::services::model_registry::{ModelProfile, ModelType, Provider};
 use crate::icons::NativeIcon;
@@ -17,7 +18,7 @@ use gpui_kit::component::{
     Disableable, Icon, IconName, Sizable, Size as UiSize, StyledExt,
     button::{Button, ButtonVariant},
     h_flex,
-    input::{Input, InputState},
+    input::InputState,
     label::Label,
     list::{List, ListDelegate, ListState},
     select::{SearchableVec, Select, SelectDelegate, SelectEvent, SelectItem, SelectState},
@@ -1594,7 +1595,7 @@ impl ProfileSettingsModal {
                                 .child(if creating_cred {
                                     h_flex()
                                         .gap_2()
-                                        .child(Input::new(&new_cred_input).flex_1())
+                                        .child(field_input(&new_cred_input).flex_1())
                                         .child(Button::new(save_action).label("Save").on_click(
                                             cx.listener(
                                                 move |this, _, window, cx| match save_action {
@@ -1890,7 +1891,7 @@ impl Render for ProfileSettingsModal {
                                                 ),
                                             ),
                                     )
-                                    .child(Input::new(&self.profile_name_input)),
+                                    .child(field_input(&self.profile_name_input)),
                             ),
                         ),
                 )

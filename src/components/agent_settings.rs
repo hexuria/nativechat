@@ -1,6 +1,7 @@
 use crate::chrome::{
     AVATAR_COLORS, AVATAR_SHAPES, AVATAR_TRIGGER_PX, INFO_PANE_WIDTH,
 };
+use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
 use crate::opengrok::{CoworkerPatch, ModelEntry};
 use crate::state::AppState;
@@ -177,7 +178,7 @@ fn heading(label: &'static str, color: Hsla) -> Div {
 }
 
 fn settings_input(state: &Entity<InputState>) -> Input {
-    Input::new(state).focus_bordered(false).rounded(px(8.))
+    field_input(state)
 }
 
 fn card(fill: Hsla) -> Div {

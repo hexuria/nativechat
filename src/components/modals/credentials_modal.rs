@@ -1,3 +1,4 @@
+use crate::components::fields::field_input;
 use crate::services::database::Credential;
 use crate::state::AppState;
 use chrono::NaiveDate;
@@ -660,7 +661,7 @@ impl Render for CredentialsModal {
                                                         .font_weight(FontWeight::MEDIUM),
                                                 )
                                                 .child(
-                                                    Input::new(&self.name_input).id("name-input"),
+                                                    field_input(&self.name_input).id("name-input"),
                                                 ),
                                         )
                                         .child(
@@ -691,7 +692,7 @@ impl Render for CredentialsModal {
                                                         .font_weight(FontWeight::MEDIUM),
                                                 )
                                                 .child(
-                                                    Input::new(&self.api_key_input)
+                                                    field_input(&self.api_key_input)
                                                         .id("api-key-input"),
                                                 ),
                                         )

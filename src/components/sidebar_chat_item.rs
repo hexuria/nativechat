@@ -264,7 +264,9 @@ impl RenderOnce for ChatSessionItem {
                         .gap_2()
                         .items_center()
                         .child(div().flex_1().when_some(self.input, |this, state| {
-                            this.child(Input::new(&state).bordered(false))
+                            this.child(
+                                Input::new(&state).bordered(false).focus_bordered(false),
+                            )
                         }))
                         .child(
                             div()

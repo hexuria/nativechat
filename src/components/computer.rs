@@ -1,12 +1,13 @@
 use std::rc::Rc;
 
 use crate::chrome::INFO_PANE_WIDTH;
+use crate::components::fields::field_input;
 use crate::state::{
     AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
     ScheduleUiMode, ScheduleUnit,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
@@ -712,10 +713,6 @@ fn field_label(label: &'static str, muted: Hsla) -> impl IntoElement {
         .text_xs()
         .text_color(muted)
         .child(label)
-}
-
-fn field_input(state: &Entity<InputState>) -> Input {
-    Input::new(state).focus_bordered(false).rounded(px(8.))
 }
 
 fn field_textarea(

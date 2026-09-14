@@ -3,22 +3,36 @@ use crate::chrome::{
 };
 use crate::components::persona::PersonaMark;
 use crate::icons::NativeIcon;
-use crate::state::{AppSettingsTab, AppState};
+use crate::state::{AppSettingsTab, AppState, Conversation};
+use chrono::NaiveDateTime;
 use gpui_kit::assets::IconNamed;
+use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use std::time::{Duration, SystemTime};
+
+#[derive(Clone, PartialEq, Eq)]
+struct RailCoworker {
+    id: String,
+    name: String,
+    shape: Option<String>,
+    color: Option<String>,
+    preview: String,
+    time: String,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct SidebarRev {
     collapsed: bool,
     hidden: bool,
+    expanded_width: i32,
     theme_mode: String,
     active_id: Option<String>,
     any_modal: bool,
-    coworkers: Vec<(String, String, Option<String>, Option<String>)>,
+    coworkers: Vec<RailCoworker>,
     pinned: Vec<String>,
     hidden_ids: Vec<String>,
     renaming: Option<String>,
@@ -31,6 +45,7 @@ impl SidebarRev {
         Self {
             collapsed: state.sidebar_collapsed,
             hidden: state.sidebar_hidden,
+            expanded_width: state.sidebar_expanded_width.round() as i32,
             theme_mode: state.theme_mode.clone(),
             active_id: state.active_coworker_id.clone(),
             any_modal: state.is_voice_mode_open
@@ -41,12 +56,17 @@ impl SidebarRev {
                 .coworkers
                 .iter()
                 .map(|c| {
-                    (
-                        c.id.clone(),
-                        c.name.clone(),
-                        c.avatar_shape.clone(),
-                        c.avatar_color.clone(),
-                    )
+                    let (preview, time) = rail_preview(
+                        state.conversations.iter().find(|conv| conv.id == c.id),
+                    );
+                    RailCoworker {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        shape: c.avatar_shape.clone(),
+                        color: c.avatar_color.clone(),
+                        preview,
+                        time,
+                    }
                 })
                 .collect(),
             pinned: {
@@ -140,6 +160,12 @@ impl Render for SidebarView {
         let theme = cx.theme().clone();
         let theme_mode = state.theme_mode.clone();
         let coworkers = state.coworkers.clone();
+        let conversations = state.conversations.clone();
+        let rail_nudge = if collapsed {
+            SIDEBAR_ROW + 8.0
+        } else {
+            (state.sidebar_expanded_width - 16.0).max(SIDEBAR_ROW + 8.0)
+        };
         let active_coworker = state.active_coworker_id.clone();
         let any_modal_open = state.is_voice_mode_open
             || state.is_app_settings_open
@@ -221,6 +247,9 @@ impl Render for SidebarView {
                                         let is_active = Some(id.clone()) == active_coworker;
                                         let is_renaming = renaming.as_ref() == Some(&id);
                                         let is_pinned = pinned.contains(&id);
+                                        let (preview, when) = rail_preview(
+                                            conversations.iter().find(|conv| conv.id == id),
+                                        );
                                         let view = list_view.clone();
                                         let app = app.clone();
                                         let row = row()
@@ -282,7 +311,7 @@ impl Render for SidebarView {
                                                     .size(px(AVATAR_PX))
                                                     .lit(is_active),
                                             );
-                                        if collapsed {
+                                        let trigger = if collapsed {
                                             row.into_any_element()
                                         } else if is_renaming {
                                             row.child(
@@ -292,6 +321,7 @@ impl Render for SidebarView {
                                                     .child(
                                                         Input::new(&rename_input)
                                                             .appearance(false)
+                                                            .focus_bordered(false)
                                                             .h(px(28.)),
                                                     ),
                                             )
@@ -303,10 +333,42 @@ impl Render for SidebarView {
                                                     .flex_1()
                                                     .text_sm()
                                                     .truncate()
-                                                    .child(name),
+                                                    .child(name.clone()),
                                             )
                                             .into_any_element()
-                                        }
+                                        };
+                                        HoverCard::new(SharedString::from(format!(
+                                            "coworker-hover-{id}"
+                                        )))
+                                        .anchor(Anchor::TopLeft)
+                                        .appearance(false)
+                                        .open_delay(Duration::from_millis(80))
+                                        .close_delay(Duration::from_millis(140))
+                                        .when(!collapsed, |this| this.w_full())
+                                        .trigger(trigger)
+                                        .content({
+                                            let id = id.clone();
+                                            let name = name.clone();
+                                            let shape = c.avatar_shape.clone();
+                                            let color = c.avatar_color.clone();
+                                            move |_, _, cx| {
+                                                let theme = cx.theme();
+                                                agent_hover_card(
+                                                    id.clone(),
+                                                    name.clone(),
+                                                    shape.clone(),
+                                                    color.clone(),
+                                                    preview.clone(),
+                                                    when.clone(),
+                                                    rail_nudge,
+                                                    theme.is_dark(),
+                                                    theme.muted_foreground,
+                                                    theme.foreground,
+                                                    theme.border,
+                                                )
+                                            }
+                                        })
+                                        .into_any_element()
                                     })}),
                             ),
                     ),
@@ -619,6 +681,126 @@ impl SidebarView {
             .child(Icon::default().path(icon).size(px(16.)).text_color(fg))
             .when(!collapsed, |this| this.child(div().text_sm().child(label)))
     }
+}
+
+fn rail_preview(conversation: Option<&Conversation>) -> (String, String) {
+    let Some(conversation) = conversation else {
+        return ("No messages yet".into(), String::new());
+    };
+    let last = conversation
+        .messages
+        .iter()
+        .rev()
+        .find(|message| !message.content.trim().is_empty());
+    let preview = last
+        .map(|message| rail_preview_text(&message.content))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "No messages yet".into());
+    let time = match last {
+        Some(message) => rail_card_time(message.sent_at),
+        None => NaiveDateTime::parse_from_str(&conversation.created_at, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|dt| rail_card_time(SystemTime::from(dt.and_utc())))
+            .unwrap_or_default(),
+    };
+    (preview, time)
+}
+
+fn rail_preview_text(content: &str) -> String {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 140;
+    let count = collapsed.chars().count();
+    if count > MAX {
+        format!("{}…", collapsed.chars().take(MAX).collect::<String>())
+    } else {
+        collapsed
+    }
+}
+
+fn rail_card_time(at: SystemTime) -> String {
+    let at = chrono::DateTime::<chrono::Local>::from(at);
+    let today = chrono::Local::now().date_naive();
+    let then = at.date_naive();
+    match (today - then).num_days() {
+        0 => at.format("%l:%M %p").to_string().trim().to_string(),
+        1 => "Yesterday".into(),
+        2..=6 => at.format("%A").to_string(),
+        _ => at.format("%b %d").to_string(),
+    }
+}
+
+fn agent_hover_card(
+    id: String,
+    name: String,
+    shape: Option<String>,
+    color: Option<String>,
+    preview: String,
+    time: String,
+    nudge: f32,
+    dark: bool,
+    muted: Hsla,
+    foreground: Hsla,
+    border: Hsla,
+) -> impl IntoElement {
+    let panel_bg = if dark {
+        rgb(0x1c1c1c)
+    } else {
+        rgb(0xffffff)
+    };
+    h_flex()
+        .child(div().w(px(nudge)).h(px(1.)))
+        .child(
+            v_flex()
+                .id(SharedString::from(format!("coworker-preview-{id}")))
+                .w(px(260.))
+                .p(px(10.))
+                .gap(px(4.))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(border)
+                .bg(panel_bg)
+                .text_color(foreground)
+                .shadow_lg()
+                .occlude()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            PersonaMark::new(id)
+                                .shape(shape)
+                                .color(color)
+                                .size(px(16.))
+                                .dark(dark),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .flex_1()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .child(name),
+                        )
+                        .when(!time.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(time),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(preview),
+                ),
+        )
 }
 
 fn agent_menu(
