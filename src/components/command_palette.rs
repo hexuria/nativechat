@@ -219,8 +219,9 @@ impl CommandPalette {
                 });
             }
         }
-        // Close via the Root action so focus leaves the (now unmounted) search
-        // field. Toggling the flag alone leaves Cmd+K dead until a click.
+        self.state.update(cx, |state, cx| {
+            state.close_command_palette(cx);
+        });
         cx.dispatch_action(&CloseCommandPalette);
     }
 

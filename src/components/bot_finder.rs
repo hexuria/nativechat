@@ -110,11 +110,10 @@ impl BotFinder {
             FinderEntry::Bot { id, .. } => {
                 self.state.update(cx, |state, cx| {
                     state.select_coworker(id, cx);
+                    state.close_bot_finder(cx);
                 });
             }
         }
-        // Same as Escape: Root's CloseBotFinder handler parks focus on the
-        // window so chrome shortcuts (Cmd+K) still have a live target.
         cx.dispatch_action(&CloseBotFinder);
     }
 }

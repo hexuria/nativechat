@@ -23,6 +23,7 @@ pub struct RootView {
     circular_viz: Option<Entity<CircularVoiceViz>>,
     pub focus_handle: FocusHandle,
     show_fps: bool,
+    was_signed_in: bool,
     #[cfg(feature = "agent")]
     mailbox: Option<crate::agent::AgentMailbox>,
 }
@@ -38,6 +39,7 @@ impl RootView {
             circular_viz: None,
             focus_handle,
             show_fps: true,
+            was_signed_in: false,
             #[cfg(feature = "agent")]
             mailbox: None,
         }
@@ -144,14 +146,19 @@ impl Render for RootView {
         #[cfg(feature = "agent")]
         self.drain_agent(window, cx);
 
-        let (is_voice_mode_open, amplitude, ai_amplitude) = {
+        let (is_voice_mode_open, amplitude, ai_amplitude, signed_in) = {
             let app_state = self.state.read(cx);
             (
                 app_state.is_voice_mode_open,
                 app_state.amplitude.clone(),
                 app_state.ai_amplitude.clone(),
+                app_state.is_signed_in(),
             )
         };
+        if signed_in && !self.was_signed_in {
+            click_away(window, &self.focus_handle, cx);
+        }
+        self.was_signed_in = signed_in;
         let app_state_entity = self.state.clone();
 
         // Manage CircularVoiceViz lifecycle
@@ -255,10 +262,17 @@ impl Render for RootView {
             })
             .on_action({
                 let layout = self.layout.clone();
-                move |action: &PickFinderItem, _, cx: &mut App| {
+                let state = self.state.clone();
+                let root_focus = self.focus_handle.clone();
+                move |action: &PickFinderItem, window: &mut Window, cx: &mut App| {
                     layout.update(cx, |layout, cx| {
                         layout.pick_overlay_item(action.index, cx);
                     });
+                    state.update(cx, |state, cx| {
+                        state.close_bot_finder(cx);
+                        state.close_command_palette(cx);
+                    });
+                    click_away(window, &root_focus, cx);
                 }
             })
             .on_action({

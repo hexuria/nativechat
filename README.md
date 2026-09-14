@@ -44,7 +44,8 @@ See `migration-v2/` for the phased plan (login → roster/pin → turn → look)
 
    Or by hand: `OPENGROK_BASE_URL=http://127.0.0.1:1447 cargo run -p nativechat`
 
-   Sign in with the admin email/password. Session cookies stay in memory (sign in again after quit).
+   Sign in with the admin email/password. The session is saved in the app data
+   directory so a relaunch stays signed in; Sign out clears it.
    After login the app hires a coworker if you have none, and composer send goes to
    `POST /ag-ui` (same turn machinery as desktop `POST /api/sendPrompt`, cookie JWT sent as Bearer).
 

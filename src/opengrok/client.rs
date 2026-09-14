@@ -1,9 +1,12 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use reqwest::cookie::{CookieStore, Jar};
+use reqwest::header::HeaderValue;
 use reqwest::{Client, StatusCode, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::error::OpenGrokError;
@@ -17,6 +20,13 @@ pub struct OpenGrokClient {
     base: Url,
     http: Client,
     jar: Arc<Jar>,
+    session_path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    base_url: String,
+    cookies: Vec<(String, String)>,
 }
 
 impl OpenGrokClient {
@@ -30,7 +40,98 @@ impl OpenGrokClient {
             .tcp_nodelay(true)
             .build()
             .map_err(|e| OpenGrokError::message(e.to_string()))?;
-        Ok(Self { base, http, jar })
+        Ok(Self {
+            base,
+            http,
+            jar,
+            session_path: None,
+        })
+    }
+
+    pub fn with_session_file(mut self, path: PathBuf) -> Self {
+        self.session_path = Some(path);
+        self
+    }
+
+    fn cookie_pairs(&self) -> Vec<(String, String)> {
+        let Some(header) = CookieStore::cookies(self.jar.as_ref(), &self.base) else {
+            return Vec::new();
+        };
+        let Ok(raw) = header.to_str() else {
+            return Vec::new();
+        };
+        raw.split(';')
+            .filter_map(|pair| {
+                let pair = pair.trim();
+                let (name, value) = pair.split_once('=')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((name.to_string(), value.trim().to_string()))
+            })
+            .collect()
+    }
+
+    fn restore_cookies(&self, pairs: &[(String, String)]) {
+        let headers: Vec<HeaderValue> = pairs
+            .iter()
+            .filter_map(|(name, value)| {
+                HeaderValue::from_str(&format!("{name}={value}; Path=/")).ok()
+            })
+            .collect();
+        if headers.is_empty() {
+            return;
+        }
+        CookieStore::set_cookies(self.jar.as_ref(), &mut headers.iter(), &self.base);
+    }
+
+    pub fn load_session(&self) -> bool {
+        let Some(path) = self.session_path.as_ref() else {
+            return false;
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        let Ok(stored) = serde_json::from_slice::<StoredSession>(&bytes) else {
+            return false;
+        };
+        if stored.base_url.trim_end_matches('/') != self.base.as_str().trim_end_matches('/') {
+            return false;
+        }
+        if stored.cookies.is_empty() {
+            return false;
+        }
+        self.restore_cookies(&stored.cookies);
+        true
+    }
+
+    pub fn save_session(&self) {
+        let Some(path) = self.session_path.as_ref() else {
+            return;
+        };
+        let cookies = self.cookie_pairs();
+        if cookies.is_empty() {
+            self.clear_session();
+            return;
+        }
+        let stored = StoredSession {
+            base_url: self.base.as_str().to_string(),
+            cookies,
+        };
+        let Ok(json) = serde_json::to_vec(&stored) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = write_private(path, &json);
+    }
+
+    pub fn clear_session(&self) {
+        if let Some(path) = self.session_path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
     }
 
     /// AG-UI `principal_from_bearer` only reads `Authorization`, not cookies.
@@ -106,6 +207,7 @@ impl OpenGrokClient {
             )
             .await?;
         if response.status() == StatusCode::OK {
+            self.save_session();
             Ok(())
         } else {
             Err(Self::read_error(response).await)
@@ -117,6 +219,7 @@ impl OpenGrokClient {
             .send_json::<()>(reqwest::Method::POST, "/auth/refresh", None)
             .await?;
         if response.status().is_success() {
+            self.save_session();
             Ok(())
         } else {
             Err(Self::read_error(response).await)
@@ -127,6 +230,7 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::POST, "/auth/logout", None)
             .await?;
+        self.clear_session();
         if response.status().is_success() {
             Ok(())
         } else {
@@ -328,6 +432,25 @@ impl OpenGrokClient {
     }
 }
 
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +499,63 @@ mod tests {
         let me = client.me().await.unwrap();
         assert_eq!(me.email, "a@b.c");
         assert_eq!(me.display_name(), "Ada Lovelace");
+    }
+
+    #[tokio::test]
+    async fn session_file_survives_a_new_client() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header(
+                        "set-cookie",
+                        "og_access=tok-a; HttpOnly; Path=/; SameSite=Lax",
+                    )
+                    .append_header(
+                        "set-cookie",
+                        "og_refresh=tok-r; HttpOnly; Path=/; SameSite=Lax",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acc_1",
+                "email": "a@b.c",
+                "firstName": "Ada",
+                "lastName": "Lovelace",
+                "avatarUrl": null,
+                "orgId": "org_1",
+                "verified": true,
+                "enabled": true,
+                "isAdmin": false
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nativechat-session-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opengrok-session.json");
+        let client = OpenGrokClient::new(&server.uri())
+            .unwrap()
+            .with_session_file(path.clone());
+        client.login("a@b.c", "secret").await.unwrap();
+        assert!(path.exists());
+
+        let restored = OpenGrokClient::new(&server.uri())
+            .unwrap()
+            .with_session_file(path.clone());
+        assert!(restored.load_session());
+        let me = restored.me().await.unwrap();
+        assert_eq!(me.email, "a@b.c");
+        restored.clear_session();
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

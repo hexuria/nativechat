@@ -704,7 +704,12 @@ impl AppState {
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
         match OpenGrokClient::new(&config.opengrok_base_url) {
-            Ok(client) => self.opengrok = Some(client),
+            Ok(client) => {
+                let client = client
+                    .with_session_file(config.data_dir.join("opengrok-session.json"));
+                self.opengrok = Some(client);
+                self.restore_session(cx);
+            }
             Err(error) => {
                 self.auth_error = Some(error.message);
                 self.opengrok = None;
@@ -712,6 +717,51 @@ impl AppState {
         }
         self.config = Some(config);
         cx.notify();
+    }
+
+    fn restore_session(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !client.load_session() {
+            return;
+        }
+        self.login_epoch += 1;
+        let epoch = self.login_epoch;
+        self.auth_status = AuthStatus::SigningIn;
+        self.auth_error = None;
+        cx.spawn(async move |this, cx| {
+            let account = match client.me().await {
+                Ok(account) => Ok(account),
+                Err(error) if error.is_unauthorized() => match client.refresh().await {
+                    Ok(()) => client.me().await,
+                    Err(_) => {
+                        client.clear_session();
+                        Err(error)
+                    }
+                },
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |state, cx| {
+                if state.login_epoch != epoch {
+                    return;
+                }
+                match account {
+                    Ok(account) => {
+                        state.account = Some(account);
+                        state.auth_status = AuthStatus::SignedIn;
+                        state.auth_error = None;
+                        state.refresh_coworkers(cx);
+                    }
+                    Err(_) => {
+                        state.account = None;
+                        state.auth_status = AuthStatus::SignedOut;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn is_signed_in(&self) -> bool {
