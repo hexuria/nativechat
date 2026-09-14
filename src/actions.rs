@@ -9,6 +9,7 @@ actions!(
         ToggleSidebar,
         ToggleMiniSidebar,
         ToggleAgentSettings,
+        ToggleComputerPane,
         ToggleTheme,
         OpenSettings,
         CloseSettings,
@@ -36,6 +37,13 @@ actions!(
         SelectAppStudy,
         NewChat,
         Search,
+        FocusChatInput,
+        OpenCommandPalette,
+        CloseCommandPalette,
+        PaletteNextTab,
+        PalettePrevTab,
+        CloseBotFinder,
+        ClearSearch,
         Library,
         Projects,
         OpenAccountSettings,
@@ -58,6 +66,12 @@ pub enum TtsSource {
     #[default]
     Native,
     AI,
+}
+
+#[derive(Clone, PartialEq, Deserialize, Default, JsonSchema, Action)]
+#[action(namespace = nativechat)]
+pub struct PickFinderItem {
+    pub index: usize,
 }
 
 #[derive(Clone, PartialEq, Deserialize, Default, JsonSchema, Action)]

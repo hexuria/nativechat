@@ -216,6 +216,7 @@ impl Render for MessageInput {
         h_flex().w_full().justify_center().child(
             // Input container - rounded pill shape with shadow
             v_flex()
+                .key_context("MessageInput")
                 .max_w(px(800.0)) // Max width like Cha2tGPT
                 .w_full()
                 .gap_2()

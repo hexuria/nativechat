@@ -1,6 +1,8 @@
 use crate::actions::{
-    About, Hide, HideOthers, Minimize, NewChat, OpenSettings, ShowAll, ToggleDebugMarkdown,
-    ToggleFps, ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
+    About, ClearSearch, CloseBotFinder, CloseCommandPalette, FocusChatInput, Hide, HideOthers,
+    Minimize, NewChat, OpenCommandPalette, OpenSettings, Search, ShowAll, ToggleComputerPane,
+    ToggleDebugMarkdown, ToggleFps, ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar,
+    ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
 use gpui_kit::prelude::*;
@@ -208,6 +210,12 @@ impl Render for RootView {
             })
             .on_action({
                 let state = self.state.clone();
+                move |_: &ToggleComputerPane, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.toggle_computer_pane(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
                 move |_: &OpenSettings, _window: &mut Window, cx: &mut App| {
                     state.update(cx, |state, cx| state.toggle_app_settings(cx));
                 }
@@ -220,8 +228,73 @@ impl Render for RootView {
             })
             .on_action({
                 let state = self.state.clone();
-                move |_: &NewChat, _window: &mut Window, cx: &mut App| {
-                    state.update(cx, |state, cx| state.create_agent(cx));
+                let layout = self.layout.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &NewChat, window: &mut Window, cx: &mut App| {
+                    window.blur(cx);
+                    let open = state.read(cx).bot_finder_open;
+                    if open {
+                        state.update(cx, |state, cx| state.close_bot_finder(cx));
+                        focus_composer(&state, &layout, &root_focus, window, cx);
+                    } else {
+                        state.update(cx, |state, cx| state.open_bot_finder(cx));
+                    }
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                let layout = self.layout.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &OpenCommandPalette, window: &mut Window, cx: &mut App| {
+                    window.blur(cx);
+                    let open = state.read(cx).command_palette_open;
+                    if open {
+                        state.update(cx, |state, cx| state.close_command_palette(cx));
+                        focus_composer(&state, &layout, &root_focus, window, cx);
+                    } else {
+                        state.update(cx, |state, cx| state.open_command_palette(cx));
+                    }
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                let layout = self.layout.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &FocusChatInput, window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| {
+                        state.close_bot_finder(cx);
+                        state.close_command_palette(cx);
+                    });
+                    focus_composer(&state, &layout, &root_focus, window, cx);
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                let layout = self.layout.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &CloseBotFinder, window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.close_bot_finder(cx));
+                    focus_composer(&state, &layout, &root_focus, window, cx);
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                let layout = self.layout.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &CloseCommandPalette, window: &mut Window, cx: &mut App| {
+                    state.update(cx, |state, cx| state.close_command_palette(cx));
+                    focus_composer(&state, &layout, &root_focus, window, cx);
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                let layout = self.layout.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &ClearSearch, window: &mut Window, cx: &mut App| {
+                    layout.update(cx, |layout, cx| {
+                        layout.clear_sidebar_search(window, cx);
+                    });
+                    focus_composer(&state, &layout, &root_focus, window, cx);
                 }
             })
             .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {
@@ -347,5 +420,25 @@ impl Render for RootView {
             .when(self.show_fps, |this| {
                 this.child(gpui_fps::fps_monitor(window, cx))
             })
+    }
+}
+
+fn focus_composer(
+    state: &Entity<AppState>,
+    layout: &Entity<Layout>,
+    root_focus: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let has_agent = state.update(cx, |state, cx| {
+        state.ensure_active_coworker(cx);
+        state.active_coworker_id.is_some()
+    });
+    if has_agent {
+        layout.update(cx, |layout, cx| {
+            layout.focus_chat_input(window, cx);
+        });
+    } else {
+        root_focus.focus(window, cx);
     }
 }

@@ -69,6 +69,9 @@ pub struct Coworker {
     pub avatar_color: Option<String>,
     #[serde(default)]
     pub notify_on_updates: Option<bool>,
+    /// Hire/rename time from the server. Idle bots (no messages) sort by this.
+    #[serde(default, alias = "updated_at_ms", alias = "updatedAt")]
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

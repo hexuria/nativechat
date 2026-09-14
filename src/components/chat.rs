@@ -395,6 +395,12 @@ pub struct ChatView {
 }
 
 impl ChatView {
+    pub fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+    }
+
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             MessageInput::new(window, state.clone(), cx).on_submit({

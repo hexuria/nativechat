@@ -1,5 +1,7 @@
 use crate::components::agent_settings::AgentSettings;
 use crate::components::app_settings::AppSettings;
+use crate::components::bot_finder::BotFinder;
+use crate::components::command_palette::CommandPalette;
 use crate::components::computer::ComputerPane;
 use crate::state::RightPane;
 use crate::components::chat::ChatView;
@@ -33,6 +35,8 @@ struct ShellRev {
     model_picker: bool,
     avatar_editor: bool,
     app_settings: bool,
+    bot_finder: bool,
+    command_palette: bool,
     has_agent: bool,
     hiring: bool,
 }
@@ -57,6 +61,8 @@ impl ShellRev {
             model_picker: state.model_picker_open,
             avatar_editor: state.avatar_editor_open,
             app_settings: state.is_app_settings_open,
+            bot_finder: state.bot_finder_open,
+            command_palette: state.command_palette_open,
             has_agent: state.active_coworker_id.is_some(),
             hiring: state.hiring,
         }
@@ -72,6 +78,8 @@ pub struct Layout {
     computer: Entity<ComputerPane>,
     profile_settings_modal: Entity<ProfileSettingsModal>,
     app_settings: Entity<AppSettings>,
+    bot_finder: Entity<BotFinder>,
+    command_palette: Entity<CommandPalette>,
     state: Entity<AppState>,
     shell: ShellRev,
     last_window_width: Option<Pixels>,
@@ -88,6 +96,8 @@ impl Layout {
         let profile_settings_modal =
             cx.new(|cx| ProfileSettingsModal::new(window, state.clone(), cx));
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
+        let bot_finder = cx.new(|cx| BotFinder::new(window, state.clone(), cx));
+        let command_palette = cx.new(|cx| CommandPalette::new(window, state.clone(), cx));
         let shell = ShellRev::from_state(&state.read(cx));
 
         cx.observe(&state, |this, state, cx| {
@@ -107,11 +117,39 @@ impl Layout {
             computer,
             profile_settings_modal,
             app_settings,
+            bot_finder,
+            command_palette,
             state,
             shell,
             last_window_width: None,
             resize_drag: None,
         }
+    }
+
+    pub fn focus_sidebar_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.focus_search(window, cx);
+        });
+    }
+
+    pub fn sidebar_search_focused(&self, window: &Window, cx: &App) -> bool {
+        self.sidebar.read(cx).search_is_focused(window, cx)
+    }
+
+    pub fn clear_sidebar_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.clear_search(window, cx);
+        });
+    }
+
+    pub fn focus_chat_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| {
+            chat.focus_input(window, cx);
+        });
+    }
+
+    pub fn blur_chat_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.blur(cx);
     }
 }
 
@@ -130,6 +168,8 @@ impl Render for Layout {
 
         let state = self.state.read(cx);
         let app_settings_open = state.is_app_settings_open;
+        let bot_finder_open = state.bot_finder_open;
+        let command_palette_open = state.command_palette_open;
         if !state.is_signed_in() {
             return div()
                 .size_full()
@@ -219,8 +259,12 @@ impl Render for Layout {
                     .flex_1()
                     .h_full()
                     .min_w_0()
+                    .relative()
                     .overflow_hidden()
-                    .child(main),
+                    .child(main)
+                    .when(bot_finder_open, |this| {
+                        this.child(self.bot_finder.clone())
+                    }),
             )
             .when(right_pane != RightPane::Closed, |this| {
                 this.child(
@@ -251,6 +295,9 @@ impl Render for Layout {
                         .occlude()
                         .child(self.app_settings.clone()),
                 )
+            })
+            .when(command_palette_open, |this| {
+                this.child(self.command_palette.clone())
             })
     }
 }

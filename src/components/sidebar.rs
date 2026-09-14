@@ -6,10 +6,10 @@ use crate::icons::NativeIcon;
 use crate::state::{AppSettingsTab, AppState, Conversation};
 use chrono::NaiveDateTime;
 use gpui_kit::assets::IconNamed;
-use gpui_kit::component::hover_card::HoverCard;
+use gpui_kit::base::{Align, ElementExt as _, Placement, Positioner, POPUP_PRIORITY};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::time::{Duration, SystemTime};
@@ -53,8 +53,8 @@ impl SidebarRev {
                 || state.is_profile_settings_open
                 || state.is_credentials_modal_open,
             coworkers: state
-                .coworkers
-                .iter()
+                .ranked_coworkers()
+                .into_iter()
                 .map(|c| {
                     let (preview, time) = rail_preview(
                         state.conversations.iter().find(|conv| conv.id == c.id),
@@ -94,16 +94,32 @@ impl SidebarRev {
     }
 }
 
+#[derive(Clone)]
+struct RailHover {
+    id: String,
+    bounds: Bounds<Pixels>,
+    name: String,
+    shape: Option<String>,
+    color: Option<String>,
+    preview: String,
+    time: String,
+}
+
 pub struct SidebarView {
     state: Entity<AppState>,
     list_scroll: ScrollHandle,
     rename_input: Entity<InputState>,
+    search_input: Entity<InputState>,
     rev: SidebarRev,
+    rail_hover: Option<RailHover>,
+    hover_close: Option<Task<()>>,
+    hover_epoch: usize,
 }
 
 impl SidebarView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let rev = SidebarRev::from_state(&state.read(cx));
         cx.observe(&state, |this, state, cx| {
             let rev = SidebarRev::from_state(&state.read(cx));
@@ -122,13 +138,70 @@ impl SidebarView {
             }
         })
         .detach();
+        cx.subscribe(&search_input, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
 
         Self {
             state,
             list_scroll: ScrollHandle::new(),
             rename_input,
+            search_input,
             rev,
+            rail_hover: None,
+            hover_close: None,
+            hover_epoch: 0,
         }
+    }
+
+    fn show_rail_hover(&mut self, hover: RailHover, cx: &mut Context<Self>) {
+        self.hover_close = None;
+        self.hover_epoch += 1;
+        self.rail_hover = Some(hover);
+        cx.notify();
+    }
+
+    fn keep_rail_hover(&mut self) {
+        self.hover_close = None;
+        self.hover_epoch += 1;
+    }
+
+    pub fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    pub fn search_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.search_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
+    pub fn clear_search(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn schedule_hide_rail_hover(&mut self, cx: &mut Context<Self>) {
+        self.hover_epoch += 1;
+        let epoch = self.hover_epoch;
+        self.hover_close = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(140))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.hover_epoch == epoch {
+                    this.rail_hover = None;
+                    this.hover_close = None;
+                    cx.notify();
+                }
+            });
+        }));
     }
 }
 
@@ -159,13 +232,8 @@ impl Render for SidebarView {
         }
         let theme = cx.theme().clone();
         let theme_mode = state.theme_mode.clone();
-        let coworkers = state.coworkers.clone();
+        let coworkers = state.ranked_coworkers();
         let conversations = state.conversations.clone();
-        let rail_nudge = if collapsed {
-            SIDEBAR_ROW + 8.0
-        } else {
-            (state.sidebar_expanded_width - 16.0).max(SIDEBAR_ROW + 8.0)
-        };
         let active_coworker = state.active_coworker_id.clone();
         let any_modal_open = state.is_voice_mode_open
             || state.is_app_settings_open
@@ -214,8 +282,22 @@ impl Render for SidebarView {
                     .min_h(px(0.))
                     .w_full()
                     .gap(px(SIDEBAR_GAP))
-                    .child(self.brand_row(collapsed, any_modal_open, fg, muted, rail_hover, view.clone()))
-                    .child(self.search_row(collapsed, icon_color, rail_hover))
+                    .child(self.brand_row(
+                        collapsed,
+                        any_modal_open,
+                        state.bot_finder_open,
+                        fg,
+                        muted,
+                        rail_hover,
+                        view.clone(),
+                    ))
+                    .child(self.search_row(
+                        collapsed,
+                        state.bot_finder_open,
+                        icon_color,
+                        rail_hover,
+                        view.clone(),
+                    ))
                     .child(
                         div()
                             .id("sidebar-chat-list")
@@ -311,7 +393,7 @@ impl Render for SidebarView {
                                                     .size(px(AVATAR_PX))
                                                     .lit(is_active),
                                             );
-                                        let trigger = if collapsed {
+                                        let row = if collapsed {
                                             row.into_any_element()
                                         } else if is_renaming {
                                             row.child(
@@ -337,38 +419,60 @@ impl Render for SidebarView {
                                             )
                                             .into_any_element()
                                         };
-                                        HoverCard::new(SharedString::from(format!(
-                                            "coworker-hover-{id}"
-                                        )))
-                                        .anchor(Anchor::TopLeft)
-                                        .appearance(false)
-                                        .open_delay(Duration::from_millis(80))
-                                        .close_delay(Duration::from_millis(140))
-                                        .when(!collapsed, |this| this.w_full())
-                                        .trigger(trigger)
-                                        .content({
-                                            let id = id.clone();
-                                            let name = name.clone();
-                                            let shape = c.avatar_shape.clone();
-                                            let color = c.avatar_color.clone();
-                                            move |_, _, cx| {
-                                                let theme = cx.theme();
-                                                agent_hover_card(
-                                                    id.clone(),
-                                                    name.clone(),
-                                                    shape.clone(),
-                                                    color.clone(),
-                                                    preview.clone(),
-                                                    when.clone(),
-                                                    rail_nudge,
-                                                    theme.is_dark(),
-                                                    theme.muted_foreground,
-                                                    theme.foreground,
-                                                    theme.border,
-                                                )
-                                            }
-                                        })
-                                        .into_any_element()
+                                        div()
+                                            .id(SharedString::from(format!("coworker-hover-{id}")))
+                                            .flex_shrink_0()
+                                            .when(!collapsed, |this| this.w_full())
+                                            .on_hover({
+                                                let view = view.clone();
+                                                let id = id.clone();
+                                                let name = name.clone();
+                                                let shape = c.avatar_shape.clone();
+                                                let color = c.avatar_color.clone();
+                                                move |hovered, _, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        if *hovered {
+                                                            let bounds = this
+                                                                .rail_hover
+                                                                .as_ref()
+                                                                .filter(|h| h.id == id)
+                                                                .map(|h| h.bounds)
+                                                                .unwrap_or_else(Bounds::default);
+                                                            this.show_rail_hover(
+                                                                RailHover {
+                                                                    id: id.clone(),
+                                                                    bounds,
+                                                                    name: name.clone(),
+                                                                    shape: shape.clone(),
+                                                                    color: color.clone(),
+                                                                    preview: preview.clone(),
+                                                                    time: when.clone(),
+                                                                },
+                                                                cx,
+                                                            );
+                                                        } else {
+                                                            this.schedule_hide_rail_hover(cx);
+                                                        }
+                                                    });
+                                                }
+                                            })
+                                            .on_prepaint({
+                                                let view = view.clone();
+                                                let id = id.clone();
+                                                move |bounds, _, cx| {
+                                                    view.update(cx, |this, cx| {
+                                                        if let Some(hover) = this.rail_hover.as_mut()
+                                                            && hover.id == id
+                                                            && hover.bounds != bounds
+                                                        {
+                                                            hover.bounds = bounds;
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                }
+                                            })
+                                            .child(row)
+                                            .into_any_element()
                                     })}),
                             ),
                     ),
@@ -383,8 +487,49 @@ impl Render for SidebarView {
                 fg,
                 muted,
                 rail_hover,
-                view,
+                view.clone(),
             ))
+            .when_some(self.rail_hover.clone(), |this, hover| {
+                if hover.bounds.size.width <= px(0.) {
+                    return this;
+                }
+                let view = view.clone();
+                this.child(
+                    deferred(
+                        Positioner::side(hover.bounds)
+                            .placement(Placement::Right)
+                            .align(Align::Start)
+                            .offset(px(8.))
+                            .occlude()
+                            .child(
+                                div()
+                                    .id("coworker-preview-hit")
+                                    .on_hover(move |hovered, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            if *hovered {
+                                                this.keep_rail_hover();
+                                            } else {
+                                                this.schedule_hide_rail_hover(cx);
+                                            }
+                                        });
+                                    })
+                                    .child(agent_hover_card(
+                                        hover.id,
+                                        hover.name,
+                                        hover.shape,
+                                        hover.color,
+                                        hover.preview,
+                                        hover.time,
+                                        theme.is_dark(),
+                                        muted,
+                                        fg,
+                                        theme.border,
+                                    )),
+                            ),
+                    )
+                    .with_priority(POPUP_PRIORITY),
+                )
+            })
     }
 }
 
@@ -393,6 +538,7 @@ impl SidebarView {
         &self,
         collapsed: bool,
         any_modal_open: bool,
+        finder_open: bool,
         fg: Hsla,
         muted: Hsla,
         hover: Hsla,
@@ -458,8 +604,9 @@ impl SidebarView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_color(muted)
+                        .text_color(if finder_open { fg } else { muted })
                         .cursor_pointer()
+                        .when(finder_open, |this| this.bg(hover))
                         .hover(|s| s.bg(hover).text_color(fg))
                         .when(!any_modal_open, |this| {
                             this.on_mouse_down(MouseButton::Left, {
@@ -467,7 +614,11 @@ impl SidebarView {
                                 move |_, _, cx| {
                                     view.update(cx, |this, cx| {
                                         this.state.update(cx, |state, cx| {
-                                            state.create_agent(cx);
+                                            if state.bot_finder_open {
+                                                state.close_bot_finder(cx);
+                                            } else {
+                                                state.open_bot_finder(cx);
+                                            }
                                         });
                                     });
                                 }
@@ -478,48 +629,75 @@ impl SidebarView {
             })
     }
 
-    fn search_row(&self, collapsed: bool, icon_color: Hsla, hover: Hsla) -> impl IntoElement {
+    fn search_row(
+        &self,
+        collapsed: bool,
+        finder_open: bool,
+        icon_color: Hsla,
+        hover: Hsla,
+        view: Entity<Self>,
+    ) -> impl IntoElement {
+        // Same 54px track as brand/avatars so collapse only moves this slot sideways.
+        let track = row().id("nav-search").w_full();
         if collapsed {
-            row()
-                .id("nav-search")
-                .w_full()
-                .justify_center()
-                .child(
-                    div()
-                        .w(px(SIDEBAR_ROW))
-                        .h(px(SIDEBAR_ROW))
-                        .rounded(px(10.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(hover))
-                        .child(Icon::new(IconName::Search).size(px(16.)).text_color(icon_color)),
-                )
+            track.justify_center().child(
+                div()
+                    .id("nav-new-chat")
+                    .w(px(SIDEBAR_ROW))
+                    .h(px(SIDEBAR_ROW))
+                    .rounded(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(finder_open, |this| this.bg(hover))
+                    .hover(|s| s.bg(hover))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.state.update(cx, |state, cx| {
+                                if state.bot_finder_open {
+                                    state.close_bot_finder(cx);
+                                } else {
+                                    state.open_bot_finder(cx);
+                                }
+                            });
+                        });
+                    })
+                    .child(Icon::new(IconName::Plus).size(px(16.)).text_color(icon_color)),
+            )
         } else {
-            row()
-                .id("nav-search")
-                .w_full()
-                .px(px(12.))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .h(px(36.))
-                        .px(px(8.))
-                        .gap(px(8.))
-                        .rounded(px(10.))
-                        .border_1()
-                        .border_color(rgb(0xfcfcfc).opacity(0.15))
-                        .items_center()
-                        .cursor_pointer()
-                        .child(Icon::new(IconName::Search).size(px(16.)).text_color(icon_color))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0xfcfcfc).opacity(0.4))
-                                .child("Search"),
-                        ),
-                )
+            track.px(px(12.)).child(
+                h_flex()
+                    .id("sidebar-search")
+                    .w_full()
+                    .h(px(36.))
+                    .px(px(10.))
+                    .gap(px(8.))
+                    .items_center()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgb(0x777777).opacity(0.28))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.state.update(cx, |state, cx| {
+                                state.open_command_palette(cx);
+                            });
+                        });
+                    })
+                    .child(
+                        Icon::new(IconName::Search)
+                            .size(px(16.))
+                            .text_color(icon_color),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(icon_color)
+                            .child("Search"),
+                    ),
+            )
         }
     }
 
@@ -736,7 +914,6 @@ fn agent_hover_card(
     color: Option<String>,
     preview: String,
     time: String,
-    nudge: f32,
     dark: bool,
     muted: Hsla,
     foreground: Hsla,
@@ -747,59 +924,55 @@ fn agent_hover_card(
     } else {
         rgb(0xffffff)
     };
-    h_flex()
-        .child(div().w(px(nudge)).h(px(1.)))
+    v_flex()
+        .id(SharedString::from(format!("coworker-preview-{id}")))
+        .w(px(260.))
+        .p(px(10.))
+        .gap(px(4.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(border)
+        .bg(panel_bg)
+        .text_color(foreground)
+        .shadow_lg()
+        .occlude()
         .child(
-            v_flex()
-                .id(SharedString::from(format!("coworker-preview-{id}")))
-                .w(px(260.))
-                .p(px(10.))
-                .gap(px(4.))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(border)
-                .bg(panel_bg)
-                .text_color(foreground)
-                .shadow_lg()
-                .occlude()
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(px(8.))
                 .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
-                            PersonaMark::new(id)
-                                .shape(shape)
-                                .color(color)
-                                .size(px(16.))
-                                .dark(dark),
-                        )
-                        .child(
-                            div()
-                                .min_w(px(0.))
-                                .flex_1()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .truncate()
-                                .child(name),
-                        )
-                        .when(!time.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(time),
-                            )
-                        }),
+                    PersonaMark::new(id)
+                        .shape(shape)
+                        .color(color)
+                        .size(px(16.))
+                        .dark(dark),
                 )
                 .child(
                     div()
-                        .w_full()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(preview),
-                ),
+                        .min_w(px(0.))
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(name),
+                )
+                .when(!time.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(time),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_xs()
+                .text_color(muted)
+                .child(preview),
         )
 }
 

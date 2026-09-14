@@ -76,6 +76,7 @@ pub struct Conversation {
     pub id: String,
     pub title: String,
     pub created_at: String,
+    pub updated_at: String,
     pub messages: Vec<Message>,
     pub unread_count: usize,
 }
@@ -114,6 +115,18 @@ impl Conversation {
             format!("{}y ago", years)
         }
     }
+}
+
+fn parse_sql_time(value: &str) -> Option<SystemTime> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|dt| SystemTime::from(dt.and_utc()))
+}
+
+fn system_time_ms(at: SystemTime) -> u128 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -418,6 +431,8 @@ pub struct AppCapability {
 
 pub struct AppState {
     pub conversations: Vec<Conversation>,
+    /// Last send/receive per coworker. Beats an unopened session's empty `messages`.
+    pub last_active_at: HashMap<String, SystemTime>,
     pub active_conversation_id: Option<String>,
     pub theme_mode: String,
     pub amplitude: Arc<AtomicU32>,
@@ -431,6 +446,8 @@ pub struct AppState {
     pub is_profile_settings_open: bool,
     pub is_credentials_modal_open: bool,
     pub is_app_settings_open: bool,
+    pub bot_finder_open: bool,
+    pub command_palette_open: bool,
     pub app_settings_tab: AppSettingsTab,
     pub submit_chord: SubmitChord,
     pub audio_input: Option<AudioInput>,
@@ -602,6 +619,7 @@ impl AppState {
 
         let mut state = Self {
             conversations: Vec::new(),
+            last_active_at: HashMap::new(),
             active_conversation_id: None,
             theme_mode: "light".to_string(),
             amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -615,6 +633,8 @@ impl AppState {
             is_profile_settings_open: false,
             is_credentials_modal_open: false,
             is_app_settings_open: false,
+            bot_finder_open: false,
+            command_palette_open: false,
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
             audio_input: None,
@@ -751,9 +771,12 @@ impl AppState {
         self.auth_status = AuthStatus::SignedOut;
         self.auth_error = None;
         self.coworkers.clear();
+        self.last_active_at.clear();
         self.active_coworker_id = None;
         self.bot_status = None;
         self.is_app_settings_open = false;
+        self.bot_finder_open = false;
+        self.command_palette_open = false;
         self.close_right_pane(cx);
         cx.notify();
         if let Some(client) = client {
@@ -826,6 +849,20 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         self.model_picker_open = false;
         self.avatar_editor_open = false;
+        cx.notify();
+    }
+
+    pub fn show_agent_settings(&mut self, cx: &mut Context<Self>) {
+        self.ensure_active_coworker(cx);
+        self.right_pane = RightPane::Settings;
+        self.computer_view = ComputerView::Overview;
+        cx.notify();
+    }
+
+    pub fn show_computer_pane(&mut self, cx: &mut Context<Self>) {
+        self.ensure_active_coworker(cx);
+        self.right_pane = RightPane::Computer;
+        self.computer_view = ComputerView::Overview;
         cx.notify();
     }
 
@@ -1231,7 +1268,8 @@ impl AppState {
                                         id: s.id,
                                         title: s.title,
                                         created_at: s.created_at,
-                                        messages: Vec::new(), // Messages loaded on demand
+                                        updated_at: s.updated_at,
+                                        messages: Vec::new(),
                                         unread_count: 0,
                                     })
                                     .collect();
@@ -1254,7 +1292,48 @@ impl AppState {
         }
     }
 
+    pub fn ensure_active_coworker(&mut self, cx: &mut Context<Self>) {
+        if self.active_coworker_id.is_some() {
+            return;
+        }
+        if let Some(first) = self.ranked_coworkers().into_iter().next() {
+            self.select_coworker(first.id, cx);
+        }
+    }
+
+    pub fn open_bot_finder(&mut self, cx: &mut Context<Self>) {
+        self.command_palette_open = false;
+        self.bot_finder_open = true;
+        self.dismiss_popovers(cx);
+        cx.notify();
+    }
+
+    pub fn close_bot_finder(&mut self, cx: &mut Context<Self>) {
+        if self.bot_finder_open {
+            self.bot_finder_open = false;
+            cx.notify();
+        }
+    }
+
+    pub fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+        self.bot_finder_open = false;
+        self.command_palette_open = true;
+        self.dismiss_popovers(cx);
+        cx.notify();
+    }
+
+    pub fn close_command_palette(&mut self, cx: &mut Context<Self>) {
+        if self.command_palette_open {
+            self.command_palette_open = false;
+            cx.notify();
+        }
+    }
+
     pub fn create_agent(&mut self, cx: &mut Context<Self>) {
+        self.hire_agent("New Bot", cx);
+    }
+
+    pub fn hire_agent(&mut self, name: &str, cx: &mut Context<Self>) {
         if self.hiring {
             return;
         }
@@ -1270,9 +1349,12 @@ impl AppState {
         }
         self.hiring = true;
         self.auth_error = None;
+        self.bot_finder_open = false;
+        self.command_palette_open = false;
         cx.notify();
+        let name = name.to_string();
         cx.spawn(async move |this, cx| {
-            let result = client.hire("New Bot", None).await;
+            let result = client.hire(&name, None).await;
             let _ = this.update(cx, |state, cx| {
                 state.hiring = false;
                 match result {
@@ -1313,12 +1395,73 @@ impl AppState {
                     created_at: chrono::Local::now()
                         .format("%Y-%m-%d %H:%M:%S")
                         .to_string(),
+                    updated_at: chrono::Local::now()
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
                     messages: Vec::new(),
                     unread_count: 0,
                 },
             );
         }
         self.select_conversation(id, cx);
+    }
+
+    pub fn touch_coworker_activity(&mut self, id: &str) {
+        self.last_active_at
+            .insert(id.to_string(), SystemTime::now());
+        if let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == id) {
+            conversation.updated_at = chrono::Local::now()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+        }
+    }
+
+    /// Most recent message first; idle bots (no messages) by created date, newest first.
+    pub fn ranked_coworkers(&self) -> Vec<Coworker> {
+        let mut list = self.coworkers.clone();
+        list.sort_by(|a, b| self.coworker_rank(b).cmp(&self.coworker_rank(a)));
+        list
+    }
+
+    fn coworker_rank(&self, coworker: &Coworker) -> (u8, u128, i64) {
+        match self.coworker_activity_ms(coworker) {
+            Some(ms) => (1, ms, self.coworker_created_ms(coworker)),
+            None => (0, 0, self.coworker_created_ms(coworker)),
+        }
+    }
+
+    fn coworker_activity_ms(&self, coworker: &Coworker) -> Option<u128> {
+        if let Some(at) = self.last_active_at.get(&coworker.id) {
+            return Some(system_time_ms(*at));
+        }
+        let conversation = self.conversations.iter().find(|c| c.id == coworker.id)?;
+        if let Some(message) = conversation
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !m.content.trim().is_empty())
+        {
+            return Some(system_time_ms(message.sent_at));
+        }
+        let updated = parse_sql_time(&conversation.updated_at)?;
+        let created = parse_sql_time(&conversation.created_at);
+        if created.is_some_and(|c| updated > c) {
+            Some(system_time_ms(updated))
+        } else {
+            None
+        }
+    }
+
+    fn coworker_created_ms(&self, coworker: &Coworker) -> i64 {
+        if coworker.updated_at_ms > 0 {
+            return coworker.updated_at_ms;
+        }
+        self.conversations
+            .iter()
+            .find(|c| c.id == coworker.id)
+            .and_then(|c| parse_sql_time(&c.created_at))
+            .map(|t| system_time_ms(t) as i64)
+            .unwrap_or(0)
     }
 
     pub fn toggle_pin_coworker(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1491,6 +1634,9 @@ impl AppState {
                                         id: id.clone(),
                                         title: "New Chat".to_string(),
                                         created_at: chrono::Local::now()
+                                            .format("%Y-%m-%d %H:%M:%S")
+                                            .to_string(),
+                                        updated_at: chrono::Local::now()
                                             .format("%Y-%m-%d %H:%M:%S")
                                             .to_string(),
                                         messages: Vec::new(),
@@ -1919,6 +2065,9 @@ impl AppState {
                 is_me: false,
             });
         }
+        if let Some(id) = self.active_coworker_id.clone() {
+            self.touch_coworker_activity(&id);
+        }
         self.is_ai_responding = true;
         self.bot_status = Some("Thinking".into());
         cx.notify();
@@ -2052,6 +2201,9 @@ impl AppState {
                 is_me: true,
             };
             conversation.messages.push(message);
+        }
+        if let Some(id) = self.active_coworker_id.clone() {
+            self.touch_coworker_activity(&id);
         }
         cx.notify();
 
