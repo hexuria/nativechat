@@ -169,6 +169,7 @@ fn main() {
                     state.update(cx, |state, cx| {
                         state.set_config(config.clone(), cx);
                         state.set_database_service(db_service.clone(), cx);
+                        state.warm_tts(cx);
                     });
 
                     let state_clone = state.clone();

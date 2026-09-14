@@ -190,6 +190,15 @@ impl TtsService {
         samples
     }
 
+    /// Load the system voice off the UI thread so the first Read aloud is instant.
+    pub fn warm_native(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bridge) = &self.native_provider {
+            bridge.speak("\u{00a0}");
+            bridge.stop();
+        }
+    }
+
     pub fn start_speaking_native(&self, text: &str, _message_id: &str) -> bool {
         #[cfg(target_os = "macos")]
         if let Some(bridge) = &self.native_provider {

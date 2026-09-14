@@ -532,6 +532,8 @@ pub struct AppState {
     // Debug mode for markdown rendering
     pub debug_markdown_disabled: bool,
     pub tts_service: Option<TtsService>,
+    tts_initing: bool,
+    pending_read_aloud: Option<(String, String, TtsSource)>,
     pub native_tts: SourceTtsState,
     pub ai_tts: SourceTtsState,
     pub opengrok: Option<OpenGrokClient>,
@@ -722,6 +724,8 @@ impl AppState {
             active_profile_id: None,
             debug_markdown_disabled: false,
             tts_service: None,
+            tts_initing: false,
+            pending_read_aloud: None,
             native_tts: SourceTtsState::default(),
             ai_tts: SourceTtsState::default(),
             opengrok: None,
@@ -2937,6 +2941,49 @@ impl AppState {
         cx.notify();
     }
 
+    pub fn warm_tts(&mut self, cx: &mut Context<Self>) {
+        self.ensure_tts_service(cx);
+    }
+
+    fn ensure_tts_service(&mut self, cx: &mut Context<Self>) {
+        if self.tts_service.is_some() || self.tts_initing {
+            return;
+        }
+        self.tts_initing = true;
+        let speaking = self.is_ai_speaking.clone();
+        let amplitude = self.ai_amplitude.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    TtsService::new(speaking, amplitude).map(|service| {
+                        service.warm_native();
+                        service
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.tts_initing = false;
+                match result {
+                    Ok(service) => {
+                        state.tts_service = Some(service);
+                        if let Some((text, message_id, source)) = state.pending_read_aloud.take() {
+                            state.read_aloud(text, message_id, source, cx);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to initialize TTS service: {error}");
+                        state.pending_read_aloud = None;
+                        state.native_tts.is_loading = false;
+                        state.ai_tts.is_loading = false;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn read_aloud(
         &mut self,
         text: String,
@@ -2945,13 +2992,22 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if self.tts_service.is_none() {
-            match TtsService::new(self.is_ai_speaking.clone(), self.ai_amplitude.clone()) {
-                Ok(service) => self.tts_service = Some(service),
-                Err(e) => {
-                    eprintln!("Failed to initialize TTS service: {}", e);
-                    return;
+            self.pending_read_aloud = Some((text.clone(), message_id.clone(), source.clone()));
+            match source {
+                TtsSource::Native => {
+                    self.native_tts.message_id = Some(message_id);
+                    self.native_tts.is_loading = true;
+                    self.native_tts.is_paused = false;
+                }
+                TtsSource::AI => {
+                    self.ai_tts.message_id = Some(message_id);
+                    self.ai_tts.is_loading = true;
+                    self.ai_tts.is_paused = false;
                 }
             }
+            self.ensure_tts_service(cx);
+            cx.notify();
+            return;
         }
 
         if let Some(service) = &self.tts_service {

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -105,13 +105,49 @@ impl AudioController {
 }
 
 pub struct AudioOutput {
-    _stream: cpal::Stream,
+    /// Keeps the cpal stream thread alive. The stream itself is !Send.
+    _hold: std::sync::mpsc::Sender<()>,
     pub controller: AudioController,
     completion_notify: Arc<Notify>,
 }
 
 impl AudioOutput {
     pub fn new(is_ai_speaking: Arc<AtomicBool>, ai_amplitude: Arc<AtomicU32>) -> Result<Self> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (hold, park) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("audio-out".into())
+            .spawn(move || {
+                let result = Self::open_stream(is_ai_speaking, ai_amplitude);
+                match result {
+                    Ok((stream, controller, completion_notify)) => {
+                        if let Err(error) = stream.play() {
+                            let _ = ready_tx.send(Err(anyhow::anyhow!(error)));
+                            return;
+                        }
+                        let _ = ready_tx.send(Ok((controller, completion_notify)));
+                        let _stream = stream;
+                        let _ = park.recv();
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
+                }
+            })
+            .context("spawn audio-out thread")?;
+        let (controller, completion_notify) =
+            ready_rx.recv().context("audio-out thread dropped")??;
+        Ok(Self {
+            _hold: hold,
+            controller,
+            completion_notify,
+        })
+    }
+
+    fn open_stream(
+        is_ai_speaking: Arc<AtomicBool>,
+        ai_amplitude: Arc<AtomicU32>,
+    ) -> Result<(cpal::Stream, AudioController, Arc<Notify>)> {
         let host = cpal::default_host();
         let device = host.default_output_device().context("No output device")?;
         let config = device.default_output_config()?;
@@ -156,7 +192,6 @@ impl AudioOutput {
 
                 is_ai_speaking_clone.store(has_samples, Ordering::Relaxed);
 
-                // Detect completion (transition from speaking to not speaking)
                 if was_speaking && !has_samples {
                     completion_notify_clone.notify_one();
                 }
@@ -183,22 +218,17 @@ impl AudioOutput {
                         }
                     }
                 }
-                // Track how many samples we actually played
                 if samples_in_this_callback > 0 {
                     samples_played.fetch_add(samples_in_this_callback as u64, Ordering::Relaxed);
                 }
 
-                // Calculate RMS for Visualizer
                 let mut sum_sq = 0.0;
                 for sample in data.iter() {
                     sum_sq += sample * sample;
                 }
                 let rms = (sum_sq / data.len() as f32).sqrt();
 
-                // Apply logarithmic scaling for more natural visualization
-                // This prevents bars from maxing out too easily
                 let compressed = if rms > 0.0 {
-                    // Log scaling: log(1 + x*k) / log(1 + k) where k controls sensitivity
                     let k = 10.0;
                     ((1.0 + rms * k).ln() / (1.0 + k).ln()).min(1.0)
                 } else {
@@ -215,13 +245,7 @@ impl AudioOutput {
             err_fn,
             None,
         )?;
-        stream.play()?;
-
-        Ok(Self {
-            _stream: stream,
-            controller,
-            completion_notify,
-        })
+        Ok((stream, controller, completion_notify))
     }
 
     pub fn process_command(&self, cmd: AudioCommand) {
