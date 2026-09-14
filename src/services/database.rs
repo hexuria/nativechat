@@ -346,6 +346,14 @@ impl DatabaseService {
         Ok(id)
     }
 
+    pub async fn delete_message(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM chat_messages WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Returns all messages for a session.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let rows = sqlx::query_as::<_, ChatMessage>(

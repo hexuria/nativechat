@@ -1,6 +1,7 @@
 use crate::actions::{
     About, ClearSearch, CloseBotFinder, CloseCommandPalette, FocusChatInput, Hide, HideOthers,
-    Minimize, NewChat, OpenCommandPalette, OpenSettings, Search, ShowAll, ToggleComputerPane,
+    Minimize, NavBack, NavForward, NewChat, OpenCommandPalette, OpenSettings, Search, ShowAll,
+    ToggleComputerPane,
     ToggleDebugMarkdown, ToggleFps, ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar,
     ToggleTheme, Zoom,
 };
@@ -192,31 +193,41 @@ impl Render for RootView {
             .child(self.layout.clone())
             .on_action({
                 let state = self.state.clone();
-                move |_: &ToggleSidebar, _window: &mut Window, cx: &mut App| {
+                let root_focus = self.focus_handle.clone();
+                move |_: &ToggleSidebar, window: &mut Window, cx: &mut App| {
+                    click_away(window, &root_focus, cx);
                     state.update(cx, |state, cx| state.toggle_sidebar(cx));
                 }
             })
             .on_action({
                 let state = self.state.clone();
-                move |_: &ToggleMiniSidebar, _window: &mut Window, cx: &mut App| {
+                let root_focus = self.focus_handle.clone();
+                move |_: &ToggleMiniSidebar, window: &mut Window, cx: &mut App| {
+                    click_away(window, &root_focus, cx);
                     state.update(cx, |state, cx| state.toggle_mini_sidebar(cx));
                 }
             })
             .on_action({
                 let state = self.state.clone();
-                move |_: &ToggleAgentSettings, _window: &mut Window, cx: &mut App| {
+                let root_focus = self.focus_handle.clone();
+                move |_: &ToggleAgentSettings, window: &mut Window, cx: &mut App| {
+                    click_away(window, &root_focus, cx);
                     state.update(cx, |state, cx| state.toggle_agent_settings(cx));
                 }
             })
             .on_action({
                 let state = self.state.clone();
-                move |_: &ToggleComputerPane, _window: &mut Window, cx: &mut App| {
+                let root_focus = self.focus_handle.clone();
+                move |_: &ToggleComputerPane, window: &mut Window, cx: &mut App| {
+                    click_away(window, &root_focus, cx);
                     state.update(cx, |state, cx| state.toggle_computer_pane(cx));
                 }
             })
             .on_action({
                 let state = self.state.clone();
-                move |_: &OpenSettings, _window: &mut Window, cx: &mut App| {
+                let root_focus = self.focus_handle.clone();
+                move |_: &OpenSettings, window: &mut Window, cx: &mut App| {
+                    click_away(window, &root_focus, cx);
                     state.update(cx, |state, cx| state.toggle_app_settings(cx));
                 }
             })
@@ -228,14 +239,28 @@ impl Render for RootView {
             })
             .on_action({
                 let state = self.state.clone();
-                let layout = self.layout.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &NavBack, window: &mut Window, cx: &mut App| {
+                    click_away(window, &root_focus, cx);
+                    state.update(cx, |state, cx| state.nav_back(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
+                let root_focus = self.focus_handle.clone();
+                move |_: &NavForward, window: &mut Window, cx: &mut App| {
+                    click_away(window, &root_focus, cx);
+                    state.update(cx, |state, cx| state.nav_forward(cx));
+                }
+            })
+            .on_action({
+                let state = self.state.clone();
                 let root_focus = self.focus_handle.clone();
                 move |_: &NewChat, window: &mut Window, cx: &mut App| {
-                    window.blur(cx);
                     let open = state.read(cx).bot_finder_open;
+                    click_away(window, &root_focus, cx);
                     if open {
                         state.update(cx, |state, cx| state.close_bot_finder(cx));
-                        focus_composer(&state, &layout, &root_focus, window, cx);
                     } else {
                         state.update(cx, |state, cx| state.open_bot_finder(cx));
                     }
@@ -243,14 +268,12 @@ impl Render for RootView {
             })
             .on_action({
                 let state = self.state.clone();
-                let layout = self.layout.clone();
                 let root_focus = self.focus_handle.clone();
                 move |_: &OpenCommandPalette, window: &mut Window, cx: &mut App| {
-                    window.blur(cx);
                     let open = state.read(cx).command_palette_open;
+                    click_away(window, &root_focus, cx);
                     if open {
                         state.update(cx, |state, cx| state.close_command_palette(cx));
-                        focus_composer(&state, &layout, &root_focus, window, cx);
                     } else {
                         state.update(cx, |state, cx| state.open_command_palette(cx));
                     }
@@ -270,31 +293,31 @@ impl Render for RootView {
             })
             .on_action({
                 let state = self.state.clone();
-                let layout = self.layout.clone();
                 let root_focus = self.focus_handle.clone();
                 move |_: &CloseBotFinder, window: &mut Window, cx: &mut App| {
                     state.update(cx, |state, cx| state.close_bot_finder(cx));
-                    focus_composer(&state, &layout, &root_focus, window, cx);
+                    click_away(window, &root_focus, cx);
                 }
             })
             .on_action({
                 let state = self.state.clone();
-                let layout = self.layout.clone();
                 let root_focus = self.focus_handle.clone();
                 move |_: &CloseCommandPalette, window: &mut Window, cx: &mut App| {
-                    state.update(cx, |state, cx| state.close_command_palette(cx));
-                    focus_composer(&state, &layout, &root_focus, window, cx);
+                    state.update(cx, |state, cx| {
+                        state.close_command_palette(cx);
+                        state.close_hidden_bots(cx);
+                    });
+                    click_away(window, &root_focus, cx);
                 }
             })
             .on_action({
-                let state = self.state.clone();
                 let layout = self.layout.clone();
                 let root_focus = self.focus_handle.clone();
                 move |_: &ClearSearch, window: &mut Window, cx: &mut App| {
                     layout.update(cx, |layout, cx| {
                         layout.clear_sidebar_search(window, cx);
                     });
-                    focus_composer(&state, &layout, &root_focus, window, cx);
+                    click_away(window, &root_focus, cx);
                 }
             })
             .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {
@@ -421,6 +444,13 @@ impl Render for RootView {
                 this.child(gpui_fps::fps_monitor(window, cx))
             })
     }
+}
+
+/// Release whatever field had the caret (same as clicking empty chrome) and
+/// park focus on Root so the next chrome shortcut still has a target.
+fn click_away(window: &mut Window, root_focus: &FocusHandle, cx: &mut App) {
+    window.blur(cx);
+    root_focus.focus(window, cx);
 }
 
 fn focus_composer(

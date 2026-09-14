@@ -1,66 +1,67 @@
-use crate::actions::{BranchInNewChat, ReportMessage, ToggleReadAloud};
 use crate::icons::NativeIcon;
+use crate::state::{AppState, ReplyTo};
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, Size,
     button::{Button, ButtonVariants},
     h_flex,
-    menu::DropdownMenu,
+    menu::{DropdownMenu, PopupMenuItem},
     tooltip::Tooltip,
 };
 use gpui_kit::{prelude::FluentBuilder, prelude::*, *};
 use std::rc::Rc;
-use std::time::Duration;
+
+pub const TOOLBAR_W: f32 = 108.0;
+
+#[derive(Clone, Copy)]
+struct BtnBounds {
+    bounds: Bounds<Pixels>,
+}
 
 #[derive(IntoElement)]
-pub struct MessageActions {
+pub struct MessageToolbar {
     message_id: String,
+    source_id: String,
     message_text: String,
-    on_copy: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    preview: String,
+    is_me: bool,
+    app: Entity<AppState>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
-    can_read_aloud: bool,
-    // Native State
-    is_native_speaking: bool,
-    is_native_paused: bool,
-    is_native_loading: bool,
-    // AI State
-    is_ai_speaking: bool,
-    is_ai_paused: bool,
-    is_ai_loading: bool,
-
-    is_cached: bool,
+    on_reply: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    on_menu_open: Option<Rc<dyn Fn(bool, &mut App)>>,
 }
 
-enum IconSource {
-    Icon(Icon),
-    Path(&'static str),
-}
-
-impl MessageActions {
-    pub fn new(message_id: impl Into<String>) -> Self {
+impl MessageToolbar {
+    pub fn new(
+        app: Entity<AppState>,
+        message_id: impl Into<String>,
+        source_id: impl Into<String>,
+    ) -> Self {
         Self {
             message_id: message_id.into(),
+            source_id: source_id.into(),
             message_text: String::new(),
-            on_copy: None,
+            preview: String::new(),
+            is_me: false,
+            app,
             on_read_aloud: None,
-            can_read_aloud: false,
-            is_native_speaking: false,
-            is_native_paused: false,
-            is_native_loading: false,
-            is_ai_speaking: false,
-            is_ai_paused: false,
-            is_ai_loading: false,
-            is_cached: false,
+            on_reply: None,
+            on_menu_open: None,
         }
     }
 
-    /// Set the message text to copy when the copy button is clicked
     pub fn message_text(mut self, text: impl Into<String>) -> Self {
         self.message_text = text.into();
         self
     }
 
-    pub fn on_copy(mut self, on_copy: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-        self.on_copy = Some(Rc::new(on_copy));
+    pub fn preview(mut self, preview: impl Into<String>) -> Self {
+        self.preview = preview.into();
+        self
+    }
+
+    pub fn is_me(mut self, is_me: bool) -> Self {
+        self.is_me = is_me;
         self
     }
 
@@ -72,303 +73,185 @@ impl MessageActions {
         self
     }
 
-    pub fn can_read_aloud(mut self, can: bool) -> Self {
-        self.can_read_aloud = can;
+    pub fn on_reply(mut self, on_reply: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_reply = Some(Rc::new(on_reply));
         self
     }
 
-    pub fn is_native_speaking(mut self, is: bool) -> Self {
-        self.is_native_speaking = is;
-        self
-    }
-    pub fn is_native_paused(mut self, is: bool) -> Self {
-        self.is_native_paused = is;
-        self
-    }
-    pub fn is_native_loading(mut self, is: bool) -> Self {
-        self.is_native_loading = is;
+    pub fn on_menu_open(mut self, on_menu_open: impl Fn(bool, &mut App) + 'static) -> Self {
+        self.on_menu_open = Some(Rc::new(on_menu_open));
         self
     }
 
-    pub fn is_ai_speaking(mut self, is: bool) -> Self {
-        self.is_ai_speaking = is;
-        self
-    }
-    pub fn is_ai_paused(mut self, is: bool) -> Self {
-        self.is_ai_paused = is;
-        self
-    }
-    pub fn is_ai_loading(mut self, is: bool) -> Self {
-        self.is_ai_loading = is;
-        self
-    }
-
-    pub fn is_cached(mut self, is_cached: bool) -> Self {
-        self.is_cached = is_cached;
-        self
-    }
-
-    fn action_button(
-        &self,
-        id: &str,
-        icon: IconSource,
-        tooltip_text: &str,
+    fn icon_btn(
+        id: SharedString,
+        icon: impl Into<Icon>,
+        tooltip: &'static str,
+        cx: &App,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &mut App,
     ) -> impl IntoElement {
-        let theme = cx.theme();
-        let secondary = theme.secondary;
-        // matching copy_button icon color logic (using secondary_foreground as default)
-        let icon_color = theme.secondary_foreground;
-
-        let icon: Icon = match icon {
-            IconSource::Icon(icon) => icon,
-            IconSource::Path(path) => Icon::default().path(path),
-        };
-
-        let id = gpui_kit::SharedString::from(id.to_string());
-        let tooltip_text = tooltip_text.to_string();
-
+        let hover = cx.theme().secondary;
+        let color = cx.theme().muted_foreground;
         div()
             .id(id)
-            .w(px(32.0))
-            .h(px(32.0))
+            .size(px(28.))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(6.0))
-            .text_color(icon_color)
-            .hover(move |style| style.bg(secondary))
+            .rounded(px(6.))
             .cursor_pointer()
-            .tooltip(move |w, cx| Tooltip::new(tooltip_text.clone()).build(w, cx))
-            .child(icon.size(px(18.0)).text_color(icon_color))
+            .text_color(color)
+            .hover(move |s| s.bg(hover))
+            .tooltip(move |w, cx| Tooltip::new(tooltip).build(w, cx))
+            .child(icon.into().size(px(16.)).text_color(color))
             .on_click(on_click)
     }
-
-    fn copy_button(
-        &self,
-        id: impl Into<ElementId>,
-        tooltip_text: &'static str,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let secondary = theme.secondary;
-        let secondary_foreground = theme.secondary_foreground;
-        let success = theme.success;
-
-        let id = id.into();
-        let state = window.use_keyed_state(id.clone(), cx, |_, _| CopyState::default());
-        let copied = state.read(cx).copied;
-
-        let icon_name = if copied {
-            IconName::Check
-        } else {
-            IconName::Copy
-        };
-        let icon_color = if copied {
-            success
-        } else {
-            secondary_foreground
-        };
-
-        let message_text = self.message_text.clone();
-        let on_copy = self.on_copy.clone();
-
-        div()
-            .id(id)
-            .w(px(32.0))
-            .h(px(32.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(6.0))
-            .text_color(icon_color)
-            .hover(move |style| style.bg(secondary))
-            .cursor_pointer()
-            .tooltip(move |w, cx| {
-                Tooltip::new(if copied { "Copied!" } else { tooltip_text }).build(w, cx)
-            })
-            .child(Icon::new(icon_name).size(px(18.0)).text_color(icon_color))
-            .when(!copied, move |this| {
-                this.on_click({
-                    let state = state.clone();
-                    let message_text = message_text.clone();
-                    let on_copy = on_copy.clone();
-                    move |_, window, cx| {
-                        cx.stop_propagation();
-                        cx.write_to_clipboard(ClipboardItem::new_string(message_text.clone()));
-
-                        state.update(cx, |state, cx| {
-                            state.copied = true;
-                            cx.notify();
-                        });
-
-                        // Reset after 2 seconds
-                        let state = state.clone();
-                        cx.spawn(async move |cx| {
-                            cx.background_executor().timer(Duration::from_secs(2)).await;
-                            _ = state.update(cx, |state, cx| {
-                                state.copied = false;
-                                cx.notify();
-                            });
-                        })
-                        .detach();
-
-                        if let Some(on_copy) = &on_copy {
-                            on_copy(window, cx);
-                        }
-                    }
-                })
-            })
-    }
 }
 
-#[derive(Default)]
-struct CopyState {
-    copied: bool,
-}
-
-impl RenderOnce for MessageActions {
+impl RenderOnce for MessageToolbar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let (native_icon, native_tooltip) = if self.is_native_speaking {
-            if self.is_native_paused {
-                (Icon::new(IconName::Play), "Resume (Native)")
-            } else {
-                (Icon::new(IconName::Pause), "Pause (Native)")
-            }
-        } else if self.is_native_loading {
-            (Icon::new(IconName::Loader), "Loading...")
-        } else {
-            (Icon::new(NativeIcon::ReadAloud), "Read aloud (Native)")
-        };
+        let hover = cx.theme().secondary;
+        let color = cx.theme().muted_foreground;
+        let message_id = self.message_id.clone();
+        let source_id = self.source_id.clone();
+        let app = self.app.clone();
+        let bounds_state = window.use_keyed_state(
+            ElementId::Name(format!("emoji-bounds-{message_id}").into()),
+            cx,
+            |_, _| BtnBounds {
+                bounds: Bounds::default(),
+            },
+        );
 
         h_flex()
-            .gap_1()
+            .id(SharedString::from(format!("toolbar-{message_id}")))
+            .gap(px(2.))
             .items_center()
-            .child(self.copy_button(
-                ElementId::Name(format!("copy-{}", self.message_id).into()),
-                "Copy",
-                window,
+            .flex_shrink_0()
+            .child({
+                let bounds_state = bounds_state.clone();
+                let app = app.clone();
+                let source_id = source_id.clone();
+                div()
+                    .id(SharedString::from(format!("emoji-{message_id}")))
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_color(color)
+                    .hover(move |s| s.bg(hover))
+                    .tooltip(move |w, cx| Tooltip::new("Add reaction").build(w, cx))
+                    .child(Icon::new(NativeIcon::Smile).size(px(16.)).text_color(color))
+                    .on_prepaint({
+                        let bounds_state = bounds_state.clone();
+                        move |bounds, _, cx| {
+                            bounds_state.update(cx, |state, _| {
+                                state.bounds = bounds;
+                            });
+                        }
+                    })
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let bounds = bounds_state.read(cx).bounds;
+                        app.update(cx, |state, cx| {
+                            state.open_emoji_picker(source_id.clone(), bounds, cx);
+                        });
+                    })
+            })
+            .child(Self::icon_btn(
+                SharedString::from(format!("reply-{message_id}")),
+                NativeIcon::Reply,
+                "Reply",
                 cx,
-            ))
-            .child(self.action_button(
-                "like",
-                IconSource::Path("icons/thumbs_up.svg"),
-                "Good response",
-                |_, _, _| {},
-                cx,
-            ))
-            .child(self.action_button(
-                "dislike",
-                IconSource::Path("icons/thumbs_down.svg"),
-                "Bad response",
-                |_, _, _| {},
-                cx,
-            ))
-            .child(self.action_button(
-                "share",
-                IconSource::Path("icons/share.svg"),
-                "Share",
-                |_, _, _| {},
-                cx,
-            ))
-            .child(self.action_button(
-                "regenerate",
-                IconSource::Path("icons/reset.svg"),
-                "Try again",
-                |_, _, _| {},
-                cx,
-            ))
-            .child(self.action_button(
-                &format!("native-tts-{}", self.message_id),
-                IconSource::Icon(native_icon),
-                native_tooltip,
                 {
-                    let on_read_aloud = self.on_read_aloud.clone();
+                    let app = app.clone();
+                    let source_id = source_id.clone();
+                    let preview = self.preview.clone();
+                    let is_me = self.is_me;
+                    let on_reply = self.on_reply.clone();
                     move |_, window, cx| {
-                        if let Some(callback) = on_read_aloud.as_ref() {
-                            callback(window, cx);
+                        cx.stop_propagation();
+                        app.update(cx, |state, cx| {
+                            state.set_reply_to(
+                                ReplyTo {
+                                    message_id: source_id.clone(),
+                                    preview: preview.clone(),
+                                    is_me,
+                                },
+                                cx,
+                            );
+                        });
+                        if let Some(cb) = on_reply.as_ref() {
+                            cb(window, cx);
                         }
                     }
                 },
-                cx,
             ))
             .child(
-                Button::new(ElementId::Name(format!("more-{}", self.message_id).into()))
+                Button::new(ElementId::Name(format!("more-{message_id}").into()))
                     .icon(IconName::Ellipsis)
                     .ghost()
-                    .with_size(Size::Medium)
+                    .with_size(Size::XSmall)
                     .compact()
-                    .rounded(px(6.0))
+                    .rounded(px(6.))
                     .tooltip("More actions")
-                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                        menu.menu_with_icon(
-                            "Branch in new chat",
-                            NativeIcon::Branch,
-                            Box::new(BranchInNewChat),
-                        )
-                        .when(self.can_read_aloud, |menu| {
-                            if self.is_ai_loading {
-                                menu.menu_with_icon(
-                                    "Loading...",
-                                    IconName::Loader,
-                                    Box::new(ToggleReadAloud {
-                                        text: self.message_text.clone(),
-                                        message_id: self.message_id.clone(),
-                                        mode: crate::actions::TtsSource::AI,
+                    .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                        let app = app.clone();
+                        let source_id = source_id.clone();
+                        let text = self.message_text.clone();
+                        let on_read_aloud = self.on_read_aloud.clone();
+                        move |menu, _, _| {
+                            menu.item(
+                                PopupMenuItem::new("Delete")
+                                    .icon(Icon::new(NativeIcon::Trash))
+                                    .on_click({
+                                        let app = app.clone();
+                                        let source_id = source_id.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            app.update(cx, |state, cx| {
+                                                state.delete_message(&source_id, cx);
+                                            });
+                                        }
                                     }),
-                                )
-                            } else if self.is_ai_speaking {
-                                if self.is_ai_paused {
-                                    menu.menu_with_icon(
-                                        "Resume (AI)",
-                                        IconName::Play,
-                                        Box::new(ToggleReadAloud {
-                                            text: self.message_text.clone(),
-                                            message_id: self.message_id.clone(),
-                                            mode: crate::actions::TtsSource::AI,
-                                        }),
-                                    )
-                                } else {
-                                    menu.menu_with_icon(
-                                        "Pause (AI)",
-                                        IconName::Pause,
-                                        Box::new(ToggleReadAloud {
-                                            text: self.message_text.clone(),
-                                            message_id: self.message_id.clone(),
-                                            mode: crate::actions::TtsSource::AI,
-                                        }),
-                                    )
-                                }
-                            } else {
-                                menu.menu_with_icon(
-                                    "Read with AI",
-                                    IconName::Bot,
-                                    Box::new(ToggleReadAloud {
-                                        text: self.message_text.clone(),
-                                        message_id: self.message_id.clone(),
-                                        mode: crate::actions::TtsSource::AI,
-                                    }),
-                                )
-                            }
-                        })
-                        .when(self.is_cached, |menu| {
-                            menu.menu_with_icon(
-                                "Regenerate Audio",
-                                IconName::Replace,
-                                Box::new(crate::actions::RegenerateAudio {
-                                    text: self.message_text.clone(),
-                                    message_id: self.message_id.clone(),
-                                }),
                             )
-                        })
-                        .separator()
-                        .menu_with_icon(
-                            "Report message",
-                            NativeIcon::Report,
-                            Box::new(ReportMessage),
-                        )
+                            .item(
+                                PopupMenuItem::new("Read aloud")
+                                    .icon(Icon::new(NativeIcon::ReadAloud))
+                                    .on_click({
+                                        let on_read_aloud = on_read_aloud.clone();
+                                        move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(cb) = on_read_aloud.as_ref() {
+                                                cb(window, cx);
+                                            }
+                                        }
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new("Copy")
+                                    .icon(Icon::new(IconName::Copy))
+                                    .on_click({
+                                        let text = text.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                text.clone(),
+                                            ));
+                                        }
+                                    }),
+                            )
+                        }
+                    })
+                    .on_open_change({
+                        let on_menu_open = self.on_menu_open.clone();
+                        move |open, _, cx| {
+                            if let Some(cb) = on_menu_open.as_ref() {
+                                cb(*open, cx);
+                            }
+                        }
                     }),
             )
     }

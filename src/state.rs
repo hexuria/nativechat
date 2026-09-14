@@ -18,7 +18,7 @@ use crate::services::database::{
 use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
 use crate::services::tts_service::TtsService;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use futures::StreamExt;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -33,42 +33,35 @@ pub struct Message {
     pub content: String,
     pub sent_at: SystemTime,
     pub is_me: bool,
+    pub reply_preview: Option<String>,
 }
 
 impl Message {
-    /// Format the message timestamp into a human-readable string
+    /// Clock time on the message row, matching Grok's `12:14 PM` column.
     pub fn formatted_time(&self) -> String {
-        let now = SystemTime::now();
-        let duration = now.duration_since(self.sent_at).unwrap_or_default();
-
-        let secs = duration.as_secs();
-
-        if secs < 60 {
-            "Just now".to_string()
-        } else if secs < 3600 {
-            let mins = secs / 60;
-            format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" })
-        } else if secs < 86400 {
-            // Today - show time only
-            let hours = secs / 3600;
-            let mins = (secs % 3600) / 60;
-            format!("{:02}:{:02}", hours, mins)
-        } else if secs < 172800 {
-            // Yesterday
-            let hours = (secs % 86400) / 3600;
-            let mins = (secs % 3600) / 60;
-            format!("Yesterday {:02}:{:02}", hours, mins)
-        } else {
-            // Older messages - show date
-            let days = secs / 86400;
-            if days < 365 {
-                format!("{} days ago", days)
-            } else {
-                let years = days / 365;
-                format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
-            }
-        }
+        let dt = DateTime::<Local>::from(self.sent_at);
+        let (pm, hour) = dt.hour12();
+        let hour = if hour == 0 { 12 } else { hour };
+        format!(
+            "{}:{:02} {}",
+            hour,
+            dt.minute(),
+            if pm { "PM" } else { "AM" }
+        )
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplyTo {
+    pub message_id: String,
+    pub preview: String,
+    pub is_me: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmojiPickerOpen {
+    pub message_id: String,
+    pub bounds: Bounds<Pixels>,
 }
 
 #[derive(Clone, Debug)]
@@ -405,6 +398,69 @@ pub enum AppSettingsTab {
     Shortcuts,
 }
 
+/// One frame of in-app navigation. GPUI has no browser history; we keep this stack
+/// so ⌘[ / ⌘] can walk agents, the right pane, and Settings the way macOS apps do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavLocation {
+    pub coworker_id: Option<String>,
+    pub right_pane: RightPane,
+    pub computer_view: ComputerView,
+    pub app_settings_open: bool,
+    pub app_settings_tab: AppSettingsTab,
+}
+
+impl NavLocation {
+    fn is_blank(&self) -> bool {
+        self.coworker_id.is_none()
+            && self.right_pane == RightPane::Closed
+            && !self.app_settings_open
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NavHistory {
+    back: Vec<NavLocation>,
+    forward: Vec<NavLocation>,
+    current: Option<NavLocation>,
+    applying: bool,
+}
+
+impl NavHistory {
+    fn record(&mut self, loc: NavLocation) {
+        if self.applying {
+            return;
+        }
+        match &self.current {
+            Some(cur) if cur == &loc => {}
+            Some(cur) if cur.is_blank() => self.current = Some(loc),
+            Some(cur) => {
+                self.back.push(cur.clone());
+                self.forward.clear();
+                self.current = Some(loc);
+            }
+            None => self.current = Some(loc),
+        }
+    }
+
+    fn go_back(&mut self) -> Option<NavLocation> {
+        let prev = self.back.pop()?;
+        if let Some(cur) = self.current.take() {
+            self.forward.push(cur);
+        }
+        self.current = Some(prev.clone());
+        Some(prev)
+    }
+
+    fn go_forward(&mut self) -> Option<NavLocation> {
+        let next = self.forward.pop()?;
+        if let Some(cur) = self.current.take() {
+            self.back.push(cur);
+        }
+        self.current = Some(next.clone());
+        Some(next)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum AuthStatus {
     #[default]
@@ -448,6 +504,7 @@ pub struct AppState {
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
+    nav: NavHistory,
     pub app_settings_tab: AppSettingsTab,
     pub submit_chord: SubmitChord,
     pub audio_input: Option<AudioInput>,
@@ -497,6 +554,10 @@ pub struct AppState {
     pub pinned_coworker_ids: HashSet<String>,
     pub hidden_coworker_ids: HashSet<String>,
     pub renaming_coworker_id: Option<String>,
+    pub hidden_bots_open: bool,
+    pub reply_to: Option<ReplyTo>,
+    pub message_reactions: HashMap<String, String>,
+    pub emoji_picker: Option<EmojiPickerOpen>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -635,6 +696,7 @@ impl AppState {
             is_app_settings_open: false,
             bot_finder_open: false,
             command_palette_open: false,
+            nav: NavHistory::default(),
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
             audio_input: None,
@@ -682,6 +744,10 @@ impl AppState {
             pinned_coworker_ids: HashSet::new(),
             hidden_coworker_ids: HashSet::new(),
             renaming_coworker_id: None,
+            hidden_bots_open: false,
+            reply_to: None,
+            message_reactions: HashMap::new(),
+            emoji_picker: None,
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -797,12 +863,22 @@ impl AppState {
                 match result {
                     Ok(list) => {
                         state.coworkers = list;
+                        state.hidden_coworker_ids = state
+                            .coworkers
+                            .iter()
+                            .filter(|c| c.hidden_from_sidebar)
+                            .map(|c| c.id.clone())
+                            .collect();
                         if state
                             .active_coworker_id
                             .as_ref()
                             .is_none_or(|id| !state.coworkers.iter().any(|c| &c.id == id))
                         {
-                            if let Some(first) = state.coworkers.first().cloned() {
+                            if let Some(first) = state
+                                .ranked_coworkers()
+                                .into_iter()
+                                .find(|c| !state.hidden_coworker_ids.contains(&c.id))
+                            {
                                 state.select_coworker(first.id, cx);
                             }
                         }
@@ -849,6 +925,7 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         self.model_picker_open = false;
         self.avatar_editor_open = false;
+        self.record_nav();
         cx.notify();
     }
 
@@ -856,6 +933,7 @@ impl AppState {
         self.ensure_active_coworker(cx);
         self.right_pane = RightPane::Settings;
         self.computer_view = ComputerView::Overview;
+        self.record_nav();
         cx.notify();
     }
 
@@ -863,6 +941,7 @@ impl AppState {
         self.ensure_active_coworker(cx);
         self.right_pane = RightPane::Computer;
         self.computer_view = ComputerView::Overview;
+        self.record_nav();
         cx.notify();
     }
 
@@ -873,6 +952,7 @@ impl AppState {
         }
         self.right_pane = RightPane::Settings;
         self.computer_view = ComputerView::Overview;
+        self.record_nav();
         cx.notify();
     }
 
@@ -885,6 +965,7 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         self.model_picker_open = false;
         self.avatar_editor_open = false;
+        self.record_nav();
         cx.notify();
     }
 
@@ -912,6 +993,7 @@ impl AppState {
         };
         self.right_pane = RightPane::Computer;
         self.computer_view = ComputerView::Editor { id: Some(id) };
+        self.record_nav();
         cx.notify();
     }
 
@@ -936,6 +1018,7 @@ impl AppState {
             }
         }
         self.computer_view = ComputerView::Overview;
+        self.record_nav();
         cx.notify();
     }
 
@@ -1064,11 +1147,95 @@ impl AppState {
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
-        if !self.model_picker_open && !self.avatar_editor_open {
+        if !self.model_picker_open && !self.avatar_editor_open && self.emoji_picker.is_none() {
             return;
         }
         self.model_picker_open = false;
         self.avatar_editor_open = false;
+        self.emoji_picker = None;
+        self.hidden_bots_open = false;
+        cx.notify();
+    }
+
+    pub fn set_reply_to(&mut self, reply: ReplyTo, cx: &mut Context<Self>) {
+        self.reply_to = Some(reply);
+        cx.notify();
+    }
+
+    pub fn clear_reply_to(&mut self, cx: &mut Context<Self>) {
+        if self.reply_to.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_reaction(&mut self, message_id: String, emoji: String, cx: &mut Context<Self>) {
+        match self.message_reactions.get(&message_id) {
+            Some(current) if current == &emoji => {
+                self.message_reactions.remove(&message_id);
+            }
+            _ => {
+                self.message_reactions.insert(message_id, emoji);
+            }
+        }
+        self.emoji_picker = None;
+        cx.notify();
+    }
+
+    pub fn open_emoji_picker(
+        &mut self,
+        message_id: String,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.emoji_picker = Some(EmojiPickerOpen { message_id, bounds });
+        cx.notify();
+    }
+
+    pub fn close_emoji_picker(&mut self, cx: &mut Context<Self>) {
+        if self.emoji_picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        if self.native_tts.message_id.as_deref() == Some(message_id)
+            || self.ai_tts.message_id.as_deref() == Some(message_id)
+        {
+            if let Some(service) = &self.tts_service {
+                let _ = service.stop();
+            }
+            self.native_tts = SourceTtsState::default();
+            self.ai_tts = SourceTtsState::default();
+        }
+        if let Some(id) = &self.active_conversation_id {
+            if let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id) {
+                conversation.messages.retain(|m| m.id != message_id);
+            }
+        }
+        self.message_reactions.remove(message_id);
+        if self
+            .reply_to
+            .as_ref()
+            .is_some_and(|r| r.message_id == message_id)
+        {
+            self.reply_to = None;
+        }
+        if self
+            .emoji_picker
+            .as_ref()
+            .is_some_and(|p| p.message_id == message_id)
+        {
+            self.emoji_picker = None;
+        }
+        if let Some(db) = self.database_service.clone() {
+            let id = message_id.to_string();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = db.delete_message(&id).await {
+                    eprintln!("Failed to delete message: {error}");
+                }
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -1404,6 +1571,66 @@ impl AppState {
             );
         }
         self.select_conversation(id, cx);
+        self.record_nav();
+    }
+
+    fn nav_location(&self) -> NavLocation {
+        NavLocation {
+            coworker_id: self.active_coworker_id.clone(),
+            right_pane: self.right_pane,
+            computer_view: self.computer_view.clone(),
+            app_settings_open: self.is_app_settings_open,
+            app_settings_tab: self.app_settings_tab,
+        }
+    }
+
+    fn record_nav(&mut self) {
+        self.nav.record(self.nav_location());
+    }
+
+    pub fn nav_back(&mut self, cx: &mut Context<Self>) {
+        if self.command_palette_open || self.bot_finder_open {
+            self.command_palette_open = false;
+            self.bot_finder_open = false;
+            cx.notify();
+            return;
+        }
+        let Some(loc) = self.nav.go_back() else {
+            return;
+        };
+        self.apply_nav(loc, cx);
+    }
+
+    pub fn nav_forward(&mut self, cx: &mut Context<Self>) {
+        if self.command_palette_open || self.bot_finder_open {
+            self.command_palette_open = false;
+            self.bot_finder_open = false;
+            cx.notify();
+            return;
+        }
+        let Some(loc) = self.nav.go_forward() else {
+            return;
+        };
+        self.apply_nav(loc, cx);
+    }
+
+    fn apply_nav(&mut self, loc: NavLocation, cx: &mut Context<Self>) {
+        self.nav.applying = true;
+        self.bot_finder_open = false;
+        self.command_palette_open = false;
+        if let Some(id) = loc.coworker_id.clone() {
+            if self.active_coworker_id.as_ref() != Some(&id) {
+                self.select_coworker(id, cx);
+            }
+        } else {
+            self.active_coworker_id = None;
+        }
+        self.right_pane = loc.right_pane;
+        self.computer_view = loc.computer_view;
+        self.is_app_settings_open = loc.app_settings_open;
+        self.app_settings_tab = loc.app_settings_tab;
+        self.nav.applying = false;
+        cx.notify();
     }
 
     pub fn touch_coworker_activity(&mut self, id: &str) {
@@ -1473,19 +1700,65 @@ impl AppState {
 
     pub fn hide_coworker(&mut self, id: String, cx: &mut Context<Self>) {
         self.hidden_coworker_ids.insert(id.clone());
+        if let Some(coworker) = self.coworkers.iter_mut().find(|c| c.id == id) {
+            coworker.hidden_from_sidebar = true;
+        }
+        self.persist_hidden(&id, true, cx);
         if self.active_coworker_id.as_ref() == Some(&id) {
             let next = self
-                .coworkers
-                .iter()
-                .map(|c| c.id.clone())
+                .ranked_coworkers()
+                .into_iter()
+                .map(|c| c.id)
                 .find(|other| other != &id && !self.hidden_coworker_ids.contains(other));
-            self.active_coworker_id = next.clone();
             if let Some(next) = next {
                 self.select_coworker(next, cx);
                 return;
             }
+            self.active_coworker_id = None;
         }
         cx.notify();
+    }
+
+    pub fn unhide_coworker(&mut self, id: String, cx: &mut Context<Self>) {
+        self.hidden_coworker_ids.remove(&id);
+        if let Some(coworker) = self.coworkers.iter_mut().find(|c| c.id == id) {
+            coworker.hidden_from_sidebar = false;
+        }
+        self.persist_hidden(&id, false, cx);
+        cx.notify();
+    }
+
+    pub fn open_hidden_bots(&mut self, cx: &mut Context<Self>) {
+        self.hidden_bots_open = true;
+        cx.notify();
+    }
+
+    pub fn close_hidden_bots(&mut self, cx: &mut Context<Self>) {
+        if self.hidden_bots_open {
+            self.hidden_bots_open = false;
+            cx.notify();
+        }
+    }
+
+    fn persist_hidden(&mut self, id: &str, hidden: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let id = id.to_string();
+        let patch = CoworkerPatch {
+            hidden_from_sidebar: Some(hidden),
+            ..Default::default()
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client.patch_coworker(&id, &patch).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    eprintln!("hide coworker: {}", error.message);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn mark_coworker_read(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1729,6 +2002,7 @@ impl AppState {
                                                 content: m.content,
                                                 sent_at,
                                                 is_me: m.role == "user",
+                                                reply_preview: None,
                                             }
                                         })
                                         .collect();
@@ -2058,11 +2332,12 @@ impl AppState {
             .find(|c| c.id == conversation_id)
         {
             conversation.messages.push(Message {
-                id: "temp-ai".to_string(),
+                id: uuid::Uuid::now_v7().to_string(),
                 sender: "AI".to_string(),
                 content: String::new(),
                 sent_at: SystemTime::now(),
                 is_me: false,
+                reply_preview: None,
             });
         }
         if let Some(id) = self.active_coworker_id.clone() {
@@ -2152,7 +2427,7 @@ impl AppState {
                     .find(|c| c.id == conversation_id)
                 {
                     if let Some(last) = conversation.messages.last_mut() {
-                        if last.id == "temp-ai" {
+                        if !last.is_me {
                             match &result {
                                 Ok(text) if !text.is_empty() => last.content = text.clone(),
                                 Ok(_) => {
@@ -2187,18 +2462,21 @@ impl AppState {
             None => return,
         };
 
+        let local_id = uuid::Uuid::now_v7().to_string();
         // Add user message to UI immediately
         if let Some(conversation) = self
             .conversations
             .iter_mut()
             .find(|c| c.id == conversation_id)
         {
+            let reply_preview = self.reply_to.take().map(|r| r.preview);
             let message = Message {
-                id: "temp".to_string(), // Temporary ID
+                id: local_id.clone(),
                 sender: "Me".to_string(),
                 content: content.clone(),
                 sent_at: SystemTime::now(),
                 is_me: true,
+                reply_preview,
             };
             conversation.messages.push(message);
         }
@@ -2211,6 +2489,7 @@ impl AppState {
         if let Some(db) = self.database_service.clone() {
             let content_clone = content.clone();
             let conversation_id_clone = conversation_id.clone();
+            let local_id = local_id.clone();
             cx.spawn(async move |this, cx| {
                     match db
                         .save_message(&conversation_id_clone, "user", &content_clone, None, None)
@@ -2223,10 +2502,9 @@ impl AppState {
                                     .iter_mut()
                                     .find(|c| c.id == conversation_id_clone)
                                 {
-                                    if let Some(msg) = conversation.messages.last_mut() {
-                                        if msg.id == "temp" {
-                                            msg.id = id;
-                                        }
+                                    if let Some(msg) = conversation.messages.iter_mut().rev().find(|m| m.id == local_id)
+                                    {
+                                        msg.id = id;
                                     }
                                 }
                             })
@@ -2303,11 +2581,12 @@ impl AppState {
                         .find(|c| c.id == conversation_id)
                     {
                         let ai_message = Message {
-                            id: "temp".to_string(), // Temporary ID
+                            id: uuid::Uuid::now_v7().to_string(),
                             sender: "AI".to_string(),
                             content: String::new(), // Start empty
                             sent_at: SystemTime::now(),
                             is_me: false,
+                            reply_preview: None,
                         };
                         conversation.messages.push(ai_message);
                     }
@@ -2523,12 +2802,14 @@ impl AppState {
         if self.is_app_settings_open {
             self.dismiss_popovers(cx);
         }
+        self.record_nav();
         cx.notify();
     }
 
     pub fn set_app_settings_tab(&mut self, tab: AppSettingsTab, cx: &mut Context<Self>) {
         if self.app_settings_tab != tab {
             self.app_settings_tab = tab;
+            self.record_nav();
             cx.notify();
         }
     }
@@ -2559,6 +2840,7 @@ impl AppState {
             self.is_app_settings_open = true;
             self.dismiss_popovers(cx);
         }
+        self.record_nav();
         cx.notify();
     }
 

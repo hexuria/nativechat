@@ -13,6 +13,9 @@ pub const AVATAR_PX: f32 = 36.0;
 pub const AVATAR_TRIGGER_PX: f32 = 64.0;
 pub const MASCOT_BOX_PX: f32 = 46.0;
 pub const AUTO_COLLAPSE_WIDTH: f32 = 900.0;
+/// Below this chat-column width, timestamps (hover and peek) are hidden —
+/// Grok keeps an 82px rail, but a squeezed bubble makes the time useless.
+pub const CHAT_TIMESTAMP_MIN_WIDTH: f32 = 480.0;
 pub const RAIL_HOVER: u32 = 0x777777;
 pub const RAIL_HOVER_ALPHA: f32 = 0.32;
 
@@ -125,6 +128,29 @@ pub fn sidebar_width(hidden: bool, collapsed: bool, expanded: f32) -> f32 {
     } else {
         expanded.clamp(SIDEBAR_MIN_EXPANDED, SIDEBAR_MAX_EXPANDED)
     }
+}
+
+pub fn chrome_floats(window_width: f32) -> bool {
+    is_narrow_viewport(window_width)
+}
+
+pub fn chat_column_width(
+    window_width: f32,
+    hidden: bool,
+    collapsed: bool,
+    expanded: f32,
+    right_pane_open: bool,
+) -> f32 {
+    if chrome_floats(window_width) {
+        return window_width.max(0.0);
+    }
+    let left = sidebar_width(hidden, collapsed, expanded);
+    let right = if right_pane_open { INFO_PANE_WIDTH } else { 0.0 };
+    (window_width - left - right).max(0.0)
+}
+
+pub fn timestamps_fit(chat_width: f32) -> bool {
+    chat_width >= CHAT_TIMESTAMP_MIN_WIDTH
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -1,5 +1,6 @@
 use crate::actions::{
-    CloseCommandPalette, PaletteNextTab, PalettePrevTab, PickFinderItem,
+    CloseCommandPalette, PaletteNextTab, PalettePrevTab, PaletteSelectNext, PaletteSelectPrev,
+    PickFinderItem,
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
@@ -107,6 +108,7 @@ enum PaletteItem {
     Action {
         title: String,
         hint: String,
+        icon: &'static str,
         action: PaletteAction,
         checked: bool,
     },
@@ -126,6 +128,7 @@ pub struct CommandPalette {
     state: Entity<AppState>,
     query: Entity<InputState>,
     tab: PaletteTab,
+    selected: usize,
     was_open: bool,
     pending_focus: bool,
 }
@@ -138,16 +141,21 @@ impl CommandPalette {
             if open && !this.was_open {
                 this.pending_focus = true;
                 this.tab = PaletteTab::All;
+                this.selected = 0;
             }
             this.was_open = open;
             cx.notify();
         })
         .detach();
         cx.subscribe(&query, |this, input, event: &InputEvent, cx| match event {
-            InputEvent::Change => cx.notify(),
+            InputEvent::Change => {
+                this.selected = 0;
+                cx.notify();
+            }
             InputEvent::PressEnter { shift, secondary } if !shift && !secondary => {
                 let query = input.read(cx).value().to_string();
-                this.activate_nth(0, &query, cx);
+                let index = this.selected;
+                this.activate_nth(index, &query, cx);
             }
             _ => {}
         })
@@ -156,6 +164,7 @@ impl CommandPalette {
             state,
             query,
             tab: PaletteTab::All,
+            selected: 0,
             was_open: false,
             pending_focus: false,
         }
@@ -167,6 +176,20 @@ impl CommandPalette {
         } else {
             self.tab.prev()
         };
+        self.selected = 0;
+        cx.notify();
+    }
+
+    fn move_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let query = self.query.read(cx).value().to_string();
+        let n = self.items(&query, cx).len();
+        if n == 0 {
+            self.selected = 0;
+            cx.notify();
+            return;
+        }
+        let next = (self.selected as i32 + delta).rem_euclid(n as i32) as usize;
+        self.selected = next;
         cx.notify();
     }
 
@@ -279,12 +302,14 @@ fn action_catalog(state: &AppState) -> Vec<PaletteItem> {
         action_item(
             "Agent settings",
             "Current chat",
+            "icons/wrench.svg",
             PaletteAction::ShowAgentSettings,
             false,
         ),
         action_item(
             "Agent screen",
             "Current chat",
+            "icons/monitor.svg",
             PaletteAction::ShowComputer,
             false,
         ),
@@ -295,6 +320,7 @@ fn action_catalog(state: &AppState) -> Vec<PaletteItem> {
                 "Hide sidebar"
             },
             "View",
+            "icons/panel-left.svg",
             PaletteAction::ToggleSidebar,
             false,
         ),
@@ -305,48 +331,56 @@ fn action_catalog(state: &AppState) -> Vec<PaletteItem> {
                 "Mini sidebar"
             },
             "View",
+            "icons/panel.svg",
             PaletteAction::ToggleMiniSidebar,
             false,
         ),
         action_item(
             "Settings: General",
             "Settings",
+            "icons/wrench.svg",
             PaletteAction::OpenSettings(AppSettingsTab::General),
             false,
         ),
         action_item(
             "Settings: Profile",
             "Settings",
+            "icons/account_settings.svg",
             PaletteAction::OpenSettings(AppSettingsTab::Profile),
             false,
         ),
         action_item(
             "Settings: Appearance",
             "Settings",
+            "icons/sun.svg",
             PaletteAction::OpenSettings(AppSettingsTab::Appearance),
             false,
         ),
         action_item(
             "Settings: Keyboard shortcuts",
             "Settings",
+            "icons/session.svg",
             PaletteAction::OpenSettings(AppSettingsTab::Shortcuts),
             false,
         ),
         action_item(
             "Theme: Light",
             "Settings · Appearance",
+            "icons/sun.svg",
             PaletteAction::SetTheme("light"),
             theme == "light",
         ),
         action_item(
             "Theme: Dark",
             "Settings · Appearance",
+            "icons/moon.svg",
             PaletteAction::SetTheme("dark"),
             theme == "dark",
         ),
         action_item(
             "Theme: System",
             "Settings · Appearance",
+            "icons/system_theme.svg",
             PaletteAction::SetTheme("system"),
             theme == "system",
         ),
@@ -356,12 +390,14 @@ fn action_catalog(state: &AppState) -> Vec<PaletteItem> {
 fn action_item(
     title: &str,
     hint: &str,
+    icon: &'static str,
     action: PaletteAction,
     checked: bool,
 ) -> PaletteItem {
     PaletteItem::Action {
         title: title.into(),
         hint: hint.into(),
+        icon,
         action,
         checked,
     }
@@ -396,9 +432,15 @@ impl Render for CommandPalette {
             rgb(0xffffff)
         };
         let hover: Hsla = rgb(0x777777).opacity(0.16).into();
-        let selected: Hsla = rgb(0x777777).opacity(0.22).into();
+        let selected_fill: Hsla = rgb(0x777777).opacity(0.22).into();
         let query = self.query.read(cx).value().to_string();
         let items = self.items(&query, cx);
+        if items.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= items.len() {
+            self.selected = items.len() - 1;
+        }
+        let selected = self.selected;
         let tab = self.tab;
         let view = cx.entity();
 
@@ -425,6 +467,18 @@ impl Render for CommandPalette {
                 let view = view.clone();
                 move |_: &PalettePrevTab, _, cx| {
                     view.update(cx, |this, cx| this.cycle_tab(false, cx));
+                }
+            })
+            .on_action({
+                let view = view.clone();
+                move |_: &PaletteSelectNext, _, cx| {
+                    view.update(cx, |this, cx| this.move_selection(1, cx));
+                }
+            })
+            .on_action({
+                let view = view.clone();
+                move |_: &PaletteSelectPrev, _, cx| {
+                    view.update(cx, |this, cx| this.move_selection(-1, cx));
                 }
             })
             .on_action({
@@ -484,7 +538,7 @@ impl Render for CommandPalette {
                                     .text_sm()
                                     .cursor_pointer()
                                     .when(active, |this| {
-                                        this.bg(selected).text_color(fg).font_weight(
+                                        this.bg(selected_fill).text_color(fg).font_weight(
                                             FontWeight::MEDIUM,
                                         )
                                     })
@@ -517,10 +571,12 @@ impl Render for CommandPalette {
                                     palette_row(
                                         i,
                                         item,
+                                        i == selected,
                                         dark,
                                         fg,
                                         muted,
                                         hover,
+                                        selected_fill,
                                         view.clone(),
                                         query.clone(),
                                     )
@@ -563,132 +619,151 @@ fn empty_state(tab: PaletteTab, muted: Hsla) -> AnyElement {
 fn palette_row(
     index: usize,
     item: PaletteItem,
+    highlighted: bool,
     dark: bool,
     fg: Hsla,
     muted: Hsla,
     hover: Hsla,
+    selected_fill: Hsla,
     view: Entity<CommandPalette>,
     query: String,
 ) -> AnyElement {
     let shortcut = (index < 9).then(|| index + 1);
-    match item {
+    let (leading, title, subtitle, kind) = match item {
         PaletteItem::Action {
             title,
             hint,
+            icon,
             checked,
             ..
-        } => h_flex()
-            .id(SharedString::from(format!("palette-item-{index}")))
-            .w_full()
-            .h(px(40.))
-            .px(px(14.))
-            .gap(px(12.))
-            .items_center()
-            .cursor_pointer()
-            .hover(|s| s.bg(hover))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                view.update(cx, |this, cx| this.activate_nth(index, &query, cx));
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .text_sm()
-                    .text_color(fg)
-                    .truncate()
-                    .child(title),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(hint),
-            )
-            .when_some(shortcut, |this, n| {
-                this.child(
-                    h_flex()
-                        .gap(px(3.))
-                        .flex_shrink_0()
-                        .child(keycap("⌘", muted))
-                        .child(keycap(&format!("{n}"), muted)),
-                )
-            })
-            .when(checked, |this| {
-                this.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_sm()
-                        .text_color(muted)
-                        .child("✓"),
-                )
-            })
-            .into_any_element(),
+        } => (
+            action_icon(icon, muted),
+            title,
+            hint,
+            RowKind::Action { checked },
+        ),
         PaletteItem::Bot {
             id,
             name,
             detail,
             shape,
             color,
-        }
-        | PaletteItem::Message {
-            coworker_id: id,
+        } => (
+            PersonaMark::new(id)
+                .shape(shape)
+                .color(color)
+                .size(px(32.))
+                .dark(dark)
+                .into_any_element(),
             name,
-            snippet: detail,
+            detail,
+            RowKind::Bot,
+        ),
+        PaletteItem::Message {
+            coworker_id,
+            name,
+            snippet,
             shape,
             color,
-        } => h_flex()
-            .id(SharedString::from(format!("palette-item-{index}")))
-            .w_full()
-            .px(px(12.))
-            .py(px(8.))
-            .gap(px(10.))
-            .items_center()
-            .cursor_pointer()
-            .hover(|s| s.bg(hover))
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                view.update(cx, |this, cx| this.activate_nth(index, &query, cx));
-            })
-            .child(
-                PersonaMark::new(id)
-                    .shape(shape)
-                    .color(color)
-                    .size(px(28.))
-                    .dark(dark),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(fg)
-                            .truncate()
-                            .child(name),
-                    )
-                    .when(!detail.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .truncate()
-                                .child(detail),
-                        )
-                    }),
-            )
-            .when_some(shortcut, |this, n| {
-                this.child(
-                    h_flex()
-                        .gap(px(3.))
-                        .flex_shrink_0()
-                        .child(keycap("⌘", muted))
-                        .child(keycap(&format!("{n}"), muted)),
+        } => (
+            PersonaMark::new(coworker_id)
+                .shape(shape)
+                .color(color)
+                .size(px(32.))
+                .dark(dark)
+                .into_any_element(),
+            name,
+            snippet,
+            RowKind::Bot,
+        ),
+    };
+    h_flex()
+        .id(SharedString::from(format!("palette-item-{index}")))
+        .w_full()
+        .h(px(56.))
+        .px(px(12.))
+        .gap(px(12.))
+        .items_center()
+        .flex_shrink_0()
+        .cursor_pointer()
+        .when(highlighted, |this| this.bg(selected_fill))
+        .hover(|s| s.bg(hover))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            view.update(cx, |this, cx| this.activate_nth(index, &query, cx));
+        })
+        .child(leading)
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(fg)
+                        .truncate()
+                        .child(title),
                 )
-            })
-            .into_any_element(),
-    }
+                .when(!subtitle.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(subtitle),
+                    )
+                }),
+        )
+        .when(matches!(kind, RowKind::Action { .. }), |this| {
+            this.child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Action"),
+            )
+        })
+        .when_some(shortcut, |this, n| {
+            this.child(
+                h_flex()
+                    .gap(px(3.))
+                    .flex_shrink_0()
+                    .child(keycap("⌘", muted))
+                    .child(keycap(&format!("{n}"), muted)),
+            )
+        })
+        .when(matches!(kind, RowKind::Action { checked: true }), |this| {
+            this.child(
+                Icon::default()
+                    .path("icons/check.svg")
+                    .size(px(14.))
+                    .text_color(muted),
+            )
+        })
+        .into_any_element()
+}
+
+enum RowKind {
+    Bot,
+    Action { checked: bool },
+}
+
+fn action_icon(path: &'static str, muted: Hsla) -> AnyElement {
+    div()
+        .size(px(32.))
+        .rounded(px(8.))
+        .bg(rgb(0x777777).opacity(0.14))
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .child(
+            Icon::default()
+                .path(path)
+                .size(px(16.))
+                .text_color(muted),
+        )
+        .into_any_element()
 }
 
 fn keycap(label: &str, muted: Hsla) -> impl IntoElement {

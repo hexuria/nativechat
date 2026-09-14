@@ -17,7 +17,11 @@ pub struct LoginView {
 impl LoginView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let email = cx.new(|cx| InputState::new(window, cx).placeholder("Email"));
-        let password = cx.new(|cx| InputState::new(window, cx).placeholder("Password"));
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password")
+                .masked(true)
+        });
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         let this = Self {
             state,

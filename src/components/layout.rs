@@ -2,6 +2,7 @@ use crate::components::agent_settings::AgentSettings;
 use crate::components::app_settings::AppSettings;
 use crate::components::bot_finder::BotFinder;
 use crate::components::command_palette::CommandPalette;
+use crate::components::hidden_bots::hidden_bots_overlay;
 use crate::components::computer::ComputerPane;
 use crate::state::RightPane;
 use crate::components::chat::ChatView;
@@ -13,7 +14,7 @@ use gpui_kit::*;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme, Disableable, v_flex};
 
-use crate::chrome::{sidebar_width, INFO_PANE_WIDTH};
+use crate::chrome::{chrome_floats, sidebar_width, INFO_PANE_WIDTH};
 use crate::state::AppState;
 
 fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
@@ -37,6 +38,7 @@ struct ShellRev {
     app_settings: bool,
     bot_finder: bool,
     command_palette: bool,
+    hidden_bots: bool,
     has_agent: bool,
     hiring: bool,
 }
@@ -63,6 +65,7 @@ impl ShellRev {
             app_settings: state.is_app_settings_open,
             bot_finder: state.bot_finder_open,
             command_palette: state.command_palette_open,
+            hidden_bots: state.hidden_bots_open,
             has_agent: state.active_coworker_id.is_some(),
             hiring: state.hiring,
         }
@@ -170,6 +173,7 @@ impl Render for Layout {
         let app_settings_open = state.is_app_settings_open;
         let bot_finder_open = state.bot_finder_open;
         let command_palette_open = state.command_palette_open;
+        let hidden_bots_open = state.hidden_bots_open;
         if !state.is_signed_in() {
             return div()
                 .size_full()
@@ -184,6 +188,9 @@ impl Render for Layout {
                             .occlude()
                             .child(self.app_settings.clone()),
                     )
+                })
+                .when(command_palette_open, |this| {
+                    this.child(self.command_palette.clone())
                 });
         }
         let has_agent = state.active_coworker_id.is_some();
@@ -200,7 +207,16 @@ impl Render for Layout {
             empty_agent_pane(self.state.clone(), hire_error, hiring, &theme)
         };
         let left = sidebar_width(hidden, collapsed, expanded_width);
-        let dragging = self.resize_drag.is_some();
+        let floats = chrome_floats(f32::from(window_width));
+        let right_open = right_pane != RightPane::Closed;
+        let dragging = self.resize_drag.is_some() && !floats;
+        let show_scrim = floats && (right_open || (left > 0.0 && !collapsed));
+        let sidebar_view = self.sidebar.clone();
+        let right_child = match right_pane {
+            RightPane::Settings => self.agent_settings.clone().into_any_element(),
+            RightPane::Computer => self.computer.clone().into_any_element(),
+            RightPane::Closed => div().into_any_element(),
+        };
 
         div()
             .size_full()
@@ -225,7 +241,7 @@ impl Render for Layout {
                         }),
                     )
             })
-            .when(left > 0.0, |this| {
+            .when(!floats && left > 0.0, |this| {
                 this.child(
                     div()
                         .id("sidebar-slot")
@@ -233,7 +249,7 @@ impl Render for Layout {
                         .flex_shrink_0()
                         .h_full()
                         .relative()
-                        .child(cached_fill(self.sidebar.clone()))
+                        .child(cached_fill(sidebar_view.clone()))
                         .child(
                             div()
                                 .id("sidebar-resize")
@@ -256,6 +272,7 @@ impl Render for Layout {
             })
             .child(
                 div()
+                    .id("chat-slot")
                     .flex_1()
                     .h_full()
                     .min_w_0()
@@ -266,7 +283,7 @@ impl Render for Layout {
                         this.child(self.bot_finder.clone())
                     }),
             )
-            .when(right_pane != RightPane::Closed, |this| {
+            .when(!floats && right_open, |this| {
                 this.child(
                     div()
                         .id("right-pane-slot")
@@ -274,8 +291,59 @@ impl Render for Layout {
                         .flex_shrink_0()
                         .h_full()
                         .overflow_hidden()
+                        .child(right_child),
+                )
+            })
+            .when(show_scrim, |this| {
+                this.child(
+                    div()
+                        .id("chrome-scrim")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(gpui::black().opacity(0.28))
+                        .on_mouse_down(MouseButton::Left, {
+                            let state = self.state.clone();
+                            move |_, _, cx| {
+                                state.update(cx, |state, cx| {
+                                    if state.right_pane != RightPane::Closed {
+                                        state.close_right_pane(cx);
+                                    } else {
+                                        state.set_sidebar_collapsed(true, false, cx);
+                                    }
+                                });
+                            }
+                        }),
+                )
+            })
+            .when(floats && left > 0.0, |this| {
+                this.child(
+                    div()
+                        .id("sidebar-slot")
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(left))
+                        .occlude()
+                        .child(cached_fill(sidebar_view)),
+                )
+            })
+            .when(floats && right_open, |this| {
+                this.child(
+                    div()
+                        .id("right-pane-slot")
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(INFO_PANE_WIDTH))
+                        .occlude()
+                        .overflow_hidden()
                         .child(match right_pane {
-                            RightPane::Settings => self.agent_settings.clone().into_any_element(),
+                            RightPane::Settings => {
+                                self.agent_settings.clone().into_any_element()
+                            }
                             RightPane::Computer => self.computer.clone().into_any_element(),
                             RightPane::Closed => div().into_any_element(),
                         }),
@@ -298,6 +366,9 @@ impl Render for Layout {
             })
             .when(command_palette_open, |this| {
                 this.child(self.command_palette.clone())
+            })
+            .when(hidden_bots_open, |this| {
+                this.child(hidden_bots_overlay(self.state.clone(), cx))
             })
     }
 }

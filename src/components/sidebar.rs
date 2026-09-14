@@ -114,6 +114,7 @@ pub struct SidebarView {
     rail_hover: Option<RailHover>,
     hover_close: Option<Task<()>>,
     hover_epoch: usize,
+    hidden_row_hover: bool,
 }
 
 impl SidebarView {
@@ -154,6 +155,7 @@ impl SidebarView {
             rail_hover: None,
             hover_close: None,
             hover_epoch: 0,
+            hidden_row_hover: false,
         }
     }
 
@@ -235,6 +237,7 @@ impl Render for SidebarView {
         let coworkers = state.ranked_coworkers();
         let conversations = state.conversations.clone();
         let active_coworker = state.active_coworker_id.clone();
+        let hidden_ids = state.hidden_coworker_ids.clone();
         let any_modal_open = state.is_voice_mode_open
             || state.is_app_settings_open
             || state.is_profile_settings_open;
@@ -473,7 +476,16 @@ impl Render for SidebarView {
                                             })
                                             .child(row)
                                             .into_any_element()
-                                    })}),
+                                    })})
+                                    .when(!collapsed && !hidden_ids.is_empty(), |this| {
+                                        this.child(self.hidden_bots_row(
+                                            hidden_ids.len(),
+                                            muted,
+                                            fg,
+                                            rail_hover,
+                                            view.clone(),
+                                        ))
+                                    }),
                             ),
                     ),
             )
@@ -627,6 +639,67 @@ impl SidebarView {
                         .child(Icon::new(IconName::Plus).size(px(16.))),
                 )
             })
+    }
+
+    fn hidden_bots_row(
+        &self,
+        count: usize,
+        muted: Hsla,
+        fg: Hsla,
+        hover: Hsla,
+        view: Entity<Self>,
+    ) -> impl IntoElement {
+        let show_chevron = self.hidden_row_hover;
+        row()
+            .id("hidden-bots-row")
+            .w_full()
+            .px(px(9.))
+            .rounded(px(10.))
+            .cursor_pointer()
+            .hover(|s| s.bg(hover))
+            .on_hover({
+                let view = view.clone();
+                move |hovered, _, cx| {
+                    view.update(cx, |this, cx| {
+                        if this.hidden_row_hover != *hovered {
+                            this.hidden_row_hover = *hovered;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let view = view.clone();
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.state.update(cx, |state, cx| state.open_hidden_bots(cx));
+                    });
+                }
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Hidden Bots"),
+                    )
+                    .child(if show_chevron {
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(14.))
+                            .text_color(fg)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(count.to_string())
+                            .into_any_element()
+                    }),
+            )
     }
 
     fn search_row(

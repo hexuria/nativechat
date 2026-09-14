@@ -12,7 +12,7 @@ use crate::actions::{
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
-use crate::state::{AppState, SubmitChord};
+use crate::state::{AppState, ReplyTo, SubmitChord};
 use gpui_kit::InteractiveElement;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -46,13 +46,15 @@ pub struct MessageInput {
     is_app_settings_open: bool,
     is_profile_settings_open: bool,
     submit_chord: SubmitChord,
+    reply_to: Option<ReplyTo>,
+    coworker_name: String,
 }
 
 impl MessageInput {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input_state = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Type a message...")
+                .placeholder(format!("Message {}", composer_bot_name(&state.read(cx))))
                 .auto_grow(1, 20)
                 .submit_on_enter(true)
         });
@@ -64,6 +66,8 @@ impl MessageInput {
         let is_app_settings_open = app_state.is_app_settings_open;
         let is_profile_settings_open = app_state.is_profile_settings_open;
         let submit_chord = app_state.submit_chord;
+        let reply_to = app_state.reply_to.clone();
+        let coworker_name = composer_bot_name(&app_state);
 
         let this = Self {
             state: state.clone(),
@@ -73,6 +77,8 @@ impl MessageInput {
             is_app_settings_open,
             is_profile_settings_open,
             submit_chord,
+            reply_to,
+            coworker_name: coworker_name.clone(),
             on_submit: None,
             voice_mode: false,
             voice_wave: None,
@@ -88,8 +94,14 @@ impl MessageInput {
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_app_settings_open, changed);
                 sync_field_copy!(this, state, is_profile_settings_open, changed);
+                sync_field_clone!(this, state, reply_to, changed);
                 if this.submit_chord != state.submit_chord {
                     this.submit_chord = state.submit_chord;
+                    changed = true;
+                }
+                let name = composer_bot_name(&state);
+                if this.coworker_name != name {
+                    this.coworker_name = name;
                     changed = true;
                 }
             }
@@ -105,14 +117,18 @@ impl MessageInput {
         .detach();
 
         cx.subscribe_in(&input_state, window, |this, _state, event, window, cx| {
-            if let InputEvent::PressEnter { secondary, shift } = event {
-                let send = match this.submit_chord {
-                    SubmitChord::Enter => !shift && !secondary,
-                    SubmitChord::CommandEnter => *secondary,
-                };
-                if send {
-                    this.trigger_submit(window, cx);
+            match event {
+                InputEvent::PressEnter { secondary, shift } => {
+                    let send = match this.submit_chord {
+                        SubmitChord::Enter => !shift && !secondary,
+                        SubmitChord::CommandEnter => *secondary,
+                    };
+                    if send {
+                        this.trigger_submit(window, cx);
+                    }
                 }
+                InputEvent::Change => cx.notify(),
+                _ => {}
             }
         })
         .detach();
@@ -194,10 +210,12 @@ impl MessageInput {
 }
 
 impl Render for MessageInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state_model = self.state.clone();
-        
-
+        let placeholder = format!("Message {}", self.coworker_name);
+        self.input_state.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx);
+        });
 
         let theme = cx.theme();
         let secondary = theme.secondary;
@@ -211,6 +229,10 @@ impl Render for MessageInput {
         let any_modal_open = self.is_voice_mode_open
             || self.is_app_settings_open
             || self.is_profile_settings_open;
+        let draft = self.input_state.read(cx).value();
+        let compact = !self.voice_mode
+            && self.selected_apps.is_empty()
+            && !draft.contains('\n');
 
         // ChatGPT-style: centered container with max-width
         h_flex().w_full().justify_center().child(
@@ -220,33 +242,91 @@ impl Render for MessageInput {
                 .max_w(px(800.0)) // Max width like Cha2tGPT
                 .w_full()
                 .gap_2()
-                .px_4()
-                .py_3()
+                .when(compact, |this| this.px_3().py(px(6.)))
+                .when(!compact, |this| this.px_4().py_3())
                 .bg(theme.background) // Match chat background (white in light mode)
                 .border_1()
                 .border_color(border)
                 .rounded(px(26.0)) // Rounded pill shape
                 .shadow_sm()
-                .child(
-                    // Top: Input field (grows to fill space)
-                    div().flex_grow(1.).child(if self.voice_mode {
-                        if let Some(voice_wave) = &self.voice_wave {
-                            voice_wave.clone().into_any_element()
+                .when_some(self.reply_to.clone(), |this, reply| {
+                    let preview = reply.preview.clone();
+                    this.child(
+                        h_flex()
+                            .id("reply-bar")
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_1()
+                            .pb_1()
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                            .text_color(theme.muted_foreground)
+                                            .child("Replying"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .truncate()
+                                            .child(preview),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("reply-dismiss")
+                                    .size(px(22.))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(secondary))
+                                    .child(
+                                        Icon::new(IconName::Close)
+                                            .size(px(12.))
+                                            .text_color(secondary_foreground),
+                                    )
+                                    .on_click({
+                                        let state_model = state_model.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            state_model.update(cx, |state, cx| {
+                                                state.clear_reply_to(cx);
+                                            });
+                                        }
+                                    }),
+                            ),
+                    )
+                })
+                .when(!compact, |this| {
+                    this.child(
+                        // Top: Input field (grows to fill space)
+                        div().flex_grow(1.).child(if self.voice_mode {
+                            if let Some(voice_wave) = &self.voice_wave {
+                                voice_wave.clone().into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }
                         } else {
-                            div().into_any_element()
-                        }
-                    } else {
-                        Textarea::new(&self.input_state)
-                            .appearance(false)
-                            .into_any_element()
-                    }),
-                )
+                            Textarea::new(&self.input_state)
+                                .appearance(false)
+                                .into_any_element()
+                        }),
+                    )
+                })
                 .child(
-                    // Bottom: Toolbar
+                    // Bottom: Toolbar (and the field, when the composer is one line)
                     h_flex()
-                        .justify_between()
-                        .items_start() // Align items to the top
-                        .gap_2()
+                        .when(compact, |this| this.items_center().gap_1())
+                        .when(!compact, |this| this.justify_between().items_start().gap_2())
                         .child(
                              // App Picker Popover (Moved out of wrapping container)
                             Button::new("add-app")
@@ -341,7 +421,8 @@ impl Render for MessageInput {
                                     }
                                 })
                         )
-                        .child(
+                        .when(!compact, |this| {
+                        this.child(
                             // Bottom Row
                             div()
                                 .flex()
@@ -508,6 +589,21 @@ impl Render for MessageInput {
                                     })
                                 )
                                 )
+                        })
+                        .when(compact, |this| {
+                            this.child(
+                                div()
+                                    .id("composer-field")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .w_full()
+                                    .child(
+                                        Textarea::new(&self.input_state)
+                                            .appearance(false)
+                                            .w_full(),
+                                    ),
+                            )
+                        })
                         .child(
                             // Right: Action Icons
                             h_flex()
@@ -770,4 +866,14 @@ fn tool_icon(name: &str) -> Icon {
         "Spotify" => Icon::new(NativeIcon::Spotify),
         _ => Icon::new(NativeIcon::Clip),
     }
+}
+
+fn composer_bot_name(state: &AppState) -> String {
+    state
+        .active_coworker_id
+        .as_ref()
+        .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
+        .map(|c| c.name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "bot".into())
 }

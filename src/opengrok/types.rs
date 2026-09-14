@@ -72,6 +72,8 @@ pub struct Coworker {
     /// Hire/rename time from the server. Idle bots (no messages) sort by this.
     #[serde(default, alias = "updated_at_ms", alias = "updatedAt")]
     pub updated_at_ms: i64,
+    #[serde(default, alias = "hiddenFromSidebar")]
+    pub hidden_from_sidebar: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -91,6 +93,8 @@ pub struct CoworkerPatch {
     pub avatar_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notify_on_updates: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_from_sidebar: Option<bool>,
 }
 
 impl CoworkerPatch {
@@ -102,6 +106,7 @@ impl CoworkerPatch {
             && self.avatar_shape.is_none()
             && self.avatar_color.is_none()
             && self.notify_on_updates.is_none()
+            && self.hidden_from_sidebar.is_none()
     }
 }
 

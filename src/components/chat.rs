@@ -3,10 +3,12 @@ use std::time::Duration;
 
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
 use crate::components::chat_input::MessageInput;
-use crate::components::message::MessageBubble;
+use crate::components::emoji_picker::{full_picker, reaction_strip};
+use crate::chrome::{chat_column_width, timestamps_fit};
+use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::services::tts_service::TtsService;
 use crate::components::persona::PersonaMark;
-use crate::state::AppState;
+use crate::state::{AppState, EmojiPickerOpen};
 use crate::tts_text::{
     CHAT_ROW_CHUNK_BYTES, chunk_text, highlight_in_chunk, looks_like_markdown,
     map_utf16_range_to_utf8,
@@ -14,9 +16,13 @@ use crate::tts_text::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use gpui_kit::FontWeight;
+use gpui_kit::base::{Align, Placement, Positioner};
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IndexPath, h_flex, v_flex};
+use std::rc::Rc;
 
 /// Cheap fingerprint so ChatView does not rebuild markdown on unrelated AppState
 /// changes (sidebar toggle, theme, amplitude, etc.).
@@ -37,6 +43,9 @@ struct ChatFeedRev {
     ai_paused: bool,
     ai_loading: bool,
     highlight: Option<(usize, usize)>,
+    reactions: Vec<(String, String)>,
+    reply_to: Option<String>,
+    emoji_for: Option<String>,
 }
 
 impl ChatFeedRev {
@@ -67,6 +76,17 @@ impl ChatFeedRev {
             ai_paused: state.ai_tts.is_paused,
             ai_loading: state.ai_tts.is_loading,
             highlight,
+            reactions: {
+                let mut pairs: Vec<(String, String)> = state
+                    .message_reactions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                pairs.sort();
+                pairs
+            },
+            reply_to: state.reply_to.as_ref().map(|r| r.message_id.clone()),
+            emoji_for: state.emoji_picker.as_ref().map(|p| p.message_id.clone()),
         }
     }
 }
@@ -90,6 +110,8 @@ struct ChatRow {
     show_footer: bool,
     source_id: String,
     tts_text: SharedString,
+    reply_preview: Option<String>,
+    reaction: Option<String>,
 }
 
 fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
@@ -111,6 +133,9 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         } else {
             None
         };
+        if !msg.is_me && msg.content.trim().is_empty() {
+            continue;
+        }
         let use_markdown = !msg.is_me && looks_like_markdown(&msg.content);
         let chunks = chunk_text(&msg.content, CHAT_ROW_CHUNK_BYTES);
         let last = chunks.len().saturating_sub(1);
@@ -145,6 +170,16 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 } else {
                     SharedString::default()
                 },
+                reply_preview: if ix == last {
+                    msg.reply_preview.clone()
+                } else {
+                    None
+                },
+                reaction: if ix == last {
+                    state.message_reactions.get(&msg.id).cloned()
+                } else {
+                    None
+                },
             });
         }
     }
@@ -177,6 +212,7 @@ impl ChatPalette {
 
 struct ChatTranscript {
     app_state: Entity<AppState>,
+    input: Entity<MessageInput>,
     scroller: Entity<MessageScrollerState>,
     rows: Arc<Vec<ChatRow>>,
     feed_rev: ChatFeedRev,
@@ -185,10 +221,12 @@ struct ChatTranscript {
     can_read_aloud: bool,
     palette: ChatPalette,
     highlight_pump: bool,
+    ts_peek: f32,
+    peek_epoch: u64,
 }
 
 impl ChatTranscript {
-    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<AppState>, input: Entity<MessageInput>, cx: &mut Context<Self>) -> Self {
         let (rows, feed_rev, debug_mode, can_read_aloud, last_conversation_id) = {
             let app = state.read(cx);
             let feed_rev = ChatFeedRev::from_state(&app);
@@ -238,6 +276,7 @@ impl ChatTranscript {
 
         let mut this = Self {
             app_state: state,
+            input,
             scroller,
             rows,
             feed_rev,
@@ -246,12 +285,65 @@ impl ChatTranscript {
             can_read_aloud,
             palette: ChatPalette::from_cx(cx),
             highlight_pump: false,
+            ts_peek: 0.0,
+            peek_epoch: 0,
         };
         if this.feed_rev.native_speaking_id.is_some() || this.feed_rev.ai_speaking_id.is_some()
         {
             this.start_highlight_pump(cx);
         }
         this
+    }
+
+    fn arm_peek_release(&mut self, cx: &mut Context<Self>) {
+        self.peek_epoch = self.peek_epoch.wrapping_add(1);
+        let epoch = self.peek_epoch;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(90))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.peek_epoch != epoch {
+                    return;
+                }
+                this.ts_peek = 0.0;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn on_timestamp_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(px(16.));
+        let dx = f32::from(delta.x);
+        let dy = f32::from(delta.y);
+        if dx.abs() <= dy.abs() {
+            return;
+        }
+        if self.ts_peek <= 0.0 && dx.abs() < 1.5 {
+            return;
+        }
+        let win = f32::from(_window.viewport_size().width);
+        let app = self.app_state.read(cx);
+        let chat_w = chat_column_width(
+            win,
+            app.sidebar_hidden,
+            app.sidebar_collapsed,
+            app.sidebar_expanded_width,
+            app.right_pane != crate::state::RightPane::Closed,
+        );
+        if !timestamps_fit(chat_w) {
+            return;
+        }
+        cx.stop_propagation();
+        self.ts_peek = (self.ts_peek + dx).clamp(0.0, TS_PEEK_MAX);
+        self.arm_peek_release(cx);
+        cx.notify();
     }
 
     /// Tick highlight on this view only. Do not notify AppState (that dirties the window).
@@ -292,13 +384,36 @@ impl ChatTranscript {
 }
 
 impl Render for ChatTranscript {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows.clone();
         let app_state = self.app_state.clone();
+        let input = self.input.clone();
         let debug_mode = self.debug_mode;
         let can_read_aloud = self.can_read_aloud;
         let palette = self.palette.clone();
-        MessageScroller::new("chat-messages", self.scroller.clone(), move |ix, _, _cx| {
+        let picker_id = self
+            .app_state
+            .read(cx)
+            .emoji_picker
+            .as_ref()
+            .map(|p| p.message_id.clone());
+        let ts_peek = self.ts_peek;
+        let timestamps_ok = {
+            let win = f32::from(_window.viewport_size().width);
+            let app = self.app_state.read(cx);
+            timestamps_fit(chat_column_width(
+                win,
+                app.sidebar_hidden,
+                app.sidebar_collapsed,
+                app.sidebar_expanded_width,
+                app.right_pane != crate::state::RightPane::Closed,
+            ))
+        };
+        div()
+            .id("chat-timestamp-peek")
+            .size_full()
+            .on_scroll_wheel(cx.listener(Self::on_timestamp_wheel))
+            .child(MessageScroller::new("chat-messages", self.scroller.clone(), move |ix, _, _cx| {
             let Some(row) = rows.get(ix) else {
                 return div().into_any_element();
             };
@@ -320,8 +435,10 @@ impl Render for ChatTranscript {
             let source_id = row.source_id.clone();
             let tts_text = row.tts_text.to_string();
             let show_footer = row.show_footer;
+            let picker_open = picker_id.as_ref() == Some(&row.source_id);
             let mut bubble = MessageBubble::new(row.content.to_string())
                 .message_id(row.id.clone())
+                .source_id(row.source_id.clone())
                 .is_me(row.is_me)
                 .bg_color(bg_color)
                 .text_color(text_color)
@@ -338,23 +455,39 @@ impl Render for ChatTranscript {
                 .highlight_range(row.highlight_range.clone())
                 .highlight_color(highlight_color)
                 .use_markdown(row.use_markdown)
-                .show_footer(show_footer);
+                .show_footer(show_footer)
+                .reply_preview(row.reply_preview.clone())
+                .reaction(row.reaction.clone())
+                .picker_open(picker_open)
+                .ts_peek(ts_peek)
+                .timestamps_ok(timestamps_ok)
+                .app_state(app_state.clone());
             if show_footer {
+                let state_for_tts = state_entity.clone();
+                let source_for_tts = source_id.clone();
+                let tts = tts_text.clone();
                 bubble = bubble.copy_text(tts_text.clone()).on_read_aloud(move |_, cx| {
-                    state_entity.update(cx, |state, cx| {
+                    state_for_tts.update(cx, |state, cx| {
                         state.toggle_read_aloud(
-                            source_id.clone(),
-                            tts_text.clone(),
+                            source_for_tts.clone(),
+                            tts.clone(),
                             crate::actions::TtsSource::Native,
                             cx,
                         );
                     });
                 });
+                let input = input.clone();
+                bubble = bubble.on_reply(move |window, cx| {
+                    input.update(cx, |input, cx| {
+                        input.focus(window, cx);
+                    });
+                });
             }
             bubble.into_any_element()
         })
-        .pt(px(80.0))
-        .with_jump_button_transition(Duration::ZERO)
+            .pt(px(80.0))
+            .with_jump_button_transition(Duration::ZERO),
+        )
     }
 }
 
@@ -382,7 +515,6 @@ pub struct ChatView {
     transcript: Entity<ChatTranscript>,
     profile_select: Entity<SelectState<SearchableVec<ProfileItem>>>,
     cached_profiles: Vec<ProfileItem>,
-    should_focus_input: bool,
     profiles_need_sync: bool,
     selection_need_sync: bool,
     active_profile_id: Option<i64>,
@@ -392,6 +524,11 @@ pub struct ChatView {
     coworker_id: Option<String>,
     coworker_shape: Option<String>,
     coworker_color: Option<String>,
+    emoji_search: Entity<InputState>,
+    emoji_query: String,
+    emoji_full: bool,
+    emoji_category: usize,
+    emoji_open: Option<EmojiPickerOpen>,
 }
 
 impl ChatView {
@@ -399,6 +536,84 @@ impl ChatView {
         self.input.update(cx, |input, cx| {
             input.focus(window, cx);
         });
+    }
+
+    fn render_emoji_overlay(
+        &self,
+        open: EmojiPickerOpen,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let app = self.state.clone();
+        let search = self.emoji_search.clone();
+        let query = self.emoji_query.clone();
+        let category = self.emoji_category;
+        let full = self.emoji_full;
+        let view = cx.entity();
+        let panel = if full {
+            full_picker(
+                app.clone(),
+                open.message_id.clone(),
+                search,
+                query,
+                category,
+                Rc::new({
+                    let view = view.clone();
+                    move |ix, cx| {
+                        view.update(cx, |this, cx| {
+                            this.emoji_category = ix;
+                            this.emoji_query.clear();
+                            cx.notify();
+                        });
+                    }
+                }),
+                cx,
+            )
+            .into_any_element()
+        } else {
+            reaction_strip(
+                app.clone(),
+                open.message_id.clone(),
+                Rc::new({
+                    let view = view.clone();
+                    move |_, cx| {
+                        view.update(cx, |this, cx| {
+                            this.emoji_full = true;
+                            cx.notify();
+                        });
+                    }
+                }),
+                cx,
+            )
+            .into_any_element()
+        };
+        div()
+            .id("emoji-overlay")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, {
+                let app = app.clone();
+                move |_, _, cx| {
+                    app.update(cx, |state, cx| state.close_emoji_picker(cx));
+                }
+            })
+            .child(
+                deferred(
+                    Positioner::side(open.bounds)
+                        .placement(Placement::Bottom)
+                        .align(Align::Start)
+                        .offset(px(6.))
+                        .occlude()
+                        .child(
+                            div()
+                                .id("emoji-panel")
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(panel),
+                        ),
+                ),
+            )
     }
 
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -445,10 +660,13 @@ impl ChatView {
             )
         };
 
-        let transcript = cx.new(|cx| ChatTranscript::new(state.clone(), cx));
+        let transcript = cx.new(|cx| ChatTranscript::new(state.clone(), input.clone(), cx));
         let profile_items_vec = SearchableVec::new(profile_items.clone());
         let profile_select = cx.new(|cx| {
             SelectState::new(profile_items_vec, initial_selection, window, cx).searchable(true)
+        });
+        let emoji_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search emoji")
         });
 
         let this = Self {
@@ -457,7 +675,6 @@ impl ChatView {
             transcript,
             profile_select: profile_select.clone(),
             cached_profiles: profile_items,
-            should_focus_input: false,
             profiles_need_sync: false,
             selection_need_sync: false,
             active_profile_id,
@@ -467,13 +684,17 @@ impl ChatView {
             coworker_id: None,
             coworker_shape: None,
             coworker_color: None,
+            emoji_search: emoji_search.clone(),
+            emoji_query: String::new(),
+            emoji_full: false,
+            emoji_category: 0,
+            emoji_open: None,
         };
 
         cx.observe(&state, |this: &mut Self, state, cx| {
             let current_id = state.read(cx).active_conversation_id.clone();
             if current_id != this.last_conversation_id {
                 this.last_conversation_id = current_id;
-                this.should_focus_input = true;
                 cx.notify();
             }
         })
@@ -574,6 +795,7 @@ impl ChatView {
             let coworker_id = coworker.map(|c| c.id.clone());
             let coworker_shape = coworker.and_then(|c| c.avatar_shape.clone());
             let coworker_color = coworker.and_then(|c| c.avatar_color.clone());
+            let emoji_open = app.emoji_picker.clone();
             let mut changed = false;
             if this.bot_status != label {
                 this.bot_status = label;
@@ -595,10 +817,33 @@ impl ChatView {
                 this.coworker_color = coworker_color;
                 changed = true;
             }
+            let picker_changed = match (&this.emoji_open, &emoji_open) {
+                (None, None) => false,
+                (Some(a), Some(b)) => a.message_id != b.message_id,
+                _ => true,
+            };
+            if picker_changed {
+                this.emoji_open = emoji_open;
+                this.emoji_full = false;
+                this.emoji_category = 0;
+                this.emoji_query.clear();
+                changed = true;
+            }
             if changed {
                 cx.notify();
             }
         })
+        .detach();
+
+        cx.subscribe(
+            &emoji_search,
+            |this: &mut Self, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.emoji_query = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        )
         .detach();
 
         this
@@ -608,14 +853,6 @@ impl ChatView {
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-
-        // Handle auto-focus
-        if self.should_focus_input {
-            self.should_focus_input = false;
-            self.input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
-        }
 
         if self.profiles_need_sync {
             let items = SearchableVec::new(self.cached_profiles.clone());
@@ -707,6 +944,9 @@ impl Render for ChatView {
                             .clone()
                             .cached(StyleRefinement::default().absolute().size_full()),
                     )
+                    .when_some(self.emoji_open.clone(), |this, open| {
+                        this.child(self.render_emoji_overlay(open, cx))
+                    })
                     .child(
                         // Header - Absolute positioned at top
                         h_flex()
@@ -793,14 +1033,33 @@ impl Render for ChatView {
                     .pb_4()
                     .gap_2()
                     .when_some(self.bot_status.clone(), |this, label| {
+                        let name = self
+                            .coworker_name
+                            .clone()
+                            .unwrap_or_else(|| "Agent".into());
+                        let id = self.coworker_id.clone().unwrap_or_default();
                         this.child(
                             h_flex()
-                                .id("bot-status")
-                                .gap_2()
+                                .id("bot-working")
+                                .gap(px(8.))
                                 .items_center()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(label),
+                                .px_1()
+                                .tooltip(move |w, cx| {
+                                    Tooltip::new(label.clone()).build(w, cx)
+                                })
+                                .child(
+                                    PersonaMark::new(id)
+                                        .shape(self.coworker_shape.clone())
+                                        .color(self.coworker_color.clone())
+                                        .size(px(20.))
+                                        .dark(theme.is_dark()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{name} is working")),
+                                ),
                         )
                     })
                     .child(self.input.clone()),
