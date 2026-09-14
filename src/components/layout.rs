@@ -1,5 +1,7 @@
 use crate::components::agent_settings::AgentSettings;
 use crate::components::app_settings::AppSettings;
+use crate::components::computer::ComputerPane;
+use crate::state::RightPane;
 use crate::components::chat::ChatView;
 use crate::components::login::LoginView;
 use crate::components::modals::profile_settings::ProfileSettingsModal;
@@ -26,7 +28,8 @@ struct ShellRev {
     signed_in: bool,
     signing_in: bool,
     auth_error: Option<String>,
-    agent_settings: bool,
+    right_pane: u8,
+    computer_editor: bool,
     model_picker: bool,
     avatar_editor: bool,
     app_settings: bool,
@@ -45,7 +48,12 @@ impl ShellRev {
             signed_in: state.is_signed_in(),
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
-            agent_settings: state.is_agent_settings_open,
+            right_pane: match state.right_pane {
+                RightPane::Closed => 0,
+                RightPane::Settings => 1,
+                RightPane::Computer => 2,
+            },
+            computer_editor: matches!(state.computer_view, crate::state::ComputerView::Editor { .. }),
             model_picker: state.model_picker_open,
             avatar_editor: state.avatar_editor_open,
             app_settings: state.is_app_settings_open,
@@ -61,6 +69,7 @@ pub struct Layout {
     chat: Entity<ChatView>,
     login: Entity<LoginView>,
     agent_settings: Entity<AgentSettings>,
+    computer: Entity<ComputerPane>,
     profile_settings_modal: Entity<ProfileSettingsModal>,
     app_settings: Entity<AppSettings>,
     state: Entity<AppState>,
@@ -75,6 +84,7 @@ impl Layout {
         let chat = cx.new(|cx| ChatView::new(window, state.clone(), cx));
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
+        let computer = cx.new(|cx| ComputerPane::new(window, state.clone(), cx));
         let profile_settings_modal =
             cx.new(|cx| ProfileSettingsModal::new(window, state.clone(), cx));
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
@@ -94,6 +104,7 @@ impl Layout {
             chat,
             login,
             agent_settings,
+            computer,
             profile_settings_modal,
             app_settings,
             state,
@@ -141,7 +152,7 @@ impl Render for Layout {
         let hidden = state.sidebar_hidden;
         let collapsed = state.sidebar_collapsed;
         let expanded_width = state.sidebar_expanded_width;
-        let settings_open = state.is_agent_settings_open;
+        let right_pane = state.right_pane;
         let theme = cx.theme().clone();
         let main = if has_agent {
             self.chat.clone().into_any_element()
@@ -211,15 +222,19 @@ impl Render for Layout {
                     .overflow_hidden()
                     .child(main),
             )
-            .when(settings_open, |this| {
+            .when(right_pane != RightPane::Closed, |this| {
                 this.child(
                     div()
-                        .id("agent-settings-slot")
+                        .id("right-pane-slot")
                         .w(px(INFO_PANE_WIDTH))
                         .flex_shrink_0()
                         .h_full()
                         .overflow_hidden()
-                        .child(self.agent_settings.clone()),
+                        .child(match right_pane {
+                            RightPane::Settings => self.agent_settings.clone().into_any_element(),
+                            RightPane::Computer => self.computer.clone().into_any_element(),
+                            RightPane::Closed => div().into_any_element(),
+                        }),
                 )
             })
             .children(

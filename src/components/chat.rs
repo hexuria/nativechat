@@ -5,6 +5,7 @@ use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadA
 use crate::components::chat_input::MessageInput;
 use crate::components::message::MessageBubble;
 use crate::services::tts_service::TtsService;
+use crate::components::persona::PersonaMark;
 use crate::state::AppState;
 use crate::tts_text::{
     CHAT_ROW_CHUNK_BYTES, chunk_text, highlight_in_chunk, looks_like_markdown,
@@ -388,6 +389,9 @@ pub struct ChatView {
     last_conversation_id: Option<String>,
     bot_status: Option<String>,
     coworker_name: Option<String>,
+    coworker_id: Option<String>,
+    coworker_shape: Option<String>,
+    coworker_color: Option<String>,
 }
 
 impl ChatView {
@@ -454,6 +458,9 @@ impl ChatView {
             last_conversation_id,
             bot_status: None,
             coworker_name: None,
+            coworker_id: None,
+            coworker_shape: None,
+            coworker_color: None,
         };
 
         cx.observe(&state, |this: &mut Self, state, cx| {
@@ -553,11 +560,14 @@ impl ChatView {
         cx.observe(&state, |this, app, cx| {
             let app = app.read(cx);
             let label = app.bot_status.clone();
-            let coworker_name = app
+            let coworker = app
                 .active_coworker_id
                 .as_ref()
-                .and_then(|id| app.coworkers.iter().find(|c| &c.id == id))
-                .map(|c| c.name.clone());
+                .and_then(|id| app.coworkers.iter().find(|c| &c.id == id));
+            let coworker_name = coworker.map(|c| c.name.clone());
+            let coworker_id = coworker.map(|c| c.id.clone());
+            let coworker_shape = coworker.and_then(|c| c.avatar_shape.clone());
+            let coworker_color = coworker.and_then(|c| c.avatar_color.clone());
             let mut changed = false;
             if this.bot_status != label {
                 this.bot_status = label;
@@ -565,6 +575,18 @@ impl ChatView {
             }
             if this.coworker_name != coworker_name {
                 this.coworker_name = coworker_name;
+                changed = true;
+            }
+            if this.coworker_id != coworker_id {
+                this.coworker_id = coworker_id;
+                changed = true;
+            }
+            if this.coworker_shape != coworker_shape {
+                this.coworker_shape = coworker_shape;
+                changed = true;
+            }
+            if this.coworker_color != coworker_color {
+                this.coworker_color = coworker_color;
                 changed = true;
             }
             if changed {
@@ -697,19 +719,43 @@ impl Render for ChatView {
                                 h_flex().gap_2().items_center().child(
                                     div()
                                         .id("header-coworker")
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, {
+                                            let state = self.state.clone();
+                                            move |_, _, cx| {
+                                                state.update(cx, |state, cx| {
+                                                    state.toggle_agent_settings(cx);
+                                                });
+                                            }
+                                        })
+                                        .when_some(self.coworker_id.clone(), |this, id| {
+                                            this.child(
+                                                PersonaMark::new(id)
+                                                    .shape(self.coworker_shape.clone())
+                                                    .color(self.coworker_color.clone())
+                                                    .size(px(24.))
+                                                    .dark(theme.is_dark()),
+                                            )
+                                        })
                                         .child(
-                                            self.coworker_name
-                                                .clone()
-                                                .unwrap_or_else(|| "Native Chat".into()),
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(
+                                                    self.coworker_name
+                                                        .clone()
+                                                        .unwrap_or_else(|| "Native Chat".into()),
+                                                ),
                                         ),
                                 ),
                             )
                             .child(
                                 h_flex().gap_2().items_center().child(
                                     div()
-                                        .id("header-settings")
+                                        .id("header-monitor")
                                         .size(px(28.))
                                         .rounded(px(8.))
                                         .flex()
@@ -721,7 +767,7 @@ impl Render for ChatView {
                                             let state = self.state.clone();
                                             move |_, _, cx| {
                                                 state.update(cx, |state, cx| {
-                                                    state.toggle_agent_settings(cx);
+                                                    state.toggle_computer_pane(cx);
                                                 });
                                             }
                                         })

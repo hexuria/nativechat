@@ -303,7 +303,7 @@ impl Render for AgentSettings {
                                 let app = app.clone();
                                 move |_, _, cx| {
                                     app.update(cx, |state, cx| {
-                                        state.toggle_agent_settings(cx);
+                                        state.close_right_pane(cx);
                                     });
                                 }
                             })

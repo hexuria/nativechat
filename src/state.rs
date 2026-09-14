@@ -135,6 +135,255 @@ pub enum SubmitChord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RightPane {
+    #[default]
+    Closed,
+    Settings,
+    Computer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComputerView {
+    Overview,
+    Editor { id: Option<String> },
+}
+
+impl Default for ComputerView {
+    fn default() -> Self {
+        Self::Overview
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentRoutine {
+    pub id: String,
+    pub name: String,
+    pub instruction: String,
+    pub active: bool,
+    pub triggers: Vec<RoutineTrigger>,
+    pub runs: Vec<RoutineRun>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduleUiMode {
+    Interval,
+    Custom,
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduleUnit {
+    Minutes,
+    Hours,
+    Days,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduleDayKind {
+    EveryDay,
+    Weekdays,
+    DaysOfMonth,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleSpec {
+    pub mode: ScheduleUiMode,
+    pub every: u32,
+    pub unit: ScheduleUnit,
+    pub expr: String,
+    pub months: Vec<u8>,
+    pub day_kind: ScheduleDayKind,
+    pub weekdays: Vec<u8>,
+    pub month_days: Vec<u8>,
+    pub times: Vec<(u8, u8)>,
+}
+
+impl ScheduleSpec {
+    pub fn interval(every: u32, unit: ScheduleUnit) -> Self {
+        Self {
+            mode: ScheduleUiMode::Interval,
+            every,
+            unit,
+            expr: String::new(),
+            months: Vec::new(),
+            day_kind: ScheduleDayKind::EveryDay,
+            weekdays: Vec::new(),
+            month_days: Vec::new(),
+            times: vec![(9, 0)],
+        }
+    }
+
+    pub fn custom(expr: &str) -> Self {
+        let mut spec = Self::interval(1, ScheduleUnit::Hours);
+        spec.mode = ScheduleUiMode::Custom;
+        spec.expr = expr.to_string();
+        spec
+    }
+
+    pub fn advanced_daily(hour: u8, minute: u8) -> Self {
+        let mut spec = Self::interval(1, ScheduleUnit::Days);
+        spec.mode = ScheduleUiMode::Advanced;
+        spec.day_kind = ScheduleDayKind::EveryDay;
+        spec.times = vec![(hour, minute)];
+        spec
+    }
+
+    pub fn from_preset(name: &str) -> Self {
+        match name {
+            "Every hour" => Self::interval(1, ScheduleUnit::Hours),
+            "Every day" => Self::advanced_daily(9, 0),
+            "Weekdays" => {
+                let mut spec = Self::advanced_daily(9, 0);
+                spec.day_kind = ScheduleDayKind::Weekdays;
+                spec.weekdays = vec![1, 2, 3, 4, 5];
+                spec
+            }
+            "Every week" => {
+                let mut spec = Self::advanced_daily(9, 0);
+                spec.day_kind = ScheduleDayKind::Weekdays;
+                spec.weekdays = vec![1];
+                spec
+            }
+            "Every month" => {
+                let mut spec = Self::advanced_daily(8, 0);
+                spec.day_kind = ScheduleDayKind::DaysOfMonth;
+                spec.month_days = vec![1];
+                spec
+            }
+            "Interval" => Self::interval(30, ScheduleUnit::Minutes),
+            "Advanced..." => Self::advanced_daily(9, 0),
+            _ => Self::interval(30, ScheduleUnit::Minutes),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self.mode {
+            ScheduleUiMode::Interval => match (self.every, self.unit) {
+                (1, ScheduleUnit::Minutes) => "Every minute".into(),
+                (n, ScheduleUnit::Minutes) => format!("Every {n} minutes"),
+                (1, ScheduleUnit::Hours) => "Every hour".into(),
+                (n, ScheduleUnit::Hours) => format!("Every {n} hours"),
+                (1, ScheduleUnit::Days) => "Every day".into(),
+                (n, ScheduleUnit::Days) => format!("Every {n} days"),
+            },
+            ScheduleUiMode::Custom => {
+                if self.expr.trim().is_empty() {
+                    "Custom schedule".into()
+                } else {
+                    self.expr.clone()
+                }
+            }
+            ScheduleUiMode::Advanced => advanced_label(self),
+        }
+    }
+}
+
+fn format_clock(hour: u8, minute: u8) -> String {
+    let (h12, am) = if hour == 0 {
+        (12, true)
+    } else if hour < 12 {
+        (hour, true)
+    } else if hour == 12 {
+        (12, false)
+    } else {
+        (hour - 12, false)
+    };
+    format!(
+        "{}:{:02} {}",
+        h12,
+        minute,
+        if am { "AM" } else { "PM" }
+    )
+}
+
+fn ordinal(n: u8) -> String {
+    let suffix = if matches!(n % 100, 11 | 12 | 13) {
+        "th"
+    } else {
+        match n % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    format!("{n}{suffix}")
+}
+
+fn advanced_label(spec: &ScheduleSpec) -> String {
+    let time = spec
+        .times
+        .first()
+        .map(|(h, m)| format_clock(*h, *m))
+        .unwrap_or_else(|| "9:00 AM".into());
+    match spec.day_kind {
+        ScheduleDayKind::EveryDay => format!("Every day at {time}"),
+        ScheduleDayKind::Weekdays if spec.weekdays == [1, 2, 3, 4, 5] => {
+            format!("Weekdays at {time}")
+        }
+        ScheduleDayKind::Weekdays if spec.weekdays.len() == 1 => {
+            format!("Every week at {time}")
+        }
+        ScheduleDayKind::DaysOfMonth if spec.month_days == [1] => {
+            format!("Monthly on the 1st at {time}")
+        }
+        ScheduleDayKind::DaysOfMonth => {
+            let days = spec
+                .month_days
+                .iter()
+                .map(|d| ordinal(*d))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Monthly on the {days} at {time}")
+        }
+        _ => format!("Scheduled at {time}"),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutineTrigger {
+    Schedule {
+        id: String,
+        spec: ScheduleSpec,
+    },
+    Event {
+        id: String,
+        kind: &'static str,
+        label: String,
+    },
+    Webhook {
+        id: String,
+        url: String,
+        key: String,
+        header: String,
+    },
+}
+
+impl RoutineTrigger {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Schedule { id, .. }
+            | Self::Event { id, .. }
+            | Self::Webhook { id, .. } => id,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Schedule { spec, .. } => spec.label(),
+            Self::Event { label, .. } => label.clone(),
+            Self::Webhook { .. } => "When a webhook fires".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutineRun {
+    pub at: String,
+    pub ok: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AppSettingsTab {
     #[default]
     General,
@@ -222,7 +471,9 @@ pub struct AppState {
     pub active_coworker_id: Option<String>,
     pub bot_status: Option<String>,
     pub model_catalogue: ModelCatalogue,
-    pub is_agent_settings_open: bool,
+    pub right_pane: RightPane,
+    pub computer_view: ComputerView,
+    pub routines: HashMap<String, Vec<AgentRoutine>>,
     pub model_picker_open: bool,
     pub avatar_editor_open: bool,
     pub hiring: bool,
@@ -402,7 +653,9 @@ impl AppState {
             active_coworker_id: None,
             bot_status: None,
             model_catalogue: ModelCatalogue::default(),
-            is_agent_settings_open: false,
+            right_pane: RightPane::Closed,
+            computer_view: ComputerView::Overview,
+            routines: HashMap::new(),
             model_picker_open: false,
             avatar_editor_open: false,
             hiring: false,
@@ -501,7 +754,7 @@ impl AppState {
         self.active_coworker_id = None;
         self.bot_status = None;
         self.is_app_settings_open = false;
-        self.is_agent_settings_open = false;
+        self.close_right_pane(cx);
         cx.notify();
         if let Some(client) = client {
             cx.spawn(async move |_, _| {
@@ -557,11 +810,218 @@ impl AppState {
         .detach();
     }
 
+    pub fn is_right_pane_open(&self) -> bool {
+        self.right_pane != RightPane::Closed
+    }
+
+    pub fn is_agent_settings_open(&self) -> bool {
+        self.right_pane == RightPane::Settings
+    }
+
+    pub fn close_right_pane(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane == RightPane::Closed {
+            return;
+        }
+        self.right_pane = RightPane::Closed;
+        self.computer_view = ComputerView::Overview;
+        self.model_picker_open = false;
+        self.avatar_editor_open = false;
+        cx.notify();
+    }
+
     pub fn toggle_agent_settings(&mut self, cx: &mut Context<Self>) {
-        self.is_agent_settings_open = !self.is_agent_settings_open;
-        if !self.is_agent_settings_open {
-            self.model_picker_open = false;
-            self.avatar_editor_open = false;
+        if self.right_pane == RightPane::Settings {
+            self.close_right_pane(cx);
+            return;
+        }
+        self.right_pane = RightPane::Settings;
+        self.computer_view = ComputerView::Overview;
+        cx.notify();
+    }
+
+    pub fn toggle_computer_pane(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane == RightPane::Computer {
+            self.close_right_pane(cx);
+            return;
+        }
+        self.right_pane = RightPane::Computer;
+        self.computer_view = ComputerView::Overview;
+        self.model_picker_open = false;
+        self.avatar_editor_open = false;
+        cx.notify();
+    }
+
+    pub fn open_routine_editor(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        let id = match id {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                self.routines.entry(coworker_id).or_default().insert(
+                    0,
+                    AgentRoutine {
+                        id: id.clone(),
+                        name: String::new(),
+                        instruction: String::new(),
+                        active: true,
+                        triggers: Vec::new(),
+                        runs: Vec::new(),
+                    },
+                );
+                id
+            }
+        };
+        self.right_pane = RightPane::Computer;
+        self.computer_view = ComputerView::Editor { id: Some(id) };
+        cx.notify();
+    }
+
+    pub fn back_to_computer(&mut self, cx: &mut Context<Self>) {
+        if let (Some(coworker_id), ComputerView::Editor { id: Some(rid) }) = (
+            self.active_coworker_id.clone(),
+            self.computer_view.clone(),
+        ) {
+            let empty = self
+                .routines
+                .get(&coworker_id)
+                .and_then(|rows| rows.iter().find(|row| row.id == rid))
+                .is_some_and(|row| {
+                    row.name.trim().is_empty()
+                        && row.instruction.trim().is_empty()
+                        && row.triggers.is_empty()
+                        && row.runs.is_empty()
+                });
+            if empty {
+                self.delete_routine(&coworker_id, &rid, cx);
+                return;
+            }
+        }
+        self.computer_view = ComputerView::Overview;
+        cx.notify();
+    }
+
+    pub fn coworker_routines(&self, coworker_id: &str) -> &[AgentRoutine] {
+        self.routines
+            .get(coworker_id)
+            .map(|rows| rows.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn save_routine_fields(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        name: String,
+        instruction: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+            row.name = name;
+            row.instruction = instruction;
+        }
+        cx.notify();
+    }
+
+    pub fn routine_mut(&mut self, coworker_id: &str, routine_id: &str) -> Option<&mut AgentRoutine> {
+        self.routines
+            .get_mut(coworker_id)?
+            .iter_mut()
+            .find(|row| row.id == routine_id)
+    }
+
+    pub fn add_routine_trigger(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        trigger: RoutineTrigger,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+            row.triggers.push(trigger);
+        }
+        cx.notify();
+    }
+
+    pub fn update_webhook(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        trigger_id: &str,
+        url: String,
+        key: String,
+        header: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.routine_mut(coworker_id, routine_id)
+            && let Some(RoutineTrigger::Webhook {
+                url: u,
+                key: k,
+                header: h,
+                ..
+            }) = row.triggers.iter_mut().find(|t| t.id() == trigger_id)
+        {
+            *u = url;
+            *k = key;
+            *h = header;
+        }
+        cx.notify();
+    }
+
+    pub fn update_schedule_spec(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        trigger_id: &str,
+        spec: ScheduleSpec,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.routine_mut(coworker_id, routine_id)
+            && let Some(RoutineTrigger::Schedule { spec: current, .. }) =
+                row.triggers.iter_mut().find(|t| t.id() == trigger_id)
+        {
+            *current = spec;
+        }
+        cx.notify();
+    }
+
+    pub fn record_routine_run(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+        let stamp = chrono::Local::now()
+            .format("%b %d at %I:%M %p")
+            .to_string()
+            .replace(" 0", " ");
+        if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+            row.runs.insert(
+                0,
+                RoutineRun {
+                    at: stamp,
+                    ok: true,
+                },
+            );
+        }
+        cx.notify();
+    }
+
+    pub fn delete_routine(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+        if let Some(rows) = self.routines.get_mut(coworker_id) {
+            rows.retain(|row| row.id != routine_id);
+        }
+        self.computer_view = ComputerView::Overview;
+        cx.notify();
+    }
+
+    pub fn set_routine_active(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(rows) = self.routines.get_mut(coworker_id)
+            && let Some(row) = rows.iter_mut().find(|row| row.id == routine_id)
+        {
+            row.active = active;
         }
         cx.notify();
     }
@@ -924,9 +1384,8 @@ impl AppState {
 
     pub fn open_agent_profile(&mut self, id: String, cx: &mut Context<Self>) {
         self.select_coworker(id, cx);
-        if !self.is_agent_settings_open {
-            self.is_agent_settings_open = true;
-        }
+        self.right_pane = RightPane::Settings;
+        self.computer_view = ComputerView::Overview;
         cx.notify();
     }
 
@@ -1003,7 +1462,7 @@ impl AppState {
             if let Some(next) = self.active_coworker_id.clone() {
                 self.select_coworker(next, cx);
             } else {
-                self.is_agent_settings_open = false;
+                self.close_right_pane(cx);
             }
         }
         cx.notify();

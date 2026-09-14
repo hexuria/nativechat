@@ -4,6 +4,7 @@ pub mod persona;
 pub mod chat_input;
 pub mod circular_voice_viz;
 pub mod agent_settings;
+pub mod computer;
 pub mod layout;
 pub mod login;
 pub mod message;

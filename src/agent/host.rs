@@ -198,7 +198,7 @@ impl NativeChatHost {
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
             bot_status: state.bot_status.clone(),
-            agent_settings_open: state.is_agent_settings_open,
+            agent_settings_open: state.is_agent_settings_open(),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
             pending: None,
