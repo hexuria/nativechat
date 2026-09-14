@@ -1,7 +1,7 @@
 use crate::actions::{
     About, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind, FindNext, FindPrev,
     FocusChatInput, Hide, HideOthers, Minimize, NavBack, NavForward, NewChat, OpenCommandPalette,
-    OpenSettings, Search, ShowAll,
+    OpenSettings, PickFinderItem, Search, ShowAll,
     ToggleComputerPane,
     ToggleDebugMarkdown, ToggleFps, ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar,
     ToggleTheme, Zoom,
@@ -251,6 +251,14 @@ impl Render for RootView {
                     } else {
                         state.update(cx, |state, cx| state.open_bot_finder(cx));
                     }
+                }
+            })
+            .on_action({
+                let layout = self.layout.clone();
+                move |action: &PickFinderItem, _, cx: &mut App| {
+                    layout.update(cx, |layout, cx| {
+                        layout.pick_overlay_item(action.index, cx);
+                    });
                 }
             })
             .on_action({

@@ -1,4 +1,4 @@
-use crate::actions::{CloseBotFinder, PickFinderItem};
+use crate::actions::CloseBotFinder;
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
 use crate::opengrok::Coworker;
@@ -67,6 +67,11 @@ impl BotFinder {
             return;
         };
         self.activate(entry, cx);
+    }
+
+    pub(crate) fn activate_shortcut(&mut self, index: usize, cx: &mut Context<Self>) {
+        let query = self.query.read(cx).value().to_string();
+        self.pick_nth_bot(index, &query, cx);
     }
 
     fn pick_nth_bot(&mut self, bot_index: usize, query: &str, cx: &mut Context<Self>) {
@@ -192,13 +197,6 @@ impl Render for BotFinder {
             .occlude()
             .bg(theme.background)
             .key_context("BotFinder")
-            .on_action({
-                let view = view.clone();
-                let query = query.clone();
-                move |action: &PickFinderItem, _, cx| {
-                    view.update(cx, |this, cx| this.pick_nth_bot(action.index, &query, cx));
-                }
-            })
             .child(
                 v_flex()
                     .size_full()

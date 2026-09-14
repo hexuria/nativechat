@@ -1,6 +1,5 @@
 use crate::actions::{
     CloseCommandPalette, PaletteNextTab, PalettePrevTab, PaletteSelectNext, PaletteSelectPrev,
-    PickFinderItem,
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
@@ -191,6 +190,11 @@ impl CommandPalette {
         let next = (self.selected as i32 + delta).rem_euclid(n as i32) as usize;
         self.selected = next;
         cx.notify();
+    }
+
+    pub(crate) fn activate_shortcut(&mut self, index: usize, cx: &mut Context<Self>) {
+        let query = self.query.read(cx).value().to_string();
+        self.activate_nth(index, &query, cx);
     }
 
     fn activate_nth(&mut self, index: usize, query: &str, cx: &mut Context<Self>) {
@@ -478,13 +482,6 @@ impl Render for CommandPalette {
                 let view = view.clone();
                 move |_: &PaletteSelectPrev, _, cx| {
                     view.update(cx, |this, cx| this.move_selection(-1, cx));
-                }
-            })
-            .on_action({
-                let view = view.clone();
-                let query = query.clone();
-                move |action: &PickFinderItem, _, cx| {
-                    view.update(cx, |this, cx| this.activate_nth(action.index, &query, cx));
                 }
             })
             .child(

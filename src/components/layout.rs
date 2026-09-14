@@ -171,6 +171,19 @@ impl Layout {
     pub fn blur_chat_input(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.blur(cx);
     }
+
+    pub fn pick_overlay_item(&self, index: usize, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if state.command_palette_open {
+            self.command_palette.update(cx, |palette, cx| {
+                palette.activate_shortcut(index, cx);
+            });
+        } else if state.bot_finder_open {
+            self.bot_finder.update(cx, |finder, cx| {
+                finder.activate_shortcut(index, cx);
+            });
+        }
+    }
 }
 
 impl Render for Layout {
