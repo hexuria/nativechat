@@ -31,21 +31,6 @@ pub struct Profile {
     pub created_at: String,
 }
 
-/// Model stored in the database.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct ModelEntity {
-    pub id: String,
-    pub provider: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub model_type: String,
-    pub input_token_limit: Option<i64>,
-    pub output_token_limit: Option<i64>,
-    pub capabilities: String,
-    pub is_thinking: bool,
-    pub created_at: String,
-}
-
 /// Database service for credential and profile operations.
 #[derive(Clone)]
 pub struct DatabaseService {
@@ -132,44 +117,6 @@ impl DatabaseService {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
-    }
-
-    /// Saves a model to the database.
-    pub async fn save_model(&self, model: &ModelEntity) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO models (id, provider, name, description, model_type, input_token_limit, output_token_limit, capabilities, is_thinking, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                provider = excluded.provider,
-                name = excluded.name,
-                description = excluded.description,
-                model_type = excluded.model_type,
-                input_token_limit = excluded.input_token_limit,
-                output_token_limit = excluded.output_token_limit,
-                capabilities = excluded.capabilities,
-                is_thinking = excluded.is_thinking"
-        )
-        .bind(&model.id)
-        .bind(&model.provider)
-        .bind(&model.name)
-        .bind(&model.description)
-        .bind(&model.model_type)
-        .bind(model.input_token_limit)
-        .bind(model.output_token_limit)
-        .bind(&model.capabilities)
-        .bind(model.is_thinking)
-        .bind(&model.created_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Returns all models.
-    pub async fn get_models_list(&self) -> Result<Vec<ModelEntity>> {
-        let rows = sqlx::query_as::<_, ModelEntity>("SELECT * FROM models ORDER BY provider, name")
-            .fetch_all(&self.pool)
-            .await?;
         Ok(rows)
     }
 

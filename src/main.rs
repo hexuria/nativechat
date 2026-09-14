@@ -215,12 +215,6 @@ fn main() {
                         println!("Report message action triggered");
                     });
                     cx.spawn(async move |cx| {
-                        if let Err(e) =
-                            nativechat::services::model_seeder::seed_models(&db_service_clone).await
-                        {
-                            eprintln!("Failed to seed models: {}", e);
-                        }
-
                         match AppState::load_profiles_and_credentials(&db_service_clone).await {
                             Ok((profiles, credentials)) => {
                                 let _ = state_clone.update(cx, |state, cx| {

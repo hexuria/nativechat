@@ -38,9 +38,11 @@ See `migration-v2/` for the phased plan (login → roster/pin → turn → look)
 4. NativeChat:
 
    ```sh
-   export OPENGROK_BASE_URL=http://127.0.0.1:1447   # default
-   cargo run -p nativechat
+   just run          # rebuild + relaunch against :1447
+   just run 1448     # same, other port
    ```
+
+   Or by hand: `OPENGROK_BASE_URL=http://127.0.0.1:1447 cargo run -p nativechat`
 
    Sign in with the admin email/password. Session cookies stay in memory (sign in again after quit).
    After login the app hires a coworker if you have none, and composer send goes to

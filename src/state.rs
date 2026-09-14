@@ -9,9 +9,6 @@ use crate::opengrok::{
     activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue,
     OpenGrokClient, ProfileUpdate,
 };
-use crate::llm::{
-    ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
-};
 use crate::services::database::{
     Credential as DbCredential, DatabaseService, Profile as DbProfile,
 };
@@ -19,7 +16,6 @@ use crate::services::gemini_client::GeminiLiveClient;
 use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
 use crate::services::tts_service::TtsService;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
-use futures::StreamExt;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -522,7 +518,6 @@ pub struct AppState {
     pub model_registry: Arc<ModelRegistry>,
     pub available_models: Vec<ModelProfile>,
     pub database_service: Option<DatabaseService>,
-    pub llm_provider: Option<Arc<dyn LlmProvider>>,
     pub config: Option<Config>,
     pub is_ai_responding: bool,
     // Database profile and credential fields
@@ -716,7 +711,6 @@ impl AppState {
             model_registry: Arc::new(ModelRegistry::new()),
             available_models: Vec::new(),
             database_service: None,
-            llm_provider: None,
             config: None,
             is_ai_responding: false,
             db_profiles: Vec::new(),
@@ -768,16 +762,6 @@ impl AppState {
     }
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
-        // Initialize LLM provider based on config
-        match create_provider(&config) {
-            Ok(provider) => {
-                println!("[LLM] Initialized {} provider", config.default_provider);
-                self.llm_provider = Some(Arc::from(provider));
-            }
-            Err(e) => {
-                eprintln!("[LLM] Failed to create provider: {}", e);
-            }
-        }
         match OpenGrokClient::new(&config.opengrok_base_url) {
             Ok(client) => self.opengrok = Some(client),
             Err(error) => {
@@ -2044,9 +2028,6 @@ impl AppState {
         // Update cache with fresh data from DB
         Self::save_cached_state(self.active_profile_id, self.db_profiles.clone());
 
-        // Re-evaluate LLM provider with new credentials
-        self.update_llm_provider(cx);
-
         cx.notify();
     }
 
@@ -2069,7 +2050,6 @@ impl AppState {
     }
 
     /// Select a database profile by ID and update the active profile.
-    /// This also updates the LLM provider to use the profile's credential.
     /// Persists the selection to the settings table.
     /// Requirements: 2.2, 5.1
     pub fn select_db_profile(&mut self, profile_id: i64, cx: &mut Context<Self>) {
@@ -2079,7 +2059,6 @@ impl AppState {
             self.stop_read_aloud(cx);
 
             self.active_profile_id = Some(profile_id);
-            self.update_llm_provider(cx);
 
             // Persist to local cache immediately
             Self::save_cached_state(Some(profile_id), self.db_profiles.clone());
@@ -2209,49 +2188,6 @@ impl AppState {
             }
         }
         Ok(None)
-    }
-
-    /// Update the LLM provider based on the active profile's credential.
-    /// Falls back to Config-based provider if no profile/credential is selected.
-    pub fn update_llm_provider(&mut self, cx: &mut Context<Self>) {
-        // Try to create provider from active profile's credential
-        if let Some(credential) = self.active_credential() {
-            let model_id = self
-                .active_profile()
-                .and_then(|p| p.text_model_id.as_deref());
-
-            match create_provider_from_credential(credential, model_id) {
-                Ok(provider) => {
-                    println!(
-                        "[LLM] Initialized {} provider from profile credential",
-                        credential.provider
-                    );
-                    self.llm_provider = Some(Arc::from(provider));
-                    cx.notify();
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[LLM] Failed to create provider from credential: {}", e);
-                }
-            }
-        }
-
-        // Fall back to Config-based provider
-        if let Some(config) = &self.config {
-            match create_provider(config) {
-                Ok(provider) => {
-                    println!(
-                        "[LLM] Initialized {} provider from config (fallback)",
-                        config.default_provider
-                    );
-                    self.llm_provider = Some(Arc::from(provider));
-                }
-                Err(e) => {
-                    eprintln!("[LLM] Failed to create provider from config: {}", e);
-                }
-            }
-        }
-        cx.notify();
     }
 
     pub fn fetch_models(&mut self, api_keys: HashMap<Provider, String>, cx: &mut Context<Self>) {
@@ -2483,7 +2419,12 @@ impl AppState {
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
-        if self.is_signed_in() && self.active_coworker_id.is_none() {
+        if !self.is_signed_in() {
+            self.auth_error = Some("Sign in first".to_string());
+            cx.notify();
+            return;
+        }
+        if self.active_coworker_id.is_none() {
             self.auth_error = Some("Create a bot first".to_string());
             cx.notify();
             return;
@@ -2547,183 +2488,7 @@ impl AppState {
             .detach();
         }
 
-        if self.is_signed_in() {
-            self.send_opengrok_turn(conversation_id, content, cx);
-            return;
-        }
-
-        // Get AI response
-        let provider = match &self.llm_provider {
-            Some(p) => p.clone(),
-            None => {
-                eprintln!("[LLM] No provider configured");
-                return;
-            }
-        };
-
-        // Build chat history for context
-        let chat_messages: Vec<ChatMessage> = self
-            .conversations
-            .iter()
-            .find(|c| c.id == conversation_id)
-            .map(|c| {
-                c.messages
-                    .iter()
-                    .map(|m| ChatMessage {
-                        role: if m.is_me {
-                            "user".to_string()
-                        } else {
-                            "assistant".to_string()
-                        },
-                        content: m.content.clone(),
-                        images: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Use active profile's text_model_id if set, otherwise fall back to provider default
-        // Requirements 4.1, 4.2
-        let model = self
-            .active_profile()
-            .and_then(|p| p.text_model_id.clone())
-            .unwrap_or_else(|| provider.default_model().to_string());
-
-        let request = ChatRequest {
-            model: model.clone(),
-            messages: chat_messages,
-            system_prompt: Some("You are a helpful AI assistant.".to_string()),
-            temperature: 0.7,
-            max_tokens: Some(2048),
-            stream: true,
-        };
-
-        self.is_ai_responding = true;
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-                println!("[LLM] Sending request to AI...");
-
-                // Create the AI message placeholder first
-                let _ = this.update(cx, |state, model_cx| {
-                    if let Some(conversation) = state
-                        .conversations
-                        .iter_mut()
-                        .find(|c| c.id == conversation_id)
-                    {
-                        let ai_message = Message {
-                            id: uuid::Uuid::now_v7().to_string(),
-                            sender: "AI".to_string(),
-                            content: String::new(), // Start empty
-                            sent_at: SystemTime::now(),
-                            is_me: false,
-                            reply_preview: None,
-                        };
-                        conversation.messages.push(ai_message);
-                    }
-                    model_cx.notify();
-                });
-
-                let mut full_response = String::new();
-
-                match provider.chat_stream(request).await {
-                    Ok(mut stream) => {
-                        println!("[LLM] Stream started");
-
-                        while let Some(chunk_result) = stream.next().await {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    if !chunk.delta.is_empty() {
-                                        full_response.push_str(&chunk.delta);
-                                        let _ = this.update(cx, |state, cx| {
-                                            if let Some(conversation) = state
-                                                .conversations
-                                                .iter_mut()
-                                                .find(|c| c.id == conversation_id)
-                                            {
-                                                if let Some(last_msg) =
-                                                    conversation.messages.last_mut()
-                                                {
-                                                    last_msg.content.push_str(&chunk.delta);
-                                                    cx.notify();
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[LLM] Stream error: {}", e);
-                                    // Append error to message or show error
-                                }
-                            }
-                        }
-
-                        let _ = this.update(cx, |state, cx| {
-                            state.is_ai_responding = false;
-                            // Save AI response to DB
-                            if let Some(db) = state.database_service.clone() {
-                                let response_clone = full_response.clone();
-                                let model_clone = model.clone();
-                                let conversation_id_clone = conversation_id.clone();
-                                cx.spawn(async move |this, cx| {
-                                        match db
-                                            .save_message(
-                                                &conversation_id_clone,
-                                                "assistant",
-                                                &response_clone,
-                                                Some(model_clone),
-                                                None,
-                                            )
-                                            .await
-                                        {
-                                            Ok(id) => {
-                                                this.update(cx, |state, cx| {
-                                                    if let Some(conversation) = state
-                                                        .conversations
-                                                        .iter_mut()
-                                                        .find(|c| c.id == conversation_id_clone)
-                                                    {
-                                                        if let Some(msg) =
-                                                            conversation.messages.last_mut()
-                                                        {
-                                                            if msg.id == "temp" {
-                                                                msg.id = id;
-                                                            }
-                                                        }
-                                                    }
-                                                })
-                                                .ok();
-                                            }
-                                            Err(e) => eprintln!("Failed to save AI message: {}", e),
-                                        }
-                                })
-                                .detach();
-                            }
-                            cx.notify();
-                        });
-                        println!("[LLM] Stream finished");
-                    }
-                    Err(e) => {
-                        eprintln!("[LLM] Error starting stream: {}", e);
-                        let _ = this.update(cx, |state, cx| {
-                            if let Some(conversation) = state
-                                .conversations
-                                .iter_mut()
-                                .find(|c| c.id == conversation_id)
-                            {
-                                // If we failed to start stream, we might want to remove the empty message
-                                // or update it with error
-                                if let Some(last_msg) = conversation.messages.last_mut() {
-                                    last_msg.content = format!("Error: {}", e);
-                                }
-                            }
-                            state.is_ai_responding = false;
-                            cx.notify();
-                        });
-                    }
-                }
-            })
-        .detach();
+        self.send_opengrok_turn(conversation_id, content, cx);
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {

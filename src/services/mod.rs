@@ -5,7 +5,6 @@ pub mod gemini_client;
 pub mod live_tts_provider;
 pub mod macos_tts_bridge;
 pub mod model_registry;
-pub mod model_seeder;
 pub mod rest_tts_provider;
 pub mod tts_provider;
 pub mod tts_service;

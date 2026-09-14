@@ -10,7 +10,6 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod find_text;
-pub mod llm;
 pub mod opengrok;
 pub mod root;
 pub mod services;
