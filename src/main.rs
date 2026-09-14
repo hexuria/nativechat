@@ -194,8 +194,6 @@ fn main() {
                         state.warm_tts(cx);
                     });
 
-                    let state_clone = state.clone();
-                    let db_service_clone = db_service.clone();
                     cx.on_action(|_: &CopyMessage, _cx: &mut App| {});
                     cx.on_action(|_: &BranchInNewChat, _cx: &mut App| {
                         println!("Branch in new chat action triggered");
@@ -214,22 +212,6 @@ fn main() {
                     cx.on_action(|_: &ReportMessage, _cx: &mut App| {
                         println!("Report message action triggered");
                     });
-                    cx.spawn(async move |cx| {
-                        match AppState::load_profiles_and_credentials(&db_service_clone).await {
-                            Ok((profiles, credentials)) => {
-                                let _ = state_clone.update(cx, |state, cx| {
-                                    state.set_profiles_and_credentials(profiles, credentials, cx);
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to load profiles and credentials: {}", e);
-                            }
-                        }
-
-                        println!("App data refreshed from DB successfully!");
-                    })
-                    .detach();
-
                     let view = cx.new(|cx| {
                         #[cfg(feature = "agent")]
                         {

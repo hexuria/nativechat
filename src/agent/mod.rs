@@ -6,7 +6,7 @@
 //!
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
-//! `footer-credentials`, `footer-profile`, `composer`.
+//! `composer`.
 
 mod host;
 #[cfg(target_os = "macos")]

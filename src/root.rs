@@ -13,8 +13,6 @@ use gpui_kit::{InteractiveElement, *};
 use crate::state::AppState;
 
 use crate::components::circular_voice_viz::CircularVoiceViz;
-use crate::components::modals::credentials_modal::CredentialsModal;
-use crate::components::modals::profile_settings::ProfileSettingsModal;
 use crate::components::voice_mode_modal::render_voice_mode_modal;
 use gpui_kit::component::{ActiveTheme, Root};
 
@@ -23,8 +21,6 @@ pub struct RootView {
     layout: Entity<Layout>,
     state: Entity<AppState>,
     circular_viz: Option<Entity<CircularVoiceViz>>,
-    credentials_modal: Option<Entity<CredentialsModal>>,
-    profile_settings_modal: Option<Entity<ProfileSettingsModal>>,
     pub focus_handle: FocusHandle,
     show_fps: bool,
     #[cfg(feature = "agent")]
@@ -40,8 +36,6 @@ impl RootView {
             layout,
             state,
             circular_viz: None,
-            credentials_modal: None,
-            profile_settings_modal: None,
             focus_handle,
             show_fps: true,
             #[cfg(feature = "agent")]
@@ -150,20 +144,12 @@ impl Render for RootView {
         #[cfg(feature = "agent")]
         self.drain_agent(window, cx);
 
-        let (
-            is_voice_mode_open,
-            amplitude,
-            ai_amplitude,
-            is_credentials_modal_open,
-            is_profile_settings_open,
-        ) = {
+        let (is_voice_mode_open, amplitude, ai_amplitude) = {
             let app_state = self.state.read(cx);
             (
                 app_state.is_voice_mode_open,
                 app_state.amplitude.clone(),
                 app_state.ai_amplitude.clone(),
-                app_state.is_credentials_modal_open,
-                app_state.is_profile_settings_open,
             )
         };
         let app_state_entity = self.state.clone();
@@ -372,14 +358,6 @@ impl Render for RootView {
             })
             .on_action({
                 let state = self.state.clone();
-                move |_: &crate::actions::ToggleCredentialsModal,
-                      _window: &mut Window,
-                      cx: &mut App| {
-                    state.update(cx, |state, cx| state.toggle_credentials_modal(cx));
-                }
-            })
-            .on_action({
-                let state = self.state.clone();
                 move |_: &ToggleDebugMarkdown, _window: &mut Window, cx: &mut App| {
                     state.update(cx, |state, cx| state.toggle_debug_markdown(cx));
                 }
@@ -396,76 +374,6 @@ impl Render for RootView {
                     None
                 }
             } else {
-                None
-            })
-            // Credentials Modal
-            .children(if is_credentials_modal_open {
-                if self.credentials_modal.is_none() {
-                    self.credentials_modal =
-                        Some(CredentialsModal::new(app_state_entity.clone(), window, cx));
-                }
-                Some(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .occlude()
-                        .bg(cx.theme().background.opacity(0.8))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w_4_5()
-                                .h_4_5()
-                                .bg(cx.theme().background)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded_lg()
-                                .shadow_lg()
-                                .child(self.credentials_modal.clone().unwrap())
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
-                        ),
-                )
-            } else {
-                self.credentials_modal = None;
-                None
-            })
-            // Profile Settings Modal
-            .children(if is_profile_settings_open {
-                if self.profile_settings_modal.is_none() {
-                    self.profile_settings_modal =
-                        Some(cx.new(|cx| {
-                            ProfileSettingsModal::new(window, app_state_entity.clone(), cx)
-                        }));
-                }
-                Some(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .occlude()
-                        .bg(cx.theme().background.opacity(0.8))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .w_4_5()
-                                .h_4_5()
-                                .bg(cx.theme().background)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .rounded_lg()
-                                .shadow_lg()
-                                .child(self.profile_settings_modal.clone().unwrap())
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
-                        ),
-                )
-            } else {
-                self.profile_settings_modal = None;
                 None
             })
             // Root overlay layers

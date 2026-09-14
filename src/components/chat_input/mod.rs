@@ -44,7 +44,6 @@ pub struct MessageInput {
     selected_apps: Vec<String>,
     is_voice_mode_open: bool,
     is_app_settings_open: bool,
-    is_profile_settings_open: bool,
     submit_chord: SubmitChord,
     reply_to: Option<ReplyTo>,
     coworker_name: String,
@@ -64,7 +63,6 @@ impl MessageInput {
         let selected_apps = app_state.selected_apps.clone();
         let is_voice_mode_open = app_state.is_voice_mode_open;
         let is_app_settings_open = app_state.is_app_settings_open;
-        let is_profile_settings_open = app_state.is_profile_settings_open;
         let submit_chord = app_state.submit_chord;
         let reply_to = app_state.reply_to.clone();
         let coworker_name = composer_bot_name(&app_state);
@@ -75,7 +73,6 @@ impl MessageInput {
             selected_apps,
             is_voice_mode_open,
             is_app_settings_open,
-            is_profile_settings_open,
             submit_chord,
             reply_to,
             coworker_name: coworker_name.clone(),
@@ -93,7 +90,6 @@ impl MessageInput {
                 sync_field_clone!(this, state, selected_apps, changed);
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_app_settings_open, changed);
-                sync_field_copy!(this, state, is_profile_settings_open, changed);
                 sync_field_clone!(this, state, reply_to, changed);
                 if this.submit_chord != state.submit_chord {
                     this.submit_chord = state.submit_chord;
@@ -150,13 +146,6 @@ impl MessageInput {
     }
 
     fn trigger_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Check if a profile is selected
-        if self.state.read(cx).active_profile_id.is_none() {
-            println!("No profile selected, ignoring submit.");
-            // Optionally, we could show a toast or shake the input here
-            return;
-        }
-
         println!("Triggering submit...");
         let text = self.input_state.read(cx).value();
         let trimmed = text.trim();
@@ -181,7 +170,7 @@ impl MessageInput {
             self.voice_wave = None;
         } else {
             let amplitude = self.state.read(cx).amplitude.clone();
-            match AudioInput::new(amplitude.clone(), None) {
+            match AudioInput::new(amplitude.clone()) {
                 Ok(input) => {
                     self.voice_mode = true;
                     self.audio_input = Some(input);
@@ -226,9 +215,7 @@ impl Render for MessageInput {
         let selected_apps = self.selected_apps.clone();
 
         // Check if any modal is open using cached state
-        let any_modal_open = self.is_voice_mode_open
-            || self.is_app_settings_open
-            || self.is_profile_settings_open;
+        let any_modal_open = self.is_voice_mode_open || self.is_app_settings_open;
         let draft = self.input_state.read(cx).value();
         let compact = !self.voice_mode
             && self.selected_apps.is_empty()

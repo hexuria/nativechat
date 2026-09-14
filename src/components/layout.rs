@@ -7,7 +7,6 @@ use crate::components::computer::ComputerPane;
 use crate::state::RightPane;
 use crate::components::chat::ChatView;
 use crate::components::login::LoginView;
-use crate::components::modals::profile_settings::ProfileSettingsModal;
 use crate::components::sidebar::SidebarView;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -27,7 +26,6 @@ struct ShellRev {
     hidden: bool,
     expanded_width: i32,
     auto_collapsed: bool,
-    profile: bool,
     signed_in: bool,
     signing_in: bool,
     auth_error: Option<String>,
@@ -50,7 +48,6 @@ impl ShellRev {
             hidden: state.sidebar_hidden,
             expanded_width: state.sidebar_expanded_width.round() as i32,
             auto_collapsed: state.auto_collapsed,
-            profile: state.is_profile_settings_open,
             signed_in: state.is_signed_in(),
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
@@ -79,7 +76,6 @@ pub struct Layout {
     login: Entity<LoginView>,
     agent_settings: Entity<AgentSettings>,
     computer: Entity<ComputerPane>,
-    profile_settings_modal: Entity<ProfileSettingsModal>,
     app_settings: Entity<AppSettings>,
     bot_finder: Entity<BotFinder>,
     command_palette: Entity<CommandPalette>,
@@ -96,8 +92,6 @@ impl Layout {
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
         let computer = cx.new(|cx| ComputerPane::new(window, state.clone(), cx));
-        let profile_settings_modal =
-            cx.new(|cx| ProfileSettingsModal::new(window, state.clone(), cx));
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
         let bot_finder = cx.new(|cx| BotFinder::new(window, state.clone(), cx));
         let command_palette = cx.new(|cx| CommandPalette::new(window, state.clone(), cx));
@@ -118,7 +112,6 @@ impl Layout {
             login,
             agent_settings,
             computer,
-            profile_settings_modal,
             app_settings,
             bot_finder,
             command_palette,
@@ -373,11 +366,6 @@ impl Render for Layout {
                         }),
                 )
             })
-            .children(
-                state
-                    .is_profile_settings_open
-                    .then(|| self.profile_settings_modal.clone().into_any_element()),
-            )
             .when(app_settings_open, |this| {
                 this.child(
                     div()

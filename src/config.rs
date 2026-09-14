@@ -10,8 +10,6 @@ use crate::error::{AppError, Result};
 pub struct Config {
     pub database_url: String,
     pub data_dir: PathBuf,
-    /// Optional Gemini key for local TTS / live voice. Chat inference goes through OpenGrok.
-    pub gemini_api_key: Option<String>,
     pub opengrok_base_url: String,
 }
 
@@ -30,14 +28,12 @@ impl Config {
             format!("sqlite://{}?mode=rwc", data_dir.join("data.db").display())
         });
 
-        let gemini_api_key = std::env::var("GEMINI_API_KEY").ok();
         let opengrok_base_url = std::env::var("OPENGROK_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:1447".to_string());
 
         Ok(Self {
             database_url,
             data_dir,
-            gemini_api_key,
             opengrok_base_url,
         })
     }

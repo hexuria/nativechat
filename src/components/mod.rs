@@ -15,7 +15,6 @@ pub mod layout;
 pub mod login;
 pub mod message;
 pub mod message_actions;
-pub mod modals;
 pub mod sidebar;
 pub mod sidebar_chat_item;
 pub mod voice_mode_modal;

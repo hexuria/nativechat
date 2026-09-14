@@ -8,7 +8,6 @@ use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::chrome::{chat_column_width, timestamps_fit, CHAT_CONTENT_MAX};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
-use crate::services::tts_service::TtsService;
 use crate::components::persona::PersonaMark;
 use crate::state::{AppState, EmojiPickerOpen};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
@@ -18,9 +17,8 @@ use gpui_kit::FontWeight;
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, IndexPath, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use std::rc::Rc;
 
 /// Cheap fingerprint so ChatView does not rebuild markdown on unrelated AppState
@@ -38,9 +36,6 @@ struct ChatFeedRev {
     native_speaking_id: Option<String>,
     native_paused: bool,
     native_loading: bool,
-    ai_speaking_id: Option<String>,
-    ai_paused: bool,
-    ai_loading: bool,
     highlight: Option<(usize, usize)>,
     reactions: Vec<(String, String)>,
     reply_to: Option<String>,
@@ -63,17 +58,11 @@ impl ChatFeedRev {
             last_len: last.map(|m| m.content.len()).unwrap_or(0),
             is_ai_responding: state.is_ai_responding,
             debug_mode: state.debug_markdown_disabled,
-            can_read_aloud: state
-                .active_profile()
-                .and_then(|p| p.tts_model_id.as_ref())
-                .is_some(),
+            can_read_aloud: true,
             theme_mode: state.theme_mode.clone(),
             native_speaking_id: state.native_tts.message_id.clone(),
             native_paused: state.native_tts.is_paused,
             native_loading: state.native_tts.is_loading,
-            ai_speaking_id: state.ai_tts.message_id.clone(),
-            ai_paused: state.ai_tts.is_paused,
-            ai_loading: state.ai_tts.is_loading,
             highlight,
             reactions: {
                 let mut pairs: Vec<(String, String)> = state
@@ -122,13 +111,10 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     let mut rows = Vec::new();
     for msg in &conv.messages {
         let is_native_speaking = state.native_tts.message_id.as_ref() == Some(&msg.id);
-        let is_ai_speaking = state.ai_tts.message_id.as_ref() == Some(&msg.id);
         let full_highlight = if is_native_speaking {
             state
                 .active_highlight_range()
                 .and_then(|range| map_utf16_range_to_utf8(&msg.content, range))
-        } else if is_ai_speaking {
-            state.active_highlight_range()
         } else {
             None
         };
@@ -145,10 +131,10 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             is_native_speaking,
             is_native_paused: state.native_tts.is_paused && is_native_speaking,
             is_native_loading: state.native_tts.is_loading && is_native_speaking,
-            is_ai_speaking,
-            is_ai_paused: state.ai_tts.is_paused && is_ai_speaking,
-            is_ai_loading: state.ai_tts.is_loading && is_ai_speaking,
-            is_cached: TtsService::is_cached(&msg.id),
+            is_ai_speaking: false,
+            is_ai_paused: false,
+            is_ai_loading: false,
+            is_cached: false,
             highlight_range: full_highlight,
             highlight_native,
             use_markdown,
@@ -244,9 +230,7 @@ impl ChatTranscript {
                     scroller.remeasure_items(count - 1..count, cx);
                 }
             });
-            if this.feed_rev.native_speaking_id.is_some()
-                || this.feed_rev.ai_speaking_id.is_some()
-            {
+            if this.feed_rev.native_speaking_id.is_some() {
                 this.start_highlight_pump(cx);
             }
             this.recompute_find(false, cx);
@@ -271,8 +255,7 @@ impl ChatTranscript {
             find_hits: Vec::new(),
             find_current: None,
         };
-        if this.feed_rev.native_speaking_id.is_some() || this.feed_rev.ai_speaking_id.is_some()
-        {
+        if this.feed_rev.native_speaking_id.is_some() {
             this.start_highlight_pump(cx);
         }
         this
@@ -418,8 +401,7 @@ impl ChatTranscript {
                 let keep = this
                     .update(cx, |this, cx| {
                         let app = this.app_state.read(cx);
-                        let speaking = app.native_tts.message_id.is_some()
-                            || app.ai_tts.message_id.is_some();
+                        let speaking = app.native_tts.message_id.is_some();
                         let feed = ChatFeedRev::from_state(&app);
                         if this.feed_rev != feed {
                             this.rows = snapshot_rows(&app);
@@ -552,33 +534,10 @@ impl Render for ChatTranscript {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
-struct ProfileItem {
-    id: Option<i64>, // None for "Create New Profile", Some(id) for actual profiles
-    name: String,
-}
-
-impl SelectItem for ProfileItem {
-    type Value = Option<i64>;
-
-    fn title(&self) -> SharedString {
-        SharedString::from(self.name.clone())
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.id
-    }
-}
-
 pub struct ChatView {
     input: Entity<MessageInput>,
     state: Entity<AppState>,
     transcript: Entity<ChatTranscript>,
-    profile_select: Entity<SelectState<SearchableVec<ProfileItem>>>,
-    cached_profiles: Vec<ProfileItem>,
-    profiles_need_sync: bool,
-    selection_need_sync: bool,
-    active_profile_id: Option<i64>,
     last_conversation_id: Option<String>,
     bot_status: Option<String>,
     coworker_name: Option<String>,
@@ -739,43 +698,9 @@ impl ChatView {
             })
         });
 
-        let (last_conversation_id, profile_items, initial_selection, active_profile_id) = {
-            let app_state = state.read(cx);
-            let last_conversation_id = app_state.active_conversation_id.clone();
-            let active_profile_id = app_state.active_profile_id;
-            let mut profile_items: Vec<ProfileItem> = app_state
-                .db_profiles
-                .iter()
-                .map(|p| ProfileItem {
-                    id: Some(p.id),
-                    name: p.name.chars().take(30).collect::<String>(),
-                })
-                .collect();
-            profile_items.push(ProfileItem {
-                id: None,
-                name: "Create New Profile...".to_string(),
-            });
-            let initial_selection = if let Some(active_id) = app_state.active_profile_id {
-                profile_items
-                    .iter()
-                    .position(|p| p.id == Some(active_id))
-                    .map(IndexPath::new)
-            } else {
-                None
-            };
-            (
-                last_conversation_id,
-                profile_items,
-                initial_selection,
-                active_profile_id,
-            )
-        };
+        let last_conversation_id = state.read(cx).active_conversation_id.clone();
 
         let transcript = cx.new(|cx| ChatTranscript::new(state.clone(), input.clone(), cx));
-        let profile_items_vec = SearchableVec::new(profile_items.clone());
-        let profile_select = cx.new(|cx| {
-            SelectState::new(profile_items_vec, initial_selection, window, cx).searchable(true)
-        });
         let emoji_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search emoji")
         });
@@ -787,11 +712,6 @@ impl ChatView {
             input,
             state: state.clone(),
             transcript,
-            profile_select: profile_select.clone(),
-            cached_profiles: profile_items,
-            profiles_need_sync: false,
-            selection_need_sync: false,
-            active_profile_id,
             last_conversation_id,
             bot_status: None,
             coworker_name: None,
@@ -815,90 +735,6 @@ impl ChatView {
                 cx.notify();
             }
         })
-        .detach();
-
-        // Subscribe to state changes to update cached values and notify only when relevant fields change
-        cx.observe(&state, |this: &mut Self, state, cx| {
-            let mut changed = false;
-            let profiles;
-            let active_id;
-
-            {
-                let state = state.read(cx);
-                // Clone profiles to use after dropping state read lock
-                profiles = state.db_profiles.clone();
-                active_id = state.active_profile_id;
-            }
-
-            // Sync profiles
-            let new_profile_items: Vec<ProfileItem> = profiles
-                .iter()
-                .map(|p| ProfileItem {
-                    id: Some(p.id),
-                    name: p.name.chars().take(30).collect::<String>(),
-                })
-                .collect();
-
-            let cached_len = this.cached_profiles.len();
-            let profiles_changed = if cached_len > 0 {
-                let cached_real_profiles = &this.cached_profiles[0..cached_len - 1];
-                if cached_real_profiles.len() != new_profile_items.len() {
-                    true
-                } else {
-                    cached_real_profiles
-                        .iter()
-                        .zip(new_profile_items.iter())
-                        .any(|(a, b)| a != b)
-                }
-            } else {
-                true
-            };
-
-            if profiles_changed {
-                let mut full_items = new_profile_items.clone();
-                full_items.push(ProfileItem {
-                    id: None,
-                    name: "Create New Profile...".to_string(),
-                });
-
-                this.cached_profiles = full_items;
-                this.profiles_need_sync = true;
-                changed = true;
-            }
-
-            if this.active_profile_id != active_id {
-                this.active_profile_id = active_id;
-                this.selection_need_sync = true;
-                changed = true;
-            }
-
-            if changed {
-                cx.notify();
-            }
-        })
-        .detach();
-
-        // Subscribe to profile select events
-        cx.subscribe(
-            &profile_select,
-            |this: &mut Self, _, event: &SelectEvent<SearchableVec<ProfileItem>>, cx| {
-                if let SelectEvent::Confirm(Some(value)) = event {
-                    if let Some(profile_id) = value {
-                        // Selected an existing profile
-                        this.state.update(cx, |state, cx| {
-                            state.select_db_profile(*profile_id, cx);
-                        });
-                    } else {
-                        // Selected "Create New Profile..."
-                        this.state.update(cx, |state, cx| {
-                            if !state.is_profile_settings_open {
-                                state.toggle_profile_settings(cx);
-                            }
-                        });
-                    }
-                }
-            },
-        )
         .detach();
 
         cx.observe(&state, |this, app, cx| {
@@ -1000,22 +836,6 @@ impl Render for ChatView {
         }
         let theme = cx.theme().clone();
 
-        if self.profiles_need_sync {
-            let items = SearchableVec::new(self.cached_profiles.clone());
-            self.profile_select.update(cx, |select, cx| {
-                select.set_items(items, window, cx);
-            });
-            self.profiles_need_sync = false;
-        }
-
-        if self.selection_need_sync {
-            let active_id = self.active_profile_id;
-            self.profile_select.update(cx, |select, cx| {
-                select.set_selected_value(&active_id, window, cx);
-            });
-            self.selection_need_sync = false;
-        }
-
         let app = self.state.clone();
         let view = cx.entity();
         let (find_current, find_total, find_has_query) = self.transcript.read(cx).find_status();
@@ -1043,16 +863,6 @@ impl Render for ChatView {
                             action.mode.clone(),
                             cx,
                         );
-                    });
-                }
-            })
-            .on_action({
-                let state = self.state.clone();
-                move |action: &crate::actions::RegenerateAudio,
-                      _window: &mut Window,
-                      cx: &mut App| {
-                    state.update(cx, |state, cx| {
-                        state.regenerate_audio(action.message_id.clone(), action.text.clone(), cx);
                     });
                 }
             })

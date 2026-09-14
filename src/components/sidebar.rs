@@ -48,10 +48,7 @@ impl SidebarRev {
             expanded_width: state.sidebar_expanded_width.round() as i32,
             theme_mode: state.theme_mode.clone(),
             active_id: state.active_coworker_id.clone(),
-            any_modal: state.is_voice_mode_open
-                || state.is_app_settings_open
-                || state.is_profile_settings_open
-                || state.is_credentials_modal_open,
+            any_modal: state.is_voice_mode_open || state.is_app_settings_open,
             coworkers: state
                 .ranked_coworkers()
                 .into_iter()
@@ -238,9 +235,7 @@ impl Render for SidebarView {
         let conversations = state.conversations.clone();
         let active_coworker = state.active_coworker_id.clone();
         let hidden_ids = state.hidden_coworker_ids.clone();
-        let any_modal_open = state.is_voice_mode_open
-            || state.is_app_settings_open
-            || state.is_profile_settings_open;
+        let any_modal_open = state.is_voice_mode_open || state.is_app_settings_open;
         let account_label = state
             .account
             .as_ref()

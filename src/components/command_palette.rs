@@ -202,23 +202,22 @@ impl CommandPalette {
             PaletteItem::Bot { id, .. } | PaletteItem::Message { coworker_id: id, .. } => {
                 self.state.update(cx, |state, cx| {
                     state.select_coworker(id, cx);
-                    state.close_command_palette(cx);
                 });
             }
             PaletteItem::Action { action, .. } => {
-                self.state.update(cx, |state, cx| {
-                    state.close_command_palette(cx);
-                    match action {
-                        PaletteAction::OpenSettings(tab) => state.open_app_settings(tab, cx),
-                        PaletteAction::SetTheme(mode) => state.set_theme_mode(mode, cx),
-                        PaletteAction::ToggleSidebar => state.toggle_sidebar(cx),
-                        PaletteAction::ToggleMiniSidebar => state.toggle_mini_sidebar(cx),
-                        PaletteAction::ShowAgentSettings => state.show_agent_settings(cx),
-                        PaletteAction::ShowComputer => state.show_computer_pane(cx),
-                    }
+                self.state.update(cx, |state, cx| match action {
+                    PaletteAction::OpenSettings(tab) => state.open_app_settings(tab, cx),
+                    PaletteAction::SetTheme(mode) => state.set_theme_mode(mode, cx),
+                    PaletteAction::ToggleSidebar => state.toggle_sidebar(cx),
+                    PaletteAction::ToggleMiniSidebar => state.toggle_mini_sidebar(cx),
+                    PaletteAction::ShowAgentSettings => state.show_agent_settings(cx),
+                    PaletteAction::ShowComputer => state.show_computer_pane(cx),
                 });
             }
         }
+        // Close via the Root action so focus leaves the (now unmounted) search
+        // field. Toggling the flag alone leaves Cmd+K dead until a click.
+        cx.dispatch_action(&CloseCommandPalette);
     }
 
     fn items(&self, query: &str, cx: &App) -> Vec<PaletteItem> {

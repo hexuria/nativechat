@@ -1,5 +1,3 @@
-use crate::services::gemini_client::GeminiLiveClient;
-use base64::{Engine as _, engine::general_purpose};
 use coreaudio_sys as sys;
 use std::ffi::c_void;
 use std::ptr;
@@ -17,19 +15,11 @@ pub struct AudioInput {
 struct InputContext {
     unit: sys::AudioUnit, // Added to store the AudioUnit reference
     amplitude: Arc<AtomicU32>,
-    gemini_client: Option<GeminiLiveClient>,
-    buffer: Vec<i16>,
 }
 
 impl AudioInput {
-    pub fn new(
-        amplitude: Arc<AtomicU32>,
-        gemini_client: Option<GeminiLiveClient>,
-    ) -> anyhow::Result<Self> {
-        println!(
-            "[AudioInput] Creating new VoiceProcessingIO instance (sys). Has client: {}",
-            gemini_client.is_some()
-        );
+    pub fn new(amplitude: Arc<AtomicU32>) -> anyhow::Result<Self> {
+        println!("[AudioInput] Creating new VoiceProcessingIO instance (sys)");
 
         unsafe {
             // 1. Describe the Audio Component (VoiceProcessingIO)
@@ -130,8 +120,6 @@ impl AudioInput {
             let mut context = Box::new(InputContext {
                 unit: ptr::null_mut(), // Initialize as null, update later
                 amplitude,
-                gemini_client,
-                buffer: Vec::with_capacity(1600),
             });
 
             // Update unit in context
@@ -234,31 +222,6 @@ extern "C" fn input_callback(
         context
             .amplitude
             .store(boosted.to_bits(), Ordering::Relaxed);
-
-        // 2. Gemini Client
-        if let Some(client) = &context.gemini_client {
-            // Resample 48k -> 16k (Decimate by 3)
-            for chunk in samples.chunks(3) {
-                let sum: f32 = chunk.iter().sum();
-                let avg = sum / chunk.len() as f32;
-
-                let s = avg.clamp(-1.0, 1.0);
-                let val = (s * 32767.0) as i16;
-                context.buffer.push(val);
-            }
-
-            if context.buffer.len() >= 1600 {
-                // 1600 samples = 100ms at 16kHz
-                let mut pcm_bytes = Vec::with_capacity(context.buffer.len() * 2); // 2 bytes per i16
-                for val in &context.buffer {
-                    pcm_bytes.extend_from_slice(&val.to_le_bytes());
-                }
-
-                let base64_audio = general_purpose::STANDARD.encode(&pcm_bytes);
-                client.send_audio(base64_audio);
-                context.buffer.clear();
-            }
-        }
 
         0 // noErr
     }

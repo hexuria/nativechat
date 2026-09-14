@@ -16,8 +16,6 @@ pub mod ids {
     pub const NAV_TOGGLE: &str = "nav-toggle-sidebar";
     pub const FOOTER_THEME: &str = "footer-theme";
     pub const FOOTER_ACCOUNT: &str = "footer-account";
-    pub const FOOTER_CREDENTIALS: &str = "footer-credentials";
-    pub const FOOTER_PROFILE: &str = "footer-profile";
     pub const FOOTER_SIGN_OUT: &str = "footer-sign-out";
     pub const COMPOSER: &str = "composer";
     pub const PAGE_LOGIN: &str = "page-login";
@@ -25,10 +23,7 @@ pub mod ids {
     pub const LOGIN_PASSWORD: &str = "login-password";
     pub const LOGIN_SUBMIT: &str = "login-submit";
     pub const LOGIN_ERROR: &str = "login-error";
-    pub const PROFILE_SELECT: &str = "profile-select";
     pub const DIALOG_ACCOUNT: &str = "dialog-account";
-    pub const DIALOG_PROFILE: &str = "dialog-profile";
-    pub const DIALOG_CREDENTIALS: &str = "dialog-credentials";
     pub const DIALOG_VOICE: &str = "dialog-voice";
     pub const HEADER_SETTINGS: &str = "header-settings";
     pub const AGENT_SETTINGS: &str = "agent-settings";
@@ -50,8 +45,6 @@ pub enum Command {
     ToggleMiniSidebar,
     ToggleTheme,
     ToggleAccount,
-    ToggleCredentials,
-    ToggleProfile,
     ToggleAgentSettings,
     ToggleModelPicker,
     SetModelPicker(bool),
@@ -75,8 +68,6 @@ impl Command {
             Self::ToggleMiniSidebar => state.toggle_mini_sidebar(cx),
             Self::ToggleTheme => state.toggle_theme(cx),
             Self::ToggleAccount => state.toggle_account_settings(cx),
-            Self::ToggleCredentials => state.toggle_credentials_modal(cx),
-            Self::ToggleProfile => state.toggle_profile_settings(cx),
             Self::ToggleAgentSettings => state.toggle_agent_settings(cx),
             Self::ToggleModelPicker => {
                 let open = !state.model_picker_open;
@@ -125,10 +116,7 @@ pub struct NativeChatHost {
     sidebar_collapsed: bool,
     theme_mode: String,
     sessions: Vec<SessionSnap>,
-    profile_name: Option<String>,
     account_open: bool,
-    profile_open: bool,
-    credentials_open: bool,
     voice_open: bool,
     signed_in: bool,
     account_label: String,
@@ -167,19 +155,12 @@ impl NativeChatHost {
                 })
                 .collect()
         };
-        let profile_name = state
-            .active_profile_id
-            .and_then(|id| state.db_profiles.iter().find(|p| p.id == id))
-            .map(|p| p.name.clone());
         Self {
             ready: true,
             sidebar_collapsed: state.sidebar_collapsed,
             theme_mode: state.theme_mode.clone(),
             sessions,
-            profile_name,
             account_open: state.is_app_settings_open,
-            profile_open: state.is_profile_settings_open,
-            credentials_open: state.is_credentials_modal_open,
             voice_open: state.is_voice_mode_open,
             signed_in: state.is_signed_in(),
             account_label: state
@@ -280,18 +261,9 @@ impl NativeChatHost {
                 ids::FOOTER_ACCOUNT,
                 self.account_label.clone(),
             ))
-            .with_child(UiNode::button(ids::FOOTER_CREDENTIALS, "Credentials"))
-            .with_child(UiNode::button(ids::FOOTER_PROFILE, "Profile Settings"))
             .with_child(UiNode::button(ids::FOOTER_SIGN_OUT, "Sign Out"));
 
         let mut page = UiNode::page(ids::PAGE, "Chat")
-            .with_child(
-                UiNode::new(ids::PROFILE_SELECT, "combobox", "Select Profile").with_value(
-                    self.profile_name
-                        .clone()
-                        .unwrap_or_else(|| "Select Profile".into()),
-                ),
-            )
             .with_child(UiNode::textbox(ids::COMPOSER, "Type a message..."))
             .with_child(UiNode::new(
                 "transcript-tail",
@@ -317,14 +289,6 @@ impl NativeChatHost {
                     .with_child(
                         UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
                             .with_visible(self.account_open),
-                    )
-                    .with_child(
-                        UiNode::dialog(ids::DIALOG_PROFILE, "Profile Settings")
-                            .with_visible(self.profile_open),
-                    )
-                    .with_child(
-                        UiNode::dialog(ids::DIALOG_CREDENTIALS, "Credentials")
-                            .with_visible(self.credentials_open),
                     )
                     .with_child(
                         UiNode::dialog(ids::DIALOG_VOICE, "Voice Mode").with_visible(self.voice_open),
@@ -358,10 +322,6 @@ impl NativeChatHost {
             Command::ToggleTheme
         } else if target == ids::FOOTER_ACCOUNT {
             Command::ToggleAccount
-        } else if target == ids::FOOTER_CREDENTIALS {
-            Command::ToggleCredentials
-        } else if target == ids::FOOTER_PROFILE {
-            Command::ToggleProfile
         } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
             Command::ToggleAgentSettings
         } else if target == "agent-model-field" || target == "agent-model-dismiss" {
@@ -412,8 +372,6 @@ impl NativeChatHost {
             },
             "theme.toggle" => Command::ToggleTheme,
             "settings.account" => Command::ToggleAccount,
-            "settings.credentials" => Command::ToggleCredentials,
-            "settings.profile" => Command::ToggleProfile,
             "auth.login" => {
                 let email = args
                     .get("email")

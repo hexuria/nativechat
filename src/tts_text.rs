@@ -23,10 +23,6 @@ pub fn looks_like_markdown(text: &str) -> bool {
         || text.contains("\n1. ")
 }
 
-pub fn is_live_tts_model(model_id: &str) -> bool {
-    model_id.to_lowercase().contains("native-audio")
-}
-
 pub fn map_utf16_range_to_utf8(text: &str, range: Range<usize>) -> Option<Range<usize>> {
     let mut utf16_index = 0;
     let mut utf8_start = None;
@@ -252,16 +248,6 @@ mod tests {
         assert_eq!(map_utf16_range_to_utf8("", 0..0), Some(0..0));
         assert_eq!(map_utf16_range_to_utf8("ab", 2..2), Some(2..2));
         assert_eq!(map_utf16_range_to_utf8("ab", 0..2), Some(0..2));
-    }
-
-    #[test]
-    fn live_model_gate() {
-        assert!(is_live_tts_model(
-            "gemini-2.5-flash-native-audio-preview-09-2025"
-        ));
-        assert!(is_live_tts_model("models/foo-native-audio"));
-        assert!(!is_live_tts_model("gemini-2.0-flash"));
-        assert!(!is_live_tts_model("gemini-2.0-flash-exp"));
     }
 
     #[test]

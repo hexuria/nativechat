@@ -9,11 +9,7 @@ use crate::opengrok::{
     activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue,
     OpenGrokClient, ProfileUpdate,
 };
-use crate::services::database::{
-    Credential as DbCredential, DatabaseService, Profile as DbProfile,
-};
-use crate::services::gemini_client::GeminiLiveClient;
-use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
+use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
@@ -466,13 +462,6 @@ pub enum AuthStatus {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Profile {
-    pub id: usize,
-    pub name: String,
-    pub avatar: Option<String>, // Path or IconName
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct AppCapability {
     pub name: String,      // The tag name (e.g., "Photos")
     pub label: String,     // The menu label (e.g., "Add photos & files")
@@ -495,8 +484,6 @@ pub struct AppState {
     pub is_voice_muted: bool,
     pub voice_status: VoiceStatus,
     pub more_menu_open: bool,
-    pub is_profile_settings_open: bool,
-    pub is_credentials_modal_open: bool,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -504,9 +491,6 @@ pub struct AppState {
     pub app_settings_tab: AppSettingsTab,
     pub submit_chord: SubmitChord,
     pub audio_input: Option<AudioInput>,
-    pub gemini_client: Option<GeminiLiveClient>,
-    pub profiles: Vec<Profile>,
-    pub selected_profile: Option<Profile>,
     pub available_apps: Vec<String>,
     pub selected_apps: Vec<String>,
     pub capabilities: Vec<AppCapability>,
@@ -515,22 +499,14 @@ pub struct AppState {
     pub sidebar_expanded_width: f32,
     pub sidebar_responsive: ResponsiveCollapse,
     pub auto_collapsed: bool,
-    pub model_registry: Arc<ModelRegistry>,
-    pub available_models: Vec<ModelProfile>,
     pub database_service: Option<DatabaseService>,
     pub config: Option<Config>,
     pub is_ai_responding: bool,
-    // Database profile and credential fields
-    pub db_profiles: Vec<DbProfile>,
-    pub db_credentials: Vec<DbCredential>,
-    pub active_profile_id: Option<i64>,
-    // Debug mode for markdown rendering
     pub debug_markdown_disabled: bool,
     pub tts_service: Option<TtsService>,
     tts_initing: bool,
-    pending_read_aloud: Option<(String, String, TtsSource)>,
+    pending_read_aloud: Option<(String, String)>,
     pub native_tts: SourceTtsState,
-    pub ai_tts: SourceTtsState,
     pub opengrok: Option<OpenGrokClient>,
     pub account: Option<Account>,
     pub auth_status: AuthStatus,
@@ -572,20 +548,6 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let profiles = vec![
-            Profile {
-                id: 1,
-                name: "John Doe".to_string(),
-                avatar: None,
-            },
-            Profile {
-                id: 2,
-                name: "Jane Smith".to_string(),
-                avatar: None,
-            },
-        ];
-        let selected_profile = profiles.first().cloned();
-
         let available_apps = vec![
             "Canva".to_string(),
             "Figma".to_string(),
@@ -688,8 +650,6 @@ impl AppState {
             is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
-            is_profile_settings_open: false,
-            is_credentials_modal_open: false,
             is_app_settings_open: false,
             bot_finder_open: false,
             command_palette_open: false,
@@ -697,9 +657,6 @@ impl AppState {
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
             audio_input: None,
-            gemini_client: None,
-            profiles,
-            selected_profile,
             available_apps,
             selected_apps: Vec::new(),
             capabilities,
@@ -708,20 +665,14 @@ impl AppState {
             sidebar_expanded_width: SIDEBAR_EXPANDED,
             sidebar_responsive: ResponsiveCollapse::default(),
             auto_collapsed: false,
-            model_registry: Arc::new(ModelRegistry::new()),
-            available_models: Vec::new(),
             database_service: None,
             config: None,
             is_ai_responding: false,
-            db_profiles: Vec::new(),
-            db_credentials: Vec::new(),
-            active_profile_id: None,
             debug_markdown_disabled: false,
             tts_service: None,
             tts_initing: false,
             pending_read_aloud: None,
             native_tts: SourceTtsState::default(),
-            ai_tts: SourceTtsState::default(),
             opengrok: None,
             account: None,
             auth_status: AuthStatus::SignedOut,
@@ -747,16 +698,6 @@ impl AppState {
             message_reactions: HashMap::new(),
             emoji_picker: None,
         };
-        // Synchronously load cached state to avoid startup delay
-        if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
-            println!(
-                "Loaded cached state: ID {:?}, {} profiles",
-                cached_id,
-                cached_profiles.len()
-            );
-            state.active_profile_id = cached_id;
-            state.db_profiles = cached_profiles;
-        }
 
         state
     }
@@ -1186,14 +1127,11 @@ impl AppState {
     }
 
     pub fn delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
-        if self.native_tts.message_id.as_deref() == Some(message_id)
-            || self.ai_tts.message_id.as_deref() == Some(message_id)
-        {
+        if self.native_tts.message_id.as_deref() == Some(message_id) {
             if let Some(service) = &self.tts_service {
-                let _ = service.stop();
+                service.stop_native();
             }
             self.native_tts = SourceTtsState::default();
-            self.ai_tts = SourceTtsState::default();
         }
         if let Some(id) = &self.active_conversation_id {
             if let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id) {
@@ -2006,214 +1944,10 @@ impl AppState {
         }
     }
 
-    /// Load all profiles and credentials from the database into AppState.
-    pub async fn load_profiles_and_credentials(
-        db: &DatabaseService,
-    ) -> anyhow::Result<(Vec<DbProfile>, Vec<DbCredential>)> {
-        let profiles = db.get_profiles().await?;
-        let credentials = db.get_credentials().await?;
-        Ok((profiles, credentials))
-    }
-
-    /// Set the loaded profiles and credentials into AppState.
-    pub fn set_profiles_and_credentials(
-        &mut self,
-        profiles: Vec<DbProfile>,
-        credentials: Vec<DbCredential>,
-        cx: &mut Context<Self>,
-    ) {
-        self.db_profiles = profiles.clone();
-        self.db_credentials = credentials;
-
-        // Update cache with fresh data from DB
-        Self::save_cached_state(self.active_profile_id, self.db_profiles.clone());
-
-        cx.notify();
-    }
-
-    /// Reload profiles and credentials from the database and update the state.
-    /// This ensures that any changes made (e.g., in settings) are reflected globally.
-    pub fn reload_from_db(&mut self, cx: &mut Context<Self>) {
-        if let Some(db) = self.database_service.clone() {
-            cx.spawn(async move |this, cx| {
-                    if let Ok((profiles, credentials)) =
-                        Self::load_profiles_and_credentials(&db).await
-                    {
-                        this.update(cx, |state, cx| {
-                            state.set_profiles_and_credentials(profiles, credentials, cx);
-                        })
-                        .ok();
-                    }
-                })
-            .detach();
-        }
-    }
-
-    /// Select a database profile by ID and update the active profile.
-    /// Persists the selection to the settings table.
-    /// Requirements: 2.2, 5.1
-    pub fn select_db_profile(&mut self, profile_id: i64, cx: &mut Context<Self>) {
-        // Verify the profile exists before setting
-        if self.db_profiles.iter().any(|p| p.id == profile_id) {
-            // Stop any active TTS
-            self.stop_read_aloud(cx);
-
-            self.active_profile_id = Some(profile_id);
-
-            // Persist to local cache immediately
-            Self::save_cached_state(Some(profile_id), self.db_profiles.clone());
-
-            // Persist the selection asynchronously to DB
-            if let Some(db) = self.database_service.clone() {
-                cx.spawn(async move |_this, _cx| {
-                        if let Err(e) = Self::persist_selected_profile(&db, Some(profile_id)).await
-                        {
-                            eprintln!("Failed to persist selected profile: {}", e);
-                        }
-                    },
-                )
-                .detach();
-            }
-
-            cx.notify();
-        }
-    }
-
-    /// Get the currently active database profile.
-    pub fn active_profile(&self) -> Option<&DbProfile> {
-        self.active_profile_id
-            .and_then(|id| self.db_profiles.iter().find(|p| p.id == id))
-    }
-
-    /// Get the text credential for the active profile.
-    pub fn active_credential(&self) -> Option<&DbCredential> {
-        self.active_profile()
-            .and_then(|profile| profile.text_credential_id)
-            .and_then(|cred_id| self.db_credentials.iter().find(|c| c.id == cred_id))
-    }
-
-    /// Persist the selected profile ID to the settings table.
-    /// Requirements: 5.1
-    pub async fn persist_selected_profile(
-        db: &DatabaseService,
-        profile_id: Option<i64>,
-    ) -> anyhow::Result<()> {
-        const SETTING_KEY: &str = "selected_profile_id";
-        match profile_id {
-            Some(id) => {
-                db.set_setting(SETTING_KEY, &id.to_string()).await?;
-            }
-            None => {
-                db.delete_setting(SETTING_KEY).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Save the selected profile ID and profile list to a local JSON file for instant startup.
-    pub fn save_cached_state(profile_id: Option<i64>, profiles: Vec<DbProfile>) {
-        use std::fs;
-        use std::path::PathBuf;
-
-        // Determine config directory
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("nativechat");
-
-        if !config_dir.exists() {
-            let _ = fs::create_dir_all(&config_dir);
-        }
-
-        let cache_file = config_dir.join("last_profile.json");
-
-        #[derive(serde::Serialize)]
-        struct CachedState {
-            profile_id: Option<i64>,
-            profiles: Vec<DbProfile>,
-        }
-
-        let data = CachedState {
-            profile_id,
-            profiles,
-        };
-
-        if let Ok(json) = serde_json::to_string(&data) {
-            let _ = fs::write(cache_file, json);
-        }
-    }
-
-    /// Load the cached profile ID and profile list from the local JSON file.
-    pub fn load_cached_state() -> Option<(Option<i64>, Vec<DbProfile>)> {
-        use std::fs;
-        use std::path::PathBuf;
-
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("nativechat");
-        let cache_file = config_dir.join("last_profile.json");
-
-        #[derive(serde::Deserialize)]
-        struct CachedState {
-            profile_id: Option<i64>,
-            profiles: Vec<DbProfile>,
-        }
-
-        if let Ok(content) = fs::read_to_string(cache_file) {
-            if let Ok(data) = serde_json::from_str::<CachedState>(&content) {
-                return Some((data.profile_id, data.profiles));
-            }
-        }
-
-        None
-    }
-
-    /// Restore the selected profile from settings on startup.
-    /// Validates that the profile still exists, clears if not.
-    /// Requirements: 5.2, 5.3
-    pub async fn restore_selected_profile(
-        db: &DatabaseService,
-        profiles: &[DbProfile],
-    ) -> anyhow::Result<Option<i64>> {
-        const SETTING_KEY: &str = "selected_profile_id";
-
-        if let Some(value) = db.get_setting(SETTING_KEY).await? {
-            if let Ok(profile_id) = value.parse::<i64>() {
-                // Validate profile still exists
-                if profiles.iter().any(|p| p.id == profile_id) {
-                    return Ok(Some(profile_id));
-                } else {
-                    // Profile no longer exists, clear the setting
-                    db.delete_setting(SETTING_KEY).await?;
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn fetch_models(&mut self, api_keys: HashMap<Provider, String>, cx: &mut Context<Self>) {
-        let registry = self.model_registry.clone();
-        cx.spawn(async move |this, cx| {
-                let models = registry.get_all_models(&api_keys).await;
-                this.update(cx, |state: &mut AppState, cx| {
-                    state.available_models = models;
-                    cx.notify();
-                })
-                .ok();
-            })
-        .detach();
-    }
-
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
         self.active_conversation_id = Some(conversation_id.clone());
         self.load_session_messages(conversation_id, cx);
         cx.notify();
-    }
-
-    pub fn select_profile(&mut self, profile_id: usize, cx: &mut Context<Self>) {
-        if let Some(profile) = self.profiles.iter().find(|p| p.id == profile_id) {
-            self.selected_profile = Some(profile.clone());
-            cx.notify();
-        }
     }
 
     pub fn select_app(&mut self, app_name: String, cx: &mut Context<Self>) {
@@ -2644,92 +2378,28 @@ impl AppState {
         self.open_app_settings(AppSettingsTab::Profile, cx);
     }
 
-    pub fn toggle_profile_settings(&mut self, cx: &mut Context<Self>) {
-        self.is_profile_settings_open = !self.is_profile_settings_open;
-        cx.notify();
-    }
-
-    pub fn toggle_credentials_modal(&mut self, cx: &mut Context<Self>) {
-        self.is_credentials_modal_open = !self.is_credentials_modal_open;
-        cx.notify();
-    }
-
     pub fn start_voice_mode(&mut self, cx: &mut Context<Self>) {
         self.is_voice_mode_open = true;
         self.voice_status = VoiceStatus::Connecting;
         cx.notify();
 
-        if self.gemini_client.is_some() {
-            println!("Gemini client already connected, ignoring start request");
-            self.voice_status = VoiceStatus::Connected;
-            return;
-        }
-
-        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-        if api_key.is_empty() {
-            eprintln!("GEMINI_API_KEY not set");
-            self.voice_status = VoiceStatus::Error("API Key Missing".to_string());
-            // Still start audio input for local viz, but without Gemini
-            match AudioInput::new(self.amplitude.clone(), None) {
-                Ok(input) => self.audio_input = Some(input),
-                Err(e) => eprintln!("Failed to start local audio input: {}", e),
+        match AudioInput::new(self.amplitude.clone()) {
+            Ok(input) => {
+                self.audio_input = Some(input);
+                self.voice_status = VoiceStatus::Connected;
             }
-            return;
+            Err(e) => {
+                eprintln!("Failed to start local audio input: {}", e);
+                self.voice_status = VoiceStatus::Error("Mic Error".to_string());
+            }
         }
-
-        let ai_amplitude = self.ai_amplitude.clone();
-        let amplitude = self.amplitude.clone();
-
-        cx.spawn(async move |this, cx| {
-                println!("Connecting to Gemini...");
-                match GeminiLiveClient::connect(api_key, ai_amplitude) {
-                    Ok(client) => {
-                        println!("Connected to Gemini!");
-                        let _ = this.update(cx, |state, _cx| {
-                            state.gemini_client = Some(client.clone());
-                            state.voice_status = VoiceStatus::Connected;
-
-                            // Restart audio input with the connected client
-                            match AudioInput::new(amplitude, Some(client)) {
-                                Ok(input) => {
-                                    state.audio_input = Some(input);
-                                    println!("Audio input started with Gemini client");
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to start audio input: {}", e);
-                                    state.voice_status =
-                                        VoiceStatus::Error("Mic Error".to_string());
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to connect to Gemini: {}", e);
-                        let _ = this.update(cx, |state, _cx| {
-                            state.voice_status =
-                                VoiceStatus::Error("Connection Failed".to_string());
-                            // Fallback to local audio if connection fails
-                            match AudioInput::new(amplitude, None) {
-                                Ok(input) => state.audio_input = Some(input),
-                                Err(e) => eprintln!("Failed to start local audio input: {}", e),
-                            }
-                        });
-                    }
-                }
-            })
-        .detach();
+        cx.notify();
     }
 
     pub fn stop_voice_mode(&mut self, cx: &mut Context<Self>) {
         self.is_voice_mode_open = false;
         self.voice_status = VoiceStatus::Disconnected;
-
-        if let Some(client) = &self.gemini_client {
-            client.disconnect();
-        }
-        self.gemini_client = None;
-        self.audio_input = None; // Drops AudioInput, stops capture
-
+        self.audio_input = None;
         cx.notify();
     }
 
@@ -2742,33 +2412,20 @@ impl AppState {
             return;
         }
         self.tts_initing = true;
-        let speaking = self.is_ai_speaking.clone();
-        let amplitude = self.ai_amplitude.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let service = cx
                 .background_executor()
                 .spawn(async move {
-                    TtsService::new(speaking, amplitude).map(|service| {
-                        service.warm_native();
-                        service
-                    })
+                    let service = TtsService::new();
+                    service.warm_native();
+                    service
                 })
                 .await;
             let _ = this.update(cx, |state, cx| {
                 state.tts_initing = false;
-                match result {
-                    Ok(service) => {
-                        state.tts_service = Some(service);
-                        if let Some((text, message_id, source)) = state.pending_read_aloud.take() {
-                            state.read_aloud(text, message_id, source, cx);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Failed to initialize TTS service: {error}");
-                        state.pending_read_aloud = None;
-                        state.native_tts.is_loading = false;
-                        state.ai_tts.is_loading = false;
-                    }
+                state.tts_service = Some(service);
+                if let Some((text, message_id)) = state.pending_read_aloud.take() {
+                    state.read_aloud(text, message_id, TtsSource::Native, cx);
                 }
                 cx.notify();
             });
@@ -2783,137 +2440,48 @@ impl AppState {
         source: TtsSource,
         cx: &mut Context<Self>,
     ) {
+        let _ = source;
         if self.tts_service.is_none() {
-            self.pending_read_aloud = Some((text.clone(), message_id.clone(), source.clone()));
-            match source {
-                TtsSource::Native => {
-                    self.native_tts.message_id = Some(message_id);
-                    self.native_tts.is_loading = true;
-                    self.native_tts.is_paused = false;
-                }
-                TtsSource::AI => {
-                    self.ai_tts.message_id = Some(message_id);
-                    self.ai_tts.is_loading = true;
-                    self.ai_tts.is_paused = false;
-                }
-            }
+            self.pending_read_aloud = Some((text.clone(), message_id.clone()));
+            self.native_tts.message_id = Some(message_id);
+            self.native_tts.is_loading = true;
+            self.native_tts.is_paused = false;
             self.ensure_tts_service(cx);
             cx.notify();
             return;
         }
 
         if let Some(service) = &self.tts_service {
-            match source {
-                TtsSource::Native => {
-                    // Pause AI if running
-                    if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
-                        service.pause();
-                        self.ai_tts.is_paused = true;
-                    }
+            self.native_tts.message_id = Some(message_id.clone());
+            self.native_tts.is_paused = false;
+            self.native_tts.is_loading = false;
+            cx.notify();
 
-                    self.native_tts.message_id = Some(message_id.clone());
-                    self.native_tts.is_paused = false;
-                    self.native_tts.is_loading = false;
-                    cx.notify();
+            let service = service.clone();
+            let message_id = message_id.clone();
+            let text = text.clone();
 
-                    let service = service.clone();
-                    let message_id = message_id.clone();
-                    let text = text.clone();
-
-                    if service.start_speaking_native(&text, &message_id) {
-                        cx.spawn(async move |this, cx| {
-                            service.wait_until_finished_native().await;
-                            if let Some(this) = this.upgrade() {
-                                let _ = this.update(cx, |state, cx| {
-                                    if state.native_tts.message_id.as_ref() == Some(&message_id) {
-                                        state.native_tts.message_id = None;
-                                        cx.notify();
-                                    }
-                                });
+            if service.start_speaking_native(&text, &message_id) {
+                cx.spawn(async move |this, cx| {
+                    service.wait_until_finished_native().await;
+                    if let Some(this) = this.upgrade() {
+                        let _ = this.update(cx, |state, cx| {
+                            if state.native_tts.message_id.as_ref() == Some(&message_id) {
+                                state.native_tts.message_id = None;
+                                cx.notify();
                             }
-                        })
-                        .detach();
+                        });
                     }
-                }
-                TtsSource::AI => {
-                    // Pause Native if running
-                    if self.native_tts.message_id.is_some() && !self.native_tts.is_paused {
-                        service.pause_native();
-                        self.native_tts.is_paused = true;
-                    }
-
-                    self.ai_tts.message_id = Some(message_id.clone());
-                    self.ai_tts.is_loading = true;
-                    self.ai_tts.is_paused = false;
-                    cx.notify();
-
-                    // Get Config
-                    let tts_model_id = self
-                        .active_profile()
-                        .and_then(|p| p.tts_model_id.clone())
-                        .unwrap_or_else(|| "native".to_string());
-                    let tts_voice = self.active_profile().and_then(|p| p.tts_voice.clone());
-                    let api_key = self
-                        .active_credential()
-                        .map(|c| c.api_key.clone())
-                        .or_else(|| self.config.as_ref().and_then(|c| c.gemini_api_key.clone()))
-                        .unwrap_or_default();
-
-                    let service = service.clone();
-                    let message_id = message_id.clone();
-                    let text = text.clone();
-
-                    cx.spawn(async move |this, cx| {
-                            let start_result = service
-                                .start_speaking(
-                                    &text,
-                                    &message_id,
-                                    &tts_model_id,
-                                    &api_key,
-                                    &tts_voice,
-                                )
-                                .await;
-                            match start_result {
-                                Ok(true) => {
-                                    // Speaking started
-                                    this.update(cx, |state, cx| {
-                                        state.ai_tts.is_loading = false;
-                                        cx.notify();
-                                    })
-                                    .ok();
-
-                                    service.wait_until_finished_ai().await;
-
-                                    this.update(cx, |state, cx| {
-                                        if state.ai_tts.message_id.as_ref() == Some(&message_id) {
-                                            state.ai_tts.message_id = None;
-                                            cx.notify();
-                                        }
-                                    })
-                                    .ok();
-                                }
-                                Ok(false) | Err(_) => {
-                                    this.update(cx, |state, cx| {
-                                        state.ai_tts.message_id = None;
-                                        state.ai_tts.is_loading = false;
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                }
-                            }
-                        })
-                    .detach();
-                }
+                })
+                .detach();
             }
         }
     }
 
     pub fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
         if let Some(service) = &self.tts_service {
-            let _ = service.stop_native();
-            let _ = service.stop();
+            service.stop_native();
             self.native_tts = SourceTtsState::default();
-            self.ai_tts = SourceTtsState::default();
             cx.notify();
         }
     }
@@ -2924,10 +2492,6 @@ impl AppState {
                 service.pause_native();
                 self.native_tts.is_paused = true;
             }
-            if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
-                service.pause();
-                self.ai_tts.is_paused = true;
-            }
             cx.notify();
         }
     }
@@ -2937,10 +2501,6 @@ impl AppState {
             if self.native_tts.message_id.is_some() && self.native_tts.is_paused {
                 service.resume_native();
                 self.native_tts.is_paused = false;
-            }
-            if self.ai_tts.message_id.is_some() && self.ai_tts.is_paused {
-                service.resume();
-                self.ai_tts.is_paused = false;
             }
             cx.notify();
         }
@@ -2959,74 +2519,22 @@ impl AppState {
         mode: TtsSource,
         cx: &mut Context<Self>,
     ) {
+        let _ = mode;
         if let Some(service) = &self.tts_service {
-            match mode {
-                TtsSource::Native => {
-                    // Check if Native is active on this message
-                    if self.native_tts.message_id.as_ref() == Some(&message_id) {
-                        if self.native_tts.is_paused {
-                            // Resume Native
-                            // Ensure AI is paused first
-                            if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
-                                service.pause();
-                                self.ai_tts.is_paused = true;
-                            }
-                            service.resume_native();
-                            self.native_tts.is_paused = false;
-                        } else {
-                            // Pause Native
-                            service.pause_native();
-                            self.native_tts.is_paused = true;
-                        }
-                        cx.notify();
-                    } else {
-                        self.read_aloud(text, message_id, TtsSource::Native, cx);
-                    }
+            if self.native_tts.message_id.as_ref() == Some(&message_id) {
+                if self.native_tts.is_paused {
+                    service.resume_native();
+                    self.native_tts.is_paused = false;
+                } else {
+                    service.pause_native();
+                    self.native_tts.is_paused = true;
                 }
-                TtsSource::AI => {
-                    // Check if AI is active on this message
-                    if self.ai_tts.message_id.as_ref() == Some(&message_id) {
-                        if self.ai_tts.is_paused {
-                            // Resume AI
-                            // Ensure Native is paused
-                            // Ensure Native is stopped completely so highlight color reverts to AI
-                            if self.native_tts.message_id.is_some() {
-                                service.stop_native();
-                                self.native_tts = SourceTtsState::default();
-                            }
-                            service.resume();
-                            self.ai_tts.is_paused = false;
-                        } else {
-                            // Pause AI
-                            service.pause();
-                            self.ai_tts.is_paused = true;
-                        }
-                        cx.notify();
-                    } else {
-                        self.read_aloud(text, message_id, TtsSource::AI, cx);
-                    }
-                }
+                cx.notify();
+            } else {
+                self.read_aloud(text, message_id, TtsSource::Native, cx);
             }
         } else {
-            // Initialize if needed
-            self.read_aloud(text, message_id, mode, cx);
+            self.read_aloud(text, message_id, TtsSource::Native, cx);
         }
-    }
-
-    pub fn regenerate_audio(&mut self, message_id: String, text: String, cx: &mut Context<Self>) {
-        // Clear cache helper
-        if let Some(path) = TtsService::get_cache_path(&message_id) {
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-
-        // Force loading state immediately for reactivity
-        self.ai_tts.message_id = Some(message_id.clone());
-        self.ai_tts.is_loading = true;
-        self.ai_tts.is_paused = false;
-        cx.notify();
-
-        self.read_aloud(text, message_id, TtsSource::AI, cx);
     }
 }
