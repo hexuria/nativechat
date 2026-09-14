@@ -43,7 +43,7 @@ pub struct MessageInput {
     // Cached state to avoid re-rendering on every AppState change
     selected_apps: Vec<String>,
     is_voice_mode_open: bool,
-    is_account_settings_open: bool,
+    is_app_settings_open: bool,
     is_profile_settings_open: bool,
     submit_chord: SubmitChord,
 }
@@ -61,7 +61,7 @@ impl MessageInput {
         let app_state = state.read(cx);
         let selected_apps = app_state.selected_apps.clone();
         let is_voice_mode_open = app_state.is_voice_mode_open;
-        let is_account_settings_open = app_state.is_account_settings_open;
+        let is_app_settings_open = app_state.is_app_settings_open;
         let is_profile_settings_open = app_state.is_profile_settings_open;
         let submit_chord = app_state.submit_chord;
 
@@ -70,7 +70,7 @@ impl MessageInput {
             input_state: input_state.clone(),
             selected_apps,
             is_voice_mode_open,
-            is_account_settings_open,
+            is_app_settings_open,
             is_profile_settings_open,
             submit_chord,
             on_submit: None,
@@ -86,7 +86,7 @@ impl MessageInput {
                 let state = state.read(cx);
                 sync_field_clone!(this, state, selected_apps, changed);
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
-                sync_field_copy!(this, state, is_account_settings_open, changed);
+                sync_field_copy!(this, state, is_app_settings_open, changed);
                 sync_field_copy!(this, state, is_profile_settings_open, changed);
                 if this.submit_chord != state.submit_chord {
                     this.submit_chord = state.submit_chord;
@@ -209,7 +209,7 @@ impl Render for MessageInput {
 
         // Check if any modal is open using cached state
         let any_modal_open = self.is_voice_mode_open
-            || self.is_account_settings_open
+            || self.is_app_settings_open
             || self.is_profile_settings_open;
 
         // ChatGPT-style: centered container with max-width

@@ -3,8 +3,10 @@ use crate::chrome::{
 };
 use crate::components::persona::PersonaMark;
 use crate::icons::NativeIcon;
-use crate::state::AppState;
+use crate::state::{AppSettingsTab, AppState};
 use gpui_kit::assets::IconNamed;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -17,6 +19,9 @@ struct SidebarRev {
     active_id: Option<String>,
     any_modal: bool,
     coworkers: Vec<(String, String, Option<String>, Option<String>)>,
+    pinned: Vec<String>,
+    hidden_ids: Vec<String>,
+    renaming: Option<String>,
     account_label: String,
     account_email: String,
 }
@@ -29,7 +34,7 @@ impl SidebarRev {
             theme_mode: state.theme_mode.clone(),
             active_id: state.active_coworker_id.clone(),
             any_modal: state.is_voice_mode_open
-                || state.is_account_settings_open
+                || state.is_app_settings_open
                 || state.is_profile_settings_open
                 || state.is_credentials_modal_open,
             coworkers: state
@@ -44,6 +49,17 @@ impl SidebarRev {
                     )
                 })
                 .collect(),
+            pinned: {
+                let mut ids: Vec<_> = state.pinned_coworker_ids.iter().cloned().collect();
+                ids.sort();
+                ids
+            },
+            hidden_ids: {
+                let mut ids: Vec<_> = state.hidden_coworker_ids.iter().cloned().collect();
+                ids.sort();
+                ids
+            },
+            renaming: state.renaming_coworker_id.clone(),
             account_label: state
                 .account
                 .as_ref()
@@ -61,11 +77,13 @@ impl SidebarRev {
 pub struct SidebarView {
     state: Entity<AppState>,
     list_scroll: ScrollHandle,
+    rename_input: Entity<InputState>,
     rev: SidebarRev,
 }
 
 impl SidebarView {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
         let rev = SidebarRev::from_state(&state.read(cx));
         cx.observe(&state, |this, state, cx| {
             let rev = SidebarRev::from_state(&state.read(cx));
@@ -75,10 +93,20 @@ impl SidebarView {
             }
         })
         .detach();
+        cx.subscribe_in(&rename_input, window, |this, input, event, _window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let name = input.read(cx).value().to_string();
+                this.state.update(cx, |state, cx| {
+                    state.commit_rename_coworker(name, cx);
+                });
+            }
+        })
+        .detach();
 
         Self {
             state,
             list_scroll: ScrollHandle::new(),
+            rename_input,
             rev,
         }
     }
@@ -114,7 +142,7 @@ impl Render for SidebarView {
         let coworkers = state.coworkers.clone();
         let active_coworker = state.active_coworker_id.clone();
         let any_modal_open = state.is_voice_mode_open
-            || state.is_account_settings_open
+            || state.is_app_settings_open
             || state.is_profile_settings_open;
         let account_label = state
             .account
@@ -177,11 +205,24 @@ impl Render for SidebarView {
                                     .when(collapsed, |this| this.items_center())
                                     .when(!collapsed, |this| this.px(px(12.)))
                                     .pb(px(12.))
-                                    .children(coworkers.into_iter().map(|c| {
+                                    .children({
+                                        let mut rows: Vec<_> = coworkers.into_iter().collect();
+                                        let hidden = state.hidden_coworker_ids.clone();
+                                        let pinned = state.pinned_coworker_ids.clone();
+                                        let renaming = state.renaming_coworker_id.clone();
+                                        let rename_input = self.rename_input.clone();
+                                        let app = self.state.clone();
+                                        let list_view = view.clone();
+                                        rows.retain(|c| !hidden.contains(&c.id));
+                                        rows.sort_by_key(|c| !pinned.contains(&c.id));
+                                        rows.into_iter().map(move |c| {
                                         let id = c.id.clone();
                                         let name = c.name.clone();
                                         let is_active = Some(id.clone()) == active_coworker;
-                                        let view = view.clone();
+                                        let is_renaming = renaming.as_ref() == Some(&id);
+                                        let is_pinned = pinned.contains(&id);
+                                        let view = list_view.clone();
+                                        let app = app.clone();
                                         let row = row()
                                             .id(SharedString::from(format!("coworker-{id}")))
                                             .when(collapsed, |this| {
@@ -204,12 +245,34 @@ impl Render for SidebarView {
                                             })
                                             .on_mouse_down(MouseButton::Left, {
                                                 let id = id.clone();
+                                                let view = view.clone();
                                                 move |_, _, cx| {
                                                     view.update(cx, |this, cx| {
                                                         this.state.update(cx, |state, cx| {
+                                                            if state.renaming_coworker_id.as_ref()
+                                                                != Some(&id)
+                                                            {
+                                                                state.cancel_rename_coworker(cx);
+                                                            }
                                                             state.select_coworker(id.clone(), cx);
                                                         });
                                                     });
+                                                }
+                                            })
+                                            .context_menu({
+                                                let app = app.clone();
+                                                let view = view.clone();
+                                                let id = id.clone();
+                                                let name = name.clone();
+                                                move |menu, _, _cx| {
+                                                    agent_menu(
+                                                        menu,
+                                                        app.clone(),
+                                                        view.clone(),
+                                                        id.clone(),
+                                                        name.clone(),
+                                                        is_pinned,
+                                                    )
                                                 }
                                             })
                                             .child(
@@ -220,7 +283,19 @@ impl Render for SidebarView {
                                                     .lit(is_active),
                                             );
                                         if collapsed {
-                                            row
+                                            row.into_any_element()
+                                        } else if is_renaming {
+                                            row.child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .flex_1()
+                                                    .child(
+                                                        Input::new(&rename_input)
+                                                            .appearance(false)
+                                                            .h(px(28.)),
+                                                    ),
+                                            )
+                                            .into_any_element()
                                         } else {
                                             row.child(
                                                 div()
@@ -230,8 +305,9 @@ impl Render for SidebarView {
                                                     .truncate()
                                                     .child(name),
                                             )
+                                            .into_any_element()
                                         }
-                                    })),
+                                    })}),
                             ),
                     ),
             )
@@ -475,7 +551,7 @@ impl SidebarView {
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         view.update(cx, |this, cx| {
                             this.state.update(cx, |state, cx| {
-                                state.toggle_account_settings(cx);
+                                state.open_app_settings(AppSettingsTab::Profile, cx);
                             });
                         });
                     })
@@ -543,4 +619,84 @@ impl SidebarView {
             .child(Icon::default().path(icon).size(px(16.)).text_color(fg))
             .when(!collapsed, |this| this.child(div().text_sm().child(label)))
     }
+}
+
+fn agent_menu(
+    menu: PopupMenu,
+    app: Entity<AppState>,
+    view: Entity<SidebarView>,
+    id: String,
+    name: String,
+    pinned: bool,
+) -> PopupMenu {
+    menu.item(
+        PopupMenuItem::new("Pin")
+            .checked(pinned)
+            .on_click({
+                let app = app.clone();
+                let id = id.clone();
+                move |_, _, cx| {
+                    app.update(cx, |state, cx| state.toggle_pin_coworker(id.clone(), cx));
+                }
+            }),
+    )
+    .item(PopupMenuItem::new("Move to new section").disabled(true))
+    .item(PopupMenuItem::new("Mark as Read").on_click({
+        let app = app.clone();
+        let id = id.clone();
+        move |_, _, cx| {
+            app.update(cx, |state, cx| state.mark_coworker_read(&id, cx));
+        }
+    }))
+    .separator()
+    .item(PopupMenuItem::new("Rename Bot").on_click({
+        let app = app.clone();
+        let id = id.clone();
+        let name = name.clone();
+        move |_, window, cx| {
+            view.update(cx, |this, cx| {
+                this.rename_input.update(cx, |input, cx| {
+                    input.set_value(name.clone(), window, cx);
+                    input.focus_handle(cx).focus(window, cx);
+                });
+            });
+            app.update(cx, |state, cx| {
+                state.begin_rename_coworker(id.clone(), cx);
+            });
+        }
+    }))
+    .item(PopupMenuItem::new("Edit Profile").on_click({
+        let app = app.clone();
+        let id = id.clone();
+        move |_, _, cx| {
+            app.update(cx, |state, cx| state.open_agent_profile(id.clone(), cx));
+        }
+    }))
+    .item(PopupMenuItem::new("Duplicate").on_click({
+        let app = app.clone();
+        let id = id.clone();
+        move |_, _, cx| {
+            app.update(cx, |state, cx| state.duplicate_coworker(id.clone(), cx));
+        }
+    }))
+    .item(PopupMenuItem::new("Copy conversation ID").on_click({
+        let id = id.clone();
+        move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+        }
+    }))
+    .separator()
+    .item(PopupMenuItem::new("Hide from sidebar").on_click({
+        let app = app.clone();
+        let id = id.clone();
+        move |_, _, cx| {
+            app.update(cx, |state, cx| state.hide_coworker(id.clone(), cx));
+        }
+    }))
+    .item(PopupMenuItem::new("Delete").on_click({
+        let app = app.clone();
+        move |_, _, cx| {
+            app.update(cx, |state, cx| state.delete_coworker(id.clone(), cx));
+        }
+    }))
 }

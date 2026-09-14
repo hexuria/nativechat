@@ -21,7 +21,7 @@ use crate::services::tts_service::TtsService;
 use chrono::NaiveDateTime;
 use futures::StreamExt;
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::SystemTime;
@@ -179,7 +179,6 @@ pub struct AppState {
     pub is_voice_muted: bool,
     pub voice_status: VoiceStatus,
     pub more_menu_open: bool,
-    pub is_account_settings_open: bool,
     pub is_profile_settings_open: bool,
     pub is_credentials_modal_open: bool,
     pub is_app_settings_open: bool,
@@ -227,6 +226,9 @@ pub struct AppState {
     pub model_picker_open: bool,
     pub avatar_editor_open: bool,
     pub hiring: bool,
+    pub pinned_coworker_ids: HashSet<String>,
+    pub hidden_coworker_ids: HashSet<String>,
+    pub renaming_coworker_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -359,7 +361,6 @@ impl AppState {
             is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
-            is_account_settings_open: false,
             is_profile_settings_open: false,
             is_credentials_modal_open: false,
             is_app_settings_open: false,
@@ -405,6 +406,9 @@ impl AppState {
             model_picker_open: false,
             avatar_editor_open: false,
             hiring: false,
+            pinned_coworker_ids: HashSet::new(),
+            hidden_coworker_ids: HashSet::new(),
+            renaming_coworker_id: None,
         };
         // Synchronously load cached state to avoid startup delay
         if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
@@ -496,7 +500,7 @@ impl AppState {
         self.coworkers.clear();
         self.active_coworker_id = None;
         self.bot_status = None;
-        self.is_account_settings_open = false;
+        self.is_app_settings_open = false;
         self.is_agent_settings_open = false;
         cx.notify();
         if let Some(client) = client {
@@ -855,6 +859,165 @@ impl AppState {
             );
         }
         self.select_conversation(id, cx);
+    }
+
+    pub fn toggle_pin_coworker(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.pinned_coworker_ids.remove(&id) {
+            self.pinned_coworker_ids.insert(id);
+        }
+        cx.notify();
+    }
+
+    pub fn hide_coworker(&mut self, id: String, cx: &mut Context<Self>) {
+        self.hidden_coworker_ids.insert(id.clone());
+        if self.active_coworker_id.as_ref() == Some(&id) {
+            let next = self
+                .coworkers
+                .iter()
+                .map(|c| c.id.clone())
+                .find(|other| other != &id && !self.hidden_coworker_ids.contains(other));
+            self.active_coworker_id = next.clone();
+            if let Some(next) = next {
+                self.select_coworker(next, cx);
+                return;
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn mark_coworker_read(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == id) {
+            conversation.unread_count = 0;
+        }
+        cx.notify();
+    }
+
+    pub fn begin_rename_coworker(&mut self, id: String, cx: &mut Context<Self>) {
+        self.renaming_coworker_id = Some(id);
+        cx.notify();
+    }
+
+    pub fn cancel_rename_coworker(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_coworker_id.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn commit_rename_coworker(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(id) = self.renaming_coworker_id.take() else {
+            return;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.select_coworker(id, cx);
+        self.patch_active_agent(
+            CoworkerPatch {
+                name: Some(name),
+                ..Default::default()
+            },
+            cx,
+        );
+    }
+
+    pub fn open_agent_profile(&mut self, id: String, cx: &mut Context<Self>) {
+        self.select_coworker(id, cx);
+        if !self.is_agent_settings_open {
+            self.is_agent_settings_open = true;
+        }
+        cx.notify();
+    }
+
+    pub fn duplicate_coworker(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.hiring {
+            return;
+        }
+        let Some(source) = self.coworkers.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        self.hiring = true;
+        self.auth_error = None;
+        cx.notify();
+        let name = if source.name.trim().is_empty() {
+            "New Bot".to_string()
+        } else {
+            format!("{} copy", source.name.trim())
+        };
+        let model = if source.model.is_empty() {
+            None
+        } else {
+            Some(source.model.clone())
+        };
+        let patch = CoworkerPatch {
+            model: model.clone(),
+            role: source.role.clone(),
+            title: source.title.clone(),
+            avatar_shape: source.avatar_shape.clone(),
+            avatar_color: source.avatar_color.clone(),
+            notify_on_updates: source.notify_on_updates,
+            ..Default::default()
+        };
+        cx.spawn(async move |this, cx| {
+            let hired = client.hire(&name, model.as_deref()).await;
+            let _ = this.update(cx, |state, cx| {
+                state.hiring = false;
+                match hired {
+                    Ok(hired) => {
+                        let new_id = hired.id.clone();
+                        state.coworkers.insert(0, hired);
+                        if !patch.is_empty() {
+                            state.active_coworker_id = Some(new_id.clone());
+                            state.patch_active_agent(patch, cx);
+                        }
+                        state.select_coworker(new_id, cx);
+                    }
+                    Err(error) => state.auth_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn delete_coworker(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        self.coworkers.retain(|c| c.id != id);
+        self.pinned_coworker_ids.remove(&id);
+        self.hidden_coworker_ids.remove(&id);
+        if self.renaming_coworker_id.as_ref() == Some(&id) {
+            self.renaming_coworker_id = None;
+        }
+        if self.active_coworker_id.as_ref() == Some(&id) {
+            self.active_coworker_id = self.coworkers.first().map(|c| c.id.clone());
+            if let Some(next) = self.active_coworker_id.clone() {
+                self.select_coworker(next, cx);
+            } else {
+                self.is_agent_settings_open = false;
+            }
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.delete_coworker(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    state.auth_error = Some(error.message);
+                    state.refresh_coworkers(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn create_new_session(&mut self, cx: &mut Context<Self>) {
@@ -1779,9 +1942,17 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn toggle_account_settings(&mut self, cx: &mut Context<Self>) {
-        self.is_account_settings_open = !self.is_account_settings_open;
+    pub fn open_app_settings(&mut self, tab: AppSettingsTab, cx: &mut Context<Self>) {
+        self.app_settings_tab = tab;
+        if !self.is_app_settings_open {
+            self.is_app_settings_open = true;
+            self.dismiss_popovers(cx);
+        }
         cx.notify();
+    }
+
+    pub fn toggle_account_settings(&mut self, cx: &mut Context<Self>) {
+        self.open_app_settings(AppSettingsTab::Profile, cx);
     }
 
     pub fn toggle_profile_settings(&mut self, cx: &mut Context<Self>) {

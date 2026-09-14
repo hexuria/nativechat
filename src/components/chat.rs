@@ -15,8 +15,7 @@ use gpui_kit::*;
 use gpui_kit::FontWeight;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme, IndexPath, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IndexPath, h_flex, v_flex};
 
 /// Cheap fingerprint so ChatView does not rebuild markdown on unrelated AppState
 /// changes (sidebar toggle, theme, amplitude, etc.).
@@ -709,19 +708,28 @@ impl Render for ChatView {
                             )
                             .child(
                                 h_flex().gap_2().items_center().child(
-                                    div().id("header-settings").child(
-                                        Button::new("header-settings-btn")
-                                            .label("Settings")
-                                            .ghost()
-                                            .on_click({
-                                                let state = self.state.clone();
-                                                move |_, _, cx| {
-                                                    state.update(cx, |state, cx| {
-                                                        state.toggle_agent_settings(cx);
-                                                    });
-                                                }
-                                            }),
-                                    ),
+                                    div()
+                                        .id("header-settings")
+                                        .size(px(28.))
+                                        .rounded(px(8.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                                        .on_mouse_down(MouseButton::Left, {
+                                            let state = self.state.clone();
+                                            move |_, _, cx| {
+                                                state.update(cx, |state, cx| {
+                                                    state.toggle_agent_settings(cx);
+                                                });
+                                            }
+                                        })
+                                        .child(
+                                            Icon::default()
+                                                .path("icons/monitor.svg")
+                                                .size(px(16.)),
+                                        ),
                                 ),
                             ),
                     ),

@@ -228,6 +228,17 @@ impl OpenGrokClient {
             .map_err(|e| OpenGrokError::message(e.to_string()))
     }
 
+    pub async fn delete_coworker(&self, coworker_id: &str) -> Result<(), OpenGrokError> {
+        let path = format!("/coworkers/{coworker_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        Err(Self::read_error(response).await)
+    }
+
     pub async fn patch_coworker(
         &self,
         coworker_id: &str,

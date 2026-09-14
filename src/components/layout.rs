@@ -2,9 +2,7 @@ use crate::components::agent_settings::AgentSettings;
 use crate::components::app_settings::AppSettings;
 use crate::components::chat::ChatView;
 use crate::components::login::LoginView;
-use crate::components::modals::{
-    account_settings::AccountSettingsModal, profile_settings::ProfileSettingsModal,
-};
+use crate::components::modals::profile_settings::ProfileSettingsModal;
 use crate::components::sidebar::SidebarView;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -24,7 +22,6 @@ struct ShellRev {
     hidden: bool,
     expanded_width: i32,
     auto_collapsed: bool,
-    account: bool,
     profile: bool,
     signed_in: bool,
     signing_in: bool,
@@ -44,7 +41,6 @@ impl ShellRev {
             hidden: state.sidebar_hidden,
             expanded_width: state.sidebar_expanded_width.round() as i32,
             auto_collapsed: state.auto_collapsed,
-            account: state.is_account_settings_open,
             profile: state.is_profile_settings_open,
             signed_in: state.is_signed_in(),
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
@@ -65,7 +61,6 @@ pub struct Layout {
     chat: Entity<ChatView>,
     login: Entity<LoginView>,
     agent_settings: Entity<AgentSettings>,
-    account_settings_modal: Entity<AccountSettingsModal>,
     profile_settings_modal: Entity<ProfileSettingsModal>,
     app_settings: Entity<AppSettings>,
     state: Entity<AppState>,
@@ -76,12 +71,10 @@ pub struct Layout {
 
 impl Layout {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let sidebar = cx.new(|cx| SidebarView::new(state.clone(), cx));
+        let sidebar = cx.new(|cx| SidebarView::new(window, state.clone(), cx));
         let chat = cx.new(|cx| ChatView::new(window, state.clone(), cx));
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
-        let account_settings_modal =
-            cx.new(|cx| AccountSettingsModal::new(window, state.clone(), cx));
         let profile_settings_modal =
             cx.new(|cx| ProfileSettingsModal::new(window, state.clone(), cx));
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
@@ -101,7 +94,6 @@ impl Layout {
             chat,
             login,
             agent_settings,
-            account_settings_modal,
             profile_settings_modal,
             app_settings,
             state,
@@ -230,11 +222,6 @@ impl Render for Layout {
                         .child(self.agent_settings.clone()),
                 )
             })
-            .children(
-                state
-                    .is_account_settings_open
-                    .then(|| self.account_settings_modal.clone().into_any_element()),
-            )
             .children(
                 state
                     .is_profile_settings_open

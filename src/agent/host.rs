@@ -177,7 +177,7 @@ impl NativeChatHost {
             theme_mode: state.theme_mode.clone(),
             sessions,
             profile_name,
-            account_open: state.is_account_settings_open,
+            account_open: state.is_app_settings_open,
             profile_open: state.is_profile_settings_open,
             credentials_open: state.is_credentials_modal_open,
             voice_open: state.is_voice_mode_open,
@@ -315,7 +315,7 @@ impl NativeChatHost {
                     .with_child(sidebar)
                     .with_child(page)
                     .with_child(
-                        UiNode::dialog(ids::DIALOG_ACCOUNT, "Account Settings")
+                        UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
                             .with_visible(self.account_open),
                     )
                     .with_child(
