@@ -4,15 +4,15 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::HeaderValue;
+use reqwest::header::{ACCEPT, CACHE_CONTROL, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::error::OpenGrokError;
 use super::types::{
-    assistant_text_from_sse, error_message_from_body, Account, AguiMessage, Coworker,
-    CoworkerPatch, ModelCatalogue, ProfileUpdate,
+    Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate,
+    error_message_from_body,
 };
 
 #[derive(Clone)]
@@ -31,9 +31,8 @@ struct StoredSession {
 
 impl OpenGrokClient {
     pub fn new(base_url: &str) -> Result<Self, OpenGrokError> {
-        let base = Url::parse(base_url).map_err(|e| {
-            OpenGrokError::message(format!("invalid OpenGrok URL {base_url}: {e}"))
-        })?;
+        let base = Url::parse(base_url)
+            .map_err(|e| OpenGrokError::message(format!("invalid OpenGrok URL {base_url}: {e}")))?;
         let jar = Arc::new(Jar::default());
         let http = Client::builder()
             .cookie_provider(jar.clone())
@@ -299,11 +298,7 @@ impl OpenGrokClient {
             .map_err(|e| OpenGrokError::message(e.to_string()))
     }
 
-    pub async fn hire(
-        &self,
-        name: &str,
-        model: Option<&str>,
-    ) -> Result<Coworker, OpenGrokError> {
+    pub async fn hire(&self, name: &str, model: Option<&str>) -> Result<Coworker, OpenGrokError> {
         let mut body = json!({ "name": name });
         if let Some(model) = model.filter(|m| !m.is_empty()) {
             body["model"] = json!(model);
@@ -350,9 +345,7 @@ impl OpenGrokClient {
         patch: &CoworkerPatch,
     ) -> Result<Coworker, OpenGrokError> {
         if patch.is_empty() {
-            return Err(OpenGrokError::message(
-                "nothing to change".to_string(),
-            ));
+            return Err(OpenGrokError::message("nothing to change".to_string()));
         }
         let path = format!("/coworkers/{coworker_id}");
         let response = self
@@ -385,9 +378,20 @@ impl OpenGrokClient {
             "messages": messages,
             "forwardedProps": { "coworkerId": coworker_id },
         });
-        let response = self
-            .send_json(reqwest::Method::POST, "/ag-ui", Some(&body))
-            .await?;
+        let url = self.url("/ag-ui")?;
+        let mut req = self
+            .http
+            .post(url)
+            .header(ACCEPT, "text/event-stream")
+            .header(CACHE_CONTROL, "no-cache")
+            .json(&body);
+        if let Some(token) = self.access_token() {
+            req = req.bearer_auth(token);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
@@ -453,6 +457,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::assistant_text_from_sse;
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
@@ -535,10 +540,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let dir = std::env::temp_dir().join(format!(
-            "nativechat-session-{}",
-            uuid::Uuid::now_v7()
-        ));
+        let dir = std::env::temp_dir().join(format!("nativechat-session-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("opengrok-session.json");
         let client = OpenGrokClient::new(&server.uri())
@@ -563,9 +565,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/auth/login"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_json(json!({"error":"bad password"})),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error":"bad password"})))
             .mount(&server)
             .await;
 
@@ -632,6 +632,78 @@ mod tests {
             "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n",
         );
         assert_eq!(assistant_text_from_sse(body).unwrap(), "Hello world");
+    }
+
+    #[tokio::test]
+    async fn run_turn_forwards_sse_frames_as_they_arrive() {
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut socket = socket;
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let frames = [
+                "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m1\",\"role\":\"assistant\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\"Hello\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\" world\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"m1\"}\n\n",
+                "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n",
+            ];
+            let body: String = frames.concat();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            for frame in frames {
+                socket.write_all(frame.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+
+        let client = OpenGrokClient::new(&format!("http://{addr}")).unwrap();
+        let first_at = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let start = Instant::now();
+        let text = client
+            .run_turn(
+                "cw",
+                "t",
+                &[AguiMessage {
+                    id: "u1".into(),
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                {
+                    let first_at = first_at.clone();
+                    move |event| {
+                        let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if kind == "TEXT_MESSAGE_CONTENT" {
+                            let mut slot = first_at.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(Instant::now());
+                            }
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(text, "Hello world");
+        let first = first_at.lock().unwrap().expect("saw text");
+        let until_first = first.duration_since(start);
+        let total = start.elapsed();
+        assert!(
+            until_first + Duration::from_millis(50) < total,
+            "first text at {until_first:?}, stream ended at {total:?} — frames were buffered"
+        );
     }
 
     #[tokio::test]
