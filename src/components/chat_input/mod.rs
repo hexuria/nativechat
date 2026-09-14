@@ -239,7 +239,7 @@ impl Render for MessageInput {
             // Input container - rounded pill shape with shadow
             v_flex()
                 .key_context("MessageInput")
-                .max_w(px(800.0)) // Max width like Cha2tGPT
+                .max_w(px(crate::chrome::CHAT_CONTENT_MAX))
                 .w_full()
                 .gap_2()
                 .when(compact, |this| this.px_3().py(px(6.)))

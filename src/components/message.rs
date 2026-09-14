@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
-use crate::chrome::is_narrow_viewport;
+use crate::chrome::{chat_column_width, is_narrow_viewport, CHAT_CONTENT_MAX};
 use crate::components::message_actions::{MessageToolbar, TOOLBAR_W};
-use crate::state::AppState;
+use crate::state::{AppState, RightPane};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -239,7 +239,27 @@ impl RenderOnce for MessageBubble {
             && !peeking;
         let (bg, fg) = bubble_colors(self.is_me, cx);
         let muted = cx.theme().muted_foreground;
-        let max_bubble = relative(0.92);
+        // Grok: max-width: min(88%, 640px, calc(100% - 82px)) with width: fit-content.
+        // Percent of a shrink-wrapped parent cycles in Taffy and wraps too early.
+        let win = f32::from(window.viewport_size().width);
+        let chat_w = self
+            .app
+            .as_ref()
+            .map(|app| {
+                let state = app.read(cx);
+                chat_column_width(
+                    win,
+                    state.sidebar_hidden,
+                    state.sidebar_collapsed,
+                    state.sidebar_expanded_width,
+                    state.right_pane != RightPane::Closed,
+                )
+            })
+            .unwrap_or(win)
+            .min(CHAT_CONTENT_MAX);
+        let max_bubble = px((chat_w * 0.88)
+            .min(640.0)
+            .min((chat_w - 82.0).max(160.0)));
 
         let body = if self.debug_mode {
             div()
@@ -281,10 +301,10 @@ impl RenderOnce for MessageBubble {
 
         let bubble = div()
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
+            .flex_shrink_0()
             .max_w(max_bubble)
-            .px(px(14.))
-            .py(px(8.))
-            .rounded(px(18.))
+            .when(self.is_me, |this| this.px(px(14.)).py(px(8.)).rounded_full())
+            .when(!self.is_me, |this| this.px(px(12.)).py(px(8.)).rounded(px(18.)))
             .bg(bg)
             .text_color(fg)
             .child(
@@ -300,7 +320,6 @@ impl RenderOnce for MessageBubble {
         let bubble_stack = div()
             .relative()
             .flex_shrink_0()
-            .min_w(px(48.))
             .when(self.reaction.is_some(), |this| this.mb(px(12.)))
             .child(bubble)
             .when_some(self.reaction.clone(), |this, emoji| {

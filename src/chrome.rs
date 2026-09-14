@@ -16,6 +16,9 @@ pub const AUTO_COLLAPSE_WIDTH: f32 = 900.0;
 /// Below this chat-column width, timestamps (hover and peek) are hidden —
 /// Grok keeps an 82px rail, but a squeezed bubble makes the time useless.
 pub const CHAT_TIMESTAMP_MIN_WIDTH: f32 = 480.0;
+/// Desktop transcript + composer column. Grok uses ~690px; we match the
+/// composer so bubbles line up with the input field.
+pub const CHAT_CONTENT_MAX: f32 = 800.0;
 pub const RAIL_HOVER: u32 = 0x777777;
 pub const RAIL_HOVER_ALPHA: f32 = 0.32;
 

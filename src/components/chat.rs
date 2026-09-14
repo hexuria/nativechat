@@ -4,15 +4,12 @@ use std::time::Duration;
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
-use crate::chrome::{chat_column_width, timestamps_fit};
+use crate::chrome::{chat_column_width, timestamps_fit, CHAT_CONTENT_MAX};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::services::tts_service::TtsService;
 use crate::components::persona::PersonaMark;
 use crate::state::{AppState, EmojiPickerOpen};
-use crate::tts_text::{
-    CHAT_ROW_CHUNK_BYTES, chunk_text, highlight_in_chunk, looks_like_markdown,
-    map_utf16_range_to_utf8,
-};
+use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use gpui_kit::FontWeight;
@@ -137,51 +134,28 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             continue;
         }
         let use_markdown = !msg.is_me && looks_like_markdown(&msg.content);
-        let chunks = chunk_text(&msg.content, CHAT_ROW_CHUNK_BYTES);
-        let last = chunks.len().saturating_sub(1);
-        for (ix, chunk) in chunks.into_iter().enumerate() {
-            let highlight_range = full_highlight.as_ref().and_then(|range| {
-                highlight_in_chunk(range, chunk.byte_start, chunk.text.len())
-            });
-            let highlight_native = is_native_speaking && highlight_range.is_some();
-            rows.push(ChatRow {
-                id: if ix == 0 {
-                    msg.id.clone()
-                } else {
-                    format!("{}:{ix}", msg.id)
-                },
-                content: SharedString::from(chunk.text),
-                is_me: msg.is_me,
-                timestamp: SharedString::from(msg.formatted_time()),
-                is_native_speaking: is_native_speaking && ix == last,
-                is_native_paused: state.native_tts.is_paused && is_native_speaking && ix == last,
-                is_native_loading: state.native_tts.is_loading && is_native_speaking && ix == last,
-                is_ai_speaking: is_ai_speaking && ix == last,
-                is_ai_paused: state.ai_tts.is_paused && is_ai_speaking && ix == last,
-                is_ai_loading: state.ai_tts.is_loading && is_ai_speaking && ix == last,
-                is_cached: TtsService::is_cached(&msg.id),
-                highlight_range,
-                highlight_native,
-                use_markdown,
-                show_footer: ix == last,
-                source_id: msg.id.clone(),
-                tts_text: if ix == last {
-                    SharedString::from(msg.content.clone())
-                } else {
-                    SharedString::default()
-                },
-                reply_preview: if ix == last {
-                    msg.reply_preview.clone()
-                } else {
-                    None
-                },
-                reaction: if ix == last {
-                    state.message_reactions.get(&msg.id).cloned()
-                } else {
-                    None
-                },
-            });
-        }
+        let highlight_native = is_native_speaking && full_highlight.is_some();
+        rows.push(ChatRow {
+            id: msg.id.clone(),
+            content: SharedString::from(msg.content.clone()),
+            is_me: msg.is_me,
+            timestamp: SharedString::from(msg.formatted_time()),
+            is_native_speaking,
+            is_native_paused: state.native_tts.is_paused && is_native_speaking,
+            is_native_loading: state.native_tts.is_loading && is_native_speaking,
+            is_ai_speaking,
+            is_ai_paused: state.ai_tts.is_paused && is_ai_speaking,
+            is_ai_loading: state.ai_tts.is_loading && is_ai_speaking,
+            is_cached: TtsService::is_cached(&msg.id),
+            highlight_range: full_highlight,
+            highlight_native,
+            use_markdown,
+            show_footer: true,
+            source_id: msg.id.clone(),
+            tts_text: SharedString::from(msg.content.clone()),
+            reply_preview: msg.reply_preview.clone(),
+            reaction: state.message_reactions.get(&msg.id).cloned(),
+        });
     }
     Arc::new(rows)
 }
@@ -940,9 +914,24 @@ impl Render for ChatView {
                     .min_h_0()
                     .relative()
                     .child(
-                        self.transcript
-                            .clone()
-                            .cached(StyleRefinement::default().absolute().size_full()),
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .justify_center()
+                            .px_4()
+                            .child(
+                                div()
+                                    .id("chat-content-col")
+                                    .w_full()
+                                    .max_w(px(CHAT_CONTENT_MAX))
+                                    .h_full()
+                                    .child(
+                                        self.transcript.clone().cached(
+                                            StyleRefinement::default().size_full(),
+                                        ),
+                                    ),
+                            ),
                     )
                     .when_some(self.emoji_open.clone(), |this, open| {
                         this.child(self.render_emoji_overlay(open, cx))
@@ -1029,9 +1018,15 @@ impl Render for ChatView {
             .child(
                 v_flex()
                     .flex_shrink_0()
+                    .w_full()
+                    .items_center()
                     .px_4()
                     .pb_4()
-                    .gap_2()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(CHAT_CONTENT_MAX))
+                            .gap_2()
                     .when_some(self.bot_status.clone(), |this, label| {
                         let name = self
                             .coworker_name
@@ -1063,6 +1058,7 @@ impl Render for ChatView {
                         )
                     })
                     .child(self.input.clone()),
+                    ),
             )
     }
 }

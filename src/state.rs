@@ -2419,6 +2419,29 @@ impl AppState {
                                     });
                                 }
                             }
+                            let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
+                                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                    if !delta.is_empty() {
+                                        let _ = this.update(cx, |state, cx| {
+                                            if let Some(conversation) = state
+                                                .conversations
+                                                .iter_mut()
+                                                .find(|c| c.id == conversation_id)
+                                            {
+                                                if let Some(last) =
+                                                    conversation.messages.last_mut()
+                                                {
+                                                    if !last.is_me {
+                                                        last.content.push_str(delta);
+                                                        cx.notify();
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
                         })
                         .await
                 }
@@ -2433,14 +2456,18 @@ impl AppState {
                     if let Some(last) = conversation.messages.last_mut() {
                         if !last.is_me {
                             match &result {
-                                Ok(text) if !text.is_empty() => last.content = text.clone(),
-                                Ok(_) => {
+                                Ok(text) if !text.is_empty() => {
+                                    if last.content != *text {
+                                        last.content = text.clone();
+                                    }
+                                }
+                                Ok(_) if last.content.trim().is_empty() => {
                                     last.content =
                                         "(OpenGrok returned no assistant text.)".to_string()
                                 }
+                                Ok(_) => {}
                                 Err(error) => last.content = format!("OpenGrok: {}", error.message),
                             }
-                            last.id = uuid::Uuid::now_v7().to_string();
                         }
                     }
                 }

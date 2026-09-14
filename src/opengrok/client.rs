@@ -27,6 +27,7 @@ impl OpenGrokClient {
         let jar = Arc::new(Jar::default());
         let http = Client::builder()
             .cookie_provider(jar.clone())
+            .tcp_nodelay(true)
             .build()
             .map_err(|e| OpenGrokError::message(e.to_string()))?;
         Ok(Self { base, http, jar })
