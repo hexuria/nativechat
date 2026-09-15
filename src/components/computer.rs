@@ -130,18 +130,26 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, routines) = {
+        let (view, agent_name, coworker_id, box_id, routines) = {
             let state = self.state.read(cx);
-            let name = state
+            let coworker = state
                 .active_coworker_id
                 .as_ref()
-                .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
+                .and_then(|id| state.coworkers.iter().find(|c| &c.id == id));
+            let name = coworker
                 .map(|c| c.name.clone())
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or_else(|| "Bot".into());
+            let box_id = coworker.and_then(|c| c.box_id.clone());
             let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
             let routines = state.coworker_routines(&coworker_id).to_vec();
-            (state.computer_view.clone(), name, coworker_id, routines)
+            (
+                state.computer_view.clone(),
+                name,
+                coworker_id,
+                box_id,
+                routines,
+            )
         };
 
         v_flex()
@@ -155,7 +163,15 @@ impl Render for ComputerPane {
             .text_color(theme.foreground)
             .child(match view {
                 ComputerView::Overview => self
-                    .overview(&agent_name, &coworker_id, &routines, muted, app, &theme)
+                    .overview(
+                        &agent_name,
+                        &coworker_id,
+                        box_id.as_deref(),
+                        &routines,
+                        muted,
+                        app,
+                        &theme,
+                    )
                     .into_any_element(),
                 ComputerView::Editor { id } => self
                     .editor(id, coworker_id, routines, muted, app, &theme, window, cx)
@@ -169,6 +185,7 @@ impl ComputerPane {
         &self,
         agent_name: &str,
         _coworker_id: &str,
+        box_id: Option<&str>,
         routines: &[AgentRoutine],
         muted: Hsla,
         app: Entity<AppState>,
@@ -214,6 +231,17 @@ impl ComputerPane {
                             .text_xs()
                             .text_color(muted)
                             .child(format!("{agent_name}'s screen")),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(match box_id {
+                                Some(id) => format!("Computer {id}"),
+                                None => "No computer yet. The next turn may attach a local box.".into(),
+                            }),
                     )
                     .child(if routines.is_empty() {
                         v_flex()

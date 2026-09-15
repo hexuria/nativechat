@@ -74,6 +74,8 @@ pub struct Coworker {
     pub updated_at_ms: i64,
     #[serde(default, alias = "hiddenFromSidebar")]
     pub hidden_from_sidebar: bool,
+    #[serde(default, alias = "boxId", alias = "box_id")]
+    pub box_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
