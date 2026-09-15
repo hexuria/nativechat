@@ -149,7 +149,6 @@ struct ChatRow {
     tts_text: SharedString,
     reply_preview: Option<String>,
     reaction: Option<String>,
-    parts: Vec<ChatPart>,
     widget: Option<UiSpec>,
     approval: Option<ApprovalSpec>,
     status_line: Option<String>,
@@ -201,13 +200,16 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         };
         let mut text_buf = String::new();
         let mut ui_n = 0usize;
-        let flush_text = |rows: &mut Vec<ChatRow>, text_buf: &mut String| {
+        let mut text_n = 0usize;
+        let flush_text = |rows: &mut Vec<ChatRow>, text_buf: &mut String, text_n: &mut usize| {
             let text = std::mem::take(text_buf);
             if text.trim().is_empty() {
                 return;
             }
+            let id = text_row_id(&msg.id, *text_n);
+            *text_n += 1;
             rows.push(ChatRow {
-                id: msg.id.clone(),
+                id,
                 content: SharedString::from(text.clone()),
                 is_me: msg.is_me,
                 timestamp: SharedString::from(msg.formatted_time()),
@@ -226,7 +228,6 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 tts_text: SharedString::from(text),
                 reply_preview: msg.reply_preview.clone(),
                 reaction: state.message_reactions.get(&msg.id).cloned(),
-                parts: Vec::new(),
                 widget: None,
                 approval: None,
                 status_line: None,
@@ -236,7 +237,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             match part {
                 ChatPart::Text(text) => text_buf.push_str(&text),
                 ChatPart::Ui(spec) => {
-                    flush_text(&mut rows, &mut text_buf);
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
                     rows.push(ChatRow {
                         id: format!("{}-ui-{ui_n}", msg.id),
                         content: SharedString::from(""),
@@ -257,7 +258,6 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         tts_text: SharedString::from(""),
                         reply_preview: None,
                         reaction: None,
-                        parts: Vec::new(),
                         widget: Some(spec),
                         approval: None,
                         status_line: None,
@@ -265,7 +265,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     ui_n += 1;
                 }
                 ChatPart::Approval(spec) => {
-                    flush_text(&mut rows, &mut text_buf);
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
                     let outcome = state.approval_status_line(&spec.call_id, bot_name);
                     rows.push(ChatRow {
                         id: format!("{}-ask-{ui_n}", msg.id),
@@ -287,7 +287,6 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         tts_text: SharedString::from(""),
                         reply_preview: None,
                         reaction: None,
-                        parts: Vec::new(),
                         widget: None,
                         approval: outcome.is_none().then_some(spec),
                         status_line: outcome,
@@ -296,7 +295,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 }
             }
         }
-        flush_text(&mut rows, &mut text_buf);
+        flush_text(&mut rows, &mut text_buf, &mut text_n);
     }
     Arc::new(rows)
 }
@@ -702,7 +701,6 @@ impl Render for ChatTranscript {
                         .picker_open(picker_open)
                         .ts_peek(ts_peek)
                         .timestamps_ok(timestamps_ok)
-                        .parts(row.parts.clone())
                         .app_state(app_state.clone());
                     if show_footer {
                         let state_for_tts = state_entity.clone();
@@ -1269,5 +1267,28 @@ impl Render for ChatView {
                             .child(self.input.clone()),
                     ),
             )
+    }
+}
+
+/// One message can flush several text rows (text, then a card, then more
+/// text). Their element ids key hover and menu state, so each row needs its
+/// own. The first keeps the message id; later ones get an ordinal.
+fn text_row_id(msg_id: &str, n: usize) -> String {
+    if n == 0 {
+        msg_id.to_string()
+    } else {
+        format!("{msg_id}-t{n}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_row_id;
+
+    #[test]
+    fn text_rows_of_one_message_get_distinct_ids() {
+        assert_eq!(text_row_id("m1", 0), "m1");
+        assert_eq!(text_row_id("m1", 1), "m1-t1");
+        assert_ne!(text_row_id("m1", 1), text_row_id("m1", 2));
     }
 }
