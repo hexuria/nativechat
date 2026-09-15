@@ -104,7 +104,7 @@ fn describe_tool(name: &str, args: Option<&str>) -> String {
                 "Running commands".into()
             }
         }
-        "user_machine_shell" => command
+        super::gen_ui::USER_MACHINE_SHELL => command
             .map(|c| format!("On your machine: {c}"))
             .unwrap_or_else(|| "On your machine".into()),
         "Computer" | "Screenshot" | "computerUseToolCall" => "On its computer".into(),

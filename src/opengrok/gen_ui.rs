@@ -9,6 +9,8 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use super::client::LocalExecMode;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatPart {
     Text(String),
@@ -29,6 +31,50 @@ pub struct ApprovalSpec {
     /// Tool result after the command ran (`exit 0` + stdout/stderr).
     pub output: Option<String>,
     pub ok: Option<bool>,
+}
+
+/// The harness tool that runs on the person's own machine, through this
+/// app's local-exec daemon. Every other tool runs on the coworker's box.
+pub const USER_MACHINE_SHELL: &str = "user_machine_shell";
+
+/// The person's answer on a permission card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalExecResolution {
+    Always,
+    AllowOnce,
+    Never,
+    DenyOnce,
+}
+
+impl ApprovalSpec {
+    pub fn runs_on_this_mac(&self) -> bool {
+        self.tool == USER_MACHINE_SHELL
+    }
+
+    /// Where the command runs, the way the card and its outcome line say it.
+    pub fn place(&self) -> &'static str {
+        if self.runs_on_this_mac() {
+            "your computer"
+        } else {
+            "its computer"
+        }
+    }
+}
+
+/// What this Mac's Always/Never setting answers on its own. Only the
+/// local-shell tool is covered; a box tool always gets its card.
+pub fn policy_answer(
+    spec: &ApprovalSpec,
+    mode: Option<LocalExecMode>,
+) -> Option<LocalExecResolution> {
+    if !spec.runs_on_this_mac() {
+        return None;
+    }
+    match mode? {
+        LocalExecMode::Always => Some(LocalExecResolution::Always),
+        LocalExecMode::Never => Some(LocalExecResolution::Never),
+        LocalExecMode::Ask => None,
+    }
 }
 
 impl ChatPart {
@@ -146,7 +192,7 @@ impl TurnAssembler {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if name == "user_machine_shell" && !id.is_empty() {
+                if name == USER_MACHINE_SHELL && !id.is_empty() {
                     self.shell_args.entry(id.clone()).or_default();
                 }
                 if kind == "TOOL_CALL_CHUNK" {
@@ -621,24 +667,17 @@ pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalExecVerdict {
-    AllowOnce,
-    Always,
-    DeniedOnce,
-    Never,
-}
-
 /// Centered status Grok paints after the permission card leaves the transcript.
-pub fn local_exec_outcome(bot: &str, verdict: LocalExecVerdict) -> String {
-    match verdict {
-        LocalExecVerdict::Always => format!("{bot} can run commands on your computer."),
-        LocalExecVerdict::Never => format!("{bot} cannot run commands on your computer."),
-        LocalExecVerdict::DeniedOnce => {
-            format!("{bot} was not allowed to run commands on your computer.")
+/// `place` is [`ApprovalSpec::place`].
+pub fn local_exec_outcome(bot: &str, resolution: LocalExecResolution, place: &str) -> String {
+    match resolution {
+        LocalExecResolution::Always => format!("{bot} can run commands on {place}."),
+        LocalExecResolution::Never => format!("{bot} cannot run commands on {place}."),
+        LocalExecResolution::DenyOnce => {
+            format!("{bot} was not allowed to run commands on {place}.")
         }
-        LocalExecVerdict::AllowOnce => {
-            format!("{bot} can run commands on your computer this time.")
+        LocalExecResolution::AllowOnce => {
+            format!("{bot} can run commands on {place} this time.")
         }
     }
 }
@@ -1090,21 +1129,67 @@ mod tests {
 
     #[test]
     fn local_exec_outcome_matches_grok_copy() {
+        let here = "your computer";
         assert_eq!(
-            local_exec_outcome("Hexuria", LocalExecVerdict::AllowOnce),
+            local_exec_outcome("Hexuria", LocalExecResolution::AllowOnce, here),
             "Hexuria can run commands on your computer this time."
         );
         assert_eq!(
-            local_exec_outcome("Hexuria", LocalExecVerdict::Always),
+            local_exec_outcome("Hexuria", LocalExecResolution::Always, here),
             "Hexuria can run commands on your computer."
         );
         assert_eq!(
-            local_exec_outcome("Hexuria", LocalExecVerdict::DeniedOnce),
+            local_exec_outcome("Hexuria", LocalExecResolution::DenyOnce, here),
             "Hexuria was not allowed to run commands on your computer."
         );
         assert_eq!(
-            local_exec_outcome("Hexuria", LocalExecVerdict::Never),
+            local_exec_outcome("Hexuria", LocalExecResolution::Never, here),
             "Hexuria cannot run commands on your computer."
         );
+        assert_eq!(
+            local_exec_outcome("Hexuria", LocalExecResolution::AllowOnce, "its computer"),
+            "Hexuria can run commands on its computer this time."
+        );
+    }
+
+    fn approval_for(tool: &str) -> ApprovalSpec {
+        ApprovalSpec {
+            run_id: "r1".into(),
+            call_id: "c1".into(),
+            tool: tool.into(),
+            command: "ls".into(),
+            why: String::new(),
+            reason: "exec-consent".into(),
+            output: None,
+            ok: None,
+        }
+    }
+
+    #[test]
+    fn only_the_local_shell_tool_runs_on_this_mac() {
+        let local = approval_for(USER_MACHINE_SHELL);
+        let boxed = approval_for("Shell");
+        assert!(local.runs_on_this_mac());
+        assert!(!boxed.runs_on_this_mac());
+        assert_eq!(local.place(), "your computer");
+        assert_eq!(boxed.place(), "its computer");
+    }
+
+    #[test]
+    fn machine_policy_never_answers_for_a_box_tool() {
+        let local = approval_for(USER_MACHINE_SHELL);
+        let boxed = approval_for("Shell");
+        assert_eq!(
+            policy_answer(&local, Some(LocalExecMode::Always)),
+            Some(LocalExecResolution::Always)
+        );
+        assert_eq!(
+            policy_answer(&local, Some(LocalExecMode::Never)),
+            Some(LocalExecResolution::Never)
+        );
+        assert_eq!(policy_answer(&local, Some(LocalExecMode::Ask)), None);
+        assert_eq!(policy_answer(&local, None), None);
+        assert_eq!(policy_answer(&boxed, Some(LocalExecMode::Always)), None);
+        assert_eq!(policy_answer(&boxed, Some(LocalExecMode::Never)), None);
     }
 }

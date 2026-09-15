@@ -7,10 +7,10 @@ use crate::chrome::{
 use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, ChatPart, ConnectedComputer, Coworker,
-    CoworkerPatch, FormSpec, LocalExecMode, LocalExecVerdict, ModelCatalogue, OpenGrokClient,
+    CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
     ProfileUpdate, QueuedApproval, TurnAssembler, activity_from_agui, command_from_args,
-    command_from_replay_events, enrol_this_machine, local_exec_outcome, serve_local_exec,
-    stored_machine_id, visible_bot_status,
+    command_from_replay_events, enrol_this_machine, local_exec_outcome, policy_answer,
+    serve_local_exec, stored_machine_id, visible_bot_status,
 };
 use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
@@ -558,28 +558,21 @@ pub enum ApprovalDecision {
     Failed(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalExecResolution {
-    Always,
-    AllowOnce,
-    Never,
-    DenyOnce,
-}
-
 impl ApprovalDecision {
     pub fn is_settled(&self) -> bool {
         !matches!(self, Self::Pending | Self::Sending)
     }
 
-    pub fn outcome_line(&self, bot: &str) -> Option<String> {
-        let verdict = match self {
-            Self::AllowOnce => LocalExecVerdict::AllowOnce,
-            Self::Always => LocalExecVerdict::Always,
-            Self::Denied => LocalExecVerdict::DeniedOnce,
-            Self::Never => LocalExecVerdict::Never,
+    /// `place` is [`ApprovalSpec::place`].
+    pub fn outcome_line(&self, bot: &str, place: &str) -> Option<String> {
+        let resolution = match self {
+            Self::AllowOnce => LocalExecResolution::AllowOnce,
+            Self::Always => LocalExecResolution::Always,
+            Self::Denied => LocalExecResolution::DenyOnce,
+            Self::Never => LocalExecResolution::Never,
             _ => return None,
         };
-        Some(local_exec_outcome(bot, verdict))
+        Some(local_exec_outcome(bot, resolution, place))
     }
 }
 
@@ -869,27 +862,29 @@ impl AppState {
             .map(|computer| computer.mode)
     }
 
-    fn auto_resolve_local_exec(&self) -> Option<LocalExecResolution> {
-        match self.this_machine_mode() {
-            Some(LocalExecMode::Always) => Some(LocalExecResolution::Always),
-            Some(LocalExecMode::Never) => Some(LocalExecResolution::Never),
-            _ => None,
-        }
+    /// What this Mac's policy answers for `spec` without a card, if anything.
+    fn auto_resolve_local_exec(&self, spec: &ApprovalSpec) -> Option<LocalExecResolution> {
+        policy_answer(spec, self.this_machine_mode())
     }
 
-    pub fn approval_status_line(&self, call_id: &str, bot: &str) -> Option<String> {
+    /// True once the person (or the policy) has answered; a click still in
+    /// flight counts.
+    pub fn approval_answered(&self, call_id: &str) -> bool {
+        self.approval_decisions
+            .get(call_id)
+            .is_some_and(|decision| !matches!(decision, ApprovalDecision::Pending))
+    }
+
+    pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
         if let Some(line) = self
             .approval_decisions
-            .get(call_id)
-            .and_then(|decision| decision.outcome_line(bot))
+            .get(&spec.call_id)
+            .and_then(|decision| decision.outcome_line(bot, spec.place()))
         {
             return Some(line);
         }
-        match self.this_machine_mode() {
-            Some(LocalExecMode::Always) => Some(local_exec_outcome(bot, LocalExecVerdict::Always)),
-            Some(LocalExecMode::Never) => Some(local_exec_outcome(bot, LocalExecVerdict::Never)),
-            _ => None,
-        }
+        self.auto_resolve_local_exec(spec)
+            .map(|resolution| local_exec_outcome(bot, resolution, spec.place()))
     }
 
     fn finish_responding(&mut self, coworker_id: Option<&str>, waiting_approval: bool) {
@@ -2311,12 +2306,13 @@ impl AppState {
                                     }
                                 }
                                 if assembler.waiting_approval() {
-                                    if let Some(resolution) = state.auto_resolve_local_exec() {
-                                        if let Some(spec) =
-                                            parts.iter().rev().find_map(|part| match part {
-                                                ChatPart::Approval(spec) => Some(spec.clone()),
-                                                _ => None,
-                                            })
+                                    let open = parts.iter().rev().find_map(|part| match part {
+                                        ChatPart::Approval(spec) => Some(spec.clone()),
+                                        _ => None,
+                                    });
+                                    if let Some(spec) = open {
+                                        if let Some(resolution) =
+                                            state.auto_resolve_local_exec(&spec)
                                         {
                                             state.answer_approval(spec, resolution, cx);
                                         }
@@ -2367,21 +2363,23 @@ impl AppState {
                     }
                 }
                 if waiting_approval {
-                    if let Some(resolution) = state.auto_resolve_local_exec() {
-                        if let Some(spec) = state
-                            .conversations
-                            .iter()
-                            .find(|c| c.id == conversation_id)
-                            .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
-                            .and_then(|m| {
-                                m.parts.iter().rev().find_map(|part| match part {
-                                    ChatPart::Approval(spec) => Some(spec.clone()),
-                                    _ => None,
-                                })
+                    let open = state
+                        .conversations
+                        .iter()
+                        .find(|c| c.id == conversation_id)
+                        .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
+                        .and_then(|m| {
+                            m.parts.iter().rev().find_map(|part| match part {
+                                ChatPart::Approval(spec) => Some(spec.clone()),
+                                _ => None,
                             })
-                        {
-                            state.answer_approval(spec, resolution, cx);
-                        }
+                        });
+                    let auto = open
+                        .as_ref()
+                        .and_then(|spec| state.auto_resolve_local_exec(spec))
+                        .zip(open);
+                    if let Some((resolution, spec)) = auto {
+                        state.answer_approval(spec, resolution, cx);
                         state.finish_responding(turn_id.as_deref(), false);
                     } else {
                         state.finish_responding(turn_id.as_deref(), true);
@@ -2406,15 +2404,7 @@ impl AppState {
         resolution: LocalExecResolution,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .approval_decisions
-            .get(&spec.call_id)
-            .is_some_and(ApprovalDecision::is_settled)
-            || matches!(
-                self.approval_decisions.get(&spec.call_id),
-                Some(ApprovalDecision::Sending)
-            )
-        {
+        if self.approval_answered(&spec.call_id) {
             return;
         }
         self.approval_decisions
@@ -2454,6 +2444,8 @@ impl AppState {
             LocalExecResolution::Never => (false, ApprovalDecision::Never, Some("never")),
             LocalExecResolution::DenyOnce => (false, ApprovalDecision::Denied, None),
         };
+        // Only the local-shell tool can move this Mac's policy.
+        let mode = mode.filter(|_| spec.runs_on_this_mac());
         if let (Some(machine_id), Some(stored)) = (machine_id.as_ref(), mode) {
             if let Some(computer) = self
                 .computers
@@ -2705,20 +2697,17 @@ impl AppState {
                 return;
             };
             let _ = this.update(cx, |state, cx| {
-                if let Some(resolution) = state.auto_resolve_local_exec() {
-                    for item in queue {
-                        if state
-                            .approval_decisions
-                            .get(&item.call_id)
-                            .is_some_and(|d| {
-                                d.is_settled() || matches!(d, ApprovalDecision::Sending)
-                            })
-                        {
-                            continue;
-                        }
-                        state.answer_approval(spec_from_queued(&item), resolution, cx);
+                // The policy answers what it covers; the rest wait for a card.
+                let mut needs_card = Vec::new();
+                for item in queue {
+                    if state.approval_answered(&item.call_id) {
+                        continue;
                     }
-                    return;
+                    let spec = spec_from_queued(&item);
+                    match state.auto_resolve_local_exec(&spec) {
+                        Some(resolution) => state.answer_approval(spec, resolution, cx),
+                        None => needs_card.push(item),
+                    }
                 }
                 if state.is_ai_responding {
                     return;
@@ -2726,17 +2715,10 @@ impl AppState {
                 let Some(thread_id) = thread_id.as_deref() else {
                     return;
                 };
-                let Some(item) = QueuedApproval::latest_for_thread(&queue, thread_id) else {
+                let Some(item) = QueuedApproval::latest_for_thread(&needs_card, thread_id) else {
                     return;
                 };
                 if item.run_id.trim().is_empty() {
-                    return;
-                }
-                if state
-                    .approval_decisions
-                    .get(&item.call_id)
-                    .is_some_and(|d| d.is_settled() || matches!(d, ApprovalDecision::Sending))
-                {
                     return;
                 }
                 state.attach_queued_approval(item.clone());
@@ -2988,9 +2970,6 @@ impl AppState {
     }
 
     fn has_open_approval(&self, conversation_id: &str) -> bool {
-        if self.auto_resolve_local_exec().is_some() {
-            return false;
-        }
         let Some(conversation) = self
             .conversations
             .iter()
@@ -3003,13 +2982,8 @@ impl AppState {
                 && message.parts.iter().any(|part| match part {
                     ChatPart::Approval(spec) => {
                         !spec.run_id.is_empty()
-                            && !self
-                                .approval_decisions
-                                .get(&spec.call_id)
-                                .is_some_and(|decision| {
-                                    decision.is_settled()
-                                        || matches!(decision, ApprovalDecision::Sending)
-                                })
+                            && !self.approval_answered(&spec.call_id)
+                            && self.auto_resolve_local_exec(spec).is_none()
                     }
                     _ => false,
                 })

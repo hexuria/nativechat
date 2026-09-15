@@ -266,7 +266,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 }
                 ChatPart::Approval(spec) => {
                     flush_text(&mut rows, &mut text_buf, &mut text_n);
-                    let outcome = state.approval_status_line(&spec.call_id, bot_name);
+                    let outcome = state.approval_status_line(&spec, bot_name);
                     rows.push(ChatRow {
                         id: format!("{}-ask-{ui_n}", msg.id),
                         content: SharedString::from(outcome.clone().unwrap_or_default()),

@@ -1,7 +1,8 @@
 //! Native AG-UI widgets. Not markdown, not KaTeX.
 
-use crate::opengrok::{ApprovalSpec, BarChartSpec, FormSpec, UiSpec};
-use crate::state::{AppState, ApprovalDecision, LocalExecResolution};
+use crate::opengrok::{ApprovalSpec, BarChartSpec, FormSpec, LocalExecResolution, UiSpec};
+use crate::state::{AppState, ApprovalDecision};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -46,7 +47,7 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
             "this agent".into(),
             String::new(),
         ));
-    if let Some(line) = decision.outcome_line(&bot) {
+    if let Some(line) = decision.outcome_line(&bot, spec.place()) {
         return div()
             .w_full()
             .py(px(8.))
@@ -97,28 +98,32 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                     .flex_1()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!(
-                        "Allow {bot} and all Bots to run commands on your local computer?"
-                    )),
+                    .child(if spec.runs_on_this_mac() {
+                        format!("Allow {bot} and all Bots to run commands on your local computer?")
+                    } else {
+                        format!("Allow {bot} to run {} on its computer?", spec.tool)
+                    }),
             )
             .child(dismiss_button(spec, app.clone(), theme.muted_foreground)),
     );
-    if !machine.is_empty() {
+    if spec.runs_on_this_mac() {
+        if !machine.is_empty() {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(machine),
+            );
+        }
         body = body.child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(machine),
+                .child(format!(
+                    "This applies to {bot} and every Bot. It can always be changed in Settings."
+                )),
         );
     }
-    body = body.child(
-        div()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(format!(
-                "This applies to {bot} and every Bot. It can always be changed in Settings."
-            )),
-    );
     let command = if spec.command.trim().is_empty() {
         "Command was not included with this request.".to_string()
     } else {
@@ -143,40 +148,57 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 .child("Sending…"),
         );
     } else {
-        body = body.child(
-            h_flex()
-                .w_full()
-                .justify_end()
-                .gap(px(8.))
-                .flex_wrap()
-                .child(approval_button(
-                    spec,
-                    "Always allow",
-                    LocalExecResolution::Always,
-                    app.clone(),
-                    theme.primary,
-                    theme.primary_foreground,
-                    theme.primary,
-                ))
-                .child(approval_button(
-                    spec,
-                    "Allow once",
-                    LocalExecResolution::AllowOnce,
-                    app.clone(),
-                    theme.border,
-                    theme.foreground,
-                    theme.background,
-                ))
-                .child(approval_button(
-                    spec,
-                    "Never",
-                    LocalExecResolution::Never,
-                    app,
-                    theme.border,
-                    theme.foreground,
-                    theme.background,
-                )),
+        // Always/Never set this Mac's policy, so only the local-shell tool
+        // offers them. A box tool is answered one request at a time.
+        let local = spec.runs_on_this_mac();
+        let (primary, plain) = (
+            (theme.primary, theme.primary_foreground, theme.primary),
+            (theme.border, theme.foreground, theme.background),
         );
+        let allow_once = if local { plain } else { primary };
+        let mut row = h_flex().w_full().justify_end().gap(px(8.)).flex_wrap();
+        if local {
+            row = row.child(approval_button(
+                spec,
+                "Always allow",
+                LocalExecResolution::Always,
+                app.clone(),
+                primary.0,
+                primary.1,
+                primary.2,
+            ));
+        }
+        row = row
+            .child(approval_button(
+                spec,
+                "Allow once",
+                LocalExecResolution::AllowOnce,
+                app.clone(),
+                allow_once.0,
+                allow_once.1,
+                allow_once.2,
+            ))
+            .child(approval_button(
+                spec,
+                "Deny once",
+                LocalExecResolution::DenyOnce,
+                app.clone(),
+                plain.0,
+                plain.1,
+                plain.2,
+            ));
+        if local {
+            row = row.child(approval_button(
+                spec,
+                "Never",
+                LocalExecResolution::Never,
+                app,
+                plain.0,
+                plain.1,
+                plain.2,
+            ));
+        }
+        body = body.child(row);
     }
     body.into_any_element()
 }
@@ -190,6 +212,7 @@ fn dismiss_button(spec: &ApprovalSpec, app: Option<Entity<AppState>>, color: Hsl
         .cursor_pointer()
         .text_color(color)
         .child("×")
+        .tooltip(|w, cx| Tooltip::new("Deny this time").build(w, cx))
         .when_some(app, |this, app| {
             this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 app.update(cx, |state, cx| {
