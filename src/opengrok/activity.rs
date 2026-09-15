@@ -80,6 +80,17 @@ fn file_basename(path: &str) -> Option<&str> {
         .next_back()
 }
 
+/// First line of the command, cut so the status line stays one line.
+fn short_command(command: &str) -> String {
+    const MAX: usize = 48;
+    let line = command.lines().next().unwrap_or("").trim();
+    let mut out: String = line.chars().take(MAX).collect();
+    if line.chars().count() > MAX || command.lines().nth(1).is_some() {
+        out.push('…');
+    }
+    out
+}
+
 fn describe_tool(name: &str, args: Option<&str>) -> String {
     let parsed = args.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
     let path = parsed
@@ -96,16 +107,15 @@ fn describe_tool(name: &str, args: Option<&str>) -> String {
         "WebSearch" | "webSearchToolCall" => "Searching the web".into(),
         "WebFetch" | "webFetchToolCall" => "Reading the web".into(),
         "GenerateImage" | "generateImageToolCall" => "Generating a photo".into(),
-        "Shell" | "BoxShell" | "shellToolCall" | "ExternalShell" => {
-            if command.is_some_and(|c| c.contains('>') || c.contains("tee ") || c.contains("sed "))
-            {
+        "Shell" | "BoxShell" | "shellToolCall" | "ExternalShell" => match command {
+            Some(c) if c.contains('>') || c.contains("tee ") || c.contains("sed ") => {
                 "Drafting the file".into()
-            } else {
-                "Running commands".into()
             }
-        }
+            Some(c) => format!("Running `{}`", short_command(c)),
+            None => "Running commands".into(),
+        },
         super::gen_ui::USER_MACHINE_SHELL => command
-            .map(|c| format!("On your machine: {c}"))
+            .map(|c| format!("On your machine: {}", short_command(c)))
             .unwrap_or_else(|| "On your machine".into()),
         "Computer" | "Screenshot" | "computerUseToolCall" => "On its computer".into(),
         "" => "Working".into(),
@@ -155,11 +165,27 @@ mod tests {
             })
         );
         assert_eq!(
-            activity_from_agui(&ev, Some(r#"{"command":"ls"}"#)),
+            activity_from_agui(&ev, Some(r#"{"command":"cargo test"}"#)),
+            ActivityTick::Set(BotActivity {
+                label: "Running `cargo test`".into()
+            })
+        );
+        assert_eq!(
+            activity_from_agui(&ev, None),
             ActivityTick::Set(BotActivity {
                 label: "Running commands".into()
             })
         );
+    }
+
+    #[test]
+    fn short_command_keeps_the_status_line_to_one_line() {
+        assert_eq!(short_command("ls -la"), "ls -la");
+        assert_eq!(short_command("  echo hi\nls"), "echo hi…");
+        let long = "x".repeat(60);
+        let cut = short_command(&long);
+        assert_eq!(cut.chars().count(), 49);
+        assert!(cut.ends_with('…'));
     }
 
     #[test]

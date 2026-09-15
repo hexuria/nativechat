@@ -1,26 +1,14 @@
-mod items;
 #[macro_use]
 mod sync_macros;
 
-pub use items::{render_flyout_item, render_popover_item};
-
-use crate::actions::{
-    SelectAppCanva, SelectAppCanvas, SelectAppCoursera, SelectAppDeepResearch, SelectAppFigma,
-    SelectAppImageGeneration, SelectAppLinear, SelectAppNotion, SelectAppPhotos, SelectAppSpotify,
-    SelectAppStudy, SelectAppThinking, SelectAppWebSearch,
-};
 use crate::audio::AudioInput;
 use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
 use crate::state::{AppState, ReplyTo, SubmitChord};
 use gpui_kit::InteractiveElement;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName,
-    button::{Button, ButtonVariants},
-    h_flex,
+    ActiveTheme, Icon, IconName, h_flex,
     input::{InputEvent, Textarea, TextareaState},
-    menu::{DropdownMenu, PopupMenuItem},
-    popover::Popover,
     tooltip::Tooltip,
     v_flex,
 };
@@ -39,7 +27,6 @@ pub struct MessageInput {
     audio_input: Option<AudioInput>,
     state: Entity<AppState>,
     // Cached state to avoid re-rendering on every AppState change
-    selected_apps: Vec<String>,
     is_voice_mode_open: bool,
     is_app_settings_open: bool,
     submit_chord: SubmitChord,
@@ -58,7 +45,6 @@ impl MessageInput {
 
         // Cache initial values from AppState
         let app_state = state.read(cx);
-        let selected_apps = app_state.selected_apps.clone();
         let is_voice_mode_open = app_state.is_voice_mode_open;
         let is_app_settings_open = app_state.is_app_settings_open;
         let submit_chord = app_state.submit_chord;
@@ -68,7 +54,6 @@ impl MessageInput {
         let this = Self {
             state: state.clone(),
             input_state: input_state.clone(),
-            selected_apps,
             is_voice_mode_open,
             is_app_settings_open,
             submit_chord,
@@ -85,7 +70,6 @@ impl MessageInput {
             let mut changed = false;
             {
                 let state = state.read(cx);
-                sync_field_clone!(this, state, selected_apps, changed);
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_app_settings_open, changed);
                 sync_field_clone!(this, state, reply_to, changed);
@@ -208,14 +192,10 @@ impl Render for MessageInput {
         let secondary = theme.secondary;
         let secondary_foreground = theme.secondary_foreground;
         let border = theme.border;
-        // Removed direct state read to prevent excessive re-renders
-        // let app_state = state_model.read(cx);
-        let selected_apps = self.selected_apps.clone();
-
         // Check if any modal is open using cached state
         let any_modal_open = self.is_voice_mode_open || self.is_app_settings_open;
         let draft = self.input_state.read(cx).value();
-        let compact = !self.voice_mode && self.selected_apps.is_empty() && !draft.contains('\n');
+        let compact = !self.voice_mode && !draft.contains('\n');
 
         // ChatGPT-style: centered container with max-width
         h_flex().w_full().justify_center().child(
@@ -309,269 +289,8 @@ impl Render for MessageInput {
                     // Bottom: Toolbar (and the field, when the composer is one line)
                     h_flex()
                         .when(compact, |this| this.items_center().gap_1())
-                        .when(!compact, |this| this.justify_between().items_start().gap_2())
-                        .child(
-                             // App Picker Popover (Moved out of wrapping container)
-                            Button::new("add-app")
-                                .icon(IconName::Plus)
-                                .ghost()
-                                .rounded_full()
-                                .when(!any_modal_open, |this| this.cursor_pointer())
-                                .dropdown_menu_with_anchor(Anchor::BottomLeft, {
-                                    let state_model = state_model.clone();
-                                    move |menu, window, cx| {
-                                        let state = state_model.read(cx);
-                                        let capabilities = state.capabilities.clone();
-                                        
-                                        let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
-                                            let state_model = state_model.clone();
-                                            let label_string = label.to_string();
-                                            let app_name_string = app_name.to_string();
-                                            let icon_string = icon.to_string();
-                                            PopupMenuItem::new(label_string)
-                                                .icon(Icon::default().path(icon_string))
-                                                .on_click(move |_, window, cx| {
-                                                    state_model.update(cx, |state, cx| state.select_app(app_name_string.clone(), cx));
-                                                    window.dispatch_action(action.boxed_clone(), cx);
-                                                })
-                                        };
-
-                                        fn get_action(action_id: &str) -> Box<dyn Action> {
-                                            match action_id {
-                                                "SelectAppPhotos" => Box::new(SelectAppPhotos),
-                                                "SelectAppImageGeneration" => Box::new(SelectAppImageGeneration),
-                                                "SelectAppThinking" => Box::new(SelectAppThinking),
-                                                "SelectAppDeepResearch" => Box::new(SelectAppDeepResearch),
-                                                "SelectAppStudy" => Box::new(SelectAppStudy),
-                                                "SelectAppWebSearch" => Box::new(SelectAppWebSearch),
-                                                "SelectAppCanvas" => Box::new(SelectAppCanvas),
-                                                "SelectAppCanva" => Box::new(SelectAppCanva),
-                                                "SelectAppCoursera" => Box::new(SelectAppCoursera),
-                                                "SelectAppFigma" => Box::new(SelectAppFigma),
-                                                "SelectAppSpotify" => Box::new(SelectAppSpotify),
-                                                _ => Box::new(SelectAppWebSearch), // Fallback
-                                            }
-                                        }
-
-                                        let mut menu = menu;
-                                        
-                                        // Primary Items
-                                        for cap in capabilities.iter().filter(|c| c.is_primary) {
-                                            menu = menu.item(make_item(
-                                                &cap.label,
-                                                &cap.name,
-                                                &cap.icon,
-                                                get_action(&cap.action_id),
-                                                state_model.clone()
-                                            ));
-                                        }
-
-                                        menu = menu.separator();
-
-                                        // Secondary Items ("More" submenu)
-                                        let secondary_caps: Vec<_> = capabilities.iter().filter(|c| !c.is_primary).cloned().collect();
-                                        if !secondary_caps.is_empty() {
-                                            let state_model_submenu = state_model.clone();
-                                            let secondary_caps_for_submenu = secondary_caps.clone();
-                                            menu = menu.submenu("More", window, cx, move |menu, _, _| {
-                                                let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
-                                                    let state_model = state_model.clone();
-                                                    let label_string = label.to_string();
-                                                    let app_name_string = app_name.to_string();
-                                                    let icon_string = icon.to_string();
-                                                    PopupMenuItem::new(label_string)
-                                                        .icon(Icon::default().path(icon_string))
-                                                        .on_click(move |_, window, cx| {
-                                                            state_model.update(cx, |state, cx| state.select_app(app_name_string.clone(), cx));
-                                                            window.dispatch_action(action.boxed_clone(), cx);
-                                                        })
-                                                };
-
-                                                let mut submenu = menu;
-                                                for cap in secondary_caps_for_submenu.iter() {
-                                                    submenu = submenu.item(make_item(
-                                                        &cap.label,
-                                                        &cap.name,
-                                                        &cap.icon,
-                                                        get_action(&cap.action_id),
-                                                        state_model_submenu.clone()
-                                                    ));
-                                                }
-                                                submenu
-                                            });
-                                        }
-                                        menu
-                                    }
-                                })
-                        )
                         .when(!compact, |this| {
-                        this.child(
-                            // Bottom Row
-                            div()
-                                .flex()
-                                .flex_1() // Allow this section to shrink/grow
-                                .min_w_0() // Allow shrinking below content size to force wrapping
-                                .flex_wrap() // Allow wrapping
-                                .items_center()
-                                .gap_2()
-                                .children(
-                                    std::iter::once(
-                                        div().into_any_element() // Placeholder or remove entirely if not needed
-                                    )
-                                    .chain({
-                                        let (tool_calls, rest): (Vec<_>, Vec<_>) = selected_apps.iter()
-                                            .cloned()
-                                            .partition(|app| matches!(app.as_str(), "Web search" | "Deep Research" | "Image Generation" | "Photos" | "Thinking"));
-
-                                        let (skills, mini_apps): (Vec<_>, Vec<_>) = rest.into_iter()
-                                            .partition(|app| matches!(app.as_str(), "Study" | "Canvas"));
-
-                                        let groups = vec![
-                                            ("Tools", tool_calls, "icons/wrench.svg"),
-                                            ("Skills", skills, "icons/wizard_hat.svg"),
-                                            ("Apps", mini_apps, "icons/plugins.svg"),
-                                        ];
-
-                                        let state_model = state_model.clone();
-                                        groups.into_iter().flat_map(move |(group_name, apps, icon_path)| -> Box<dyn Iterator<Item = AnyElement>> {
-                                            if apps.len() >= 2 {
-                                                let apps_clone = apps.clone();
-                                                let state_model = state_model.clone();
-                                                let group_name = group_name.to_string();
-                                                let icon_path = icon_path.to_string();
-                                                
-                                                Box::new(std::iter::once(
-                                                    Popover::new(SharedString::from(format!("aggregated-{}-popover", group_name.to_lowercase())))
-                                                        .anchor(Anchor::BottomLeft)
-                                                        .trigger(
-                                                            Button::new(SharedString::from(format!("aggregated-{}-btn", group_name.to_lowercase())))
-                                                                .ghost()
-                                                                .bg(secondary)
-                                                                .rounded_md()
-                                                                .px_2()
-                                                                .py_1()
-                                                                .child(
-                                                                    h_flex()
-                                                                        .gap_1()
-                                                                        .items_center()
-                                                                        .child(
-                                                                            svg()
-                                                                                .path(icon_path.clone())
-                                                                                .size(px(12.0))
-                                                                                .text_color(secondary_foreground)
-                                                                        )
-                                                                        .child(
-                                                                            div()
-                                                                                .child(format!("{} {}", apps.len(), group_name.to_lowercase()))
-                                                                                .text_size(px(12.0)),
-                                                                        )
-                                                                        .child(
-                                                                            Icon::new(IconName::ChevronDown)
-                                                                                .size(px(12.0))
-                                                                                .text_color(secondary_foreground)
-                                                                        )
-                                                                )
-                                                        )
-                                                        .content(move |_, _, cx| {
-                                                            let theme = cx.theme();
-                                                            v_flex()
-                                                                .w(px(200.0))
-                                                                .p_1()
-                                                                .gap_1()
-                                                                .children(
-                                                                    apps_clone.iter().enumerate().map(|(i, app)| {
-                                                                        let app_name = app.clone();
-                                                                        let icon = tool_icon(&app_name);
-
-                                                                        h_flex()
-                                                                            .gap_2()
-                                                                            .items_center()
-                                                                            .px_2()
-                                                                            .py_1()
-                                                                            .rounded_sm()
-                                                                            .hover(move |s| s.bg(theme.secondary))
-                                                                            .cursor_pointer()
-                                                                            .id(SharedString::from(format!("remove-{}-aggregated-{}", group_name.to_lowercase(), i)))
-                                                                            .on_click({
-                                                                                let state_model = state_model.clone();
-                                                                                move |_event, _window, cx| {
-                                                                                    state_model.update(cx, |state, cx| {
-                                                                                        state.remove_app(app_name.clone(), cx);
-                                                                                    });
-                                                                                }
-                                                                            })
-                                                                            .child(
-                                                                                Icon::new(icon)
-                                                                                    .size(px(12.0))
-                                                                                    .text_color(theme.secondary_foreground)
-                                                                            )
-                                                                            .child(
-                                                                                div()
-                                                                                    .child(app.clone())
-                                                                                    .text_size(px(12.0))
-                                                                            )
-                                                                            .child(
-                                                                                div().flex_grow(1.) // Spacer
-                                                                            )
-                                                                            .child(
-                                                                                Icon::new(NativeIcon::Close)
-                                                                                    .size(px(12.0))
-                                                                                    .text_color(theme.secondary_foreground)
-                                                                            )
-                                                                    })
-                                                                )
-                                                        })
-                                                        .into_any_element()
-                                                ))
-                                            } else {
-                                                // Render individual tags
-                                                let state_model = state_model.clone();
-                                                Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
-                                                        let app_name = app.clone();
-                                                        let icon = tool_icon(&app_name);
-
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_1()
-                                                            .bg(secondary)
-                                                            .rounded_md()
-                                                            .px_2()
-                                                            .py_1()
-                                                            .child(
-                                                                Icon::new(icon)
-                                                                    .size(px(12.0))
-                                                                    .text_color(secondary_foreground)
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .child(app_name.clone())
-                                                                    .text_size(px(12.0)),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id(SharedString::from(format!("remove-{}-{}", app_name.to_lowercase(), i)))
-                                                                    .cursor_pointer()
-                                                                    .on_click({
-                                                                        let state_model = state_model.clone();
-                                                                        move |_event, _window, cx| {
-                                                                            state_model.update(cx, |state, cx| {
-                                                                                state.remove_app(app_name.clone(), cx);
-                                                                            });
-                                                                        }
-                                                                    })
-                                                                    .child(
-                                                                        Icon::new(NativeIcon::Close)
-                                                                            .size(px(14.0)),
-                                                                    ),
-                                                            )
-                                                            .into_any_element()
-                                                    }))
-                                            }
-                                        })
-                                    })
-                                )
-                                )
+                            this.justify_between().items_start().gap_2()
                         })
                         .when(compact, |this| {
                             this.child(
@@ -581,9 +300,7 @@ impl Render for MessageInput {
                                     .min_w_0()
                                     .w_full()
                                     .child(
-                                        Textarea::new(&self.input_state)
-                                            .appearance(false)
-                                            .w_full(),
+                                        Textarea::new(&self.input_state).appearance(false).w_full(),
                                     ),
                             )
                         })
@@ -615,11 +332,11 @@ impl Render for MessageInput {
                                                 Icon::new(NativeIcon::Close)
                                                     .text_color(secondary_foreground),
                                             );
-                                        
+
                                         if !any_modal_open {
                                             cancel_btn = cancel_btn.cursor_pointer();
                                         }
-                                        
+
                                         cancel_btn
                                     })
                                     .child({
@@ -644,11 +361,11 @@ impl Render for MessageInput {
                                                 Icon::new(IconName::Check)
                                                     .text_color(theme.background),
                                             );
-                                        
+
                                         if !any_modal_open {
                                             confirm_btn = confirm_btn.cursor_pointer();
                                         }
-                                        
+
                                         confirm_btn
                                     })
                                 })
@@ -676,11 +393,11 @@ impl Render for MessageInput {
                                                     .size(px(18.0))
                                                     .text_color(secondary_foreground),
                                             );
-                                        
+
                                         if !any_modal_open {
                                             mic_btn = mic_btn.cursor_pointer();
                                         }
-                                        
+
                                         mic_btn
                                     })
                                     .child(
@@ -711,11 +428,11 @@ impl Render for MessageInput {
                                                         .size(px(18.0))
                                                         .text_color(secondary_foreground),
                                                 );
-                                            
+
                                             if !any_modal_open {
                                                 sparkles_btn = sparkles_btn.cursor_pointer();
                                             }
-                                            
+
                                             sparkles_btn
                                         } else {
                                             // Typing state: Send button (Black bg, White arrow)
@@ -742,112 +459,18 @@ impl Render for MessageInput {
                                                     Icon::new(IconName::ArrowUp)
                                                         .text_color(theme.background),
                                                 );
-                                            
+
                                             if !any_modal_open {
                                                 send_btn = send_btn.cursor_pointer();
                                             }
-                                            
-                                            send_btn
-                                        }
-                                    )
-                                })
-                        )
-                )
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppCanva, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Canva".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppFigma, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Figma".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppNotion, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Notion".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppLinear, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Linear".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppWebSearch, _, cx| {
-                        println!("Action SelectAppWebSearch received");
-                        state.update(cx, |state, cx| state.select_app("Web search".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppCanvas, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Canvas".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppCoursera, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Coursera".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppSpotify, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Spotify".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppPhotos, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Photos".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppImageGeneration, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Image Generation".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppThinking, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Thinking".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppDeepResearch, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Deep Research".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppStudy, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Study".to_string(), cx));
-                    }
-                }))
-    }
-}
 
-fn tool_icon(name: &str) -> Icon {
-    match name {
-        "Image Generation" => Icon::new(NativeIcon::CreateImage),
-        "Thinking" => Icon::new(NativeIcon::Thinking),
-        "Deep Research" => Icon::new(NativeIcon::DeepSearch),
-        "Study" => Icon::new(NativeIcon::Study),
-        "Web search" => Icon::new(NativeIcon::WebSearch),
-        "Canvas" => Icon::new(NativeIcon::Canvas),
-        "Canva" => Icon::new(NativeIcon::Canva),
-        "Coursera" => Icon::new(NativeIcon::Coursera),
-        "Figma" => Icon::new(NativeIcon::Figma),
-        "Spotify" => Icon::new(NativeIcon::Spotify),
-        _ => Icon::new(NativeIcon::Clip),
+                                            send_btn
+                                        },
+                                    )
+                                }),
+                        ),
+                ),
+        )
     }
 }
 
