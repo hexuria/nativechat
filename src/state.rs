@@ -2295,8 +2295,10 @@ impl AppState {
                         }
                     }
                 }
-                if !waiting_approval {
+                if !waiting_approval && result.is_ok() {
                     // The run is final; a run parked on a card is saved when it finishes.
+                    // An error line is painted, never saved: it must not become history
+                    // the model is shown next turn.
                     let reply = state
                         .conversations
                         .iter()
@@ -2525,11 +2527,14 @@ impl AppState {
                                             ActivityTick::Set(activity.clone()),
                                         );
                                     }
-                                    "finished" | "failed" => {
+                                    "finished" => {
                                         state.finish_responding(coworker_id.as_deref(), false);
                                         if let Some(id) = conversation_id.as_ref() {
                                             state.persist_assistant_reply(id, plain.clone(), cx);
                                         }
+                                    }
+                                    "failed" => {
+                                        state.finish_responding(coworker_id.as_deref(), false);
                                     }
                                     _ => {}
                                 }
