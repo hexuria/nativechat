@@ -2095,6 +2095,44 @@ impl AppState {
         cx.notify();
     }
 
+    fn conversation_title(&self, id: &str) -> String {
+        self.conversations
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Keep the coworker's reply so the thread survives a relaunch.
+    fn persist_assistant_reply(
+        &self,
+        conversation_id: &str,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        if content.trim().is_empty() {
+            return;
+        }
+        let Some(db) = self.database_service.clone() else {
+            return;
+        };
+        let title = self.conversation_title(conversation_id);
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |_this, _cx| {
+            let saved = match db.ensure_session(&conversation_id, &title).await {
+                Ok(()) => db
+                    .save_message(&conversation_id, "assistant", &content, None, None)
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = saved {
+                eprintln!("Failed to save assistant message: {error}");
+            }
+        })
+        .detach();
+    }
+
     fn send_opengrok_turn(
         &mut self,
         conversation_id: String,
@@ -2255,6 +2293,19 @@ impl AppState {
                                 Err(error) => last.content = format!("OpenGrok: {}", error.message),
                             }
                         }
+                    }
+                }
+                if !waiting_approval {
+                    // The run is final; a run parked on a card is saved when it finishes.
+                    let reply = state
+                        .conversations
+                        .iter()
+                        .find(|c| c.id == conversation_id)
+                        .and_then(|c| c.messages.last())
+                        .filter(|m| !m.is_me)
+                        .map(|m| m.content.clone());
+                    if let Some(reply) = reply {
+                        state.persist_assistant_reply(&conversation_id, reply, cx);
                     }
                 }
                 if waiting_approval {
@@ -2476,6 +2527,9 @@ impl AppState {
                                     }
                                     "finished" | "failed" => {
                                         state.finish_responding(coworker_id.as_deref(), false);
+                                        if let Some(id) = conversation_id.as_ref() {
+                                            state.persist_assistant_reply(id, plain.clone(), cx);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -2826,8 +2880,14 @@ impl AppState {
         if let Some(db) = self.database_service.clone() {
             let content_clone = content.clone();
             let conversation_id_clone = conversation_id.clone();
+            let title = self.conversation_title(&conversation_id);
             let local_id = local_id.clone();
             cx.spawn(async move |this, cx| {
+                // A coworker thread has no session row until it first speaks.
+                if let Err(e) = db.ensure_session(&conversation_id_clone, &title).await {
+                    eprintln!("Failed to save user message: {}", e);
+                    return;
+                }
                 match db
                     .save_message(&conversation_id_clone, "user", &content_clone, None, None)
                     .await

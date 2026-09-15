@@ -26,6 +26,18 @@ impl DatabaseService {
         Ok(id)
     }
 
+    /// A session row under a caller-chosen id. Coworker threads use the
+    /// coworker id, so their messages persist under the id the conversation
+    /// already carries. A row that exists is left alone.
+    pub async fn ensure_session(&self, id: &str, title: &str) -> Result<()> {
+        sqlx::query("INSERT OR IGNORE INTO chat_sessions (id, title) VALUES (?, ?)")
+            .bind(id)
+            .bind(title)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_sessions(&self) -> Result<Vec<ChatSession>> {
         let rows = sqlx::query_as::<_, ChatSession>(
             "SELECT id, title, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC",
