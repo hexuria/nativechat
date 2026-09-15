@@ -6,8 +6,8 @@ use crate::chrome::{
 };
 use crate::config::Config;
 use crate::opengrok::{
-    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxStatus, ChatPart,
-    ConnectedComputer, Coworker, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
+    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
+    Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
     ModelCatalogue, OpenGrokClient, ProfileUpdate, QueuedApproval, ToolCallTracker, TurnAssembler,
     activity_from_replay, command_from_args, command_from_replay_events, enrol_this_machine,
     local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id, visible_bot_status,
@@ -533,7 +533,14 @@ pub struct AppState {
     local_exec_cancel: Option<Arc<AtomicBool>>,
     pub expanded_shell_output: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
-    pub box_status: Option<BoxStatus>,
+    /// The active coworker's computer, as last polled. Cleared on a switch so a
+    /// bot never shows the previous one's screen.
+    pub coworker_computer: Option<CoworkerComputer>,
+    /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
+    /// endpoint, so polling stops until the roster reloads.
+    pub computer_endpoint_missing: bool,
+    /// Runs while the Computer pane is open; dropped when it closes.
+    computer_poll: Option<Task<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -649,7 +656,9 @@ impl AppState {
             local_exec_cancel: None,
             expanded_shell_output: HashSet::new(),
             computers: Vec::new(),
-            box_status: None,
+            coworker_computer: None,
+            computer_endpoint_missing: false,
+            computer_poll: None,
         };
 
         state
@@ -983,11 +992,27 @@ impl AppState {
         self.right_pane == RightPane::Settings
     }
 
+    /// How often the open Computer pane asks after the coworker's box.
+    const COMPUTER_POLL: Duration = Duration::from_secs(2);
+
+    /// Every change of the right pane goes through here, so the Computer poll
+    /// runs exactly while that pane is open.
+    fn set_right_pane(&mut self, pane: RightPane, cx: &mut Context<Self>) {
+        let computer = pane == RightPane::Computer;
+        self.right_pane = pane;
+        if computer {
+            self.refresh_coworker_computer(cx);
+            self.start_computer_poll(cx);
+        } else {
+            self.computer_poll = None;
+        }
+    }
+
     pub fn close_right_pane(&mut self, cx: &mut Context<Self>) {
         if self.right_pane == RightPane::Closed {
             return;
         }
-        self.right_pane = RightPane::Closed;
+        self.set_right_pane(RightPane::Closed, cx);
         self.computer_view = ComputerView::Overview;
         self.model_picker_open = false;
         self.avatar_editor_open = false;
@@ -997,7 +1022,7 @@ impl AppState {
 
     pub fn show_agent_settings(&mut self, cx: &mut Context<Self>) {
         self.ensure_active_coworker(cx);
-        self.right_pane = RightPane::Settings;
+        self.set_right_pane(RightPane::Settings, cx);
         self.computer_view = ComputerView::Overview;
         self.record_nav();
         cx.notify();
@@ -1005,9 +1030,8 @@ impl AppState {
 
     pub fn show_computer_pane(&mut self, cx: &mut Context<Self>) {
         self.ensure_active_coworker(cx);
-        self.right_pane = RightPane::Computer;
+        self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
-        self.refresh_box_status(cx);
         self.record_nav();
         cx.notify();
     }
@@ -1017,7 +1041,7 @@ impl AppState {
             self.close_right_pane(cx);
             return;
         }
-        self.right_pane = RightPane::Settings;
+        self.set_right_pane(RightPane::Settings, cx);
         self.computer_view = ComputerView::Overview;
         self.record_nav();
         cx.notify();
@@ -1028,28 +1052,75 @@ impl AppState {
             self.close_right_pane(cx);
             return;
         }
-        self.right_pane = RightPane::Computer;
+        self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
         self.model_picker_open = false;
         self.avatar_editor_open = false;
-        self.refresh_box_status(cx);
         self.record_nav();
         cx.notify();
     }
 
-    pub fn refresh_box_status(&mut self, cx: &mut Context<Self>) {
+    /// Keep the Computer pane's tile current while it is open. Idempotent; the
+    /// task is dropped by `set_right_pane` when the pane closes.
+    fn start_computer_poll(&mut self, cx: &mut Context<Self>) {
+        if self.computer_poll.is_some() {
+            return;
+        }
+        self.computer_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Self::COMPUTER_POLL).await;
+                let alive = this.update(cx, |state, cx| {
+                    if state.right_pane == RightPane::Computer {
+                        state.refresh_coworker_computer(cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    pub fn refresh_coworker_computer(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
         let Some(coworker_id) = self.active_coworker_id.clone() else {
-            self.box_status = None;
+            self.coworker_computer = None;
             return;
         };
+        if self.computer_endpoint_missing {
+            return;
+        }
         cx.spawn(async move |this, cx| {
-            let status = client.coworker_computer(&coworker_id).await.ok();
+            let result = client.coworker_computer(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                state.box_status = status;
-                cx.notify();
+                // A late answer for a bot the person has since left is stale.
+                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(status) => {
+                        if state.coworker_computer.as_ref() != Some(&status) {
+                            state.coworker_computer = Some(status);
+                            cx.notify();
+                        }
+                    }
+                    Err(error) if error.status == Some(404) => {
+                        eprintln!(
+                            "NativeChat computer: this server has no /coworkers/{{id}}/computer; not polling"
+                        );
+                        state.computer_endpoint_missing = true;
+                        state.computer_poll = None;
+                    }
+                    Err(error) => {
+                        // Say it once, when the status is lost, not every two seconds.
+                        if state.coworker_computer.take().is_some() {
+                            eprintln!("NativeChat computer: {}", error.message);
+                            cx.notify();
+                        }
+                    }
+                }
             });
         })
         .detach();
@@ -1063,52 +1134,72 @@ impl AppState {
             return;
         };
         if let Some(url) = self
-            .box_status
+            .coworker_computer
             .as_ref()
-            .and_then(BoxStatus::screen_url)
+            .and_then(CoworkerComputer::vnc_url)
             .map(str::to_string)
         {
-            self.open_computer_window(&url, cx);
+            self.open_computer_window(&coworker_id, &url, cx);
             return;
         }
         cx.spawn(async move |this, cx| {
-            let status = client.ensure_coworker_computer(&coworker_id).await.ok();
-            let _ = this.update(cx, |state, cx| {
-                if let Some(status) = status {
-                    if let Some(url) = status.screen_url() {
-                        state.open_computer_window(url, cx);
+            let result = client.ensure_coworker_computer(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| match result {
+                Ok(status) => {
+                    if let Some(url) = status.vnc_url().map(str::to_string) {
+                        state.open_computer_window(&coworker_id, &url, cx);
                     }
-                    state.box_status = Some(status);
+                    if state.active_coworker_id.as_deref() == Some(coworker_id.as_str()) {
+                        state.coworker_computer = Some(status);
+                        cx.notify();
+                    }
                 }
-                cx.notify();
+                Err(error) => eprintln!(
+                    "NativeChat computer: could not open the computer of {coworker_id}: {}",
+                    error.message
+                ),
             });
         })
         .detach();
     }
 
-    fn open_computer_window(&self, url: &str, cx: &mut Context<Self>) {
-        let url = url.to_string();
+    /// The screen of `coworker_id`, in its own window. The title names that
+    /// coworker, not whichever one is active by the time the answer lands.
+    fn open_computer_window(&self, coworker_id: &str, url: &str, cx: &mut Context<Self>) {
         let title = self
             .coworkers
             .iter()
-            .find(|coworker| Some(&coworker.id) == self.active_coworker_id.as_ref())
+            .find(|coworker| coworker.id == coworker_id)
             .map(|coworker| format!("{}'s Computer", coworker.name))
             .unwrap_or_else(|| "Computer".into());
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds {
-                origin: point(px(72.), px(72.)),
-                size: size(px(1100.), px(760.)),
-            })),
-            window_min_size: Some(size(px(640.), px(480.))),
-            titlebar: Some(TitlebarOptions {
-                title: Some(title.into()),
-                ..TitlebarOptions::default()
-            }),
-            ..WindowOptions::default()
-        };
-        let _ = cx.open_window(options, move |window, cx| {
-            cx.new(|cx| crate::components::computer_screen::ComputerScreen::new(&url, window, cx))
-        });
+        #[cfg(target_os = "macos")]
+        {
+            let url = url.to_string();
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(72.), px(72.)),
+                    size: size(px(1100.), px(760.)),
+                })),
+                window_min_size: Some(size(px(640.), px(480.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.into()),
+                    ..TitlebarOptions::default()
+                }),
+                ..WindowOptions::default()
+            };
+            let opened = cx.open_window(options, move |window, cx| {
+                cx.new(|cx| {
+                    crate::components::computer_screen::ComputerScreen::new(&url, window, cx)
+                })
+            });
+            if let Err(error) = opened {
+                eprintln!("NativeChat computer: could not open a window: {error}");
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("NativeChat computer: {title} is at {url}; opening it in-app is macOS-only");
+        }
     }
 
     pub fn open_routine_editor(&mut self, id: Option<String>, cx: &mut Context<Self>) {
@@ -1133,7 +1224,7 @@ impl AppState {
                 id
             }
         };
-        self.right_pane = RightPane::Computer;
+        self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Editor { id: Some(id) };
         self.record_nav();
         cx.notify();
@@ -1700,6 +1791,8 @@ impl AppState {
             return;
         };
         self.active_coworker_id = Some(id.clone());
+        // The previous bot's screen must not show under this bot's name.
+        self.coworker_computer = None;
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(
                 0,
@@ -1768,7 +1861,7 @@ impl AppState {
         } else {
             self.active_coworker_id = None;
         }
-        self.right_pane = loc.right_pane;
+        self.set_right_pane(loc.right_pane, cx);
         self.computer_view = loc.computer_view;
         self.is_app_settings_open = loc.app_settings_open;
         self.app_settings_tab = loc.app_settings_tab;
@@ -1941,7 +2034,7 @@ impl AppState {
 
     pub fn open_agent_profile(&mut self, id: String, cx: &mut Context<Self>) {
         self.select_coworker(id, cx);
-        self.right_pane = RightPane::Settings;
+        self.set_right_pane(RightPane::Settings, cx);
         self.computer_view = ComputerView::Overview;
         cx.notify();
     }
@@ -3155,6 +3248,8 @@ impl AppState {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
+        // A roster reload is the moment a server upgrade would show; ask again.
+        self.computer_endpoint_missing = false;
         let this_id = self.local_exec_machine_id.clone();
         cx.spawn(async move |this, cx| {
             let Ok(mut computers) = client.list_computers().await else {

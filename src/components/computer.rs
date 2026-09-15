@@ -1,10 +1,9 @@
 use std::rc::Rc;
-use std::time::Duration;
 
 use crate::chrome::INFO_PANE_WIDTH;
 use crate::components::fields::field_input;
 use crate::state::{
-    AgentRoutine, AppState, ComputerView, RightPane, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
+    AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
     ScheduleUiMode, ScheduleUnit,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -26,7 +25,6 @@ pub struct ComputerPane {
     custom_cron: Entity<InputState>,
     loaded_editor: Option<Option<String>>,
     webhook_popover: Option<String>,
-    screen_hover: bool,
 }
 
 impl ComputerPane {
@@ -42,21 +40,6 @@ impl ComputerPane {
         let webhook_header = cx.new(|cx| InputState::new(window, cx).placeholder("header"));
         let custom_cron = cx.new(|cx| InputState::new(window, cx).placeholder("@every 1h"));
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let Ok(_) = this.update(cx, |this, cx| {
-                    if this.state.read(cx).right_pane == RightPane::Computer {
-                        this.state.update(cx, |state, cx| {
-                            state.refresh_box_status(cx);
-                        });
-                    }
-                }) else {
-                    break;
-                };
-            }
-        })
-        .detach();
         Self {
             state,
             name_input,
@@ -67,7 +50,6 @@ impl ComputerPane {
             custom_cron,
             loaded_editor: None,
             webhook_popover: None,
-            screen_hover: false,
         }
     }
 
@@ -160,9 +142,9 @@ impl Render for ComputerPane {
             let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
             let routines = state.coworker_routines(&coworker_id).to_vec();
             let has_screen = state
-                .box_status
+                .coworker_computer
                 .as_ref()
-                .and_then(|status| status.screen_url())
+                .and_then(|status| status.vnc_url())
                 .is_some();
             (
                 state.computer_view.clone(),
@@ -191,10 +173,8 @@ impl Render for ComputerPane {
                         box_id.as_deref(),
                         &routines,
                         has_screen,
-                        self.screen_hover,
                         muted,
                         app,
-                        cx.entity(),
                         &theme,
                     )
                     .into_any_element(),
@@ -213,10 +193,8 @@ impl ComputerPane {
         box_id: Option<&str>,
         routines: &[AgentRoutine],
         has_screen: bool,
-        hovering: bool,
         muted: Hsla,
         app: Entity<AppState>,
-        pane: Entity<Self>,
         theme: &gpui_kit::component::Theme,
     ) -> impl IntoElement {
         v_flex()
@@ -230,7 +208,7 @@ impl ComputerPane {
                     .pt(px(8.))
                     .pb(px(16.))
                     .gap(px(12.))
-                    .child(screen_tile(has_screen, hovering, app.clone(), pane, theme))
+                    .child(screen_tile(has_screen, app.clone(), theme))
                     .child(
                         div()
                             .w_full()
@@ -672,16 +650,17 @@ impl ComputerPane {
     }
 }
 
+/// The coworker's screen. The Open pill is the control: it appears on hover
+/// only once the box has a screen URL, and only then does the tile take a
+/// click — a blank monitor must not provision a box behind the person's back.
 fn screen_tile(
     has_screen: bool,
-    hovering: bool,
     app: Entity<AppState>,
-    pane: Entity<ComputerPane>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    let open = hovering && has_screen;
     div()
         .id("agent-screen")
+        .group("agent-screen")
         .relative()
         .w_full()
         .h(px(168.))
@@ -689,19 +668,15 @@ fn screen_tile(
         .rounded(px(12.))
         .bg(rgb(0x2a2a2a))
         .overflow_hidden()
-        .on_hover(move |hovered, _, cx| {
-            pane.update(cx, |this, cx| {
-                this.screen_hover = *hovered;
-                cx.notify();
-            });
-        })
-        .on_mouse_down(MouseButton::Left, {
-            let app = app.clone();
-            move |_, _, cx| {
-                app.update(cx, |state, cx| {
-                    state.open_coworker_screen(cx);
-                });
-            }
+        .when(has_screen, |this| {
+            this.cursor_pointer().on_mouse_down(MouseButton::Left, {
+                let app = app.clone();
+                move |_, _, cx| {
+                    app.update(cx, |state, cx| {
+                        state.open_coworker_screen(cx);
+                    });
+                }
+            })
         })
         .child(
             div()
@@ -717,12 +692,14 @@ fn screen_tile(
                         .text_color(rgb(0x888888)),
                 ),
         )
-        .when(open, |this| {
+        .when(has_screen, |this| {
             this.child(
                 div()
                     .id("agent-screen-open")
                     .absolute()
                     .inset_0()
+                    .opacity(0.)
+                    .group_hover("agent-screen", |style| style.opacity(1.))
                     .flex()
                     .items_center()
                     .justify_center()
