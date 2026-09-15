@@ -1062,8 +1062,13 @@ impl AppState {
         let Some(coworker_id) = self.active_coworker_id.clone() else {
             return;
         };
-        if let Some(url) = self.box_status.as_ref().and_then(BoxStatus::screen_url) {
-            open_url(url);
+        if let Some(url) = self
+            .box_status
+            .as_ref()
+            .and_then(BoxStatus::screen_url)
+            .map(str::to_string)
+        {
+            self.open_computer_window(&url, cx);
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -1071,7 +1076,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 if let Some(status) = status {
                     if let Some(url) = status.screen_url() {
-                        open_url(url);
+                        state.open_computer_window(url, cx);
                     }
                     state.box_status = Some(status);
                 }
@@ -1079,6 +1084,31 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    fn open_computer_window(&self, url: &str, cx: &mut Context<Self>) {
+        let url = url.to_string();
+        let title = self
+            .coworkers
+            .iter()
+            .find(|coworker| Some(&coworker.id) == self.active_coworker_id.as_ref())
+            .map(|coworker| format!("{}'s Computer", coworker.name))
+            .unwrap_or_else(|| "Computer".into());
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: point(px(72.), px(72.)),
+                size: size(px(1100.), px(760.)),
+            })),
+            window_min_size: Some(size(px(640.), px(480.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.into()),
+                ..TitlebarOptions::default()
+            }),
+            ..WindowOptions::default()
+        };
+        let _ = cx.open_window(options, move |window, cx| {
+            cx.new(|cx| crate::components::computer_screen::ComputerScreen::new(&url, window, cx))
+        });
     }
 
     pub fn open_routine_editor(&mut self, id: Option<String>, cx: &mut Context<Self>) {
@@ -3386,10 +3416,6 @@ impl AppState {
             self.read_aloud(text, message_id, TtsSource::Native, cx);
         }
     }
-}
-
-fn open_url(url: &str) {
-    let _ = std::process::Command::new("open").arg(url).spawn();
 }
 
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {

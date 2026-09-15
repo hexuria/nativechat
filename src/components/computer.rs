@@ -736,6 +736,15 @@ fn screen_tile(
                             .text_color(theme.primary_foreground)
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                Icon::default()
+                                    .path("icons/expand.svg")
+                                    .size(px(14.))
+                                    .text_color(theme.primary_foreground),
+                            )
                             .child("Open"),
                     ),
             )

@@ -7,6 +7,7 @@ pub mod chat_input;
 pub mod circular_voice_viz;
 pub mod command_palette;
 pub mod computer;
+pub mod computer_screen;
 pub mod emoji_picker;
 pub mod fields;
 pub mod gen_ui;
