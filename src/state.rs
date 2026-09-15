@@ -6,9 +6,9 @@ use crate::chrome::{
 };
 use crate::config::Config;
 use crate::opengrok::{
-    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
-    Coworker, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue,
-    OpenGrokClient, ProfileUpdate, QueuedApproval, ToolCallTracker, TurnAssembler,
+    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxStatus, ChatPart,
+    ConnectedComputer, Coworker, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
+    ModelCatalogue, OpenGrokClient, ProfileUpdate, QueuedApproval, ToolCallTracker, TurnAssembler,
     activity_from_replay, command_from_args, command_from_replay_events, enrol_this_machine,
     local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id, visible_bot_status,
 };
@@ -533,6 +533,7 @@ pub struct AppState {
     local_exec_cancel: Option<Arc<AtomicBool>>,
     pub expanded_shell_output: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
+    pub box_status: Option<BoxStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -648,6 +649,7 @@ impl AppState {
             local_exec_cancel: None,
             expanded_shell_output: HashSet::new(),
             computers: Vec::new(),
+            box_status: None,
         };
 
         state
@@ -1005,6 +1007,7 @@ impl AppState {
         self.ensure_active_coworker(cx);
         self.right_pane = RightPane::Computer;
         self.computer_view = ComputerView::Overview;
+        self.refresh_box_status(cx);
         self.record_nav();
         cx.notify();
     }
@@ -1029,8 +1032,53 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         self.model_picker_open = false;
         self.avatar_editor_open = false;
+        self.refresh_box_status(cx);
         self.record_nav();
         cx.notify();
+    }
+
+    pub fn refresh_box_status(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            self.box_status = None;
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let status = client.coworker_computer(&coworker_id).await.ok();
+            let _ = this.update(cx, |state, cx| {
+                state.box_status = status;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn open_coworker_screen(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        if let Some(url) = self.box_status.as_ref().and_then(BoxStatus::screen_url) {
+            open_url(url);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let status = client.ensure_coworker_computer(&coworker_id).await.ok();
+            let _ = this.update(cx, |state, cx| {
+                if let Some(status) = status {
+                    if let Some(url) = status.screen_url() {
+                        open_url(url);
+                    }
+                    state.box_status = Some(status);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn open_routine_editor(&mut self, id: Option<String>, cx: &mut Context<Self>) {
@@ -3338,6 +3386,10 @@ impl AppState {
             self.read_aloud(text, message_id, TtsSource::Native, cx);
         }
     }
+}
+
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
 }
 
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {

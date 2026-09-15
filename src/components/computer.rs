@@ -1,9 +1,10 @@
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::chrome::INFO_PANE_WIDTH;
 use crate::components::fields::field_input;
 use crate::state::{
-    AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
+    AgentRoutine, AppState, ComputerView, RightPane, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
     ScheduleUiMode, ScheduleUnit,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -25,6 +26,7 @@ pub struct ComputerPane {
     custom_cron: Entity<InputState>,
     loaded_editor: Option<Option<String>>,
     webhook_popover: Option<String>,
+    screen_hover: bool,
 }
 
 impl ComputerPane {
@@ -40,6 +42,21 @@ impl ComputerPane {
         let webhook_header = cx.new(|cx| InputState::new(window, cx).placeholder("header"));
         let custom_cron = cx.new(|cx| InputState::new(window, cx).placeholder("@every 1h"));
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let Ok(_) = this.update(cx, |this, cx| {
+                    if this.state.read(cx).right_pane == RightPane::Computer {
+                        this.state.update(cx, |state, cx| {
+                            state.refresh_box_status(cx);
+                        });
+                    }
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
         Self {
             state,
             name_input,
@@ -50,6 +67,7 @@ impl ComputerPane {
             custom_cron,
             loaded_editor: None,
             webhook_popover: None,
+            screen_hover: false,
         }
     }
 
@@ -128,7 +146,7 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, box_id, routines) = {
+        let (view, agent_name, coworker_id, box_id, routines, has_screen) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -141,12 +159,18 @@ impl Render for ComputerPane {
             let box_id = coworker.and_then(|c| c.box_id.clone());
             let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
             let routines = state.coworker_routines(&coworker_id).to_vec();
+            let has_screen = state
+                .box_status
+                .as_ref()
+                .and_then(|status| status.screen_url())
+                .is_some();
             (
                 state.computer_view.clone(),
                 name,
                 coworker_id,
                 box_id,
                 routines,
+                has_screen,
             )
         };
 
@@ -166,8 +190,11 @@ impl Render for ComputerPane {
                         &coworker_id,
                         box_id.as_deref(),
                         &routines,
+                        has_screen,
+                        self.screen_hover,
                         muted,
                         app,
+                        cx.entity(),
                         &theme,
                     )
                     .into_any_element(),
@@ -185,8 +212,11 @@ impl ComputerPane {
         _coworker_id: &str,
         box_id: Option<&str>,
         routines: &[AgentRoutine],
+        has_screen: bool,
+        hovering: bool,
         muted: Hsla,
         app: Entity<AppState>,
+        pane: Entity<Self>,
         theme: &gpui_kit::component::Theme,
     ) -> impl IntoElement {
         v_flex()
@@ -200,24 +230,7 @@ impl ComputerPane {
                     .pt(px(8.))
                     .pb(px(16.))
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .id("agent-screen")
-                            .w_full()
-                            .h(px(168.))
-                            .flex_shrink_0()
-                            .rounded(px(12.))
-                            .bg(rgb(0x2a2a2a))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::default()
-                                    .path("icons/monitor.svg")
-                                    .size(px(22.))
-                                    .text_color(rgb(0x888888)),
-                            ),
-                    )
+                    .child(screen_tile(has_screen, hovering, app.clone(), pane, theme))
                     .child(
                         div()
                             .w_full()
@@ -657,6 +670,76 @@ impl ComputerPane {
                 ))
             })
     }
+}
+
+fn screen_tile(
+    has_screen: bool,
+    hovering: bool,
+    app: Entity<AppState>,
+    pane: Entity<ComputerPane>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let open = hovering && has_screen;
+    div()
+        .id("agent-screen")
+        .relative()
+        .w_full()
+        .h(px(168.))
+        .flex_shrink_0()
+        .rounded(px(12.))
+        .bg(rgb(0x2a2a2a))
+        .overflow_hidden()
+        .on_hover(move |hovered, _, cx| {
+            pane.update(cx, |this, cx| {
+                this.screen_hover = *hovered;
+                cx.notify();
+            });
+        })
+        .on_mouse_down(MouseButton::Left, {
+            let app = app.clone();
+            move |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    state.open_coworker_screen(cx);
+                });
+            }
+        })
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::default()
+                        .path("icons/monitor.svg")
+                        .size(px(22.))
+                        .text_color(rgb(0x888888)),
+                ),
+        )
+        .when(open, |this| {
+            this.child(
+                div()
+                    .id("agent-screen-open")
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x000000).opacity(0.35))
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(8.))
+                            .rounded_full()
+                            .bg(theme.primary)
+                            .text_color(theme.primary_foreground)
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Open"),
+                    ),
+            )
+        })
 }
 
 fn pane_header(
