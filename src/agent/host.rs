@@ -54,6 +54,8 @@ pub enum Command {
     SelectSession(String),
     SelectCoworker(String),
     SendMessage(String),
+    ToggleComputerPane,
+    OpenCoworkerScreen,
     AnswerApproval {
         call_id: String,
         resolution: LocalExecResolution,
@@ -99,6 +101,8 @@ impl Command {
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
+            Self::ToggleComputerPane => state.toggle_computer_pane(cx),
+            Self::OpenCoworkerScreen => state.open_coworker_screen(cx),
             Self::AnswerApproval {
                 call_id,
                 resolution,
@@ -170,6 +174,10 @@ pub struct NativeChatHost {
     model_picker_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
+    computer_open: bool,
+    /// The coworker's computer as the pane sees it: "<state>; screen: yes|no",
+    /// "endpoint missing", or "unknown".
+    computer_status: String,
     pending: Option<Command>,
 }
 
@@ -234,6 +242,26 @@ impl NativeChatHost {
                     tool: spec.tool,
                 })
                 .collect(),
+            computer_open: state.right_pane == crate::state::RightPane::Computer,
+            computer_status: if state.computer_endpoint_missing {
+                "endpoint missing".to_string()
+            } else {
+                state
+                    .coworker_computer
+                    .as_ref()
+                    .map(|computer| {
+                        format!(
+                            "{}; screen: {}",
+                            computer.state,
+                            if computer.vnc_url().is_some() {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| "unknown".to_string())
+            },
             pending: None,
         }
     }
@@ -345,6 +373,15 @@ impl NativeChatHost {
             }
             page = page.with_child(card);
         }
+        page = page.with_child(
+            UiNode::new("computer-pane", "dialog", "Computer")
+                .with_visible(self.computer_open)
+                .with_child(UiNode::new(
+                    "computer-status",
+                    "status",
+                    self.computer_status.clone(),
+                )),
+        );
 
         UiTree {
             app: "nativechat".into(),
@@ -451,6 +488,8 @@ impl NativeChatHost {
                 Command::SetAvatarColor(id)
             }
             "theme.toggle" => Command::ToggleTheme,
+            "computer.toggle" => Command::ToggleComputerPane,
+            "computer.open" => Command::OpenCoworkerScreen,
             "settings.account" => Command::ToggleAccount,
             "auth.login" => {
                 let email = args
