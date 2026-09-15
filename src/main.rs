@@ -1,14 +1,12 @@
 use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
-    About, BranchInNewChat, ClearSearch, CloseBotFinder, CloseSettings, CopyMessage, Hide,
-    HideOthers, Minimize, NewChat, OpenSettings, PickFinderItem, Quit, ReadAloud, ReportMessage,
-    CloseCommandPalette, CloseFind, FindNext, FindPrev, FocusChatInput, NavBack, NavForward,
-    OpenCommandPalette, PaletteNextTab, PalettePrevTab, PaletteSelectNext, PaletteSelectPrev,
-    Search, ShowAll, ToggleAgentSettings,
-    ToggleComputerPane, ToggleDebugMarkdown, ToggleFps,
-    ToggleMiniSidebar,
-    ToggleSidebar, ToggleTheme, Zoom,
+    About, BranchInNewChat, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind,
+    CloseSettings, CopyMessage, FindNext, FindPrev, FocusChatInput, Hide, HideOthers, Minimize,
+    NavBack, NavForward, NewChat, OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab,
+    PaletteSelectNext, PaletteSelectPrev, PickFinderItem, Quit, ReadAloud, ReportMessage, Search,
+    ShowAll, ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown, ToggleFps,
+    ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
@@ -137,22 +135,58 @@ fn main() {
                 KeyBinding::new("ctrl-p", PaletteSelectPrev, Some("CommandPalette")),
                 KeyBinding::new("cmd-1", PickFinderItem { index: 0 }, Some("BotFinder")),
                 KeyBinding::new("cmd-1", PickFinderItem { index: 0 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-1", PickFinderItem { index: 0 }, Some("Input")),
+                KeyBinding::new("cmd-1", PickFinderItem { index: 0 }, Some("Editor")),
+                KeyBinding::new("cmd-1", PickFinderItem { index: 0 }, Some("MessageInput")),
+                KeyBinding::new("cmd-1", PickFinderItem { index: 0 }, Some("Root")),
                 KeyBinding::new("cmd-2", PickFinderItem { index: 1 }, Some("BotFinder")),
                 KeyBinding::new("cmd-2", PickFinderItem { index: 1 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-2", PickFinderItem { index: 1 }, Some("Input")),
+                KeyBinding::new("cmd-2", PickFinderItem { index: 1 }, Some("Editor")),
+                KeyBinding::new("cmd-2", PickFinderItem { index: 1 }, Some("MessageInput")),
+                KeyBinding::new("cmd-2", PickFinderItem { index: 1 }, Some("Root")),
                 KeyBinding::new("cmd-3", PickFinderItem { index: 2 }, Some("BotFinder")),
                 KeyBinding::new("cmd-3", PickFinderItem { index: 2 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-3", PickFinderItem { index: 2 }, Some("Input")),
+                KeyBinding::new("cmd-3", PickFinderItem { index: 2 }, Some("Editor")),
+                KeyBinding::new("cmd-3", PickFinderItem { index: 2 }, Some("MessageInput")),
+                KeyBinding::new("cmd-3", PickFinderItem { index: 2 }, Some("Root")),
                 KeyBinding::new("cmd-4", PickFinderItem { index: 3 }, Some("BotFinder")),
                 KeyBinding::new("cmd-4", PickFinderItem { index: 3 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-4", PickFinderItem { index: 3 }, Some("Input")),
+                KeyBinding::new("cmd-4", PickFinderItem { index: 3 }, Some("Editor")),
+                KeyBinding::new("cmd-4", PickFinderItem { index: 3 }, Some("MessageInput")),
+                KeyBinding::new("cmd-4", PickFinderItem { index: 3 }, Some("Root")),
                 KeyBinding::new("cmd-5", PickFinderItem { index: 4 }, Some("BotFinder")),
                 KeyBinding::new("cmd-5", PickFinderItem { index: 4 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-5", PickFinderItem { index: 4 }, Some("Input")),
+                KeyBinding::new("cmd-5", PickFinderItem { index: 4 }, Some("Editor")),
+                KeyBinding::new("cmd-5", PickFinderItem { index: 4 }, Some("MessageInput")),
+                KeyBinding::new("cmd-5", PickFinderItem { index: 4 }, Some("Root")),
                 KeyBinding::new("cmd-6", PickFinderItem { index: 5 }, Some("BotFinder")),
                 KeyBinding::new("cmd-6", PickFinderItem { index: 5 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-6", PickFinderItem { index: 5 }, Some("Input")),
+                KeyBinding::new("cmd-6", PickFinderItem { index: 5 }, Some("Editor")),
+                KeyBinding::new("cmd-6", PickFinderItem { index: 5 }, Some("MessageInput")),
+                KeyBinding::new("cmd-6", PickFinderItem { index: 5 }, Some("Root")),
                 KeyBinding::new("cmd-7", PickFinderItem { index: 6 }, Some("BotFinder")),
                 KeyBinding::new("cmd-7", PickFinderItem { index: 6 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-7", PickFinderItem { index: 6 }, Some("Input")),
+                KeyBinding::new("cmd-7", PickFinderItem { index: 6 }, Some("Editor")),
+                KeyBinding::new("cmd-7", PickFinderItem { index: 6 }, Some("MessageInput")),
+                KeyBinding::new("cmd-7", PickFinderItem { index: 6 }, Some("Root")),
                 KeyBinding::new("cmd-8", PickFinderItem { index: 7 }, Some("BotFinder")),
                 KeyBinding::new("cmd-8", PickFinderItem { index: 7 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-8", PickFinderItem { index: 7 }, Some("Input")),
+                KeyBinding::new("cmd-8", PickFinderItem { index: 7 }, Some("Editor")),
+                KeyBinding::new("cmd-8", PickFinderItem { index: 7 }, Some("MessageInput")),
+                KeyBinding::new("cmd-8", PickFinderItem { index: 7 }, Some("Root")),
                 KeyBinding::new("cmd-9", PickFinderItem { index: 8 }, Some("BotFinder")),
                 KeyBinding::new("cmd-9", PickFinderItem { index: 8 }, Some("CommandPalette")),
+                KeyBinding::new("cmd-9", PickFinderItem { index: 8 }, Some("Input")),
+                KeyBinding::new("cmd-9", PickFinderItem { index: 8 }, Some("Editor")),
+                KeyBinding::new("cmd-9", PickFinderItem { index: 8 }, Some("MessageInput")),
+                KeyBinding::new("cmd-9", PickFinderItem { index: 8 }, Some("Root")),
                 KeyBinding::new("cmd-,", OpenSettings, None),
                 KeyBinding::new("cmd-,", OpenSettings, Some("Editor")),
                 KeyBinding::new("cmd-,", OpenSettings, Some("AppSettings")),
@@ -194,8 +228,6 @@ fn main() {
                         state.warm_tts(cx);
                     });
 
-                    let state_clone = state.clone();
-                    let db_service_clone = db_service.clone();
                     cx.on_action(|_: &CopyMessage, _cx: &mut App| {});
                     cx.on_action(|_: &BranchInNewChat, _cx: &mut App| {
                         println!("Branch in new chat action triggered");
@@ -214,28 +246,6 @@ fn main() {
                     cx.on_action(|_: &ReportMessage, _cx: &mut App| {
                         println!("Report message action triggered");
                     });
-                    cx.spawn(async move |cx| {
-                        if let Err(e) =
-                            nativechat::services::model_seeder::seed_models(&db_service_clone).await
-                        {
-                            eprintln!("Failed to seed models: {}", e);
-                        }
-
-                        match AppState::load_profiles_and_credentials(&db_service_clone).await {
-                            Ok((profiles, credentials)) => {
-                                let _ = state_clone.update(cx, |state, cx| {
-                                    state.set_profiles_and_credentials(profiles, credentials, cx);
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to load profiles and credentials: {}", e);
-                            }
-                        }
-
-                        println!("App data refreshed from DB successfully!");
-                    })
-                    .detach();
-
                     let view = cx.new(|cx| {
                         #[cfg(feature = "agent")]
                         {

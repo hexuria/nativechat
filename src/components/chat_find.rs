@@ -61,11 +61,7 @@ pub fn find_bar_element(
                 on_close(window, cx);
             }
         })
-        .child(
-            Icon::new(IconName::Search)
-                .size(px(14.))
-                .text_color(muted),
-        )
+        .child(Icon::new(IconName::Search).size(px(14.)).text_color(muted))
         .child(
             div().flex_1().min_w(px(0.)).child(
                 field_input(query)
@@ -136,12 +132,13 @@ fn find_icon_btn(
         .items_center()
         .justify_center()
         .when(enabled, |this| {
-            this.cursor_pointer()
-                .hover(|s| s.bg(hover))
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            this.cursor_pointer().hover(|s| s.bg(hover)).on_mouse_down(
+                MouseButton::Left,
+                move |_, window, cx| {
                     cx.stop_propagation();
                     on_click(window, cx);
-                })
+                },
+            )
         })
         .child(Icon::new(icon).size(px(14.)).text_color(color))
 }

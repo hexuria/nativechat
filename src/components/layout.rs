@@ -1,20 +1,19 @@
 use crate::components::agent_settings::AgentSettings;
 use crate::components::app_settings::AppSettings;
 use crate::components::bot_finder::BotFinder;
-use crate::components::command_palette::CommandPalette;
-use crate::components::hidden_bots::hidden_bots_overlay;
-use crate::components::computer::ComputerPane;
-use crate::state::RightPane;
 use crate::components::chat::ChatView;
+use crate::components::command_palette::CommandPalette;
+use crate::components::computer::ComputerPane;
+use crate::components::hidden_bots::hidden_bots_overlay;
 use crate::components::login::LoginView;
-use crate::components::modals::profile_settings::ProfileSettingsModal;
 use crate::components::sidebar::SidebarView;
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
+use crate::state::RightPane;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme, Disableable, v_flex};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 
-use crate::chrome::{chrome_floats, sidebar_width, INFO_PANE_WIDTH};
+use crate::chrome::{INFO_PANE_WIDTH, chrome_floats, sidebar_width};
 use crate::state::AppState;
 
 fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
@@ -27,7 +26,6 @@ struct ShellRev {
     hidden: bool,
     expanded_width: i32,
     auto_collapsed: bool,
-    profile: bool,
     signed_in: bool,
     signing_in: bool,
     auth_error: Option<String>,
@@ -50,7 +48,6 @@ impl ShellRev {
             hidden: state.sidebar_hidden,
             expanded_width: state.sidebar_expanded_width.round() as i32,
             auto_collapsed: state.auto_collapsed,
-            profile: state.is_profile_settings_open,
             signed_in: state.is_signed_in(),
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
@@ -59,7 +56,10 @@ impl ShellRev {
                 RightPane::Settings => 1,
                 RightPane::Computer => 2,
             },
-            computer_editor: matches!(state.computer_view, crate::state::ComputerView::Editor { .. }),
+            computer_editor: matches!(
+                state.computer_view,
+                crate::state::ComputerView::Editor { .. }
+            ),
             model_picker: state.model_picker_open,
             avatar_editor: state.avatar_editor_open,
             app_settings: state.is_app_settings_open,
@@ -79,7 +79,6 @@ pub struct Layout {
     login: Entity<LoginView>,
     agent_settings: Entity<AgentSettings>,
     computer: Entity<ComputerPane>,
-    profile_settings_modal: Entity<ProfileSettingsModal>,
     app_settings: Entity<AppSettings>,
     bot_finder: Entity<BotFinder>,
     command_palette: Entity<CommandPalette>,
@@ -96,8 +95,6 @@ impl Layout {
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
         let computer = cx.new(|cx| ComputerPane::new(window, state.clone(), cx));
-        let profile_settings_modal =
-            cx.new(|cx| ProfileSettingsModal::new(window, state.clone(), cx));
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
         let bot_finder = cx.new(|cx| BotFinder::new(window, state.clone(), cx));
         let command_palette = cx.new(|cx| CommandPalette::new(window, state.clone(), cx));
@@ -118,7 +115,6 @@ impl Layout {
             login,
             agent_settings,
             computer,
-            profile_settings_modal,
             app_settings,
             bot_finder,
             command_palette,
@@ -177,6 +173,19 @@ impl Layout {
 
     pub fn blur_chat_input(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.blur(cx);
+    }
+
+    pub fn pick_overlay_item(&self, index: usize, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if state.command_palette_open {
+            self.command_palette.update(cx, |palette, cx| {
+                palette.activate_shortcut(index, cx);
+            });
+        } else if state.bot_finder_open {
+            self.bot_finder.update(cx, |finder, cx| {
+                finder.activate_shortcut(index, cx);
+            });
+        }
     }
 }
 
@@ -286,8 +295,7 @@ impl Render for Layout {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                        this.resize_drag =
-                                            Some((f32::from(ev.position.x), left));
+                                        this.resize_drag = Some((f32::from(ev.position.x), left));
                                         cx.notify();
                                     }),
                                 ),
@@ -303,9 +311,7 @@ impl Render for Layout {
                     .relative()
                     .overflow_hidden()
                     .child(main)
-                    .when(bot_finder_open, |this| {
-                        this.child(self.bot_finder.clone())
-                    }),
+                    .when(bot_finder_open, |this| this.child(self.bot_finder.clone())),
             )
             .when(!floats && right_open, |this| {
                 this.child(
@@ -365,19 +371,12 @@ impl Render for Layout {
                         .occlude()
                         .overflow_hidden()
                         .child(match right_pane {
-                            RightPane::Settings => {
-                                self.agent_settings.clone().into_any_element()
-                            }
+                            RightPane::Settings => self.agent_settings.clone().into_any_element(),
                             RightPane::Computer => self.computer.clone().into_any_element(),
                             RightPane::Closed => div().into_any_element(),
                         }),
                 )
             })
-            .children(
-                state
-                    .is_profile_settings_open
-                    .then(|| self.profile_settings_modal.clone().into_any_element()),
-            )
             .when(app_settings_open, |this| {
                 this.child(
                     div()
@@ -435,11 +434,7 @@ fn empty_agent_pane(
         .child(
             div().id("create-first-bot").child(
                 Button::new("create-first-bot-btn")
-                    .label(if hiring {
-                        "Creating…"
-                    } else {
-                        "New Bot"
-                    })
+                    .label(if hiring { "Creating…" } else { "New Bot" })
                     .primary()
                     .disabled(hiring)
                     .on_click(move |_, _, cx| {

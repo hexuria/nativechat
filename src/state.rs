@@ -1,30 +1,25 @@
 use crate::actions::TtsSource;
 use crate::audio::AudioInput;
-use crate::config::Config;
 use crate::chrome::{
-    collapse_for_width, remember_choice, sidebar_from_resize, ResponsiveCollapse, SidebarChrome,
-    SIDEBAR_EXPANDED,
+    ResponsiveCollapse, SIDEBAR_EXPANDED, SidebarChrome, collapse_for_width, remember_choice,
+    sidebar_from_resize,
 };
+use crate::config::Config;
 use crate::opengrok::{
-    activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue,
-    OpenGrokClient, ProfileUpdate,
+    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
+    Coworker, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue,
+    OpenGrokClient, ProfileUpdate, QueuedApproval, ToolCallTracker, TurnAssembler,
+    activity_from_replay, command_from_args, command_from_replay_events, enrol_this_machine,
+    local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id, visible_bot_status,
 };
-use crate::llm::{
-    ChatMessage, ChatRequest, LlmProvider, create_provider, create_provider_from_credential,
-};
-use crate::services::database::{
-    Credential as DbCredential, DatabaseService, Profile as DbProfile,
-};
-use crate::services::gemini_client::GeminiLiveClient;
-use crate::services::model_registry::{ModelProfile, ModelRegistry, Provider};
+use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
-use futures::StreamExt;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -34,9 +29,18 @@ pub struct Message {
     pub sent_at: SystemTime,
     pub is_me: bool,
     pub reply_preview: Option<String>,
+    pub parts: Vec<ChatPart>,
 }
 
 impl Message {
+    pub fn has_visible_body(&self) -> bool {
+        !self.content.trim().is_empty()
+            || self.parts.iter().any(|part| match part {
+                ChatPart::Text(text) => !text.trim().is_empty(),
+                ChatPart::Ui(_) | ChatPart::Approval(_) => true,
+            })
+    }
+
     /// Clock time on the message row, matching Grok's `12:14 PM` column.
     pub fn formatted_time(&self) -> String {
         let dt = DateTime::<Local>::from(self.sent_at);
@@ -294,12 +298,7 @@ fn format_clock(hour: u8, minute: u8) -> String {
     } else {
         (hour - 12, false)
     };
-    format!(
-        "{}:{:02} {}",
-        h12,
-        minute,
-        if am { "AM" } else { "PM" }
-    )
+    format!("{}:{:02} {}", h12, minute, if am { "AM" } else { "PM" })
 }
 
 fn ordinal(n: u8) -> String {
@@ -368,9 +367,7 @@ pub enum RoutineTrigger {
 impl RoutineTrigger {
     pub fn id(&self) -> &str {
         match self {
-            Self::Schedule { id, .. }
-            | Self::Event { id, .. }
-            | Self::Webhook { id, .. } => id,
+            Self::Schedule { id, .. } | Self::Event { id, .. } | Self::Webhook { id, .. } => id,
         }
     }
 
@@ -396,6 +393,7 @@ pub enum AppSettingsTab {
     Profile,
     Appearance,
     Shortcuts,
+    Computer,
 }
 
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
@@ -469,22 +467,6 @@ pub enum AuthStatus {
     SignedIn,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Profile {
-    pub id: usize,
-    pub name: String,
-    pub avatar: Option<String>, // Path or IconName
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AppCapability {
-    pub name: String,      // The tag name (e.g., "Photos")
-    pub label: String,     // The menu label (e.g., "Add photos & files")
-    pub icon: String,      // Icon path
-    pub action_id: String, // Action identifier
-    pub is_primary: bool,  // Whether it belongs in the main menu or "More" submenu
-}
-
 pub struct AppState {
     pub conversations: Vec<Conversation>,
     /// Last send/receive per coworker. Beats an unopened session's empty `messages`.
@@ -499,8 +481,6 @@ pub struct AppState {
     pub is_voice_muted: bool,
     pub voice_status: VoiceStatus,
     pub more_menu_open: bool,
-    pub is_profile_settings_open: bool,
-    pub is_credentials_modal_open: bool,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -508,34 +488,19 @@ pub struct AppState {
     pub app_settings_tab: AppSettingsTab,
     pub submit_chord: SubmitChord,
     pub audio_input: Option<AudioInput>,
-    pub gemini_client: Option<GeminiLiveClient>,
-    pub profiles: Vec<Profile>,
-    pub selected_profile: Option<Profile>,
-    pub available_apps: Vec<String>,
-    pub selected_apps: Vec<String>,
-    pub capabilities: Vec<AppCapability>,
     pub sidebar_collapsed: bool,
     pub sidebar_hidden: bool,
     pub sidebar_expanded_width: f32,
     pub sidebar_responsive: ResponsiveCollapse,
     pub auto_collapsed: bool,
-    pub model_registry: Arc<ModelRegistry>,
-    pub available_models: Vec<ModelProfile>,
     pub database_service: Option<DatabaseService>,
-    pub llm_provider: Option<Arc<dyn LlmProvider>>,
     pub config: Option<Config>,
     pub is_ai_responding: bool,
-    // Database profile and credential fields
-    pub db_profiles: Vec<DbProfile>,
-    pub db_credentials: Vec<DbCredential>,
-    pub active_profile_id: Option<i64>,
-    // Debug mode for markdown rendering
     pub debug_markdown_disabled: bool,
     pub tts_service: Option<TtsService>,
     tts_initing: bool,
-    pending_read_aloud: Option<(String, String, TtsSource)>,
+    pending_read_aloud: Option<(String, String)>,
     pub native_tts: SourceTtsState,
-    pub ai_tts: SourceTtsState,
     pub opengrok: Option<OpenGrokClient>,
     pub account: Option<Account>,
     pub auth_status: AuthStatus,
@@ -546,6 +511,8 @@ pub struct AppState {
     pub coworkers: Vec<Coworker>,
     pub active_coworker_id: Option<String>,
     pub bot_status: Option<String>,
+    /// Coworker whose turn owns `bot_status` / `is_ai_responding`.
+    responding_coworker_id: Option<String>,
     pub model_catalogue: ModelCatalogue,
     pub right_pane: RightPane,
     pub computer_view: ComputerView,
@@ -560,6 +527,46 @@ pub struct AppState {
     pub reply_to: Option<ReplyTo>,
     pub message_reactions: HashMap<String, String>,
     pub emoji_picker: Option<EmojiPickerOpen>,
+    pub form_picks: HashMap<String, HashMap<String, String>>,
+    pub approval_decisions: HashMap<String, ApprovalDecision>,
+    pub local_exec_machine_id: Option<String>,
+    local_exec_cancel: Option<Arc<AtomicBool>>,
+    pub expanded_shell_output: HashSet<String>,
+    pub computers: Vec<ConnectedComputer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Pending,
+    Sending,
+    AllowOnce,
+    Always,
+    Denied,
+    Never,
+    Failed(String),
+}
+
+impl ApprovalDecision {
+    pub fn is_settled(&self) -> bool {
+        !matches!(self, Self::Pending | Self::Sending)
+    }
+
+    /// The person (or the policy) has answered; a click still in flight counts.
+    pub fn is_answered(&self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+
+    /// `place` is [`ApprovalSpec::place`].
+    pub fn outcome_line(&self, bot: &str, place: &str) -> Option<String> {
+        let resolution = match self {
+            Self::AllowOnce => LocalExecResolution::AllowOnce,
+            Self::Always => LocalExecResolution::Always,
+            Self::Denied => LocalExecResolution::DenyOnce,
+            Self::Never => LocalExecResolution::Never,
+            _ => return None,
+        };
+        Some(local_exec_outcome(bot, resolution, place))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -577,109 +584,6 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let profiles = vec![
-            Profile {
-                id: 1,
-                name: "John Doe".to_string(),
-                avatar: None,
-            },
-            Profile {
-                id: 2,
-                name: "Jane Smith".to_string(),
-                avatar: None,
-            },
-        ];
-        let selected_profile = profiles.first().cloned();
-
-        let available_apps = vec![
-            "Canva".to_string(),
-            "Figma".to_string(),
-            "Notion".to_string(),
-            "Linear".to_string(),
-        ];
-
-        let capabilities = vec![
-            // Primary Items
-            AppCapability {
-                name: "Photos".to_string(),
-                label: "Add photos & files".to_string(),
-                icon: "icons/clip.svg".to_string(),
-                action_id: "SelectAppPhotos".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Image Generation".to_string(),
-                label: "Image Generation".to_string(),
-                icon: "icons/create_image.svg".to_string(),
-                action_id: "SelectAppImageGeneration".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Thinking".to_string(),
-                label: "Thinking".to_string(),
-                icon: "icons/thinking.svg".to_string(),
-                action_id: "SelectAppThinking".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Deep Research".to_string(),
-                label: "Deep Research".to_string(),
-                icon: "icons/deep_search.svg".to_string(),
-                action_id: "SelectAppDeepResearch".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Study".to_string(),
-                label: "Study".to_string(),
-                icon: "icons/study.svg".to_string(),
-                action_id: "SelectAppStudy".to_string(),
-                is_primary: true,
-            },
-            // Secondary Items ("More" submenu)
-            AppCapability {
-                name: "Web search".to_string(),
-                label: "Web search".to_string(),
-                icon: "icons/web_search.svg".to_string(),
-                action_id: "SelectAppWebSearch".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Canvas".to_string(),
-                label: "Canvas".to_string(),
-                icon: "icons/canvas.svg".to_string(),
-                action_id: "SelectAppCanvas".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Canva".to_string(),
-                label: "Canva".to_string(),
-                icon: "icons/canva.svg".to_string(),
-                action_id: "SelectAppCanva".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Coursera".to_string(),
-                label: "Coursera".to_string(),
-                icon: "icons/coursera.svg".to_string(),
-                action_id: "SelectAppCoursera".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Figma".to_string(),
-                label: "Figma".to_string(),
-                icon: "icons/figma.svg".to_string(),
-                action_id: "SelectAppFigma".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Spotify".to_string(),
-                label: "Spotify".to_string(),
-                icon: "icons/spotify.svg".to_string(),
-                action_id: "SelectAppSpotify".to_string(),
-                is_primary: false,
-            },
-        ];
-
         let mut state = Self {
             conversations: Vec::new(),
             last_active_at: HashMap::new(),
@@ -693,8 +597,6 @@ impl AppState {
             is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
-            is_profile_settings_open: false,
-            is_credentials_modal_open: false,
             is_app_settings_open: false,
             bot_finder_open: false,
             command_palette_open: false,
@@ -702,32 +604,19 @@ impl AppState {
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
             audio_input: None,
-            gemini_client: None,
-            profiles,
-            selected_profile,
-            available_apps,
-            selected_apps: Vec::new(),
-            capabilities,
             sidebar_collapsed: false,
             sidebar_hidden: false,
             sidebar_expanded_width: SIDEBAR_EXPANDED,
             sidebar_responsive: ResponsiveCollapse::default(),
             auto_collapsed: false,
-            model_registry: Arc::new(ModelRegistry::new()),
-            available_models: Vec::new(),
             database_service: None,
-            llm_provider: None,
             config: None,
             is_ai_responding: false,
-            db_profiles: Vec::new(),
-            db_credentials: Vec::new(),
-            active_profile_id: None,
             debug_markdown_disabled: false,
             tts_service: None,
             tts_initing: false,
             pending_read_aloud: None,
             native_tts: SourceTtsState::default(),
-            ai_tts: SourceTtsState::default(),
             opengrok: None,
             account: None,
             auth_status: AuthStatus::SignedOut,
@@ -738,6 +627,7 @@ impl AppState {
             coworkers: Vec::new(),
             active_coworker_id: None,
             bot_status: None,
+            responding_coworker_id: None,
             model_catalogue: ModelCatalogue::default(),
             right_pane: RightPane::Closed,
             computer_view: ComputerView::Overview,
@@ -752,34 +642,25 @@ impl AppState {
             reply_to: None,
             message_reactions: HashMap::new(),
             emoji_picker: None,
+            form_picks: HashMap::new(),
+            approval_decisions: HashMap::new(),
+            local_exec_machine_id: None,
+            local_exec_cancel: None,
+            expanded_shell_output: HashSet::new(),
+            computers: Vec::new(),
         };
-        // Synchronously load cached state to avoid startup delay
-        if let Some((cached_id, cached_profiles)) = Self::load_cached_state() {
-            println!(
-                "Loaded cached state: ID {:?}, {} profiles",
-                cached_id,
-                cached_profiles.len()
-            );
-            state.active_profile_id = cached_id;
-            state.db_profiles = cached_profiles;
-        }
 
         state
     }
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
-        // Initialize LLM provider based on config
-        match create_provider(&config) {
-            Ok(provider) => {
-                println!("[LLM] Initialized {} provider", config.default_provider);
-                self.llm_provider = Some(Arc::from(provider));
-            }
-            Err(e) => {
-                eprintln!("[LLM] Failed to create provider: {}", e);
-            }
-        }
         match OpenGrokClient::new(&config.opengrok_base_url) {
-            Ok(client) => self.opengrok = Some(client),
+            Ok(client) => {
+                let client =
+                    client.with_session_file(config.data_dir.join("opengrok-session.json"));
+                self.opengrok = Some(client);
+                self.restore_session(cx);
+            }
             Err(error) => {
                 self.auth_error = Some(error.message);
                 self.opengrok = None;
@@ -789,8 +670,179 @@ impl AppState {
         cx.notify();
     }
 
+    fn restore_session(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !client.load_session() {
+            return;
+        }
+        self.login_epoch += 1;
+        let epoch = self.login_epoch;
+        self.auth_status = AuthStatus::SigningIn;
+        self.auth_error = None;
+        cx.spawn(async move |this, cx| {
+            let account = match client.me().await {
+                Ok(account) => Ok(account),
+                Err(error) if error.is_unauthorized() => match client.refresh().await {
+                    Ok(()) => client.me().await,
+                    Err(_) => {
+                        client.clear_session();
+                        Err(error)
+                    }
+                },
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |state, cx| {
+                if state.login_epoch != epoch {
+                    return;
+                }
+                match account {
+                    Ok(account) => {
+                        state.account = Some(account);
+                        state.auth_status = AuthStatus::SignedIn;
+                        state.auth_error = None;
+                        state.start_local_exec(cx);
+                        state.refresh_coworkers(cx);
+                        state.refresh_computers(cx);
+                        state.sync_pending_approvals(cx);
+                    }
+                    Err(_) => {
+                        state.account = None;
+                        state.auth_status = AuthStatus::SignedOut;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn is_signed_in(&self) -> bool {
         self.auth_status == AuthStatus::SignedIn && self.account.is_some()
+    }
+
+    pub fn visible_bot_status(&self) -> Option<String> {
+        visible_bot_status(
+            self.active_coworker_id.as_deref(),
+            self.responding_coworker_id.as_deref(),
+            self.bot_status.as_deref(),
+        )
+    }
+
+    /// The selected coworker's name, for copy that addresses it.
+    pub fn active_bot_name(&self) -> String {
+        self.active_coworker_id
+            .as_ref()
+            .and_then(|id| self.coworkers.iter().find(|c| &c.id == id))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "this agent".to_string())
+    }
+
+    pub fn is_active_bot_responding(&self) -> bool {
+        self.is_ai_responding
+            && self.active_coworker_id.is_some()
+            && self.active_coworker_id == self.responding_coworker_id
+    }
+
+    fn begin_responding(&mut self, coworker_id: Option<&str>, status: &str) {
+        self.responding_coworker_id = coworker_id.map(str::to_string);
+        self.is_ai_responding = true;
+        self.bot_status = Some(status.to_string());
+    }
+
+    fn apply_turn_status(&mut self, coworker_id: Option<&str>, tick: ActivityTick) {
+        if coworker_id.is_some() && coworker_id != self.responding_coworker_id.as_deref() {
+            return;
+        }
+        match tick {
+            ActivityTick::Keep => {}
+            ActivityTick::Clear => self.bot_status = None,
+            ActivityTick::Set(activity) => self.bot_status = Some(activity.label),
+        }
+    }
+
+    fn this_machine_mode(&self) -> Option<LocalExecMode> {
+        self.computers
+            .iter()
+            .find(|computer| {
+                computer.this_machine
+                    || self.local_exec_machine_id.as_ref() == Some(&computer.machine_id)
+            })
+            .map(|computer| computer.mode)
+    }
+
+    /// What this Mac's policy answers for `spec` without a card, if anything.
+    fn auto_resolve_local_exec(&self, spec: &ApprovalSpec) -> Option<LocalExecResolution> {
+        policy_answer(spec, self.this_machine_mode())
+    }
+
+    pub fn approval_answered(&self, call_id: &str) -> bool {
+        self.approval_decisions
+            .get(call_id)
+            .is_some_and(ApprovalDecision::is_answered)
+    }
+
+    /// Cards in the open conversation still waiting on the person.
+    pub fn open_approvals(&self) -> Vec<ApprovalSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::Approval(spec) if !self.approval_answered(&spec.call_id) => {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Answer a card by id. False when no such card is open.
+    pub fn answer_approval_by_id(
+        &mut self,
+        call_id: &str,
+        resolution: LocalExecResolution,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(spec) = self
+            .open_approvals()
+            .into_iter()
+            .find(|spec| spec.call_id == call_id)
+        else {
+            return false;
+        };
+        self.answer_approval(spec, resolution, cx);
+        true
+    }
+
+    pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
+        if let Some(line) = self
+            .approval_decisions
+            .get(&spec.call_id)
+            .and_then(|decision| decision.outcome_line(bot, spec.place()))
+        {
+            return Some(line);
+        }
+        self.auto_resolve_local_exec(spec)
+            .map(|resolution| local_exec_outcome(bot, resolution, spec.place()))
+    }
+
+    fn finish_responding(&mut self, coworker_id: Option<&str>, waiting_approval: bool) {
+        if coworker_id.is_some()
+            && self.responding_coworker_id.is_some()
+            && coworker_id != self.responding_coworker_id.as_deref()
+        {
+            return;
+        }
+        self.is_ai_responding = false;
+        if waiting_approval {
+            self.bot_status = Some("Waiting for approval".into());
+        } else {
+            self.bot_status = None;
+            self.responding_coworker_id = None;
+        }
     }
 
     pub fn login(&mut self, email: String, password: String, cx: &mut Context<Self>) {
@@ -821,7 +873,10 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
+                        state.refresh_computers(cx);
+                        state.sync_pending_approvals(cx);
                     }
                     Err(error) => {
                         state.account = None;
@@ -844,10 +899,15 @@ impl AppState {
         self.last_active_at.clear();
         self.active_coworker_id = None;
         self.bot_status = None;
+        self.responding_coworker_id = None;
+        self.is_ai_responding = false;
         self.is_app_settings_open = false;
         self.bot_finder_open = false;
         self.command_palette_open = false;
         self.close_right_pane(cx);
+        self.stop_local_exec();
+        self.approval_decisions.clear();
+        self.computers.clear();
         cx.notify();
         if let Some(client) = client {
             cx.spawn(async move |_, _| {
@@ -1002,10 +1062,9 @@ impl AppState {
     }
 
     pub fn back_to_computer(&mut self, cx: &mut Context<Self>) {
-        if let (Some(coworker_id), ComputerView::Editor { id: Some(rid) }) = (
-            self.active_coworker_id.clone(),
-            self.computer_view.clone(),
-        ) {
+        if let (Some(coworker_id), ComputerView::Editor { id: Some(rid) }) =
+            (self.active_coworker_id.clone(), self.computer_view.clone())
+        {
             let empty = self
                 .routines
                 .get(&coworker_id)
@@ -1048,7 +1107,11 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn routine_mut(&mut self, coworker_id: &str, routine_id: &str) -> Option<&mut AgentRoutine> {
+    pub fn routine_mut(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+    ) -> Option<&mut AgentRoutine> {
         self.routines
             .get_mut(coworker_id)?
             .iter_mut()
@@ -1110,7 +1173,12 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn record_routine_run(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+    pub fn record_routine_run(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let stamp = chrono::Local::now()
             .format("%b %d at %I:%M %p")
             .to_string()
@@ -1202,14 +1270,11 @@ impl AppState {
     }
 
     pub fn delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
-        if self.native_tts.message_id.as_deref() == Some(message_id)
-            || self.ai_tts.message_id.as_deref() == Some(message_id)
-        {
+        if self.native_tts.message_id.as_deref() == Some(message_id) {
             if let Some(service) = &self.tts_service {
-                let _ = service.stop();
+                service.stop_native();
             }
             self.native_tts = SourceTtsState::default();
-            self.ai_tts = SourceTtsState::default();
         }
         if let Some(id) = &self.active_conversation_id {
             if let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id) {
@@ -1430,35 +1495,35 @@ impl AppState {
     pub fn load_sessions(&mut self, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             cx.spawn(async move |this, cx| {
-                    match db.get_sessions().await {
-                        Ok(sessions) => {
-                            this.update(cx, |state, cx| {
-                                state.conversations = sessions
-                                    .into_iter()
-                                    .map(|s| Conversation {
-                                        id: s.id,
-                                        title: s.title,
-                                        created_at: s.created_at,
-                                        updated_at: s.updated_at,
-                                        messages: Vec::new(),
-                                        unread_count: 0,
-                                    })
-                                    .collect();
+                match db.get_sessions().await {
+                    Ok(sessions) => {
+                        this.update(cx, |state, cx| {
+                            state.conversations = sessions
+                                .into_iter()
+                                .map(|s| Conversation {
+                                    id: s.id,
+                                    title: s.title,
+                                    created_at: s.created_at,
+                                    updated_at: s.updated_at,
+                                    messages: Vec::new(),
+                                    unread_count: 0,
+                                })
+                                .collect();
 
-                                // If no active conversation, select the most recent one
-                                if state.active_conversation_id.is_none() {
-                                    if let Some(first) = state.conversations.first() {
-                                        let id = first.id.clone();
-                                        state.select_conversation(id, cx);
-                                    }
+                            // If no active conversation, select the most recent one
+                            if state.active_conversation_id.is_none() {
+                                if let Some(first) = state.conversations.first() {
+                                    let id = first.id.clone();
+                                    state.select_conversation(id, cx);
                                 }
-                                cx.notify();
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to load sessions: {}", e),
+                            }
+                            cx.notify();
+                        })
+                        .ok();
                     }
-                })
+                    Err(e) => eprintln!("Failed to load sessions: {}", e),
+                }
+            })
             .detach();
         }
     }
@@ -1563,12 +1628,8 @@ impl AppState {
                 Conversation {
                     id: id.clone(),
                     title: coworker.name.clone(),
-                    created_at: chrono::Local::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
-                    updated_at: chrono::Local::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
+                    created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    updated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     messages: Vec::new(),
                     unread_count: 0,
                 },
@@ -1641,9 +1702,7 @@ impl AppState {
         self.last_active_at
             .insert(id.to_string(), SystemTime::now());
         if let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == id) {
-            conversation.updated_at = chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string();
+            conversation.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         }
     }
 
@@ -1901,32 +1960,32 @@ impl AppState {
 
     pub fn create_new_session(&mut self, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
-            cx.spawn(async move |this, cx| {
-                    match db.create_session("New Chat").await {
-                        Ok(id) => {
-                            this.update(cx, |state, cx| {
-                                state.conversations.insert(
-                                    0,
-                                    Conversation {
-                                        id: id.clone(),
-                                        title: "New Chat".to_string(),
-                                        created_at: chrono::Local::now()
-                                            .format("%Y-%m-%d %H:%M:%S")
-                                            .to_string(),
-                                        updated_at: chrono::Local::now()
-                                            .format("%Y-%m-%d %H:%M:%S")
-                                            .to_string(),
-                                        messages: Vec::new(),
-                                        unread_count: 0,
-                                    },
-                                );
-                                state.select_conversation(id, cx);
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to create session: {}", e),
+            cx.spawn(
+                async move |this, cx| match db.create_session("New Chat").await {
+                    Ok(id) => {
+                        this.update(cx, |state, cx| {
+                            state.conversations.insert(
+                                0,
+                                Conversation {
+                                    id: id.clone(),
+                                    title: "New Chat".to_string(),
+                                    created_at: chrono::Local::now()
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string(),
+                                    updated_at: chrono::Local::now()
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string(),
+                                    messages: Vec::new(),
+                                    unread_count: 0,
+                                },
+                            );
+                            state.select_conversation(id, cx);
+                        })
+                        .ok();
                     }
-                })
+                    Err(e) => eprintln!("Failed to create session: {}", e),
+                },
+            )
             .detach();
         }
     }
@@ -1938,11 +1997,10 @@ impl AppState {
 
             if let Some(db) = self.database_service.clone() {
                 cx.spawn(async move |_this, _cx| {
-                        if let Err(e) = db.update_session_title(&id, &new_title).await {
-                            eprintln!("Failed to rename session: {}", e);
-                        }
-                    },
-                )
+                    if let Err(e) = db.update_session_title(&id, &new_title).await {
+                        eprintln!("Failed to rename session: {}", e);
+                    }
+                })
                 .detach();
             }
         }
@@ -1964,11 +2022,10 @@ impl AppState {
 
             if let Some(db) = self.database_service.clone() {
                 cx.spawn(async move |_this, _cx| {
-                        if let Err(e) = db.delete_session(&id).await {
-                            eprintln!("Failed to delete session: {}", e);
-                        }
-                    },
-                )
+                    if let Err(e) = db.delete_session(&id).await {
+                        eprintln!("Failed to delete session: {}", e);
+                    }
+                })
                 .detach();
             }
         }
@@ -1977,325 +2034,103 @@ impl AppState {
     pub fn load_session_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             let session_id_clone = session_id.clone();
-            cx.spawn(async move |this, cx| {
-                    match db.get_messages(&session_id_clone).await {
-                        Ok(db_messages) => {
-                            this.update(cx, |state, cx| {
-                                if let Some(conversation) = state
-                                    .conversations
-                                    .iter_mut()
-                                    .find(|c| c.id == session_id_clone)
-                                {
-                                    conversation.messages = db_messages
-                                        .into_iter()
-                                        .map(|m| {
-                                            let sent_at = NaiveDateTime::parse_from_str(
-                                                &m.created_at,
-                                                "%Y-%m-%d %H:%M:%S",
-                                            )
-                                            .map(|dt| SystemTime::from(dt.and_utc()))
-                                            .unwrap_or(SystemTime::now());
-
-                                            Message {
-                                                id: m.id,
-                                                sender: if m.role == "user" {
-                                                    "Me".to_string()
-                                                } else {
-                                                    "AI".to_string()
-                                                },
-                                                content: m.content,
-                                                sent_at,
-                                                is_me: m.role == "user",
-                                                reply_preview: None,
-                                            }
-                                        })
-                                        .collect();
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to load messages: {}", e),
-                    }
-                })
-            .detach();
-        }
-    }
-
-    /// Load all profiles and credentials from the database into AppState.
-    pub async fn load_profiles_and_credentials(
-        db: &DatabaseService,
-    ) -> anyhow::Result<(Vec<DbProfile>, Vec<DbCredential>)> {
-        let profiles = db.get_profiles().await?;
-        let credentials = db.get_credentials().await?;
-        Ok((profiles, credentials))
-    }
-
-    /// Set the loaded profiles and credentials into AppState.
-    pub fn set_profiles_and_credentials(
-        &mut self,
-        profiles: Vec<DbProfile>,
-        credentials: Vec<DbCredential>,
-        cx: &mut Context<Self>,
-    ) {
-        self.db_profiles = profiles.clone();
-        self.db_credentials = credentials;
-
-        // Update cache with fresh data from DB
-        Self::save_cached_state(self.active_profile_id, self.db_profiles.clone());
-
-        // Re-evaluate LLM provider with new credentials
-        self.update_llm_provider(cx);
-
-        cx.notify();
-    }
-
-    /// Reload profiles and credentials from the database and update the state.
-    /// This ensures that any changes made (e.g., in settings) are reflected globally.
-    pub fn reload_from_db(&mut self, cx: &mut Context<Self>) {
-        if let Some(db) = self.database_service.clone() {
-            cx.spawn(async move |this, cx| {
-                    if let Ok((profiles, credentials)) =
-                        Self::load_profiles_and_credentials(&db).await
-                    {
+            cx.spawn(
+                async move |this, cx| match db.get_messages(&session_id_clone).await {
+                    Ok(db_messages) => {
                         this.update(cx, |state, cx| {
-                            state.set_profiles_and_credentials(profiles, credentials, cx);
+                            if let Some(conversation) = state
+                                .conversations
+                                .iter_mut()
+                                .find(|c| c.id == session_id_clone)
+                            {
+                                conversation.messages = db_messages
+                                    .into_iter()
+                                    .map(|m| {
+                                        let sent_at = NaiveDateTime::parse_from_str(
+                                            &m.created_at,
+                                            "%Y-%m-%d %H:%M:%S",
+                                        )
+                                        .map(|dt| SystemTime::from(dt.and_utc()))
+                                        .unwrap_or(SystemTime::now());
+
+                                        Message {
+                                            id: m.id,
+                                            sender: if m.role == "user" {
+                                                "Me".to_string()
+                                            } else {
+                                                "AI".to_string()
+                                            },
+                                            content: m.content,
+                                            sent_at,
+                                            is_me: m.role == "user",
+                                            reply_preview: None,
+                                            parts: Vec::new(),
+                                        }
+                                    })
+                                    .collect();
+                                state.sync_pending_approvals(cx);
+                                cx.notify();
+                            }
                         })
                         .ok();
                     }
-                })
+                    Err(e) => {
+                        eprintln!("Failed to load messages: {}", e);
+                        let _ = this.update(cx, |state, cx| {
+                            state.sync_pending_approvals(cx);
+                        });
+                    }
+                },
+            )
             .detach();
+        } else {
+            self.sync_pending_approvals(cx);
         }
-    }
-
-    /// Select a database profile by ID and update the active profile.
-    /// This also updates the LLM provider to use the profile's credential.
-    /// Persists the selection to the settings table.
-    /// Requirements: 2.2, 5.1
-    pub fn select_db_profile(&mut self, profile_id: i64, cx: &mut Context<Self>) {
-        // Verify the profile exists before setting
-        if self.db_profiles.iter().any(|p| p.id == profile_id) {
-            // Stop any active TTS
-            self.stop_read_aloud(cx);
-
-            self.active_profile_id = Some(profile_id);
-            self.update_llm_provider(cx);
-
-            // Persist to local cache immediately
-            Self::save_cached_state(Some(profile_id), self.db_profiles.clone());
-
-            // Persist the selection asynchronously to DB
-            if let Some(db) = self.database_service.clone() {
-                cx.spawn(async move |_this, _cx| {
-                        if let Err(e) = Self::persist_selected_profile(&db, Some(profile_id)).await
-                        {
-                            eprintln!("Failed to persist selected profile: {}", e);
-                        }
-                    },
-                )
-                .detach();
-            }
-
-            cx.notify();
-        }
-    }
-
-    /// Get the currently active database profile.
-    pub fn active_profile(&self) -> Option<&DbProfile> {
-        self.active_profile_id
-            .and_then(|id| self.db_profiles.iter().find(|p| p.id == id))
-    }
-
-    /// Get the text credential for the active profile.
-    pub fn active_credential(&self) -> Option<&DbCredential> {
-        self.active_profile()
-            .and_then(|profile| profile.text_credential_id)
-            .and_then(|cred_id| self.db_credentials.iter().find(|c| c.id == cred_id))
-    }
-
-    /// Persist the selected profile ID to the settings table.
-    /// Requirements: 5.1
-    pub async fn persist_selected_profile(
-        db: &DatabaseService,
-        profile_id: Option<i64>,
-    ) -> anyhow::Result<()> {
-        const SETTING_KEY: &str = "selected_profile_id";
-        match profile_id {
-            Some(id) => {
-                db.set_setting(SETTING_KEY, &id.to_string()).await?;
-            }
-            None => {
-                db.delete_setting(SETTING_KEY).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Save the selected profile ID and profile list to a local JSON file for instant startup.
-    pub fn save_cached_state(profile_id: Option<i64>, profiles: Vec<DbProfile>) {
-        use std::fs;
-        use std::path::PathBuf;
-
-        // Determine config directory
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("nativechat");
-
-        if !config_dir.exists() {
-            let _ = fs::create_dir_all(&config_dir);
-        }
-
-        let cache_file = config_dir.join("last_profile.json");
-
-        #[derive(serde::Serialize)]
-        struct CachedState {
-            profile_id: Option<i64>,
-            profiles: Vec<DbProfile>,
-        }
-
-        let data = CachedState {
-            profile_id,
-            profiles,
-        };
-
-        if let Ok(json) = serde_json::to_string(&data) {
-            let _ = fs::write(cache_file, json);
-        }
-    }
-
-    /// Load the cached profile ID and profile list from the local JSON file.
-    pub fn load_cached_state() -> Option<(Option<i64>, Vec<DbProfile>)> {
-        use std::fs;
-        use std::path::PathBuf;
-
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("nativechat");
-        let cache_file = config_dir.join("last_profile.json");
-
-        #[derive(serde::Deserialize)]
-        struct CachedState {
-            profile_id: Option<i64>,
-            profiles: Vec<DbProfile>,
-        }
-
-        if let Ok(content) = fs::read_to_string(cache_file) {
-            if let Ok(data) = serde_json::from_str::<CachedState>(&content) {
-                return Some((data.profile_id, data.profiles));
-            }
-        }
-
-        None
-    }
-
-    /// Restore the selected profile from settings on startup.
-    /// Validates that the profile still exists, clears if not.
-    /// Requirements: 5.2, 5.3
-    pub async fn restore_selected_profile(
-        db: &DatabaseService,
-        profiles: &[DbProfile],
-    ) -> anyhow::Result<Option<i64>> {
-        const SETTING_KEY: &str = "selected_profile_id";
-
-        if let Some(value) = db.get_setting(SETTING_KEY).await? {
-            if let Ok(profile_id) = value.parse::<i64>() {
-                // Validate profile still exists
-                if profiles.iter().any(|p| p.id == profile_id) {
-                    return Ok(Some(profile_id));
-                } else {
-                    // Profile no longer exists, clear the setting
-                    db.delete_setting(SETTING_KEY).await?;
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Update the LLM provider based on the active profile's credential.
-    /// Falls back to Config-based provider if no profile/credential is selected.
-    pub fn update_llm_provider(&mut self, cx: &mut Context<Self>) {
-        // Try to create provider from active profile's credential
-        if let Some(credential) = self.active_credential() {
-            let model_id = self
-                .active_profile()
-                .and_then(|p| p.text_model_id.as_deref());
-
-            match create_provider_from_credential(credential, model_id) {
-                Ok(provider) => {
-                    println!(
-                        "[LLM] Initialized {} provider from profile credential",
-                        credential.provider
-                    );
-                    self.llm_provider = Some(Arc::from(provider));
-                    cx.notify();
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[LLM] Failed to create provider from credential: {}", e);
-                }
-            }
-        }
-
-        // Fall back to Config-based provider
-        if let Some(config) = &self.config {
-            match create_provider(config) {
-                Ok(provider) => {
-                    println!(
-                        "[LLM] Initialized {} provider from config (fallback)",
-                        config.default_provider
-                    );
-                    self.llm_provider = Some(Arc::from(provider));
-                }
-                Err(e) => {
-                    eprintln!("[LLM] Failed to create provider from config: {}", e);
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    pub fn fetch_models(&mut self, api_keys: HashMap<Provider, String>, cx: &mut Context<Self>) {
-        let registry = self.model_registry.clone();
-        cx.spawn(async move |this, cx| {
-                let models = registry.get_all_models(&api_keys).await;
-                this.update(cx, |state: &mut AppState, cx| {
-                    state.available_models = models;
-                    cx.notify();
-                })
-                .ok();
-            })
-        .detach();
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
         self.active_conversation_id = Some(conversation_id.clone());
         self.load_session_messages(conversation_id, cx);
+        self.sync_pending_approvals(cx);
         cx.notify();
     }
 
-    pub fn select_profile(&mut self, profile_id: usize, cx: &mut Context<Self>) {
-        if let Some(profile) = self.profiles.iter().find(|p| p.id == profile_id) {
-            self.selected_profile = Some(profile.clone());
-            cx.notify();
-        }
+    fn conversation_title(&self, id: &str) -> String {
+        self.conversations
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| id.to_string())
     }
 
-    pub fn select_app(&mut self, app_name: String, cx: &mut Context<Self>) {
-        println!("State: select_app called for {}", app_name);
-        if !self.selected_apps.contains(&app_name) {
-            println!("State: Adding {} to selected_apps", app_name);
-            self.selected_apps.push(app_name);
-            cx.notify();
-        } else {
-            println!("State: {} already selected", app_name);
+    /// Keep the coworker's reply so the thread survives a relaunch.
+    fn persist_assistant_reply(
+        &self,
+        conversation_id: &str,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        if content.trim().is_empty() {
+            return;
         }
-    }
-
-    pub fn remove_app(&mut self, app_name: String, cx: &mut Context<Self>) {
-        if let Some(index) = self.selected_apps.iter().position(|a| *a == app_name) {
-            self.selected_apps.remove(index);
-            cx.notify();
-        }
+        let Some(db) = self.database_service.clone() else {
+            return;
+        };
+        let title = self.conversation_title(conversation_id);
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |_this, _cx| {
+            let saved = match db.ensure_session(&conversation_id, &title).await {
+                Ok(()) => db
+                    .save_message(&conversation_id, "assistant", &content, None, None)
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = saved {
+                eprintln!("Failed to save assistant message: {error}");
+            }
+        })
+        .detach();
     }
 
     fn send_opengrok_turn(
@@ -2317,6 +2152,7 @@ impl AppState {
             .map(|c| {
                 c.messages
                     .iter()
+                    .filter(|m| !m.content.trim().is_empty() || m.is_me)
                     .map(|m| AguiMessage {
                         id: m.id.clone(),
                         role: if m.is_me {
@@ -2325,6 +2161,7 @@ impl AppState {
                             "assistant".to_string()
                         },
                         content: m.content.clone(),
+                        tool_call_id: None,
                     })
                     .collect()
             })
@@ -2342,17 +2179,17 @@ impl AppState {
                 sent_at: SystemTime::now(),
                 is_me: false,
                 reply_preview: None,
+                parts: Vec::new(),
             });
         }
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
-        self.is_ai_responding = true;
-        self.bot_status = Some("Thinking".into());
+        self.begin_responding(coworker_id.as_deref(), "Thinking");
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let coworker = match coworker_id {
+            let coworker = match coworker_id.clone() {
                 Some(id) => Ok(id),
                 None => match client.hire("NativeChat", None).await {
                     Ok(hired) => {
@@ -2366,86 +2203,78 @@ impl AppState {
                     Err(error) => Err(error),
                 },
             };
-            let result = match coworker {
+            let (result, waiting_approval, turn_id) = match coworker {
                 Ok(id) => {
-                    let mut args_by_call: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
-                    let mut names_by_call: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
-                    client
+                    let mut tracker = ToolCallTracker::default();
+                    let mut assembler = TurnAssembler::default();
+                    let result = client
                         .run_turn(&id, &conversation_id, &history, |event| {
-                            if let Some(call_id) =
-                                event.get("toolCallId").and_then(|v| v.as_str())
-                            {
-                                if let Some(name) =
-                                    event.get("toolCallName").and_then(|v| v.as_str())
-                                {
-                                    names_by_call.insert(call_id.to_string(), name.to_string());
-                                }
-                                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                    args_by_call
-                                        .entry(call_id.to_string())
-                                        .or_default()
-                                        .push_str(delta);
-                                }
-                            }
-                            let call_id = event.get("toolCallId").and_then(|v| v.as_str());
-                            let args = call_id.and_then(|id| args_by_call.get(id)).map(String::as_str);
-                            let mut event = event.clone();
-                            if event.get("toolCallName").is_none() {
-                                if let Some(name) = call_id.and_then(|id| names_by_call.get(id)) {
-                                    event
-                                        .as_object_mut()
-                                        .map(|o| o.insert("toolCallName".into(), name.clone().into()));
-                                }
-                            }
-                            match activity_from_agui(&event, args) {
+                            match tracker.tick(event) {
                                 ActivityTick::Keep => {}
-                                ActivityTick::Clear => {
+                                tick => {
+                                    let turn_id = id.clone();
                                     let _ = this.update(cx, |state, cx| {
-                                        if state.bot_status.is_some() {
-                                            state.bot_status = None;
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                                ActivityTick::Set(activity) => {
-                                    let _ = this.update(cx, |state, cx| {
-                                        if state.bot_status.as_deref() != Some(activity.label.as_str())
-                                        {
-                                            state.bot_status = Some(activity.label);
+                                        let before = state.bot_status.clone();
+                                        state.apply_turn_status(Some(&turn_id), tick);
+                                        if state.bot_status != before {
                                             cx.notify();
                                         }
                                     });
                                 }
                             }
-                            let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
-                                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                    if !delta.is_empty() {
-                                        let _ = this.update(cx, |state, cx| {
-                                            if let Some(conversation) = state
-                                                .conversations
-                                                .iter_mut()
-                                                .find(|c| c.id == conversation_id)
-                                            {
-                                                if let Some(last) =
-                                                    conversation.messages.last_mut()
-                                                {
-                                                    if !last.is_me {
-                                                        last.content.push_str(delta);
-                                                        cx.notify();
-                                                    }
-                                                }
-                                            }
-                                        });
+                            assembler.push_event(&event);
+                            let (plain, parts) = assembler.snapshot();
+                            let _ = this.update(cx, |state, cx| {
+                                if let Some(conversation) = state
+                                    .conversations
+                                    .iter_mut()
+                                    .find(|c| c.id == conversation_id)
+                                {
+                                    if let Some(last) = conversation.messages.last_mut() {
+                                        if !last.is_me {
+                                            last.content = plain.clone();
+                                            last.parts = parts.clone();
+                                            cx.notify();
+                                        }
                                     }
                                 }
-                            }
+                                if assembler.waiting_approval() {
+                                    let open = parts.iter().rev().find_map(|part| match part {
+                                        ChatPart::Approval(spec) => Some(spec.clone()),
+                                        _ => None,
+                                    });
+                                    if let Some(spec) = open {
+                                        if let Some(resolution) =
+                                            state.auto_resolve_local_exec(&spec)
+                                        {
+                                            state.answer_approval(spec, resolution, cx);
+                                        }
+                                    }
+                                }
+                            });
                         })
-                        .await
+                        .await;
+                    assembler.finish();
+                    let waiting_approval = assembler.waiting_approval();
+                    let (plain, parts) = assembler.snapshot();
+                    let _ = this.update(cx, |state, cx| {
+                        if let Some(conversation) = state
+                            .conversations
+                            .iter_mut()
+                            .find(|c| c.id == conversation_id)
+                        {
+                            if let Some(last) = conversation.messages.last_mut() {
+                                if !last.is_me {
+                                    last.content = plain;
+                                    last.parts = parts;
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                    (result, waiting_approval, Some(id))
                 }
-                Err(error) => Err(error),
+                Err(error) => (Err(error), false, coworker_id.clone()),
             };
             let _ = this.update(cx, |state, cx| {
                 if let Some(conversation) = state
@@ -2454,25 +2283,60 @@ impl AppState {
                     .find(|c| c.id == conversation_id)
                 {
                     if let Some(last) = conversation.messages.last_mut() {
-                        if !last.is_me {
+                        if !last.is_me && !last.has_visible_body() {
                             match &result {
-                                Ok(text) if !text.is_empty() => {
-                                    if last.content != *text {
-                                        last.content = text.clone();
-                                    }
-                                }
-                                Ok(_) if last.content.trim().is_empty() => {
+                                Ok(text) if !text.is_empty() => last.content = text.clone(),
+                                Ok(_) => {
                                     last.content =
                                         "(OpenGrok returned no assistant text.)".to_string()
                                 }
-                                Ok(_) => {}
                                 Err(error) => last.content = format!("OpenGrok: {}", error.message),
                             }
                         }
                     }
                 }
-                state.is_ai_responding = false;
-                state.bot_status = None;
+                if !waiting_approval && result.is_ok() {
+                    // The run is final; a run parked on a card is saved when it finishes.
+                    // An error line is painted, never saved: it must not become history
+                    // the model is shown next turn.
+                    let reply = state
+                        .conversations
+                        .iter()
+                        .find(|c| c.id == conversation_id)
+                        .and_then(|c| c.messages.last())
+                        .filter(|m| !m.is_me)
+                        .map(|m| m.content.clone());
+                    if let Some(reply) = reply {
+                        state.persist_assistant_reply(&conversation_id, reply, cx);
+                    }
+                }
+                if waiting_approval {
+                    let open = state
+                        .conversations
+                        .iter()
+                        .find(|c| c.id == conversation_id)
+                        .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
+                        .and_then(|m| {
+                            m.parts.iter().rev().find_map(|part| match part {
+                                ChatPart::Approval(spec) => Some(spec.clone()),
+                                _ => None,
+                            })
+                        });
+                    let auto = open
+                        .as_ref()
+                        .and_then(|spec| state.auto_resolve_local_exec(spec))
+                        .zip(open);
+                    if let Some((resolution, spec)) = auto {
+                        state.answer_approval(spec, resolution, cx);
+                        state.finish_responding(turn_id.as_deref(), false);
+                    } else {
+                        state.finish_responding(turn_id.as_deref(), true);
+                        state.fill_open_approval_commands(cx);
+                        state.sync_pending_approvals(cx);
+                    }
+                } else {
+                    state.finish_responding(turn_id.as_deref(), false);
+                }
                 if let Err(error) = result {
                     state.auth_error = Some(error.message);
                 }
@@ -2482,8 +2346,508 @@ impl AppState {
         .detach();
     }
 
+    pub fn answer_approval(
+        &mut self,
+        spec: ApprovalSpec,
+        resolution: LocalExecResolution,
+        cx: &mut Context<Self>,
+    ) {
+        if self.approval_answered(&spec.call_id) {
+            return;
+        }
+        self.approval_decisions
+            .insert(spec.call_id.clone(), ApprovalDecision::Sending);
+        self.drop_other_pending_approvals(&spec.call_id);
+        cx.notify();
+        let Some(client) = self.opengrok.clone() else {
+            self.approval_decisions.insert(
+                spec.call_id.clone(),
+                ApprovalDecision::Failed("OpenGrok is not configured".into()),
+            );
+            return;
+        };
+        let machine_id = self
+            .local_exec_machine_id
+            .clone()
+            .or_else(|| {
+                self.computers
+                    .iter()
+                    .find(|computer| computer.this_machine)
+                    .map(|computer| computer.machine_id.clone())
+            })
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .and_then(|config| stored_machine_id(&config.data_dir))
+            })
+            .or_else(|| {
+                self.computers
+                    .first()
+                    .map(|computer| computer.machine_id.clone())
+            });
+        let conversation_id = self.active_conversation_id.clone();
+        let (approved, decision, mode) = match resolution {
+            LocalExecResolution::Always => (true, ApprovalDecision::Always, Some("bypass")),
+            LocalExecResolution::AllowOnce => (true, ApprovalDecision::AllowOnce, None),
+            LocalExecResolution::Never => (false, ApprovalDecision::Never, Some("never")),
+            LocalExecResolution::DenyOnce => (false, ApprovalDecision::Denied, None),
+        };
+        // Only the local-shell tool can move this Mac's policy.
+        let mode = mode.filter(|_| spec.runs_on_this_mac());
+        if let (Some(machine_id), Some(stored)) = (machine_id.as_ref(), mode) {
+            if let Some(computer) = self
+                .computers
+                .iter_mut()
+                .find(|computer| &computer.machine_id == machine_id)
+            {
+                computer.mode = LocalExecMode::from_stored(stored);
+            }
+            cx.notify();
+        }
+        let run_id_empty = spec.run_id.trim().is_empty();
+        cx.spawn(async move |this, cx| {
+            if let (Some(machine_id), Some(mode)) = (machine_id.as_deref(), mode) {
+                let _ = client.set_local_exec_mode(machine_id, mode).await;
+                let _ = this.update(cx, |state, cx| {
+                    state.refresh_computers(cx);
+                });
+            }
+            if run_id_empty {
+                let _ = this.update(cx, |state, cx| {
+                    state.drop_dead_approval(&spec.call_id);
+                    state
+                        .approval_decisions
+                        .insert(spec.call_id.clone(), decision);
+                    cx.notify();
+                });
+                return;
+            }
+            let mut run_id = spec.run_id.clone();
+            if let Ok(queue) = client.list_approvals().await
+                && let Some(item) = queue.iter().find(|item| item.call_id == spec.call_id)
+            {
+                run_id = item.run_id.clone();
+            }
+            let result = client.answer_run(&run_id, &spec.call_id, approved).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(_) => {
+                        state
+                            .approval_decisions
+                            .insert(spec.call_id.clone(), decision);
+                        let coworker_id = state.active_coworker_id.clone();
+                        if approved {
+                            state.begin_responding(coworker_id.as_deref(), "Running commands");
+                            state.follow_answered_run(
+                                run_id.clone(),
+                                conversation_id,
+                                coworker_id,
+                                cx,
+                            );
+                        } else {
+                            state.finish_responding(coworker_id.as_deref(), false);
+                        }
+                    }
+                    Err(error) => {
+                        if error.message.contains("no such run") {
+                            state.drop_dead_approval(&spec.call_id);
+                        } else {
+                            state.approval_decisions.insert(
+                                spec.call_id.clone(),
+                                ApprovalDecision::Failed(error.message),
+                            );
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn follow_answered_run(
+        &mut self,
+        run_id: String,
+        conversation_id: Option<String>,
+        coworker_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let mut last_len = 0usize;
+            for _ in 0..400 {
+                match client.replay_run(&run_id).await {
+                    Ok(replay) => {
+                        if replay.events.len() != last_len {
+                            last_len = replay.events.len();
+                            let mut assembler = TurnAssembler::default();
+                            for event in &replay.events {
+                                assembler.push_event(event);
+                            }
+                            assembler.finish();
+                            let (plain, parts) = assembler.snapshot();
+                            let status = replay.status.clone();
+                            // The journal says what the run is doing now; "Working" only
+                            // when no frame has said.
+                            let activity =
+                                activity_from_replay(&replay.events).unwrap_or(BotActivity {
+                                    label: "Working".into(),
+                                });
+                            let _ = this.update(cx, |state, cx| {
+                                if let Some(conversation_id) = conversation_id.as_ref()
+                                    && let Some(conversation) = state
+                                        .conversations
+                                        .iter_mut()
+                                        .find(|c| &c.id == conversation_id)
+                                    && let Some(last) =
+                                        conversation.messages.iter_mut().rev().find(|m| !m.is_me)
+                                {
+                                    last.content = plain.clone();
+                                    last.parts = parts.clone();
+                                    for part in &parts {
+                                        if let ChatPart::Approval(spec) = part
+                                            && spec.output.is_some()
+                                        {
+                                            state.approval_decisions.insert(
+                                                spec.call_id.clone(),
+                                                ApprovalDecision::AllowOnce,
+                                            );
+                                        }
+                                    }
+                                }
+                                match status.as_str() {
+                                    "awaiting-approval" => {
+                                        state.finish_responding(coworker_id.as_deref(), true);
+                                    }
+                                    "running" => {
+                                        state.apply_turn_status(
+                                            coworker_id.as_deref(),
+                                            ActivityTick::Set(activity.clone()),
+                                        );
+                                    }
+                                    "finished" => {
+                                        state.finish_responding(coworker_id.as_deref(), false);
+                                        if let Some(id) = conversation_id.as_ref() {
+                                            state.persist_assistant_reply(id, plain.clone(), cx);
+                                        }
+                                    }
+                                    "failed" => {
+                                        state.finish_responding(coworker_id.as_deref(), false);
+                                    }
+                                    _ => {}
+                                }
+                                cx.notify();
+                            });
+                        }
+                        match replay.status.as_str() {
+                            "finished" | "failed" => break,
+                            "awaiting-approval" => {
+                                let _ = this.update(cx, |state, cx| {
+                                    state.finish_responding(coworker_id.as_deref(), true);
+                                    cx.notify();
+                                });
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => break,
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if !matches!(state.bot_status.as_deref(), Some("Waiting for approval")) {
+                    state.finish_responding(coworker_id.as_deref(), false);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn fill_approval_command(&mut self, call_id: &str, command: String) {
+        if command.trim().is_empty() {
+            return;
+        }
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                for part in &mut message.parts {
+                    if let ChatPart::Approval(spec) = part
+                        && spec.call_id == call_id
+                        && spec.command.is_empty()
+                    {
+                        spec.command = command.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn fill_open_approval_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let mut jobs = Vec::new();
+        for conversation in &self.conversations {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    if let ChatPart::Approval(spec) = part
+                        && spec.command.is_empty()
+                        && !spec.run_id.is_empty()
+                    {
+                        jobs.push((spec.run_id.clone(), spec.call_id.clone()));
+                    }
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            for (run_id, call_id) in jobs {
+                let mut command = String::new();
+                if let Ok(replay) = client.replay_run(&run_id).await {
+                    command = command_from_replay_events(&replay.events, &call_id);
+                    if command.is_empty()
+                        && let Some(pending) = replay.pending
+                    {
+                        let pending_id = pending
+                            .get("call_id")
+                            .or_else(|| pending.get("callId"))
+                            .and_then(serde_json::Value::as_str);
+                        if pending_id.is_none_or(|id| id == call_id) {
+                            command = command_from_args(
+                                pending.get("arguments").unwrap_or(&serde_json::Value::Null),
+                            );
+                        }
+                    }
+                }
+                if command.is_empty()
+                    && let Ok(queue) = client.list_approvals().await
+                    && let Some(item) = queue.iter().find(|item| item.call_id == call_id)
+                {
+                    command = command_from_args(&item.arguments);
+                }
+                if command.is_empty() {
+                    continue;
+                }
+                let _ = this.update(cx, |state, cx| {
+                    state.fill_approval_command(&call_id, command);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn sync_pending_approvals(&mut self, cx: &mut Context<Self>) {
+        if self.is_ai_responding {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let thread_id = self.active_conversation_id.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(queue) = client.list_approvals().await else {
+                return;
+            };
+            let _ = this.update(cx, |state, cx| {
+                // The policy answers what it covers; the rest wait for a card.
+                let mut needs_card = Vec::new();
+                for item in queue {
+                    if state.approval_answered(&item.call_id) {
+                        continue;
+                    }
+                    let spec = spec_from_queued(&item);
+                    match state.auto_resolve_local_exec(&spec) {
+                        Some(resolution) => state.answer_approval(spec, resolution, cx),
+                        None => needs_card.push(item),
+                    }
+                }
+                if state.is_ai_responding {
+                    return;
+                }
+                let Some(thread_id) = thread_id.as_deref() else {
+                    return;
+                };
+                let Some(item) = QueuedApproval::latest_for_thread(&needs_card, thread_id) else {
+                    return;
+                };
+                if item.run_id.trim().is_empty() {
+                    return;
+                }
+                state.attach_queued_approval(item.clone());
+                state.responding_coworker_id = Some(thread_id.to_string());
+                state.bot_status = Some("Waiting for approval".into());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn drop_dead_approval(&mut self, call_id: &str) {
+        self.approval_decisions.remove(call_id);
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(
+                    |part| !matches!(part, ChatPart::Approval(spec) if spec.call_id == call_id),
+                );
+            }
+        }
+    }
+
+    fn drop_other_pending_approvals(&mut self, keep_call_id: &str) {
+        let decisions = &self.approval_decisions;
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::Approval(spec) => {
+                        spec.call_id == keep_call_id
+                            || decisions
+                                .get(&spec.call_id)
+                                .is_some_and(ApprovalDecision::is_answered)
+                    }
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn attach_queued_approval(&mut self, item: QueuedApproval) {
+        let spec = spec_from_queued(&item);
+        self.approval_decisions
+            .entry(spec.call_id.clone())
+            .or_insert(ApprovalDecision::Pending);
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == item.thread_id)
+        else {
+            return;
+        };
+        if let Some(last) = conversation.messages.iter_mut().rev().find(|m| !m.is_me) {
+            if let Some(ChatPart::Approval(existing)) = last.parts.iter_mut().find(|part| {
+                matches!(part, ChatPart::Approval(existing) if existing.call_id == spec.call_id
+                    || existing.run_id == spec.run_id)
+            }) {
+                if existing.command.is_empty() && !spec.command.is_empty() {
+                    existing.command = spec.command;
+                }
+                if existing.run_id.is_empty() {
+                    existing.run_id = spec.run_id;
+                }
+                return;
+            }
+            if last
+                .parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Approval(_)))
+            {
+                return;
+            }
+            last.parts.push(ChatPart::Approval(spec));
+            return;
+        }
+        conversation.messages.push(Message {
+            id: uuid::Uuid::now_v7().to_string(),
+            sender: "AI".to_string(),
+            content: String::new(),
+            sent_at: SystemTime::now(),
+            is_me: false,
+            reply_preview: None,
+            parts: vec![ChatPart::Approval(spec)],
+        });
+    }
+
+    fn start_local_exec(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(config) = self.config.clone() else {
+            return;
+        };
+        self.stop_local_exec();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.local_exec_cancel = Some(cancel.clone());
+        cx.spawn(async move |this, cx| {
+            match enrol_this_machine(&client, &config.data_dir).await {
+                Ok(machine_id) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.local_exec_machine_id = Some(machine_id);
+                        state.refresh_computers(cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    eprintln!("NativeChat local-exec: {error}");
+                }
+            }
+            serve_local_exec(client, config.data_dir, cancel).await;
+        })
+        .detach();
+    }
+
+    fn stop_local_exec(&mut self) {
+        if let Some(cancel) = &self.local_exec_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.local_exec_cancel = None;
+        self.local_exec_machine_id = None;
+    }
+
+    pub fn toggle_shell_output(&mut self, call_id: String, cx: &mut Context<Self>) {
+        if !self.expanded_shell_output.remove(&call_id) {
+            self.expanded_shell_output.insert(call_id);
+        }
+        cx.notify();
+    }
+
+    pub fn pick_form_option(
+        &mut self,
+        message_id: String,
+        field_id: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.form_picks
+            .entry(message_id)
+            .or_default()
+            .insert(field_id, value);
+        cx.notify();
+    }
+
+    pub fn submit_form(&mut self, message_id: String, spec: FormSpec, cx: &mut Context<Self>) {
+        let picks = self
+            .form_picks
+            .get(&message_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut lines = Vec::new();
+        if let Some(title) = &spec.title {
+            lines.push(title.clone());
+        }
+        for field in &spec.fields {
+            if let Some(value) = picks.get(&field.id) {
+                lines.push(format!("{}: {value}", field.label));
+            }
+        }
+        let body = lines.join("\n");
+        if body.trim().is_empty() {
+            return;
+        }
+        self.send_message(body, cx);
+    }
+
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
-        if self.is_signed_in() && self.active_coworker_id.is_none() {
+        if !self.is_signed_in() {
+            self.auth_error = Some("Sign in first".to_string());
+            cx.notify();
+            return;
+        }
+        if self.active_coworker_id.is_none() {
             self.auth_error = Some("Create a bot first".to_string());
             cx.notify();
             return;
@@ -2508,6 +2872,7 @@ impl AppState {
                 sent_at: SystemTime::now(),
                 is_me: true,
                 reply_preview,
+                parts: Vec::new(),
             };
             conversation.messages.push(message);
         }
@@ -2520,210 +2885,74 @@ impl AppState {
         if let Some(db) = self.database_service.clone() {
             let content_clone = content.clone();
             let conversation_id_clone = conversation_id.clone();
+            let title = self.conversation_title(&conversation_id);
             let local_id = local_id.clone();
             cx.spawn(async move |this, cx| {
-                    match db
-                        .save_message(&conversation_id_clone, "user", &content_clone, None, None)
-                        .await
-                    {
-                        Ok(id) => {
-                            this.update(cx, |state, cx| {
-                                if let Some(conversation) = state
-                                    .conversations
-                                    .iter_mut()
-                                    .find(|c| c.id == conversation_id_clone)
-                                {
-                                    if let Some(msg) = conversation.messages.iter_mut().rev().find(|m| m.id == local_id)
-                                    {
-                                        msg.id = id;
-                                    }
-                                }
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to save user message: {}", e),
-                    }
-                })
-            .detach();
-        }
-
-        if self.is_signed_in() {
-            self.send_opengrok_turn(conversation_id, content, cx);
-            return;
-        }
-
-        // Get AI response
-        let provider = match &self.llm_provider {
-            Some(p) => p.clone(),
-            None => {
-                eprintln!("[LLM] No provider configured");
-                return;
-            }
-        };
-
-        // Build chat history for context
-        let chat_messages: Vec<ChatMessage> = self
-            .conversations
-            .iter()
-            .find(|c| c.id == conversation_id)
-            .map(|c| {
-                c.messages
-                    .iter()
-                    .map(|m| ChatMessage {
-                        role: if m.is_me {
-                            "user".to_string()
-                        } else {
-                            "assistant".to_string()
-                        },
-                        content: m.content.clone(),
-                        images: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Use active profile's text_model_id if set, otherwise fall back to provider default
-        // Requirements 4.1, 4.2
-        let model = self
-            .active_profile()
-            .and_then(|p| p.text_model_id.clone())
-            .unwrap_or_else(|| provider.default_model().to_string());
-
-        let request = ChatRequest {
-            model: model.clone(),
-            messages: chat_messages,
-            system_prompt: Some("You are a helpful AI assistant.".to_string()),
-            temperature: 0.7,
-            max_tokens: Some(2048),
-            stream: true,
-        };
-
-        self.is_ai_responding = true;
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-                println!("[LLM] Sending request to AI...");
-
-                // Create the AI message placeholder first
-                let _ = this.update(cx, |state, model_cx| {
-                    if let Some(conversation) = state
-                        .conversations
-                        .iter_mut()
-                        .find(|c| c.id == conversation_id)
-                    {
-                        let ai_message = Message {
-                            id: uuid::Uuid::now_v7().to_string(),
-                            sender: "AI".to_string(),
-                            content: String::new(), // Start empty
-                            sent_at: SystemTime::now(),
-                            is_me: false,
-                            reply_preview: None,
-                        };
-                        conversation.messages.push(ai_message);
-                    }
-                    model_cx.notify();
-                });
-
-                let mut full_response = String::new();
-
-                match provider.chat_stream(request).await {
-                    Ok(mut stream) => {
-                        println!("[LLM] Stream started");
-
-                        while let Some(chunk_result) = stream.next().await {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    if !chunk.delta.is_empty() {
-                                        full_response.push_str(&chunk.delta);
-                                        let _ = this.update(cx, |state, cx| {
-                                            if let Some(conversation) = state
-                                                .conversations
-                                                .iter_mut()
-                                                .find(|c| c.id == conversation_id)
-                                            {
-                                                if let Some(last_msg) =
-                                                    conversation.messages.last_mut()
-                                                {
-                                                    last_msg.content.push_str(&chunk.delta);
-                                                    cx.notify();
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[LLM] Stream error: {}", e);
-                                    // Append error to message or show error
-                                }
-                            }
-                        }
-
-                        let _ = this.update(cx, |state, cx| {
-                            state.is_ai_responding = false;
-                            // Save AI response to DB
-                            if let Some(db) = state.database_service.clone() {
-                                let response_clone = full_response.clone();
-                                let model_clone = model.clone();
-                                let conversation_id_clone = conversation_id.clone();
-                                cx.spawn(async move |this, cx| {
-                                        match db
-                                            .save_message(
-                                                &conversation_id_clone,
-                                                "assistant",
-                                                &response_clone,
-                                                Some(model_clone),
-                                                None,
-                                            )
-                                            .await
-                                        {
-                                            Ok(id) => {
-                                                this.update(cx, |state, cx| {
-                                                    if let Some(conversation) = state
-                                                        .conversations
-                                                        .iter_mut()
-                                                        .find(|c| c.id == conversation_id_clone)
-                                                    {
-                                                        if let Some(msg) =
-                                                            conversation.messages.last_mut()
-                                                        {
-                                                            if msg.id == "temp" {
-                                                                msg.id = id;
-                                                            }
-                                                        }
-                                                    }
-                                                })
-                                                .ok();
-                                            }
-                                            Err(e) => eprintln!("Failed to save AI message: {}", e),
-                                        }
-                                })
-                                .detach();
-                            }
-                            cx.notify();
-                        });
-                        println!("[LLM] Stream finished");
-                    }
-                    Err(e) => {
-                        eprintln!("[LLM] Error starting stream: {}", e);
-                        let _ = this.update(cx, |state, cx| {
+                // A coworker thread has no session row until it first speaks.
+                if let Err(e) = db.ensure_session(&conversation_id_clone, &title).await {
+                    eprintln!("Failed to save user message: {}", e);
+                    return;
+                }
+                match db
+                    .save_message(&conversation_id_clone, "user", &content_clone, None, None)
+                    .await
+                {
+                    Ok(id) => {
+                        this.update(cx, |state, cx| {
                             if let Some(conversation) = state
                                 .conversations
                                 .iter_mut()
-                                .find(|c| c.id == conversation_id)
+                                .find(|c| c.id == conversation_id_clone)
                             {
-                                // If we failed to start stream, we might want to remove the empty message
-                                // or update it with error
-                                if let Some(last_msg) = conversation.messages.last_mut() {
-                                    last_msg.content = format!("Error: {}", e);
+                                if let Some(msg) = conversation
+                                    .messages
+                                    .iter_mut()
+                                    .rev()
+                                    .find(|m| m.id == local_id)
+                                {
+                                    msg.id = id;
                                 }
                             }
-                            state.is_ai_responding = false;
-                            cx.notify();
-                        });
+                        })
+                        .ok();
                     }
+                    Err(e) => eprintln!("Failed to save user message: {}", e),
                 }
             })
-        .detach();
+            .detach();
+        }
+
+        if self.has_open_approval(&conversation_id) {
+            self.bot_status = Some("Waiting for approval".into());
+            cx.notify();
+            return;
+        }
+        if self.is_active_bot_responding() {
+            cx.notify();
+            return;
+        }
+        self.send_opengrok_turn(conversation_id, content, cx);
+    }
+
+    fn has_open_approval(&self, conversation_id: &str) -> bool {
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return false;
+        };
+        conversation.messages.iter().rev().any(|message| {
+            !message.is_me
+                && message.parts.iter().any(|part| match part {
+                    ChatPart::Approval(spec) => {
+                        !spec.run_id.is_empty()
+                            && !self.approval_answered(&spec.call_id)
+                            && self.auto_resolve_local_exec(spec).is_none()
+                    }
+                    _ => false,
+                })
+        })
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -2770,11 +2999,7 @@ impl AppState {
     }
 
     pub fn apply_responsive_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
-        let result = collapse_for_width(
-            self.sidebar_responsive,
-            width,
-            self.sidebar_collapsed,
-        );
+        let result = collapse_for_width(self.sidebar_responsive, width, self.sidebar_collapsed);
         self.sidebar_responsive = result.next;
         if let Some(apply) = result.apply {
             if self.sidebar_collapsed != apply {
@@ -2841,8 +3066,80 @@ impl AppState {
         if self.app_settings_tab != tab {
             self.app_settings_tab = tab;
             self.record_nav();
+            if tab == AppSettingsTab::Computer {
+                self.refresh_computers(cx);
+            }
             cx.notify();
         }
+    }
+
+    pub fn refresh_computers(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let this_id = self.local_exec_machine_id.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(mut computers) = client.list_computers().await else {
+                return;
+            };
+            for computer in &mut computers {
+                computer.this_machine = this_id.as_ref() == Some(&computer.machine_id);
+                if computer.this_machine {
+                    computer.online = true;
+                }
+            }
+            computers.sort_by_key(|computer| !computer.this_machine);
+            let _ = this.update(cx, |state, cx| {
+                state.computers = computers;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn set_computer_exec_mode(
+        &mut self,
+        machine_id: String,
+        mode: LocalExecMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(computer) = self
+            .computers
+            .iter_mut()
+            .find(|computer| computer.machine_id == machine_id)
+        {
+            computer.mode = mode;
+        }
+        cx.notify();
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let stored = mode.as_stored();
+            let ok = client
+                .set_local_exec_mode(&machine_id, stored)
+                .await
+                .is_ok();
+            let confirmed = if ok {
+                client
+                    .local_exec_mode(&machine_id)
+                    .await
+                    .ok()
+                    .map(|mode| LocalExecMode::from_stored(&mode))
+            } else {
+                None
+            };
+            let _ = this.update(cx, |state, cx| {
+                if confirmed != Some(mode) {
+                    state.refresh_computers(cx);
+                    return;
+                }
+                if mode == LocalExecMode::Always {
+                    state.sync_pending_approvals(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn set_submit_chord(&mut self, chord: SubmitChord, cx: &mut Context<Self>) {
@@ -2871,6 +3168,9 @@ impl AppState {
             self.is_app_settings_open = true;
             self.dismiss_popovers(cx);
         }
+        if tab == AppSettingsTab::Computer {
+            self.refresh_computers(cx);
+        }
         self.record_nav();
         cx.notify();
     }
@@ -2879,92 +3179,28 @@ impl AppState {
         self.open_app_settings(AppSettingsTab::Profile, cx);
     }
 
-    pub fn toggle_profile_settings(&mut self, cx: &mut Context<Self>) {
-        self.is_profile_settings_open = !self.is_profile_settings_open;
-        cx.notify();
-    }
-
-    pub fn toggle_credentials_modal(&mut self, cx: &mut Context<Self>) {
-        self.is_credentials_modal_open = !self.is_credentials_modal_open;
-        cx.notify();
-    }
-
     pub fn start_voice_mode(&mut self, cx: &mut Context<Self>) {
         self.is_voice_mode_open = true;
         self.voice_status = VoiceStatus::Connecting;
         cx.notify();
 
-        if self.gemini_client.is_some() {
-            println!("Gemini client already connected, ignoring start request");
-            self.voice_status = VoiceStatus::Connected;
-            return;
-        }
-
-        let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_default();
-        if api_key.is_empty() {
-            eprintln!("GEMINI_API_KEY not set");
-            self.voice_status = VoiceStatus::Error("API Key Missing".to_string());
-            // Still start audio input for local viz, but without Gemini
-            match AudioInput::new(self.amplitude.clone(), None) {
-                Ok(input) => self.audio_input = Some(input),
-                Err(e) => eprintln!("Failed to start local audio input: {}", e),
+        match AudioInput::new(self.amplitude.clone()) {
+            Ok(input) => {
+                self.audio_input = Some(input);
+                self.voice_status = VoiceStatus::Connected;
             }
-            return;
+            Err(e) => {
+                eprintln!("Failed to start local audio input: {}", e);
+                self.voice_status = VoiceStatus::Error("Mic Error".to_string());
+            }
         }
-
-        let ai_amplitude = self.ai_amplitude.clone();
-        let amplitude = self.amplitude.clone();
-
-        cx.spawn(async move |this, cx| {
-                println!("Connecting to Gemini...");
-                match GeminiLiveClient::connect(api_key, ai_amplitude) {
-                    Ok(client) => {
-                        println!("Connected to Gemini!");
-                        let _ = this.update(cx, |state, _cx| {
-                            state.gemini_client = Some(client.clone());
-                            state.voice_status = VoiceStatus::Connected;
-
-                            // Restart audio input with the connected client
-                            match AudioInput::new(amplitude, Some(client)) {
-                                Ok(input) => {
-                                    state.audio_input = Some(input);
-                                    println!("Audio input started with Gemini client");
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to start audio input: {}", e);
-                                    state.voice_status =
-                                        VoiceStatus::Error("Mic Error".to_string());
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to connect to Gemini: {}", e);
-                        let _ = this.update(cx, |state, _cx| {
-                            state.voice_status =
-                                VoiceStatus::Error("Connection Failed".to_string());
-                            // Fallback to local audio if connection fails
-                            match AudioInput::new(amplitude, None) {
-                                Ok(input) => state.audio_input = Some(input),
-                                Err(e) => eprintln!("Failed to start local audio input: {}", e),
-                            }
-                        });
-                    }
-                }
-            })
-        .detach();
+        cx.notify();
     }
 
     pub fn stop_voice_mode(&mut self, cx: &mut Context<Self>) {
         self.is_voice_mode_open = false;
         self.voice_status = VoiceStatus::Disconnected;
-
-        if let Some(client) = &self.gemini_client {
-            client.disconnect();
-        }
-        self.gemini_client = None;
-        self.audio_input = None; // Drops AudioInput, stops capture
-
+        self.audio_input = None;
         cx.notify();
     }
 
@@ -2977,33 +3213,20 @@ impl AppState {
             return;
         }
         self.tts_initing = true;
-        let speaking = self.is_ai_speaking.clone();
-        let amplitude = self.ai_amplitude.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let service = cx
                 .background_executor()
                 .spawn(async move {
-                    TtsService::new(speaking, amplitude).map(|service| {
-                        service.warm_native();
-                        service
-                    })
+                    let service = TtsService::new();
+                    service.warm_native();
+                    service
                 })
                 .await;
             let _ = this.update(cx, |state, cx| {
                 state.tts_initing = false;
-                match result {
-                    Ok(service) => {
-                        state.tts_service = Some(service);
-                        if let Some((text, message_id, source)) = state.pending_read_aloud.take() {
-                            state.read_aloud(text, message_id, source, cx);
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Failed to initialize TTS service: {error}");
-                        state.pending_read_aloud = None;
-                        state.native_tts.is_loading = false;
-                        state.ai_tts.is_loading = false;
-                    }
+                state.tts_service = Some(service);
+                if let Some((text, message_id)) = state.pending_read_aloud.take() {
+                    state.read_aloud(text, message_id, TtsSource::Native, cx);
                 }
                 cx.notify();
             });
@@ -3018,137 +3241,48 @@ impl AppState {
         source: TtsSource,
         cx: &mut Context<Self>,
     ) {
+        let _ = source;
         if self.tts_service.is_none() {
-            self.pending_read_aloud = Some((text.clone(), message_id.clone(), source.clone()));
-            match source {
-                TtsSource::Native => {
-                    self.native_tts.message_id = Some(message_id);
-                    self.native_tts.is_loading = true;
-                    self.native_tts.is_paused = false;
-                }
-                TtsSource::AI => {
-                    self.ai_tts.message_id = Some(message_id);
-                    self.ai_tts.is_loading = true;
-                    self.ai_tts.is_paused = false;
-                }
-            }
+            self.pending_read_aloud = Some((text.clone(), message_id.clone()));
+            self.native_tts.message_id = Some(message_id);
+            self.native_tts.is_loading = true;
+            self.native_tts.is_paused = false;
             self.ensure_tts_service(cx);
             cx.notify();
             return;
         }
 
         if let Some(service) = &self.tts_service {
-            match source {
-                TtsSource::Native => {
-                    // Pause AI if running
-                    if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
-                        service.pause();
-                        self.ai_tts.is_paused = true;
-                    }
+            self.native_tts.message_id = Some(message_id.clone());
+            self.native_tts.is_paused = false;
+            self.native_tts.is_loading = false;
+            cx.notify();
 
-                    self.native_tts.message_id = Some(message_id.clone());
-                    self.native_tts.is_paused = false;
-                    self.native_tts.is_loading = false;
-                    cx.notify();
+            let service = service.clone();
+            let message_id = message_id.clone();
+            let text = text.clone();
 
-                    let service = service.clone();
-                    let message_id = message_id.clone();
-                    let text = text.clone();
-
-                    if service.start_speaking_native(&text, &message_id) {
-                        cx.spawn(async move |this, cx| {
-                            service.wait_until_finished_native().await;
-                            if let Some(this) = this.upgrade() {
-                                let _ = this.update(cx, |state, cx| {
-                                    if state.native_tts.message_id.as_ref() == Some(&message_id) {
-                                        state.native_tts.message_id = None;
-                                        cx.notify();
-                                    }
-                                });
+            if service.start_speaking_native(&text, &message_id) {
+                cx.spawn(async move |this, cx| {
+                    service.wait_until_finished_native().await;
+                    if let Some(this) = this.upgrade() {
+                        let _ = this.update(cx, |state, cx| {
+                            if state.native_tts.message_id.as_ref() == Some(&message_id) {
+                                state.native_tts.message_id = None;
+                                cx.notify();
                             }
-                        })
-                        .detach();
+                        });
                     }
-                }
-                TtsSource::AI => {
-                    // Pause Native if running
-                    if self.native_tts.message_id.is_some() && !self.native_tts.is_paused {
-                        service.pause_native();
-                        self.native_tts.is_paused = true;
-                    }
-
-                    self.ai_tts.message_id = Some(message_id.clone());
-                    self.ai_tts.is_loading = true;
-                    self.ai_tts.is_paused = false;
-                    cx.notify();
-
-                    // Get Config
-                    let tts_model_id = self
-                        .active_profile()
-                        .and_then(|p| p.tts_model_id.clone())
-                        .unwrap_or_else(|| "native".to_string());
-                    let tts_voice = self.active_profile().and_then(|p| p.tts_voice.clone());
-                    let api_key = self
-                        .active_credential()
-                        .map(|c| c.api_key.clone())
-                        .or_else(|| self.config.as_ref().and_then(|c| c.gemini_api_key.clone()))
-                        .unwrap_or_default();
-
-                    let service = service.clone();
-                    let message_id = message_id.clone();
-                    let text = text.clone();
-
-                    cx.spawn(async move |this, cx| {
-                            let start_result = service
-                                .start_speaking(
-                                    &text,
-                                    &message_id,
-                                    &tts_model_id,
-                                    &api_key,
-                                    &tts_voice,
-                                )
-                                .await;
-                            match start_result {
-                                Ok(true) => {
-                                    // Speaking started
-                                    this.update(cx, |state, cx| {
-                                        state.ai_tts.is_loading = false;
-                                        cx.notify();
-                                    })
-                                    .ok();
-
-                                    service.wait_until_finished_ai().await;
-
-                                    this.update(cx, |state, cx| {
-                                        if state.ai_tts.message_id.as_ref() == Some(&message_id) {
-                                            state.ai_tts.message_id = None;
-                                            cx.notify();
-                                        }
-                                    })
-                                    .ok();
-                                }
-                                Ok(false) | Err(_) => {
-                                    this.update(cx, |state, cx| {
-                                        state.ai_tts.message_id = None;
-                                        state.ai_tts.is_loading = false;
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                }
-                            }
-                        })
-                    .detach();
-                }
+                })
+                .detach();
             }
         }
     }
 
     pub fn stop_read_aloud(&mut self, cx: &mut Context<Self>) {
         if let Some(service) = &self.tts_service {
-            let _ = service.stop_native();
-            let _ = service.stop();
+            service.stop_native();
             self.native_tts = SourceTtsState::default();
-            self.ai_tts = SourceTtsState::default();
             cx.notify();
         }
     }
@@ -3159,10 +3293,6 @@ impl AppState {
                 service.pause_native();
                 self.native_tts.is_paused = true;
             }
-            if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
-                service.pause();
-                self.ai_tts.is_paused = true;
-            }
             cx.notify();
         }
     }
@@ -3172,10 +3302,6 @@ impl AppState {
             if self.native_tts.message_id.is_some() && self.native_tts.is_paused {
                 service.resume_native();
                 self.native_tts.is_paused = false;
-            }
-            if self.ai_tts.message_id.is_some() && self.ai_tts.is_paused {
-                service.resume();
-                self.ai_tts.is_paused = false;
             }
             cx.notify();
         }
@@ -3194,74 +3320,35 @@ impl AppState {
         mode: TtsSource,
         cx: &mut Context<Self>,
     ) {
+        let _ = mode;
         if let Some(service) = &self.tts_service {
-            match mode {
-                TtsSource::Native => {
-                    // Check if Native is active on this message
-                    if self.native_tts.message_id.as_ref() == Some(&message_id) {
-                        if self.native_tts.is_paused {
-                            // Resume Native
-                            // Ensure AI is paused first
-                            if self.ai_tts.message_id.is_some() && !self.ai_tts.is_paused {
-                                service.pause();
-                                self.ai_tts.is_paused = true;
-                            }
-                            service.resume_native();
-                            self.native_tts.is_paused = false;
-                        } else {
-                            // Pause Native
-                            service.pause_native();
-                            self.native_tts.is_paused = true;
-                        }
-                        cx.notify();
-                    } else {
-                        self.read_aloud(text, message_id, TtsSource::Native, cx);
-                    }
+            if self.native_tts.message_id.as_ref() == Some(&message_id) {
+                if self.native_tts.is_paused {
+                    service.resume_native();
+                    self.native_tts.is_paused = false;
+                } else {
+                    service.pause_native();
+                    self.native_tts.is_paused = true;
                 }
-                TtsSource::AI => {
-                    // Check if AI is active on this message
-                    if self.ai_tts.message_id.as_ref() == Some(&message_id) {
-                        if self.ai_tts.is_paused {
-                            // Resume AI
-                            // Ensure Native is paused
-                            // Ensure Native is stopped completely so highlight color reverts to AI
-                            if self.native_tts.message_id.is_some() {
-                                service.stop_native();
-                                self.native_tts = SourceTtsState::default();
-                            }
-                            service.resume();
-                            self.ai_tts.is_paused = false;
-                        } else {
-                            // Pause AI
-                            service.pause();
-                            self.ai_tts.is_paused = true;
-                        }
-                        cx.notify();
-                    } else {
-                        self.read_aloud(text, message_id, TtsSource::AI, cx);
-                    }
-                }
+                cx.notify();
+            } else {
+                self.read_aloud(text, message_id, TtsSource::Native, cx);
             }
         } else {
-            // Initialize if needed
-            self.read_aloud(text, message_id, mode, cx);
+            self.read_aloud(text, message_id, TtsSource::Native, cx);
         }
     }
+}
 
-    pub fn regenerate_audio(&mut self, message_id: String, text: String, cx: &mut Context<Self>) {
-        // Clear cache helper
-        if let Some(path) = TtsService::get_cache_path(&message_id) {
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-
-        // Force loading state immediately for reactivity
-        self.ai_tts.message_id = Some(message_id.clone());
-        self.ai_tts.is_loading = true;
-        self.ai_tts.is_paused = false;
-        cx.notify();
-
-        self.read_aloud(text, message_id, TtsSource::AI, cx);
+fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
+    ApprovalSpec {
+        run_id: item.run_id.clone(),
+        call_id: item.call_id.clone(),
+        tool: item.tool.clone(),
+        command: command_from_args(&item.arguments),
+        why: "your machine's owner must approve this command".into(),
+        reason: "exec-consent".into(),
+        output: None,
+        ok: None,
     }
 }

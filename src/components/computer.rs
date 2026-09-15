@@ -38,9 +38,7 @@ impl ComputerPane {
         let webhook_url = cx.new(|cx| InputState::new(window, cx).placeholder("POST URL"));
         let webhook_key = cx.new(|cx| InputState::new(window, cx).placeholder("key"));
         let webhook_header = cx.new(|cx| InputState::new(window, cx).placeholder("header"));
-        let custom_cron = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("@every 1h")
-        });
+        let custom_cron = cx.new(|cx| InputState::new(window, cx).placeholder("@every 1h"));
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         Self {
             state,
@@ -130,18 +128,26 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, routines) = {
+        let (view, agent_name, coworker_id, box_id, routines) = {
             let state = self.state.read(cx);
-            let name = state
+            let coworker = state
                 .active_coworker_id
                 .as_ref()
-                .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
+                .and_then(|id| state.coworkers.iter().find(|c| &c.id == id));
+            let name = coworker
                 .map(|c| c.name.clone())
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or_else(|| "Bot".into());
+            let box_id = coworker.and_then(|c| c.box_id.clone());
             let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
             let routines = state.coworker_routines(&coworker_id).to_vec();
-            (state.computer_view.clone(), name, coworker_id, routines)
+            (
+                state.computer_view.clone(),
+                name,
+                coworker_id,
+                box_id,
+                routines,
+            )
         };
 
         v_flex()
@@ -155,7 +161,15 @@ impl Render for ComputerPane {
             .text_color(theme.foreground)
             .child(match view {
                 ComputerView::Overview => self
-                    .overview(&agent_name, &coworker_id, &routines, muted, app, &theme)
+                    .overview(
+                        &agent_name,
+                        &coworker_id,
+                        box_id.as_deref(),
+                        &routines,
+                        muted,
+                        app,
+                        &theme,
+                    )
                     .into_any_element(),
                 ComputerView::Editor { id } => self
                     .editor(id, coworker_id, routines, muted, app, &theme, window, cx)
@@ -169,6 +183,7 @@ impl ComputerPane {
         &self,
         agent_name: &str,
         _coworker_id: &str,
+        box_id: Option<&str>,
         routines: &[AgentRoutine],
         muted: Hsla,
         app: Entity<AppState>,
@@ -176,11 +191,7 @@ impl ComputerPane {
     ) -> impl IntoElement {
         v_flex()
             .size_full()
-            .child(pane_header(
-                None,
-                "",
-                app.clone(),
-            ))
+            .child(pane_header(None, "", app.clone()))
             .child(
                 v_flex()
                     .w_full()
@@ -215,17 +226,27 @@ impl ComputerPane {
                             .text_color(muted)
                             .child(format!("{agent_name}'s screen")),
                     )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(match box_id {
+                                Some(id) => format!("Computer {id}"),
+                                None => {
+                                    "No computer yet. The next turn may attach a local box.".into()
+                                }
+                            }),
+                    )
                     .child(if routines.is_empty() {
                         v_flex()
                             .w_full()
                             .gap(px(10.))
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(muted)
-                                    .child(
-                                        "Routines are recurring tasks this Bot runs on a schedule.",
-                                    ),
+                                div().text_sm().text_color(muted).child(
+                                    "Routines are recurring tasks this Bot runs on a schedule.",
+                                ),
                             )
                             .child(
                                 div()
@@ -317,12 +338,7 @@ impl ComputerPane {
                                         v_flex()
                                             .flex_1()
                                             .min_w(px(0.))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .truncate()
-                                                    .child(name),
-                                            )
+                                            .child(div().text_sm().truncate().child(name))
                                             .when(paused, |this| {
                                                 this.child(
                                                     div()
@@ -349,15 +365,18 @@ impl ComputerPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let existing = id.as_ref().and_then(|rid| {
-            routines.iter().find(|row| &row.id == rid).cloned()
-        });
+        let existing = id
+            .as_ref()
+            .and_then(|rid| routines.iter().find(|row| &row.id == rid).cloned());
         let active = existing.as_ref().map(|r| r.active).unwrap_or(true);
         let triggers = existing
             .as_ref()
             .map(|r| r.triggers.clone())
             .unwrap_or_default();
-        let runs = existing.as_ref().map(|r| r.runs.clone()).unwrap_or_default();
+        let runs = existing
+            .as_ref()
+            .map(|r| r.runs.clone())
+            .unwrap_or_default();
         let name_input = self.name_input.clone();
         let instruction_input = self.instruction_input.clone();
         let webhook_url = self.webhook_url.clone();
@@ -386,15 +405,12 @@ impl ComputerPane {
                 let cron = custom_cron.read(cx).value().to_string();
                 app.update(cx, |state, cx| {
                     state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
-                    if let Some(sid) = state
-                        .routine_mut(&coworker_id, &rid)
-                        .and_then(|row| {
-                            row.triggers.iter().rev().find_map(|t| match t {
-                                RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
-                                _ => None,
-                            })
+                    if let Some(sid) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
+                        row.triggers.iter().rev().find_map(|t| match t {
+                            RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
+                            _ => None,
                         })
-                    {
+                    }) {
                         if let Some(row) = state.routine_mut(&coworker_id, &rid)
                             && let Some(RoutineTrigger::Schedule { spec, .. }) =
                                 row.triggers.iter_mut().find(|t| t.id() == sid)
@@ -403,15 +419,12 @@ impl ComputerPane {
                             spec.expr = cron;
                         }
                     }
-                    if let Some(hook) = state
-                        .routine_mut(&coworker_id, &rid)
-                        .and_then(|row| {
-                            row.triggers.iter().rev().find_map(|t| match t {
-                                RoutineTrigger::Webhook { id, .. } => Some(id.clone()),
-                                _ => None,
-                            })
+                    if let Some(hook) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
+                        row.triggers.iter().rev().find_map(|t| match t {
+                            RoutineTrigger::Webhook { id, .. } => Some(id.clone()),
+                            _ => None,
                         })
-                    {
+                    }) {
                         state.update_webhook(&coworker_id, &rid, &hook, url, key, header, cx);
                     }
                 });
@@ -481,11 +494,7 @@ impl ComputerPane {
                                             move |_, _, cx| {
                                                 if let Some(id) = id.clone() {
                                                     app.update(cx, |state, cx| {
-                                                        state.delete_routine(
-                                                            &coworker_id,
-                                                            &id,
-                                                            cx,
-                                                        );
+                                                        state.delete_routine(&coworker_id, &id, cx);
                                                     });
                                                 }
                                             }
@@ -505,9 +514,7 @@ impl ComputerPane {
                                             persist(cx);
                                             if let Some(id) = id.clone() {
                                                 app.update(cx, |state, cx| {
-                                                    state.record_routine_run(
-                                                        &coworker_id, &id, cx,
-                                                    );
+                                                    state.record_routine_run(&coworker_id, &id, cx);
                                                 });
                                             }
                                         }
@@ -685,9 +692,13 @@ fn pane_header(
                     )
                 }),
         )
-        .child(icon_btn("computer-close", "icons/chevrons-right.svg", move |cx| {
-            app.update(cx, |state, cx| state.close_right_pane(cx));
-        }))
+        .child(icon_btn(
+            "computer-close",
+            "icons/chevrons-right.svg",
+            move |cx| {
+                app.update(cx, |state, cx| state.close_right_pane(cx));
+            },
+        ))
 }
 
 fn icon_btn(
@@ -709,10 +720,7 @@ fn icon_btn(
 }
 
 fn field_label(label: &'static str, muted: Hsla) -> impl IntoElement {
-    div()
-        .text_xs()
-        .text_color(muted)
-        .child(label)
+    div().text_xs().text_color(muted).child(label)
 }
 
 fn field_textarea(
@@ -740,12 +748,7 @@ fn trigger_row(trigger: &RoutineTrigger, muted: Hsla) -> AnyElement {
         .w_full()
         .gap(px(8.))
         .items_center()
-        .child(
-            Icon::default()
-                .path(icon)
-                .size(px(14.))
-                .text_color(muted),
-        )
+        .child(Icon::default().path(icon).size(px(14.)).text_color(muted))
         .child(div().text_sm().child(trigger.label()))
         .into_any_element()
 }
@@ -897,9 +900,7 @@ fn add_trigger_button(
                         let header = header.clone();
                         webhook_url.update(cx, |input, cx| input.set_value(url, window, cx));
                         webhook_key.update(cx, |input, cx| input.set_value(key, window, cx));
-                        webhook_header.update(cx, |input, cx| {
-                            input.set_value(header, window, cx)
-                        });
+                        webhook_header.update(cx, |input, cx| input.set_value(header, window, cx));
                     }
                     app.update(cx, |state, cx| {
                         state.add_routine_trigger(&coworker_id, &rid, trigger, cx);
@@ -930,12 +931,13 @@ fn add_trigger_button(
                     }
                 });
                 move |menu, _, _| {
-                    let item = |label: &'static str, push_sched: Rc<dyn Fn(&'static str, &mut App)>| {
-                        PopupMenuItem::new(label).on_click({
-                            let push_sched = push_sched.clone();
-                            move |_, _, cx| push_sched(label, cx)
-                        })
-                    };
+                    let item =
+                        |label: &'static str, push_sched: Rc<dyn Fn(&'static str, &mut App)>| {
+                            PopupMenuItem::new(label).on_click({
+                                let push_sched = push_sched.clone();
+                                move |_, _, cx| push_sched(label, cx)
+                            })
+                        };
                     menu.item(item("Every hour", push_sched.clone()))
                         .item(item("Every day", push_sched.clone()))
                         .item(item("Weekdays", push_sched.clone()))
@@ -1005,9 +1007,7 @@ fn schedule_editor(
         .child(match spec.mode {
             ScheduleUiMode::Interval => interval_row(spec, patch).into_any_element(),
             ScheduleUiMode::Custom => field_input(&custom_cron).into_any_element(),
-            ScheduleUiMode::Advanced => {
-                advanced_editor(spec, patch, muted).into_any_element()
-            }
+            ScheduleUiMode::Advanced => advanced_editor(spec, patch, muted).into_any_element(),
         })
 }
 
@@ -1021,7 +1021,10 @@ fn mode_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> im
         .ghost()
         .label(label)
         .dropdown_menu(move |menu, _, _| {
-            let item = |name: &'static str, mode: ScheduleUiMode, spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
+            let item = |name: &'static str,
+                        mode: ScheduleUiMode,
+                        spec: ScheduleSpec,
+                        patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
                 PopupMenuItem::new(name).on_click({
                     let patch = patch.clone();
                     move |_, _, cx| {
@@ -1038,9 +1041,24 @@ fn mode_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> im
                     }
                 })
             };
-            menu.item(item("Interval", ScheduleUiMode::Interval, spec.clone(), patch.clone()))
-                .item(item("Custom", ScheduleUiMode::Custom, spec.clone(), patch.clone()))
-                .item(item("Advanced", ScheduleUiMode::Advanced, spec.clone(), patch.clone()))
+            menu.item(item(
+                "Interval",
+                ScheduleUiMode::Interval,
+                spec.clone(),
+                patch.clone(),
+            ))
+            .item(item(
+                "Custom",
+                ScheduleUiMode::Custom,
+                spec.clone(),
+                patch.clone(),
+            ))
+            .item(item(
+                "Advanced",
+                ScheduleUiMode::Advanced,
+                spec.clone(),
+                patch.clone(),
+            ))
         })
 }
 
@@ -1061,11 +1079,13 @@ fn interval_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -
                     for n in [1, 2, 5, 10, 15, 30, 45, 60] {
                         let spec = spec.clone();
                         let patch = patch.clone();
-                        menu = menu.item(PopupMenuItem::new(n.to_string()).on_click(move |_, _, cx| {
-                            let mut next = spec.clone();
-                            next.every = n;
-                            patch(next, cx);
-                        }));
+                        menu = menu.item(PopupMenuItem::new(n.to_string()).on_click(
+                            move |_, _, cx| {
+                                let mut next = spec.clone();
+                                next.every = n;
+                                patch(next, cx);
+                            },
+                        ));
                     }
                     menu
                 })
@@ -1080,16 +1100,35 @@ fn interval_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -
                 .ghost()
                 .label(unit_label)
                 .dropdown_menu(move |menu, _, _| {
-                    let item = |name: &'static str, unit: ScheduleUnit, spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
-                        PopupMenuItem::new(name).on_click(move |_, _, cx| {
-                            let mut next = spec.clone();
-                            next.unit = unit;
-                            patch(next, cx);
-                        })
-                    };
-                    menu.item(item("minutes", ScheduleUnit::Minutes, spec.clone(), patch.clone()))
-                        .item(item("hours", ScheduleUnit::Hours, spec.clone(), patch.clone()))
-                        .item(item("days", ScheduleUnit::Days, spec.clone(), patch.clone()))
+                    let item =
+                        |name: &'static str,
+                         unit: ScheduleUnit,
+                         spec: ScheduleSpec,
+                         patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
+                            PopupMenuItem::new(name).on_click(move |_, _, cx| {
+                                let mut next = spec.clone();
+                                next.unit = unit;
+                                patch(next, cx);
+                            })
+                        };
+                    menu.item(item(
+                        "minutes",
+                        ScheduleUnit::Minutes,
+                        spec.clone(),
+                        patch.clone(),
+                    ))
+                    .item(item(
+                        "hours",
+                        ScheduleUnit::Hours,
+                        spec.clone(),
+                        patch.clone(),
+                    ))
+                    .item(item(
+                        "days",
+                        ScheduleUnit::Days,
+                        spec.clone(),
+                        patch.clone(),
+                    ))
                 })
         })
 }
@@ -1126,13 +1165,22 @@ fn advanced_editor(
             h_flex()
                 .gap(px(8.))
                 .items_start()
-                .child(div().text_xs().text_color(muted).w(px(52.)).pt(px(6.)).child("Time"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .w(px(52.))
+                        .pt(px(6.))
+                        .child("Time"),
+                )
                 .child(
                     v_flex()
                         .gap(px(6.))
-                        .children(spec.times.iter().enumerate().map(|(i, (h, m))| {
-                            time_row(i, *h, *m, spec.clone(), patch.clone())
-                        }))
+                        .children(
+                            spec.times.iter().enumerate().map(|(i, (h, m))| {
+                                time_row(i, *h, *m, spec.clone(), patch.clone())
+                            }),
+                        )
                         .child({
                             let spec = spec.clone();
                             let patch = patch.clone();
@@ -1165,8 +1213,18 @@ fn months_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) ->
         .label(label)
         .dropdown_menu(move |menu, _, _| {
             let names = [
-                "January", "February", "March", "April", "May", "June",
-                "July", "August", "September", "October", "November", "December",
+                "January",
+                "February",
+                "March",
+                "April",
+                "May",
+                "June",
+                "July",
+                "August",
+                "September",
+                "October",
+                "November",
+                "December",
             ];
             let mut menu = menu.item(PopupMenuItem::new("Any month").on_click({
                 let spec = spec.clone();
@@ -1182,16 +1240,18 @@ fn months_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) ->
                 let on = spec.months.contains(&month);
                 let spec = spec.clone();
                 let patch = patch.clone();
-                menu = menu.item(PopupMenuItem::new(*name).checked(on).on_click(move |_, _, cx| {
-                    let mut next = spec.clone();
-                    if let Some(pos) = next.months.iter().position(|m| *m == month) {
-                        next.months.remove(pos);
-                    } else {
-                        next.months.push(month);
-                        next.months.sort();
-                    }
-                    patch(next, cx);
-                }));
+                menu = menu.item(PopupMenuItem::new(*name).checked(on).on_click(
+                    move |_, _, cx| {
+                        let mut next = spec.clone();
+                        if let Some(pos) = next.months.iter().position(|m| *m == month) {
+                            next.months.remove(pos);
+                        } else {
+                            next.months.push(month);
+                            next.months.sort();
+                        }
+                        patch(next, cx);
+                    },
+                ));
             }
             menu
         })
@@ -1207,20 +1267,41 @@ fn days_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> i
         .ghost()
         .label(label)
         .dropdown_menu(move |menu, _, _| {
-            let item = |name: &'static str, kind: ScheduleDayKind, spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
+            let item = |name: &'static str,
+                        kind: ScheduleDayKind,
+                        spec: ScheduleSpec,
+                        patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
                 PopupMenuItem::new(name).on_click(move |_, _, cx| {
                     let mut next = spec.clone();
                     next.day_kind = kind;
                     patch(next, cx);
                 })
             };
-            menu.item(item("Every day", ScheduleDayKind::EveryDay, spec.clone(), patch.clone()))
-                .item(item("Days of the week", ScheduleDayKind::Weekdays, spec.clone(), patch.clone()))
-                .item(item("Days of the month", ScheduleDayKind::DaysOfMonth, spec.clone(), patch.clone()))
+            menu.item(item(
+                "Every day",
+                ScheduleDayKind::EveryDay,
+                spec.clone(),
+                patch.clone(),
+            ))
+            .item(item(
+                "Days of the week",
+                ScheduleDayKind::Weekdays,
+                spec.clone(),
+                patch.clone(),
+            ))
+            .item(item(
+                "Days of the month",
+                ScheduleDayKind::DaysOfMonth,
+                spec.clone(),
+                patch.clone(),
+            ))
         })
 }
 
-fn month_day_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
+fn month_day_menu(
+    spec: ScheduleSpec,
+    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+) -> impl IntoElement {
     let label = spec
         .month_days
         .first()
@@ -1247,22 +1328,29 @@ fn month_day_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>)
                 };
                 let spec = spec.clone();
                 let patch = patch.clone();
-                menu = menu.item(PopupMenuItem::new(name).checked(on).on_click(move |_, _, cx| {
-                    let mut next = spec.clone();
-                    if let Some(pos) = next.month_days.iter().position(|x| *x == d) {
-                        next.month_days.remove(pos);
-                    } else {
-                        next.month_days.push(d);
-                        next.month_days.sort();
-                    }
-                    patch(next, cx);
-                }));
+                menu = menu.item(
+                    PopupMenuItem::new(name)
+                        .checked(on)
+                        .on_click(move |_, _, cx| {
+                            let mut next = spec.clone();
+                            if let Some(pos) = next.month_days.iter().position(|x| *x == d) {
+                                next.month_days.remove(pos);
+                            } else {
+                                next.month_days.push(d);
+                                next.month_days.sort();
+                            }
+                            patch(next, cx);
+                        }),
+                );
             }
             menu
         })
 }
 
-fn weekday_chips(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
+fn weekday_chips(
+    spec: ScheduleSpec,
+    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+) -> impl IntoElement {
     let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     h_flex().gap(px(4.)).children((0u8..7).map(|d| {
         let on = spec.weekdays.contains(&d);
@@ -1333,19 +1421,17 @@ fn time_row(
                                 } else {
                                     (h - 12, false)
                                 };
-                                let name = format!(
-                                    "{}:{:02} {}",
-                                    h12,
-                                    m,
-                                    if am { "AM" } else { "PM" }
-                                );
-                                menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _, cx| {
-                                    let mut next = spec.clone();
-                                    if let Some(slot) = next.times.get_mut(index) {
-                                        *slot = (h, m);
-                                    }
-                                    patch(next, cx);
-                                }));
+                                let name =
+                                    format!("{}:{:02} {}", h12, m, if am { "AM" } else { "PM" });
+                                menu = menu.item(PopupMenuItem::new(name).on_click(
+                                    move |_, _, cx| {
+                                        let mut next = spec.clone();
+                                        if let Some(slot) = next.times.get_mut(index) {
+                                            *slot = (h, m);
+                                        }
+                                        patch(next, cx);
+                                    },
+                                ));
                             }
                         }
                         menu

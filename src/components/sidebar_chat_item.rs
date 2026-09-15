@@ -1,10 +1,10 @@
+use crate::icons::NativeIcon;
+use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt, h_flex, input::Input, v_flex};
 use gpui_kit::{
     App, Entity, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, RenderOnce,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, red, white,
 };
 use std::rc::Rc;
-use crate::icons::NativeIcon;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, StyledExt, h_flex, input::Input, v_flex};
 
 #[derive(IntoElement)]
 pub struct ChatSessionItem {
@@ -264,9 +264,7 @@ impl RenderOnce for ChatSessionItem {
                         .gap_2()
                         .items_center()
                         .child(div().flex_1().when_some(self.input, |this, state| {
-                            this.child(
-                                Input::new(&state).bordered(false).focus_bordered(false),
-                            )
+                            this.child(Input::new(&state).bordered(false).focus_bordered(false))
                         }))
                         .child(
                             div()

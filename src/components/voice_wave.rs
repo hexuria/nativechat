@@ -4,12 +4,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::state::AppState;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AsyncApp, Bounds, Context, Entity, IntoElement, Render, WeakEntity, Window, canvas, fill,
     point, px, size,
 };
-use gpui_kit::component::ActiveTheme;
 
 pub struct VoiceWave {
     amplitude: Arc<AtomicU32>,
@@ -29,73 +29,73 @@ impl VoiceWave {
     ) -> Entity<Self> {
         cx.new(|cx| {
             cx.spawn(async move |view: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    loop {
-                        // Run at 60fps (approx 16ms) for smooth animation
-                        cx.background_executor()
-                            .timer(Duration::from_millis(16))
-                            .await;
+                loop {
+                    // Run at 60fps (approx 16ms) for smooth animation
+                    cx.background_executor()
+                        .timer(Duration::from_millis(16))
+                        .await;
 
-                        // Update view state
-                        if view
-                            .update(cx, |this, cx| {
-                                let is_muted =
-                                    this.state.read_with(cx, |state, _| state.is_voice_muted);
+                    // Update view state
+                    if view
+                        .update(cx, |this, cx| {
+                            let is_muted =
+                                this.state.read_with(cx, |state, _| state.is_voice_muted);
 
-                                let current_amp = if is_muted {
-                                    0.0
-                                } else {
-                                    f32::from_bits(this.amplitude.load(Ordering::Relaxed)) * 0.1
-                                };
+                            let current_amp = if is_muted {
+                                0.0
+                            } else {
+                                f32::from_bits(this.amplitude.load(Ordering::Relaxed)) * 0.1
+                            };
 
-                                // Peak sampling: capture the highest amplitude since the last bar push
-                                if current_amp > this.current_peak {
-                                    this.current_peak = current_amp;
+                            // Peak sampling: capture the highest amplitude since the last bar push
+                            if current_amp > this.current_peak {
+                                this.current_peak = current_amp;
+                            }
+
+                            // Envelope Follower (Attack/Release Physics)
+                            // Smooths out the jittery raw amplitude
+                            let target = this.current_peak;
+                            if target > this.smoothed_amp {
+                                // Attack: Fast jump up (0.3)
+                                this.smoothed_amp += (target - this.smoothed_amp) * 0.3;
+                            } else {
+                                // Release: Slow fade down (0.05)
+                                this.smoothed_amp += (target - this.smoothed_amp) * 0.05;
+                            }
+
+                            // Scroll speed in pixels per frame
+                            // 2.0px per 16ms = ~120px per second (Faster, smoother scroll)
+                            let speed = 2.0;
+                            this.scroll_phase += speed;
+
+                            // Animation speed for the "living" effect
+                            // Increased to 0.8 (2x) for faster height transitions
+                            this.animation_offset += 0.8;
+
+                            let bar_width = 2.0;
+                            let spacing = 3.0;
+                            let stride = bar_width + spacing;
+
+                            // When we've scrolled a full bar's width, push the SMOOTHED value to history
+                            if this.scroll_phase >= stride {
+                                this.history.push_front(this.smoothed_amp);
+                                this.current_peak = 0.0; // Reset peak for next bar
+                                this.scroll_phase -= stride; // Keep remainder for smooth continuity
+
+                                // Keep history size large enough
+                                if this.history.len() > 300 {
+                                    this.history.pop_back();
                                 }
+                            }
 
-                                // Envelope Follower (Attack/Release Physics)
-                                // Smooths out the jittery raw amplitude
-                                let target = this.current_peak;
-                                if target > this.smoothed_amp {
-                                    // Attack: Fast jump up (0.3)
-                                    this.smoothed_amp += (target - this.smoothed_amp) * 0.3;
-                                } else {
-                                    // Release: Slow fade down (0.05)
-                                    this.smoothed_amp += (target - this.smoothed_amp) * 0.05;
-                                }
-
-                                // Scroll speed in pixels per frame
-                                // 2.0px per 16ms = ~120px per second (Faster, smoother scroll)
-                                let speed = 2.0;
-                                this.scroll_phase += speed;
-
-                                // Animation speed for the "living" effect
-                                // Increased to 0.8 (2x) for faster height transitions
-                                this.animation_offset += 0.8;
-
-                                let bar_width = 2.0;
-                                let spacing = 3.0;
-                                let stride = bar_width + spacing;
-
-                                // When we've scrolled a full bar's width, push the SMOOTHED value to history
-                                if this.scroll_phase >= stride {
-                                    this.history.push_front(this.smoothed_amp);
-                                    this.current_peak = 0.0; // Reset peak for next bar
-                                    this.scroll_phase -= stride; // Keep remainder for smooth continuity
-
-                                    // Keep history size large enough
-                                    if this.history.len() > 300 {
-                                        this.history.pop_back();
-                                    }
-                                }
-
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
                     }
-                })
+                }
+            })
             .detach();
 
             Self {

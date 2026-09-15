@@ -1,6 +1,4 @@
-use crate::chrome::{
-    persona_shape_path, resolve_persona_color, resolve_persona_shape, AVATAR_PX,
-};
+use crate::chrome::{AVATAR_PX, persona_shape_path, resolve_persona_color, resolve_persona_shape};
 use gpui_kit::component::Icon;
 use gpui_kit::*;
 
@@ -95,12 +93,7 @@ impl RenderOnce for PersonaMark {
                     .justify_center()
                     .opacity(if self.lit { 1. } else { 0. })
                     .group_hover(group, |s| s.opacity(1.))
-                    .child(
-                        Icon::default()
-                            .path(path)
-                            .size(halo)
-                            .text_color(halo_fill),
-                    ),
+                    .child(Icon::default().path(path).size(halo).text_color(halo_fill)),
             )
             .child(
                 Icon::default()

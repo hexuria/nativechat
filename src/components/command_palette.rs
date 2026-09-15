@@ -1,6 +1,5 @@
 use crate::actions::{
     CloseCommandPalette, PaletteNextTab, PalettePrevTab, PaletteSelectNext, PaletteSelectPrev,
-    PickFinderItem,
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
@@ -193,32 +192,40 @@ impl CommandPalette {
         cx.notify();
     }
 
+    pub(crate) fn activate_shortcut(&mut self, index: usize, cx: &mut Context<Self>) {
+        let query = self.query.read(cx).value().to_string();
+        self.activate_nth(index, &query, cx);
+    }
+
     fn activate_nth(&mut self, index: usize, query: &str, cx: &mut Context<Self>) {
         let items = self.items(query, cx);
         let Some(item) = items.into_iter().nth(index) else {
             return;
         };
         match item {
-            PaletteItem::Bot { id, .. } | PaletteItem::Message { coworker_id: id, .. } => {
+            PaletteItem::Bot { id, .. }
+            | PaletteItem::Message {
+                coworker_id: id, ..
+            } => {
                 self.state.update(cx, |state, cx| {
                     state.select_coworker(id, cx);
-                    state.close_command_palette(cx);
                 });
             }
             PaletteItem::Action { action, .. } => {
-                self.state.update(cx, |state, cx| {
-                    state.close_command_palette(cx);
-                    match action {
-                        PaletteAction::OpenSettings(tab) => state.open_app_settings(tab, cx),
-                        PaletteAction::SetTheme(mode) => state.set_theme_mode(mode, cx),
-                        PaletteAction::ToggleSidebar => state.toggle_sidebar(cx),
-                        PaletteAction::ToggleMiniSidebar => state.toggle_mini_sidebar(cx),
-                        PaletteAction::ShowAgentSettings => state.show_agent_settings(cx),
-                        PaletteAction::ShowComputer => state.show_computer_pane(cx),
-                    }
+                self.state.update(cx, |state, cx| match action {
+                    PaletteAction::OpenSettings(tab) => state.open_app_settings(tab, cx),
+                    PaletteAction::SetTheme(mode) => state.set_theme_mode(mode, cx),
+                    PaletteAction::ToggleSidebar => state.toggle_sidebar(cx),
+                    PaletteAction::ToggleMiniSidebar => state.toggle_mini_sidebar(cx),
+                    PaletteAction::ShowAgentSettings => state.show_agent_settings(cx),
+                    PaletteAction::ShowComputer => state.show_computer_pane(cx),
                 });
             }
         }
+        self.state.update(cx, |state, cx| {
+            state.close_command_palette(cx);
+        });
+        cx.dispatch_action(&CloseCommandPalette);
     }
 
     fn items(&self, query: &str, cx: &App) -> Vec<PaletteItem> {
@@ -264,19 +271,14 @@ impl CommandPalette {
             }
         }
         if want_actions {
-            items.extend(
-                action_catalog(&state)
-                    .into_iter()
-                    .filter(|item| {
-                        needle.is_empty() || {
-                            let PaletteItem::Action { title, hint, .. } = item else {
-                                return false;
-                            };
-                            title.to_lowercase().contains(&needle)
-                                || hint.to_lowercase().contains(&needle)
-                        }
-                    }),
-            );
+            items.extend(action_catalog(&state).into_iter().filter(|item| {
+                needle.is_empty() || {
+                    let PaletteItem::Action { title, hint, .. } = item else {
+                        return false;
+                    };
+                    title.to_lowercase().contains(&needle) || hint.to_lowercase().contains(&needle)
+                }
+            }));
         }
         items
     }
@@ -364,6 +366,13 @@ fn action_catalog(state: &AppState) -> Vec<PaletteItem> {
             false,
         ),
         action_item(
+            "Settings: Computer",
+            "Settings",
+            "icons/monitor.svg",
+            PaletteAction::OpenSettings(AppSettingsTab::Computer),
+            false,
+        ),
+        action_item(
             "Theme: Light",
             "Settings · Appearance",
             "icons/sun.svg",
@@ -426,11 +435,7 @@ impl Render for CommandPalette {
         let muted = theme.muted_foreground;
         let fg = theme.foreground;
         let border = theme.border;
-        let panel = if dark {
-            rgb(0x2c2c2c)
-        } else {
-            rgb(0xffffff)
-        };
+        let panel = if dark { rgb(0x2c2c2c) } else { rgb(0xffffff) };
         let hover: Hsla = rgb(0x777777).opacity(0.16).into();
         let selected_fill: Hsla = rgb(0x777777).opacity(0.22).into();
         let query = self.query.read(cx).value().to_string();
@@ -481,13 +486,6 @@ impl Render for CommandPalette {
                     view.update(cx, |this, cx| this.move_selection(-1, cx));
                 }
             })
-            .on_action({
-                let view = view.clone();
-                let query = query.clone();
-                move |action: &PickFinderItem, _, cx| {
-                    view.update(cx, |this, cx| this.activate_nth(action.index, &query, cx));
-                }
-            })
             .child(
                 v_flex()
                     .id("command-palette-card")
@@ -509,11 +507,7 @@ impl Render for CommandPalette {
                             .items_center()
                             .border_b_1()
                             .border_color(border)
-                            .child(
-                                Icon::new(IconName::Search)
-                                    .size(px(16.))
-                                    .text_color(muted),
-                            )
+                            .child(Icon::new(IconName::Search).size(px(16.)).text_color(muted))
                             .child(
                                 field_input(&self.query)
                                     .id("command-palette-input")
@@ -538,9 +532,9 @@ impl Render for CommandPalette {
                                     .text_sm()
                                     .cursor_pointer()
                                     .when(active, |this| {
-                                        this.bg(selected_fill).text_color(fg).font_weight(
-                                            FontWeight::MEDIUM,
-                                        )
+                                        this.bg(selected_fill)
+                                            .text_color(fg)
+                                            .font_weight(FontWeight::MEDIUM)
                                     })
                                     .when(!active, |this| this.text_color(muted))
                                     .hover(|s| s.bg(hover))
@@ -556,34 +550,32 @@ impl Render for CommandPalette {
                                     .child(t.label())
                             })),
                     )
-                    .child(
-                        if items.is_empty() {
-                            empty_state(tab, muted)
-                        } else {
-                            v_flex()
-                                .id("command-palette-results")
-                                .flex_1()
-                                .w_full()
-                                .min_h(px(0.))
-                                .overflow_y_scroll()
-                                .pb(px(8.))
-                                .children(items.into_iter().enumerate().map(|(i, item)| {
-                                    palette_row(
-                                        i,
-                                        item,
-                                        i == selected,
-                                        dark,
-                                        fg,
-                                        muted,
-                                        hover,
-                                        selected_fill,
-                                        view.clone(),
-                                        query.clone(),
-                                    )
-                                }))
-                                .into_any_element()
-                        },
-                    ),
+                    .child(if items.is_empty() {
+                        empty_state(tab, muted)
+                    } else {
+                        v_flex()
+                            .id("command-palette-results")
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .pb(px(8.))
+                            .children(items.into_iter().enumerate().map(|(i, item)| {
+                                palette_row(
+                                    i,
+                                    item,
+                                    i == selected,
+                                    dark,
+                                    fg,
+                                    muted,
+                                    hover,
+                                    selected_fill,
+                                    view.clone(),
+                                    query.clone(),
+                                )
+                            }))
+                            .into_any_element()
+                    }),
             )
     }
 }
@@ -596,23 +588,14 @@ fn empty_state(tab: PaletteTab, muted: Hsla) -> AnyElement {
         .items_center()
         .justify_center()
         .gap(px(8.))
-        .child(
-            Icon::new(IconName::Search)
-                .size(px(28.))
-                .text_color(muted),
-        )
+        .child(Icon::new(IconName::Search).size(px(28.)).text_color(muted))
         .child(
             div()
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .child(tab.empty_title()),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(tab.empty_hint()),
-        )
+        .child(div().text_xs().text_color(muted).child(tab.empty_hint()))
         .into_any_element()
 }
 
@@ -697,21 +680,9 @@ fn palette_row(
                 .flex_1()
                 .min_w(px(0.))
                 .gap(px(2.))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(fg)
-                        .truncate()
-                        .child(title),
-                )
+                .child(div().text_sm().text_color(fg).truncate().child(title))
                 .when(!subtitle.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .truncate()
-                            .child(subtitle),
-                    )
+                    this.child(div().text_xs().text_color(muted).truncate().child(subtitle))
                 }),
         )
         .when(matches!(kind, RowKind::Action { .. }), |this| {
@@ -757,12 +728,7 @@ fn action_icon(path: &'static str, muted: Hsla) -> AnyElement {
         .items_center()
         .justify_center()
         .flex_shrink_0()
-        .child(
-            Icon::default()
-                .path(path)
-                .size(px(16.))
-                .text_color(muted),
-        )
+        .child(Icon::default().path(path).size(px(16.)).text_color(muted))
         .into_any_element()
 }
 
@@ -780,5 +746,3 @@ fn keycap(label: &str, muted: Hsla) -> impl IntoElement {
         .text_color(muted)
         .child(label.to_string())
 }
-
-

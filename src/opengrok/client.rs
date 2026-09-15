@@ -1,15 +1,18 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use reqwest::cookie::{CookieStore, Jar};
+use reqwest::header::{ACCEPT, CACHE_CONTROL, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::error::OpenGrokError;
 use super::types::{
-    assistant_text_from_sse, error_message_from_body, Account, AguiMessage, Coworker,
-    CoworkerPatch, ModelCatalogue, ProfileUpdate,
+    Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate,
+    error_message_from_body,
 };
 
 #[derive(Clone)]
@@ -17,20 +20,117 @@ pub struct OpenGrokClient {
     base: Url,
     http: Client,
     jar: Arc<Jar>,
+    session_path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    base_url: String,
+    cookies: Vec<(String, String)>,
 }
 
 impl OpenGrokClient {
     pub fn new(base_url: &str) -> Result<Self, OpenGrokError> {
-        let base = Url::parse(base_url).map_err(|e| {
-            OpenGrokError::message(format!("invalid OpenGrok URL {base_url}: {e}"))
-        })?;
+        let base = Url::parse(base_url)
+            .map_err(|e| OpenGrokError::message(format!("invalid OpenGrok URL {base_url}: {e}")))?;
         let jar = Arc::new(Jar::default());
         let http = Client::builder()
             .cookie_provider(jar.clone())
             .tcp_nodelay(true)
             .build()
             .map_err(|e| OpenGrokError::message(e.to_string()))?;
-        Ok(Self { base, http, jar })
+        Ok(Self {
+            base,
+            http,
+            jar,
+            session_path: None,
+        })
+    }
+
+    pub fn with_session_file(mut self, path: PathBuf) -> Self {
+        self.session_path = Some(path);
+        self
+    }
+
+    fn cookie_pairs(&self) -> Vec<(String, String)> {
+        let Some(header) = CookieStore::cookies(self.jar.as_ref(), &self.base) else {
+            return Vec::new();
+        };
+        let Ok(raw) = header.to_str() else {
+            return Vec::new();
+        };
+        raw.split(';')
+            .filter_map(|pair| {
+                let pair = pair.trim();
+                let (name, value) = pair.split_once('=')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((name.to_string(), value.trim().to_string()))
+            })
+            .collect()
+    }
+
+    fn restore_cookies(&self, pairs: &[(String, String)]) {
+        let headers: Vec<HeaderValue> = pairs
+            .iter()
+            .filter_map(|(name, value)| {
+                HeaderValue::from_str(&format!("{name}={value}; Path=/")).ok()
+            })
+            .collect();
+        if headers.is_empty() {
+            return;
+        }
+        CookieStore::set_cookies(self.jar.as_ref(), &mut headers.iter(), &self.base);
+    }
+
+    pub fn load_session(&self) -> bool {
+        let Some(path) = self.session_path.as_ref() else {
+            return false;
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        let Ok(stored) = serde_json::from_slice::<StoredSession>(&bytes) else {
+            return false;
+        };
+        if stored.base_url.trim_end_matches('/') != self.base.as_str().trim_end_matches('/') {
+            return false;
+        }
+        if stored.cookies.is_empty() {
+            return false;
+        }
+        self.restore_cookies(&stored.cookies);
+        true
+    }
+
+    pub fn save_session(&self) {
+        let Some(path) = self.session_path.as_ref() else {
+            return;
+        };
+        let cookies = self.cookie_pairs();
+        if cookies.is_empty() {
+            self.clear_session();
+            return;
+        }
+        let stored = StoredSession {
+            base_url: self.base.as_str().to_string(),
+            cookies,
+        };
+        let Ok(json) = serde_json::to_vec(&stored) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = write_private(path, &json);
+    }
+
+    pub fn clear_session(&self) {
+        if let Some(path) = self.session_path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
     }
 
     /// AG-UI `principal_from_bearer` only reads `Authorization`, not cookies.
@@ -81,6 +181,19 @@ impl OpenGrokClient {
         OpenGrokError::status(status, error_message_from_body(&body))
     }
 
+    /// The body as `T` on a 2xx, the server's error otherwise.
+    async fn json_or_error<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T, OpenGrokError> {
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
     pub async fn health(&self) -> Result<(), OpenGrokError> {
         let url = self.url("/health")?;
         let response = self
@@ -106,6 +219,7 @@ impl OpenGrokClient {
             )
             .await?;
         if response.status() == StatusCode::OK {
+            self.save_session();
             Ok(())
         } else {
             Err(Self::read_error(response).await)
@@ -117,6 +231,7 @@ impl OpenGrokClient {
             .send_json::<()>(reqwest::Method::POST, "/auth/refresh", None)
             .await?;
         if response.status().is_success() {
+            self.save_session();
             Ok(())
         } else {
             Err(Self::read_error(response).await)
@@ -127,6 +242,7 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::POST, "/auth/logout", None)
             .await?;
+        self.clear_session();
         if response.status().is_success() {
             Ok(())
         } else {
@@ -138,26 +254,14 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/account", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn update_profile(&self, update: &ProfileUpdate) -> Result<Account, OpenGrokError> {
         let response = self
             .send_json(reqwest::Method::POST, "/account/profile", Some(update))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn change_password(
@@ -186,20 +290,10 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/coworkers", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
-    pub async fn hire(
-        &self,
-        name: &str,
-        model: Option<&str>,
-    ) -> Result<Coworker, OpenGrokError> {
+    pub async fn hire(&self, name: &str, model: Option<&str>) -> Result<Coworker, OpenGrokError> {
         let mut body = json!({ "name": name });
         if let Some(model) = model.filter(|m| !m.is_empty()) {
             body["model"] = json!(model);
@@ -207,26 +301,14 @@ impl OpenGrokClient {
         let response = self
             .send_json(reqwest::Method::POST, "/coworkers", Some(&body))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn list_models(&self) -> Result<ModelCatalogue, OpenGrokError> {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/models", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn delete_coworker(&self, coworker_id: &str) -> Result<(), OpenGrokError> {
@@ -246,21 +328,13 @@ impl OpenGrokClient {
         patch: &CoworkerPatch,
     ) -> Result<Coworker, OpenGrokError> {
         if patch.is_empty() {
-            return Err(OpenGrokError::message(
-                "nothing to change".to_string(),
-            ));
+            return Err(OpenGrokError::message("nothing to change".to_string()));
         }
         let path = format!("/coworkers/{coworker_id}");
         let response = self
             .send_json(reqwest::Method::PATCH, &path, Some(patch))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     /// One turn. Desktop Grok Bot POSTs `/api/sendPrompt` then paints from `GET /events`.
@@ -279,11 +353,23 @@ impl OpenGrokClient {
             "threadId": thread_id,
             "runId": uuid::Uuid::now_v7().to_string(),
             "messages": messages,
+            "tools": super::gen_ui::agui_tools(),
             "forwardedProps": { "coworkerId": coworker_id },
         });
-        let response = self
-            .send_json(reqwest::Method::POST, "/ag-ui", Some(&body))
-            .await?;
+        let url = self.url("/ag-ui")?;
+        let mut req = self
+            .http
+            .post(url)
+            .header(ACCEPT, "text/event-stream")
+            .header(CACHE_CONTROL, "no-cache")
+            .json(&body);
+        if let Some(token) = self.access_token() {
+            req = req.bearer_auth(token);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
@@ -326,10 +412,341 @@ impl OpenGrokClient {
         }
         Ok(assistant)
     }
+
+    pub async fn answer_run(
+        &self,
+        run_id: &str,
+        call_id: &str,
+        approved: bool,
+    ) -> Result<AnswerReply, OpenGrokError> {
+        let path = format!("/ag-ui/runs/{run_id}/answer");
+        let body = json!({ "call_id": call_id, "approved": approved });
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    pub async fn replay_run(&self, run_id: &str) -> Result<RunReplay, OpenGrokError> {
+        let path = format!("/ag-ui/runs/{run_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    pub async fn list_approvals(&self) -> Result<Vec<QueuedApproval>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/ag-ui/approvals", None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    pub async fn list_computers(&self) -> Result<Vec<ConnectedComputer>, OpenGrokError> {
+        let machines = self.list_daemons().await?;
+        let mut computers = Vec::new();
+        for machine in machines {
+            if machine.revoked {
+                continue;
+            }
+            let stored = self
+                .local_exec_mode(&machine.machine_id)
+                .await
+                .unwrap_or_default();
+            let label = if machine.label.trim().is_empty() {
+                "Computer".to_string()
+            } else {
+                machine.label
+            };
+            computers.push(ConnectedComputer {
+                machine_id: machine.machine_id,
+                label,
+                mode: LocalExecMode::from_stored(&stored),
+                this_machine: false,
+                online: machine.connected,
+            });
+        }
+        Ok(computers)
+    }
+
+    pub async fn list_daemons(&self) -> Result<Vec<DaemonMachine>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/local-exec/daemon", None)
+            .await?;
+        let body: DaemonList = Self::json_or_error(response).await?;
+        Ok(body.machines)
+    }
+
+    pub async fn enrol_daemon(
+        &self,
+        label: &str,
+        machine_id: Option<&str>,
+    ) -> Result<DaemonEnrol, OpenGrokError> {
+        let mut body = json!({ "label": label });
+        if let Some(machine_id) = machine_id.filter(|id| !id.is_empty()) {
+            body["machineId"] = json!(machine_id);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, "/local-exec/daemon", Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    pub async fn local_exec_mode(&self, machine_id: &str) -> Result<String, OpenGrokError> {
+        let path = format!("/local-exec/policy?machine={machine_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        let body: LocalExecPolicyView = Self::json_or_error(response).await?;
+        Ok(body.mode)
+    }
+
+    pub async fn set_local_exec_mode(
+        &self,
+        machine_id: &str,
+        mode: &str,
+    ) -> Result<(), OpenGrokError> {
+        let body = json!({ "machineId": machine_id, "mode": mode });
+        let response = self
+            .send_json(reqwest::Method::PUT, "/local-exec/policy", Some(&body))
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
+    pub async fn add_local_exec_rule(
+        &self,
+        machine_id: &str,
+        kind: &str,
+        pattern: &str,
+    ) -> Result<(), OpenGrokError> {
+        let body = json!({
+            "machineId": machine_id,
+            "kind": kind,
+            "pattern": pattern,
+        });
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                "/local-exec/policy/rule",
+                Some(&body),
+            )
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
+    pub async fn post_local_exec_responses(
+        &self,
+        daemon_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), OpenGrokError> {
+        let url = self.url("/local-exec/responses")?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(daemon_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
+    /// Hold `GET /local-exec/requests` and call `on_frame` for each JSON `data:` event.
+    pub async fn stream_local_exec_requests<F>(
+        &self,
+        daemon_token: &str,
+        mut on_frame: F,
+    ) -> Result<(), OpenGrokError>
+    where
+        F: FnMut(serde_json::Value) + Send,
+    {
+        let url = self.url("/local-exec/requests")?;
+        let response = self
+            .http
+            .get(url)
+            .header(ACCEPT, "text/event-stream")
+            .header(CACHE_CONTROL, "no-cache")
+            .bearer_auth(daemon_token)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        let mut stream = response.bytes_stream();
+        let mut buf = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| OpenGrokError::message(e.to_string()))?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(idx) = buf.find("\n\n") {
+                let frame = buf[..idx].to_string();
+                buf = buf[idx + 2..].to_string();
+                for line in frame.lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                        on_frame(value);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnswerReply {
+    #[serde(rename = "alreadyAnswered", default)]
+    pub already_answered: bool,
+    #[serde(default)]
+    pub continuing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunReplay {
+    #[serde(rename = "runId", default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pending: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueuedApproval {
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    #[serde(rename = "threadId", default)]
+    pub thread_id: String,
+    #[serde(rename = "callId")]
+    pub call_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+impl QueuedApproval {
+    /// One suspended run at a time in the transcript. Older unanswered
+    /// host-shell runs stay on the server; they are not stacked on this turn.
+    pub fn latest_for_thread<'a>(queue: &'a [Self], thread_id: &str) -> Option<&'a Self> {
+        queue.iter().rev().find(|item| item.thread_id == thread_id)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaemonList {
+    #[serde(default)]
+    machines: Vec<DaemonMachine>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonMachine {
+    #[serde(rename = "machineId")]
+    pub machine_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub revoked: bool,
+    #[serde(default)]
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalExecMode {
+    Ask,
+    Always,
+    Never,
+}
+
+impl LocalExecMode {
+    pub fn from_stored(mode: &str) -> Self {
+        match mode {
+            "ask" => Self::Ask,
+            "bypass" => Self::Always,
+            _ => Self::Never,
+        }
+    }
+
+    pub fn as_stored(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Always => "bypass",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask every time",
+            Self::Always => "Always allow",
+            Self::Never => "Never allow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedComputer {
+    pub machine_id: String,
+    pub label: String,
+    pub mode: LocalExecMode,
+    pub this_machine: bool,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonEnrol {
+    #[serde(rename = "machineId")]
+    pub machine_id: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalExecPolicyView {
+    #[serde(default)]
+    mode: String,
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::assistant_text_from_sse;
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
@@ -379,13 +796,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_401_is_distinguishable() {
+    async fn session_file_survives_a_new_client() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/auth/login"))
             .respond_with(
-                ResponseTemplate::new(401).set_body_json(json!({"error":"bad password"})),
+                ResponseTemplate::new(200)
+                    .append_header(
+                        "set-cookie",
+                        "og_access=tok-a; HttpOnly; Path=/; SameSite=Lax",
+                    )
+                    .append_header(
+                        "set-cookie",
+                        "og_refresh=tok-r; HttpOnly; Path=/; SameSite=Lax",
+                    ),
             )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acc_1",
+                "email": "a@b.c",
+                "firstName": "Ada",
+                "lastName": "Lovelace",
+                "avatarUrl": null,
+                "orgId": "org_1",
+                "verified": true,
+                "enabled": true,
+                "isAdmin": false
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("nativechat-session-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opengrok-session.json");
+        let client = OpenGrokClient::new(&server.uri())
+            .unwrap()
+            .with_session_file(path.clone());
+        client.login("a@b.c", "secret").await.unwrap();
+        assert!(path.exists());
+
+        let restored = OpenGrokClient::new(&server.uri())
+            .unwrap()
+            .with_session_file(path.clone());
+        assert!(restored.load_session());
+        let me = restored.me().await.unwrap();
+        assert_eq!(me.email, "a@b.c");
+        restored.clear_session();
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn login_401_is_distinguishable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error":"bad password"})))
             .mount(&server)
             .await;
 
@@ -455,6 +924,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_turn_forwards_sse_frames_as_they_arrive() {
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            socket.set_nodelay(true).unwrap();
+            let mut socket = socket;
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            let frames = [
+                "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m1\",\"role\":\"assistant\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\"Hello\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\" world\"}\n\n",
+                "data: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"m1\"}\n\n",
+                "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n",
+            ];
+            let body: String = frames.concat();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            for frame in frames {
+                socket.write_all(frame.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+
+        let client = OpenGrokClient::new(&format!("http://{addr}")).unwrap();
+        let first_at = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let start = Instant::now();
+        let text = client
+            .run_turn(
+                "cw",
+                "t",
+                &[AguiMessage {
+                    id: "u1".into(),
+                    role: "user".into(),
+                    content: "hi".into(),
+                    tool_call_id: None,
+                }],
+                {
+                    let first_at = first_at.clone();
+                    move |event| {
+                        let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if kind == "TEXT_MESSAGE_CONTENT" {
+                            let mut slot = first_at.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(Instant::now());
+                            }
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(text, "Hello world");
+        let first = first_at.lock().unwrap().expect("saw text");
+        let until_first = first.duration_since(start);
+        let total = start.elapsed();
+        assert!(
+            until_first + Duration::from_millis(50) < total,
+            "first text at {until_first:?}, stream ended at {total:?} — frames were buffered"
+        );
+    }
+
+    #[tokio::test]
     async fn list_models_reads_ids() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -502,5 +1044,118 @@ mod tests {
             .unwrap();
         assert_eq!(updated.model, "xai/grok-4.6@sub");
         assert_eq!(updated.role.as_deref(), Some("Research, marketing, admin"));
+    }
+
+    #[tokio::test]
+    async fn answer_run_posts_call_id_and_approved() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/runs/run-1/answer"))
+            .and(body_json(json!({"call_id":"call-9","approved":true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "runId": "run-1",
+                "callId": "call-9",
+                "approved": true,
+                "alreadyAnswered": false,
+                "continuing": true
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client.answer_run("run-1", "call-9", true).await.unwrap();
+        assert!(!reply.already_answered);
+        assert!(reply.continuing);
+    }
+
+    #[tokio::test]
+    async fn list_approvals_returns_the_waiting_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/approvals"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "runId": "run-1",
+                "threadId": "t1",
+                "callId": "call-9",
+                "tool": "user_machine_shell",
+                "arguments": {"command": "ls"}
+            }])))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let queue = client.list_approvals().await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].call_id, "call-9");
+        assert_eq!(queue[0].tool, "user_machine_shell");
+    }
+
+    #[test]
+    fn latest_queued_approval_is_the_last_for_that_thread() {
+        let queue = vec![
+            QueuedApproval {
+                run_id: "r1".into(),
+                thread_id: "t1".into(),
+                call_id: "old".into(),
+                tool: "user_machine_shell".into(),
+                arguments: json!({"command": "ls"}),
+            },
+            QueuedApproval {
+                run_id: "r2".into(),
+                thread_id: "t2".into(),
+                call_id: "other".into(),
+                tool: "user_machine_shell".into(),
+                arguments: json!({"command": "pwd"}),
+            },
+            QueuedApproval {
+                run_id: "r3".into(),
+                thread_id: "t1".into(),
+                call_id: "new".into(),
+                tool: "user_machine_shell".into(),
+                arguments: json!({"command": "uname"}),
+            },
+        ];
+        let latest = QueuedApproval::latest_for_thread(&queue, "t1").unwrap();
+        assert_eq!(latest.call_id, "new");
+        assert!(QueuedApproval::latest_for_thread(&queue, "missing").is_none());
+    }
+
+    #[test]
+    fn local_exec_mode_round_trips_grok_settings_words() {
+        assert_eq!(LocalExecMode::from_stored("ask").as_stored(), "ask");
+        assert_eq!(LocalExecMode::from_stored("bypass"), LocalExecMode::Always);
+        assert_eq!(LocalExecMode::Always.as_stored(), "bypass");
+        assert_eq!(LocalExecMode::from_stored("never"), LocalExecMode::Never);
+        assert_eq!(LocalExecMode::from_stored(""), LocalExecMode::Never);
+        assert_eq!(LocalExecMode::Always.label(), "Always allow");
+        assert_eq!(LocalExecMode::Ask.label(), "Ask every time");
+        assert_eq!(LocalExecMode::Never.label(), "Never allow");
+    }
+
+    #[tokio::test]
+    async fn list_computers_skips_revoked_and_reads_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [
+                    {"machineId": "mac_live", "label": "NativeChat on this Mac", "revoked": false, "connected": true},
+                    {"machineId": "mac_dead", "label": "old", "revoked": true}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/policy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"mode": "bypass"})))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let computers = client.list_computers().await.unwrap();
+        assert_eq!(computers.len(), 1);
+        assert_eq!(computers[0].machine_id, "mac_live");
+        assert_eq!(computers[0].mode, LocalExecMode::Always);
+        assert!(computers[0].online);
     }
 }

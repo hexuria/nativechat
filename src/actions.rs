@@ -1,5 +1,5 @@
-use gpui_kit::actions;
 use gpui_kit::Action;
+use gpui_kit::actions;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -22,21 +22,6 @@ actions!(
         ShowAll,
         About,
         Quit,
-        SelectProfile1,
-        SelectProfile2,
-        SelectAppCanva,
-        SelectAppFigma,
-        SelectAppNotion,
-        SelectAppLinear,
-        SelectAppPhotos,
-        SelectAppWebSearch,
-        SelectAppCanvas,
-        SelectAppCoursera,
-        SelectAppSpotify,
-        SelectAppImageGeneration,
-        SelectAppThinking,
-        SelectAppDeepResearch,
-        SelectAppStudy,
         NewChat,
         Search,
         FindNext,
@@ -54,9 +39,7 @@ actions!(
         Library,
         Projects,
         OpenAccountSettings,
-        OpenProfileSettings,
         SignOut,
-        ToggleCredentialsModal,
         ToggleDebugMarkdown,
         ToggleFps,
         CopyMessage,
@@ -72,7 +55,6 @@ actions!(
 pub enum TtsSource {
     #[default]
     Native,
-    AI,
 }
 
 #[derive(Clone, PartialEq, Deserialize, Default, JsonSchema, Action)]
@@ -113,13 +95,6 @@ pub struct ToggleReadAloud {
     pub text: String,
     pub message_id: String,
     pub mode: TtsSource,
-}
-
-#[derive(Clone, PartialEq, Deserialize, Default, JsonSchema, Action)]
-#[action(namespace = nativechat)]
-pub struct RegenerateAudio {
-    pub text: String,
-    pub message_id: String,
 }
 
 actions!(

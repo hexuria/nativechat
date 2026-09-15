@@ -23,10 +23,6 @@ pub fn looks_like_markdown(text: &str) -> bool {
         || text.contains("\n1. ")
 }
 
-pub fn is_live_tts_model(model_id: &str) -> bool {
-    model_id.to_lowercase().contains("native-audio")
-}
-
 pub fn map_utf16_range_to_utf8(text: &str, range: Range<usize>) -> Option<Range<usize>> {
     let mut utf16_index = 0;
     let mut utf8_start = None;
@@ -255,16 +251,6 @@ mod tests {
     }
 
     #[test]
-    fn live_model_gate() {
-        assert!(is_live_tts_model(
-            "gemini-2.5-flash-native-audio-preview-09-2025"
-        ));
-        assert!(is_live_tts_model("models/foo-native-audio"));
-        assert!(!is_live_tts_model("gemini-2.0-flash"));
-        assert!(!is_live_tts_model("gemini-2.0-flash-exp"));
-    }
-
-    #[test]
     fn highlight_lands_on_owning_chunk() {
         let text = "a".repeat(600);
         let chunks = chunk_text(&text, CHAT_ROW_CHUNK_BYTES);
@@ -280,8 +266,6 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 0);
         assert_eq!(hits[0].1, 10..20);
-        assert!(
-            highlight_in_chunk(&range, chunks[1].byte_start, chunks[1].text.len()).is_none()
-        );
+        assert!(highlight_in_chunk(&range, chunks[1].byte_start, chunks[1].text.len()).is_none());
     }
 }

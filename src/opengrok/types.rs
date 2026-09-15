@@ -74,6 +74,8 @@ pub struct Coworker {
     pub updated_at_ms: i64,
     #[serde(default, alias = "hiddenFromSidebar")]
     pub hidden_from_sidebar: bool,
+    #[serde(default, alias = "boxId", alias = "box_id")]
+    pub box_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -128,6 +130,8 @@ pub struct AguiMessage {
     pub id: String,
     pub role: String,
     pub content: String,
+    #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 /// Pull assistant `delta` fields out of an AG-UI SSE body (desktop Seam A

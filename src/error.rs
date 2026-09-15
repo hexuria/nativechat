@@ -7,12 +7,6 @@ pub enum AppError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    #[error("LLM provider error: {0}")]
-    LlmProvider(String),
-
-    #[error("Bad request: {0}")]
-    BadRequest(String),
-
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 

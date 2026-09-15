@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
-use crate::chrome::{chat_column_width, is_narrow_viewport, CHAT_CONTENT_MAX};
+use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width, is_narrow_viewport};
 use crate::components::message_actions::{MessageToolbar, TOOLBAR_W};
 use crate::state::{AppState, RightPane};
 use gpui_kit::component::text::TextView;
@@ -264,9 +264,7 @@ impl RenderOnce for MessageBubble {
             })
             .unwrap_or(win)
             .min(CHAT_CONTENT_MAX);
-        let max_bubble = px((chat_w * 0.88)
-            .min(640.0)
-            .min((chat_w - 82.0).max(160.0)));
+        let max_bubble = px((chat_w * 0.88).min(640.0).min((chat_w - 82.0).max(160.0)));
 
         let body = if self.debug_mode {
             div()
@@ -312,8 +310,12 @@ impl RenderOnce for MessageBubble {
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
             .flex_shrink_0()
             .max_w(max_bubble)
-            .when(self.is_me, |this| this.px(px(14.)).py(px(8.)).rounded_full())
-            .when(!self.is_me, |this| this.px(px(12.)).py(px(8.)).rounded(px(18.)))
+            .when(self.is_me, |this| {
+                this.px(px(14.)).py(px(8.)).rounded(px(BUBBLE_RADIUS))
+            })
+            .when(!self.is_me, |this| {
+                this.px(px(12.)).py(px(8.)).rounded(px(BUBBLE_RADIUS))
+            })
             .bg(bg)
             .text_color(fg)
             .child(
@@ -428,12 +430,7 @@ impl RenderOnce for MessageBubble {
         let body_row = div()
             .relative()
             .w_full()
-            .child(
-                div()
-                    .w_full()
-                    .ml(px(-peek))
-                    .child(main),
-            )
+            .child(div().w_full().ml(px(-peek)).child(main))
             .child(
                 div()
                     .absolute()
