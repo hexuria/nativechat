@@ -19,6 +19,9 @@ pub const CHAT_TIMESTAMP_MIN_WIDTH: f32 = 480.0;
 /// Desktop transcript + composer column. Grok uses ~690px; we match the
 /// composer so bubbles line up with the input field.
 pub const CHAT_CONTENT_MAX: f32 = 800.0;
+/// Grok message corners (`rounded-3xl` / 24px). 18px read as a card on
+/// tall replies; 24px makes short ones pills and long ones still a bubble.
+pub const BUBBLE_RADIUS: f32 = 24.0;
 pub const RAIL_HOVER: u32 = 0x777777;
 pub const RAIL_HOVER_ALPHA: f32 = 0.32;
 

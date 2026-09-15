@@ -376,6 +376,7 @@ impl OpenGrokClient {
             "threadId": thread_id,
             "runId": uuid::Uuid::now_v7().to_string(),
             "messages": messages,
+            "tools": super::gen_ui::agui_tools(),
             "forwardedProps": { "coworkerId": coworker_id },
         });
         let url = self.url("/ag-ui")?;
@@ -680,6 +681,7 @@ mod tests {
                     id: "u1".into(),
                     role: "user".into(),
                     content: "hi".into(),
+                    tool_call_id: None,
                 }],
                 {
                     let first_at = first_at.clone();

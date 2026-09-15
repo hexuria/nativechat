@@ -2,23 +2,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
+use crate::chrome::{CHAT_CONTENT_MAX, chat_column_width, timestamps_fit};
 use crate::components::chat_find::find_bar_element;
-use crate::find_text::{marks_for_row, project_hits, FindHit};
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
-use crate::chrome::{chat_column_width, timestamps_fit, CHAT_CONTENT_MAX};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
+use crate::find_text::{FindHit, marks_for_row, project_hits};
+use crate::components::gen_ui::render_ui_spec;
+use crate::opengrok::{ChatPart, UiSpec};
 use crate::state::{AppState, EmojiPickerOpen};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
 use gpui_kit::FontWeight;
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 use std::rc::Rc;
 
 /// Cheap fingerprint so ChatView does not rebuild markdown on unrelated AppState
@@ -29,6 +31,8 @@ struct ChatFeedRev {
     message_count: usize,
     last_id: Option<String>,
     last_len: usize,
+    last_ui: usize,
+    form_picks: Vec<(String, String, String)>,
     is_ai_responding: bool,
     debug_mode: bool,
     can_read_aloud: bool,
@@ -44,9 +48,10 @@ struct ChatFeedRev {
 
 impl ChatFeedRev {
     fn from_state(state: &AppState) -> Self {
-        let conv = state.active_conversation_id.as_ref().and_then(|id| {
-            state.conversations.iter().find(|c| &c.id == id)
-        });
+        let conv = state
+            .active_conversation_id
+            .as_ref()
+            .and_then(|id| state.conversations.iter().find(|c| &c.id == id));
         let last = conv.and_then(|c| c.messages.last());
         let highlight = state
             .active_highlight_range()
@@ -56,6 +61,20 @@ impl ChatFeedRev {
             message_count: conv.map(|c| c.messages.len()).unwrap_or(0),
             last_id: last.map(|m| m.id.clone()),
             last_len: last.map(|m| m.content.len()).unwrap_or(0),
+            last_ui: last.map(|m| m.parts.len()).unwrap_or(0),
+            form_picks: {
+                let mut picks: Vec<(String, String, String)> = state
+                    .form_picks
+                    .iter()
+                    .flat_map(|(msg, fields)| {
+                        fields
+                            .iter()
+                            .map(|(field, value)| (msg.clone(), field.clone(), value.clone()))
+                    })
+                    .collect();
+                picks.sort();
+                picks
+            },
             is_ai_responding: state.is_ai_responding,
             debug_mode: state.debug_markdown_disabled,
             can_read_aloud: true,
@@ -100,12 +119,16 @@ struct ChatRow {
     tts_text: SharedString,
     reply_preview: Option<String>,
     reaction: Option<String>,
+    parts: Vec<ChatPart>,
+    widget: Option<UiSpec>,
 }
 
 fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
-    let Some(conv) = state.active_conversation_id.as_ref().and_then(|id| {
-        state.conversations.iter().find(|c| &c.id == id)
-    }) else {
+    let Some(conv) = state
+        .active_conversation_id
+        .as_ref()
+        .and_then(|id| state.conversations.iter().find(|c| &c.id == id))
+    else {
         return Arc::new(Vec::new());
     };
     let mut rows = Vec::new();
@@ -118,32 +141,79 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         } else {
             None
         };
-        if !msg.is_me && msg.content.trim().is_empty() {
+        if !msg.is_me && !msg.has_visible_body() {
             continue;
         }
-        let use_markdown = !msg.is_me && looks_like_markdown(&msg.content);
         let highlight_native = is_native_speaking && full_highlight.is_some();
-        rows.push(ChatRow {
-            id: msg.id.clone(),
-            content: SharedString::from(msg.content.clone()),
-            is_me: msg.is_me,
-            timestamp: SharedString::from(msg.formatted_time()),
-            is_native_speaking,
-            is_native_paused: state.native_tts.is_paused && is_native_speaking,
-            is_native_loading: state.native_tts.is_loading && is_native_speaking,
-            is_ai_speaking: false,
-            is_ai_paused: false,
-            is_ai_loading: false,
-            is_cached: false,
-            highlight_range: full_highlight,
-            highlight_native,
-            use_markdown,
-            show_footer: true,
-            source_id: msg.id.clone(),
-            tts_text: SharedString::from(msg.content.clone()),
-            reply_preview: msg.reply_preview.clone(),
-            reaction: state.message_reactions.get(&msg.id).cloned(),
-        });
+        let display: Vec<ChatPart> = if msg.parts.iter().any(|p| matches!(p, ChatPart::Ui(_))) {
+            msg.parts.clone()
+        } else {
+            vec![ChatPart::Text(msg.content.clone())]
+        };
+        let mut text_buf = String::new();
+        let mut ui_n = 0usize;
+        let flush_text = |rows: &mut Vec<ChatRow>, text_buf: &mut String| {
+            let text = std::mem::take(text_buf);
+            if text.trim().is_empty() {
+                return;
+            }
+            rows.push(ChatRow {
+                id: msg.id.clone(),
+                content: SharedString::from(text.clone()),
+                is_me: msg.is_me,
+                timestamp: SharedString::from(msg.formatted_time()),
+                is_native_speaking,
+                is_native_paused: state.native_tts.is_paused && is_native_speaking,
+                is_native_loading: state.native_tts.is_loading && is_native_speaking,
+                is_ai_speaking: false,
+                is_ai_paused: false,
+                is_ai_loading: false,
+                is_cached: false,
+                highlight_range: full_highlight.clone(),
+                highlight_native,
+                use_markdown: !msg.is_me && looks_like_markdown(&text),
+                show_footer: true,
+                source_id: msg.id.clone(),
+                tts_text: SharedString::from(text),
+                reply_preview: msg.reply_preview.clone(),
+                reaction: state.message_reactions.get(&msg.id).cloned(),
+                parts: Vec::new(),
+                widget: None,
+            });
+        };
+        for part in display {
+            match part {
+                ChatPart::Text(text) => text_buf.push_str(&text),
+                ChatPart::Ui(spec) => {
+                    flush_text(&mut rows, &mut text_buf);
+                    rows.push(ChatRow {
+                        id: format!("{}-ui-{ui_n}", msg.id),
+                        content: SharedString::from(""),
+                        is_me: false,
+                        timestamp: SharedString::from(""),
+                        is_native_speaking: false,
+                        is_native_paused: false,
+                        is_native_loading: false,
+                        is_ai_speaking: false,
+                        is_ai_paused: false,
+                        is_ai_loading: false,
+                        is_cached: false,
+                        highlight_range: None,
+                        highlight_native: false,
+                        use_markdown: false,
+                        show_footer: false,
+                        source_id: msg.id.clone(),
+                        tts_text: SharedString::from(""),
+                        reply_preview: None,
+                        reaction: None,
+                        parts: Vec::new(),
+                        widget: Some(spec),
+                    });
+                    ui_n += 1;
+                }
+            }
+        }
+        flush_text(&mut rows, &mut text_buf);
     }
     Arc::new(rows)
 }
@@ -300,7 +370,10 @@ impl ChatTranscript {
     }
 
     fn recompute_find(&mut self, land: bool, cx: &mut Context<Self>) {
-        let hits = project_hits(self.rows.iter().map(|row| row.content.as_ref()), &self.find_query);
+        let hits = project_hits(
+            self.rows.iter().map(|row| row.content.as_ref()),
+            &self.find_query,
+        );
         if hits.is_empty() {
             self.find_hits = hits;
             self.find_current = None;
@@ -455,82 +528,106 @@ impl Render for ChatTranscript {
             .id("chat-timestamp-peek")
             .size_full()
             .on_scroll_wheel(cx.listener(Self::on_timestamp_wheel))
-            .child(MessageScroller::new("chat-messages", self.scroller.clone(), move |ix, _, _cx| {
-            let Some(row) = rows.get(ix) else {
-                return div().into_any_element();
-            };
-            let highlight_color = if row.highlight_range.is_some() {
-                if row.highlight_native {
-                    Some(palette.yellow.opacity(0.4))
-                } else {
-                    Some(palette.green.opacity(0.4))
-                }
-            } else {
-                None
-            };
-            let (bg_color, text_color) = if row.is_me {
-                (palette.primary, palette.primary_foreground)
-            } else {
-                (palette.secondary, palette.secondary_foreground)
-            };
-            let state_entity = app_state.clone();
-            let source_id = row.source_id.clone();
-            let tts_text = row.tts_text.to_string();
-            let show_footer = row.show_footer;
-            let picker_open = picker_id.as_ref() == Some(&row.source_id);
-            let mut bubble = MessageBubble::new(row.content.to_string())
-                .message_id(row.id.clone())
-                .source_id(row.source_id.clone())
-                .is_me(row.is_me)
-                .bg_color(bg_color)
-                .text_color(text_color)
-                .timestamp(row.timestamp.to_string())
-                .debug_mode(debug_mode)
-                .can_read_aloud(can_read_aloud && show_footer)
-                .is_native_speaking(row.is_native_speaking)
-                .is_native_paused(row.is_native_paused)
-                .is_native_loading(row.is_native_loading)
-                .is_ai_speaking(row.is_ai_speaking)
-                .is_ai_paused(row.is_ai_paused)
-                .is_ai_loading(row.is_ai_loading)
-                .is_cached(row.is_cached)
-                .highlight_range(row.highlight_range.clone())
-                .highlight_color(highlight_color)
-                .find_marks(marks_for_row(ix, &find_hits, find_current))
-                .use_markdown(row.use_markdown)
-                .show_footer(show_footer)
-                .reply_preview(row.reply_preview.clone())
-                .reaction(row.reaction.clone())
-                .picker_open(picker_open)
-                .ts_peek(ts_peek)
-                .timestamps_ok(timestamps_ok)
-                .app_state(app_state.clone());
-            if show_footer {
-                let state_for_tts = state_entity.clone();
-                let source_for_tts = source_id.clone();
-                let tts = tts_text.clone();
-                bubble = bubble.copy_text(tts_text.clone()).on_read_aloud(move |_, cx| {
-                    state_for_tts.update(cx, |state, cx| {
-                        state.toggle_read_aloud(
-                            source_for_tts.clone(),
-                            tts.clone(),
-                            crate::actions::TtsSource::Native,
-                            cx,
-                        );
-                    });
-                });
-                let input = input.clone();
-                bubble = bubble.on_reply(move |window, cx| {
-                    input.update(cx, |input, cx| {
-                        input.focus(window, cx);
-                    });
-                });
-            }
-            bubble.into_any_element()
-        })
-            .pt(px(80.0))
-            .with_jump_button_transition(Duration::ZERO),
-        )
+            .child(
+                MessageScroller::new("chat-messages", self.scroller.clone(), move |ix, _, cx| {
+                    let Some(row) = rows.get(ix) else {
+                        return div().into_any_element();
+                    };
+                    if let Some(spec) = &row.widget {
+                        return div()
+                            .id(ElementId::Name(row.id.clone().into()))
+                            .w_full()
+                            .flex()
+                            .justify_start()
+                            .py(px(6.))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(CHAT_CONTENT_MAX * 0.72))
+                                    .child(render_ui_spec(
+                                        spec,
+                                        &row.source_id,
+                                        Some(app_state.clone()),
+                                        cx,
+                                    )),
+                            )
+                            .into_any_element();
+                    }
+                    let highlight_color = if row.highlight_range.is_some() {
+                        if row.highlight_native {
+                            Some(palette.yellow.opacity(0.4))
+                        } else {
+                            Some(palette.green.opacity(0.4))
+                        }
+                    } else {
+                        None
+                    };
+                    let (bg_color, text_color) = if row.is_me {
+                        (palette.primary, palette.primary_foreground)
+                    } else {
+                        (palette.secondary, palette.secondary_foreground)
+                    };
+                    let state_entity = app_state.clone();
+                    let source_id = row.source_id.clone();
+                    let tts_text = row.tts_text.to_string();
+                    let show_footer = row.show_footer;
+                    let picker_open = picker_id.as_ref() == Some(&row.source_id);
+                    let mut bubble = MessageBubble::new(row.content.to_string())
+                        .message_id(row.id.clone())
+                        .source_id(row.source_id.clone())
+                        .is_me(row.is_me)
+                        .bg_color(bg_color)
+                        .text_color(text_color)
+                        .timestamp(row.timestamp.to_string())
+                        .debug_mode(debug_mode)
+                        .can_read_aloud(can_read_aloud && show_footer)
+                        .is_native_speaking(row.is_native_speaking)
+                        .is_native_paused(row.is_native_paused)
+                        .is_native_loading(row.is_native_loading)
+                        .is_ai_speaking(row.is_ai_speaking)
+                        .is_ai_paused(row.is_ai_paused)
+                        .is_ai_loading(row.is_ai_loading)
+                        .is_cached(row.is_cached)
+                        .highlight_range(row.highlight_range.clone())
+                        .highlight_color(highlight_color)
+                        .find_marks(marks_for_row(ix, &find_hits, find_current))
+                        .use_markdown(row.use_markdown)
+                        .show_footer(show_footer)
+                        .reply_preview(row.reply_preview.clone())
+                        .reaction(row.reaction.clone())
+                        .picker_open(picker_open)
+                        .ts_peek(ts_peek)
+                        .timestamps_ok(timestamps_ok)
+                        .parts(row.parts.clone())
+                        .app_state(app_state.clone());
+                    if show_footer {
+                        let state_for_tts = state_entity.clone();
+                        let source_for_tts = source_id.clone();
+                        let tts = tts_text.clone();
+                        bubble = bubble
+                            .copy_text(tts_text.clone())
+                            .on_read_aloud(move |_, cx| {
+                                state_for_tts.update(cx, |state, cx| {
+                                    state.toggle_read_aloud(
+                                        source_for_tts.clone(),
+                                        tts.clone(),
+                                        crate::actions::TtsSource::Native,
+                                        cx,
+                                    );
+                                });
+                            });
+                        let input = input.clone();
+                        bubble = bubble.on_reply(move |window, cx| {
+                            input.update(cx, |input, cx| {
+                                input.focus(window, cx);
+                            });
+                        });
+                    }
+                    bubble.into_any_element()
+                })
+                .pt(px(80.0))
+                .with_jump_button_transition(Duration::ZERO),
+            )
     }
 }
 
@@ -667,23 +764,21 @@ impl ChatView {
                     app.update(cx, |state, cx| state.close_emoji_picker(cx));
                 }
             })
-            .child(
-                deferred(
-                    Positioner::side(open.bounds)
-                        .placement(Placement::Bottom)
-                        .align(Align::Start)
-                        .offset(px(6.))
-                        .occlude()
-                        .child(
-                            div()
-                                .id("emoji-panel")
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .child(panel),
-                        ),
-                ),
-            )
+            .child(deferred(
+                Positioner::side(open.bounds)
+                    .placement(Placement::Bottom)
+                    .align(Align::Start)
+                    .offset(px(6.))
+                    .occlude()
+                    .child(
+                        div()
+                            .id("emoji-panel")
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(panel),
+                    ),
+            ))
     }
 
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -701,12 +796,8 @@ impl ChatView {
         let last_conversation_id = state.read(cx).active_conversation_id.clone();
 
         let transcript = cx.new(|cx| ChatTranscript::new(state.clone(), input.clone(), cx));
-        let emoji_search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search emoji")
-        });
-        let find_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Find in chat")
-        });
+        let emoji_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search emoji"));
+        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in chat"));
 
         let this = Self {
             input,
@@ -911,9 +1002,9 @@ impl Render for ChatView {
                                     .max_w(px(CHAT_CONTENT_MAX))
                                     .h_full()
                                     .child(
-                                        self.transcript.clone().cached(
-                                            StyleRefinement::default().size_full(),
-                                        ),
+                                        self.transcript
+                                            .clone()
+                                            .cached(StyleRefinement::default().size_full()),
                                     ),
                             ),
                     )
@@ -972,7 +1063,9 @@ impl Render for ChatView {
                                 ),
                             )
                             .child(
-                                h_flex().gap_2().items_center()
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
                                     .when(self.find_open, |this| {
                                         this.child(find_bar_element(
                                             &self.find_input,
@@ -1003,29 +1096,29 @@ impl Render for ChatView {
                                         ))
                                     })
                                     .child(
-                                    div()
-                                        .id("header-monitor")
-                                        .size(px(28.))
-                                        .rounded(px(8.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
-                                        .on_mouse_down(MouseButton::Left, {
-                                            let state = self.state.clone();
-                                            move |_, _, cx| {
-                                                state.update(cx, |state, cx| {
-                                                    state.toggle_computer_pane(cx);
-                                                });
-                                            }
-                                        })
-                                        .child(
-                                            Icon::default()
-                                                .path("icons/monitor.svg")
-                                                .size(px(16.)),
-                                        ),
-                                ),
+                                        div()
+                                            .id("header-monitor")
+                                            .size(px(28.))
+                                            .rounded(px(8.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                                            .on_mouse_down(MouseButton::Left, {
+                                                let state = self.state.clone();
+                                                move |_, _, cx| {
+                                                    state.update(cx, |state, cx| {
+                                                        state.toggle_computer_pane(cx);
+                                                    });
+                                                }
+                                            })
+                                            .child(
+                                                Icon::default()
+                                                    .path("icons/monitor.svg")
+                                                    .size(px(16.)),
+                                            ),
+                                    ),
                             ),
                     ),
             )
@@ -1041,40 +1134,36 @@ impl Render for ChatView {
                             .w_full()
                             .max_w(px(CHAT_CONTENT_MAX))
                             .gap_2()
-                    .when_some(self.bot_status.clone(), |this, label| {
-                        let name = self
-                            .coworker_name
-                            .clone()
-                            .unwrap_or_else(|| "Agent".into());
-                        let id = self.coworker_id.clone().unwrap_or_default();
-                        this.child(
-                            h_flex()
-                                .id("bot-working")
-                                .gap(px(8.))
-                                .items_center()
-                                .px_1()
-                                .tooltip(move |w, cx| {
-                                    Tooltip::new(label.clone()).build(w, cx)
-                                })
-                                .child(
-                                    PersonaMark::new(id)
-                                        .shape(self.coworker_shape.clone())
-                                        .color(self.coworker_color.clone())
-                                        .size(px(20.))
-                                        .dark(theme.is_dark()),
+                            .when_some(self.bot_status.clone(), |this, label| {
+                                let name =
+                                    self.coworker_name.clone().unwrap_or_else(|| "Agent".into());
+                                let id = self.coworker_id.clone().unwrap_or_default();
+                                this.child(
+                                    h_flex()
+                                        .id("bot-working")
+                                        .gap(px(8.))
+                                        .items_center()
+                                        .px_1()
+                                        .tooltip(move |w, cx| {
+                                            Tooltip::new(label.clone()).build(w, cx)
+                                        })
+                                        .child(
+                                            PersonaMark::new(id)
+                                                .shape(self.coworker_shape.clone())
+                                                .color(self.coworker_color.clone())
+                                                .size(px(20.))
+                                                .dark(theme.is_dark()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(theme.muted_foreground)
+                                                .child(format!("{name} is working")),
+                                        ),
                                 )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("{name} is working")),
-                                ),
-                        )
-                    })
-                    .child(self.input.clone()),
+                            })
+                            .child(self.input.clone()),
                     ),
             )
     }
 }
-
-

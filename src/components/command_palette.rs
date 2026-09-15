@@ -203,7 +203,10 @@ impl CommandPalette {
             return;
         };
         match item {
-            PaletteItem::Bot { id, .. } | PaletteItem::Message { coworker_id: id, .. } => {
+            PaletteItem::Bot { id, .. }
+            | PaletteItem::Message {
+                coworker_id: id, ..
+            } => {
                 self.state.update(cx, |state, cx| {
                     state.select_coworker(id, cx);
                 });
@@ -268,19 +271,14 @@ impl CommandPalette {
             }
         }
         if want_actions {
-            items.extend(
-                action_catalog(&state)
-                    .into_iter()
-                    .filter(|item| {
-                        needle.is_empty() || {
-                            let PaletteItem::Action { title, hint, .. } = item else {
-                                return false;
-                            };
-                            title.to_lowercase().contains(&needle)
-                                || hint.to_lowercase().contains(&needle)
-                        }
-                    }),
-            );
+            items.extend(action_catalog(&state).into_iter().filter(|item| {
+                needle.is_empty() || {
+                    let PaletteItem::Action { title, hint, .. } = item else {
+                        return false;
+                    };
+                    title.to_lowercase().contains(&needle) || hint.to_lowercase().contains(&needle)
+                }
+            }));
         }
         items
     }
@@ -430,11 +428,7 @@ impl Render for CommandPalette {
         let muted = theme.muted_foreground;
         let fg = theme.foreground;
         let border = theme.border;
-        let panel = if dark {
-            rgb(0x2c2c2c)
-        } else {
-            rgb(0xffffff)
-        };
+        let panel = if dark { rgb(0x2c2c2c) } else { rgb(0xffffff) };
         let hover: Hsla = rgb(0x777777).opacity(0.16).into();
         let selected_fill: Hsla = rgb(0x777777).opacity(0.22).into();
         let query = self.query.read(cx).value().to_string();
@@ -506,11 +500,7 @@ impl Render for CommandPalette {
                             .items_center()
                             .border_b_1()
                             .border_color(border)
-                            .child(
-                                Icon::new(IconName::Search)
-                                    .size(px(16.))
-                                    .text_color(muted),
-                            )
+                            .child(Icon::new(IconName::Search).size(px(16.)).text_color(muted))
                             .child(
                                 field_input(&self.query)
                                     .id("command-palette-input")
@@ -535,9 +525,9 @@ impl Render for CommandPalette {
                                     .text_sm()
                                     .cursor_pointer()
                                     .when(active, |this| {
-                                        this.bg(selected_fill).text_color(fg).font_weight(
-                                            FontWeight::MEDIUM,
-                                        )
+                                        this.bg(selected_fill)
+                                            .text_color(fg)
+                                            .font_weight(FontWeight::MEDIUM)
                                     })
                                     .when(!active, |this| this.text_color(muted))
                                     .hover(|s| s.bg(hover))
@@ -553,34 +543,32 @@ impl Render for CommandPalette {
                                     .child(t.label())
                             })),
                     )
-                    .child(
-                        if items.is_empty() {
-                            empty_state(tab, muted)
-                        } else {
-                            v_flex()
-                                .id("command-palette-results")
-                                .flex_1()
-                                .w_full()
-                                .min_h(px(0.))
-                                .overflow_y_scroll()
-                                .pb(px(8.))
-                                .children(items.into_iter().enumerate().map(|(i, item)| {
-                                    palette_row(
-                                        i,
-                                        item,
-                                        i == selected,
-                                        dark,
-                                        fg,
-                                        muted,
-                                        hover,
-                                        selected_fill,
-                                        view.clone(),
-                                        query.clone(),
-                                    )
-                                }))
-                                .into_any_element()
-                        },
-                    ),
+                    .child(if items.is_empty() {
+                        empty_state(tab, muted)
+                    } else {
+                        v_flex()
+                            .id("command-palette-results")
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .pb(px(8.))
+                            .children(items.into_iter().enumerate().map(|(i, item)| {
+                                palette_row(
+                                    i,
+                                    item,
+                                    i == selected,
+                                    dark,
+                                    fg,
+                                    muted,
+                                    hover,
+                                    selected_fill,
+                                    view.clone(),
+                                    query.clone(),
+                                )
+                            }))
+                            .into_any_element()
+                    }),
             )
     }
 }
@@ -593,23 +581,14 @@ fn empty_state(tab: PaletteTab, muted: Hsla) -> AnyElement {
         .items_center()
         .justify_center()
         .gap(px(8.))
-        .child(
-            Icon::new(IconName::Search)
-                .size(px(28.))
-                .text_color(muted),
-        )
+        .child(Icon::new(IconName::Search).size(px(28.)).text_color(muted))
         .child(
             div()
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .child(tab.empty_title()),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(tab.empty_hint()),
-        )
+        .child(div().text_xs().text_color(muted).child(tab.empty_hint()))
         .into_any_element()
 }
 
@@ -694,21 +673,9 @@ fn palette_row(
                 .flex_1()
                 .min_w(px(0.))
                 .gap(px(2.))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(fg)
-                        .truncate()
-                        .child(title),
-                )
+                .child(div().text_sm().text_color(fg).truncate().child(title))
                 .when(!subtitle.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .truncate()
-                            .child(subtitle),
-                    )
+                    this.child(div().text_xs().text_color(muted).truncate().child(subtitle))
                 }),
         )
         .when(matches!(kind, RowKind::Action { .. }), |this| {
@@ -754,12 +721,7 @@ fn action_icon(path: &'static str, muted: Hsla) -> AnyElement {
         .items_center()
         .justify_center()
         .flex_shrink_0()
-        .child(
-            Icon::default()
-                .path(path)
-                .size(px(16.))
-                .text_color(muted),
-        )
+        .child(Icon::default().path(path).size(px(16.)).text_color(muted))
         .into_any_element()
 }
 
@@ -777,5 +739,3 @@ fn keycap(label: &str, muted: Hsla) -> impl IntoElement {
         .text_color(muted)
         .child(label.to_string())
 }
-
-

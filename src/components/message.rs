@@ -1,9 +1,14 @@
 use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
-use crate::chrome::{chat_column_width, is_narrow_viewport, CHAT_CONTENT_MAX};
+use crate::chrome::{
+    chat_column_width, is_narrow_viewport, BUBBLE_RADIUS, CHAT_CONTENT_MAX,
+};
+use crate::components::gen_ui::render_ui_spec;
 use crate::components::message_actions::{MessageToolbar, TOOLBAR_W};
+use crate::opengrok::ChatPart;
 use crate::state::{AppState, RightPane};
+use crate::tts_text::looks_like_markdown;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::{prelude::FluentBuilder, *};
@@ -33,6 +38,7 @@ pub struct MessageBubble {
     ts_peek: f32,
     timestamps_ok: bool,
     app: Option<Entity<AppState>>,
+    parts: Vec<ChatPart>,
 }
 
 impl MessageBubble {
@@ -59,7 +65,13 @@ impl MessageBubble {
             ts_peek: 0.0,
             timestamps_ok: true,
             app: None,
+            parts: Vec::new(),
         }
+    }
+
+    pub fn parts(mut self, parts: Vec<ChatPart>) -> Self {
+        self.parts = parts;
+        self
     }
 
     pub fn use_markdown(mut self, use_markdown: bool) -> Self {
@@ -195,6 +207,72 @@ impl MessageBubble {
     }
 }
 
+fn has_ui_part(parts: &[ChatPart]) -> bool {
+    parts.iter().any(|part| matches!(part, ChatPart::Ui(_)))
+}
+
+fn render_parts(
+    parts: &[ChatPart],
+    row_key: &str,
+    is_me: bool,
+    use_markdown: bool,
+    debug_mode: bool,
+    message_id: &str,
+    app: Option<Entity<AppState>>,
+    max_bubble: Pixels,
+    cx: &App,
+) -> AnyElement {
+    let children: Vec<AnyElement> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, part)| match part {
+            ChatPart::Text(text) if text.trim().is_empty() => None,
+            ChatPart::Text(text) => Some(render_text_part(
+                text,
+                i,
+                row_key,
+                is_me,
+                use_markdown,
+                debug_mode,
+            )),
+            ChatPart::Ui(spec) => Some(render_ui_spec(spec, message_id, app.clone(), cx)),
+        })
+        .collect();
+    // Pixel width: a shrink-wrapped nested v_flex measures min-content and
+    // wraps one word per line (the Taffy cycle max_w on a fit-content parent).
+    v_flex()
+        .w(max_bubble)
+        .gap(px(10.))
+        .children(children)
+        .into_any_element()
+}
+
+fn render_text_part(
+    text: &str,
+    index: usize,
+    row_key: &str,
+    is_me: bool,
+    use_markdown: bool,
+    debug_mode: bool,
+) -> AnyElement {
+    if debug_mode || is_me || !use_markdown || !looks_like_markdown(text) {
+        div()
+            .id(ElementId::Name(
+                format!("msg-body-{row_key}-{index}").into(),
+            ))
+            .w_full()
+            .text_sm()
+            .child(text.to_string())
+            .into_any_element()
+    } else {
+        TextView::markdown(
+            ElementId::Name(format!("md-{row_key}-{index}").into()),
+            SharedString::from(text.to_string()),
+        )
+        .into_any_element()
+    }
+}
+
 fn bubble_colors(is_me: bool, cx: &App) -> (Hsla, Hsla) {
     let theme = cx.theme();
     let dark = theme.is_dark();
@@ -264,11 +342,21 @@ impl RenderOnce for MessageBubble {
             })
             .unwrap_or(win)
             .min(CHAT_CONTENT_MAX);
-        let max_bubble = px((chat_w * 0.88)
-            .min(640.0)
-            .min((chat_w - 82.0).max(160.0)));
+        let max_bubble = px((chat_w * 0.88).min(640.0).min((chat_w - 82.0).max(160.0)));
 
-        let body = if self.debug_mode {
+        let body = if has_ui_part(&self.parts) {
+            render_parts(
+                &self.parts,
+                &row_key,
+                self.is_me,
+                self.use_markdown,
+                self.debug_mode,
+                &self.message_id,
+                self.app.clone(),
+                max_bubble,
+                cx,
+            )
+        } else if self.debug_mode {
             div()
                 .text_sm()
                 .font_family("monospace")
@@ -312,8 +400,12 @@ impl RenderOnce for MessageBubble {
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
             .flex_shrink_0()
             .max_w(max_bubble)
-            .when(self.is_me, |this| this.px(px(14.)).py(px(8.)).rounded_full())
-            .when(!self.is_me, |this| this.px(px(12.)).py(px(8.)).rounded(px(18.)))
+            .when(self.is_me, |this| {
+                this.px(px(14.)).py(px(8.)).rounded(px(BUBBLE_RADIUS))
+            })
+            .when(!self.is_me, |this| {
+                this.px(px(12.)).py(px(8.)).rounded(px(BUBBLE_RADIUS))
+            })
             .bg(bg)
             .text_color(fg)
             .child(
@@ -428,12 +520,7 @@ impl RenderOnce for MessageBubble {
         let body_row = div()
             .relative()
             .w_full()
-            .child(
-                div()
-                    .w_full()
-                    .ml(px(-peek))
-                    .child(main),
-            )
+            .child(div().w_full().ml(px(-peek)).child(main))
             .child(
                 div()
                     .absolute()

@@ -1,13 +1,13 @@
 use crate::actions::TtsSource;
 use crate::audio::AudioInput;
-use crate::config::Config;
 use crate::chrome::{
-    collapse_for_width, remember_choice, sidebar_from_resize, ResponsiveCollapse, SidebarChrome,
-    SIDEBAR_EXPANDED,
+    ResponsiveCollapse, SIDEBAR_EXPANDED, SidebarChrome, collapse_for_width, remember_choice,
+    sidebar_from_resize,
 };
+use crate::config::Config;
 use crate::opengrok::{
-    activity_from_agui, Account, ActivityTick, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue,
-    OpenGrokClient, ProfileUpdate,
+    Account, ActivityTick, AguiMessage, ChatPart, Coworker, CoworkerPatch, FormSpec,
+    ModelCatalogue, OpenGrokClient, ProfileUpdate, TurnAssembler, activity_from_agui,
 };
 use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
@@ -26,9 +26,18 @@ pub struct Message {
     pub sent_at: SystemTime,
     pub is_me: bool,
     pub reply_preview: Option<String>,
+    pub parts: Vec<ChatPart>,
 }
 
 impl Message {
+    pub fn has_visible_body(&self) -> bool {
+        !self.content.trim().is_empty()
+            || self.parts.iter().any(|part| match part {
+                ChatPart::Text(text) => !text.trim().is_empty(),
+                ChatPart::Ui(_) => true,
+            })
+    }
+
     /// Clock time on the message row, matching Grok's `12:14 PM` column.
     pub fn formatted_time(&self) -> String {
         let dt = DateTime::<Local>::from(self.sent_at);
@@ -286,12 +295,7 @@ fn format_clock(hour: u8, minute: u8) -> String {
     } else {
         (hour - 12, false)
     };
-    format!(
-        "{}:{:02} {}",
-        h12,
-        minute,
-        if am { "AM" } else { "PM" }
-    )
+    format!("{}:{:02} {}", h12, minute, if am { "AM" } else { "PM" })
 }
 
 fn ordinal(n: u8) -> String {
@@ -360,9 +364,7 @@ pub enum RoutineTrigger {
 impl RoutineTrigger {
     pub fn id(&self) -> &str {
         match self {
-            Self::Schedule { id, .. }
-            | Self::Event { id, .. }
-            | Self::Webhook { id, .. } => id,
+            Self::Schedule { id, .. } | Self::Event { id, .. } | Self::Webhook { id, .. } => id,
         }
     }
 
@@ -531,6 +533,7 @@ pub struct AppState {
     pub reply_to: Option<ReplyTo>,
     pub message_reactions: HashMap<String, String>,
     pub emoji_picker: Option<EmojiPickerOpen>,
+    pub form_picks: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -697,6 +700,7 @@ impl AppState {
             reply_to: None,
             message_reactions: HashMap::new(),
             emoji_picker: None,
+            form_picks: HashMap::new(),
         };
 
         state
@@ -705,8 +709,8 @@ impl AppState {
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
         match OpenGrokClient::new(&config.opengrok_base_url) {
             Ok(client) => {
-                let client = client
-                    .with_session_file(config.data_dir.join("opengrok-session.json"));
+                let client =
+                    client.with_session_file(config.data_dir.join("opengrok-session.json"));
                 self.opengrok = Some(client);
                 self.restore_session(cx);
             }
@@ -977,10 +981,9 @@ impl AppState {
     }
 
     pub fn back_to_computer(&mut self, cx: &mut Context<Self>) {
-        if let (Some(coworker_id), ComputerView::Editor { id: Some(rid) }) = (
-            self.active_coworker_id.clone(),
-            self.computer_view.clone(),
-        ) {
+        if let (Some(coworker_id), ComputerView::Editor { id: Some(rid) }) =
+            (self.active_coworker_id.clone(), self.computer_view.clone())
+        {
             let empty = self
                 .routines
                 .get(&coworker_id)
@@ -1023,7 +1026,11 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn routine_mut(&mut self, coworker_id: &str, routine_id: &str) -> Option<&mut AgentRoutine> {
+    pub fn routine_mut(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+    ) -> Option<&mut AgentRoutine> {
         self.routines
             .get_mut(coworker_id)?
             .iter_mut()
@@ -1085,7 +1092,12 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn record_routine_run(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+    pub fn record_routine_run(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let stamp = chrono::Local::now()
             .format("%b %d at %I:%M %p")
             .to_string()
@@ -1402,35 +1414,35 @@ impl AppState {
     pub fn load_sessions(&mut self, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             cx.spawn(async move |this, cx| {
-                    match db.get_sessions().await {
-                        Ok(sessions) => {
-                            this.update(cx, |state, cx| {
-                                state.conversations = sessions
-                                    .into_iter()
-                                    .map(|s| Conversation {
-                                        id: s.id,
-                                        title: s.title,
-                                        created_at: s.created_at,
-                                        updated_at: s.updated_at,
-                                        messages: Vec::new(),
-                                        unread_count: 0,
-                                    })
-                                    .collect();
+                match db.get_sessions().await {
+                    Ok(sessions) => {
+                        this.update(cx, |state, cx| {
+                            state.conversations = sessions
+                                .into_iter()
+                                .map(|s| Conversation {
+                                    id: s.id,
+                                    title: s.title,
+                                    created_at: s.created_at,
+                                    updated_at: s.updated_at,
+                                    messages: Vec::new(),
+                                    unread_count: 0,
+                                })
+                                .collect();
 
-                                // If no active conversation, select the most recent one
-                                if state.active_conversation_id.is_none() {
-                                    if let Some(first) = state.conversations.first() {
-                                        let id = first.id.clone();
-                                        state.select_conversation(id, cx);
-                                    }
+                            // If no active conversation, select the most recent one
+                            if state.active_conversation_id.is_none() {
+                                if let Some(first) = state.conversations.first() {
+                                    let id = first.id.clone();
+                                    state.select_conversation(id, cx);
                                 }
-                                cx.notify();
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to load sessions: {}", e),
+                            }
+                            cx.notify();
+                        })
+                        .ok();
                     }
-                })
+                    Err(e) => eprintln!("Failed to load sessions: {}", e),
+                }
+            })
             .detach();
         }
     }
@@ -1535,12 +1547,8 @@ impl AppState {
                 Conversation {
                     id: id.clone(),
                     title: coworker.name.clone(),
-                    created_at: chrono::Local::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
-                    updated_at: chrono::Local::now()
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string(),
+                    created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    updated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     messages: Vec::new(),
                     unread_count: 0,
                 },
@@ -1613,9 +1621,7 @@ impl AppState {
         self.last_active_at
             .insert(id.to_string(), SystemTime::now());
         if let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == id) {
-            conversation.updated_at = chrono::Local::now()
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string();
+            conversation.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         }
     }
 
@@ -1873,32 +1879,32 @@ impl AppState {
 
     pub fn create_new_session(&mut self, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
-            cx.spawn(async move |this, cx| {
-                    match db.create_session("New Chat").await {
-                        Ok(id) => {
-                            this.update(cx, |state, cx| {
-                                state.conversations.insert(
-                                    0,
-                                    Conversation {
-                                        id: id.clone(),
-                                        title: "New Chat".to_string(),
-                                        created_at: chrono::Local::now()
-                                            .format("%Y-%m-%d %H:%M:%S")
-                                            .to_string(),
-                                        updated_at: chrono::Local::now()
-                                            .format("%Y-%m-%d %H:%M:%S")
-                                            .to_string(),
-                                        messages: Vec::new(),
-                                        unread_count: 0,
-                                    },
-                                );
-                                state.select_conversation(id, cx);
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to create session: {}", e),
+            cx.spawn(
+                async move |this, cx| match db.create_session("New Chat").await {
+                    Ok(id) => {
+                        this.update(cx, |state, cx| {
+                            state.conversations.insert(
+                                0,
+                                Conversation {
+                                    id: id.clone(),
+                                    title: "New Chat".to_string(),
+                                    created_at: chrono::Local::now()
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string(),
+                                    updated_at: chrono::Local::now()
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string(),
+                                    messages: Vec::new(),
+                                    unread_count: 0,
+                                },
+                            );
+                            state.select_conversation(id, cx);
+                        })
+                        .ok();
                     }
-                })
+                    Err(e) => eprintln!("Failed to create session: {}", e),
+                },
+            )
             .detach();
         }
     }
@@ -1910,11 +1916,10 @@ impl AppState {
 
             if let Some(db) = self.database_service.clone() {
                 cx.spawn(async move |_this, _cx| {
-                        if let Err(e) = db.update_session_title(&id, &new_title).await {
-                            eprintln!("Failed to rename session: {}", e);
-                        }
-                    },
-                )
+                    if let Err(e) = db.update_session_title(&id, &new_title).await {
+                        eprintln!("Failed to rename session: {}", e);
+                    }
+                })
                 .detach();
             }
         }
@@ -1936,11 +1941,10 @@ impl AppState {
 
             if let Some(db) = self.database_service.clone() {
                 cx.spawn(async move |_this, _cx| {
-                        if let Err(e) = db.delete_session(&id).await {
-                            eprintln!("Failed to delete session: {}", e);
-                        }
-                    },
-                )
+                    if let Err(e) = db.delete_session(&id).await {
+                        eprintln!("Failed to delete session: {}", e);
+                    }
+                })
                 .detach();
             }
         }
@@ -1949,47 +1953,48 @@ impl AppState {
     pub fn load_session_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             let session_id_clone = session_id.clone();
-            cx.spawn(async move |this, cx| {
-                    match db.get_messages(&session_id_clone).await {
-                        Ok(db_messages) => {
-                            this.update(cx, |state, cx| {
-                                if let Some(conversation) = state
-                                    .conversations
-                                    .iter_mut()
-                                    .find(|c| c.id == session_id_clone)
-                                {
-                                    conversation.messages = db_messages
-                                        .into_iter()
-                                        .map(|m| {
-                                            let sent_at = NaiveDateTime::parse_from_str(
-                                                &m.created_at,
-                                                "%Y-%m-%d %H:%M:%S",
-                                            )
-                                            .map(|dt| SystemTime::from(dt.and_utc()))
-                                            .unwrap_or(SystemTime::now());
+            cx.spawn(
+                async move |this, cx| match db.get_messages(&session_id_clone).await {
+                    Ok(db_messages) => {
+                        this.update(cx, |state, cx| {
+                            if let Some(conversation) = state
+                                .conversations
+                                .iter_mut()
+                                .find(|c| c.id == session_id_clone)
+                            {
+                                conversation.messages = db_messages
+                                    .into_iter()
+                                    .map(|m| {
+                                        let sent_at = NaiveDateTime::parse_from_str(
+                                            &m.created_at,
+                                            "%Y-%m-%d %H:%M:%S",
+                                        )
+                                        .map(|dt| SystemTime::from(dt.and_utc()))
+                                        .unwrap_or(SystemTime::now());
 
-                                            Message {
-                                                id: m.id,
-                                                sender: if m.role == "user" {
-                                                    "Me".to_string()
-                                                } else {
-                                                    "AI".to_string()
-                                                },
-                                                content: m.content,
-                                                sent_at,
-                                                is_me: m.role == "user",
-                                                reply_preview: None,
-                                            }
-                                        })
-                                        .collect();
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to load messages: {}", e),
+                                        Message {
+                                            id: m.id,
+                                            sender: if m.role == "user" {
+                                                "Me".to_string()
+                                            } else {
+                                                "AI".to_string()
+                                            },
+                                            content: m.content,
+                                            sent_at,
+                                            is_me: m.role == "user",
+                                            reply_preview: None,
+                                            parts: Vec::new(),
+                                        }
+                                    })
+                                    .collect();
+                                cx.notify();
+                            }
+                        })
+                        .ok();
                     }
-                })
+                    Err(e) => eprintln!("Failed to load messages: {}", e),
+                },
+            )
             .detach();
         }
     }
@@ -2037,6 +2042,7 @@ impl AppState {
             .map(|c| {
                 c.messages
                     .iter()
+                    .filter(|m| !m.content.trim().is_empty() || m.is_me)
                     .map(|m| AguiMessage {
                         id: m.id.clone(),
                         role: if m.is_me {
@@ -2045,6 +2051,7 @@ impl AppState {
                             "assistant".to_string()
                         },
                         content: m.content.clone(),
+                        tool_call_id: None,
                     })
                     .collect()
             })
@@ -2062,6 +2069,7 @@ impl AppState {
                 sent_at: SystemTime::now(),
                 is_me: false,
                 reply_preview: None,
+                parts: Vec::new(),
             });
         }
         if let Some(id) = self.active_coworker_id.clone() {
@@ -2086,16 +2094,16 @@ impl AppState {
                     Err(error) => Err(error),
                 },
             };
-            let result = match coworker {
+            let (result, waiting_approval) = match coworker {
                 Ok(id) => {
                     let mut args_by_call: std::collections::HashMap<String, String> =
                         std::collections::HashMap::new();
                     let mut names_by_call: std::collections::HashMap<String, String> =
                         std::collections::HashMap::new();
-                    client
+                    let mut assembler = TurnAssembler::default();
+                    let result = client
                         .run_turn(&id, &conversation_id, &history, |event| {
-                            if let Some(call_id) =
-                                event.get("toolCallId").and_then(|v| v.as_str())
+                            if let Some(call_id) = event.get("toolCallId").and_then(|v| v.as_str())
                             {
                                 if let Some(name) =
                                     event.get("toolCallName").and_then(|v| v.as_str())
@@ -2110,13 +2118,15 @@ impl AppState {
                                 }
                             }
                             let call_id = event.get("toolCallId").and_then(|v| v.as_str());
-                            let args = call_id.and_then(|id| args_by_call.get(id)).map(String::as_str);
+                            let args = call_id
+                                .and_then(|id| args_by_call.get(id))
+                                .map(String::as_str);
                             let mut event = event.clone();
                             if event.get("toolCallName").is_none() {
                                 if let Some(name) = call_id.and_then(|id| names_by_call.get(id)) {
-                                    event
-                                        .as_object_mut()
-                                        .map(|o| o.insert("toolCallName".into(), name.clone().into()));
+                                    event.as_object_mut().map(|o| {
+                                        o.insert("toolCallName".into(), name.clone().into())
+                                    });
                                 }
                             }
                             match activity_from_agui(&event, args) {
@@ -2131,7 +2141,8 @@ impl AppState {
                                 }
                                 ActivityTick::Set(activity) => {
                                     let _ = this.update(cx, |state, cx| {
-                                        if state.bot_status.as_deref() != Some(activity.label.as_str())
+                                        if state.bot_status.as_deref()
+                                            != Some(activity.label.as_str())
                                         {
                                             state.bot_status = Some(activity.label);
                                             cx.notify();
@@ -2139,33 +2150,46 @@ impl AppState {
                                     });
                                 }
                             }
-                            let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
-                                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                    if !delta.is_empty() {
-                                        let _ = this.update(cx, |state, cx| {
-                                            if let Some(conversation) = state
-                                                .conversations
-                                                .iter_mut()
-                                                .find(|c| c.id == conversation_id)
-                                            {
-                                                if let Some(last) =
-                                                    conversation.messages.last_mut()
-                                                {
-                                                    if !last.is_me {
-                                                        last.content.push_str(delta);
-                                                        cx.notify();
-                                                    }
-                                                }
-                                            }
-                                        });
+                            assembler.push_event(&event);
+                            let (plain, parts) = assembler.snapshot();
+                            let _ = this.update(cx, |state, cx| {
+                                if let Some(conversation) = state
+                                    .conversations
+                                    .iter_mut()
+                                    .find(|c| c.id == conversation_id)
+                                {
+                                    if let Some(last) = conversation.messages.last_mut() {
+                                        if !last.is_me {
+                                            last.content = plain.clone();
+                                            last.parts = parts.clone();
+                                            cx.notify();
+                                        }
                                     }
                                 }
-                            }
+                            });
                         })
-                        .await
+                        .await;
+                    assembler.finish();
+                    let waiting_approval = assembler.waiting_approval();
+                    let (plain, parts) = assembler.snapshot();
+                    let _ = this.update(cx, |state, cx| {
+                        if let Some(conversation) = state
+                            .conversations
+                            .iter_mut()
+                            .find(|c| c.id == conversation_id)
+                        {
+                            if let Some(last) = conversation.messages.last_mut() {
+                                if !last.is_me {
+                                    last.content = plain;
+                                    last.parts = parts;
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                    (result, waiting_approval)
                 }
-                Err(error) => Err(error),
+                Err(error) => (Err(error), false),
             };
             let _ = this.update(cx, |state, cx| {
                 if let Some(conversation) = state
@@ -2174,25 +2198,24 @@ impl AppState {
                     .find(|c| c.id == conversation_id)
                 {
                     if let Some(last) = conversation.messages.last_mut() {
-                        if !last.is_me {
+                        if !last.is_me && !last.has_visible_body() {
                             match &result {
-                                Ok(text) if !text.is_empty() => {
-                                    if last.content != *text {
-                                        last.content = text.clone();
-                                    }
-                                }
-                                Ok(_) if last.content.trim().is_empty() => {
+                                Ok(text) if !text.is_empty() => last.content = text.clone(),
+                                Ok(_) => {
                                     last.content =
                                         "(OpenGrok returned no assistant text.)".to_string()
                                 }
-                                Ok(_) => {}
                                 Err(error) => last.content = format!("OpenGrok: {}", error.message),
                             }
                         }
                     }
                 }
                 state.is_ai_responding = false;
-                state.bot_status = None;
+                state.bot_status = if waiting_approval {
+                    Some("Waiting for approval".into())
+                } else {
+                    None
+                };
                 if let Err(error) = result {
                     state.auth_error = Some(error.message);
                 }
@@ -2200,6 +2223,42 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    pub fn pick_form_option(
+        &mut self,
+        message_id: String,
+        field_id: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.form_picks
+            .entry(message_id)
+            .or_default()
+            .insert(field_id, value);
+        cx.notify();
+    }
+
+    pub fn submit_form(&mut self, message_id: String, spec: FormSpec, cx: &mut Context<Self>) {
+        let picks = self
+            .form_picks
+            .get(&message_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut lines = Vec::new();
+        if let Some(title) = &spec.title {
+            lines.push(title.clone());
+        }
+        for field in &spec.fields {
+            if let Some(value) = picks.get(&field.id) {
+                lines.push(format!("{}: {value}", field.label));
+            }
+        }
+        let body = lines.join("\n");
+        if body.trim().is_empty() {
+            return;
+        }
+        self.send_message(body, cx);
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
@@ -2233,6 +2292,7 @@ impl AppState {
                 sent_at: SystemTime::now(),
                 is_me: true,
                 reply_preview,
+                parts: Vec::new(),
             };
             conversation.messages.push(message);
         }
@@ -2247,28 +2307,32 @@ impl AppState {
             let conversation_id_clone = conversation_id.clone();
             let local_id = local_id.clone();
             cx.spawn(async move |this, cx| {
-                    match db
-                        .save_message(&conversation_id_clone, "user", &content_clone, None, None)
-                        .await
-                    {
-                        Ok(id) => {
-                            this.update(cx, |state, cx| {
-                                if let Some(conversation) = state
-                                    .conversations
+                match db
+                    .save_message(&conversation_id_clone, "user", &content_clone, None, None)
+                    .await
+                {
+                    Ok(id) => {
+                        this.update(cx, |state, cx| {
+                            if let Some(conversation) = state
+                                .conversations
+                                .iter_mut()
+                                .find(|c| c.id == conversation_id_clone)
+                            {
+                                if let Some(msg) = conversation
+                                    .messages
                                     .iter_mut()
-                                    .find(|c| c.id == conversation_id_clone)
+                                    .rev()
+                                    .find(|m| m.id == local_id)
                                 {
-                                    if let Some(msg) = conversation.messages.iter_mut().rev().find(|m| m.id == local_id)
-                                    {
-                                        msg.id = id;
-                                    }
+                                    msg.id = id;
                                 }
-                            })
-                            .ok();
-                        }
-                        Err(e) => eprintln!("Failed to save user message: {}", e),
+                            }
+                        })
+                        .ok();
                     }
-                })
+                    Err(e) => eprintln!("Failed to save user message: {}", e),
+                }
+            })
             .detach();
         }
 
@@ -2319,11 +2383,7 @@ impl AppState {
     }
 
     pub fn apply_responsive_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
-        let result = collapse_for_width(
-            self.sidebar_responsive,
-            width,
-            self.sidebar_collapsed,
-        );
+        let result = collapse_for_width(self.sidebar_responsive, width, self.sidebar_collapsed);
         self.sidebar_responsive = result.next;
         if let Some(apply) = result.apply {
             if self.sidebar_collapsed != apply {
