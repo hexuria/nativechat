@@ -33,10 +33,10 @@ pub const EMOJI_CATEGORIES: [EmojiCat; 8] = [
         label: "People",
         icon: "👋",
         glyphs: &[
-            "👋", "🤚", "🖐️", "✋", "🖖", "👌", "🤌", "🤏", "✌️", "🤞", "🤟", "🤘", "🤙",
-            "👈", "👉", "👆", "🖕", "👇", "☝️", "👍", "👎", "✊", "👊", "🤛", "🤜", "👏", "🙌",
-            "🫶", "👐", "🤲", "🤝", "🙏", "✍️", "💅", "🤳", "💪", "🦾", "🦵", "🦶", "👂", "👃",
-            "🧠", "👀", "👁️", "👅", "👄", "💋", "👶", "👧", "🧒", "👦", "👩", "🧑", "👨", "👱",
+            "👋", "🤚", "🖐️", "✋", "🖖", "👌", "🤌", "🤏", "✌️", "🤞", "🤟", "🤘", "🤙", "👈",
+            "👉", "👆", "🖕", "👇", "☝️", "👍", "👎", "✊", "👊", "🤛", "🤜", "👏", "🙌", "🫶",
+            "👐", "🤲", "🤝", "🙏", "✍️", "💅", "🤳", "💪", "🦾", "🦵", "🦶", "👂", "👃", "🧠",
+            "👀", "👁️", "👅", "👄", "💋", "👶", "👧", "🧒", "👦", "👩", "🧑", "👨", "👱",
         ],
     },
     EmojiCat {
@@ -95,8 +95,9 @@ pub const EMOJI_CATEGORIES: [EmojiCat; 8] = [
         glyphs: &[
             "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🤎", "💔", "❣️", "💕", "💞", "💓",
             "💗", "💖", "💘", "💝", "💟", "☮️", "✝️", "☪️", "🕉️", "☸️", "✡️", "🔯", "🕎", "☯️",
-            "☦️", "🛐", "⛎", "♈", "♉", "♊", "♋", "♌", "♍", "♎", "♏", "♐", "♑", "♒", "♓",
-            "✅", "❌", "❓", "❗", "💯", "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚫", "⚪", "🟤",
+            "☦️", "🛐", "⛎", "♈", "♉", "♊", "♋", "♌", "♍", "♎", "♏", "♐", "♑", "♒",
+            "♓", "✅", "❌", "❓", "❗", "💯", "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚫", "⚪",
+            "🟤",
         ],
     },
 ];
@@ -154,36 +155,36 @@ pub fn reaction_strip(
         .border_color(theme.border)
         .rounded(px(14.))
         .shadow_lg()
-    .children(QUICK_REACTIONS.iter().map(|glyph| {
-        let glyph = *glyph;
-        glyph_btn(
-            SharedString::from(format!("react-{message_id}-{glyph}")),
-            glyph,
-            px(32.),
-            pick_emoji(&app, message_id.clone(), glyph.to_string()),
+        .children(QUICK_REACTIONS.iter().map(|glyph| {
+            let glyph = *glyph;
+            glyph_btn(
+                SharedString::from(format!("react-{message_id}-{glyph}")),
+                glyph,
+                px(32.),
+                pick_emoji(&app, message_id.clone(), glyph.to_string()),
+            )
+        }))
+        .child(
+            div()
+                .id(SharedString::from(format!("react-more-{message_id}")))
+                .size(px(32.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .border_1()
+                .border_color(muted.opacity(0.35))
+                .hover(|s| s.bg(rgb(0x888888).opacity(0.14)))
+                .child(Icon::new(IconName::Plus).size(px(14.)).text_color(muted))
+                .on_click({
+                    let on_more = on_more.clone();
+                    move |_, window, cx| {
+                        cx.stop_propagation();
+                        on_more(window, cx);
+                    }
+                }),
         )
-    }))
-    .child(
-        div()
-            .id(SharedString::from(format!("react-more-{message_id}")))
-            .size(px(32.))
-            .rounded_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .border_1()
-            .border_color(muted.opacity(0.35))
-            .hover(|s| s.bg(rgb(0x888888).opacity(0.14)))
-            .child(Icon::new(IconName::Plus).size(px(14.)).text_color(muted))
-            .on_click({
-                let on_more = on_more.clone();
-                move |_, window, cx| {
-                    cx.stop_propagation();
-                    on_more(window, cx);
-                }
-            }),
-    )
 }
 
 pub fn full_picker(
@@ -224,88 +225,88 @@ pub fn full_picker(
         .rounded(px(14.))
         .shadow_lg()
         .overflow_hidden()
-    .child(
-        h_flex()
-            .w_full()
-            .h(px(36.))
-            .px(px(10.))
-            .mt(px(8.))
-            .mx(px(8.))
-            .max_w(px(304.))
-            .items_center()
-            .gap(px(6.))
-            .rounded(px(8.))
-            .bg(theme.muted)
-            .child(Icon::new(IconName::Search).size(px(14.)).text_color(muted))
-            .child(
-                Input::new(&search)
-                    .appearance(false)
-                    .focus_bordered(false)
-                    .w_full(),
-            ),
-    )
-    .child(
-        div()
-            .px(px(12.))
-            .pt(px(10.))
-            .pb(px(4.))
-            .text_xs()
-            .text_color(muted)
-            .child(if q.is_empty() {
-                cat.label.to_string()
-            } else {
-                "Search results".into()
-            }),
-    )
-    .child(
-        div()
-            .id(SharedString::from(format!("emoji-grid-{message_id}")))
-            .flex_1()
-            .min_h_0()
-            .px(px(8.))
-            .overflow_y_scroll()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .children(glyphs.into_iter().map(|glyph| {
-                        glyph_btn(
-                            SharedString::from(format!("pick-{message_id}-{glyph}")),
-                            glyph,
-                            px(34.),
-                            pick_emoji(&app, message_id.clone(), glyph.to_string()),
-                        )
-                    })),
-            ),
-    )
-    .child(
-        h_flex()
-            .w_full()
-            .h(px(40.))
-            .px(px(6.))
-            .items_center()
-            .justify_between()
-            .border_t_1()
-            .border_color(theme.border)
-            .children(EMOJI_CATEGORIES.iter().enumerate().map(|(ix, cat)| {
-                let on_category = on_category.clone();
-                let active = q.is_empty() && ix == category;
-                div()
-                    .id(SharedString::from(format!("emoji-cat-{ix}")))
-                    .size(px(28.))
-                    .rounded(px(8.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .when(active, |this| this.bg(selected))
-                    .hover(move |s| s.bg(hover))
-                    .child(div().text_size(px(14.)).child(cat.icon.to_string()))
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        on_category(ix, cx);
-                    })
-            })),
-    )
+        .child(
+            h_flex()
+                .w_full()
+                .h(px(36.))
+                .px(px(10.))
+                .mt(px(8.))
+                .mx(px(8.))
+                .max_w(px(304.))
+                .items_center()
+                .gap(px(6.))
+                .rounded(px(8.))
+                .bg(theme.muted)
+                .child(Icon::new(IconName::Search).size(px(14.)).text_color(muted))
+                .child(
+                    Input::new(&search)
+                        .appearance(false)
+                        .focus_bordered(false)
+                        .w_full(),
+                ),
+        )
+        .child(
+            div()
+                .px(px(12.))
+                .pt(px(10.))
+                .pb(px(4.))
+                .text_xs()
+                .text_color(muted)
+                .child(if q.is_empty() {
+                    cat.label.to_string()
+                } else {
+                    "Search results".into()
+                }),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("emoji-grid-{message_id}")))
+                .flex_1()
+                .min_h_0()
+                .px(px(8.))
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .children(glyphs.into_iter().map(|glyph| {
+                            glyph_btn(
+                                SharedString::from(format!("pick-{message_id}-{glyph}")),
+                                glyph,
+                                px(34.),
+                                pick_emoji(&app, message_id.clone(), glyph.to_string()),
+                            )
+                        })),
+                ),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .h(px(40.))
+                .px(px(6.))
+                .items_center()
+                .justify_between()
+                .border_t_1()
+                .border_color(theme.border)
+                .children(EMOJI_CATEGORIES.iter().enumerate().map(|(ix, cat)| {
+                    let on_category = on_category.clone();
+                    let active = q.is_empty() && ix == category;
+                    div()
+                        .id(SharedString::from(format!("emoji-cat-{ix}")))
+                        .size(px(28.))
+                        .rounded(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .when(active, |this| this.bg(selected))
+                        .hover(move |s| s.bg(hover))
+                        .child(div().text_size(px(14.)).child(cat.icon.to_string()))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            on_category(ix, cx);
+                        })
+                })),
+        )
 }

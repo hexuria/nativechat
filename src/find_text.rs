@@ -56,7 +56,11 @@ pub fn project_hits(texts: impl IntoIterator<Item = impl AsRef<str>>, query: &st
     hits
 }
 
-pub fn marks_for_row(row: usize, hits: &[FindHit], current: Option<usize>) -> Vec<(Range<usize>, bool)> {
+pub fn marks_for_row(
+    row: usize,
+    hits: &[FindHit],
+    current: Option<usize>,
+) -> Vec<(Range<usize>, bool)> {
     hits.iter()
         .enumerate()
         .filter(|(_, hit)| hit.row == row)

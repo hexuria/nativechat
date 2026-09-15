@@ -1,11 +1,11 @@
 use crate::state::AppState;
+use gpui_kit::component::ActiveTheme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use std::f32::consts::PI;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use gpui_kit::component::ActiveTheme;
 
 const CIRCLE_RADIUS: f32 = 150.0;
 
@@ -56,24 +56,23 @@ impl CircularVoiceViz {
         cx.new(|cx| {
             // Start animation loop at 60fps
             cx.spawn(async move |view: WeakEntity<Self>, cx: &mut AsyncApp| {
-                        loop {
-                            // 60 FPS target
-                            cx.background_executor()
-                                .timer(Duration::from_millis(16))
-                                .await;
+                loop {
+                    // 60 FPS target
+                    cx.background_executor()
+                        .timer(Duration::from_millis(16))
+                        .await;
 
-                            let result = view.update(cx, |this, cx| {
-                                this.update_animation(cx);
-                                cx.notify();
-                            });
+                    let result = view.update(cx, |this, cx| {
+                        this.update_animation(cx);
+                        cx.notify();
+                    });
 
-                            if result.is_err() {
-                                // View dropped
-                                break;
-                            }
-                        }
-                    },
-            )
+                    if result.is_err() {
+                        // View dropped
+                        break;
+                    }
+                }
+            })
             .detach();
 
             Self {

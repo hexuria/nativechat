@@ -29,9 +29,7 @@ pub struct BotFinder {
 
 impl BotFinder {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search or create Bots")
-        });
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search or create Bots"));
         cx.observe(&state, |this, state, cx| {
             let open = state.read(cx).bot_finder_open;
             if open && !this.was_open {
@@ -102,10 +100,12 @@ impl BotFinder {
     fn activate(&mut self, entry: FinderEntry, cx: &mut Context<Self>) {
         match entry {
             FinderEntry::CreateNew => {
-                self.state.update(cx, |state, cx| state.hire_agent("New Bot", cx));
+                self.state
+                    .update(cx, |state, cx| state.hire_agent("New Bot", cx));
             }
             FinderEntry::CreateNamed(name) => {
-                self.state.update(cx, |state, cx| state.hire_agent(&name, cx));
+                self.state
+                    .update(cx, |state, cx| state.hire_agent(&name, cx));
             }
             FinderEntry::Bot { id, .. } => {
                 self.state.update(cx, |state, cx| {
@@ -178,11 +178,7 @@ impl Render for BotFinder {
         let muted = theme.muted_foreground;
         let fg = theme.foreground;
         let border = theme.border;
-        let panel = if dark {
-            rgb(0x2a2a2a)
-        } else {
-            rgb(0xffffff)
-        };
+        let panel = if dark { rgb(0x2a2a2a) } else { rgb(0xffffff) };
         let hover: Hsla = rgb(0x777777).opacity(0.16).into();
         let query = self.query.read(cx).value().to_string();
         let coworkers = self.state.read(cx).ranked_coworkers();
@@ -210,12 +206,7 @@ impl Render for BotFinder {
                             .flex_shrink_0()
                             .border_b_1()
                             .border_color(border)
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(muted)
-                                    .child("To:"),
-                            )
+                            .child(div().text_sm().text_color(muted).child("To:"))
                             .child(
                                 div().flex_1().min_w(px(0.)).child(
                                     field_input(&self.query)
@@ -237,55 +228,47 @@ impl Render for BotFinder {
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.dispatch_action(&CloseBotFinder);
                                     })
-                                    .child(
-                                        Icon::default()
-                                            .path("icons/close.svg")
-                                            .size(px(14.)),
-                                    ),
+                                    .child(Icon::default().path("icons/close.svg").size(px(14.))),
                             ),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .w_full()
-                            .p(px(12.))
-                            .child(
-                                v_flex()
-                                    .id("bot-finder-menu")
-                                    .w(px(420.))
-                                    .max_h(px(420.))
-                                    .overflow_y_scroll()
-                                    .rounded(px(12.))
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(panel)
-                                    .shadow_lg()
-                                    .py(px(6.))
-                                    .children({
-                                        let mut bot_shortcut = 0usize;
-                                        items.into_iter().enumerate().map(move |(i, entry)| {
-                                            let shortcut = if matches!(entry, FinderEntry::Bot { .. })
-                                                && bot_shortcut < 9
-                                            {
-                                                bot_shortcut += 1;
-                                                Some(bot_shortcut)
-                                            } else {
-                                                None
-                                            };
-                                            finder_row(
-                                                i,
-                                                entry,
-                                                shortcut,
-                                                dark,
-                                                fg,
-                                                muted,
-                                                hover,
-                                                view.clone(),
-                                                query.clone(),
-                                            )
-                                        })
-                                    }),
-                            ),
+                        div().flex_1().w_full().p(px(12.)).child(
+                            v_flex()
+                                .id("bot-finder-menu")
+                                .w(px(420.))
+                                .max_h(px(420.))
+                                .overflow_y_scroll()
+                                .rounded(px(12.))
+                                .border_1()
+                                .border_color(border)
+                                .bg(panel)
+                                .shadow_lg()
+                                .py(px(6.))
+                                .children({
+                                    let mut bot_shortcut = 0usize;
+                                    items.into_iter().enumerate().map(move |(i, entry)| {
+                                        let shortcut = if matches!(entry, FinderEntry::Bot { .. })
+                                            && bot_shortcut < 9
+                                        {
+                                            bot_shortcut += 1;
+                                            Some(bot_shortcut)
+                                        } else {
+                                            None
+                                        };
+                                        finder_row(
+                                            i,
+                                            entry,
+                                            shortcut,
+                                            dark,
+                                            fg,
+                                            muted,
+                                            hover,
+                                            view.clone(),
+                                            query.clone(),
+                                        )
+                                    })
+                                }),
+                        ),
                     ),
             )
     }

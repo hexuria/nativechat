@@ -38,17 +38,83 @@ pub struct AvatarColor {
 }
 
 pub const AVATAR_COLORS: [AvatarColor; 11] = [
-    AvatarColor { id: "black", label: "Black", swatch: 0x000000, light: 0x000000, dark: 0xFFFFFF },
-    AvatarColor { id: "brown", label: "Brown", swatch: 0x936439, light: 0xA27952, dark: 0x855C36 },
-    AvatarColor { id: "red", label: "Red", swatch: 0xFF263C, light: 0xFF3E51, dark: 0xE02135 },
-    AvatarColor { id: "orange", label: "Orange", swatch: 0xFF6700, light: 0xFF781C, dark: 0xFF6700 },
-    AvatarColor { id: "yellow", label: "Yellow", swatch: 0xFF9800, light: 0xFFAF38, dark: 0xFF9800 },
-    AvatarColor { id: "green", label: "Green", swatch: 0x00C972, light: 0x00C972, dark: 0x009957 },
-    AvatarColor { id: "cyan", label: "Cyan", swatch: 0x00BCA6, light: 0x1CC3B0, dark: 0x00A592 },
-    AvatarColor { id: "blue", label: "Blue", swatch: 0x1084FE, light: 0x2A92FE, dark: 0x0E74E0 },
-    AvatarColor { id: "violet", label: "Violet", swatch: 0x9159FE, light: 0xA97EFE, dark: 0x804EE0 },
-    AvatarColor { id: "magenta", label: "Magenta", swatch: 0xFF309B, light: 0xFF5EB1, dark: 0xE02A88 },
-    AvatarColor { id: "gray", label: "Gray", swatch: 0x777777, light: 0x959595, dark: 0x777777 },
+    AvatarColor {
+        id: "black",
+        label: "Black",
+        swatch: 0x000000,
+        light: 0x000000,
+        dark: 0xFFFFFF,
+    },
+    AvatarColor {
+        id: "brown",
+        label: "Brown",
+        swatch: 0x936439,
+        light: 0xA27952,
+        dark: 0x855C36,
+    },
+    AvatarColor {
+        id: "red",
+        label: "Red",
+        swatch: 0xFF263C,
+        light: 0xFF3E51,
+        dark: 0xE02135,
+    },
+    AvatarColor {
+        id: "orange",
+        label: "Orange",
+        swatch: 0xFF6700,
+        light: 0xFF781C,
+        dark: 0xFF6700,
+    },
+    AvatarColor {
+        id: "yellow",
+        label: "Yellow",
+        swatch: 0xFF9800,
+        light: 0xFFAF38,
+        dark: 0xFF9800,
+    },
+    AvatarColor {
+        id: "green",
+        label: "Green",
+        swatch: 0x00C972,
+        light: 0x00C972,
+        dark: 0x009957,
+    },
+    AvatarColor {
+        id: "cyan",
+        label: "Cyan",
+        swatch: 0x00BCA6,
+        light: 0x1CC3B0,
+        dark: 0x00A592,
+    },
+    AvatarColor {
+        id: "blue",
+        label: "Blue",
+        swatch: 0x1084FE,
+        light: 0x2A92FE,
+        dark: 0x0E74E0,
+    },
+    AvatarColor {
+        id: "violet",
+        label: "Violet",
+        swatch: 0x9159FE,
+        light: 0xA97EFE,
+        dark: 0x804EE0,
+    },
+    AvatarColor {
+        id: "magenta",
+        label: "Magenta",
+        swatch: 0xFF309B,
+        light: 0xFF5EB1,
+        dark: 0xE02A88,
+    },
+    AvatarColor {
+        id: "gray",
+        label: "Gray",
+        swatch: 0x777777,
+        light: 0x959595,
+        dark: 0x777777,
+    },
 ];
 
 const FALLBACK_COLORS: [&str; 10] = [
@@ -90,7 +156,11 @@ pub fn collapse_for_width(
     if narrow == state.was_narrow {
         return ResponsiveCollapseResult {
             next: ResponsiveCollapse {
-                preferred: if narrow { state.preferred } else { is_collapsed },
+                preferred: if narrow {
+                    state.preferred
+                } else {
+                    is_collapsed
+                },
                 was_narrow: narrow,
             },
             apply: None,
@@ -151,7 +221,11 @@ pub fn chat_column_width(
         return window_width.max(0.0);
     }
     let left = sidebar_width(hidden, collapsed, expanded);
-    let right = if right_pane_open { INFO_PANE_WIDTH } else { 0.0 };
+    let right = if right_pane_open {
+        INFO_PANE_WIDTH
+    } else {
+        0.0
+    };
     (window_width - left - right).max(0.0)
 }
 
@@ -346,6 +420,9 @@ mod tests {
     #[test]
     fn known_shape_wins_over_hash() {
         assert_eq!(resolve_persona_shape("cw_1", Some("hex")), "hex");
-        assert_eq!(resolve_persona_shape("cw_1", Some("nope")), resolve_persona_shape("cw_1", None));
+        assert_eq!(
+            resolve_persona_shape("cw_1", Some("nope")),
+            resolve_persona_shape("cw_1", None)
+        );
     }
 }

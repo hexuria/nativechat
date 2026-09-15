@@ -1,7 +1,7 @@
 use crate::state::AppState;
+use gpui_kit::component::{ActiveTheme, h_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use gpui_kit::component::{ActiveTheme, h_flex};
 
 /// Renders a popover menu item with hover and click functionality
 pub fn render_popover_item<V: 'static>(

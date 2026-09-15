@@ -1,6 +1,4 @@
-use crate::chrome::{
-    AVATAR_COLORS, AVATAR_SHAPES, AVATAR_TRIGGER_PX, INFO_PANE_WIDTH,
-};
+use crate::chrome::{AVATAR_COLORS, AVATAR_SHAPES, AVATAR_TRIGGER_PX, INFO_PANE_WIDTH};
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
 use crate::opengrok::{CoworkerPatch, ModelEntry};
@@ -182,11 +180,7 @@ fn settings_input(state: &Entity<InputState>) -> Input {
 }
 
 fn card(fill: Hsla) -> Div {
-    div()
-        .w_full()
-        .p(px(8.))
-        .rounded(px(12.))
-        .bg(fill)
+    div().w_full().p(px(8.)).rounded(px(12.)).bg(fill)
 }
 
 fn notify_switch(on: bool) -> Div {
@@ -218,31 +212,20 @@ impl Render for AgentSettings {
         let dark = theme.is_dark();
         let muted = theme.muted_foreground;
         let card_fill: Hsla = rgb(0x777777).opacity(0.173).into();
-        let (
-            id,
-            model,
-            shape,
-            color,
-            notify,
-            catalogue,
-            note,
-            error,
-            model_open,
-            editor_open,
-        ) = {
+        let (id, model, shape, color, notify, catalogue, note, error, model_open, editor_open) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
                 .as_ref()
                 .and_then(|id| state.coworkers.iter().find(|c| &c.id == id));
             (
-                coworker.map(|c| c.id.clone()).unwrap_or_else(|| "agent".into()),
+                coworker
+                    .map(|c| c.id.clone())
+                    .unwrap_or_else(|| "agent".into()),
                 coworker.map(|c| c.model.clone()).unwrap_or_default(),
                 coworker.and_then(|c| c.avatar_shape.clone()),
                 coworker.and_then(|c| c.avatar_color.clone()),
-                coworker
-                    .and_then(|c| c.notify_on_updates)
-                    .unwrap_or(false),
+                coworker.and_then(|c| c.notify_on_updates).unwrap_or(false),
                 state.model_catalogue.models.clone(),
                 state.model_catalogue.note.clone(),
                 state.auth_error.clone(),
@@ -641,11 +624,7 @@ fn avatar_editor_panel(
     dark: bool,
     theme: gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    let panel_bg = if dark {
-        rgb(0x1c1c1c)
-    } else {
-        rgb(0xffffff)
-    };
+    let panel_bg = if dark { rgb(0x1c1c1c) } else { rgb(0xffffff) };
     v_flex()
         .id("avatar-editor")
         .w(px(PANE_INNER))
@@ -768,8 +747,7 @@ fn avatar_editor_panel(
                             let app = app.clone();
                             let id = candidate.id;
                             let group = SharedString::from(format!("color-{id}"));
-                            let halo_fill: Hsla =
-                                rgb(candidate.swatch).opacity(0.32).into();
+                            let halo_fill: Hsla = rgb(candidate.swatch).opacity(0.32).into();
                             div()
                                 .id(SharedString::from(format!("color-{id}")))
                                 .relative()
@@ -799,12 +777,7 @@ fn avatar_editor_panel(
                                         .opacity(if selected { 1. } else { 0. })
                                         .group_hover(group, |s| s.opacity(1.)),
                                 )
-                                .child(
-                                    div()
-                                        .size(px(24.))
-                                        .rounded_full()
-                                        .bg(rgb(candidate.swatch)),
-                                )
+                                .child(div().size(px(24.)).rounded_full().bg(rgb(candidate.swatch)))
                         })),
                 ),
         )
@@ -817,11 +790,7 @@ fn model_picker_panel(
     dark: bool,
     theme: gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    let list_bg = if dark {
-        rgb(0x1c1c1c)
-    } else {
-        rgb(0xffffff)
-    };
+    let list_bg = if dark { rgb(0x1c1c1c) } else { rgb(0xffffff) };
     v_flex()
         .id("agent-model-list")
         .w(px(PANE_INNER))
@@ -870,11 +839,7 @@ fn model_picker_panel(
 }
 
 impl AgentSettings {
-    fn auto_review_body(
-        &self,
-        mode: AutoReviewMode,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn auto_review_body(&self, mode: AutoReviewMode, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .pt(px(12.))
             .gap(px(8.))

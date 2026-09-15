@@ -1,19 +1,19 @@
 use crate::components::agent_settings::AgentSettings;
 use crate::components::app_settings::AppSettings;
 use crate::components::bot_finder::BotFinder;
-use crate::components::command_palette::CommandPalette;
-use crate::components::hidden_bots::hidden_bots_overlay;
-use crate::components::computer::ComputerPane;
-use crate::state::RightPane;
 use crate::components::chat::ChatView;
+use crate::components::command_palette::CommandPalette;
+use crate::components::computer::ComputerPane;
+use crate::components::hidden_bots::hidden_bots_overlay;
 use crate::components::login::LoginView;
 use crate::components::sidebar::SidebarView;
-use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::*;
+use crate::state::RightPane;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme, Disableable, v_flex};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 
-use crate::chrome::{chrome_floats, sidebar_width, INFO_PANE_WIDTH};
+use crate::chrome::{INFO_PANE_WIDTH, chrome_floats, sidebar_width};
 use crate::state::AppState;
 
 fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
@@ -56,7 +56,10 @@ impl ShellRev {
                 RightPane::Settings => 1,
                 RightPane::Computer => 2,
             },
-            computer_editor: matches!(state.computer_view, crate::state::ComputerView::Editor { .. }),
+            computer_editor: matches!(
+                state.computer_view,
+                crate::state::ComputerView::Editor { .. }
+            ),
             model_picker: state.model_picker_open,
             avatar_editor: state.avatar_editor_open,
             app_settings: state.is_app_settings_open,
@@ -292,8 +295,7 @@ impl Render for Layout {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                        this.resize_drag =
-                                            Some((f32::from(ev.position.x), left));
+                                        this.resize_drag = Some((f32::from(ev.position.x), left));
                                         cx.notify();
                                     }),
                                 ),
@@ -309,9 +311,7 @@ impl Render for Layout {
                     .relative()
                     .overflow_hidden()
                     .child(main)
-                    .when(bot_finder_open, |this| {
-                        this.child(self.bot_finder.clone())
-                    }),
+                    .when(bot_finder_open, |this| this.child(self.bot_finder.clone())),
             )
             .when(!floats && right_open, |this| {
                 this.child(
@@ -371,9 +371,7 @@ impl Render for Layout {
                         .occlude()
                         .overflow_hidden()
                         .child(match right_pane {
-                            RightPane::Settings => {
-                                self.agent_settings.clone().into_any_element()
-                            }
+                            RightPane::Settings => self.agent_settings.clone().into_any_element(),
                             RightPane::Computer => self.computer.clone().into_any_element(),
                             RightPane::Closed => div().into_any_element(),
                         }),
@@ -436,11 +434,7 @@ fn empty_agent_pane(
         .child(
             div().id("create-first-bot").child(
                 Button::new("create-first-bot-btn")
-                    .label(if hiring {
-                        "Creating…"
-                    } else {
-                        "New Bot"
-                    })
+                    .label(if hiring { "Creating…" } else { "New Bot" })
                     .primary()
                     .disabled(hiring)
                     .on_click(move |_, _, cx| {

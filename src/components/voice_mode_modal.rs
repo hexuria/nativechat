@@ -1,9 +1,9 @@
 use crate::components::circular_voice_viz::CircularVoiceViz;
 use crate::state::{AppState, VoiceStatus};
 use gpui_kit::InteractiveElement;
+use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 
 pub fn render_voice_mode_modal<V: 'static>(
     state: Entity<AppState>,

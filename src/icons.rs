@@ -1,5 +1,5 @@
-use gpui_kit::assets::IconNamed;
 use gpui_kit::SharedString;
+use gpui_kit::assets::IconNamed;
 
 /// App-specific icons that are not in the GPUI Kit Lucide catalog.
 ///

@@ -1,10 +1,8 @@
 use crate::actions::{
     About, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind, FindNext, FindPrev,
     FocusChatInput, Hide, HideOthers, Minimize, NavBack, NavForward, NewChat, OpenCommandPalette,
-    OpenSettings, PickFinderItem, Search, ShowAll,
-    ToggleComputerPane,
-    ToggleDebugMarkdown, ToggleFps, ToggleAgentSettings, ToggleMiniSidebar, ToggleSidebar,
-    ToggleTheme, Zoom,
+    OpenSettings, PickFinderItem, Search, ShowAll, ToggleAgentSettings, ToggleComputerPane,
+    ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
 use gpui_kit::prelude::*;
@@ -83,10 +81,7 @@ impl RootView {
         };
         for posted in mailbox.take() {
             if let gpui_agent::Op::Screenshot {
-                path,
-                mode,
-                target,
-                ..
+                path, mode, target, ..
             } = &posted.request.op
             {
                 let response = if mode.is_scrolled() {

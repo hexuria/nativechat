@@ -1,14 +1,12 @@
 use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
-    About, BranchInNewChat, ClearSearch, CloseBotFinder, CloseSettings, CopyMessage, Hide,
-    HideOthers, Minimize, NewChat, OpenSettings, PickFinderItem, Quit, ReadAloud, ReportMessage,
-    CloseCommandPalette, CloseFind, FindNext, FindPrev, FocusChatInput, NavBack, NavForward,
-    OpenCommandPalette, PaletteNextTab, PalettePrevTab, PaletteSelectNext, PaletteSelectPrev,
-    Search, ShowAll, ToggleAgentSettings,
-    ToggleComputerPane, ToggleDebugMarkdown, ToggleFps,
-    ToggleMiniSidebar,
-    ToggleSidebar, ToggleTheme, Zoom,
+    About, BranchInNewChat, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind,
+    CloseSettings, CopyMessage, FindNext, FindPrev, FocusChatInput, Hide, HideOthers, Minimize,
+    NavBack, NavForward, NewChat, OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab,
+    PaletteSelectNext, PaletteSelectPrev, PickFinderItem, Quit, ReadAloud, ReportMessage, Search,
+    ShowAll, ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown, ToggleFps,
+    ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;

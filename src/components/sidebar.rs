@@ -6,7 +6,7 @@ use crate::icons::NativeIcon;
 use crate::state::{AppSettingsTab, AppState, Conversation};
 use chrono::NaiveDateTime;
 use gpui_kit::assets::IconNamed;
-use gpui_kit::base::{Align, ElementExt as _, Placement, Positioner, POPUP_PRIORITY};
+use gpui_kit::base::{Align, ElementExt as _, POPUP_PRIORITY, Placement, Positioner};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -53,9 +53,8 @@ impl SidebarRev {
                 .ranked_coworkers()
                 .into_iter()
                 .map(|c| {
-                    let (preview, time) = rail_preview(
-                        state.conversations.iter().find(|conv| conv.id == c.id),
-                    );
+                    let (preview, time) =
+                        rail_preview(state.conversations.iter().find(|conv| conv.id == c.id));
                     RailCoworker {
                         id: c.id.clone(),
                         name: c.name.clone(),
@@ -169,7 +168,8 @@ impl SidebarView {
     }
 
     pub fn focus_search(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_input.update(cx, |input, cx| input.focus(window, cx));
+        self.search_input
+            .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
 
@@ -322,42 +322,46 @@ impl Render for SidebarView {
                                         rows.retain(|c| !hidden.contains(&c.id));
                                         rows.sort_by_key(|c| !pinned.contains(&c.id));
                                         rows.into_iter().map(move |c| {
-                                        let id = c.id.clone();
-                                        let name = c.name.clone();
-                                        let is_active = Some(id.clone()) == active_coworker;
-                                        let is_renaming = renaming.as_ref() == Some(&id);
-                                        let is_pinned = pinned.contains(&id);
-                                        let (preview, when) = rail_preview(
-                                            conversations.iter().find(|conv| conv.id == id),
-                                        );
-                                        let view = list_view.clone();
-                                        let app = app.clone();
-                                        let row = row()
-                                            .id(SharedString::from(format!("coworker-{id}")))
-                                            .when(collapsed, |this| {
-                                                this.w(px(SIDEBAR_ROW))
-                                                    .justify_center()
-                                                    .px(px(9.))
-                                                    .rounded(px(10.))
-                                            })
-                                            .when(!collapsed, |this| {
-                                                this.w_full()
-                                                    .px(px(9.))
-                                                    .gap(px(9.))
-                                                    .rounded(px(10.))
-                                            })
-                                            .cursor_pointer()
-                                            .when(!collapsed, |this| {
-                                                this.hover(|s| s.bg(rail_hover)).when(is_active, |this| {
-                                                    this.bg(rail_hover)
-                                                })
-                                            })
-                                            .on_mouse_down(MouseButton::Left, {
-                                                let id = id.clone();
-                                                let view = view.clone();
-                                                move |_, _, cx| {
-                                                    view.update(cx, |this, cx| {
-                                                        this.state.update(cx, |state, cx| {
+                                            let id = c.id.clone();
+                                            let name = c.name.clone();
+                                            let is_active = Some(id.clone()) == active_coworker;
+                                            let is_renaming = renaming.as_ref() == Some(&id);
+                                            let is_pinned = pinned.contains(&id);
+                                            let (preview, when) = rail_preview(
+                                                conversations.iter().find(|conv| conv.id == id),
+                                            );
+                                            let view = list_view.clone();
+                                            let app = app.clone();
+                                            let row =
+                                                row()
+                                                    .id(SharedString::from(format!(
+                                                        "coworker-{id}"
+                                                    )))
+                                                    .when(collapsed, |this| {
+                                                        this.w(px(SIDEBAR_ROW))
+                                                            .justify_center()
+                                                            .px(px(9.))
+                                                            .rounded(px(10.))
+                                                    })
+                                                    .when(!collapsed, |this| {
+                                                        this.w_full()
+                                                            .px(px(9.))
+                                                            .gap(px(9.))
+                                                            .rounded(px(10.))
+                                                    })
+                                                    .cursor_pointer()
+                                                    .when(!collapsed, |this| {
+                                                        this.hover(|s| s.bg(rail_hover))
+                                                            .when(is_active, |this| {
+                                                                this.bg(rail_hover)
+                                                            })
+                                                    })
+                                                    .on_mouse_down(MouseButton::Left, {
+                                                        let id = id.clone();
+                                                        let view = view.clone();
+                                                        move |_, _, cx| {
+                                                            view.update(cx, |this, cx| {
+                                                                this.state.update(cx, |state, cx| {
                                                             if state.renaming_coworker_id.as_ref()
                                                                 != Some(&id)
                                                             {
@@ -365,113 +369,116 @@ impl Render for SidebarView {
                                                             }
                                                             state.select_coworker(id.clone(), cx);
                                                         });
-                                                    });
-                                                }
-                                            })
-                                            .context_menu({
-                                                let app = app.clone();
-                                                let view = view.clone();
-                                                let id = id.clone();
-                                                let name = name.clone();
-                                                move |menu, _, _cx| {
-                                                    agent_menu(
-                                                        menu,
-                                                        app.clone(),
-                                                        view.clone(),
-                                                        id.clone(),
-                                                        name.clone(),
-                                                        is_pinned,
-                                                    )
-                                                }
-                                            })
-                                            .child(
-                                                PersonaMark::new(id.clone())
-                                                    .shape(c.avatar_shape.clone())
-                                                    .color(c.avatar_color.clone())
-                                                    .size(px(AVATAR_PX))
-                                                    .lit(is_active),
-                                            );
-                                        let row = if collapsed {
-                                            row.into_any_element()
-                                        } else if is_renaming {
-                                            row.child(
-                                                div()
-                                                    .min_w(px(0.))
-                                                    .flex_1()
+                                                            });
+                                                        }
+                                                    })
+                                                    .context_menu({
+                                                        let app = app.clone();
+                                                        let view = view.clone();
+                                                        let id = id.clone();
+                                                        let name = name.clone();
+                                                        move |menu, _, _cx| {
+                                                            agent_menu(
+                                                                menu,
+                                                                app.clone(),
+                                                                view.clone(),
+                                                                id.clone(),
+                                                                name.clone(),
+                                                                is_pinned,
+                                                            )
+                                                        }
+                                                    })
                                                     .child(
+                                                        PersonaMark::new(id.clone())
+                                                            .shape(c.avatar_shape.clone())
+                                                            .color(c.avatar_color.clone())
+                                                            .size(px(AVATAR_PX))
+                                                            .lit(is_active),
+                                                    );
+                                            let row = if collapsed {
+                                                row.into_any_element()
+                                            } else if is_renaming {
+                                                row.child(
+                                                    div().min_w(px(0.)).flex_1().child(
                                                         Input::new(&rename_input)
                                                             .appearance(false)
                                                             .focus_bordered(false)
                                                             .h(px(28.)),
                                                     ),
-                                            )
-                                            .into_any_element()
-                                        } else {
-                                            row.child(
-                                                div()
-                                                    .min_w(px(0.))
-                                                    .flex_1()
-                                                    .text_sm()
-                                                    .truncate()
-                                                    .child(name.clone()),
-                                            )
-                                            .into_any_element()
-                                        };
-                                        div()
-                                            .id(SharedString::from(format!("coworker-hover-{id}")))
-                                            .flex_shrink_0()
-                                            .when(!collapsed, |this| this.w_full())
-                                            .on_hover({
-                                                let view = view.clone();
-                                                let id = id.clone();
-                                                let name = name.clone();
-                                                let shape = c.avatar_shape.clone();
-                                                let color = c.avatar_color.clone();
-                                                move |hovered, _, cx| {
-                                                    view.update(cx, |this, cx| {
-                                                        if *hovered {
-                                                            let bounds = this
-                                                                .rail_hover
-                                                                .as_ref()
-                                                                .filter(|h| h.id == id)
-                                                                .map(|h| h.bounds)
-                                                                .unwrap_or_else(Bounds::default);
-                                                            this.show_rail_hover(
-                                                                RailHover {
-                                                                    id: id.clone(),
-                                                                    bounds,
-                                                                    name: name.clone(),
-                                                                    shape: shape.clone(),
-                                                                    color: color.clone(),
-                                                                    preview: preview.clone(),
-                                                                    time: when.clone(),
-                                                                },
-                                                                cx,
-                                                            );
-                                                        } else {
-                                                            this.schedule_hide_rail_hover(cx);
-                                                        }
-                                                    });
-                                                }
-                                            })
-                                            .on_prepaint({
-                                                let view = view.clone();
-                                                let id = id.clone();
-                                                move |bounds, _, cx| {
-                                                    view.update(cx, |this, cx| {
-                                                        if let Some(hover) = this.rail_hover.as_mut()
-                                                            && hover.id == id
-                                                            && hover.bounds != bounds
-                                                        {
-                                                            hover.bounds = bounds;
-                                                            cx.notify();
-                                                        }
-                                                    });
-                                                }
-                                            })
-                                            .child(row)
-                                            .into_any_element()
-                                    })})
+                                                )
+                                                .into_any_element()
+                                            } else {
+                                                row.child(
+                                                    div()
+                                                        .min_w(px(0.))
+                                                        .flex_1()
+                                                        .text_sm()
+                                                        .truncate()
+                                                        .child(name.clone()),
+                                                )
+                                                .into_any_element()
+                                            };
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "coworker-hover-{id}"
+                                                )))
+                                                .flex_shrink_0()
+                                                .when(!collapsed, |this| this.w_full())
+                                                .on_hover({
+                                                    let view = view.clone();
+                                                    let id = id.clone();
+                                                    let name = name.clone();
+                                                    let shape = c.avatar_shape.clone();
+                                                    let color = c.avatar_color.clone();
+                                                    move |hovered, _, cx| {
+                                                        view.update(cx, |this, cx| {
+                                                            if *hovered {
+                                                                let bounds = this
+                                                                    .rail_hover
+                                                                    .as_ref()
+                                                                    .filter(|h| h.id == id)
+                                                                    .map(|h| h.bounds)
+                                                                    .unwrap_or_else(
+                                                                        Bounds::default,
+                                                                    );
+                                                                this.show_rail_hover(
+                                                                    RailHover {
+                                                                        id: id.clone(),
+                                                                        bounds,
+                                                                        name: name.clone(),
+                                                                        shape: shape.clone(),
+                                                                        color: color.clone(),
+                                                                        preview: preview.clone(),
+                                                                        time: when.clone(),
+                                                                    },
+                                                                    cx,
+                                                                );
+                                                            } else {
+                                                                this.schedule_hide_rail_hover(cx);
+                                                            }
+                                                        });
+                                                    }
+                                                })
+                                                .on_prepaint({
+                                                    let view = view.clone();
+                                                    let id = id.clone();
+                                                    move |bounds, _, cx| {
+                                                        view.update(cx, |this, cx| {
+                                                            if let Some(hover) =
+                                                                this.rail_hover.as_mut()
+                                                                && hover.id == id
+                                                                && hover.bounds != bounds
+                                                            {
+                                                                hover.bounds = bounds;
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    }
+                                                })
+                                                .child(row)
+                                                .into_any_element()
+                                        })
+                                    })
                                     .when(!collapsed && !hidden_ids.is_empty(), |this| {
                                         this.child(self.hidden_bots_row(
                                             hidden_ids.len(),
@@ -667,7 +674,8 @@ impl SidebarView {
                 let view = view.clone();
                 move |_, _, cx| {
                     view.update(cx, |this, cx| {
-                        this.state.update(cx, |state, cx| state.open_hidden_bots(cx));
+                        this.state
+                            .update(cx, |state, cx| state.open_hidden_bots(cx));
                     });
                 }
             })
@@ -676,12 +684,7 @@ impl SidebarView {
                     .w_full()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("Hidden Bots"),
-                    )
+                    .child(div().text_sm().text_color(muted).child("Hidden Bots"))
                     .child(if show_chevron {
                         Icon::new(IconName::ChevronRight)
                             .size(px(14.))
@@ -731,7 +734,11 @@ impl SidebarView {
                             });
                         });
                     })
-                    .child(Icon::new(IconName::Plus).size(px(16.)).text_color(icon_color)),
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(px(16.))
+                            .text_color(icon_color),
+                    ),
             )
         } else {
             track.px(px(12.)).child(
@@ -759,12 +766,7 @@ impl SidebarView {
                             .size(px(16.))
                             .text_color(icon_color),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(icon_color)
-                            .child("Search"),
-                    ),
+                    .child(div().text_sm().text_color(icon_color).child("Search")),
             )
         }
     }
@@ -883,11 +885,7 @@ impl SidebarView {
                                 )
                                 .when(!email.is_empty(), |this| {
                                     this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .truncate()
-                                            .child(email),
+                                        div().text_xs().text_color(muted).truncate().child(email),
                                     )
                                 }),
                         )
@@ -987,11 +985,7 @@ fn agent_hover_card(
     foreground: Hsla,
     border: Hsla,
 ) -> impl IntoElement {
-    let panel_bg = if dark {
-        rgb(0x1c1c1c)
-    } else {
-        rgb(0xffffff)
-    };
+    let panel_bg = if dark { rgb(0x1c1c1c) } else { rgb(0xffffff) };
     v_flex()
         .id(SharedString::from(format!("coworker-preview-{id}")))
         .w(px(260.))
@@ -1035,13 +1029,7 @@ fn agent_hover_card(
                     )
                 }),
         )
-        .child(
-            div()
-                .w_full()
-                .text_xs()
-                .text_color(muted)
-                .child(preview),
-        )
+        .child(div().w_full().text_xs().text_color(muted).child(preview))
 }
 
 fn agent_menu(
@@ -1052,17 +1040,13 @@ fn agent_menu(
     name: String,
     pinned: bool,
 ) -> PopupMenu {
-    menu.item(
-        PopupMenuItem::new("Pin")
-            .checked(pinned)
-            .on_click({
-                let app = app.clone();
-                let id = id.clone();
-                move |_, _, cx| {
-                    app.update(cx, |state, cx| state.toggle_pin_coworker(id.clone(), cx));
-                }
-            }),
-    )
+    menu.item(PopupMenuItem::new("Pin").checked(pinned).on_click({
+        let app = app.clone();
+        let id = id.clone();
+        move |_, _, cx| {
+            app.update(cx, |state, cx| state.toggle_pin_coworker(id.clone(), cx));
+        }
+    }))
     .item(PopupMenuItem::new("Move to new section").disabled(true))
     .item(PopupMenuItem::new("Mark as Read").on_click({
         let app = app.clone();

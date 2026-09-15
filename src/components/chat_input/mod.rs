@@ -14,8 +14,6 @@ use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
 use crate::state::{AppState, ReplyTo, SubmitChord};
 use gpui_kit::InteractiveElement;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName,
     button::{Button, ButtonVariants},
@@ -26,8 +24,8 @@ use gpui_kit::component::{
     tooltip::Tooltip,
     v_flex,
 };
-
-
+use gpui_kit::prelude::*;
+use gpui_kit::*;
 
 actions!(chat, [SubmitMessage]);
 
@@ -112,8 +110,10 @@ impl MessageInput {
         })
         .detach();
 
-        cx.subscribe_in(&input_state, window, |this, _state, event, window, cx| {
-            match event {
+        cx.subscribe_in(
+            &input_state,
+            window,
+            |this, _state, event, window, cx| match event {
                 InputEvent::PressEnter { secondary, shift } => {
                     let send = match this.submit_chord {
                         SubmitChord::Enter => !shift && !secondary,
@@ -125,11 +125,9 @@ impl MessageInput {
                 }
                 InputEvent::Change => cx.notify(),
                 _ => {}
-            }
-        })
+            },
+        )
         .detach();
-
-
 
         this
     }
@@ -217,9 +215,7 @@ impl Render for MessageInput {
         // Check if any modal is open using cached state
         let any_modal_open = self.is_voice_mode_open || self.is_app_settings_open;
         let draft = self.input_state.read(cx).value();
-        let compact = !self.voice_mode
-            && self.selected_apps.is_empty()
-            && !draft.contains('\n');
+        let compact = !self.voice_mode && self.selected_apps.is_empty() && !draft.contains('\n');
 
         // ChatGPT-style: centered container with max-width
         h_flex().w_full().justify_center().child(

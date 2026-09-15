@@ -266,8 +266,6 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 0);
         assert_eq!(hits[0].1, 10..20);
-        assert!(
-            highlight_in_chunk(&range, chunks[1].byte_start, chunks[1].text.len()).is_none()
-        );
+        assert!(highlight_in_chunk(&range, chunks[1].byte_start, chunks[1].text.len()).is_none());
     }
 }

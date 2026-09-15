@@ -1,6 +1,6 @@
 use crate::services::macos_tts_bridge::{MacTtsBridge, TtsEvent};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 

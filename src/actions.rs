@@ -1,5 +1,5 @@
-use gpui_kit::actions;
 use gpui_kit::Action;
+use gpui_kit::actions;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
