@@ -435,6 +435,353 @@ impl OpenGrokClient {
         }
         Ok(assistant)
     }
+
+    pub async fn answer_run(
+        &self,
+        run_id: &str,
+        call_id: &str,
+        approved: bool,
+    ) -> Result<AnswerReply, OpenGrokError> {
+        let path = format!("/ag-ui/runs/{run_id}/answer");
+        let body = json!({ "call_id": call_id, "approved": approved });
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(&body))
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
+    pub async fn replay_run(&self, run_id: &str) -> Result<RunReplay, OpenGrokError> {
+        let path = format!("/ag-ui/runs/{run_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
+    pub async fn list_approvals(&self) -> Result<Vec<QueuedApproval>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/ag-ui/approvals", None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
+    pub async fn list_computers(&self) -> Result<Vec<ConnectedComputer>, OpenGrokError> {
+        let machines = self.list_daemons().await?;
+        let mut computers = Vec::new();
+        for machine in machines {
+            if machine.revoked {
+                continue;
+            }
+            let stored = self
+                .local_exec_mode(&machine.machine_id)
+                .await
+                .unwrap_or_default();
+            let label = if machine.label.trim().is_empty() {
+                "Computer".to_string()
+            } else {
+                machine.label
+            };
+            computers.push(ConnectedComputer {
+                machine_id: machine.machine_id,
+                label,
+                mode: LocalExecMode::from_stored(&stored),
+                this_machine: false,
+                online: machine.connected,
+            });
+        }
+        Ok(computers)
+    }
+
+    pub async fn list_daemons(&self) -> Result<Vec<DaemonMachine>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/local-exec/daemon", None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        let body: DaemonList = response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        Ok(body.machines)
+    }
+
+    pub async fn enrol_daemon(
+        &self,
+        label: &str,
+        machine_id: Option<&str>,
+    ) -> Result<DaemonEnrol, OpenGrokError> {
+        let mut body = json!({ "label": label });
+        if let Some(machine_id) = machine_id.filter(|id| !id.is_empty()) {
+            body["machineId"] = json!(machine_id);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, "/local-exec/daemon", Some(&body))
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
+    pub async fn local_exec_mode(&self, machine_id: &str) -> Result<String, OpenGrokError> {
+        let path = format!("/local-exec/policy?machine={machine_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        let body: LocalExecPolicyView = response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        Ok(body.mode)
+    }
+
+    pub async fn set_local_exec_mode(
+        &self,
+        machine_id: &str,
+        mode: &str,
+    ) -> Result<(), OpenGrokError> {
+        let body = json!({ "machineId": machine_id, "mode": mode });
+        let response = self
+            .send_json(reqwest::Method::PUT, "/local-exec/policy", Some(&body))
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
+    pub async fn add_local_exec_rule(
+        &self,
+        machine_id: &str,
+        kind: &str,
+        pattern: &str,
+    ) -> Result<(), OpenGrokError> {
+        let body = json!({
+            "machineId": machine_id,
+            "kind": kind,
+            "pattern": pattern,
+        });
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                "/local-exec/policy/rule",
+                Some(&body),
+            )
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
+    pub async fn post_local_exec_responses(
+        &self,
+        daemon_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), OpenGrokError> {
+        let url = self.url("/local-exec/responses")?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(daemon_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
+    /// Hold `GET /local-exec/requests` and call `on_frame` for each JSON `data:` event.
+    pub async fn stream_local_exec_requests<F>(
+        &self,
+        daemon_token: &str,
+        mut on_frame: F,
+    ) -> Result<(), OpenGrokError>
+    where
+        F: FnMut(serde_json::Value) + Send,
+    {
+        let url = self.url("/local-exec/requests")?;
+        let response = self
+            .http
+            .get(url)
+            .header(ACCEPT, "text/event-stream")
+            .header(CACHE_CONTROL, "no-cache")
+            .bearer_auth(daemon_token)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        let mut stream = response.bytes_stream();
+        let mut buf = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| OpenGrokError::message(e.to_string()))?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(idx) = buf.find("\n\n") {
+                let frame = buf[..idx].to_string();
+                buf = buf[idx + 2..].to_string();
+                for line in frame.lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                        on_frame(value);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnswerReply {
+    #[serde(rename = "alreadyAnswered", default)]
+    pub already_answered: bool,
+    #[serde(default)]
+    pub continuing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunReplay {
+    #[serde(rename = "runId", default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub pending: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueuedApproval {
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    #[serde(rename = "threadId", default)]
+    pub thread_id: String,
+    #[serde(rename = "callId")]
+    pub call_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+impl QueuedApproval {
+    /// One suspended run at a time in the transcript. Older unanswered
+    /// host-shell runs stay on the server; they are not stacked on this turn.
+    pub fn latest_for_thread<'a>(queue: &'a [Self], thread_id: &str) -> Option<&'a Self> {
+        queue.iter().rev().find(|item| item.thread_id == thread_id)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaemonList {
+    #[serde(default)]
+    machines: Vec<DaemonMachine>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonMachine {
+    #[serde(rename = "machineId")]
+    pub machine_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub revoked: bool,
+    #[serde(default)]
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalExecMode {
+    Ask,
+    Always,
+    Never,
+}
+
+impl LocalExecMode {
+    pub fn from_stored(mode: &str) -> Self {
+        match mode {
+            "ask" => Self::Ask,
+            "bypass" => Self::Always,
+            _ => Self::Never,
+        }
+    }
+
+    pub fn as_stored(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Always => "bypass",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask every time",
+            Self::Always => "Always allow",
+            Self::Never => "Never allow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedComputer {
+    pub machine_id: String,
+    pub label: String,
+    pub mode: LocalExecMode,
+    pub this_machine: bool,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonEnrol {
+    #[serde(rename = "machineId")]
+    pub machine_id: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalExecPolicyView {
+    #[serde(default)]
+    mode: String,
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -756,5 +1103,118 @@ mod tests {
             .unwrap();
         assert_eq!(updated.model, "xai/grok-4.6@sub");
         assert_eq!(updated.role.as_deref(), Some("Research, marketing, admin"));
+    }
+
+    #[tokio::test]
+    async fn answer_run_posts_call_id_and_approved() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/runs/run-1/answer"))
+            .and(body_json(json!({"call_id":"call-9","approved":true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "runId": "run-1",
+                "callId": "call-9",
+                "approved": true,
+                "alreadyAnswered": false,
+                "continuing": true
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client.answer_run("run-1", "call-9", true).await.unwrap();
+        assert!(!reply.already_answered);
+        assert!(reply.continuing);
+    }
+
+    #[tokio::test]
+    async fn list_approvals_returns_the_waiting_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/approvals"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "runId": "run-1",
+                "threadId": "t1",
+                "callId": "call-9",
+                "tool": "user_machine_shell",
+                "arguments": {"command": "ls"}
+            }])))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let queue = client.list_approvals().await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].call_id, "call-9");
+        assert_eq!(queue[0].tool, "user_machine_shell");
+    }
+
+    #[test]
+    fn latest_queued_approval_is_the_last_for_that_thread() {
+        let queue = vec![
+            QueuedApproval {
+                run_id: "r1".into(),
+                thread_id: "t1".into(),
+                call_id: "old".into(),
+                tool: "user_machine_shell".into(),
+                arguments: json!({"command": "ls"}),
+            },
+            QueuedApproval {
+                run_id: "r2".into(),
+                thread_id: "t2".into(),
+                call_id: "other".into(),
+                tool: "user_machine_shell".into(),
+                arguments: json!({"command": "pwd"}),
+            },
+            QueuedApproval {
+                run_id: "r3".into(),
+                thread_id: "t1".into(),
+                call_id: "new".into(),
+                tool: "user_machine_shell".into(),
+                arguments: json!({"command": "uname"}),
+            },
+        ];
+        let latest = QueuedApproval::latest_for_thread(&queue, "t1").unwrap();
+        assert_eq!(latest.call_id, "new");
+        assert!(QueuedApproval::latest_for_thread(&queue, "missing").is_none());
+    }
+
+    #[test]
+    fn local_exec_mode_round_trips_grok_settings_words() {
+        assert_eq!(LocalExecMode::from_stored("ask").as_stored(), "ask");
+        assert_eq!(LocalExecMode::from_stored("bypass"), LocalExecMode::Always);
+        assert_eq!(LocalExecMode::Always.as_stored(), "bypass");
+        assert_eq!(LocalExecMode::from_stored("never"), LocalExecMode::Never);
+        assert_eq!(LocalExecMode::from_stored(""), LocalExecMode::Never);
+        assert_eq!(LocalExecMode::Always.label(), "Always allow");
+        assert_eq!(LocalExecMode::Ask.label(), "Ask every time");
+        assert_eq!(LocalExecMode::Never.label(), "Never allow");
+    }
+
+    #[tokio::test]
+    async fn list_computers_skips_revoked_and_reads_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [
+                    {"machineId": "mac_live", "label": "NativeChat on this Mac", "revoked": false, "connected": true},
+                    {"machineId": "mac_dead", "label": "old", "revoked": true}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/policy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"mode": "bypass"})))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let computers = client.list_computers().await.unwrap();
+        assert_eq!(computers.len(), 1);
+        assert_eq!(computers[0].machine_id, "mac_live");
+        assert_eq!(computers[0].mode, LocalExecMode::Always);
+        assert!(computers[0].online);
     }
 }

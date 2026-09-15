@@ -1,7 +1,9 @@
 use crate::actions::CloseSettings;
+use crate::opengrok::LocalExecMode;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -20,7 +22,7 @@ impl Render for AppSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let (tab, chord, theme_mode, account_name, account_email) = {
+        let (tab, chord, theme_mode, account_name, account_email, computers) = {
             let state = self.state.read(cx);
             let (name, email) = state
                 .account
@@ -33,6 +35,7 @@ impl Render for AppSettings {
                 state.theme_mode.clone(),
                 name,
                 email,
+                state.computers.clone(),
             )
         };
         let app = self.state.clone();
@@ -78,24 +81,22 @@ impl Render for AppSettings {
                                 AppSettingsTab::General => {
                                     general_page(chord, muted, app.clone()).into_any_element()
                                 }
-                                AppSettingsTab::Profile => profile_page(
-                                    account_name,
-                                    account_email,
+                                AppSettingsTab::Profile => {
+                                    profile_page(account_name, account_email, muted, app.clone())
+                                        .into_any_element()
+                                }
+                                AppSettingsTab::Appearance => appearance_page(
+                                    &theme_mode,
                                     muted,
+                                    theme.foreground,
                                     app.clone(),
                                 )
                                 .into_any_element(),
-                                AppSettingsTab::Appearance => {
-                                    appearance_page(
-                                        &theme_mode,
-                                        muted,
-                                        theme.foreground,
-                                        app.clone(),
-                                    )
-                                    .into_any_element()
-                                }
                                 AppSettingsTab::Shortcuts => {
                                     shortcuts_page(chord, muted, &theme).into_any_element()
+                                }
+                                AppSettingsTab::Computer => {
+                                    computer_page(computers, muted, app.clone()).into_any_element()
                                 }
                             }),
                     ),
@@ -182,6 +183,13 @@ impl AppSettings {
                 AppSettingsTab::Shortcuts,
                 cx,
             ))
+            .child(nav_item(
+                "settings-tab-computer",
+                "Computer",
+                tab == AppSettingsTab::Computer,
+                AppSettingsTab::Computer,
+                cx,
+            ))
     }
 }
 
@@ -191,6 +199,7 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Profile => "Profile",
         AppSettingsTab::Appearance => "Appearance",
         AppSettingsTab::Shortcuts => "Keyboard shortcuts",
+        AppSettingsTab::Computer => "Computer",
     }
 }
 
@@ -223,12 +232,7 @@ fn nav_item(
 fn general_page(chord: SubmitChord, muted: Hsla, app: Entity<AppState>) -> impl IntoElement {
     v_flex()
         .gap(px(12.))
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child("Chat"),
-        )
+        .child(div().text_xs().text_color(muted).child("Chat"))
         .child(
             v_flex()
                 .w_full()
@@ -250,11 +254,7 @@ fn general_page(chord: SubmitChord, muted: Hsla, app: Entity<AppState>) -> impl 
                         }
                     },
                 ))
-                .child(
-                    div()
-                        .h(px(1.))
-                        .bg(rgb(0x777777).opacity(0.16)),
-                )
+                .child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
                 .child(choice_row(
                     "settings-send-cmd-enter",
                     "⌘Enter to send",
@@ -291,12 +291,7 @@ fn choice_row(
                 .min_w(px(0.))
                 .gap(px(2.))
                 .child(div().text_sm().child(title))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x888888))
-                        .child(subtitle),
-                ),
+                .child(div().text_xs().text_color(rgb(0x888888)).child(subtitle)),
         )
         .child(radio_dot(selected))
 }
@@ -311,12 +306,7 @@ fn radio_dot(on: bool) -> impl IntoElement {
         .items_center()
         .justify_center()
         .when(on, |this| {
-            this.child(
-                div()
-                    .size(px(8.))
-                    .rounded_full()
-                    .bg(rgb(0x1084FE)),
-            )
+            this.child(div().size(px(8.)).rounded_full().bg(rgb(0x1084FE)))
         })
 }
 
@@ -373,12 +363,7 @@ fn appearance_page(
 ) -> impl IntoElement {
     v_flex()
         .gap(px(12.))
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child("Theme"),
-        )
+        .child(div().text_xs().text_color(muted).child("Theme"))
         .child(
             h_flex()
                 .gap(px(10.))
@@ -437,6 +422,173 @@ fn theme_chip(
         .child(div().text_sm().child(label))
 }
 
+fn computer_page(
+    computers: Vec<crate::opengrok::ConnectedComputer>,
+    muted: Hsla,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    let page = v_flex()
+        .gap(px(12.))
+        .child(div().text_xs().text_color(muted).child("Computers"));
+    if computers.is_empty() {
+        return page.child(
+            div()
+                .text_sm()
+                .text_color(muted)
+                .child("No computers yet. Stay signed in here and NativeChat enrols this Mac."),
+        );
+    }
+    let mut card = v_flex()
+        .w_full()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0x777777).opacity(0.24))
+        .overflow_hidden();
+    for (i, computer) in computers.into_iter().enumerate() {
+        if i > 0 {
+            card = card.child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)));
+        }
+        card = card.child(computer_row(computer, muted, app.clone()));
+    }
+    page.child(card)
+}
+
+fn computer_row(
+    computer: crate::opengrok::ConnectedComputer,
+    muted: Hsla,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    let heading = if computer.this_machine {
+        "Current computer"
+    } else {
+        "Computer"
+    };
+    let hint = if !computer.online {
+        "Offline. Open NativeChat on this computer while it is online to run commands."
+    } else if computer.this_machine {
+        "This is the computer you are using now"
+    } else {
+        "Online. Agents can run commands here per the policy below."
+    };
+    let subtitle = if !computer.online {
+        "Local execution needs this computer connected."
+    } else {
+        match computer.mode {
+            LocalExecMode::Always => "Agents run commands on this computer without asking.",
+            LocalExecMode::Ask => "Agents ask before every command on this computer.",
+            LocalExecMode::Never => "Agents cannot run commands on this computer.",
+        }
+    };
+    let status = if computer.online { "Online" } else { "Offline" };
+    v_flex()
+        .w_full()
+        .px(px(16.))
+        .py(px(14.))
+        .gap(px(14.))
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(
+                            h_flex()
+                                .gap(px(8.))
+                                .items_center()
+                                .child(div().text_sm().child(heading))
+                                .child(div().text_xs().text_color(muted).child(status)),
+                        )
+                        .child(div().text_xs().text_color(muted).child(hint)),
+                )
+                .child(
+                    div()
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(rgb(0x777777).opacity(0.28))
+                        .text_xs()
+                        .child(computer.label.clone()),
+                ),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(div().text_sm().child("Execution on this computer"))
+                        .child(div().text_xs().text_color(muted).child(subtitle)),
+                )
+                .child(exec_mode_picker(
+                    computer.machine_id.clone(),
+                    computer.mode,
+                    app,
+                )),
+        )
+}
+
+fn exec_mode_picker(
+    machine_id: String,
+    current: LocalExecMode,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    Button::new(ElementId::Name(format!("exec-mode-{machine_id}").into()))
+        .label(current.label())
+        .ghost()
+        .compact()
+        .icon(IconName::ChevronDown)
+        .dropdown_menu({
+            let machine_id = machine_id.clone();
+            move |menu, _, _| {
+                menu.item(exec_menu_item(
+                    machine_id.clone(),
+                    LocalExecMode::Always,
+                    current,
+                    app.clone(),
+                ))
+                .item(exec_menu_item(
+                    machine_id.clone(),
+                    LocalExecMode::Ask,
+                    current,
+                    app.clone(),
+                ))
+                .item(exec_menu_item(
+                    machine_id.clone(),
+                    LocalExecMode::Never,
+                    current,
+                    app.clone(),
+                ))
+            }
+        })
+}
+
+fn exec_menu_item(
+    machine_id: String,
+    mode: LocalExecMode,
+    current: LocalExecMode,
+    app: Entity<AppState>,
+) -> PopupMenuItem {
+    PopupMenuItem::new(mode.label())
+        .checked(mode == current)
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            app.update(cx, |state, cx| {
+                state.set_computer_exec_mode(machine_id.clone(), mode, cx);
+            });
+        })
+}
+
 fn shortcuts_page(
     chord: SubmitChord,
     muted: Hsla,
@@ -479,13 +631,7 @@ fn shortcuts_page(
                 ("Toggle FPS", "⌘⇧F"),
             ],
         ),
-        (
-            "App",
-            &[
-                ("Settings", "⌘,"),
-                ("Quit", "⌘Q"),
-            ],
-        ),
+        ("App", &[("Settings", "⌘,"), ("Quit", "⌘Q")]),
     ];
 
     v_flex()
@@ -493,12 +639,7 @@ fn shortcuts_page(
         .children(groups.into_iter().map(|(title, rows)| {
             v_flex()
                 .gap(px(8.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(title),
-                )
+                .child(div().text_xs().text_color(muted).child(title))
                 .child(
                     v_flex()
                         .w_full()

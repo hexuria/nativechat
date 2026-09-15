@@ -1,7 +1,7 @@
 //! Native AG-UI widgets. Not markdown, not KaTeX.
 
-use crate::opengrok::{BarChartSpec, FormSpec, UiSpec};
-use crate::state::AppState;
+use crate::opengrok::{ApprovalSpec, BarChartSpec, FormSpec, UiSpec};
+use crate::state::{AppState, ApprovalDecision, LocalExecResolution};
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -16,6 +16,222 @@ pub fn render_ui_spec(
         UiSpec::BarChart(chart) => render_bar_chart(chart, cx),
         UiSpec::Form(form) => render_form(form, message_id, app, cx),
     }
+}
+
+pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let (decision, bot, machine) = app
+        .as_ref()
+        .map(|entity| {
+            let state = entity.read(cx);
+            let decision = state
+                .approval_decisions
+                .get(&spec.call_id)
+                .cloned()
+                .unwrap_or(ApprovalDecision::Pending);
+            let bot = state
+                .active_coworker_id
+                .as_ref()
+                .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "this agent".to_string());
+            (
+                decision,
+                bot,
+                state.local_exec_machine_id.clone().unwrap_or_default(),
+            )
+        })
+        .unwrap_or((
+            ApprovalDecision::Pending,
+            "this agent".into(),
+            String::new(),
+        ));
+    if let Some(line) = decision.outcome_line(&bot) {
+        return div()
+            .w_full()
+            .py(px(8.))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(line),
+            )
+            .into_any_element();
+    }
+    if matches!(decision, ApprovalDecision::Failed(ref message) if !message.is_empty()) {
+        let message = match &decision {
+            ApprovalDecision::Failed(message) => message.clone(),
+            _ => String::new(),
+        };
+        return div()
+            .w_full()
+            .py(px(8.))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(message),
+            )
+            .into_any_element();
+    }
+    let mut body = v_flex()
+        .w_full()
+        .gap(px(8.))
+        .p(px(14.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background);
+    body = body.child(
+        h_flex()
+            .w_full()
+            .items_start()
+            .justify_between()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!(
+                        "Allow {bot} and all Bots to run commands on your local computer?"
+                    )),
+            )
+            .child(dismiss_button(spec, app.clone(), theme.muted_foreground)),
+    );
+    if !machine.is_empty() {
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(machine),
+        );
+    }
+    body = body.child(
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(format!(
+                "This applies to {bot} and every Bot. It can always be changed in Settings."
+            )),
+    );
+    let command = if spec.command.trim().is_empty() {
+        "Command was not included with this request.".to_string()
+    } else {
+        spec.command.clone()
+    };
+    body = body.child(
+        div()
+            .w_full()
+            .px(px(8.))
+            .py(px(6.))
+            .rounded(px(6.))
+            .bg(theme.secondary)
+            .text_xs()
+            .text_color(theme.secondary_foreground)
+            .child(command),
+    );
+    if matches!(decision, ApprovalDecision::Sending) {
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Sending…"),
+        );
+    } else {
+        body = body.child(
+            h_flex()
+                .w_full()
+                .justify_end()
+                .gap(px(8.))
+                .flex_wrap()
+                .child(approval_button(
+                    spec,
+                    "Always allow",
+                    LocalExecResolution::Always,
+                    app.clone(),
+                    theme.primary,
+                    theme.primary_foreground,
+                    theme.primary,
+                ))
+                .child(approval_button(
+                    spec,
+                    "Allow once",
+                    LocalExecResolution::AllowOnce,
+                    app.clone(),
+                    theme.border,
+                    theme.foreground,
+                    theme.background,
+                ))
+                .child(approval_button(
+                    spec,
+                    "Never",
+                    LocalExecResolution::Never,
+                    app,
+                    theme.border,
+                    theme.foreground,
+                    theme.background,
+                )),
+        );
+    }
+    body.into_any_element()
+}
+
+fn dismiss_button(spec: &ApprovalSpec, app: Option<Entity<AppState>>, color: Hsla) -> AnyElement {
+    let spec = spec.clone();
+    div()
+        .id(ElementId::Name(
+            format!("approval-dismiss-{}", spec.call_id).into(),
+        ))
+        .cursor_pointer()
+        .text_color(color)
+        .child("×")
+        .when_some(app, |this, app| {
+            this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    state.answer_approval(spec.clone(), LocalExecResolution::DenyOnce, cx);
+                });
+            })
+        })
+        .into_any_element()
+}
+
+fn approval_button(
+    spec: &ApprovalSpec,
+    label: &'static str,
+    resolution: LocalExecResolution,
+    app: Option<Entity<AppState>>,
+    border: Hsla,
+    text: Hsla,
+    fill: Hsla,
+) -> AnyElement {
+    let spec = spec.clone();
+    div()
+        .id(ElementId::Name(
+            format!("approval-{}-{label}", spec.call_id).into(),
+        ))
+        .px(px(9.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(border)
+        .bg(fill)
+        .text_color(text)
+        .text_xs()
+        .cursor_pointer()
+        .child(label)
+        .when_some(app, |this, app| {
+            this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    state.answer_approval(spec.clone(), resolution, cx);
+                });
+            })
+        })
+        .into_any_element()
 }
 
 fn render_bar_chart(chart: &BarChartSpec, cx: &App) -> AnyElement {

@@ -6,11 +6,11 @@ use crate::chrome::{CHAT_CONTENT_MAX, chat_column_width, timestamps_fit};
 use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
+use crate::components::gen_ui::{render_approval, render_ui_spec};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::find_text::{FindHit, marks_for_row, project_hits};
-use crate::components::gen_ui::render_ui_spec;
-use crate::opengrok::{ChatPart, UiSpec};
+use crate::opengrok::{ApprovalSpec, ChatPart, UiSpec, collapse_open_approvals};
 use crate::state::{AppState, EmojiPickerOpen};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::FontWeight;
@@ -44,6 +44,9 @@ struct ChatFeedRev {
     reactions: Vec<(String, String)>,
     reply_to: Option<String>,
     emoji_for: Option<String>,
+    approvals: Vec<(String, String)>,
+    last_output: usize,
+    expanded_output: Vec<String>,
 }
 
 impl ChatFeedRev {
@@ -75,7 +78,7 @@ impl ChatFeedRev {
                 picks.sort();
                 picks
             },
-            is_ai_responding: state.is_ai_responding,
+            is_ai_responding: state.is_active_bot_responding(),
             debug_mode: state.debug_markdown_disabled,
             can_read_aloud: true,
             theme_mode: state.theme_mode.clone(),
@@ -94,6 +97,33 @@ impl ChatFeedRev {
             },
             reply_to: state.reply_to.as_ref().map(|r| r.message_id.clone()),
             emoji_for: state.emoji_picker.as_ref().map(|p| p.message_id.clone()),
+            approvals: {
+                let mut pairs: Vec<(String, String)> = state
+                    .approval_decisions
+                    .iter()
+                    .map(|(id, decision)| (id.clone(), format!("{decision:?}")))
+                    .collect();
+                pairs.sort();
+                pairs
+            },
+            last_output: last
+                .map(|msg| {
+                    msg.parts
+                        .iter()
+                        .map(|part| match part {
+                            ChatPart::Approval(spec) => {
+                                spec.output.as_ref().map(String::len).unwrap_or(0)
+                            }
+                            _ => 0,
+                        })
+                        .sum()
+                })
+                .unwrap_or(0),
+            expanded_output: {
+                let mut ids: Vec<String> = state.expanded_shell_output.iter().cloned().collect();
+                ids.sort();
+                ids
+            },
         }
     }
 }
@@ -121,6 +151,8 @@ struct ChatRow {
     reaction: Option<String>,
     parts: Vec<ChatPart>,
     widget: Option<UiSpec>,
+    approval: Option<ApprovalSpec>,
+    status_line: Option<String>,
 }
 
 fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
@@ -145,8 +177,25 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             continue;
         }
         let highlight_native = is_native_speaking && full_highlight.is_some();
-        let display: Vec<ChatPart> = if msg.parts.iter().any(|p| matches!(p, ChatPart::Ui(_))) {
-            msg.parts.clone()
+        let bot_name = state
+            .active_coworker_id
+            .as_ref()
+            .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
+            .map(|c| c.name.as_str())
+            .unwrap_or("this agent");
+        let display: Vec<ChatPart> = if msg.parts.iter().any(ChatPart::is_widget) {
+            let open: std::collections::HashSet<String> = msg
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    ChatPart::Approval(spec) => match state.approval_decisions.get(&spec.call_id) {
+                        Some(decision) if decision.is_settled() => None,
+                        _ => Some(spec.call_id.clone()),
+                    },
+                    _ => None,
+                })
+                .collect();
+            collapse_open_approvals(&msg.parts, &open)
         } else {
             vec![ChatPart::Text(msg.content.clone())]
         };
@@ -179,6 +228,8 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 reaction: state.message_reactions.get(&msg.id).cloned(),
                 parts: Vec::new(),
                 widget: None,
+                approval: None,
+                status_line: None,
             });
         };
         for part in display {
@@ -208,6 +259,38 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         reaction: None,
                         parts: Vec::new(),
                         widget: Some(spec),
+                        approval: None,
+                        status_line: None,
+                    });
+                    ui_n += 1;
+                }
+                ChatPart::Approval(spec) => {
+                    flush_text(&mut rows, &mut text_buf);
+                    let outcome = state.approval_status_line(&spec.call_id, bot_name);
+                    rows.push(ChatRow {
+                        id: format!("{}-ask-{ui_n}", msg.id),
+                        content: SharedString::from(outcome.clone().unwrap_or_default()),
+                        is_me: false,
+                        timestamp: SharedString::from(""),
+                        is_native_speaking: false,
+                        is_native_paused: false,
+                        is_native_loading: false,
+                        is_ai_speaking: false,
+                        is_ai_paused: false,
+                        is_ai_loading: false,
+                        is_cached: false,
+                        highlight_range: None,
+                        highlight_native: false,
+                        use_markdown: false,
+                        show_footer: false,
+                        source_id: msg.id.clone(),
+                        tts_text: SharedString::from(""),
+                        reply_preview: None,
+                        reaction: None,
+                        parts: Vec::new(),
+                        widget: None,
+                        approval: outcome.is_none().then_some(spec),
+                        status_line: outcome,
                     });
                     ui_n += 1;
                 }
@@ -540,17 +623,38 @@ impl Render for ChatTranscript {
                             .flex()
                             .justify_start()
                             .py(px(6.))
+                            .child(div().w_full().max_w(px(CHAT_CONTENT_MAX * 0.72)).child(
+                                render_ui_spec(spec, &row.source_id, Some(app_state.clone()), cx),
+                            ))
+                            .into_any_element();
+                    }
+                    if let Some(line) = &row.status_line {
+                        return div()
+                            .id(ElementId::Name(row.id.clone().into()))
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .py(px(8.))
                             .child(
                                 div()
-                                    .w_full()
-                                    .max_w(px(CHAT_CONTENT_MAX * 0.72))
-                                    .child(render_ui_spec(
-                                        spec,
-                                        &row.source_id,
-                                        Some(app_state.clone()),
-                                        cx,
-                                    )),
+                                    .text_sm()
+                                    .text_color(palette.secondary_foreground.opacity(0.7))
+                                    .child(line.clone()),
                             )
+                            .into_any_element();
+                    }
+                    if let Some(spec) = &row.approval {
+                        return div()
+                            .id(ElementId::Name(row.id.clone().into()))
+                            .w_full()
+                            .flex()
+                            .justify_start()
+                            .py(px(6.))
+                            .child(div().w_full().max_w(px(560.)).child(render_approval(
+                                spec,
+                                Some(app_state.clone()),
+                                cx,
+                            )))
                             .into_any_element();
                     }
                     let highlight_color = if row.highlight_range.is_some() {
@@ -830,7 +934,7 @@ impl ChatView {
 
         cx.observe(&state, |this, app, cx| {
             let app = app.read(cx);
-            let label = app.bot_status.clone();
+            let label = app.visible_bot_status();
             let coworker = app
                 .active_coworker_id
                 .as_ref()

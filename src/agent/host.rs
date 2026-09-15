@@ -54,8 +54,14 @@ pub enum Command {
     SelectSession(String),
     SelectCoworker(String),
     SendMessage(String),
-    Login { email: String, password: String },
-    SetLoginDraft { email: Option<String>, password: Option<String> },
+    Login {
+        email: String,
+        password: String,
+    },
+    SetLoginDraft {
+        email: Option<String>,
+        password: Option<String>,
+    },
     Logout,
     Shutdown,
 }
@@ -178,7 +184,7 @@ impl NativeChatHost {
                 .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
-            bot_status: state.bot_status.clone(),
+            bot_status: state.visible_bot_status(),
             agent_settings_open: state.is_agent_settings_open(),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
@@ -211,7 +217,8 @@ impl NativeChatHost {
             let mut empty = UiNode::page("empty-roster", "Create your first Bot")
                 .with_child(UiNode::button("create-first-bot", "New Bot"));
             if let Some(error) = &self.auth_error {
-                empty = empty.with_child(UiNode::new("empty-roster-error", "status", error.clone()));
+                empty =
+                    empty.with_child(UiNode::new("empty-roster-error", "status", error.clone()));
             }
             return UiTree {
                 app: "nativechat".into(),
@@ -242,26 +249,25 @@ impl NativeChatHost {
             })
             .collect();
 
-        let sidebar = UiNode::navigation(ids::SIDEBAR, "Sidebar")
-            .with_child(UiNode::button(ids::NAV_TOGGLE, "Toggle sidebar"))
-            .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
-            .with_child(UiNode::button(ids::NAV_SEARCH, "Search"))
-            .with_child(UiNode::button(ids::NAV_LIBRARY, "Library"))
-            .with_child(UiNode::button(ids::NAV_PROJECTS, "Projects"))
-            .with_child(
-                UiNode::scroll(ids::SIDEBAR_LIST, "Chats").with_child(
+        let sidebar =
+            UiNode::navigation(ids::SIDEBAR, "Sidebar")
+                .with_child(UiNode::button(ids::NAV_TOGGLE, "Toggle sidebar"))
+                .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
+                .with_child(UiNode::button(ids::NAV_SEARCH, "Search"))
+                .with_child(UiNode::button(ids::NAV_LIBRARY, "Library"))
+                .with_child(UiNode::button(ids::NAV_PROJECTS, "Projects"))
+                .with_child(UiNode::scroll(ids::SIDEBAR_LIST, "Chats").with_child(
                     UiNode::list("sidebar-sessions", "Sessions").with_children(sessions),
-                ),
-            )
-            .with_child(UiNode::button(
-                ids::FOOTER_THEME,
-                format!("Theme: {}", self.theme_mode),
-            ))
-            .with_child(UiNode::button(
-                ids::FOOTER_ACCOUNT,
-                self.account_label.clone(),
-            ))
-            .with_child(UiNode::button(ids::FOOTER_SIGN_OUT, "Sign Out"));
+                ))
+                .with_child(UiNode::button(
+                    ids::FOOTER_THEME,
+                    format!("Theme: {}", self.theme_mode),
+                ))
+                .with_child(UiNode::button(
+                    ids::FOOTER_ACCOUNT,
+                    self.account_label.clone(),
+                ))
+                .with_child(UiNode::button(ids::FOOTER_SIGN_OUT, "Sign Out"));
 
         let mut page = UiNode::page(ids::PAGE, "Chat")
             .with_child(UiNode::textbox(ids::COMPOSER, "Type a message..."))
@@ -291,7 +297,8 @@ impl NativeChatHost {
                             .with_visible(self.account_open),
                     )
                     .with_child(
-                        UiNode::dialog(ids::DIALOG_VOICE, "Voice Mode").with_visible(self.voice_open),
+                        UiNode::dialog(ids::DIALOG_VOICE, "Voice Mode")
+                            .with_visible(self.voice_open),
                     )
                     .with_child(
                         UiNode::dialog(ids::AGENT_SETTINGS, "Agent Settings")
@@ -307,8 +314,14 @@ impl NativeChatHost {
                                     .with_visible(self.model_picker_open),
                             ),
                     )
-                    .with_child(UiNode::button("agent-model-dismiss", "Dismiss model picker"))
-                    .with_child(UiNode::button("avatar-editor-dismiss", "Dismiss avatar editor")),
+                    .with_child(UiNode::button(
+                        "agent-model-dismiss",
+                        "Dismiss model picker",
+                    ))
+                    .with_child(UiNode::button(
+                        "avatar-editor-dismiss",
+                        "Dismiss avatar editor",
+                    )),
             ],
         }
     }
@@ -369,7 +382,7 @@ impl NativeChatHost {
                     .ok_or_else(|| "avatar.color requires arg id".to_string())?
                     .to_string();
                 Command::SetAvatarColor(id)
-            },
+            }
             "theme.toggle" => Command::ToggleTheme,
             "settings.account" => Command::ToggleAccount,
             "auth.login" => {
@@ -457,9 +470,7 @@ impl AgentHost for NativeChatHost {
                     Err("composer typing is not wired yet".into())
                 }
             }
-            Op::Type { .. } | Op::Key { .. } => {
-                Err("composer typing is not wired yet".into())
-            }
+            Op::Type { .. } | Op::Key { .. } => Err("composer typing is not wired yet".into()),
             _ => Ok(DispatchResult::empty()),
         }
     }

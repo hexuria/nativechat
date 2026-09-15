@@ -6,8 +6,11 @@ use crate::chrome::{
 };
 use crate::config::Config;
 use crate::opengrok::{
-    Account, ActivityTick, AguiMessage, ChatPart, Coworker, CoworkerPatch, FormSpec,
-    ModelCatalogue, OpenGrokClient, ProfileUpdate, TurnAssembler, activity_from_agui,
+    Account, ActivityTick, AguiMessage, ApprovalSpec, ChatPart, ConnectedComputer, Coworker,
+    CoworkerPatch, FormSpec, LocalExecMode, LocalExecVerdict, ModelCatalogue, OpenGrokClient,
+    ProfileUpdate, QueuedApproval, TurnAssembler, activity_from_agui, command_from_args,
+    command_from_replay_events, enrol_this_machine, local_exec_outcome, serve_local_exec,
+    stored_machine_id, visible_bot_status,
 };
 use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
@@ -15,8 +18,8 @@ use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -34,7 +37,7 @@ impl Message {
         !self.content.trim().is_empty()
             || self.parts.iter().any(|part| match part {
                 ChatPart::Text(text) => !text.trim().is_empty(),
-                ChatPart::Ui(_) => true,
+                ChatPart::Ui(_) | ChatPart::Approval(_) => true,
             })
     }
 
@@ -390,6 +393,7 @@ pub enum AppSettingsTab {
     Profile,
     Appearance,
     Shortcuts,
+    Computer,
 }
 
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
@@ -519,6 +523,8 @@ pub struct AppState {
     pub coworkers: Vec<Coworker>,
     pub active_coworker_id: Option<String>,
     pub bot_status: Option<String>,
+    /// Coworker whose turn owns `bot_status` / `is_ai_responding`.
+    responding_coworker_id: Option<String>,
     pub model_catalogue: ModelCatalogue,
     pub right_pane: RightPane,
     pub computer_view: ComputerView,
@@ -534,6 +540,47 @@ pub struct AppState {
     pub message_reactions: HashMap<String, String>,
     pub emoji_picker: Option<EmojiPickerOpen>,
     pub form_picks: HashMap<String, HashMap<String, String>>,
+    pub approval_decisions: HashMap<String, ApprovalDecision>,
+    pub local_exec_machine_id: Option<String>,
+    local_exec_cancel: Option<Arc<AtomicBool>>,
+    pub expanded_shell_output: HashSet<String>,
+    pub computers: Vec<ConnectedComputer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Pending,
+    Sending,
+    AllowOnce,
+    Always,
+    Denied,
+    Never,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalExecResolution {
+    Always,
+    AllowOnce,
+    Never,
+    DenyOnce,
+}
+
+impl ApprovalDecision {
+    pub fn is_settled(&self) -> bool {
+        !matches!(self, Self::Pending | Self::Sending)
+    }
+
+    pub fn outcome_line(&self, bot: &str) -> Option<String> {
+        let verdict = match self {
+            Self::AllowOnce => LocalExecVerdict::AllowOnce,
+            Self::Always => LocalExecVerdict::Always,
+            Self::Denied => LocalExecVerdict::DeniedOnce,
+            Self::Never => LocalExecVerdict::Never,
+            _ => return None,
+        };
+        Some(local_exec_outcome(bot, verdict))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -686,6 +733,7 @@ impl AppState {
             coworkers: Vec::new(),
             active_coworker_id: None,
             bot_status: None,
+            responding_coworker_id: None,
             model_catalogue: ModelCatalogue::default(),
             right_pane: RightPane::Closed,
             computer_view: ComputerView::Overview,
@@ -701,6 +749,11 @@ impl AppState {
             message_reactions: HashMap::new(),
             emoji_picker: None,
             form_picks: HashMap::new(),
+            approval_decisions: HashMap::new(),
+            local_exec_machine_id: None,
+            local_exec_cancel: None,
+            expanded_shell_output: HashSet::new(),
+            computers: Vec::new(),
         };
 
         state
@@ -755,7 +808,10 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
+                        state.refresh_computers(cx);
+                        state.sync_pending_approvals(cx);
                     }
                     Err(_) => {
                         state.account = None;
@@ -770,6 +826,86 @@ impl AppState {
 
     pub fn is_signed_in(&self) -> bool {
         self.auth_status == AuthStatus::SignedIn && self.account.is_some()
+    }
+
+    pub fn visible_bot_status(&self) -> Option<String> {
+        visible_bot_status(
+            self.active_coworker_id.as_deref(),
+            self.responding_coworker_id.as_deref(),
+            self.bot_status.as_deref(),
+        )
+    }
+
+    pub fn is_active_bot_responding(&self) -> bool {
+        self.is_ai_responding
+            && self.active_coworker_id.is_some()
+            && self.active_coworker_id == self.responding_coworker_id
+    }
+
+    fn begin_responding(&mut self, coworker_id: Option<&str>, status: &str) {
+        self.responding_coworker_id = coworker_id.map(str::to_string);
+        self.is_ai_responding = true;
+        self.bot_status = Some(status.to_string());
+    }
+
+    fn apply_turn_status(&mut self, coworker_id: Option<&str>, tick: ActivityTick) {
+        if coworker_id.is_some() && coworker_id != self.responding_coworker_id.as_deref() {
+            return;
+        }
+        match tick {
+            ActivityTick::Keep => {}
+            ActivityTick::Clear => self.bot_status = None,
+            ActivityTick::Set(activity) => self.bot_status = Some(activity.label),
+        }
+    }
+
+    fn this_machine_mode(&self) -> Option<LocalExecMode> {
+        self.computers
+            .iter()
+            .find(|computer| {
+                computer.this_machine
+                    || self.local_exec_machine_id.as_ref() == Some(&computer.machine_id)
+            })
+            .map(|computer| computer.mode)
+    }
+
+    fn auto_resolve_local_exec(&self) -> Option<LocalExecResolution> {
+        match self.this_machine_mode() {
+            Some(LocalExecMode::Always) => Some(LocalExecResolution::Always),
+            Some(LocalExecMode::Never) => Some(LocalExecResolution::Never),
+            _ => None,
+        }
+    }
+
+    pub fn approval_status_line(&self, call_id: &str, bot: &str) -> Option<String> {
+        if let Some(line) = self
+            .approval_decisions
+            .get(call_id)
+            .and_then(|decision| decision.outcome_line(bot))
+        {
+            return Some(line);
+        }
+        match self.this_machine_mode() {
+            Some(LocalExecMode::Always) => Some(local_exec_outcome(bot, LocalExecVerdict::Always)),
+            Some(LocalExecMode::Never) => Some(local_exec_outcome(bot, LocalExecVerdict::Never)),
+            _ => None,
+        }
+    }
+
+    fn finish_responding(&mut self, coworker_id: Option<&str>, waiting_approval: bool) {
+        if coworker_id.is_some()
+            && self.responding_coworker_id.is_some()
+            && coworker_id != self.responding_coworker_id.as_deref()
+        {
+            return;
+        }
+        self.is_ai_responding = false;
+        if waiting_approval {
+            self.bot_status = Some("Waiting for approval".into());
+        } else {
+            self.bot_status = None;
+            self.responding_coworker_id = None;
+        }
     }
 
     pub fn login(&mut self, email: String, password: String, cx: &mut Context<Self>) {
@@ -800,7 +936,10 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
+                        state.refresh_computers(cx);
+                        state.sync_pending_approvals(cx);
                     }
                     Err(error) => {
                         state.account = None;
@@ -823,10 +962,15 @@ impl AppState {
         self.last_active_at.clear();
         self.active_coworker_id = None;
         self.bot_status = None;
+        self.responding_coworker_id = None;
+        self.is_ai_responding = false;
         self.is_app_settings_open = false;
         self.bot_finder_open = false;
         self.command_palette_open = false;
         self.close_right_pane(cx);
+        self.stop_local_exec();
+        self.approval_decisions.clear();
+        self.computers.clear();
         cx.notify();
         if let Some(client) = client {
             cx.spawn(async move |_, _| {
@@ -1987,21 +2131,30 @@ impl AppState {
                                         }
                                     })
                                     .collect();
+                                state.sync_pending_approvals(cx);
                                 cx.notify();
                             }
                         })
                         .ok();
                     }
-                    Err(e) => eprintln!("Failed to load messages: {}", e),
+                    Err(e) => {
+                        eprintln!("Failed to load messages: {}", e);
+                        let _ = this.update(cx, |state, cx| {
+                            state.sync_pending_approvals(cx);
+                        });
+                    }
                 },
             )
             .detach();
+        } else {
+            self.sync_pending_approvals(cx);
         }
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
         self.active_conversation_id = Some(conversation_id.clone());
         self.load_session_messages(conversation_id, cx);
+        self.sync_pending_approvals(cx);
         cx.notify();
     }
 
@@ -2075,12 +2228,11 @@ impl AppState {
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
-        self.is_ai_responding = true;
-        self.bot_status = Some("Thinking".into());
+        self.begin_responding(coworker_id.as_deref(), "Thinking");
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let coworker = match coworker_id {
+            let coworker = match coworker_id.clone() {
                 Some(id) => Ok(id),
                 None => match client.hire("NativeChat", None).await {
                     Ok(hired) => {
@@ -2094,7 +2246,7 @@ impl AppState {
                     Err(error) => Err(error),
                 },
             };
-            let (result, waiting_approval) = match coworker {
+            let (result, waiting_approval, turn_id) = match coworker {
                 Ok(id) => {
                     let mut args_by_call: std::collections::HashMap<String, String> =
                         std::collections::HashMap::new();
@@ -2131,20 +2283,12 @@ impl AppState {
                             }
                             match activity_from_agui(&event, args) {
                                 ActivityTick::Keep => {}
-                                ActivityTick::Clear => {
+                                tick => {
+                                    let turn_id = id.clone();
                                     let _ = this.update(cx, |state, cx| {
-                                        if state.bot_status.is_some() {
-                                            state.bot_status = None;
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                                ActivityTick::Set(activity) => {
-                                    let _ = this.update(cx, |state, cx| {
-                                        if state.bot_status.as_deref()
-                                            != Some(activity.label.as_str())
-                                        {
-                                            state.bot_status = Some(activity.label);
+                                        let before = state.bot_status.clone();
+                                        state.apply_turn_status(Some(&turn_id), tick);
+                                        if state.bot_status != before {
                                             cx.notify();
                                         }
                                     });
@@ -2163,6 +2307,18 @@ impl AppState {
                                             last.content = plain.clone();
                                             last.parts = parts.clone();
                                             cx.notify();
+                                        }
+                                    }
+                                }
+                                if assembler.waiting_approval() {
+                                    if let Some(resolution) = state.auto_resolve_local_exec() {
+                                        if let Some(spec) =
+                                            parts.iter().rev().find_map(|part| match part {
+                                                ChatPart::Approval(spec) => Some(spec.clone()),
+                                                _ => None,
+                                            })
+                                        {
+                                            state.answer_approval(spec, resolution, cx);
                                         }
                                     }
                                 }
@@ -2187,9 +2343,9 @@ impl AppState {
                         }
                         cx.notify();
                     });
-                    (result, waiting_approval)
+                    (result, waiting_approval, Some(id))
                 }
-                Err(error) => (Err(error), false),
+                Err(error) => (Err(error), false, coworker_id.clone()),
             };
             let _ = this.update(cx, |state, cx| {
                 if let Some(conversation) = state
@@ -2210,12 +2366,31 @@ impl AppState {
                         }
                     }
                 }
-                state.is_ai_responding = false;
-                state.bot_status = if waiting_approval {
-                    Some("Waiting for approval".into())
+                if waiting_approval {
+                    if let Some(resolution) = state.auto_resolve_local_exec() {
+                        if let Some(spec) = state
+                            .conversations
+                            .iter()
+                            .find(|c| c.id == conversation_id)
+                            .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
+                            .and_then(|m| {
+                                m.parts.iter().rev().find_map(|part| match part {
+                                    ChatPart::Approval(spec) => Some(spec.clone()),
+                                    _ => None,
+                                })
+                            })
+                        {
+                            state.answer_approval(spec, resolution, cx);
+                        }
+                        state.finish_responding(turn_id.as_deref(), false);
+                    } else {
+                        state.finish_responding(turn_id.as_deref(), true);
+                        state.fill_open_approval_commands(cx);
+                        state.sync_pending_approvals(cx);
+                    }
                 } else {
-                    None
-                };
+                    state.finish_responding(turn_id.as_deref(), false);
+                }
                 if let Err(error) = result {
                     state.auth_error = Some(error.message);
                 }
@@ -2223,6 +2398,470 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    pub fn answer_approval(
+        &mut self,
+        spec: ApprovalSpec,
+        resolution: LocalExecResolution,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .approval_decisions
+            .get(&spec.call_id)
+            .is_some_and(ApprovalDecision::is_settled)
+            || matches!(
+                self.approval_decisions.get(&spec.call_id),
+                Some(ApprovalDecision::Sending)
+            )
+        {
+            return;
+        }
+        self.approval_decisions
+            .insert(spec.call_id.clone(), ApprovalDecision::Sending);
+        self.drop_other_pending_approvals(&spec.call_id);
+        cx.notify();
+        let Some(client) = self.opengrok.clone() else {
+            self.approval_decisions.insert(
+                spec.call_id.clone(),
+                ApprovalDecision::Failed("OpenGrok is not configured".into()),
+            );
+            return;
+        };
+        let machine_id = self
+            .local_exec_machine_id
+            .clone()
+            .or_else(|| {
+                self.computers
+                    .iter()
+                    .find(|computer| computer.this_machine)
+                    .map(|computer| computer.machine_id.clone())
+            })
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .and_then(|config| stored_machine_id(&config.data_dir))
+            })
+            .or_else(|| {
+                self.computers
+                    .first()
+                    .map(|computer| computer.machine_id.clone())
+            });
+        let conversation_id = self.active_conversation_id.clone();
+        let (approved, decision, mode) = match resolution {
+            LocalExecResolution::Always => (true, ApprovalDecision::Always, Some("bypass")),
+            LocalExecResolution::AllowOnce => (true, ApprovalDecision::AllowOnce, None),
+            LocalExecResolution::Never => (false, ApprovalDecision::Never, Some("never")),
+            LocalExecResolution::DenyOnce => (false, ApprovalDecision::Denied, None),
+        };
+        if let (Some(machine_id), Some(stored)) = (machine_id.as_ref(), mode) {
+            if let Some(computer) = self
+                .computers
+                .iter_mut()
+                .find(|computer| &computer.machine_id == machine_id)
+            {
+                computer.mode = LocalExecMode::from_stored(stored);
+            }
+            cx.notify();
+        }
+        let run_id_empty = spec.run_id.trim().is_empty();
+        cx.spawn(async move |this, cx| {
+            if let (Some(machine_id), Some(mode)) = (machine_id.as_deref(), mode) {
+                let _ = client.set_local_exec_mode(machine_id, mode).await;
+                let _ = this.update(cx, |state, cx| {
+                    state.refresh_computers(cx);
+                });
+            }
+            if run_id_empty {
+                let _ = this.update(cx, |state, cx| {
+                    state.drop_dead_approval(&spec.call_id);
+                    state
+                        .approval_decisions
+                        .insert(spec.call_id.clone(), decision);
+                    cx.notify();
+                });
+                return;
+            }
+            let mut run_id = spec.run_id.clone();
+            if let Ok(queue) = client.list_approvals().await
+                && let Some(item) = queue.iter().find(|item| item.call_id == spec.call_id)
+            {
+                run_id = item.run_id.clone();
+            }
+            let result = client.answer_run(&run_id, &spec.call_id, approved).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(_) => {
+                        state
+                            .approval_decisions
+                            .insert(spec.call_id.clone(), decision);
+                        let coworker_id = state.active_coworker_id.clone();
+                        if approved {
+                            state.begin_responding(coworker_id.as_deref(), "Running commands");
+                            state.follow_answered_run(
+                                run_id.clone(),
+                                conversation_id,
+                                coworker_id,
+                                cx,
+                            );
+                        } else {
+                            state.finish_responding(coworker_id.as_deref(), false);
+                        }
+                    }
+                    Err(error) => {
+                        if error.message.contains("no such run") {
+                            state.drop_dead_approval(&spec.call_id);
+                        } else {
+                            state.approval_decisions.insert(
+                                spec.call_id.clone(),
+                                ApprovalDecision::Failed(error.message),
+                            );
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn follow_answered_run(
+        &mut self,
+        run_id: String,
+        conversation_id: Option<String>,
+        coworker_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let mut last_len = 0usize;
+            for _ in 0..400 {
+                match client.replay_run(&run_id).await {
+                    Ok(replay) => {
+                        if replay.events.len() != last_len {
+                            last_len = replay.events.len();
+                            let mut assembler = TurnAssembler::default();
+                            for event in &replay.events {
+                                assembler.push_event(event);
+                            }
+                            assembler.finish();
+                            let (plain, parts) = assembler.snapshot();
+                            let status = replay.status.clone();
+                            let _ = this.update(cx, |state, cx| {
+                                if let Some(conversation_id) = conversation_id.as_ref()
+                                    && let Some(conversation) = state
+                                        .conversations
+                                        .iter_mut()
+                                        .find(|c| &c.id == conversation_id)
+                                    && let Some(last) =
+                                        conversation.messages.iter_mut().rev().find(|m| !m.is_me)
+                                {
+                                    last.content = plain.clone();
+                                    last.parts = parts.clone();
+                                    for part in &parts {
+                                        if let ChatPart::Approval(spec) = part
+                                            && spec.output.is_some()
+                                        {
+                                            state.approval_decisions.insert(
+                                                spec.call_id.clone(),
+                                                ApprovalDecision::AllowOnce,
+                                            );
+                                        }
+                                    }
+                                }
+                                match status.as_str() {
+                                    "awaiting-approval" => {
+                                        state.finish_responding(coworker_id.as_deref(), true);
+                                    }
+                                    "running" => {
+                                        state.apply_turn_status(
+                                            coworker_id.as_deref(),
+                                            ActivityTick::Set(crate::opengrok::BotActivity {
+                                                label: "Working".into(),
+                                            }),
+                                        );
+                                    }
+                                    "finished" | "failed" => {
+                                        state.finish_responding(coworker_id.as_deref(), false);
+                                    }
+                                    _ => {}
+                                }
+                                cx.notify();
+                            });
+                        }
+                        match replay.status.as_str() {
+                            "finished" | "failed" => break,
+                            "awaiting-approval" => {
+                                let _ = this.update(cx, |state, cx| {
+                                    state.finish_responding(coworker_id.as_deref(), true);
+                                    cx.notify();
+                                });
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => break,
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if !matches!(state.bot_status.as_deref(), Some("Waiting for approval")) {
+                    state.finish_responding(coworker_id.as_deref(), false);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn fill_approval_command(&mut self, call_id: &str, command: String) {
+        if command.trim().is_empty() {
+            return;
+        }
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                for part in &mut message.parts {
+                    if let ChatPart::Approval(spec) = part
+                        && spec.call_id == call_id
+                        && spec.command.is_empty()
+                    {
+                        spec.command = command.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn fill_open_approval_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let mut jobs = Vec::new();
+        for conversation in &self.conversations {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    if let ChatPart::Approval(spec) = part
+                        && spec.command.is_empty()
+                        && !spec.run_id.is_empty()
+                    {
+                        jobs.push((spec.run_id.clone(), spec.call_id.clone()));
+                    }
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            for (run_id, call_id) in jobs {
+                let mut command = String::new();
+                if let Ok(replay) = client.replay_run(&run_id).await {
+                    command = command_from_replay_events(&replay.events, &call_id);
+                    if command.is_empty()
+                        && let Some(pending) = replay.pending
+                    {
+                        let pending_id = pending
+                            .get("call_id")
+                            .or_else(|| pending.get("callId"))
+                            .and_then(serde_json::Value::as_str);
+                        if pending_id.is_none_or(|id| id == call_id) {
+                            command = command_from_args(
+                                pending.get("arguments").unwrap_or(&serde_json::Value::Null),
+                            );
+                        }
+                    }
+                }
+                if command.is_empty()
+                    && let Ok(queue) = client.list_approvals().await
+                    && let Some(item) = queue.iter().find(|item| item.call_id == call_id)
+                {
+                    command = command_from_args(&item.arguments);
+                }
+                if command.is_empty() {
+                    continue;
+                }
+                let _ = this.update(cx, |state, cx| {
+                    state.fill_approval_command(&call_id, command);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn sync_pending_approvals(&mut self, cx: &mut Context<Self>) {
+        if self.is_ai_responding {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let thread_id = self.active_conversation_id.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(queue) = client.list_approvals().await else {
+                return;
+            };
+            let _ = this.update(cx, |state, cx| {
+                if let Some(resolution) = state.auto_resolve_local_exec() {
+                    for item in queue {
+                        if state
+                            .approval_decisions
+                            .get(&item.call_id)
+                            .is_some_and(|d| {
+                                d.is_settled() || matches!(d, ApprovalDecision::Sending)
+                            })
+                        {
+                            continue;
+                        }
+                        state.answer_approval(spec_from_queued(&item), resolution, cx);
+                    }
+                    return;
+                }
+                if state.is_ai_responding {
+                    return;
+                }
+                let Some(thread_id) = thread_id.as_deref() else {
+                    return;
+                };
+                let Some(item) = QueuedApproval::latest_for_thread(&queue, thread_id) else {
+                    return;
+                };
+                if item.run_id.trim().is_empty() {
+                    return;
+                }
+                if state
+                    .approval_decisions
+                    .get(&item.call_id)
+                    .is_some_and(|d| d.is_settled() || matches!(d, ApprovalDecision::Sending))
+                {
+                    return;
+                }
+                state.attach_queued_approval(item.clone());
+                state.responding_coworker_id = Some(thread_id.to_string());
+                state.bot_status = Some("Waiting for approval".into());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn drop_dead_approval(&mut self, call_id: &str) {
+        self.approval_decisions.remove(call_id);
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(
+                    |part| !matches!(part, ChatPart::Approval(spec) if spec.call_id == call_id),
+                );
+            }
+        }
+    }
+
+    fn drop_other_pending_approvals(&mut self, keep_call_id: &str) {
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::Approval(spec) => {
+                        spec.call_id == keep_call_id
+                            || self.approval_decisions.get(&spec.call_id).is_some_and(|d| {
+                                d.is_settled() || matches!(d, ApprovalDecision::Sending)
+                            })
+                    }
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn attach_queued_approval(&mut self, item: QueuedApproval) {
+        let spec = spec_from_queued(&item);
+        self.approval_decisions
+            .entry(spec.call_id.clone())
+            .or_insert(ApprovalDecision::Pending);
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == item.thread_id)
+        else {
+            return;
+        };
+        if let Some(last) = conversation.messages.iter_mut().rev().find(|m| !m.is_me) {
+            if let Some(ChatPart::Approval(existing)) = last.parts.iter_mut().find(|part| {
+                matches!(part, ChatPart::Approval(existing) if existing.call_id == spec.call_id
+                    || existing.run_id == spec.run_id)
+            }) {
+                if existing.command.is_empty() && !spec.command.is_empty() {
+                    existing.command = spec.command;
+                }
+                if existing.run_id.is_empty() {
+                    existing.run_id = spec.run_id;
+                }
+                return;
+            }
+            if last
+                .parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Approval(_)))
+            {
+                return;
+            }
+            last.parts.push(ChatPart::Approval(spec));
+            return;
+        }
+        conversation.messages.push(Message {
+            id: uuid::Uuid::now_v7().to_string(),
+            sender: "AI".to_string(),
+            content: String::new(),
+            sent_at: SystemTime::now(),
+            is_me: false,
+            reply_preview: None,
+            parts: vec![ChatPart::Approval(spec)],
+        });
+    }
+
+    fn start_local_exec(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(config) = self.config.clone() else {
+            return;
+        };
+        self.stop_local_exec();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.local_exec_cancel = Some(cancel.clone());
+        cx.spawn(async move |this, cx| {
+            match enrol_this_machine(&client, &config.data_dir).await {
+                Ok(machine_id) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.local_exec_machine_id = Some(machine_id);
+                        state.refresh_computers(cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    eprintln!("NativeChat local-exec: {error}");
+                }
+            }
+            serve_local_exec(client, config.data_dir, cancel).await;
+        })
+        .detach();
+    }
+
+    fn stop_local_exec(&mut self) {
+        if let Some(cancel) = &self.local_exec_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.local_exec_cancel = None;
+        self.local_exec_machine_id = None;
+    }
+
+    pub fn toggle_shell_output(&mut self, call_id: String, cx: &mut Context<Self>) {
+        if !self.expanded_shell_output.remove(&call_id) {
+            self.expanded_shell_output.insert(call_id);
+        }
+        cx.notify();
     }
 
     pub fn pick_form_option(
@@ -2336,7 +2975,45 @@ impl AppState {
             .detach();
         }
 
+        if self.has_open_approval(&conversation_id) {
+            self.bot_status = Some("Waiting for approval".into());
+            cx.notify();
+            return;
+        }
+        if self.is_active_bot_responding() {
+            cx.notify();
+            return;
+        }
         self.send_opengrok_turn(conversation_id, content, cx);
+    }
+
+    fn has_open_approval(&self, conversation_id: &str) -> bool {
+        if self.auto_resolve_local_exec().is_some() {
+            return false;
+        }
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return false;
+        };
+        conversation.messages.iter().rev().any(|message| {
+            !message.is_me
+                && message.parts.iter().any(|part| match part {
+                    ChatPart::Approval(spec) => {
+                        !spec.run_id.is_empty()
+                            && !self
+                                .approval_decisions
+                                .get(&spec.call_id)
+                                .is_some_and(|decision| {
+                                    decision.is_settled()
+                                        || matches!(decision, ApprovalDecision::Sending)
+                                })
+                    }
+                    _ => false,
+                })
+        })
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -2450,8 +3127,80 @@ impl AppState {
         if self.app_settings_tab != tab {
             self.app_settings_tab = tab;
             self.record_nav();
+            if tab == AppSettingsTab::Computer {
+                self.refresh_computers(cx);
+            }
             cx.notify();
         }
+    }
+
+    pub fn refresh_computers(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let this_id = self.local_exec_machine_id.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(mut computers) = client.list_computers().await else {
+                return;
+            };
+            for computer in &mut computers {
+                computer.this_machine = this_id.as_ref() == Some(&computer.machine_id);
+                if computer.this_machine {
+                    computer.online = true;
+                }
+            }
+            computers.sort_by_key(|computer| !computer.this_machine);
+            let _ = this.update(cx, |state, cx| {
+                state.computers = computers;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn set_computer_exec_mode(
+        &mut self,
+        machine_id: String,
+        mode: LocalExecMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(computer) = self
+            .computers
+            .iter_mut()
+            .find(|computer| computer.machine_id == machine_id)
+        {
+            computer.mode = mode;
+        }
+        cx.notify();
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let stored = mode.as_stored();
+            let ok = client
+                .set_local_exec_mode(&machine_id, stored)
+                .await
+                .is_ok();
+            let confirmed = if ok {
+                client
+                    .local_exec_mode(&machine_id)
+                    .await
+                    .ok()
+                    .map(|mode| LocalExecMode::from_stored(&mode))
+            } else {
+                None
+            };
+            let _ = this.update(cx, |state, cx| {
+                if confirmed != Some(mode) {
+                    state.refresh_computers(cx);
+                    return;
+                }
+                if mode == LocalExecMode::Always {
+                    state.sync_pending_approvals(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn set_submit_chord(&mut self, chord: SubmitChord, cx: &mut Context<Self>) {
@@ -2479,6 +3228,9 @@ impl AppState {
         if !self.is_app_settings_open {
             self.is_app_settings_open = true;
             self.dismiss_popovers(cx);
+        }
+        if tab == AppSettingsTab::Computer {
+            self.refresh_computers(cx);
         }
         self.record_nav();
         cx.notify();
@@ -2646,5 +3398,18 @@ impl AppState {
         } else {
             self.read_aloud(text, message_id, TtsSource::Native, cx);
         }
+    }
+}
+
+fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
+    ApprovalSpec {
+        run_id: item.run_id.clone(),
+        call_id: item.call_id.clone(),
+        tool: item.tool.clone(),
+        command: command_from_args(&item.arguments),
+        why: "your machine's owner must approve this command".into(),
+        reason: "exec-consent".into(),
+        output: None,
+        ok: None,
     }
 }

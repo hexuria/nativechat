@@ -5,12 +5,66 @@
 //! and mounts only when its JSON is whole. Incomplete JSON is held, not
 //! rendered as markdown, and does not stall the prose around it.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatPart {
     Text(String),
     Ui(UiSpec),
+    /// A tool the person must allow or refuse before the run continues.
+    Approval(ApprovalSpec),
+}
+
+/// The fields `POST /ag-ui/runs/{runId}/answer` needs, plus what the card shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalSpec {
+    pub run_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub command: String,
+    pub why: String,
+    pub reason: String,
+    /// Tool result after the command ran (`exit 0` + stdout/stderr).
+    pub output: Option<String>,
+    pub ok: Option<bool>,
+}
+
+impl ChatPart {
+    pub fn is_widget(&self) -> bool {
+        !matches!(self, Self::Text(_))
+    }
+}
+
+/// At most one open permission card. Older unanswered host-shell runs stay
+/// off this bubble so a turn does not look like it needs two yeses.
+pub fn collapse_open_approvals(
+    parts: &[ChatPart],
+    open_call_ids: &HashSet<String>,
+) -> Vec<ChatPart> {
+    let keep = parts.iter().rev().find_map(|part| match part {
+        ChatPart::Approval(spec) if open_call_ids.contains(&spec.call_id) => {
+            Some(spec.call_id.clone())
+        }
+        _ => None,
+    });
+    let mut kept = false;
+    parts
+        .iter()
+        .filter(|part| match part {
+            ChatPart::Approval(spec) if open_call_ids.contains(&spec.call_id) => {
+                if keep.as_ref() == Some(&spec.call_id) && !kept {
+                    kept = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +113,7 @@ pub struct TurnAssembler {
     tool: Option<OpenTool>,
     waiting_approval: bool,
     completed_ui: Vec<CompletedUiTool>,
+    shell_args: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -80,18 +135,35 @@ impl TurnAssembler {
                     }
                 }
             }
-            "TOOL_CALL_START" => {
+            "TOOL_CALL_START" | "TOOL_CALL_CHUNK" => {
                 let name = event
                     .get("toolCallName")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                let id = event
+                    .get("toolCallId")
+                    .or_else(|| event.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if name == "user_machine_shell" && !id.is_empty() {
+                    self.shell_args.entry(id.clone()).or_default();
+                }
+                if kind == "TOOL_CALL_CHUNK" {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        if let Some(buf) = self.shell_args.get_mut(&id) {
+                            buf.push_str(delta);
+                        }
+                    }
+                    if let Some(args) = event.get("arguments") {
+                        let command = command_from_args(args);
+                        if !command.is_empty() && !id.is_empty() {
+                            self.shell_args.insert(id.clone(), args.to_string());
+                        }
+                    }
+                }
                 if is_ui_tool(name) {
                     self.flush_text();
-                    let id = event
-                        .get("toolCallId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
                     self.tool = Some(OpenTool {
                         id,
                         name: name.to_string(),
@@ -100,8 +172,18 @@ impl TurnAssembler {
                 }
             }
             "TOOL_CALL_ARGS" => {
-                if let Some(tool) = self.tool.as_mut() {
-                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                let id = event
+                    .get("toolCallId")
+                    .or_else(|| event.get("id"))
+                    .and_then(Value::as_str);
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    if let Some(id) = id {
+                        self.shell_args
+                            .entry(id.to_string())
+                            .or_default()
+                            .push_str(delta);
+                    }
+                    if let Some(tool) = self.tool.as_mut() {
                         tool.args.push_str(delta);
                     }
                 }
@@ -120,18 +202,22 @@ impl TurnAssembler {
                 let name = event.get("name").and_then(Value::as_str).unwrap_or("");
                 if name == "run-awaiting-approval" {
                     self.flush_text();
-                    let tool = event
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .unwrap_or("a tool");
-                    let why = event.get("why").and_then(Value::as_str).unwrap_or("");
-                    let line = if why.is_empty() {
-                        format!("Waiting for approval to run {tool}.")
-                    } else {
-                        format!("Waiting for approval to run {tool}: {why}")
-                    };
-                    self.committed.push(ChatPart::Text(format!("\n\n{line}")));
-                    self.waiting_approval = true;
+                    if let Some(mut spec) = approval_from_event(event) {
+                        if spec.command.is_empty() {
+                            if let Some(raw) = self.shell_args.get(&spec.call_id) {
+                                if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                                    spec.command = command_from_args(&value);
+                                } else if !raw.trim().is_empty() {
+                                    spec.command = raw.clone();
+                                }
+                            }
+                        }
+                        self.committed.retain(|part| {
+                            !matches!(part, ChatPart::Approval(existing) if existing.call_id == spec.call_id)
+                        });
+                        self.committed.push(ChatPart::Approval(spec));
+                        self.waiting_approval = true;
+                    }
                 } else {
                     let value = event.get("value").cloned().unwrap_or(Value::Null);
                     if let Some(spec) = UiSpec::from_custom(name, &value) {
@@ -139,6 +225,14 @@ impl TurnAssembler {
                         self.committed.push(ChatPart::Ui(spec));
                     }
                 }
+            }
+            "TOOL_CALL_RESULT" => {
+                self.waiting_approval = false;
+                self.flush_text();
+                self.attach_tool_result(event);
+            }
+            "RUN_FINISHED" | "RUN_ERROR" => {
+                self.waiting_approval = false;
             }
             _ => {}
         }
@@ -159,6 +253,29 @@ impl TurnAssembler {
 
     pub fn waiting_approval(&self) -> bool {
         self.waiting_approval
+    }
+
+    fn attach_tool_result(&mut self, event: &Value) {
+        let call_id = event
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if call_id.is_empty() {
+            return;
+        }
+        let content = event
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let ok = event.get("ok").and_then(Value::as_bool);
+        if let Some(ChatPart::Approval(spec)) = self.committed.iter_mut().find(
+            |part| matches!(part, ChatPart::Approval(existing) if existing.call_id == call_id),
+        ) {
+            spec.output = Some(content);
+            spec.ok = ok;
+        }
     }
 
     /// Stream ended. Mount a UI tool if its args already parse; otherwise release held text.
@@ -182,7 +299,7 @@ impl TurnAssembler {
         self.committed.retain(|part| match part {
             ChatPart::Ui(UiSpec::BarChart(_)) => !chart,
             ChatPart::Ui(UiSpec::Form(_)) => chart,
-            ChatPart::Text(_) => true,
+            ChatPart::Text(_) | ChatPart::Approval(_) => true,
         });
         self.committed.push(ChatPart::Ui(spec));
         self.completed_ui.retain(|tool| tool.name != name);
@@ -470,9 +587,139 @@ fn plain_text(parts: &[ChatPart]) -> String {
         .iter()
         .filter_map(|part| match part {
             ChatPart::Text(text) => Some(text.as_str()),
-            ChatPart::Ui(_) => None,
+            ChatPart::Ui(_) | ChatPart::Approval(_) => None,
         })
         .collect()
+}
+
+pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
+    let run_id = string_at(event, "runId")?;
+    let call_id = string_at(event, "callId")?;
+    if run_id.is_empty() || call_id.is_empty() {
+        return None;
+    }
+    let tool = string_at(event, "tool").unwrap_or_else(|| "a tool".to_string());
+    let arguments = event
+        .get("arguments")
+        .cloned()
+        .or_else(|| {
+            event
+                .get("value")
+                .and_then(|value| value.get("arguments"))
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    Some(ApprovalSpec {
+        run_id,
+        call_id,
+        command: command_from_args(&arguments),
+        why: string_at(event, "why").unwrap_or_default(),
+        reason: string_at(event, "reason").unwrap_or_else(|| "exec-consent".to_string()),
+        tool,
+        output: None,
+        ok: None,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalExecVerdict {
+    AllowOnce,
+    Always,
+    DeniedOnce,
+    Never,
+}
+
+/// Centered status Grok paints after the permission card leaves the transcript.
+pub fn local_exec_outcome(bot: &str, verdict: LocalExecVerdict) -> String {
+    match verdict {
+        LocalExecVerdict::Always => format!("{bot} can run commands on your computer."),
+        LocalExecVerdict::Never => format!("{bot} cannot run commands on your computer."),
+        LocalExecVerdict::DeniedOnce => {
+            format!("{bot} was not allowed to run commands on your computer.")
+        }
+        LocalExecVerdict::AllowOnce => {
+            format!("{bot} can run commands on your computer this time.")
+        }
+    }
+}
+
+pub fn command_from_replay_events(events: &[Value], call_id: &str) -> String {
+    let mut args = String::new();
+    for event in events {
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let tool_id = event
+            .get("toolCallId")
+            .or_else(|| event.get("id"))
+            .or_else(|| event.get("callId"))
+            .and_then(Value::as_str);
+        if matches!(kind, "TOOL_CALL_ARGS" | "TOOL_CALL_CHUNK") && tool_id == Some(call_id) {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                args.push_str(delta);
+            }
+            let from_args = event
+                .get("arguments")
+                .map(command_from_args)
+                .unwrap_or_default();
+            if !from_args.is_empty() {
+                return from_args;
+            }
+        }
+        if kind == "CUSTOM"
+            && event.get("name").and_then(Value::as_str) == Some("run-awaiting-approval")
+            && event.get("callId").and_then(Value::as_str) == Some(call_id)
+        {
+            let from_args = event
+                .get("arguments")
+                .or_else(|| event.get("args"))
+                .map(command_from_args)
+                .unwrap_or_default();
+            if !from_args.is_empty() {
+                return from_args;
+            }
+        }
+    }
+    if let Ok(parsed) = serde_json::from_str::<Value>(&args) {
+        let command = command_from_args(&parsed);
+        if !command.is_empty() {
+            return command;
+        }
+    }
+    args.trim().to_string()
+}
+
+pub fn command_from_args(arguments: &Value) -> String {
+    for key in ["command", "cmd", "shell", "script"] {
+        if let Some(command) = arguments.get(key).and_then(Value::as_str) {
+            let command = command.trim();
+            if !command.is_empty() {
+                return command.to_string();
+            }
+        }
+    }
+    if let Some(raw) = arguments.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+            return command_from_args(&parsed);
+        }
+        return raw.to_string();
+    }
+    if arguments.is_null() || arguments.as_object().is_some_and(|map| map.is_empty()) {
+        return String::new();
+    }
+    arguments.to_string()
+}
+
+fn string_at(event: &Value, key: &str) -> Option<String> {
+    event
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            event
+                .get("value")
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 /// What the next `/ag-ui` run is told after NativeChat paints a frontend tool.
@@ -579,7 +826,10 @@ mod tests {
         turn.push_event(&json!({"type":"TOOL_CALL_END","toolCallId":"c1"}));
         let (_, parts) = turn.snapshot();
         assert!(matches!(parts.first(), Some(ChatPart::Text(t)) if t == "should not appear yet"));
-        assert!(matches!(parts.get(1), Some(ChatPart::Ui(UiSpec::BarChart(_)))));
+        assert!(matches!(
+            parts.get(1),
+            Some(ChatPart::Ui(UiSpec::BarChart(_)))
+        ));
         let done = turn.take_completed_ui_tools();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].id, "c1");
@@ -645,5 +895,216 @@ mod tests {
         turn.push_event(&text("The set {a, b} is finite."));
         let (plain, _) = turn.snapshot();
         assert_eq!(plain, "The set {a, b} is finite.");
+    }
+
+    #[test]
+    fn command_from_replay_reads_tool_args_and_custom() {
+        let events = vec![
+            json!({
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": "c1",
+                "delta": "{\"command\":\"ls /Volumes/goldcoders\"}"
+            }),
+            json!({
+                "type": "CUSTOM",
+                "name": "run-awaiting-approval",
+                "callId": "c1",
+                "arguments": null
+            }),
+        ];
+        assert_eq!(
+            command_from_replay_events(&events, "c1"),
+            "ls /Volumes/goldcoders"
+        );
+        let custom = vec![json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "c2",
+            "arguments": {"command": "pwd"}
+        })];
+        assert_eq!(command_from_replay_events(&custom, "c2"), "pwd");
+    }
+
+    #[test]
+    fn shell_args_fill_an_approval_card_command() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_START",
+            "toolCallId": "call-9",
+            "toolCallName": "user_machine_shell"
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_ARGS",
+            "toolCallId": "call-9",
+            "delta": "{\"command\":\"ls /Volumes/goldcoders\"}"
+        }));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "user_machine_shell"
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::Approval(spec)] => {
+                assert_eq!(spec.command, "ls /Volumes/goldcoders");
+                assert_eq!(spec.run_id, "run-1");
+            }
+            other => panic!("expected approval with command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_awaiting_approval_is_a_card_not_a_sentence() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&text("I'll check that path."));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "threadId": "t1",
+            "callId": "call-9",
+            "tool": "user_machine_shell",
+            "arguments": {"command": "ls /Volumes/goldcoders/examples"},
+            "reason": "exec-consent",
+            "why": "your machine's owner must approve this command"
+        }));
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "I'll check that path.");
+        assert!(turn.waiting_approval());
+        match parts.as_slice() {
+            [ChatPart::Text(text), ChatPart::Approval(spec)] => {
+                assert_eq!(text, "I'll check that path.");
+                assert_eq!(spec.run_id, "run-1");
+                assert_eq!(spec.call_id, "call-9");
+                assert_eq!(spec.tool, "user_machine_shell");
+                assert_eq!(spec.command, "ls /Volumes/goldcoders/examples");
+                assert_eq!(spec.reason, "exec-consent");
+            }
+            other => panic!("expected text + approval card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_run_is_no_longer_waiting() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "user_machine_shell",
+            "arguments": {"command": "ls"}
+        }));
+        assert!(turn.waiting_approval());
+        turn.push_event(&json!({"type":"RUN_FINISHED"}));
+        assert!(!turn.waiting_approval());
+    }
+
+    fn ask(call_id: &str, command: &str) -> ChatPart {
+        ChatPart::Approval(ApprovalSpec {
+            run_id: "r".into(),
+            call_id: call_id.into(),
+            tool: "user_machine_shell".into(),
+            command: command.into(),
+            why: String::new(),
+            reason: "exec-consent".into(),
+            output: None,
+            ok: None,
+        })
+    }
+
+    #[test]
+    fn extra_open_approval_cards_are_dropped() {
+        let parts = vec![
+            ChatPart::Text("ok".into()),
+            ask("old", "ls"),
+            ask("new", "uname"),
+        ];
+        let open = HashSet::from(["old".to_string(), "new".to_string()]);
+        let out = collapse_open_approvals(&parts, &open);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], ChatPart::Text(t) if t == "ok"));
+        assert!(matches!(&out[1], ChatPart::Approval(s) if s.call_id == "new"));
+    }
+
+    #[test]
+    fn a_refused_shell_result_is_not_a_permission_card() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_START",
+            "toolCallId": "call_missing_args",
+            "toolCallName": "user_machine_shell"
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_END",
+            "toolCallId": "call_missing_args"
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "call_missing_args",
+            "ok": false,
+            "content": "refused: bad arguments: missing field `command`"
+        }));
+        let (_, parts) = turn.snapshot();
+        assert!(
+            parts
+                .iter()
+                .all(|part| !matches!(part, ChatPart::Approval(_))),
+            "a refusal is not a command to approve, got {parts:?}"
+        );
+        assert!(!turn.waiting_approval());
+    }
+
+    #[test]
+    fn tool_result_stdout_lands_on_the_approval_card() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "user_machine_shell",
+            "arguments": {"command": "ls"}
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "call-9",
+            "ok": true,
+            "content": "exit 0\n--- stdout ---\nhello\n"
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::Approval(spec)] => {
+                assert_eq!(spec.ok, Some(true));
+                assert_eq!(
+                    spec.output.as_deref(),
+                    Some("exit 0\n--- stdout ---\nhello\n")
+                );
+            }
+            other => panic!("expected approval with stdout, got {other:?}"),
+        }
+        assert!(!turn.waiting_approval());
+    }
+
+    #[test]
+    fn local_exec_outcome_matches_grok_copy() {
+        assert_eq!(
+            local_exec_outcome("Hexuria", LocalExecVerdict::AllowOnce),
+            "Hexuria can run commands on your computer this time."
+        );
+        assert_eq!(
+            local_exec_outcome("Hexuria", LocalExecVerdict::Always),
+            "Hexuria can run commands on your computer."
+        );
+        assert_eq!(
+            local_exec_outcome("Hexuria", LocalExecVerdict::DeniedOnce),
+            "Hexuria was not allowed to run commands on your computer."
+        );
+        assert_eq!(
+            local_exec_outcome("Hexuria", LocalExecVerdict::Never),
+            "Hexuria cannot run commands on your computer."
+        );
     }
 }

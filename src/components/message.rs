@@ -1,10 +1,8 @@
 use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
-use crate::chrome::{
-    chat_column_width, is_narrow_viewport, BUBBLE_RADIUS, CHAT_CONTENT_MAX,
-};
-use crate::components::gen_ui::render_ui_spec;
+use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width, is_narrow_viewport};
+use crate::components::gen_ui::{render_approval, render_ui_spec};
 use crate::components::message_actions::{MessageToolbar, TOOLBAR_W};
 use crate::opengrok::ChatPart;
 use crate::state::{AppState, RightPane};
@@ -208,7 +206,7 @@ impl MessageBubble {
 }
 
 fn has_ui_part(parts: &[ChatPart]) -> bool {
-    parts.iter().any(|part| matches!(part, ChatPart::Ui(_)))
+    parts.iter().any(ChatPart::is_widget)
 }
 
 fn render_parts(
@@ -236,6 +234,7 @@ fn render_parts(
                 debug_mode,
             )),
             ChatPart::Ui(spec) => Some(render_ui_spec(spec, message_id, app.clone(), cx)),
+            ChatPart::Approval(spec) => Some(render_approval(spec, app.clone(), cx)),
         })
         .collect();
     // Pixel width: a shrink-wrapped nested v_flex measures min-content and

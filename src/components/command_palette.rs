@@ -366,6 +366,13 @@ fn action_catalog(state: &AppState) -> Vec<PaletteItem> {
             false,
         ),
         action_item(
+            "Settings: Computer",
+            "Settings",
+            "icons/monitor.svg",
+            PaletteAction::OpenSettings(AppSettingsTab::Computer),
+            false,
+        ),
+        action_item(
             "Theme: Light",
             "Settings · Appearance",
             "icons/sun.svg",
