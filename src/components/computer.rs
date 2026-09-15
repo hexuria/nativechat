@@ -128,7 +128,7 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, box_id, routines) = {
+        let (view, agent_name, coworker_id, box_id, routines, has_screen) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -141,12 +141,18 @@ impl Render for ComputerPane {
             let box_id = coworker.and_then(|c| c.box_id.clone());
             let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
             let routines = state.coworker_routines(&coworker_id).to_vec();
+            let has_screen = state
+                .coworker_computer
+                .as_ref()
+                .and_then(|status| status.vnc_url())
+                .is_some();
             (
                 state.computer_view.clone(),
                 name,
                 coworker_id,
                 box_id,
                 routines,
+                has_screen,
             )
         };
 
@@ -166,6 +172,7 @@ impl Render for ComputerPane {
                         &coworker_id,
                         box_id.as_deref(),
                         &routines,
+                        has_screen,
                         muted,
                         app,
                         &theme,
@@ -185,6 +192,7 @@ impl ComputerPane {
         _coworker_id: &str,
         box_id: Option<&str>,
         routines: &[AgentRoutine],
+        has_screen: bool,
         muted: Hsla,
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
@@ -200,24 +208,7 @@ impl ComputerPane {
                     .pt(px(8.))
                     .pb(px(16.))
                     .gap(px(12.))
-                    .child(
-                        div()
-                            .id("agent-screen")
-                            .w_full()
-                            .h(px(168.))
-                            .flex_shrink_0()
-                            .rounded(px(12.))
-                            .bg(rgb(0x2a2a2a))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::default()
-                                    .path("icons/monitor.svg")
-                                    .size(px(22.))
-                                    .text_color(rgb(0x888888)),
-                            ),
-                    )
+                    .child(screen_tile(has_screen, app.clone(), theme))
                     .child(
                         div()
                             .w_full()
@@ -657,6 +648,84 @@ impl ComputerPane {
                 ))
             })
     }
+}
+
+/// The coworker's screen. The Open pill is the control: it appears on hover
+/// only once the box has a screen URL, and only then does the tile take a
+/// click — a blank monitor must not provision a box behind the person's back.
+fn screen_tile(
+    has_screen: bool,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    div()
+        .id("agent-screen")
+        .group("agent-screen")
+        .relative()
+        .w_full()
+        .h(px(168.))
+        .flex_shrink_0()
+        .rounded(px(12.))
+        .bg(rgb(0x2a2a2a))
+        .overflow_hidden()
+        .when(has_screen, |this| {
+            this.cursor_pointer().on_mouse_down(MouseButton::Left, {
+                let app = app.clone();
+                move |_, _, cx| {
+                    app.update(cx, |state, cx| {
+                        state.open_coworker_screen(cx);
+                    });
+                }
+            })
+        })
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::default()
+                        .path("icons/monitor.svg")
+                        .size(px(22.))
+                        .text_color(rgb(0x888888)),
+                ),
+        )
+        .when(has_screen, |this| {
+            this.child(
+                div()
+                    .id("agent-screen-open")
+                    .absolute()
+                    .inset_0()
+                    .opacity(0.)
+                    .group_hover("agent-screen", |style| style.opacity(1.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x000000).opacity(0.35))
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(8.))
+                            .rounded_full()
+                            .bg(theme.primary)
+                            .text_color(theme.primary_foreground)
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                Icon::default()
+                                    .path("icons/expand.svg")
+                                    .size(px(14.))
+                                    .text_color(theme.primary_foreground),
+                            )
+                            .child("Open"),
+                    ),
+            )
+        })
 }
 
 fn pane_header(

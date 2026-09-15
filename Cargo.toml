@@ -23,13 +23,13 @@ edition = "2024"
 default = []
 # In-process gpui-agent mailbox for screenshots / semantic UI control.
 # Product builds leave this off. Launch with `--features agent` and GPUI_AGENT=1.
-agent = ["dep:gpui-agent", "dep:raw-window-handle"]
+agent = ["dep:gpui-agent"]
 
 [dependencies]
 gpui-kit = "0.6"
 gpui-fps = "0.6"
 gpui-agent = { git = "https://github.com/hexuria/gpui-agent", optional = true }
-raw-window-handle = { version = "0.6", optional = true }
+raw-window-handle = "0.6"
 anyhow.workspace = true
 rust-embed.workspace = true
 rand = "0.9.2"
@@ -63,3 +63,7 @@ short_description = "A native chat application."
 resources = ["themes/", "assets/"]
 macOS_entitlements_path = "./nativechat.entitlements"
 NSMicrophoneUsageDescription = "NativeChat needs access to your microphone for voice input."
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The coworker-screen window is a WebView; only macOS builds it (see components/computer_screen.rs).
+wry = "0.53"
