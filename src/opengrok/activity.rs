@@ -31,6 +31,62 @@ pub fn visible_bot_status(
     }
 }
 
+/// Per-call memory for the frames AG-UI splits: `TOOL_CALL_START` names the
+/// tool but has no arguments, `TOOL_CALL_ARGS` has arguments but no name.
+/// Fed every frame in order, each one labels correctly.
+#[derive(Default)]
+pub struct ToolCallTracker {
+    names: std::collections::HashMap<String, String>,
+    args: std::collections::HashMap<String, String>,
+}
+
+impl ToolCallTracker {
+    /// The status one frame implies, given the frames before it.
+    pub fn tick(&mut self, event: &Value) -> ActivityTick {
+        let call_id = event.get("toolCallId").and_then(Value::as_str);
+        if let Some(id) = call_id {
+            if let Some(name) = event.get("toolCallName").and_then(Value::as_str) {
+                self.names.insert(id.to_string(), name.to_string());
+            }
+            if let Some(arguments) = event.get("arguments") {
+                self.args.insert(id.to_string(), arguments.to_string());
+            } else if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                self.args.entry(id.to_string()).or_default().push_str(delta);
+            }
+        }
+        let args = call_id.and_then(|id| self.args.get(id)).map(String::as_str);
+        let remembered = if event.get("toolCallName").is_none() {
+            call_id.and_then(|id| self.names.get(id))
+        } else {
+            None
+        };
+        match remembered {
+            Some(name) => {
+                let mut named = event.clone();
+                if let Some(object) = named.as_object_mut() {
+                    object.insert("toolCallName".into(), name.clone().into());
+                }
+                activity_from_agui(&named, args)
+            }
+            None => activity_from_agui(event, args),
+        }
+    }
+}
+
+/// Where a journaled run is right now: the last frame that set a status.
+pub fn activity_from_replay(events: &[Value]) -> Option<BotActivity> {
+    let mut tracker = ToolCallTracker::default();
+    let mut current = None;
+    for event in events {
+        match tracker.tick(event) {
+            ActivityTick::Keep => {}
+            ActivityTick::Clear => current = None,
+            ActivityTick::Set(activity) => current = Some(activity),
+        }
+    }
+    current
+}
+
 pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTick {
     let Some(kind) = event.get("type").and_then(Value::as_str) else {
         return ActivityTick::Keep;
@@ -176,6 +232,43 @@ mod tests {
                 label: "Running commands".into()
             })
         );
+    }
+
+    #[test]
+    fn args_frame_is_labelled_by_the_name_from_its_start_frame() {
+        let mut tracker = ToolCallTracker::default();
+        let start = json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"Shell"});
+        assert_eq!(
+            tracker.tick(&start),
+            ActivityTick::Set(BotActivity {
+                label: "Running commands".into()
+            })
+        );
+        let args = json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"command\":\"cargo test\"}"});
+        assert_eq!(
+            tracker.tick(&args),
+            ActivityTick::Set(BotActivity {
+                label: "Running `cargo test`".into()
+            })
+        );
+    }
+
+    #[test]
+    fn replay_status_is_the_last_frame_that_set_one() {
+        let events = vec![
+            json!({"type":"RUN_STARTED"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"Shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","arguments":{"command":"date"}}),
+        ];
+        assert_eq!(
+            activity_from_replay(&events),
+            Some(BotActivity {
+                label: "Running `date`".into()
+            })
+        );
+        let mut finished = events.clone();
+        finished.push(json!({"type":"RUN_FINISHED"}));
+        assert_eq!(activity_from_replay(&finished), None);
     }
 
     #[test]

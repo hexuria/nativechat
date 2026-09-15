@@ -7,7 +7,10 @@ mod gen_ui;
 mod local_exec;
 mod types;
 
-pub use activity::{ActivityTick, BotActivity, activity_from_agui, visible_bot_status};
+pub use activity::{
+    ActivityTick, BotActivity, ToolCallTracker, activity_from_agui, activity_from_replay,
+    visible_bot_status,
+};
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, CompletedUiTool, FormField, FormSpec,
     LocalExecResolution, MAX_TURN_CONTINUES, TurnAssembler, UI_TOOL_RESULT, USER_MACHINE_SHELL,

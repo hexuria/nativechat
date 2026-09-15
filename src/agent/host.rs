@@ -1,7 +1,7 @@
 use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
-use crate::opengrok::CoworkerPatch;
+use crate::opengrok::{CoworkerPatch, LocalExecResolution};
 use crate::state::AppState;
 
 pub mod ids {
@@ -54,6 +54,10 @@ pub enum Command {
     SelectSession(String),
     SelectCoworker(String),
     SendMessage(String),
+    AnswerApproval {
+        call_id: String,
+        resolution: LocalExecResolution,
+    },
     Login {
         email: String,
         password: String,
@@ -95,6 +99,12 @@ impl Command {
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
+            Self::AnswerApproval {
+                call_id,
+                resolution,
+            } => {
+                state.answer_approval_by_id(&call_id, resolution, cx);
+            }
             Self::Login { email, password } => state.login(email, password, cx),
             Self::SetLoginDraft { email, password } => {
                 if let Some(email) = email {
@@ -117,6 +127,31 @@ struct SessionSnap {
     active: bool,
 }
 
+/// An approval card still waiting on the person.
+#[derive(Clone)]
+struct ApprovalSnap {
+    call_id: String,
+    tool: String,
+    place: &'static str,
+    local: bool,
+}
+
+/// `approval-<call_id>-<verb>` → the answer it stands for.
+fn approval_target(target: &str) -> Option<(String, LocalExecResolution)> {
+    let rest = target.strip_prefix("approval-")?;
+    let verbs = [
+        ("-allow-once", LocalExecResolution::AllowOnce),
+        ("-deny-once", LocalExecResolution::DenyOnce),
+        ("-always", LocalExecResolution::Always),
+        ("-never", LocalExecResolution::Never),
+    ];
+    verbs.iter().find_map(|(suffix, resolution)| {
+        rest.strip_suffix(suffix)
+            .filter(|call_id| !call_id.is_empty())
+            .map(|call_id| (call_id.to_string(), *resolution))
+    })
+}
+
 pub struct NativeChatHost {
     ready: bool,
     sidebar_collapsed: bool,
@@ -134,6 +169,7 @@ pub struct NativeChatHost {
     agent_settings_open: bool,
     model_picker_open: bool,
     avatar_editor_open: bool,
+    approvals: Vec<ApprovalSnap>,
     pending: Option<Command>,
 }
 
@@ -188,6 +224,16 @@ impl NativeChatHost {
             agent_settings_open: state.is_agent_settings_open(),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
+            approvals: state
+                .open_approvals()
+                .into_iter()
+                .map(|spec| ApprovalSnap {
+                    local: spec.runs_on_this_mac(),
+                    place: spec.place(),
+                    call_id: spec.call_id,
+                    tool: spec.tool,
+                })
+                .collect(),
             pending: None,
         }
     }
@@ -283,6 +329,22 @@ impl NativeChatHost {
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
         }
+        for approval in &self.approvals {
+            let id = format!("approval-{}", approval.call_id);
+            let mut card = UiNode::new(
+                id.clone(),
+                "dialog",
+                format!("Allow {} on {}?", approval.tool, approval.place),
+            )
+            .with_child(UiNode::button(format!("{id}-allow-once"), "Allow once"))
+            .with_child(UiNode::button(format!("{id}-deny-once"), "Deny once"));
+            if approval.local {
+                card = card
+                    .with_child(UiNode::button(format!("{id}-always"), "Always allow"))
+                    .with_child(UiNode::button(format!("{id}-never"), "Never"));
+            }
+            page = page.with_child(card);
+        }
 
         UiTree {
             app: "nativechat".into(),
@@ -357,6 +419,11 @@ impl NativeChatHost {
             Command::SelectCoworker(id.to_string())
         } else if let Some(id) = target.strip_prefix("session-") {
             Command::SelectSession(id.to_string())
+        } else if let Some((call_id, resolution)) = approval_target(target) {
+            Command::AnswerApproval {
+                call_id,
+                resolution,
+            }
         } else {
             return Err(format!("unknown click target `{target}`"));
         };
@@ -413,6 +480,24 @@ impl NativeChatHost {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "session.select requires arg id".to_string())?;
                 Command::SelectSession(id.to_string())
+            }
+            "approval.answer" => {
+                let call_id = args
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "approval.answer requires arg call_id".to_string())?;
+                let answer = args
+                    .get("answer")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "approval.answer requires arg answer".to_string())?;
+                let (call_id, resolution) =
+                    approval_target(&format!("approval-{call_id}-{answer}")).ok_or_else(|| {
+                        format!("unknown answer `{answer}` (allow-once, deny-once, always, never)")
+                    })?;
+                Command::AnswerApproval {
+                    call_id,
+                    resolution,
+                }
             }
             other => return Err(format!("unknown invoke `{other}`")),
         };

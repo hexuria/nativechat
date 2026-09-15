@@ -6,11 +6,11 @@ use crate::chrome::{
 };
 use crate::config::Config;
 use crate::opengrok::{
-    Account, ActivityTick, AguiMessage, ApprovalSpec, ChatPart, ConnectedComputer, Coworker,
-    CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
-    ProfileUpdate, QueuedApproval, TurnAssembler, activity_from_agui, command_from_args,
-    command_from_replay_events, enrol_this_machine, local_exec_outcome, policy_answer,
-    serve_local_exec, stored_machine_id, visible_bot_status,
+    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
+    Coworker, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue,
+    OpenGrokClient, ProfileUpdate, QueuedApproval, ToolCallTracker, TurnAssembler,
+    activity_from_replay, command_from_args, command_from_replay_events, enrol_this_machine,
+    local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id, visible_bot_status,
 };
 use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
@@ -781,6 +781,40 @@ impl AppState {
         self.approval_decisions
             .get(call_id)
             .is_some_and(ApprovalDecision::is_answered)
+    }
+
+    /// Cards in the open conversation still waiting on the person.
+    pub fn open_approvals(&self) -> Vec<ApprovalSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::Approval(spec) if !self.approval_answered(&spec.call_id) => {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Answer a card by id. False when no such card is open.
+    pub fn answer_approval_by_id(
+        &mut self,
+        call_id: &str,
+        resolution: LocalExecResolution,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(spec) = self
+            .open_approvals()
+            .into_iter()
+            .find(|spec| spec.call_id == call_id)
+        else {
+            return false;
+        };
+        self.answer_approval(spec, resolution, cx);
+        true
     }
 
     pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
@@ -2133,40 +2167,11 @@ impl AppState {
             };
             let (result, waiting_approval, turn_id) = match coworker {
                 Ok(id) => {
-                    let mut args_by_call: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
-                    let mut names_by_call: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
+                    let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let result = client
                         .run_turn(&id, &conversation_id, &history, |event| {
-                            if let Some(call_id) = event.get("toolCallId").and_then(|v| v.as_str())
-                            {
-                                if let Some(name) =
-                                    event.get("toolCallName").and_then(|v| v.as_str())
-                                {
-                                    names_by_call.insert(call_id.to_string(), name.to_string());
-                                }
-                                if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                    args_by_call
-                                        .entry(call_id.to_string())
-                                        .or_default()
-                                        .push_str(delta);
-                                }
-                            }
-                            let call_id = event.get("toolCallId").and_then(|v| v.as_str());
-                            let args = call_id
-                                .and_then(|id| args_by_call.get(id))
-                                .map(String::as_str);
-                            let mut event = event.clone();
-                            if event.get("toolCallName").is_none() {
-                                if let Some(name) = call_id.and_then(|id| names_by_call.get(id)) {
-                                    event.as_object_mut().map(|o| {
-                                        o.insert("toolCallName".into(), name.clone().into())
-                                    });
-                                }
-                            }
-                            match activity_from_agui(&event, args) {
+                            match tracker.tick(event) {
                                 ActivityTick::Keep => {}
                                 tick => {
                                     let turn_id = id.clone();
@@ -2431,6 +2436,12 @@ impl AppState {
                             assembler.finish();
                             let (plain, parts) = assembler.snapshot();
                             let status = replay.status.clone();
+                            // The journal says what the run is doing now; "Working" only
+                            // when no frame has said.
+                            let activity =
+                                activity_from_replay(&replay.events).unwrap_or(BotActivity {
+                                    label: "Working".into(),
+                                });
                             let _ = this.update(cx, |state, cx| {
                                 if let Some(conversation_id) = conversation_id.as_ref()
                                     && let Some(conversation) = state
@@ -2460,9 +2471,7 @@ impl AppState {
                                     "running" => {
                                         state.apply_turn_status(
                                             coworker_id.as_deref(),
-                                            ActivityTick::Set(crate::opengrok::BotActivity {
-                                                label: "Working".into(),
-                                            }),
+                                            ActivityTick::Set(activity.clone()),
                                         );
                                     }
                                     "finished" | "failed" => {
