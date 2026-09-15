@@ -551,6 +551,11 @@ impl ApprovalDecision {
         !matches!(self, Self::Pending | Self::Sending)
     }
 
+    /// The person (or the policy) has answered; a click still in flight counts.
+    pub fn is_answered(&self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+
     /// `place` is [`ApprovalSpec::place`].
     pub fn outcome_line(&self, bot: &str, place: &str) -> Option<String> {
         let resolution = match self {
@@ -725,6 +730,15 @@ impl AppState {
         )
     }
 
+    /// The selected coworker's name, for copy that addresses it.
+    pub fn active_bot_name(&self) -> String {
+        self.active_coworker_id
+            .as_ref()
+            .and_then(|id| self.coworkers.iter().find(|c| &c.id == id))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "this agent".to_string())
+    }
+
     pub fn is_active_bot_responding(&self) -> bool {
         self.is_ai_responding
             && self.active_coworker_id.is_some()
@@ -763,12 +777,10 @@ impl AppState {
         policy_answer(spec, self.this_machine_mode())
     }
 
-    /// True once the person (or the policy) has answered; a click still in
-    /// flight counts.
     pub fn approval_answered(&self, call_id: &str) -> bool {
         self.approval_decisions
             .get(call_id)
-            .is_some_and(|decision| !matches!(decision, ApprovalDecision::Pending))
+            .is_some_and(ApprovalDecision::is_answered)
     }
 
     pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
@@ -2620,14 +2632,15 @@ impl AppState {
     }
 
     fn drop_other_pending_approvals(&mut self, keep_call_id: &str) {
+        let decisions = &self.approval_decisions;
         for conversation in &mut self.conversations {
             for message in &mut conversation.messages {
                 message.parts.retain(|part| match part {
                     ChatPart::Approval(spec) => {
                         spec.call_id == keep_call_id
-                            || self.approval_decisions.get(&spec.call_id).is_some_and(|d| {
-                                d.is_settled() || matches!(d, ApprovalDecision::Sending)
-                            })
+                            || decisions
+                                .get(&spec.call_id)
+                                .is_some_and(ApprovalDecision::is_answered)
                     }
                     _ => true,
                 });

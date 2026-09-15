@@ -181,6 +181,19 @@ impl OpenGrokClient {
         OpenGrokError::status(status, error_message_from_body(&body))
     }
 
+    /// The body as `T` on a 2xx, the server's error otherwise.
+    async fn json_or_error<T: serde::de::DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T, OpenGrokError> {
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))
+    }
+
     pub async fn health(&self) -> Result<(), OpenGrokError> {
         let url = self.url("/health")?;
         let response = self
@@ -241,26 +254,14 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/account", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn update_profile(&self, update: &ProfileUpdate) -> Result<Account, OpenGrokError> {
         let response = self
             .send_json(reqwest::Method::POST, "/account/profile", Some(update))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn change_password(
@@ -289,13 +290,7 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/coworkers", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn hire(&self, name: &str, model: Option<&str>) -> Result<Coworker, OpenGrokError> {
@@ -306,26 +301,14 @@ impl OpenGrokClient {
         let response = self
             .send_json(reqwest::Method::POST, "/coworkers", Some(&body))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn list_models(&self) -> Result<ModelCatalogue, OpenGrokError> {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/models", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn delete_coworker(&self, coworker_id: &str) -> Result<(), OpenGrokError> {
@@ -351,13 +334,7 @@ impl OpenGrokClient {
         let response = self
             .send_json(reqwest::Method::PATCH, &path, Some(patch))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     /// One turn. Desktop Grok Bot POSTs `/api/sendPrompt` then paints from `GET /events`.
@@ -447,13 +424,7 @@ impl OpenGrokClient {
         let response = self
             .send_json(reqwest::Method::POST, &path, Some(&body))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn replay_run(&self, run_id: &str) -> Result<RunReplay, OpenGrokError> {
@@ -461,26 +432,14 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn list_approvals(&self) -> Result<Vec<QueuedApproval>, OpenGrokError> {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/ag-ui/approvals", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn list_computers(&self) -> Result<Vec<ConnectedComputer>, OpenGrokError> {
@@ -514,13 +473,7 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/local-exec/daemon", None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        let body: DaemonList = response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        let body: DaemonList = Self::json_or_error(response).await?;
         Ok(body.machines)
     }
 
@@ -536,13 +489,7 @@ impl OpenGrokClient {
         let response = self
             .send_json(reqwest::Method::POST, "/local-exec/daemon", Some(&body))
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+        Self::json_or_error(response).await
     }
 
     pub async fn local_exec_mode(&self, machine_id: &str) -> Result<String, OpenGrokError> {
@@ -550,13 +497,7 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
-        let body: LocalExecPolicyView = response
-            .json()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        let body: LocalExecPolicyView = Self::json_or_error(response).await?;
         Ok(body.mode)
     }
 

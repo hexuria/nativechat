@@ -154,6 +154,37 @@ struct ChatRow {
     status_line: Option<String>,
 }
 
+impl ChatRow {
+    /// A row with nothing said yet: no speech, no footer, no card. Each
+    /// kind of row sets the few fields it owns on top of this.
+    fn slot(id: String, source_id: String) -> Self {
+        Self {
+            id,
+            content: SharedString::from(""),
+            is_me: false,
+            timestamp: SharedString::from(""),
+            is_native_speaking: false,
+            is_native_paused: false,
+            is_native_loading: false,
+            is_ai_speaking: false,
+            is_ai_paused: false,
+            is_ai_loading: false,
+            is_cached: false,
+            highlight_range: None,
+            highlight_native: false,
+            use_markdown: false,
+            show_footer: false,
+            source_id,
+            tts_text: SharedString::from(""),
+            reply_preview: None,
+            reaction: None,
+            widget: None,
+            approval: None,
+            status_line: None,
+        }
+    }
+}
+
 fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     let Some(conv) = state
         .active_conversation_id
@@ -176,12 +207,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             continue;
         }
         let highlight_native = is_native_speaking && full_highlight.is_some();
-        let bot_name = state
-            .active_coworker_id
-            .as_ref()
-            .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
-            .map(|c| c.name.as_str())
-            .unwrap_or("this agent");
+        let bot_name = state.active_bot_name();
         let display: Vec<ChatPart> = if msg.parts.iter().any(ChatPart::is_widget) {
             let open: std::collections::HashSet<String> = msg
                 .parts
@@ -209,28 +235,20 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             let id = text_row_id(&msg.id, *text_n);
             *text_n += 1;
             rows.push(ChatRow {
-                id,
                 content: SharedString::from(text.clone()),
                 is_me: msg.is_me,
                 timestamp: SharedString::from(msg.formatted_time()),
                 is_native_speaking,
                 is_native_paused: state.native_tts.is_paused && is_native_speaking,
                 is_native_loading: state.native_tts.is_loading && is_native_speaking,
-                is_ai_speaking: false,
-                is_ai_paused: false,
-                is_ai_loading: false,
-                is_cached: false,
                 highlight_range: full_highlight.clone(),
                 highlight_native,
                 use_markdown: !msg.is_me && looks_like_markdown(&text),
                 show_footer: true,
-                source_id: msg.id.clone(),
                 tts_text: SharedString::from(text),
                 reply_preview: msg.reply_preview.clone(),
                 reaction: state.message_reactions.get(&msg.id).cloned(),
-                widget: None,
-                approval: None,
-                status_line: None,
+                ..ChatRow::slot(id, msg.id.clone())
             });
         };
         for part in display {
@@ -239,57 +257,19 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 ChatPart::Ui(spec) => {
                     flush_text(&mut rows, &mut text_buf, &mut text_n);
                     rows.push(ChatRow {
-                        id: format!("{}-ui-{ui_n}", msg.id),
-                        content: SharedString::from(""),
-                        is_me: false,
-                        timestamp: SharedString::from(""),
-                        is_native_speaking: false,
-                        is_native_paused: false,
-                        is_native_loading: false,
-                        is_ai_speaking: false,
-                        is_ai_paused: false,
-                        is_ai_loading: false,
-                        is_cached: false,
-                        highlight_range: None,
-                        highlight_native: false,
-                        use_markdown: false,
-                        show_footer: false,
-                        source_id: msg.id.clone(),
-                        tts_text: SharedString::from(""),
-                        reply_preview: None,
-                        reaction: None,
                         widget: Some(spec),
-                        approval: None,
-                        status_line: None,
+                        ..ChatRow::slot(format!("{}-ui-{ui_n}", msg.id), msg.id.clone())
                     });
                     ui_n += 1;
                 }
                 ChatPart::Approval(spec) => {
                     flush_text(&mut rows, &mut text_buf, &mut text_n);
-                    let outcome = state.approval_status_line(&spec, bot_name);
+                    let outcome = state.approval_status_line(&spec, &bot_name);
                     rows.push(ChatRow {
-                        id: format!("{}-ask-{ui_n}", msg.id),
                         content: SharedString::from(outcome.clone().unwrap_or_default()),
-                        is_me: false,
-                        timestamp: SharedString::from(""),
-                        is_native_speaking: false,
-                        is_native_paused: false,
-                        is_native_loading: false,
-                        is_ai_speaking: false,
-                        is_ai_paused: false,
-                        is_ai_loading: false,
-                        is_cached: false,
-                        highlight_range: None,
-                        highlight_native: false,
-                        use_markdown: false,
-                        show_footer: false,
-                        source_id: msg.id.clone(),
-                        tts_text: SharedString::from(""),
-                        reply_preview: None,
-                        reaction: None,
-                        widget: None,
                         approval: outcome.is_none().then_some(spec),
                         status_line: outcome,
+                        ..ChatRow::slot(format!("{}-ask-{ui_n}", msg.id), msg.id.clone())
                     });
                     ui_n += 1;
                 }

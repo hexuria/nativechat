@@ -52,12 +52,12 @@ pub async fn serve_local_exec(client: OpenGrokClient, data_dir: PathBuf, cancel:
     };
 
     while !cancel.load(Ordering::Relaxed) {
-        if let Err(error) = hold_requests(&client, &cred, &cancel).await {
+        if let Err(error) = run_request_stream(&client, &cred, &cancel).await {
             if error.is_unauthorized() {
                 match ensure_daemon(&client, &data_dir).await {
                     Ok(fresh) => {
                         cred = fresh;
-                        if let Err(again) = hold_requests(&client, &cred, &cancel).await {
+                        if let Err(again) = run_request_stream(&client, &cred, &cancel).await {
                             eprintln!("NativeChat local-exec: {again}");
                         }
                     }
@@ -112,7 +112,7 @@ async fn ensure_daemon(
     Ok(cred)
 }
 
-async fn hold_requests(
+async fn run_request_stream(
     client: &OpenGrokClient,
     cred: &StoredDaemon,
     cancel: &Arc<AtomicBool>,

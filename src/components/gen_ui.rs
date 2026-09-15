@@ -30,15 +30,9 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 .get(&spec.call_id)
                 .cloned()
                 .unwrap_or(ApprovalDecision::Pending);
-            let bot = state
-                .active_coworker_id
-                .as_ref()
-                .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| "this agent".to_string());
             (
                 decision,
-                bot,
+                state.active_bot_name(),
                 state.local_exec_machine_id.clone().unwrap_or_default(),
             )
         })
