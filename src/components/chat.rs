@@ -11,7 +11,7 @@ use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::find_text::{FindHit, marks_for_row, project_hits};
 use crate::opengrok::{ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, collapse_open_approvals};
-use crate::state::{AppState, EmojiPickerOpen};
+use crate::state::{AppState, EmojiPickerOpen, is_status_line, is_tool_standin};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -151,6 +151,8 @@ struct ChatRow {
     widget: Option<UiSpec>,
     approval: Option<ApprovalSpec>,
     status_line: Option<String>,
+    /// A status line about a run that failed, painted in the danger colour rather than dimmed.
+    status_failed: bool,
     screenshot: Option<ScreenshotSpec>,
 }
 
@@ -181,6 +183,7 @@ impl ChatRow {
             widget: None,
             approval: None,
             status_line: None,
+            status_failed: false,
             screenshot: None,
         }
     }
@@ -235,6 +238,17 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             }
             let id = text_row_id(&msg.id, *text_n);
             *text_n += 1;
+            // What the app says about a turn, and the stand-in a wordless turn leaves, are not
+            // speech: they get the quiet centred line, not a bubble with a toolbar on it.
+            if !msg.is_me && (is_status_line(&text) || is_tool_standin(&text)) {
+                rows.push(ChatRow {
+                    status_failed: is_status_line(&text),
+                    content: SharedString::from(text.clone()),
+                    status_line: Some(text),
+                    ..ChatRow::slot(id, msg.id.clone())
+                });
+                return;
+            }
             rows.push(ChatRow {
                 content: SharedString::from(text.clone()),
                 is_me: msg.is_me,
@@ -297,6 +311,7 @@ struct ChatPalette {
     secondary_foreground: Hsla,
     yellow: Hsla,
     green: Hsla,
+    danger: Hsla,
 }
 
 impl ChatPalette {
@@ -309,6 +324,7 @@ impl ChatPalette {
             secondary_foreground: theme.secondary_foreground,
             yellow: theme.yellow,
             green: theme.green,
+            danger: theme.danger,
         }
     }
 }
@@ -676,18 +692,20 @@ impl Render for ChatTranscript {
                                     .into_any_element();
                             }
                             if let Some(line) = &row.status_line {
+                                // A run that failed said nothing the person can act on: the line
+                                // that explains it is worth seeing, not worth reading as speech.
+                                let color = if row.status_failed {
+                                    palette.danger
+                                } else {
+                                    palette.secondary_foreground.opacity(0.7)
+                                };
                                 return div()
                                     .id(ElementId::Name(row.id.clone().into()))
                                     .w_full()
                                     .flex()
                                     .justify_center()
                                     .py(px(8.))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(palette.secondary_foreground.opacity(0.7))
-                                            .child(line.clone()),
-                                    )
+                                    .child(div().text_sm().text_color(color).child(line.clone()))
                                     .into_any_element();
                             }
                             if let Some(spec) = &row.approval {

@@ -1734,6 +1734,7 @@ mod tests {
                     role: "user".into(),
                     content: "hi".into(),
                     tool_call_id: None,
+                    reply_to: None,
                 }],
                 {
                     let first_at = first_at.clone();

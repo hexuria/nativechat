@@ -38,6 +38,9 @@ pub fn visible_bot_status(
 pub struct ToolCallTracker {
     names: std::collections::HashMap<String, String>,
     args: std::collections::HashMap<String, String>,
+    /// Call ids as they first appeared: the maps say what each call was, this says in what order,
+    /// which is what `deeds` needs to tell a turn's story.
+    order: Vec<String>,
 }
 
 impl ToolCallTracker {
@@ -45,6 +48,9 @@ impl ToolCallTracker {
     pub fn tick(&mut self, event: &Value) -> ActivityTick {
         let call_id = event.get("toolCallId").and_then(Value::as_str);
         if let Some(id) = call_id {
+            if !self.order.iter().any(|seen| seen == id) {
+                self.order.push(id.to_string());
+            }
             if let Some(name) = event.get("toolCallName").and_then(Value::as_str) {
                 self.names.insert(id.to_string(), name.to_string());
             }
@@ -71,6 +77,23 @@ impl ToolCallTracker {
             None => activity_from_agui(event, args),
         }
     }
+
+    /// What this turn did, each tool said once and in the order it was called.
+    pub fn deeds(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for id in &self.order {
+            let Some(name) = self.names.get(id) else {
+                continue;
+            };
+            let Some(deed) = deed_from_tool(name, self.args.get(id).map(String::as_str)) else {
+                continue;
+            };
+            if !out.contains(&deed) {
+                out.push(deed);
+            }
+        }
+        out
+    }
 }
 
 /// Where a journaled run is right now: the last frame that set a status.
@@ -85,6 +108,93 @@ pub fn activity_from_replay(events: &[Value]) -> Option<BotActivity> {
         }
     }
     current
+}
+
+/// What a journaled run did, for the turns rebuilt from the journal rather than watched live —
+/// a run resumed after a permission card comes back this way.
+pub fn deeds_from_replay(events: &[Value]) -> Vec<String> {
+    let mut tracker = ToolCallTracker::default();
+    for event in events {
+        tracker.tick(event);
+    }
+    tracker.deeds()
+}
+
+/// How many deeds the stand-in names. A computer-use turn calls twenty tools; the transcript
+/// wants a sentence, not a log.
+const STANDIN_DEEDS: usize = 3;
+
+/// The line a turn that acted but said nothing leaves in the transcript, e.g.
+/// "[took a screenshot of my screen]". The coworker is shown its own transcript on every later
+/// turn, so a wordless turn must still leave a memory of what it did.
+pub fn tool_standin(deeds: &[String]) -> Option<String> {
+    if deeds.is_empty() {
+        return None;
+    }
+    let mut line = deeds
+        .iter()
+        .take(STANDIN_DEEDS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", then ");
+    if deeds.len() > STANDIN_DEEDS {
+        line.push('…');
+    }
+    Some(format!("[{line}]"))
+}
+
+/// One tool call in the coworker's own voice, past tense, for the stand-in line. `describe_tool`
+/// says what a call is doing now for the status strip; this says what it did, afterwards.
+fn deed_from_tool(name: &str, args: Option<&str>) -> Option<String> {
+    let parsed = args.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let field = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key).and_then(Value::as_str))
+            .map(str::to_string)
+    };
+    let deed = match name {
+        "" => return None,
+        "Read" | "ExternalRead" | "BoxRead" | "readToolCall" | "read_file" => field("path")
+            .as_deref()
+            .and_then(file_basename)
+            .map(|file| format!("read {file}"))
+            .unwrap_or_else(|| "read a file".into()),
+        "write_file" => field("path")
+            .as_deref()
+            .and_then(file_basename)
+            .map(|file| format!("wrote {file}"))
+            .unwrap_or_else(|| "wrote a file".into()),
+        "WebSearch" | "webSearchToolCall" => "searched the web".into(),
+        "WebFetch" | "webFetchToolCall" => "read a page on the web".into(),
+        "GenerateImage" | "generateImageToolCall" => "made a picture".into(),
+        "Shell" | "BoxShell" | "shellToolCall" | "ExternalShell" | "shell" => {
+            "ran a shell command".into()
+        }
+        super::gen_ui::USER_MACHINE_SHELL => "ran a command on your computer".into(),
+        "run_recipe" => "ran a recipe".into(),
+        "Computer" | "Screenshot" | "computerUseToolCall" => {
+            "took a screenshot of my screen".into()
+        }
+        "computer" => match field("action").as_deref() {
+            Some("type") => "typed on my screen".into(),
+            Some("key") => "pressed a key on my screen".into(),
+            Some("scroll") => "scrolled my screen".into(),
+            Some("click" | "double_click" | "right_click" | "drag" | "move") => {
+                "clicked on my screen".into()
+            }
+            _ => "took a screenshot of my screen".into(),
+        },
+        "open_url" => field("url")
+            .map(|url| {
+                let rest = url.split("://").nth(1).unwrap_or(&url).to_string();
+                let host = rest.split('/').next().unwrap_or(&rest);
+                format!("opened {host}")
+            })
+            .unwrap_or_else(|| "opened a page on my screen".into()),
+        other => format!("used {other}"),
+    };
+    Some(deed)
 }
 
 pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTick {
@@ -337,6 +447,43 @@ mod tests {
         assert_eq!(
             visible_bot_status(Some("cw_new"), None, Some("Thinking")),
             None
+        );
+    }
+
+    #[test]
+    fn a_turn_that_only_looked_at_its_screen_leaves_that_behind() {
+        let mut tracker = ToolCallTracker::default();
+        tracker
+            .tick(&json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"computer"}));
+        tracker.tick(
+            &json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","arguments":{"action":"screenshot"}}),
+        );
+        assert_eq!(
+            tool_standin(&tracker.deeds()),
+            Some("[took a screenshot of my screen]".into())
+        );
+    }
+
+    #[test]
+    fn a_turn_that_did_nothing_has_nothing_to_stand_in_for() {
+        assert_eq!(tool_standin(&[]), None);
+    }
+
+    /// The stand-in tells the turn's story: every tool it called, in order, each said once, so a
+    /// screen the bot looked at twenty times is still one clause.
+    #[test]
+    fn deeds_name_each_tool_once_and_in_the_order_it_was_called() {
+        let events = vec![
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"open_url"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","arguments":{"url":"https://example.com/login"}}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c2","toolCallName":"computer"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c2","arguments":{"action":"screenshot"}}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c3","toolCallName":"computer"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c3","arguments":{"action":"screenshot"}}),
+        ];
+        assert_eq!(
+            tool_standin(&deeds_from_replay(&events)),
+            Some("[opened example.com, then took a screenshot of my screen]".into())
         );
     }
 

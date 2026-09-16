@@ -125,6 +125,22 @@ pub struct ModelCatalogue {
     pub note: Option<String>,
 }
 
+/// The message a reply points at, carried beside the message that answers it.
+///
+/// The quote is also spelled into the user message's `content`, because today's server reads
+/// only `content`. This field is what a server that understands replies should read instead:
+/// it can find the quoted message itself and word the context its own way.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReplyQuote {
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    /// The quoted words, already clipped: a reply to a long answer names it, it does not replay it.
+    pub preview: String,
+    /// The person wrote the quoted message, rather than the coworker.
+    #[serde(rename = "isMe")]
+    pub is_me: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AguiMessage {
     pub id: String,
@@ -132,6 +148,8 @@ pub struct AguiMessage {
     pub content: String,
     #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(rename = "replyTo", skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyQuote>,
 }
 
 /// Pull assistant `delta` fields out of an AG-UI SSE body (desktop Seam A
@@ -182,5 +200,46 @@ pub fn error_message_from_body(body: &str) -> String {
         "request failed".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The field is new: a server that has never heard of it must still see the array it saw
+    /// before, field for field.
+    #[test]
+    fn a_message_with_no_reply_leaves_reply_to_off_the_wire() {
+        let message = AguiMessage {
+            id: "m1".into(),
+            role: "user".into(),
+            content: "hi".into(),
+            tool_call_id: None,
+            reply_to: None,
+        };
+        let json = serde_json::to_value(&message).expect("serialises");
+        assert_eq!(json["content"], "hi");
+        assert!(json.get("replyTo").is_none(), "{json}");
+        assert!(json.get("toolCallId").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_reply_rides_along_under_reply_to() {
+        let message = AguiMessage {
+            id: "m2".into(),
+            role: "user".into(),
+            content: "what am I replying to?".into(),
+            tool_call_id: None,
+            reply_to: Some(ReplyQuote {
+                message_id: "m1".into(),
+                preview: "The build is green.".into(),
+                is_me: false,
+            }),
+        };
+        let json = serde_json::to_value(&message).expect("serialises");
+        assert_eq!(json["replyTo"]["messageId"], "m1");
+        assert_eq!(json["replyTo"]["preview"], "The build is green.");
+        assert_eq!(json["replyTo"]["isMe"], false);
     }
 }
