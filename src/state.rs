@@ -1940,6 +1940,18 @@ impl AppState {
         });
     }
 
+    /// Remove one edited version of the open recipe. The server answers the delete with
+    /// nothing in particular, so the detail is fetched again to see what is left; a refusal —
+    /// the raw and the filtered version cannot go — lands on the page's error line.
+    pub fn delete_recipe_version(&mut self, version: u32, cx: &mut Context<Self>) {
+        self.recipe_action("Deleting version…", cx, move |client, id| {
+            Box::pin(async move {
+                client.delete_recipe_version(&id, version).await?;
+                client.recipe(&id).await
+            })
+        });
+    }
+
     pub fn share_open_recipe(&mut self, target: RecipeShareTarget, cx: &mut Context<Self>) {
         self.recipe_action("Sharing…", cx, move |client, id| {
             Box::pin(async move { client.share_recipe(&id, &target).await })
