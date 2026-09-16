@@ -1,4 +1,6 @@
-use crate::chrome::{AVATAR_COLORS, AVATAR_SHAPES, AVATAR_TRIGGER_PX, INFO_PANE_WIDTH};
+use crate::chrome::{
+    AVATAR_COLORS, AVATAR_SHAPES, AVATAR_TRIGGER_PX, INFO_PANE_WIDTH, PANE_HEADER_H, PANE_HEADER_PX,
+};
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
 use crate::opengrok::{CoworkerPatch, ModelEntry};
@@ -261,8 +263,8 @@ impl Render for AgentSettings {
                 div()
                     .id("agent-settings-header")
                     .w_full()
-                    .px(px(12.))
-                    .h(px(44.))
+                    .px(px(PANE_HEADER_PX))
+                    .h(px(PANE_HEADER_H))
                     .flex()
                     .items_center()
                     .justify_between()
