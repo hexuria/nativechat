@@ -11,12 +11,15 @@ use std::rc::Rc;
 use crate::chrome::HEADER_PX;
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    RecipeDetail, RecipeRelation, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeVersion,
+    RecipeDetail, RecipeRelation, RecipeScreen, RecipeShareTarget, RecipeStep, RecipeSummary,
+    RecipeTapeEvent, RecipeVersion,
 };
 use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -40,8 +43,174 @@ const STEPS_HEIGHT: f32 = 320.;
 const STEP_NUMBER_W: f32 = 40.;
 /// The table's second column: what the step does. The details take the rest of the row.
 const STEP_VERB_W: f32 = 116.;
+/// The tape table's last column: how long after the first event this one came.
+const EVENT_TIME_W: f32 = 72.;
 /// The run's screenshot, at the width the chat draws the bot's screen.
 const SCREENSHOT_WIDTH: f32 = 520.;
+/// The bots picker's panel: wide enough for a bot's name beside its box.
+const BOTS_MENU_W: f32 = 240.;
+
+/// What a step does, apart from what it does it to: what Add step offers, and what decides
+/// whether a row's editor is the field in its Details cell or the modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepKind {
+    Click,
+    DoubleClick,
+    Drag,
+    Type,
+    Key,
+    Scroll,
+    Wait,
+}
+
+impl StepKind {
+    /// In the order the menu offers them: the pointer first, then the keyboard, then the pause.
+    const ALL: [Self; 7] = [
+        Self::Click,
+        Self::DoubleClick,
+        Self::Drag,
+        Self::Type,
+        Self::Key,
+        Self::Scroll,
+        Self::Wait,
+    ];
+
+    fn of(step: &RecipeStep) -> Self {
+        match step {
+            RecipeStep::Click { .. } => Self::Click,
+            RecipeStep::DoubleClick { .. } => Self::DoubleClick,
+            RecipeStep::Drag { .. } => Self::Drag,
+            RecipeStep::Type { .. } => Self::Type,
+            RecipeStep::Key { .. } => Self::Key,
+            RecipeStep::Scroll { .. } => Self::Scroll,
+            RecipeStep::Wait { .. } => Self::Wait,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Click => "Click",
+            Self::DoubleClick => "Double click",
+            Self::Drag => "Drag",
+            Self::Type => "Type",
+            Self::Key => "Key",
+            Self::Scroll => "Scroll",
+            Self::Wait => "Wait",
+        }
+    }
+
+    /// The word in the element id, `recipe-add-step-double-click`.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::DoubleClick => "double-click",
+            Self::Drag => "drag",
+            Self::Type => "type",
+            Self::Key => "key",
+            Self::Scroll => "scroll",
+            Self::Wait => "wait",
+        }
+    }
+
+    /// The parameters the modal edits, none for a step of one value (those are edited in the
+    /// row itself).
+    fn params(self) -> &'static [StepParam] {
+        const PLACE: [StepParam; 2] = [
+            StepParam::new("x", "X", ParamKind::X),
+            StepParam::new("y", "Y", ParamKind::Y),
+        ];
+        const CLICK: [StepParam; 3] = [
+            StepParam::new("x", "X", ParamKind::X),
+            StepParam::new("y", "Y", ParamKind::Y),
+            StepParam::new("button", "Button", ParamKind::Button),
+        ];
+        const DRAG: [StepParam; 4] = [
+            StepParam::new("x1", "From X", ParamKind::X),
+            StepParam::new("y1", "From Y", ParamKind::Y),
+            StepParam::new("x2", "To X", ParamKind::X),
+            StepParam::new("y2", "To Y", ParamKind::Y),
+        ];
+        const SCROLL: [StepParam; 4] = [
+            StepParam::new("x", "X", ParamKind::X),
+            StepParam::new("y", "Y", ParamKind::Y),
+            StepParam::new("dx", "By X", ParamKind::Amount),
+            StepParam::new("dy", "By Y", ParamKind::Amount),
+        ];
+        match self {
+            Self::Click => &CLICK,
+            Self::DoubleClick => &PLACE,
+            Self::Drag => &DRAG,
+            Self::Scroll => &SCROLL,
+            Self::Type | Self::Key | Self::Wait => &[],
+        }
+    }
+
+    /// A step of this kind to start from: in the middle of the screen, where a person can see
+    /// what they are aiming at before they change it.
+    fn new_step(self, screen: RecipeScreen) -> RecipeStep {
+        let x = (screen.width / 2) as i64;
+        let y = (screen.height / 2) as i64;
+        match self {
+            Self::Click => RecipeStep::Click { x, y, button: None },
+            Self::DoubleClick => RecipeStep::DoubleClick { x, y },
+            Self::Drag => RecipeStep::Drag {
+                x1: x,
+                y1: y,
+                x2: (x + 100).min(screen.width as i64),
+                y2: y,
+            },
+            Self::Type => RecipeStep::Type {
+                text: String::new(),
+            },
+            Self::Key => RecipeStep::Key {
+                key: "Return".to_string(),
+            },
+            Self::Scroll => RecipeStep::Scroll {
+                x,
+                y,
+                dx: 0,
+                dy: -120,
+            },
+            Self::Wait => RecipeStep::Wait { ms: NEW_WAIT_MS },
+        }
+    }
+}
+
+/// What a parameter of a step may hold, and so what a typed value has to be to be taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamKind {
+    /// Across the screen; the recipe's width bounds it.
+    X,
+    /// Down the screen; the recipe's height bounds it.
+    Y,
+    /// How far to scroll. Nothing bounds it: a wheel turns either way and past any edge.
+    Amount,
+    /// Which mouse button, as a word or as the number the tape used.
+    Button,
+}
+
+/// One parameter of a step as the modal edits it: the word in its element id, the label over
+/// its field, and what may be typed into it.
+#[derive(Debug, Clone, Copy)]
+struct StepParam {
+    name: &'static str,
+    label: &'static str,
+    kind: ParamKind,
+}
+
+impl StepParam {
+    const fn new(name: &'static str, label: &'static str, kind: ParamKind) -> Self {
+        Self { name, label, kind }
+    }
+}
+
+/// The row whose parameters the modal is showing, and of what kind, so Save knows what to
+/// build from the fields.
+#[derive(Debug, Clone, Copy)]
+struct StepModal {
+    index: usize,
+    kind: StepKind,
+}
 
 pub struct RecipesView {
     state: Entity<AppState>,
@@ -57,13 +226,21 @@ pub struct RecipesView {
     selected_version: Option<u32>,
     /// The steps under edit (the owner's Edit steps), until Save as new version or Cancel.
     draft: Option<Vec<RecipeStep>>,
-    /// The draft row whose text or wait is in `step_input`.
+    /// The draft row whose text, key or wait is in `step_input`.
     editing_step: Option<usize>,
+    /// The row the modal is editing, for a step of more than one parameter.
+    step_modal: Option<StepModal>,
+    /// The modal's fields, one per parameter of the longest step there is. They are reused
+    /// rather than made per step, so opening the modal costs no entities.
+    step_fields: Vec<Entity<InputState>>,
     /// Why the draft cannot be saved as it is.
     draft_error: Option<String>,
     /// The bot Run plays on; the first granted one until the person picks.
     run_bot: Option<String>,
 }
+
+/// The most parameters any step has: a drag's two corners.
+const STEP_FIELDS: usize = 4;
 
 impl RecipesView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -74,6 +251,9 @@ impl RecipesView {
             cx.new(|cx| InputState::new(window, cx).placeholder("name@company.com"));
         let note_input = cx.new(|cx| InputState::new(window, cx).placeholder("What changed"));
         let step_input = cx.new(|cx| InputState::new(window, cx));
+        let step_fields: Vec<Entity<InputState>> = (0..STEP_FIELDS)
+            .map(|_| cx.new(|cx| InputState::new(window, cx)))
+            .collect();
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         // Enter closes the cell being edited, as it would in any table.
         cx.subscribe(&step_input, |this, _, event: &InputEvent, cx| {
@@ -82,6 +262,15 @@ impl RecipesView {
             }
         })
         .detach();
+        // Enter in any of the modal's fields is its Save, as it would be in any dialog.
+        for field in &step_fields {
+            cx.subscribe(field, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.save_step_modal(cx);
+                }
+            })
+            .detach();
+        }
         Self {
             state,
             name_input,
@@ -93,6 +282,8 @@ impl RecipesView {
             selected_version: None,
             draft: None,
             editing_step: None,
+            step_modal: None,
+            step_fields,
             draft_error: None,
             run_bot: None,
         }
@@ -119,6 +310,7 @@ impl RecipesView {
         self.selected_version = None;
         self.draft = None;
         self.editing_step = None;
+        self.step_modal = None;
         self.draft_error = None;
         self.run_bot = None;
         self.name_input.update(cx, |input, cx| {
@@ -140,19 +332,14 @@ impl RecipesView {
         cx.notify();
     }
 
-    /// The bot Run plays on: the one picked, else the first of the person's bots this recipe
-    /// was granted to, else the first they have.
+    /// The bot Run plays on: the one last picked, else the first of the person's bots this
+    /// recipe was granted to, else the first they have (a person with one bot and no grant
+    /// still means that bot).
     fn picked_bot(&self, detail: &RecipeDetail) -> Option<String> {
         self.run_bot
             .clone()
             .filter(|id| detail.my_bots.iter().any(|bot| &bot.id == id))
-            .or_else(|| {
-                detail
-                    .grants
-                    .iter()
-                    .map(|grant| grant.coworker_id.clone())
-                    .find(|id| detail.my_bots.iter().any(|bot| &bot.id == id))
-            })
+            .or_else(|| granted_bots(detail).first().map(|bot| bot.0.clone()))
             .or_else(|| detail.my_bots.first().map(|bot| bot.id.clone()))
     }
 
@@ -175,6 +362,7 @@ impl RecipesView {
         self.selected_version = Some(version);
         self.draft = Some(steps);
         self.editing_step = None;
+        self.step_modal = None;
         self.draft_error = None;
         self.note_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
@@ -185,6 +373,7 @@ impl RecipesView {
     fn cancel_draft(&mut self, cx: &mut Context<Self>) {
         self.draft = None;
         self.editing_step = None;
+        self.step_modal = None;
         self.draft_error = None;
         cx.notify();
     }
@@ -230,27 +419,57 @@ impl RecipesView {
         cx.notify();
     }
 
-    fn add_wait(&mut self, cx: &mut Context<Self>) {
+    /// The screen this recipe was taught on, which is what bounds a step's coordinates.
+    fn screen(&self, cx: &App) -> RecipeScreen {
+        self.state
+            .read(cx)
+            .recipe_open
+            .as_ref()
+            .map(|detail| detail.recipe.screen)
+            .unwrap_or_default()
+    }
+
+    /// Add step: a step of the chosen kind at the end of the draft, with its editor open, so
+    /// the defaults it starts on are never what gets saved by accident.
+    fn add_step(&mut self, kind: StepKind, window: &mut Window, cx: &mut Context<Self>) {
+        let screen = self.screen(cx);
         let Some(draft) = self.draft.as_mut() else {
             return;
         };
         if draft.len() >= MAX_STEPS {
             self.draft_error = Some(format!("A version holds at most {MAX_STEPS} steps."));
-        } else {
-            draft.push(RecipeStep::Wait { ms: NEW_WAIT_MS });
-            self.draft_error = None;
+            cx.notify();
+            return;
         }
-        cx.notify();
+        draft.push(kind.new_step(screen));
+        let index = draft.len() - 1;
+        self.draft_error = None;
+        self.open_step_editor(index, window, cx);
     }
 
-    /// Put the step's text or wait in the field and open that cell for editing.
+    /// A row's editor: the field in its Details cell for a step of one value, the modal for a
+    /// step of several.
+    fn open_step_editor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(step) = self.draft.as_ref().and_then(|draft| draft.get(index)) else {
+            return;
+        };
+        if StepKind::of(step).params().is_empty() {
+            self.begin_step_edit(index, window, cx);
+        } else {
+            self.open_step_modal(index, window, cx);
+        }
+    }
+
+    /// Put the step's text, key or wait in the field and open that cell for editing.
     fn begin_step_edit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let value = match self.draft.as_ref().and_then(|draft| draft.get(index)) {
             Some(RecipeStep::Type { text }) => text.clone(),
+            Some(RecipeStep::Key { key }) => key.clone(),
             Some(RecipeStep::Wait { ms }) => ms.to_string(),
             _ => return,
         };
         self.editing_step = Some(index);
+        self.step_modal = None;
         self.draft_error = None;
         self.step_input.update(cx, |input, cx| {
             input.set_value(value, window, cx);
@@ -267,10 +486,28 @@ impl RecipesView {
             self.editing_step = None;
             return;
         };
+        let mut note = None;
         match step {
             RecipeStep::Type { text } => *text = value,
+            RecipeStep::Key { key } => {
+                let typed = value.trim();
+                if typed.is_empty() {
+                    self.draft_error =
+                        Some("A key step needs a key, such as Return or a.".to_string());
+                    cx.notify();
+                    return;
+                }
+                *key = typed.to_string();
+            }
             RecipeStep::Wait { ms } => match value.trim().parse::<u64>() {
-                Ok(parsed) => *ms = parsed.min(MAX_WAIT_MS),
+                Ok(parsed) => {
+                    *ms = parsed.min(MAX_WAIT_MS);
+                    if parsed > MAX_WAIT_MS {
+                        note = Some(format!(
+                            "A wait is at most {MAX_WAIT_MS} ms, so that one was shortened."
+                        ));
+                    }
+                }
                 Err(_) => {
                     self.draft_error = Some(format!(
                         "A wait is a number of milliseconds, up to {MAX_WAIT_MS}."
@@ -282,12 +519,75 @@ impl RecipesView {
             _ => {}
         }
         self.editing_step = None;
-        self.draft_error = None;
+        self.draft_error = note;
         cx.notify();
     }
 
     fn cancel_step_edit(&mut self, cx: &mut Context<Self>) {
         self.editing_step = None;
+        cx.notify();
+    }
+
+    /// Open the modal on a row: one field per parameter of the step, filled with what it holds.
+    fn open_step_modal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(step) = self.draft.as_ref().and_then(|draft| draft.get(index)) else {
+            return;
+        };
+        let kind = StepKind::of(step);
+        let values = step_param_values(step);
+        if values.is_empty() {
+            return;
+        }
+        for (field, value) in self.step_fields.iter().zip(values) {
+            field.update(cx, |input, cx| {
+                input.set_value(value, window, cx);
+            });
+        }
+        // The first field takes the caret, so the modal can be filled in and saved without
+        // reaching for the mouse again.
+        if let Some(first) = self.step_fields.first() {
+            first.update(cx, |input, cx| input.focus(window, cx));
+        }
+        self.editing_step = None;
+        self.step_modal = Some(StepModal { index, kind });
+        self.draft_error = None;
+        cx.notify();
+    }
+
+    /// The modal's Save: the fields as a step, or the reason they are not one on the page's
+    /// error line, with the modal left open on what was typed.
+    fn save_step_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.step_modal else {
+            return;
+        };
+        let screen = self.screen(cx);
+        let typed: Vec<String> = self
+            .step_fields
+            .iter()
+            .map(|field| field.read(cx).value().trim().to_string())
+            .collect();
+        let step = match build_step(modal.kind, &typed, screen) {
+            Ok(step) => step,
+            Err(reason) => {
+                self.draft_error = Some(reason);
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(slot) = self
+            .draft
+            .as_mut()
+            .and_then(|draft| draft.get_mut(modal.index))
+        {
+            *slot = step;
+        }
+        self.step_modal = None;
+        self.draft_error = None;
+        cx.notify();
+    }
+
+    fn cancel_step_modal(&mut self, cx: &mut Context<Self>) {
+        self.step_modal = None;
         cx.notify();
     }
 
@@ -315,6 +615,7 @@ impl RecipesView {
         self.selected_version = None;
         self.draft = None;
         self.editing_step = None;
+        self.step_modal = None;
         self.draft_error = None;
         cx.notify();
     }
@@ -325,15 +626,21 @@ impl Render for RecipesView {
         self.sync_fields(window, cx);
         let theme = cx.theme().clone();
         let open = self.state.read(cx).recipe_open_id.is_some();
+        let view = cx.entity();
         v_flex()
             .id("page-recipes")
             .size_full()
+            // The step modal hangs off the page, so it is centred on the page's own slot.
+            .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(if open {
                 self.detail(&theme, cx)
             } else {
                 self.list(&theme, cx)
+            })
+            .when_some(self.step_modal, |this, modal| {
+                this.child(self.step_modal_overlay(modal, &view, &theme, cx))
             })
     }
 }
@@ -496,7 +803,9 @@ impl RecipesView {
             return sections;
         }
         sections.push(self.steps_section(detail, busy, app, view, theme));
-        sections.push(self.run_section(detail, run, view, theme));
+        if let Some(run) = run {
+            sections.push(last_run_section(&run, detail, theme));
+        }
         sections.push(bots_section(detail, waiting, app, theme));
         if mine {
             sections.push(self.share_section(detail, waiting, app, theme));
@@ -692,7 +1001,14 @@ impl RecipesView {
             .child(version_line(shown, editing, muted))
             .map(|this| match steps {
                 Some(steps) => this.child(self.steps_table(steps, editing, view, muted, theme)),
-                None => this.child(tape_frame(shown, muted, theme)),
+                // A tape the server sent whole reads as a table of its own; one it stripped to
+                // a count can only say how much there was.
+                None => match shown.and_then(RecipeVersion::tape_events) {
+                    Some(events) if !events.is_empty() => {
+                        this.child(tape_table(events, muted, theme))
+                    }
+                    _ => this.child(tape_frame(shown, muted, theme)),
+                },
             })
             .when_some(self.draft_error.clone(), |this, error| {
                 this.child(
@@ -726,18 +1042,7 @@ impl RecipesView {
                 .flex_wrap()
                 .items_center()
                 .gap(px(8.))
-                .child(
-                    Button::new("recipe-add-wait")
-                        .small()
-                        .label("Add wait")
-                        .disabled(total >= MAX_STEPS)
-                        .on_click({
-                            let view = view.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |this, cx| this.add_wait(cx));
-                            }
-                        }),
-                )
+                .child(add_step_menu(total >= MAX_STEPS, view))
                 .child(
                     div()
                         .flex_1()
@@ -780,6 +1085,7 @@ impl RecipesView {
         let mine = detail.recipe.is_mine();
         let running = busy == Some("Running…");
         let picked = self.picked_bot(detail);
+        let granted = granted_bots(detail);
         let version = detail.runnable_version().map(|version| version.version);
         let can_run = picked.is_some() && version.is_some() && !waiting;
         let plays = version.map(|version| match picked.as_ref() {
@@ -798,20 +1104,32 @@ impl RecipesView {
                     .items_center()
                     .gap(px(8.))
                     .child(
-                        Button::new("recipe-run")
-                            .small()
-                            .primary()
-                            .label(if running { "Running…" } else { "Run" })
-                            .disabled(!can_run)
-                            .on_click({
-                                let app = app.clone();
-                                let picked = picked.clone();
-                                move |_, _, cx| {
-                                    let Some(id) = picked.clone() else {
-                                        return;
-                                    };
-                                    app.update(cx, |state, cx| state.run_open_recipe(id, cx));
-                                }
+                        h_flex()
+                            .items_center()
+                            .gap(px(2.))
+                            .child(
+                                Button::new("recipe-run")
+                                    .small()
+                                    .primary()
+                                    .label(if running { "Running…" } else { "Run" })
+                                    .disabled(!can_run)
+                                    .on_click({
+                                        let app = app.clone();
+                                        let picked = picked.clone();
+                                        move |_, _, cx| {
+                                            let Some(id) = picked.clone() else {
+                                                return;
+                                            };
+                                            app.update(cx, |state, cx| {
+                                                state.run_open_recipe(id, cx)
+                                            });
+                                        }
+                                    }),
+                            )
+                            // One granted bot is no choice at all, and the line beside Run
+                            // already names it.
+                            .when(granted.len() > 1, |this| {
+                                this.child(run_pick_menu(granted, picked.clone(), view))
                             }),
                     )
                     .when_some(plays, |this, plays| {
@@ -913,7 +1231,7 @@ impl RecipesView {
         theme: &Theme,
     ) -> AnyElement {
         let (verb, details) = step_words(step);
-        let editable = editing && matches!(step, RecipeStep::Type { .. } | RecipeStep::Wait { .. });
+        let editable = editing;
         let open = editing && self.editing_step == Some(index);
         let row = h_flex()
             .id(SharedString::from(format!("recipe-step-{index}")))
@@ -943,6 +1261,7 @@ impl RecipesView {
         if open {
             let hint = match step {
                 RecipeStep::Wait { .. } => "milliseconds, up to 10000",
+                RecipeStep::Key { .. } => "a key, such as Return",
                 _ => "the text to type",
             };
             return row
@@ -997,10 +1316,18 @@ impl RecipesView {
                         .rounded(px(6.))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(0x777777).opacity(0.14)))
+                        // Double click, not single: a single click on a row in a table
+                        // selects, and an editor that opens under the pointer while someone
+                        // is only reading is in the way.
                         .on_click({
                             let view = view.clone();
-                            move |_, window, cx| {
-                                view.update(cx, |this, cx| this.begin_step_edit(index, window, cx));
+                            move |event: &ClickEvent, window, cx| {
+                                if event.click_count() < 2 {
+                                    return;
+                                }
+                                view.update(cx, |this, cx| {
+                                    this.open_step_editor(index, window, cx)
+                                });
                             }
                         })
                 })
@@ -1047,62 +1374,6 @@ impl RecipesView {
             )
         })
         .into_any_element()
-    }
-
-    /// Which bot Run plays on, and what the last run came to.
-    fn run_section(
-        &self,
-        detail: &RecipeDetail,
-        run: Option<RecipeRunOutcome>,
-        view: &Entity<Self>,
-        theme: &Theme,
-    ) -> AnyElement {
-        let muted = theme.muted_foreground;
-        let picked = self.picked_bot(detail);
-        card(theme)
-            .child(section_title("Run on"))
-            .when(detail.my_bots.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("You have no bots to run it on."),
-                )
-            })
-            .child(
-                h_flex()
-                    .w_full()
-                    .flex_wrap()
-                    .gap(px(6.))
-                    .children(detail.my_bots.iter().map(|bot| {
-                        let selected = picked.as_deref() == Some(bot.id.as_str());
-                        let id = bot.id.clone();
-                        let view = view.clone();
-                        let button =
-                            Button::new(SharedString::from(format!("recipe-run-bot-{}", bot.id)))
-                                .small()
-                                .label(bot_label(&bot.name, &bot.id))
-                                .on_click(move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.run_bot = Some(id.clone());
-                                        cx.notify();
-                                    });
-                                });
-                        if selected { button.primary() } else { button }
-                    })),
-            )
-            .when(!detail.my_bots.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Run, above the steps, plays the newest version on this bot."),
-                )
-            })
-            .when_some(run, |this, run| {
-                this.child(run_outcome(&run, detail, theme))
-            })
-            .into_any_element()
     }
 
     /// The owner's sharing: the org, one person by email, and who has it now.
@@ -1218,6 +1489,104 @@ impl RecipesView {
             }))
             .into_any_element()
     }
+
+    /// The modal a step of more than one parameter opens on: one labelled field per parameter,
+    /// Cancel and Save. It mirrors the delete dialog — the same scrim, the same centred card —
+    /// and a click on the scrim is its Cancel, because a dialog that traps a stray click is
+    /// worse than one that is easy to leave.
+    fn step_modal_overlay(
+        &self,
+        modal: StepModal,
+        view: &Entity<Self>,
+        theme: &Theme,
+        cx: &App,
+    ) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let screen = self.screen(cx);
+        let params = modal.kind.params();
+        div()
+            .id("recipe-step-modal")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.32))
+            .on_mouse_down(MouseButton::Left, {
+                let view = view.clone();
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| this.cancel_step_modal(cx));
+                }
+            })
+            .child(
+                v_flex()
+                    .id("recipe-step-modal-card")
+                    .w(px(420.))
+                    .bg(theme.popover)
+                    .text_color(theme.foreground)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(14.))
+                    .shadow_lg()
+                    .px(px(20.))
+                    .py(px(18.))
+                    .gap(px(10.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("Step {}: {}", modal.index + 1, modal.kind.label())),
+                    )
+                    .child(div().text_xs().text_color(muted).child(format!(
+                        "This recipe's screen is {} × {}.",
+                        screen.width, screen.height
+                    )))
+                    .children(params.iter().zip(&self.step_fields).map(|(param, field)| {
+                        v_flex()
+                            .w_full()
+                            .gap(px(4.))
+                            .child(field_label(param.label, muted))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .child(field_input(field).id(SharedString::from(format!(
+                                        "recipe-step-field-{}",
+                                        param.name
+                                    )))),
+                            )
+                    }))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap(px(8.))
+                            .pt(px(6.))
+                            .child(
+                                Button::new("recipe-step-modal-cancel")
+                                    .label("Cancel")
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| this.cancel_step_modal(cx));
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("recipe-step-modal-save")
+                                    .primary()
+                                    .label("Save")
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| this.save_step_modal(cx));
+                                        }
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 /// The version the page shows: the one the tabs picked, else the newest that can be run, else
@@ -1300,7 +1669,7 @@ fn version_line(version: Option<&RecipeVersion>, editing: bool, muted: Hsla) -> 
     };
     let number = version.version;
     let head = if editing {
-        format!("editing a copy of v{number} · unsaved · click a type or a wait to change it")
+        format!("editing a copy of v{number} · unsaved · double click a step to change it")
     } else if version.is_runnable() {
         format!(
             "{} · {} · {}",
@@ -1434,6 +1803,259 @@ fn step_words(step: &RecipeStep) -> (String, String) {
     }
 }
 
+/// The tape itself, in the frame the steps use: every event as it was taken, in order and
+/// unfiltered, with how long after the first one it came. This is what a raw version holds,
+/// and the only place a person can see what was actually taped.
+fn tape_table(events: &[RecipeTapeEvent], muted: Hsla, theme: &Theme) -> AnyElement {
+    // The tape's own clock is the wall clock; only the distance from its start is readable.
+    let start = events.first().map(|event| event.at).unwrap_or_default();
+    v_flex()
+        .w_full()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border)
+        .overflow_hidden()
+        .child(events_head(muted, theme))
+        .child(
+            div()
+                .id("recipe-steps")
+                .w_full()
+                .h(px(STEPS_HEIGHT))
+                .overflow_y_scroll()
+                .child(v_flex().w_full().children(events.iter().enumerate().map(
+                    |(index, event)| {
+                        let (verb, details) = tape_words(event);
+                        h_flex()
+                            .id(SharedString::from(format!("recipe-event-{index}")))
+                            .w_full()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(10.))
+                            .py(px(6.))
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .w(px(STEP_NUMBER_W))
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("{}", index + 1)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(STEP_VERB_W))
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .truncate()
+                                    .child(verb),
+                            )
+                            .child(div().flex_1().min_w_0().text_sm().truncate().child(details))
+                            .child(
+                                div()
+                                    .w(px(EVENT_TIME_W))
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(event_offset(event.at - start)),
+                            )
+                    },
+                ))),
+        )
+        .into_any_element()
+}
+
+/// The tape table's header row, above its scroll so it stays while the events move.
+fn events_head(muted: Hsla, theme: &Theme) -> AnyElement {
+    h_flex()
+        .id("recipe-events-head")
+        .w_full()
+        .items_center()
+        .gap(px(8.))
+        .px(px(10.))
+        .py(px(6.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .w(px(STEP_NUMBER_W))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(muted)
+                .child("#"),
+        )
+        .child(
+            div()
+                .w(px(STEP_VERB_W))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(muted)
+                .child("Event"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(muted)
+                .child("Details"),
+        )
+        .child(
+            div()
+                .w(px(EVENT_TIME_W))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(muted)
+                .child("At"),
+        )
+        .into_any_element()
+}
+
+/// One event in two columns, the way a step is: what happened, and where or to what. Read
+/// across, a row is a sentence — "down (640, 60) button 1", "wheel (640, 400) by (0, -120)",
+/// "keyup Return".
+fn tape_words(event: &RecipeTapeEvent) -> (String, String) {
+    let kind = event.kind.clone();
+    let (x, y) = (event.x, event.y);
+    let details = match event.kind.as_str() {
+        "down" | "up" => format!("({x}, {y}) button {}", event.button),
+        "move" => format!("({x}, {y})"),
+        "wheel" => format!("({x}, {y}) by ({}, {})", event.dx, event.dy),
+        "keydown" | "keyup" => key_words(event),
+        // A kind this app has no word for is still worth its row; what it carries is not
+        // worth guessing at.
+        _ => String::new(),
+    };
+    (kind, details)
+}
+
+/// The key an event pressed: a letter in quotes, the way `type` shows its text, and a named
+/// key as it is. The browser's `code` stands in when there is no `key`.
+fn key_words(event: &RecipeTapeEvent) -> String {
+    let key = if event.key.is_empty() {
+        event.code.as_str()
+    } else {
+        event.key.as_str()
+    };
+    if key.is_empty() {
+        String::new()
+    } else if key.chars().count() == 1 {
+        format!("{key:?}")
+    } else {
+        key.to_string()
+    }
+}
+
+/// How long after the tape started an event came, as "+1.20 s". Seconds rather than the
+/// milliseconds the tape counts in, because a tape runs for minutes and reads better that way.
+fn event_offset(ms: i64) -> String {
+    format!("+{:.2} s", ms.max(0) as f64 / 1000.)
+}
+
+/// A step's parameters as the modal's fields start out, in the order [`StepKind::params`] puts
+/// them. A step of one value has none: that one is edited in its own row.
+fn step_param_values(step: &RecipeStep) -> Vec<String> {
+    match step {
+        RecipeStep::Click { x, y, button } => vec![
+            x.to_string(),
+            y.to_string(),
+            match button {
+                Some(Value::String(name)) => name.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            },
+        ],
+        RecipeStep::DoubleClick { x, y } => vec![x.to_string(), y.to_string()],
+        RecipeStep::Drag { x1, y1, x2, y2 } => vec![
+            x1.to_string(),
+            y1.to_string(),
+            x2.to_string(),
+            y2.to_string(),
+        ],
+        RecipeStep::Scroll { x, y, dx, dy } => {
+            vec![x.to_string(), y.to_string(), dx.to_string(), dy.to_string()]
+        }
+        RecipeStep::Type { .. } | RecipeStep::Key { .. } | RecipeStep::Wait { .. } => Vec::new(),
+    }
+}
+
+/// The modal's fields as a step, or why they are not one. A bot plays a recipe on a screen of
+/// its own, so a coordinate off that screen is a step that would miss whatever it was aimed at.
+fn build_step(
+    kind: StepKind,
+    typed: &[String],
+    screen: RecipeScreen,
+) -> Result<RecipeStep, String> {
+    let params = kind.params();
+    let mut numbers: Vec<i64> = Vec::with_capacity(params.len());
+    let mut button: Option<Value> = None;
+    for (param, value) in params.iter().zip(typed) {
+        match param.kind {
+            ParamKind::X | ParamKind::Y | ParamKind::Amount => {
+                let number = value
+                    .parse::<i64>()
+                    .map_err(|_| format!("{} is a whole number.", param.label))?;
+                let bound = match param.kind {
+                    ParamKind::X => Some(screen.width as i64),
+                    ParamKind::Y => Some(screen.height as i64),
+                    _ => None,
+                };
+                if let Some(bound) = bound
+                    && !(0..=bound).contains(&number)
+                {
+                    return Err(format!(
+                        "{} must be between 0 and {bound}: this recipe's screen is {} × {}.",
+                        param.label, screen.width, screen.height
+                    ));
+                }
+                numbers.push(number);
+            }
+            ParamKind::Button => button = parse_button(value)?,
+        }
+    }
+    Ok(match kind {
+        StepKind::Click => RecipeStep::Click {
+            x: numbers[0],
+            y: numbers[1],
+            button,
+        },
+        StepKind::DoubleClick => RecipeStep::DoubleClick {
+            x: numbers[0],
+            y: numbers[1],
+        },
+        StepKind::Drag => RecipeStep::Drag {
+            x1: numbers[0],
+            y1: numbers[1],
+            x2: numbers[2],
+            y2: numbers[3],
+        },
+        StepKind::Scroll => RecipeStep::Scroll {
+            x: numbers[0],
+            y: numbers[1],
+            dx: numbers[2],
+            dy: numbers[3],
+        },
+        // A step of one value never opens the modal, so its fields are never built from.
+        StepKind::Type | StepKind::Key | StepKind::Wait => kind.new_step(screen),
+    })
+}
+
+/// Which button a click uses: the word the box knows, the number the tape used, or nothing at
+/// all, which is the left one.
+fn parse_button(value: &str) -> Result<Option<Value>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(number) = value.parse::<i64>() {
+        return Ok(Some(Value::from(number)));
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "left" | "right" | "middle" => Ok(Some(Value::from(value.to_ascii_lowercase()))),
+        _ => Err("A button is left, right, middle, or the number the tape used.".to_string()),
+    }
+}
+
 /// The last run's one line, and the screen it left behind.
 fn run_outcome(run: &RecipeRunOutcome, detail: &RecipeDetail, theme: &Theme) -> AnyElement {
     let color = if run.ok {
@@ -1466,7 +2088,9 @@ fn run_outcome(run: &RecipeRunOutcome, detail: &RecipeDetail, theme: &Theme) -> 
         .into_any_element()
 }
 
-/// Which of the person's bots may run the recipe on their own.
+/// The one place bots are dealt with: which of the person's bots may run this recipe, and so
+/// which one Run may play it on. One control rather than a list of checkboxes beside a row of
+/// chips, because checking a bot and choosing a bot were the same choice said twice.
 fn bots_section(
     detail: &RecipeDetail,
     busy: bool,
@@ -1474,15 +2098,34 @@ fn bots_section(
     theme: &Theme,
 ) -> AnyElement {
     let muted = theme.muted_foreground;
+    let bots: Vec<(String, String, bool)> = detail
+        .my_bots
+        .iter()
+        .map(|bot| {
+            (
+                bot.id.clone(),
+                bot_label(&bot.name, &bot.id),
+                detail.is_granted(&bot.id),
+            )
+        })
+        .collect();
+    let summary = granted_summary(&bots);
+    let ungranted: Vec<String> = bots
+        .iter()
+        .filter(|(_, _, granted)| !granted)
+        .map(|(id, _, _)| id.clone())
+        .collect();
+    let granted: Vec<String> = bots
+        .iter()
+        .filter(|(_, _, granted)| *granted)
+        .map(|(id, _, _)| id.clone())
+        .collect();
     card(theme)
-        .child(section_title("Grant to my bots"))
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child("A granted bot may run this recipe on its own computer."),
-        )
-        .when(detail.my_bots.is_empty(), |this| {
+        .child(section_title("Bots"))
+        .child(div().text_xs().text_color(muted).child(
+            "A checked bot may run this recipe on its own computer, and Run plays it on one of them.",
+        ))
+        .when(bots.is_empty(), |this| {
             this.child(
                 div()
                     .text_xs()
@@ -1490,20 +2133,198 @@ fn bots_section(
                     .child("You have no bots yet."),
             )
         })
-        .children(detail.my_bots.iter().map(|bot| {
-            let id = bot.id.clone();
+        .when(!bots.is_empty(), |this| {
+            this.child(
+                Popover::new("recipe-bots-popover")
+                    .w(px(BOTS_MENU_W))
+                    .trigger(
+                        // The trigger only opens the panel, so it stays live while a grant is
+                        // in flight; it is the checkboxes inside that wait for the answer.
+                        Button::new("recipe-bots")
+                            .small()
+                            .label(summary)
+                            .icon(Icon::new(IconName::ChevronDown).size(px(14.))),
+                    )
+                    .content({
+                        let app = app.clone();
+                        let theme = theme.clone();
+                        move |_, _, _| bots_menu(&bots, &granted, &ungranted, busy, &app, &theme)
+                    }),
+            )
+        })
+        .into_any_element()
+}
+
+/// The picker's panel: Select all and Deselect all over one checkbox per bot. Checking grants
+/// the recipe to that bot and unchecking takes it back, each on its own request.
+fn bots_menu(
+    bots: &[(String, String, bool)],
+    granted: &[String],
+    ungranted: &[String],
+    busy: bool,
+    app: &Entity<AppState>,
+    theme: &Theme,
+) -> AnyElement {
+    v_flex()
+        .id("recipe-bots-menu")
+        .w_full()
+        .gap(px(6.))
+        .child(
+            h_flex()
+                .w_full()
+                .gap(px(6.))
+                .child(
+                    Button::new("recipe-bots-all")
+                        .xsmall()
+                        .label("Select all")
+                        .disabled(busy || ungranted.is_empty())
+                        .on_click({
+                            let app = app.clone();
+                            let ungranted = ungranted.to_vec();
+                            move |_, _, cx| {
+                                let ungranted = ungranted.clone();
+                                app.update(cx, |state, cx| {
+                                    state.set_recipe_grants(ungranted, true, cx);
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("recipe-bots-none")
+                        .xsmall()
+                        .label("Deselect all")
+                        .disabled(busy || granted.is_empty())
+                        .on_click({
+                            let app = app.clone();
+                            let granted = granted.to_vec();
+                            move |_, _, cx| {
+                                let granted = granted.clone();
+                                app.update(cx, |state, cx| {
+                                    state.set_recipe_grants(granted, false, cx);
+                                });
+                            }
+                        }),
+                ),
+        )
+        .child(div().w_full().h(px(1.)).bg(theme.border))
+        .children(bots.iter().map(|(id, label, granted)| {
+            let id = id.clone();
             let app = app.clone();
-            Checkbox::new(SharedString::from(format!("recipe-grant-{}", bot.id)))
-                .checked(detail.is_granted(&bot.id))
-                .label(bot_label(&bot.name, &bot.id))
+            Checkbox::new(SharedString::from(format!("recipe-bot-{id}")))
+                .checked(*granted)
+                .label(label.clone())
                 .disabled(busy)
                 .on_click(move |checked, _, cx| {
                     let granted = *checked;
+                    let id = id.clone();
                     app.update(cx, |state, cx| {
-                        state.set_recipe_grant(id.clone(), granted, cx);
+                        state.set_recipe_grant(id, granted, cx);
                     });
                 })
         }))
+        .into_any_element()
+}
+
+/// What the picker's trigger says: "hex", "hex and 2 others", or "No bots" when none is
+/// checked.
+fn granted_summary(bots: &[(String, String, bool)]) -> String {
+    let names: Vec<&str> = bots
+        .iter()
+        .filter(|(_, _, granted)| *granted)
+        .map(|(_, label, _)| label.as_str())
+        .collect();
+    match names.split_first() {
+        None => "No bots".to_string(),
+        Some((first, [])) => (*first).to_string(),
+        Some((first, rest)) => format!("{first} and {}", count_of(rest.len(), "other")),
+    }
+}
+
+/// The person's bots this recipe is granted to, in the order the picker lists them.
+fn granted_bots(detail: &RecipeDetail) -> Vec<(String, String)> {
+    detail
+        .my_bots
+        .iter()
+        .filter(|bot| detail.is_granted(&bot.id))
+        .map(|bot| (bot.id.clone(), bot_label(&bot.name, &bot.id)))
+        .collect()
+}
+
+/// Add step: every kind of step a version may hold, each adding one with sensible defaults and
+/// opening its editor. A drop-down rather than a button per kind, because seven buttons over a
+/// table is a second toolbar.
+fn add_step_menu(full: bool, view: &Entity<RecipesView>) -> AnyElement {
+    Button::new("recipe-add-step")
+        .small()
+        .label("Add step")
+        .disabled(full)
+        .icon(Icon::new(IconName::ChevronDown).size(px(14.)))
+        .dropdown_menu_with_anchor(Anchor::TopLeft, {
+            let view = view.clone();
+            move |menu, _, _| {
+                StepKind::ALL.into_iter().fold(menu, |menu, kind| {
+                    let view = view.clone();
+                    menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .id(SharedString::from(format!(
+                                    "recipe-add-step-{}",
+                                    kind.slug()
+                                )))
+                                .w_full()
+                                .child(kind.label())
+                        })
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| this.add_step(kind, window, cx));
+                        }),
+                    )
+                })
+            }
+        })
+        .into_any_element()
+}
+
+/// Which granted bot Run plays on, when there is more than one to choose between. It hangs off
+/// Run rather than standing as a row of its own: the choice only matters at the moment of a run.
+fn run_pick_menu(
+    granted: Vec<(String, String)>,
+    picked: Option<String>,
+    view: &Entity<RecipesView>,
+) -> AnyElement {
+    Button::new("recipe-run-pick")
+        .small()
+        .primary()
+        .icon(Icon::new(IconName::ChevronDown).size(px(14.)))
+        .tooltip("Which bot Run plays on")
+        .dropdown_menu_with_anchor(Anchor::TopLeft, {
+            let view = view.clone();
+            move |menu, _, _| {
+                granted.iter().fold(menu, |menu, (id, label)| {
+                    let view = view.clone();
+                    let id = id.clone();
+                    menu.item(
+                        PopupMenuItem::new(label.clone())
+                            .checked(picked.as_deref() == Some(id.as_str()))
+                            .on_click(move |_, _, cx| {
+                                let id = id.clone();
+                                view.update(cx, |this, cx| {
+                                    this.run_bot = Some(id);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                })
+            }
+        })
+        .into_any_element()
+}
+
+/// What the last run came to, once there has been one. It is its own card because a run's
+/// screen is the largest thing on the page and does not belong inside the steps.
+fn last_run_section(run: &RecipeRunOutcome, detail: &RecipeDetail, theme: &Theme) -> AnyElement {
+    card(theme)
+        .child(section_title("Last run"))
+        .child(run_outcome(run, detail, theme))
         .into_any_element()
 }
 
@@ -1989,7 +2810,11 @@ fn format_time(at_ms: i64) -> String {
 mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over
     // the one the test harness wants.
-    use super::{RecipeDetail, RecipeStep, RecipeVersion, shown_version, step_words, version_kind};
+    use super::{
+        RecipeDetail, RecipeScreen, RecipeStep, RecipeTapeEvent, RecipeVersion, StepKind,
+        build_step, event_offset, granted_summary, shown_version, step_param_values, step_words,
+        tape_words, version_kind,
+    };
     use serde_json::{Value, json};
 
     fn version(number: u32, kind: &str) -> RecipeVersion {
@@ -2057,6 +2882,156 @@ mod tests {
             "scroll (640, 400) by (0, -120)"
         );
         assert_eq!(row(&RecipeStep::Wait { ms: 500 }), "wait 500 ms");
+    }
+
+    #[test]
+    fn a_row_of_the_tape_reads_as_a_sentence() {
+        let event = |kind: &str, json: Value| -> RecipeTapeEvent {
+            let mut value = json;
+            value["kind"] = Value::from(kind);
+            serde_json::from_value(value).unwrap()
+        };
+        let row = |event: &RecipeTapeEvent| {
+            let (verb, details) = tape_words(event);
+            format!("{verb} {details}").trim_end().to_string()
+        };
+        assert_eq!(
+            row(&event("down", json!({"x": 640, "y": 60, "button": 1}))),
+            "down (640, 60) button 1"
+        );
+        assert_eq!(
+            row(&event("up", json!({"x": 640, "y": 60, "button": 1}))),
+            "up (640, 60) button 1"
+        );
+        assert_eq!(
+            row(&event("move", json!({"x": 700, "y": 120}))),
+            "move (700, 120)"
+        );
+        assert_eq!(
+            row(&event(
+                "wheel",
+                json!({"x": 640, "y": 400, "dx": 0, "dy": -120})
+            )),
+            "wheel (640, 400) by (0, -120)"
+        );
+        assert_eq!(
+            row(&event("keydown", json!({"key": "e", "code": "KeyE"}))),
+            "keydown \"e\""
+        );
+        assert_eq!(
+            row(&event("keyup", json!({"key": "Return"}))),
+            "keyup Return"
+        );
+        assert_eq!(
+            row(&event("keydown", json!({"code": "Enter"}))),
+            "keydown Enter",
+            "the code stands in when the tape has no key"
+        );
+        assert_eq!(
+            row(&event("blur", json!({}))),
+            "blur",
+            "an event this app has no word for still has its row"
+        );
+    }
+
+    #[test]
+    fn an_event_says_how_long_after_the_tape_started_it_came() {
+        assert_eq!(event_offset(0), "+0.00 s");
+        assert_eq!(event_offset(1200), "+1.20 s");
+        assert_eq!(event_offset(80), "+0.08 s");
+    }
+
+    #[test]
+    fn the_bots_trigger_says_which_bots_are_checked() {
+        let bots = |checked: &[bool]| -> Vec<(String, String, bool)> {
+            ["hex", "ada", "bo"]
+                .iter()
+                .zip(checked)
+                .map(|(name, on)| (format!("cw_{name}"), name.to_string(), *on))
+                .collect()
+        };
+        assert_eq!(granted_summary(&bots(&[false, false, false])), "No bots");
+        assert_eq!(granted_summary(&bots(&[true, false, false])), "hex");
+        assert_eq!(
+            granted_summary(&bots(&[true, true, false])),
+            "hex and 1 other"
+        );
+        assert_eq!(
+            granted_summary(&bots(&[true, true, true])),
+            "hex and 2 others"
+        );
+    }
+
+    #[test]
+    fn the_modal_fills_from_the_step_and_builds_one_back() {
+        let screen = RecipeScreen {
+            width: 1280,
+            height: 800,
+        };
+        let drag = RecipeStep::Drag {
+            x1: 10,
+            y1: 10,
+            x2: 200,
+            y2: 40,
+        };
+        assert_eq!(step_param_values(&drag), vec!["10", "10", "200", "40"]);
+        assert_eq!(
+            build_step(StepKind::Drag, &values(&["10", "10", "200", "40"]), screen).unwrap(),
+            drag
+        );
+        assert_eq!(
+            build_step(StepKind::Click, &values(&["412", "88", ""]), screen).unwrap(),
+            RecipeStep::Click {
+                x: 412,
+                y: 88,
+                button: None
+            },
+            "no button named is the left one"
+        );
+        assert_eq!(
+            build_step(StepKind::Click, &values(&["412", "88", "Right"]), screen).unwrap(),
+            RecipeStep::Click {
+                x: 412,
+                y: 88,
+                button: Some(Value::from("right"))
+            }
+        );
+        assert_eq!(
+            build_step(
+                StepKind::Scroll,
+                &values(&["640", "400", "0", "-120"]),
+                screen
+            )
+            .unwrap(),
+            RecipeStep::Scroll {
+                x: 640,
+                y: 400,
+                dx: 0,
+                dy: -120
+            },
+            "a scroll may go either way, however far"
+        );
+    }
+
+    #[test]
+    fn a_value_off_the_screen_is_refused_with_its_reason() {
+        let screen = RecipeScreen {
+            width: 1280,
+            height: 800,
+        };
+        let refused = |kind, typed: &[&str]| build_step(kind, &values(typed), screen).unwrap_err();
+        assert!(
+            refused(StepKind::Click, &["1400", "88", ""]).contains("1280"),
+            "the reason names the screen"
+        );
+        assert!(refused(StepKind::DoubleClick, &["10", "-1"]).contains("Y"));
+        assert!(refused(StepKind::DoubleClick, &["ten", "10"]).contains("whole number"));
+        assert!(refused(StepKind::DoubleClick, &["", "10"]).contains("X"));
+        assert!(refused(StepKind::Click, &["10", "10", "sideways"]).contains("button"));
+    }
+
+    fn values(typed: &[&str]) -> Vec<String> {
+        typed.iter().map(|value| value.to_string()).collect()
     }
 
     #[test]

@@ -1247,26 +1247,82 @@ impl RecipeVersion {
 
     /// How many tape events a raw version holds: the server sends the count, or the events.
     pub fn event_count(&self) -> u64 {
-        match &self.body.events {
-            Some(Value::Number(count)) => count.as_u64().unwrap_or(0),
-            Some(Value::Array(events)) => events.len() as u64,
-            _ => 0,
-        }
+        self.body.events.as_ref().map_or(0, RecipeTape::count)
+    }
+
+    /// The tape itself, when the server sent it rather than only its size.
+    pub fn tape_events(&self) -> Option<&[RecipeTapeEvent]> {
+        self.body.events.as_ref().and_then(RecipeTape::events)
     }
 }
 
-/// A version's body: the tape's size for v1, the steps for every version after it. The keys
-/// are the server's snake_case.
+/// A version's body: the tape for v1, the steps for every version after it. The keys are the
+/// server's snake_case.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RecipeVersionBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub events: Option<Value>,
+    pub events: Option<RecipeTape>,
     #[serde(default)]
     pub steps: Vec<RecipeStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_on_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<Value>,
+}
+
+/// What a raw version carries under `events`: the tape itself, or only how many events were
+/// taped. The detail route strips a tape to its count today (see `RECIPE-RAW-TAPE.md`), so both
+/// shapes have to parse, and an unexpected third one must not fail the whole detail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RecipeTape {
+    Count(u64),
+    Events(Vec<RecipeTapeEvent>),
+    Other(Value),
+}
+
+impl RecipeTape {
+    /// How many events were taped, whether the tape came with them or only with its size.
+    pub fn count(&self) -> u64 {
+        match self {
+            Self::Count(count) => *count,
+            Self::Events(events) => events.len() as u64,
+            Self::Other(_) => 0,
+        }
+    }
+
+    pub fn events(&self) -> Option<&[RecipeTapeEvent]> {
+        match self {
+            Self::Events(events) => Some(events),
+            _ => None,
+        }
+    }
+}
+
+/// One event off a taught tape, mirroring the server's `TapeEvent`. `kind` decides which of the
+/// rest matter: `down` and `up` carry a place and a button, `move` a place, `wheel` a place and
+/// an amount, `keydown` and `keyup` a key. `at` is the wall clock in milliseconds, so a row's
+/// offset is its own `at` less the tape's first.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RecipeTapeEvent {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub button: i32,
+    #[serde(default)]
+    pub dx: i32,
+    #[serde(default)]
+    pub dy: i32,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub at: i64,
 }
 
 /// One thing a bot does when a recipe runs. Coordinates are on the recipe's 1280×800 screen.
@@ -2104,6 +2160,42 @@ mod tests {
         assert_eq!(detail.runs[0].coworker_id, "cw_1");
         assert_eq!(detail.runs[0].at_ms, 5);
         assert_eq!(detail.shares[0].scope_id, "org_1");
+        assert!(
+            detail.versions[0].tape_events().is_none(),
+            "a count is not a tape"
+        );
+    }
+
+    #[test]
+    fn a_raw_version_takes_the_tape_or_its_count() {
+        let with_tape: RecipeVersion = serde_json::from_value(json!({
+            "version": 1,
+            "kind": "raw",
+            "body": {"events": [
+                {"kind": "down", "x": 640, "y": 60, "button": 1, "at": 1000},
+                {"kind": "keydown", "key": "e", "code": "KeyE", "at": 2200},
+            ]},
+        }))
+        .unwrap();
+        assert_eq!(with_tape.event_count(), 2);
+        let events = with_tape.tape_events().expect("the tape itself");
+        assert_eq!(events[0].button, 1);
+        assert_eq!(events[1].key, "e");
+        assert_eq!(events[1].at, 2200);
+
+        let counted: RecipeVersion =
+            serde_json::from_value(json!({"version": 1, "kind": "raw", "body": {"events": 14}}))
+                .unwrap();
+        assert_eq!(counted.event_count(), 14);
+        assert!(counted.tape_events().is_none());
+
+        // A shape this client has no word for leaves the version readable, not unparsable.
+        let odd: RecipeVersion = serde_json::from_value(
+            json!({"version": 1, "kind": "raw", "body": {"events": {"total": 14}}}),
+        )
+        .unwrap();
+        assert_eq!(odd.event_count(), 0);
+        assert!(odd.tape_events().is_none());
     }
 
     #[test]
