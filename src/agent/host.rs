@@ -56,6 +56,9 @@ pub enum Command {
     SendMessage(String),
     ToggleComputerPane,
     OpenCoworkerScreen,
+    /// Update / Reset the active bot's computer; first call arms, second confirms.
+    ArmComputerUpdate,
+    ArmComputerReset,
     AnswerApproval {
         call_id: String,
         resolution: LocalExecResolution,
@@ -103,6 +106,8 @@ impl Command {
             Self::SendMessage(text) => state.send_message(text, cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
             Self::OpenCoworkerScreen => state.open_coworker_screen(cx),
+            Self::ArmComputerUpdate => state.arm_computer_update(cx),
+            Self::ArmComputerReset => state.arm_computer_reset(cx),
             Self::AnswerApproval {
                 call_id,
                 resolution,
@@ -178,6 +183,10 @@ pub struct NativeChatHost {
     /// The coworker's computer as the pane sees it: "<state>; screen: yes|no",
     /// "endpoint missing", or "unknown".
     computer_status: String,
+    computer_update_label: String,
+    computer_reset_label: String,
+    /// The update banner's two lines, when one is showing.
+    update_banner: Option<String>,
     pending: Option<Command>,
 }
 
@@ -243,6 +252,31 @@ impl NativeChatHost {
                 })
                 .collect(),
             computer_open: state.right_pane == crate::state::RightPane::Computer,
+            computer_update_label: {
+                let status = state.coworker_computer.as_ref();
+                crate::components::computer::confirm_label(
+                    state.computer_update_is_armed(),
+                    status.is_some_and(|s| s.updating()),
+                    if status.is_some_and(|s| s.image_stale()) {
+                        "Update available"
+                    } else {
+                        "Update"
+                    },
+                )
+                .to_string()
+            },
+            computer_reset_label: crate::components::computer::confirm_label(
+                state.computer_reset_is_armed(),
+                state
+                    .coworker_computer
+                    .as_ref()
+                    .is_some_and(|s| s.updating()),
+                "Reset",
+            )
+            .to_string(),
+            update_banner: state
+                .computer_banner()
+                .map(|(title, detail)| format!("{title} — {detail}")),
             computer_status: if state.computer_endpoint_missing {
                 "endpoint missing".to_string()
             } else {
@@ -380,8 +414,19 @@ impl NativeChatHost {
                     "computer-status",
                     "status",
                     self.computer_status.clone(),
+                ))
+                .with_child(UiNode::button(
+                    "computer-update",
+                    self.computer_update_label.clone(),
+                ))
+                .with_child(UiNode::button(
+                    "computer-reset",
+                    self.computer_reset_label.clone(),
                 )),
         );
+        if let Some(banner) = &self.update_banner {
+            page = page.with_child(UiNode::new("update-banner", "status", banner.clone()));
+        }
 
         UiTree {
             app: "nativechat".into(),
@@ -490,6 +535,8 @@ impl NativeChatHost {
             "theme.toggle" => Command::ToggleTheme,
             "computer.toggle" => Command::ToggleComputerPane,
             "computer.open" => Command::OpenCoworkerScreen,
+            "computer.update" => Command::ArmComputerUpdate,
+            "computer.reset" => Command::ArmComputerReset,
             "settings.account" => Command::ToggleAccount,
             "auth.login" => {
                 let email = args

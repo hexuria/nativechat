@@ -3,7 +3,7 @@ use crate::opengrok::LocalExecMode;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -22,7 +22,7 @@ impl Render for AppSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let (tab, chord, theme_mode, account_name, account_email, computers) = {
+        let (tab, chord, theme_mode, account_name, account_email, computers, bot_name, controls) = {
             let state = self.state.read(cx);
             let (name, email) = state
                 .account
@@ -36,6 +36,24 @@ impl Render for AppSettings {
                 name,
                 email,
                 state.computers.clone(),
+                state.active_bot_name(),
+                crate::components::computer::ComputerControls {
+                    present: state
+                        .coworker_computer
+                        .as_ref()
+                        .is_some_and(|s| s.state != "absent"),
+                    updating: state
+                        .coworker_computer
+                        .as_ref()
+                        .is_some_and(|s| s.updating()),
+                    stale: state
+                        .coworker_computer
+                        .as_ref()
+                        .is_some_and(|s| s.image_stale()),
+                    update_armed: state.computer_update_is_armed(),
+                    reset_armed: state.computer_reset_is_armed(),
+                    error: state.computer_action_error.clone(),
+                },
             )
         };
         let app = self.state.clone();
@@ -97,6 +115,10 @@ impl Render for AppSettings {
                                 }
                                 AppSettingsTab::Computer => {
                                     computer_page(computers, muted, app.clone()).into_any_element()
+                                }
+                                AppSettingsTab::Updates => {
+                                    updates_page(&bot_name, &controls, muted, app.clone(), &theme)
+                                        .into_any_element()
                                 }
                             }),
                     ),
@@ -190,6 +212,13 @@ impl AppSettings {
                 AppSettingsTab::Computer,
                 cx,
             ))
+            .child(nav_item(
+                "settings-tab-updates",
+                "Updates",
+                tab == AppSettingsTab::Updates,
+                AppSettingsTab::Updates,
+                cx,
+            ))
     }
 }
 
@@ -200,7 +229,106 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Appearance => "Appearance",
         AppSettingsTab::Shortcuts => "Keyboard shortcuts",
         AppSettingsTab::Computer => "Computer",
+        AppSettingsTab::Updates => "Updates",
     }
+}
+
+/// The active bot's computer: Update (keeps files) and Reset (starts fresh), each two clicks.
+fn updates_page(
+    bot_name: &str,
+    controls: &crate::components::computer::ComputerControls,
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    use crate::components::computer::confirm_label;
+    let update_label = confirm_label(
+        controls.update_armed,
+        controls.updating,
+        if controls.stale {
+            "Update available"
+        } else {
+            "Update"
+        },
+    );
+    let reset_label = confirm_label(controls.reset_armed, controls.updating, "Reset");
+    let row = |title: String, detail: &'static str, button: Button| {
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap(px(16.))
+            .px(px(16.))
+            .py(px(12.))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .gap(px(2.))
+                    .child(div().text_sm().child(title))
+                    .child(div().text_xs().text_color(muted).child(detail)),
+            )
+            .child(button)
+    };
+    v_flex()
+        .gap(px(12.))
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(format!("{bot_name}'s Computer")),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .rounded(px(12.))
+                .border_1()
+                .border_color(rgb(0x777777).opacity(0.24))
+                .overflow_hidden()
+                .child(row(
+                    format!("Update {bot_name}'s Computer"),
+                    "Rebuilds the computer on the newest image. Your files and logins stay, but installed apps and packages are removed.",
+                    {
+                        let button = Button::new("settings-computer-update")
+                            .label(update_label)
+                            .disabled(!controls.present || controls.updating)
+                            .on_click({
+                                let app = app.clone();
+                                move |_, _, cx| {
+                                    app.update(cx, |state, cx| state.arm_computer_update(cx));
+                                }
+                            });
+                        if controls.update_armed || controls.stale {
+                            button.primary()
+                        } else {
+                            button
+                        }
+                    },
+                ))
+                .child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
+                .child(row(
+                    format!("Reset {bot_name}'s Computer"),
+                    "Start fresh if the computer gets stuck. Everything on it is lost.",
+                    Button::new("settings-computer-reset")
+                        .label(reset_label)
+                        .disabled(!controls.present || controls.updating)
+                        .on_click({
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| state.arm_computer_reset(cx));
+                            }
+                        }),
+                )),
+        )
+        .when_some(controls.error.clone(), |this, error| {
+            this.child(div().text_xs().text_color(theme.danger).child(error))
+        })
+        .when(!controls.present, |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Open a bot's Computer pane first; these act on the active bot's computer."),
+            )
+        })
 }
 
 fn nav_item(
