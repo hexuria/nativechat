@@ -10,16 +10,20 @@ use gpui_kit::{prelude::FluentBuilder, *};
 
 pub const TIMESTAMP_W: f32 = 82.0;
 pub const TS_PEEK_MAX: f32 = 82.0;
-/// The transcript's padding either side of a row (px_4 in chat.rs).
-const ROW_PAD: f32 = 16.0;
+/// The transcript's padding either side of a row: the 12px the message scroller gives every
+/// row (px_3) and the 16px (px_4) around it in chat.rs.
+const ROW_PAD: f32 = 28.0;
 /// Between the bubble and the toolbar's slot, when the slot is in the row.
 const TOOLBAR_GAP: f32 = 8.0;
 /// The narrowest bubble worth keeping the toolbar's slot beside. Below it the toolbar floats
-/// over the bubble's corner instead, and the bubble keeps its width.
+/// above the bubble's corner instead, and the bubble takes the whole row.
 const MIN_COMFORTABLE_BUBBLE: f32 = 260.0;
-/// How far a floating toolbar reaches past the bubble's edge, into the row's margin: the
-/// bubble's cap (chat_w - 82) leaves at least 50px there.
-const FLOAT_OUT: f32 = 44.0;
+/// The floating toolbar's padding around its controls; with its 1px border the pill is
+/// CONTROL_PX + 2 * PILL_PAD + 2 tall.
+const PILL_PAD: f32 = 2.0;
+/// How far the pill reaches down into the bubble's top padding (no text in the bubble's
+/// first 8px), so the pointer never crosses a gap between the bubble and the pill.
+const PILL_OVERLAP: f32 = 4.0;
 
 #[derive(Clone, IntoElement)]
 pub struct MessageBubble {
@@ -234,6 +238,13 @@ impl RenderOnce for MessageBubble {
             cx,
             |_, _| false,
         );
+        // The floating toolbar hangs above the row's box, so its own hover keeps it shown
+        // while the pointer is on it.
+        let pill_hover_state = window.use_keyed_state(
+            ElementId::Name(format!("msg-pill-hover-{row_key}").into()),
+            cx,
+            |_, _| false,
+        );
         let peek = if self.timestamps_ok {
             self.ts_peek.clamp(0.0, TS_PEEK_MAX)
         } else {
@@ -245,7 +256,10 @@ impl RenderOnce for MessageBubble {
         } else {
             0.0
         };
-        let hovered = *hover_state.read(cx) || self.picker_open || *menu_state.read(cx);
+        let hovered = *hover_state.read(cx)
+            || self.picker_open
+            || *menu_state.read(cx)
+            || *pill_hover_state.read(cx);
         let show_toolbar = self.show_footer && hovered && !peeking;
         let (bg, fg) = bubble_colors(self.is_me, cx);
         let muted = cx.theme().muted_foreground;
@@ -270,12 +284,13 @@ impl RenderOnce for MessageBubble {
         let max_bubble = (chat_w * 0.88).min(640.0).min((chat_w - 82.0).max(160.0));
         // The bubble comes first. The toolbar's slot sits beside it only while the bubble
         // that leaves is still comfortable to read; narrower than that, the toolbar floats
-        // over the bubble's corner and takes no width from the row.
+        // above the bubble's corner and takes no width from the row, so the bubble may have
+        // the whole of it: the cap's margin was only ever room for the slot.
         let row_w = (chat_w - 2.0 * ROW_PAD).max(0.0);
         let room = row_w - (TOOLBAR_W + TOOLBAR_GAP);
         let toolbar_floats = room < MIN_COMFORTABLE_BUBBLE;
         let max_bubble = px(if toolbar_floats {
-            max_bubble
+            row_w.min(640.0)
         } else {
             max_bubble.min(room)
         });
@@ -422,25 +437,42 @@ impl RenderOnce for MessageBubble {
                 .opacity(if show_toolbar { 1. } else { 0. })
                 .when_some(slot_toolbar, |this, toolbar| this.child(toolbar))
         });
-        // Floating: on hover only, over the bubble's outer bottom corner and reaching into
-        // the row's margin, so it takes nothing from the bubble's width.
-        let bubble_stack =
-            bubble_stack.when_some(float_toolbar.filter(|_| show_toolbar), |this, toolbar| {
+        // Floating: on hover only, a pill above the bubble's outer top corner (the row's edge
+        // on that side, so it never leaves the column whatever the bubble's width), in the
+        // 32px the scroller keeps between rows: it covers no text in this bubble or the one
+        // before, and the reaction chip on the bottom edge is out of its way. It hangs outside
+        // the row's box, so it keeps its own hover; and it fades rather than goes while the
+        // timestamps peek, so that hover stays consistent.
+        let pill_hover = pill_hover_state.clone();
+        let bubble_stack = bubble_stack.when_some(
+            float_toolbar.filter(|_| self.show_footer && hovered),
+            |this, toolbar| {
                 this.child(
                     div()
+                        .id(ElementId::Name(format!("msg-pill-{row_key}").into()))
                         .absolute()
-                        .bottom(px(2.))
-                        .when(is_me, |this| this.left(px(-FLOAT_OUT)))
-                        .when(!is_me, |this| this.right(px(-FLOAT_OUT)))
-                        .p(px(2.))
+                        .top(px(-(CONTROL_PX + 2. * PILL_PAD + 2. - PILL_OVERLAP)))
+                        .when(is_me, |this| this.right(px(0.)))
+                        .when(!is_me, |this| this.left(px(0.)))
+                        .p(px(PILL_PAD))
                         .rounded(px(8.))
                         .bg(reaction_bg)
                         .border_1()
                         .border_color(reaction_border)
                         .shadow_sm()
+                        .opacity(if peeking { 0. } else { 1. })
+                        .on_hover(move |on, _, cx| {
+                            pill_hover.update(cx, |state, cx| {
+                                if *state != *on {
+                                    *state = *on;
+                                    cx.notify();
+                                }
+                            });
+                        })
                         .child(toolbar),
                 )
-            });
+            },
+        );
 
         let time_label = self.timestamp.clone().unwrap_or_default();
 
