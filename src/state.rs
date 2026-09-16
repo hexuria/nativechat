@@ -1406,17 +1406,22 @@ impl AppState {
                     size: size(px(1100.), px(760.)),
                 })),
                 window_min_size: Some(size(px(640.), px(480.))),
+                // The title bar is ours: transparent, with the traffic lights left where they
+                // are, so the strip the window paints (name, Teach a task) IS the title bar and
+                // follows the app's theme rather than the system's.
                 titlebar: Some(TitlebarOptions {
-                    title: Some(title.into()),
-                    ..TitlebarOptions::default()
+                    title: Some(title.clone().into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(14.))),
                 }),
                 ..WindowOptions::default()
             };
             let coworker = coworker_id.to_string();
+            let app = cx.entity();
             let opened = cx.open_window(options, move |window, cx| {
                 cx.new(|cx| {
                     crate::components::computer_screen::ComputerScreen::new(
-                        &url, &coworker, window, cx,
+                        &url, &coworker, &title, app, window, cx,
                     )
                 })
             });

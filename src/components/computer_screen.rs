@@ -20,6 +20,13 @@ use wry::{
 };
 
 use crate::actions::{CloseWindow, Hide, Minimize, Quit};
+use crate::state::AppState;
+
+/// The title bar the window paints for itself: tall enough for the traffic lights and a
+/// button, and the part the person drags the window by.
+const TITLE_BAR_HEIGHT: f32 = 44.;
+/// Past the traffic lights.
+const TITLE_BAR_LEFT_PAD: f32 = 80.;
 
 /// What the page reports while a task is being taught: every pointer and key
 /// event on the noVNC canvas, in the screen's own 1280×800 coordinates. This is
@@ -88,6 +95,8 @@ pub struct ComputerScreen {
     /// take the app down with it: the window says what went wrong instead.
     webview: Result<Rc<wry::WebView>, String>,
     coworker_id: String,
+    /// "<name>'s Computer", painted in the title bar.
+    title: String,
     focus: FocusHandle,
     /// The page's reports land here whether or not a task is being taught; the
     /// script only posts while `__ncTeach` is on.
@@ -98,7 +107,16 @@ pub struct ComputerScreen {
 }
 
 impl ComputerScreen {
-    pub fn new(url: &str, coworker_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        url: &str,
+        coworker_id: &str,
+        title: &str,
+        app: Entity<AppState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // The theme is app-wide; a toggle in the main window must repaint this one too.
+        cx.observe(&app, |_, _, cx| cx.notify()).detach();
         let tape: Rc<RefCell<Vec<serde_json::Value>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = tape.clone();
         let webview = window
@@ -126,6 +144,7 @@ impl ComputerScreen {
         Self {
             webview,
             coworker_id: coworker_id.to_string(),
+            title: title.to_string(),
             focus,
             tape,
             teaching: None,
@@ -213,15 +232,29 @@ impl Render for ComputerScreen {
         let header = h_flex()
             .id("computer-window-header")
             .w_full()
-            .h(px(44.))
+            .h(px(TITLE_BAR_HEIGHT))
             .flex_shrink_0()
-            .px(px(12.))
+            .pl(px(TITLE_BAR_LEFT_PAD))
+            .pr(px(12.))
             .items_center()
-            .justify_end()
             .gap(px(10.))
             .bg(theme.background)
+            .text_color(theme.foreground)
             .border_b_1()
             .border_color(theme.border)
+            // The name and the empty run of the bar: the part that drags the window.
+            .child(
+                div()
+                    .id("computer-window-drag")
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.title.clone())
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move()),
+            )
             .when_some(self.last_saved.clone(), |this, note| {
                 this.child(
                     div()
