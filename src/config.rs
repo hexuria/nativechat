@@ -14,6 +14,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// Where NativeChat keeps its files, without loading the rest of the config: the same
+    /// `NATIVECHAT_DATA_DIR` override, else the platform's app-data directory.
+    pub fn data_dir() -> PathBuf {
+        std::env::var("NATIVECHAT_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|_| {
+                ProjectDirs::from("ai", "nativechat", "NativeChat")
+                    .map(|dirs| dirs.data_dir().to_path_buf())
+                    .ok_or(())
+            })
+            .unwrap_or_else(|_| PathBuf::from("."))
+    }
+
     pub fn load() -> Result<Self> {
         let project_dirs = ProjectDirs::from("ai", "nativechat", "NativeChat")
             .ok_or_else(|| AppError::Config("Could not determine app directories".into()))?;

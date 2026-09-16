@@ -17,6 +17,9 @@ actions!(
         CloseSettings,
         Minimize,
         Zoom,
+        /// Close the window this lands in — a coworker's screen closes itself; the main
+        /// window minimizes, it has nowhere else to go.
+        CloseWindow,
         Hide,
         HideOthers,
         ShowAll,
