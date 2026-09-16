@@ -731,9 +731,8 @@ pub struct AppState {
     pub voice_status: VoiceStatus,
     pub more_menu_open: bool,
     /// The composer's "+" picker: what it can offer, what is picked, and what each entry is.
-    pub available_apps: Vec<String>,
-    pub selected_apps: Vec<String>,
-    pub capabilities: Vec<AppCapability>,
+    /// Tools named for the next message. They show as chips beside the composer's "+".
+    pub picked_tools: Vec<PickedTool>,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -881,13 +880,37 @@ pub struct SourceTtsState {
     pub is_loading: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct AppCapability {
-    pub name: String,      // The tag name (e.g., "Photos")
-    pub label: String,     // The menu label (e.g., "Add photos & files")
-    pub icon: String,      // Icon path
-    pub action_id: String, // Action identifier
-    pub is_primary: bool,  // Whether it belongs in the main menu or "More" submenu
+/// A tool the person named for the next message, by typing `@` in the composer.
+///
+/// The kind travels with it. The chip row used to decide Tools from Apps by matching the name
+/// against a hardcoded list, which only worked while the names came from one hardcoded menu;
+/// a real tool's name comes from the server and matches nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickedTool {
+    /// What the server calls it: `shell`, or a plugin's qualified `plugin.server.tool`.
+    pub id: String,
+    /// What the chip reads.
+    pub label: String,
+    pub kind: PickedKind,
+}
+
+/// Which group a chip sits in. A bare name is one of the server's built-in tools; a qualified
+/// one belongs to a plugin, which is what the person means by an app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickedKind {
+    Tool,
+    App,
+}
+
+impl PickedKind {
+    /// Read the kind off the name, the same rule the server's tool listing uses.
+    pub fn of(id: &str) -> Self {
+        if id.contains('.') {
+            Self::App
+        } else {
+            Self::Tool
+        }
+    }
 }
 
 impl Default for AppState {
@@ -898,95 +921,6 @@ impl Default for AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let available_apps = vec![
-            "Canva".to_string(),
-            "Figma".to_string(),
-            "Notion".to_string(),
-            "Linear".to_string(),
-        ];
-
-        let capabilities = vec![
-            // Primary Items
-            AppCapability {
-                name: "Photos".to_string(),
-                label: "Add photos & files".to_string(),
-                icon: "icons/clip.svg".to_string(),
-                action_id: "SelectAppPhotos".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Image Generation".to_string(),
-                label: "Image Generation".to_string(),
-                icon: "icons/create_image.svg".to_string(),
-                action_id: "SelectAppImageGeneration".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Thinking".to_string(),
-                label: "Thinking".to_string(),
-                icon: "icons/thinking.svg".to_string(),
-                action_id: "SelectAppThinking".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Deep Research".to_string(),
-                label: "Deep Research".to_string(),
-                icon: "icons/deep_search.svg".to_string(),
-                action_id: "SelectAppDeepResearch".to_string(),
-                is_primary: true,
-            },
-            AppCapability {
-                name: "Study".to_string(),
-                label: "Study".to_string(),
-                icon: "icons/study.svg".to_string(),
-                action_id: "SelectAppStudy".to_string(),
-                is_primary: true,
-            },
-            // Secondary Items ("More" submenu)
-            AppCapability {
-                name: "Web search".to_string(),
-                label: "Web search".to_string(),
-                icon: "icons/web_search.svg".to_string(),
-                action_id: "SelectAppWebSearch".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Canvas".to_string(),
-                label: "Canvas".to_string(),
-                icon: "icons/canvas.svg".to_string(),
-                action_id: "SelectAppCanvas".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Canva".to_string(),
-                label: "Canva".to_string(),
-                icon: "icons/canva.svg".to_string(),
-                action_id: "SelectAppCanva".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Coursera".to_string(),
-                label: "Coursera".to_string(),
-                icon: "icons/coursera.svg".to_string(),
-                action_id: "SelectAppCoursera".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Figma".to_string(),
-                label: "Figma".to_string(),
-                icon: "icons/figma.svg".to_string(),
-                action_id: "SelectAppFigma".to_string(),
-                is_primary: false,
-            },
-            AppCapability {
-                name: "Spotify".to_string(),
-                label: "Spotify".to_string(),
-                icon: "icons/spotify.svg".to_string(),
-                action_id: "SelectAppSpotify".to_string(),
-                is_primary: false,
-            },
-        ];
-
         let mut state = Self {
             conversations: Vec::new(),
             last_active_at: HashMap::new(),
@@ -1000,9 +934,7 @@ impl AppState {
             is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
-            available_apps,
-            selected_apps: Vec::new(),
-            capabilities,
+            picked_tools: Vec::new(),
             is_app_settings_open: false,
             bot_finder_open: false,
             command_palette_open: false,
@@ -2516,18 +2448,30 @@ impl AppState {
     }
 
     /// Pick one of the composer's capabilities. The picked ones show as chips beside the field.
-    pub fn select_app(&mut self, app_name: String, cx: &mut Context<Self>) {
-        if !self.selected_apps.contains(&app_name) {
-            self.selected_apps.push(app_name);
+    /// Name a tool for the next message. Naming the same one twice is one chip, not two.
+    pub fn pick_tool(&mut self, id: String, label: String, cx: &mut Context<Self>) {
+        if self.picked_tools.iter().any(|picked| picked.id == id) {
+            return;
+        }
+        let kind = PickedKind::of(&id);
+        self.picked_tools.push(PickedTool { id, label, kind });
+        cx.notify();
+    }
+
+    /// Take a named tool back.
+    pub fn unpick_tool(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(index) = self.picked_tools.iter().position(|picked| picked.id == id) {
+            self.picked_tools.remove(index);
             cx.notify();
         }
     }
 
-    pub fn remove_app(&mut self, app_name: String, cx: &mut Context<Self>) {
-        if let Some(index) = self.selected_apps.iter().position(|a| *a == app_name) {
-            self.selected_apps.remove(index);
-            cx.notify();
-        }
+    /// The names to send with the next message, in the order they were named.
+    pub fn picked_tool_ids(&self) -> Vec<String> {
+        self.picked_tools
+            .iter()
+            .map(|picked| picked.id.clone())
+            .collect()
     }
 
     pub fn close_emoji_picker(&mut self, cx: &mut Context<Self>) {
@@ -4674,9 +4618,20 @@ fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_picked_tool_knows_whether_it_is_a_tool_or_an_app() {
+        // The chip row used to read the kind off a hardcoded list of menu names. A real tool's
+        // name comes from the server, so the rule is the one the server itself uses: a
+        // qualified name belongs to a plugin, which is what a person means by an app.
+        assert_eq!(PickedKind::of("shell"), PickedKind::Tool);
+        assert_eq!(PickedKind::of("run_recipe"), PickedKind::Tool);
+        assert_eq!(PickedKind::of("gmail.api.send"), PickedKind::App);
+    }
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        EMPTY_TURN_NOTE, Message, REPLY_QUOTE_CHARS, agui_messages, is_status_line, is_tool_standin,
+        EMPTY_TURN_NOTE, Message, PickedKind, REPLY_QUOTE_CHARS, agui_messages, is_status_line,
+        is_tool_standin,
     };
     use std::time::SystemTime;
 
