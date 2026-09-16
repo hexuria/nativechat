@@ -2738,8 +2738,11 @@ impl AppState {
                 } else {
                     state.finish_responding(turn_id.as_deref(), false);
                 }
+                // A failed run already ended the last assistant row with "OpenGrok: <why>";
+                // `auth_error` is the sign-in / settings error and the settings pane paints it,
+                // so a run's failure must not land there too.
                 if let Err(error) = result {
-                    state.auth_error = Some(error.message);
+                    eprintln!("NativeChat: the turn failed: {}", error.message);
                 }
                 cx.notify();
             });

@@ -50,6 +50,11 @@ impl Render for AppSettings {
                         .coworker_computer
                         .as_ref()
                         .is_some_and(|s| s.image_stale()),
+                    current: state
+                        .coworker_computer
+                        .as_ref()
+                        .and_then(|s| s.image.as_ref())
+                        .is_some_and(|image| !image.stale),
                     update_armed: state.computer_update_is_armed(),
                     reset_armed: state.computer_reset_is_armed(),
                     error: state.computer_action_error.clone(),
@@ -241,15 +246,11 @@ fn updates_page(
     app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    use crate::components::computer::confirm_label;
+    use crate::components::computer::{confirm_label, update_rest_label};
     let update_label = confirm_label(
         controls.update_armed,
         controls.updating,
-        if controls.stale {
-            "Update available"
-        } else {
-            "Update"
-        },
+        update_rest_label(controls.stale, controls.current),
     );
     let reset_label = confirm_label(controls.reset_armed, controls.updating, "Reset");
     let row = |title: String, detail: &'static str, button: Button| {
@@ -260,13 +261,16 @@ fn updates_page(
             .px(px(16.))
             .py(px(12.))
             .child(
+                // `min_w(0)` lets the copy shrink and wrap instead of shoving the button out of
+                // the card; the button never shrinks.
                 v_flex()
                     .flex_1()
+                    .min_w(px(0.))
                     .gap(px(2.))
                     .child(div().text_sm().child(title))
                     .child(div().text_xs().text_color(muted).child(detail)),
             )
-            .child(button)
+            .child(div().flex_shrink_0().child(button))
     };
     v_flex()
         .gap(px(12.))
@@ -290,7 +294,7 @@ fn updates_page(
                         let button = Button::new("settings-computer-update")
                             .label(update_label)
                             .small()
-                            .disabled(!controls.present || controls.updating)
+                            .disabled(controls.update_disabled())
                             .on_click({
                                 let app = app.clone();
                                 move |_, _, cx| {

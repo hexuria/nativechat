@@ -160,6 +160,11 @@ impl Render for ComputerPane {
                     .coworker_computer
                     .as_ref()
                     .is_some_and(|s| s.image_stale()),
+                current: state
+                    .coworker_computer
+                    .as_ref()
+                    .and_then(|s| s.image.as_ref())
+                    .is_some_and(|image| !image.stale),
                 update_armed: state.computer_update_is_armed(),
                 reset_armed: state.computer_reset_is_armed(),
                 error: state.computer_action_error.clone().or_else(|| {
@@ -698,6 +703,8 @@ pub struct ComputerControls {
     pub updating: bool,
     /// The box runs an older image than a new one would get.
     pub stale: bool,
+    /// The provider compared images and they match: nothing to update to.
+    pub current: bool,
     pub update_armed: bool,
     pub reset_armed: bool,
     /// Why the last action was refused, or how the last update failed.
@@ -715,6 +722,25 @@ pub fn confirm_label(armed: bool, busy: bool, rest: &'static str) -> &'static st
     }
 }
 
+/// The Update button's resting word: what the image comparison says. Unknown (a provider that
+/// cannot compare) stays "Update" so a person can still ask.
+pub fn update_rest_label(stale: bool, current: bool) -> &'static str {
+    if stale {
+        "Update available"
+    } else if current {
+        "Up to date"
+    } else {
+        "Update"
+    }
+}
+
+impl ComputerControls {
+    /// Nothing to update, or nothing to update to: the Update button waits.
+    pub fn update_disabled(&self) -> bool {
+        !self.present || self.updating || (self.current && !self.stale)
+    }
+}
+
 /// Update and Reset for the coworker's computer, each a two-click control.
 fn computer_controls(
     controls: &ComputerControls,
@@ -725,11 +751,7 @@ fn computer_controls(
     let update_label = confirm_label(
         controls.update_armed,
         controls.updating,
-        if controls.stale {
-            "Update available"
-        } else {
-            "Update"
-        },
+        update_rest_label(controls.stale, controls.current),
     );
     let reset_label = confirm_label(controls.reset_armed, controls.updating, "Reset");
     v_flex()
@@ -738,12 +760,13 @@ fn computer_controls(
         .child(
             h_flex()
                 .w_full()
+                .flex_wrap()
                 .gap(px(8.))
                 .child({
                     let button = Button::new("computer-update")
                         .label(update_label)
                         .small()
-                        .disabled(!controls.present || controls.updating)
+                        .disabled(controls.update_disabled())
                         .on_click({
                             let app = app.clone();
                             move |_, _, cx| {

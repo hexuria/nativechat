@@ -257,11 +257,12 @@ impl NativeChatHost {
                 crate::components::computer::confirm_label(
                     state.computer_update_is_armed(),
                     status.is_some_and(|s| s.updating()),
-                    if status.is_some_and(|s| s.image_stale()) {
-                        "Update available"
-                    } else {
-                        "Update"
-                    },
+                    crate::components::computer::update_rest_label(
+                        status.is_some_and(|s| s.image_stale()),
+                        status
+                            .and_then(|s| s.image.as_ref())
+                            .is_some_and(|image| !image.stale),
+                    ),
                 )
                 .to_string()
             },
