@@ -2150,7 +2150,20 @@ impl AppState {
             .map(|detail| detail.recipe.name.clone())
     }
 
+    /// Teach the active bot a task: its screen, with a tape already running. The same thing the
+    /// screen window's own Teach a task button does, asked for from the composer, opening the
+    /// window first when there is not one yet.
+    pub fn teach_task(&mut self, cx: &mut Context<Self>) {
+        self.show_coworker_screen(true, cx);
+    }
+
     pub fn open_coworker_screen(&mut self, cx: &mut Context<Self>) {
+        self.show_coworker_screen(false, cx);
+    }
+
+    /// The active coworker's screen. `teach` carries the ask for a tape all the way to the
+    /// window, which may be several awaits away: the box has to exist before it has a screen.
+    fn show_coworker_screen(&mut self, teach: bool, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
@@ -2163,7 +2176,7 @@ impl AppState {
             .and_then(CoworkerComputer::vnc_url)
             .map(str::to_string)
         {
-            self.open_computer_window(&coworker_id, &url, cx);
+            self.open_computer_window(&coworker_id, &url, teach, cx);
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -2171,7 +2184,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| match result {
                 Ok(status) => {
                     if let Some(url) = status.vnc_url().map(str::to_string) {
-                        state.open_computer_window(&coworker_id, &url, cx);
+                        state.open_computer_window(&coworker_id, &url, teach, cx);
                     }
                     if state.active_coworker_id.as_deref() == Some(coworker_id.as_str()) {
                         state.coworker_computer = Some(status);
@@ -2189,7 +2202,13 @@ impl AppState {
 
     /// The screen of `coworker_id`, in its own window. The title names that
     /// coworker, not whichever one is active by the time the answer lands.
-    fn open_computer_window(&mut self, coworker_id: &str, url: &str, cx: &mut Context<Self>) {
+    fn open_computer_window(
+        &mut self,
+        coworker_id: &str,
+        url: &str,
+        teach: bool,
+        cx: &mut Context<Self>,
+    ) {
         let title = self
             .coworkers
             .iter()
@@ -2202,7 +2221,12 @@ impl AppState {
             // update, and that is the cue to open a fresh one.
             if let Some(existing) = self.computer_windows.get(coworker_id)
                 && existing
-                    .update(cx, |_, window, _| window.activate_window())
+                    .update(cx, |screen, window, cx| {
+                        window.activate_window();
+                        if teach {
+                            screen.start_teaching(window, cx);
+                        }
+                    })
                     .is_ok()
             {
                 return;
@@ -2237,12 +2261,26 @@ impl AppState {
                 Ok(handle) => {
                     self.computer_windows
                         .insert(coworker_id.to_string(), handle);
+                    if teach {
+                        // The page is not up yet, and teaching is a flag set on it; wait the
+                        // same moment the window itself waits before painting the page.
+                        cx.spawn(async move |_, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(1500))
+                                .await;
+                            let _ = handle.update(cx, |screen, window, cx| {
+                                screen.start_teaching(window, cx);
+                            });
+                        })
+                        .detach();
+                    }
                 }
                 Err(error) => eprintln!("NativeChat computer: could not open a window: {error}"),
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = teach;
             eprintln!("NativeChat computer: {title} is at {url}; opening it in-app is macOS-only");
         }
     }
