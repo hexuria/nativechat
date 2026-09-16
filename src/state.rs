@@ -1860,6 +1860,39 @@ impl AppState {
         });
     }
 
+    /// Select all and Deselect all in the Bots picker: the same grant or revoke for several
+    /// bots. The requests go one after another rather than together, because each answers with
+    /// the whole detail and answers that raced would leave the page showing an older set.
+    pub fn set_recipe_grants(
+        &mut self,
+        coworker_ids: Vec<String>,
+        granted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if coworker_ids.is_empty() {
+            return;
+        }
+        self.recipe_action("Updating bots…", cx, move |client, id| {
+            Box::pin(async move {
+                let mut last = None;
+                for coworker_id in coworker_ids {
+                    let result = if granted {
+                        client.grant_recipe(&id, &coworker_id).await
+                    } else {
+                        client.revoke_recipe_grant(&id, &coworker_id).await
+                    };
+                    // One refusal stops the rest: the detail it would have answered with is
+                    // no longer the truth, and the reason belongs on the page.
+                    last = Some(result?);
+                }
+                match last {
+                    Some(detail) => Ok(detail),
+                    None => client.recipe(&id).await,
+                }
+            })
+        });
+    }
+
     /// Accept or decline a recipe shared with the person, from the list or from its detail.
     pub fn answer_recipe_share(&mut self, id: String, accept: bool, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {

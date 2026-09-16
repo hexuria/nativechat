@@ -22,8 +22,8 @@ pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use client::{
     ConnectedComputer, CoworkerComputer, ImageStatus, LocalExecMode, OpenGrokClient,
     QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeRelation, RecipeRun,
-    RecipeRunResult, RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary,
-    RecipeVersion, RunReplay, UpdateStatus, thin_tape,
+    RecipeRunResult, RecipeScreen, RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep,
+    RecipeSummary, RecipeTape, RecipeTapeEvent, RecipeVersion, RunReplay, UpdateStatus, thin_tape,
 };
 pub use error::OpenGrokError;
 pub use types::{
