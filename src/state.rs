@@ -8,10 +8,10 @@ use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
-    ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, ToolCallTracker,
-    TurnAssembler, activity_from_replay, command_from_args, command_from_replay_events,
-    enrol_this_machine, local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id,
-    visible_bot_status,
+    ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ToolCallTracker, TurnAssembler,
+    activity_from_replay, command_from_args, command_from_replay_events, enrol_this_machine,
+    local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id, visible_bot_status,
 };
 use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
@@ -396,6 +396,109 @@ pub enum ComputerAction {
     Reset,
 }
 
+/// What fills the main slot beside the sidebar: the chat, or a page reached from the dock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MainPage {
+    #[default]
+    Chat,
+    Recipes,
+}
+
+/// Which recipes the list asks the server for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RecipeFilter {
+    #[default]
+    Mine,
+    Shared,
+    Org,
+}
+
+impl RecipeFilter {
+    pub const ALL: [Self; 3] = [Self::Mine, Self::Shared, Self::Org];
+
+    /// The `?filter=` word.
+    pub fn query(self) -> &'static str {
+        match self {
+            Self::Mine => "mine",
+            Self::Shared => "shared",
+            Self::Org => "org",
+        }
+    }
+
+    pub fn from_query(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|filter| filter.query() == word)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mine => "Mine",
+            Self::Shared => "Shared with me",
+            Self::Org => "Org",
+        }
+    }
+
+    /// The chip's element id.
+    pub fn element_id(self) -> &'static str {
+        match self {
+            Self::Mine => "recipes-filter-mine",
+            Self::Shared => "recipes-filter-shared",
+            Self::Org => "recipes-filter-org",
+        }
+    }
+}
+
+/// What the last Run on… came back with, decoded for the page.
+#[derive(Clone)]
+pub struct RecipeRunOutcome {
+    pub coworker_id: String,
+    pub version: u32,
+    pub ok: bool,
+    pub ran: Option<u64>,
+    pub stopped_at: Option<u64>,
+    pub error: Option<String>,
+    /// The screen after the run, with its size.
+    pub image: Option<(Arc<gpui_kit::Image>, u32, u32)>,
+}
+
+impl RecipeRunOutcome {
+    fn from_result(coworker_id: String, result: RecipeRunResult) -> Self {
+        let image = result
+            .image
+            .as_ref()
+            .and_then(|image| crate::opengrok::ScreenshotSpec::from_frame("recipe-run", "", image))
+            .map(|spec| (spec.image, spec.width, spec.height));
+        Self {
+            coworker_id,
+            version: result.version,
+            ok: result.ok,
+            ran: result.ran_count(),
+            stopped_at: result.stopped_at,
+            error: result.error,
+            image,
+        }
+    }
+
+    /// The one line the page shows for the outcome.
+    pub fn headline(&self) -> String {
+        let steps = match self.ran {
+            Some(1) => "1 step".to_string(),
+            Some(count) => format!("{count} steps"),
+            None => "the steps".to_string(),
+        };
+        if self.ok {
+            return format!("Ran {steps} of v{}", self.version);
+        }
+        let stopped = match self.stopped_at {
+            Some(step) => format!("Stopped at step {step}"),
+            None => "Stopped".to_string(),
+        };
+        match &self.error {
+            Some(error) => format!("{stopped}: {error}"),
+            None => stopped,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AppSettingsTab {
     #[default]
@@ -412,6 +515,7 @@ pub enum AppSettingsTab {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NavLocation {
     pub coworker_id: Option<String>,
+    pub page: MainPage,
     pub right_pane: RightPane,
     pub computer_view: ComputerView,
     pub app_settings_open: bool,
@@ -569,6 +673,27 @@ pub struct AppState {
     /// The coworker whose absent computer we already asked the server to (re)provision, so a
     /// status of `absent` heals once per visit rather than on every poll.
     computer_heal_requested: Option<String>,
+    /// What the main slot shows: the chat, or the Recipes page.
+    pub page: MainPage,
+    pub recipes: Vec<RecipeSummary>,
+    pub recipes_filter: RecipeFilter,
+    pub recipes_loading: bool,
+    pub recipes_error: Option<String>,
+    /// Bumped per list request, so a late answer for an earlier filter is dropped.
+    recipes_epoch: u64,
+    /// The recipe the detail view shows, once it has loaded.
+    pub recipe_open: Option<RecipeDetail>,
+    /// The recipe the detail view is on, from the moment it is asked for; a late answer for
+    /// another one is dropped.
+    pub recipe_open_id: Option<String>,
+    pub recipe_loading: bool,
+    /// What the detail view is doing right now ("Saving…", "Running…"), while it does it.
+    pub recipe_busy: Option<String>,
+    /// What the last recipe request said when it was refused.
+    pub recipe_error: Option<String>,
+    pub recipe_run_result: Option<RecipeRunOutcome>,
+    /// Delete asks first: the dialog over the app, until Delete or Cancel.
+    pub recipe_delete_confirm: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -691,6 +816,19 @@ impl AppState {
             computer_heal_requested: None,
             computer_endpoint_missing: false,
             computer_poll: None,
+            page: MainPage::Chat,
+            recipes: Vec::new(),
+            recipes_filter: RecipeFilter::Mine,
+            recipes_loading: false,
+            recipes_error: None,
+            recipes_epoch: 0,
+            recipe_open: None,
+            recipe_open_id: None,
+            recipe_loading: false,
+            recipe_busy: None,
+            recipe_error: None,
+            recipe_run_result: None,
+            recipe_delete_confirm: false,
             #[cfg(target_os = "macos")]
             computer_windows: std::collections::HashMap::new(),
         };
@@ -1340,6 +1478,345 @@ impl AppState {
                 update.detail(),
             ))
         }
+    }
+
+    /// The Recipes page in the main slot, with the list for the current filter.
+    pub fn open_recipes(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_popovers(cx);
+        if self.page != MainPage::Recipes {
+            self.page = MainPage::Recipes;
+            self.record_nav();
+        }
+        self.refresh_recipes(cx);
+        cx.notify();
+    }
+
+    /// Back to the chat from a page.
+    pub fn show_chat(&mut self, cx: &mut Context<Self>) {
+        if self.page == MainPage::Chat {
+            return;
+        }
+        self.page = MainPage::Chat;
+        self.record_nav();
+        cx.notify();
+    }
+
+    pub fn set_recipes_filter(&mut self, filter: RecipeFilter, cx: &mut Context<Self>) {
+        if self.recipes_filter == filter {
+            return;
+        }
+        self.recipes_filter = filter;
+        self.refresh_recipes(cx);
+        cx.notify();
+    }
+
+    /// Load the list for the current filter. A late answer for an earlier request is dropped,
+    /// so switching chips quickly never shows the wrong list.
+    pub fn refresh_recipes(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        self.recipes_epoch += 1;
+        let epoch = self.recipes_epoch;
+        let filter = self.recipes_filter;
+        self.recipes_loading = true;
+        self.recipes_error = None;
+        cx.spawn(async move |this, cx| {
+            let result = client.list_recipes(Some(filter.query())).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.recipes_epoch != epoch {
+                    return;
+                }
+                state.recipes_loading = false;
+                match result {
+                    Ok(recipes) => state.recipes = recipes,
+                    Err(error) => state.recipes_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The detail view for one recipe.
+    pub fn open_recipe(&mut self, id: String, cx: &mut Context<Self>) {
+        self.recipe_open = None;
+        self.recipe_open_id = Some(id);
+        self.recipe_busy = None;
+        self.recipe_error = None;
+        self.recipe_run_result = None;
+        self.recipe_delete_confirm = false;
+        self.load_open_recipe(cx);
+        cx.notify();
+    }
+
+    /// Fetch the open recipe, keeping whatever is shown until the answer lands.
+    fn load_open_recipe(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(id) = self.recipe_open_id.clone() else {
+            return;
+        };
+        self.recipe_loading = true;
+        cx.spawn(async move |this, cx| {
+            let result = client.recipe(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                // A late answer for a recipe the person has since left is stale.
+                if state.recipe_open_id.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                state.recipe_loading = false;
+                match result {
+                    Ok(detail) => state.recipe_open = Some(detail),
+                    Err(error) => state.recipe_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn close_recipe(&mut self, cx: &mut Context<Self>) {
+        self.recipe_open = None;
+        self.recipe_open_id = None;
+        self.recipe_loading = false;
+        self.recipe_busy = None;
+        self.recipe_error = None;
+        self.recipe_run_result = None;
+        self.recipe_delete_confirm = false;
+        cx.notify();
+    }
+
+    /// Run one request on the open recipe and take its answer as the detail; a refusal is
+    /// shown on the page. The list is reloaded too, since names and versions show there.
+    fn recipe_action(
+        &mut self,
+        busy: &str,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(
+            OpenGrokClient,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RecipeDetail, OpenGrokError>> + Send>,
+        > + 'static,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(id) = self.recipe_open_id.clone() else {
+            return;
+        };
+        self.recipe_busy = Some(busy.to_string());
+        self.recipe_error = None;
+        cx.notify();
+        let future = action(client, id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let _ = this.update(cx, |state, cx| {
+                if state.recipe_open_id.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                state.recipe_busy = None;
+                match result {
+                    Ok(detail) => {
+                        state.recipe_open = Some(detail);
+                        state.refresh_recipes(cx);
+                    }
+                    Err(error) => state.recipe_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn rename_open_recipe(
+        &mut self,
+        name: String,
+        description: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.recipe_action("Saving…", cx, move |client, id| {
+            Box::pin(async move { client.rename_recipe(&id, &name, &description).await })
+        });
+    }
+
+    /// The edited steps as the open recipe's next version.
+    pub fn add_recipe_version(
+        &mut self,
+        steps: Vec<RecipeStep>,
+        note: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.recipe_action("Saving…", cx, move |client, id| {
+            Box::pin(async move { client.add_recipe_version(&id, &steps, &note).await })
+        });
+    }
+
+    pub fn share_open_recipe(&mut self, target: RecipeShareTarget, cx: &mut Context<Self>) {
+        self.recipe_action("Sharing…", cx, move |client, id| {
+            Box::pin(async move { client.share_recipe(&id, &target).await })
+        });
+    }
+
+    pub fn unshare_open_recipe(&mut self, scope: String, scope_id: String, cx: &mut Context<Self>) {
+        self.recipe_action("Unsharing…", cx, move |client, id| {
+            Box::pin(async move { client.unshare_recipe(&id, &scope, &scope_id).await })
+        });
+    }
+
+    /// Let one of the person's bots run the open recipe, or take that back.
+    pub fn set_recipe_grant(&mut self, coworker_id: String, granted: bool, cx: &mut Context<Self>) {
+        self.recipe_action("Updating bots…", cx, move |client, id| {
+            Box::pin(async move {
+                if granted {
+                    client.grant_recipe(&id, &coworker_id).await
+                } else {
+                    client.revoke_recipe_grant(&id, &coworker_id).await
+                }
+            })
+        });
+    }
+
+    /// Accept or decline a recipe shared with the person, from the list or from its detail.
+    pub fn answer_recipe_share(&mut self, id: String, accept: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        self.recipes_error = None;
+        if self.recipe_open_id.as_deref() == Some(id.as_str()) {
+            self.recipe_busy = Some(
+                if accept {
+                    "Accepting…"
+                } else {
+                    "Declining…"
+                }
+                .to_string(),
+            );
+            self.recipe_error = None;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = if accept {
+                client.accept_recipe(&id).await
+            } else {
+                client.decline_recipe(&id).await
+            };
+            let _ = this.update(cx, |state, cx| {
+                let open = state.recipe_open_id.as_deref() == Some(id.as_str());
+                if open {
+                    state.recipe_busy = None;
+                }
+                match result {
+                    Ok(detail) => {
+                        if open {
+                            state.recipe_open = Some(detail);
+                        }
+                        state.refresh_recipes(cx);
+                    }
+                    Err(error) if open => state.recipe_error = Some(error.message),
+                    Err(error) => state.recipes_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Play the open recipe on one of the person's bots. The outcome and the screen after it
+    /// show on the page, and the run joins the history.
+    pub fn run_open_recipe(&mut self, coworker_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(id) = self.recipe_open_id.clone() else {
+            return;
+        };
+        self.recipe_busy = Some("Running…".to_string());
+        self.recipe_error = None;
+        self.recipe_run_result = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.run_recipe(&id, &coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.recipe_open_id.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                state.recipe_busy = None;
+                match result {
+                    Ok(result) => {
+                        state.recipe_run_result =
+                            Some(RecipeRunOutcome::from_result(coworker_id, result));
+                        state.load_open_recipe(cx);
+                    }
+                    Err(error) => state.recipe_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Ask before deleting the open recipe: the dialog over the app.
+    pub fn open_recipe_delete_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.recipe_open.is_none() {
+            return;
+        }
+        self.recipe_delete_confirm = true;
+        cx.notify();
+    }
+
+    pub fn close_recipe_delete_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.recipe_delete_confirm {
+            self.recipe_delete_confirm = false;
+            cx.notify();
+        }
+    }
+
+    /// The dialog's Delete: remove the recipe, then leave its detail for the list.
+    pub fn confirm_recipe_delete(&mut self, cx: &mut Context<Self>) {
+        if !self.recipe_delete_confirm {
+            return;
+        }
+        self.recipe_delete_confirm = false;
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(id) = self.recipe_open_id.clone() else {
+            return;
+        };
+        self.recipe_busy = Some("Deleting…".to_string());
+        self.recipe_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.delete_recipe(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.recipe_open_id.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                state.recipe_busy = None;
+                match result {
+                    Ok(()) => {
+                        state.close_recipe(cx);
+                        state.refresh_recipes(cx);
+                    }
+                    Err(error) => state.recipe_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The name of the recipe the delete dialog asks about, while it is open.
+    pub fn recipe_delete_prompt(&self) -> Option<String> {
+        if !self.recipe_delete_confirm {
+            return None;
+        }
+        self.recipe_open
+            .as_ref()
+            .map(|detail| detail.recipe.name.clone())
     }
 
     pub fn open_coworker_screen(&mut self, cx: &mut Context<Self>) {
@@ -2028,6 +2505,8 @@ impl AppState {
             return;
         };
         self.active_coworker_id = Some(id.clone());
+        // A bot chosen is a chat: the main slot leaves whatever page it was on.
+        self.page = MainPage::Chat;
         // The previous bot's screen must not show under this bot's name.
         self.coworker_computer = None;
         self.coworker_screen = None;
@@ -2053,6 +2532,7 @@ impl AppState {
     fn nav_location(&self) -> NavLocation {
         NavLocation {
             coworker_id: self.active_coworker_id.clone(),
+            page: self.page,
             right_pane: self.right_pane,
             computer_view: self.computer_view.clone(),
             app_settings_open: self.is_app_settings_open,
@@ -2105,6 +2585,11 @@ impl AppState {
         self.computer_view = loc.computer_view;
         self.is_app_settings_open = loc.app_settings_open;
         self.app_settings_tab = loc.app_settings_tab;
+        // After `select_coworker`, which lands on the chat: the page is where the person was.
+        self.page = loc.page;
+        if self.page == MainPage::Recipes {
+            self.refresh_recipes(cx);
+        }
         self.nav.applying = false;
         cx.notify();
     }

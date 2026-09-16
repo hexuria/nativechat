@@ -814,6 +814,24 @@ impl SidebarView {
                 hover,
                 None,
             ))
+            .child({
+                let view = view.clone();
+                self.dock_item(
+                    "nav-recipes",
+                    collapsed,
+                    "icons/record.svg",
+                    "Recipes",
+                    fg,
+                    hover,
+                    Some(Box::new(move |cx: &mut App| {
+                        view.update(cx, |this, cx| {
+                            this.state.update(cx, |state, cx| {
+                                state.open_recipes(cx);
+                            });
+                        });
+                    })),
+                )
+            })
             .child(self.dock_item(
                 "footer-plugins",
                 collapsed,

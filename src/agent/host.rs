@@ -13,6 +13,8 @@ pub mod ids {
     pub const NAV_SEARCH: &str = "nav-search";
     pub const NAV_LIBRARY: &str = "nav-library";
     pub const NAV_PROJECTS: &str = "nav-projects";
+    pub const NAV_RECIPES: &str = "nav-recipes";
+    pub const PAGE_RECIPES: &str = "page-recipes";
     pub const NAV_TOGGLE: &str = "nav-toggle-sidebar";
     pub const FOOTER_THEME: &str = "footer-theme";
     pub const FOOTER_ACCOUNT: &str = "footer-account";
@@ -60,6 +62,15 @@ pub enum Command {
     OpenComputerConfirm(crate::state::ComputerAction),
     ConfirmComputerAction,
     CancelComputerConfirm,
+    /// The Recipes page: open it, filter it, open one recipe, answer a share, go back.
+    OpenRecipes,
+    SetRecipesFilter(crate::state::RecipeFilter),
+    OpenRecipe(String),
+    CloseRecipe,
+    AnswerRecipeShare {
+        id: String,
+        accept: bool,
+    },
     AnswerApproval {
         call_id: String,
         resolution: LocalExecResolution,
@@ -110,6 +121,11 @@ impl Command {
             Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
             Self::ConfirmComputerAction => state.confirm_computer_action(cx),
             Self::CancelComputerConfirm => state.close_computer_confirm(cx),
+            Self::OpenRecipes => state.open_recipes(cx),
+            Self::SetRecipesFilter(filter) => state.set_recipes_filter(filter, cx),
+            Self::OpenRecipe(id) => state.open_recipe(id, cx),
+            Self::CloseRecipe => state.close_recipe(cx),
+            Self::AnswerRecipeShare { id, accept } => state.answer_recipe_share(id, accept, cx),
             Self::AnswerApproval {
                 call_id,
                 resolution,
@@ -136,6 +152,15 @@ struct SessionSnap {
     id: String,
     title: String,
     active: bool,
+}
+
+/// One row of the Recipes page.
+#[derive(Clone)]
+struct RecipeSnap {
+    id: String,
+    name: String,
+    /// A share waiting on Accept or Decline.
+    pending: bool,
 }
 
 /// An approval card still waiting on the person.
@@ -191,6 +216,11 @@ pub struct NativeChatHost {
     computer_confirm: Option<String>,
     /// The update banner's two lines, when one is showing.
     update_banner: Option<String>,
+    /// The Recipes page, when it fills the main slot: its rows, and the recipe open in it.
+    recipes_open: bool,
+    recipes_filter: &'static str,
+    recipes: Vec<RecipeSnap>,
+    recipe_open: Option<String>,
     pending: Option<Command>,
 }
 
@@ -303,6 +333,18 @@ impl NativeChatHost {
                     })
                     .unwrap_or_else(|| "unknown".to_string())
             },
+            recipes_open: state.page == crate::state::MainPage::Recipes,
+            recipes_filter: state.recipes_filter.query(),
+            recipes: state
+                .recipes
+                .iter()
+                .map(|recipe| RecipeSnap {
+                    id: recipe.id.clone(),
+                    name: recipe.name.clone(),
+                    pending: recipe.is_pending_invite(),
+                })
+                .collect(),
+            recipe_open: state.recipe_open_id.clone(),
             pending: None,
         }
     }
@@ -371,6 +413,7 @@ impl NativeChatHost {
                 .with_child(UiNode::button(ids::NAV_SEARCH, "Search"))
                 .with_child(UiNode::button(ids::NAV_LIBRARY, "Library"))
                 .with_child(UiNode::button(ids::NAV_PROJECTS, "Projects"))
+                .with_child(UiNode::button(ids::NAV_RECIPES, "Recipes"))
                 .with_child(UiNode::scroll(ids::SIDEBAR_LIST, "Chats").with_child(
                     UiNode::list("sidebar-sessions", "Sessions").with_children(sessions),
                 ))
@@ -450,6 +493,7 @@ impl NativeChatHost {
                 UiNode::window(ids::WINDOW, "NativeChat")
                     .with_child(sidebar)
                     .with_child(page)
+                    .with_child(self.recipes_node())
                     .with_child(
                         UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
                             .with_visible(self.account_open),
@@ -484,6 +528,70 @@ impl NativeChatHost {
         }
     }
 
+    /// The Recipes page as the driver sees it: the filter chips, the rows with their Accept
+    /// and Decline, and the recipe open in it.
+    fn recipes_node(&self) -> UiNode {
+        let mut page = UiNode::page(ids::PAGE_RECIPES, "Recipes").with_visible(self.recipes_open);
+        for filter in crate::state::RecipeFilter::ALL {
+            let mut chip = UiNode::button(filter.element_id(), filter.label());
+            if filter.query() == self.recipes_filter {
+                chip.states.push("selected".into());
+            }
+            page = page.with_child(chip);
+        }
+        let pending = self.recipes.iter().filter(|recipe| recipe.pending).count();
+        let mut list = UiNode::list("recipes-list", "Recipes");
+        for recipe in &self.recipes {
+            let mut item = UiNode::listitem(format!("recipe-{}", recipe.id), recipe.name.clone());
+            if recipe.pending {
+                item.states.push("pending".into());
+                // The one pending share answers to the plain ids; several need the suffix.
+                let suffix = if pending == 1 {
+                    String::new()
+                } else {
+                    format!("-{}", recipe.id)
+                };
+                item = item
+                    .with_child(UiNode::button(format!("recipe-accept{suffix}"), "Accept"))
+                    .with_child(UiNode::button(format!("recipe-decline{suffix}"), "Decline"));
+            }
+            list = list.with_child(item);
+        }
+        page = page.with_child(list);
+        if let Some(id) = &self.recipe_open {
+            page = page.with_child(
+                UiNode::new("recipe-detail", "dialog", format!("Recipe {id}"))
+                    .with_child(UiNode::button("recipe-back", "Back")),
+            );
+        }
+        page
+    }
+
+    /// `recipe-accept` / `recipe-decline` (the one pending share) or the same with `-<id>`.
+    fn recipe_answer_target(&self, target: &str) -> Option<(String, bool)> {
+        let (rest, accept) = if let Some(rest) = target.strip_prefix("recipe-accept") {
+            (rest, true)
+        } else if let Some(rest) = target.strip_prefix("recipe-decline") {
+            (rest, false)
+        } else {
+            return None;
+        };
+        let id = match rest.strip_prefix('-') {
+            Some(id) if !id.is_empty() => id.to_string(),
+            Some(_) => return None,
+            None if rest.is_empty() => {
+                let mut pending = self.recipes.iter().filter(|recipe| recipe.pending);
+                let first = pending.next()?;
+                if pending.next().is_some() {
+                    return None;
+                }
+                first.id.clone()
+            }
+            None => return None,
+        };
+        Some((id, accept))
+    }
+
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
         let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
@@ -511,6 +619,19 @@ impl NativeChatHost {
             || target == ids::NAV_PROJECTS
         {
             return Ok(DispatchResult::empty());
+        } else if target == ids::NAV_RECIPES {
+            Command::OpenRecipes
+        } else if target == "recipe-back" {
+            Command::CloseRecipe
+        } else if let Some(word) = target.strip_prefix("recipes-filter-") {
+            Command::SetRecipesFilter(
+                crate::state::RecipeFilter::from_query(word)
+                    .ok_or_else(|| format!("unknown recipes filter `{word}`"))?,
+            )
+        } else if let Some((id, accept)) = self.recipe_answer_target(target) {
+            Command::AnswerRecipeShare { id, accept }
+        } else if let Some(id) = target.strip_prefix("recipe-") {
+            Command::OpenRecipe(id.to_string())
         } else if let Some(id) = target.strip_prefix("coworker-") {
             Command::SelectCoworker(id.to_string())
         } else if let Some(id) = target.strip_prefix("session-") {
@@ -554,6 +675,24 @@ impl NativeChatHost {
             "computer.confirm" => Command::ConfirmComputerAction,
             "computer.cancel" => Command::CancelComputerConfirm,
             "settings.account" => Command::ToggleAccount,
+            "recipes.open" => Command::OpenRecipes,
+            "recipes.filter" => {
+                let word = args
+                    .get("filter")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "recipes.filter requires arg filter".to_string())?;
+                Command::SetRecipesFilter(crate::state::RecipeFilter::from_query(word).ok_or_else(
+                    || format!("unknown recipes filter `{word}` (mine, shared, org)"),
+                )?)
+            }
+            "recipe.open" => {
+                let id = args
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "recipe.open requires arg id".to_string())?;
+                Command::OpenRecipe(id.to_string())
+            }
+            "recipe.close" => Command::CloseRecipe,
             "auth.login" => {
                 let email = args
                     .get("email")

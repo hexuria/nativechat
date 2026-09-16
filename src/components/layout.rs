@@ -6,8 +6,9 @@ use crate::components::command_palette::CommandPalette;
 use crate::components::computer::ComputerPane;
 use crate::components::hidden_bots::hidden_bots_overlay;
 use crate::components::login::LoginView;
+use crate::components::recipes::{RecipesView, recipe_delete_overlay};
 use crate::components::sidebar::SidebarView;
-use crate::state::RightPane;
+use crate::state::{MainPage, RightPane};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme, Disableable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -39,6 +40,8 @@ struct ShellRev {
     hidden_bots: bool,
     has_agent: bool,
     hiring: bool,
+    recipes_page: bool,
+    recipe_delete: bool,
 }
 
 impl ShellRev {
@@ -68,6 +71,8 @@ impl ShellRev {
             hidden_bots: state.hidden_bots_open,
             has_agent: state.active_coworker_id.is_some(),
             hiring: state.hiring,
+            recipes_page: state.page == MainPage::Recipes,
+            recipe_delete: state.recipe_delete_confirm,
         }
     }
 }
@@ -82,6 +87,7 @@ pub struct Layout {
     app_settings: Entity<AppSettings>,
     bot_finder: Entity<BotFinder>,
     command_palette: Entity<CommandPalette>,
+    recipes: Entity<RecipesView>,
     state: Entity<AppState>,
     shell: ShellRev,
     last_window_width: Option<Pixels>,
@@ -98,6 +104,7 @@ impl Layout {
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
         let bot_finder = cx.new(|cx| BotFinder::new(window, state.clone(), cx));
         let command_palette = cx.new(|cx| CommandPalette::new(window, state.clone(), cx));
+        let recipes = cx.new(|cx| RecipesView::new(window, state.clone(), cx));
         let shell = ShellRev::from_state(&state.read(cx));
 
         cx.observe(&state, |this, state, cx| {
@@ -118,6 +125,7 @@ impl Layout {
             app_settings,
             bot_finder,
             command_palette,
+            recipes,
             state,
             shell,
             last_window_width: None,
@@ -237,8 +245,13 @@ impl Render for Layout {
         let computer_confirm = state
             .computer_confirm
             .map(|action| (action, state.active_bot_name()));
+        let recipes_page = state.page == MainPage::Recipes;
+        let recipe_delete = state.recipe_delete_prompt();
         let theme = cx.theme().clone();
-        let main = if has_agent {
+        // A page from the dock takes the chat's slot; the chat is back when a bot is chosen.
+        let main = if recipes_page {
+            self.recipes.clone().into_any_element()
+        } else if has_agent {
             self.chat.clone().into_any_element()
         } else {
             empty_agent_pane(self.state.clone(), hire_error, hiring, &theme)
@@ -407,6 +420,9 @@ impl Render for Layout {
                     name,
                     &theme,
                 ))
+            })
+            .when_some(recipe_delete, |this, name| {
+                this.child(recipe_delete_overlay(self.state.clone(), name, &theme))
             })
     }
 }
