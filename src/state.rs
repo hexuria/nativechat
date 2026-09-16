@@ -555,6 +555,13 @@ pub struct AppState {
     pub coworker_screen: Option<std::sync::Arc<gpui_kit::Image>>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
+    /// One screen window per coworker: Open brings the existing one forward rather than
+    /// stacking another.
+    #[cfg(target_os = "macos")]
+    computer_windows: std::collections::HashMap<
+        String,
+        WindowHandle<crate::components::computer_screen::ComputerScreen>,
+    >,
     /// Update / Reset ask first: the dialog over the app, until Confirm or Cancel.
     pub computer_confirm: Option<ComputerAction>,
     /// What the last Update / Reset request said when it was refused; shown under the buttons.
@@ -684,6 +691,8 @@ impl AppState {
             computer_heal_requested: None,
             computer_endpoint_missing: false,
             computer_poll: None,
+            #[cfg(target_os = "macos")]
+            computer_windows: std::collections::HashMap::new(),
         };
 
         state
@@ -1372,7 +1381,7 @@ impl AppState {
 
     /// The screen of `coworker_id`, in its own window. The title names that
     /// coworker, not whichever one is active by the time the answer lands.
-    fn open_computer_window(&self, coworker_id: &str, url: &str, cx: &mut Context<Self>) {
+    fn open_computer_window(&mut self, coworker_id: &str, url: &str, cx: &mut Context<Self>) {
         let title = self
             .coworkers
             .iter()
@@ -1381,6 +1390,15 @@ impl AppState {
             .unwrap_or_else(|| "Computer".into());
         #[cfg(target_os = "macos")]
         {
+            // Already open: bring it forward. A handle whose window was closed fails to
+            // update, and that is the cue to open a fresh one.
+            if let Some(existing) = self.computer_windows.get(coworker_id)
+                && existing
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+            {
+                return;
+            }
             let url = url.to_string();
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -1394,13 +1412,20 @@ impl AppState {
                 }),
                 ..WindowOptions::default()
             };
+            let coworker = coworker_id.to_string();
             let opened = cx.open_window(options, move |window, cx| {
                 cx.new(|cx| {
-                    crate::components::computer_screen::ComputerScreen::new(&url, window, cx)
+                    crate::components::computer_screen::ComputerScreen::new(
+                        &url, &coworker, window, cx,
+                    )
                 })
             });
-            if let Err(error) = opened {
-                eprintln!("NativeChat computer: could not open a window: {error}");
+            match opened {
+                Ok(handle) => {
+                    self.computer_windows
+                        .insert(coworker_id.to_string(), handle);
+                }
+                Err(error) => eprintln!("NativeChat computer: could not open a window: {error}"),
             }
         }
         #[cfg(not(target_os = "macos"))]

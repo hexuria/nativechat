@@ -2,11 +2,11 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
     About, BranchInNewChat, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind,
-    CloseSettings, CopyMessage, FindNext, FindPrev, FocusChatInput, Hide, HideOthers, Minimize,
-    NavBack, NavForward, NewChat, OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab,
-    PaletteSelectNext, PaletteSelectPrev, PickFinderItem, Quit, ReadAloud, ReportMessage, Search,
-    ShowAll, ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown, ToggleFps,
-    ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
+    CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput, Hide, HideOthers,
+    Minimize, NavBack, NavForward, NewChat, OpenCommandPalette, OpenSettings, PaletteNextTab,
+    PalettePrevTab, PaletteSelectNext, PaletteSelectPrev, PickFinderItem, Quit, ReadAloud,
+    ReportMessage, Search, ShowAll, ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown,
+    ToggleFps, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::components::chat_input::SubmitMessage;
@@ -192,6 +192,9 @@ fn main() {
                 KeyBinding::new("cmd-,", OpenSettings, Some("AppSettings")),
                 KeyBinding::new("escape", CloseSettings, Some("AppSettings")),
                 KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-w", CloseWindow, None),
+                KeyBinding::new("cmd-m", Minimize, None),
+                KeyBinding::new("cmd-h", Hide, None),
                 KeyBinding::new("cmd-f12", ToggleDebugMarkdown, None),
                 KeyBinding::new("cmd-shift-f", ToggleFps, None),
                 KeyBinding::new("cmd-shift-c", CopyMessage, None),
@@ -298,6 +301,7 @@ fn set_menus(cx: &mut App) {
                 MenuItem::action("Minimize", Minimize),
                 MenuItem::action("Zoom", Zoom),
                 MenuItem::separator(),
+                MenuItem::action("Close Window", CloseWindow),
             ],
         },
         Menu {

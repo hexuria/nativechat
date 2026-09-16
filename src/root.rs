@@ -1,8 +1,9 @@
 use crate::actions::{
-    About, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind, FindNext, FindPrev,
-    FocusChatInput, Hide, HideOthers, Minimize, NavBack, NavForward, NewChat, OpenCommandPalette,
-    OpenSettings, PickFinderItem, Search, ShowAll, ToggleAgentSettings, ToggleComputerPane,
-    ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
+    About, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind, CloseWindow, FindNext,
+    FindPrev, FocusChatInput, Hide, HideOthers, Minimize, NavBack, NavForward, NewChat,
+    OpenCommandPalette, OpenSettings, PickFinderItem, Search, ShowAll, ToggleAgentSettings,
+    ToggleComputerPane, ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar, ToggleSidebar,
+    ToggleTheme, Zoom,
 };
 use crate::components::layout::Layout;
 use gpui_kit::prelude::*;
@@ -355,8 +356,12 @@ impl Render for RootView {
                     click_away(window, &root_focus, cx);
                 }
             })
-            .on_action(|_: &Minimize, _window: &mut Window, _cx: &mut App| {
-                println!("Minimize action triggered");
+            .on_action(|_: &Minimize, window: &mut Window, _cx: &mut App| {
+                window.minimize_window();
+            })
+            .on_action(|_: &CloseWindow, window: &mut Window, _cx: &mut App| {
+                // The main window has nowhere to go but the Dock.
+                window.minimize_window();
             })
             .on_action(|_: &Zoom, _window: &mut Window, _cx: &mut App| {
                 println!("Zoom action triggered");
