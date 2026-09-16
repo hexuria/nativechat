@@ -477,6 +477,28 @@ impl OpenGrokClient {
         Ok(body.machines)
     }
 
+    pub async fn coworker_computer(
+        &self,
+        coworker_id: &str,
+    ) -> Result<CoworkerComputer, OpenGrokError> {
+        let path = format!("/coworkers/{coworker_id}/computer");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    pub async fn ensure_coworker_computer(
+        &self,
+        coworker_id: &str,
+    ) -> Result<CoworkerComputer, OpenGrokError> {
+        let path = format!("/coworkers/{coworker_id}/computer");
+        let response = self
+            .send_json::<()>(reqwest::Method::POST, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     pub async fn enrol_daemon(
         &self,
         label: &str,
@@ -700,6 +722,22 @@ impl LocalExecMode {
             Self::Always => "Always allow",
             Self::Never => "Never allow",
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CoworkerComputer {
+    #[serde(rename = "agentId", default)]
+    pub agent_id: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(rename = "vncUrl", default)]
+    pub vnc_url: Option<String>,
+}
+
+impl CoworkerComputer {
+    pub fn vnc_url(&self) -> Option<&str> {
+        self.vnc_url.as_deref().filter(|url| !url.is_empty())
     }
 }
 
@@ -1088,6 +1126,73 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].call_id, "call-9");
         assert_eq!(queue[0].tool, "user_machine_shell");
+    }
+
+    #[tokio::test]
+    async fn coworker_computer_reads_vnc_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/computer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "vncUrl": "http://127.0.0.1:6080/vnc.html"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let status = client.coworker_computer("cw_1").await.unwrap();
+        assert_eq!(status.state, "running");
+        assert_eq!(status.vnc_url(), Some("http://127.0.0.1:6080/vnc.html"));
+    }
+
+    #[tokio::test]
+    async fn ensure_coworker_computer_posts_and_reads_the_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/coworkers/cw_1/computer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "vncUrl": "http://127.0.0.1:6080/vnc.html"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let status = client.ensure_coworker_computer("cw_1").await.unwrap();
+        assert_eq!(status.vnc_url(), Some("http://127.0.0.1:6080/vnc.html"));
+    }
+
+    /// A server without the endpoint is a state the app must recognise, not a crash.
+    #[tokio::test]
+    async fn coworker_computer_reports_a_missing_endpoint_as_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/computer"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.coworker_computer("cw_1").await.unwrap_err();
+        assert_eq!(error.status, Some(404));
+    }
+
+    #[tokio::test]
+    async fn a_box_without_a_screen_has_no_vnc_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/computer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "vncUrl": null
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let status = client.coworker_computer("cw_1").await.unwrap();
+        assert_eq!(status.vnc_url(), None);
     }
 
     #[test]

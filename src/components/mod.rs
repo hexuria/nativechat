@@ -7,6 +7,9 @@ pub mod chat_input;
 pub mod circular_voice_viz;
 pub mod command_palette;
 pub mod computer;
+/// The coworker's screen in a window: a `wry` WebView, which only builds on macOS here.
+#[cfg(target_os = "macos")]
+pub mod computer_screen;
 pub mod emoji_picker;
 pub mod fields;
 pub mod gen_ui;

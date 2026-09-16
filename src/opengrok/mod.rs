@@ -19,7 +19,9 @@ pub use gen_ui::{
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 
-pub use client::{ConnectedComputer, LocalExecMode, OpenGrokClient, QueuedApproval, RunReplay};
+pub use client::{
+    ConnectedComputer, CoworkerComputer, LocalExecMode, OpenGrokClient, QueuedApproval, RunReplay,
+};
 pub use error::OpenGrokError;
 pub use types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
