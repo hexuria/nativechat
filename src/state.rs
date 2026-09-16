@@ -387,6 +387,15 @@ pub struct RoutineRun {
     pub ok: bool,
 }
 
+/// What the confirm dialog over the app is asking about the active bot's computer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComputerAction {
+    /// Rebuild on the newest image; files and logins stay.
+    Update,
+    /// Start fresh; everything on it is lost.
+    Reset,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AppSettingsTab {
     #[default]
@@ -546,10 +555,8 @@ pub struct AppState {
     pub coworker_screen: Option<std::sync::Arc<gpui_kit::Image>>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
-    /// Update / Reset ask twice: the first click arms, the second within a few seconds fires.
-    /// Holds the coworker it was armed for, so a switch disarms it.
-    pub computer_update_armed: Option<(String, std::time::Instant)>,
-    pub computer_reset_armed: Option<(String, std::time::Instant)>,
+    /// Update / Reset ask first: the dialog over the app, until Confirm or Cancel.
+    pub computer_confirm: Option<ComputerAction>,
     /// What the last Update / Reset request said when it was refused; shown under the buttons.
     pub computer_action_error: Option<String>,
     /// The coworker whose absent computer we already asked the server to (re)provision, so a
@@ -672,8 +679,7 @@ impl AppState {
             computers: Vec::new(),
             coworker_computer: None,
             coworker_screen: None,
-            computer_update_armed: None,
-            computer_reset_armed: None,
+            computer_confirm: None,
             computer_action_error: None,
             computer_heal_requested: None,
             computer_endpoint_missing: false,
@@ -1019,8 +1025,7 @@ impl AppState {
     fn set_right_pane(&mut self, pane: RightPane, cx: &mut Context<Self>) {
         let computer = pane == RightPane::Computer;
         self.right_pane = pane;
-        self.computer_update_armed = None;
-        self.computer_reset_armed = None;
+        self.computer_confirm = None;
         self.computer_action_error = None;
         if computer {
             self.refresh_coworker_computer(cx);
@@ -1235,54 +1240,30 @@ impl AppState {
         .detach();
     }
 
-    /// How long the second click has to arrive.
-    const CONFIRM_WINDOW: Duration = Duration::from_secs(6);
-
-    fn armed(slot: &Option<(String, std::time::Instant)>, coworker_id: &str) -> bool {
-        slot.as_ref()
-            .is_some_and(|(id, at)| id == coworker_id && at.elapsed() < Self::CONFIRM_WINDOW)
-    }
-
-    pub fn computer_update_is_armed(&self) -> bool {
-        self.active_coworker_id
-            .as_deref()
-            .is_some_and(|id| Self::armed(&self.computer_update_armed, id))
-    }
-
-    pub fn computer_reset_is_armed(&self) -> bool {
-        self.active_coworker_id
-            .as_deref()
-            .is_some_and(|id| Self::armed(&self.computer_reset_armed, id))
-    }
-
-    /// First click arms ("Click again to confirm"); the second, within the window, updates.
-    pub fn arm_computer_update(&mut self, cx: &mut Context<Self>) {
-        let Some(coworker_id) = self.active_coworker_id.clone() else {
+    /// Ask before acting on the active bot's computer: the dialog over the app.
+    pub fn open_computer_confirm(&mut self, action: ComputerAction, cx: &mut Context<Self>) {
+        if self.active_coworker_id.is_none() {
             return;
-        };
-        self.computer_action_error = None;
-        if Self::armed(&self.computer_update_armed, &coworker_id) {
-            self.computer_update_armed = None;
-            self.start_computer_update(cx);
-        } else {
-            self.computer_update_armed = Some((coworker_id, std::time::Instant::now()));
-            self.computer_reset_armed = None;
         }
+        self.computer_action_error = None;
+        self.computer_confirm = Some(action);
         cx.notify();
     }
 
-    /// First click arms; the second, within the window, resets (data and all).
-    pub fn arm_computer_reset(&mut self, cx: &mut Context<Self>) {
-        let Some(coworker_id) = self.active_coworker_id.clone() else {
+    pub fn close_computer_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.computer_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The dialog's Confirm: do what it asked, then close it.
+    pub fn confirm_computer_action(&mut self, cx: &mut Context<Self>) {
+        let Some(action) = self.computer_confirm.take() else {
             return;
         };
-        self.computer_action_error = None;
-        if Self::armed(&self.computer_reset_armed, &coworker_id) {
-            self.computer_reset_armed = None;
-            self.start_computer_reset(cx);
-        } else {
-            self.computer_reset_armed = Some((coworker_id, std::time::Instant::now()));
-            self.computer_update_armed = None;
+        match action {
+            ComputerAction::Update => self.start_computer_update(cx),
+            ComputerAction::Reset => self.start_computer_reset(cx),
         }
         cx.notify();
     }
@@ -2020,8 +2001,7 @@ impl AppState {
         // The previous bot's screen must not show under this bot's name.
         self.coworker_computer = None;
         self.coworker_screen = None;
-        self.computer_update_armed = None;
-        self.computer_reset_armed = None;
+        self.computer_confirm = None;
         self.computer_action_error = None;
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(

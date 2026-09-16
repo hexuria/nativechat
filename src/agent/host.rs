@@ -56,9 +56,10 @@ pub enum Command {
     SendMessage(String),
     ToggleComputerPane,
     OpenCoworkerScreen,
-    /// Update / Reset the active bot's computer; first call arms, second confirms.
-    ArmComputerUpdate,
-    ArmComputerReset,
+    /// Update / Reset the active bot's computer: open the confirm dialog, then answer it.
+    OpenComputerConfirm(crate::state::ComputerAction),
+    ConfirmComputerAction,
+    CancelComputerConfirm,
     AnswerApproval {
         call_id: String,
         resolution: LocalExecResolution,
@@ -106,8 +107,9 @@ impl Command {
             Self::SendMessage(text) => state.send_message(text, cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
             Self::OpenCoworkerScreen => state.open_coworker_screen(cx),
-            Self::ArmComputerUpdate => state.arm_computer_update(cx),
-            Self::ArmComputerReset => state.arm_computer_reset(cx),
+            Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
+            Self::ConfirmComputerAction => state.confirm_computer_action(cx),
+            Self::CancelComputerConfirm => state.close_computer_confirm(cx),
             Self::AnswerApproval {
                 call_id,
                 resolution,
@@ -185,6 +187,8 @@ pub struct NativeChatHost {
     computer_status: String,
     computer_update_label: String,
     computer_reset_label: String,
+    /// The confirm dialog's question, when it is open.
+    computer_confirm: Option<String>,
     /// The update banner's two lines, when one is showing.
     update_banner: Option<String>,
     pending: Option<Command>,
@@ -252,10 +256,13 @@ impl NativeChatHost {
                 })
                 .collect(),
             computer_open: state.right_pane == crate::state::RightPane::Computer,
+            computer_confirm: state.computer_confirm.map(|action| match action {
+                crate::state::ComputerAction::Update => "Update this computer?".to_string(),
+                crate::state::ComputerAction::Reset => "Reset this computer?".to_string(),
+            }),
             computer_update_label: {
                 let status = state.coworker_computer.as_ref();
                 crate::components::computer::confirm_label(
-                    state.computer_update_is_armed(),
                     status.is_some_and(|s| s.updating()),
                     crate::components::computer::update_rest_label(
                         status.is_some_and(|s| s.image_stale()),
@@ -267,7 +274,6 @@ impl NativeChatHost {
                 .to_string()
             },
             computer_reset_label: crate::components::computer::confirm_label(
-                state.computer_reset_is_armed(),
                 state
                     .coworker_computer
                     .as_ref()
@@ -428,6 +434,13 @@ impl NativeChatHost {
         if let Some(banner) = &self.update_banner {
             page = page.with_child(UiNode::new("update-banner", "status", banner.clone()));
         }
+        if let Some(question) = &self.computer_confirm {
+            page = page.with_child(
+                UiNode::new("computer-confirm", "dialog", question.clone())
+                    .with_child(UiNode::button("computer-confirm-yes", "Confirm"))
+                    .with_child(UiNode::button("computer-confirm-cancel", "Cancel")),
+            );
+        }
 
         UiTree {
             app: "nativechat".into(),
@@ -536,8 +549,10 @@ impl NativeChatHost {
             "theme.toggle" => Command::ToggleTheme,
             "computer.toggle" => Command::ToggleComputerPane,
             "computer.open" => Command::OpenCoworkerScreen,
-            "computer.update" => Command::ArmComputerUpdate,
-            "computer.reset" => Command::ArmComputerReset,
+            "computer.update" => Command::OpenComputerConfirm(crate::state::ComputerAction::Update),
+            "computer.reset" => Command::OpenComputerConfirm(crate::state::ComputerAction::Reset),
+            "computer.confirm" => Command::ConfirmComputerAction,
+            "computer.cancel" => Command::CancelComputerConfirm,
             "settings.account" => Command::ToggleAccount,
             "auth.login" => {
                 let email = args
