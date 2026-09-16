@@ -766,7 +766,9 @@ fn screen_tile(
         .rounded(px(12.))
         .border_1()
         .border_color(theme.border)
-        .bg(rgb(0x2a2a2a))
+        // The dark plate is for the empty tile only: under a picture it showed through the
+        // corners as a thick dark arc between the border and the image's own rounding.
+        .when(screen.is_none(), |this| this.bg(rgb(0x2a2a2a)))
         .overflow_hidden()
         .when(has_screen, |this| {
             this.cursor_pointer().on_mouse_down(MouseButton::Left, {
@@ -786,7 +788,7 @@ fn screen_tile(
             Some(image) => this.child(
                 img(image)
                     .size_full()
-                    .rounded(px(11.))
+                    .rounded(px(12.))
                     .object_fit(ObjectFit::Fill),
             ),
             None => this.child(
