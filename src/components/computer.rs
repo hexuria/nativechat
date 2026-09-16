@@ -12,7 +12,9 @@ use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Icon, Selectable, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Icon, Selectable, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -129,7 +131,7 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, box_id, routines, has_screen, screen) = {
+        let (view, agent_name, coworker_id, box_id, routines, has_screen, screen, controls) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -139,7 +141,36 @@ impl Render for ComputerPane {
                 .map(|c| c.name.clone())
                 .filter(|n| !n.trim().is_empty())
                 .unwrap_or_else(|| "Bot".into());
-            let box_id = coworker.and_then(|c| c.box_id.clone());
+            // The live box the status reports wins over the id frozen on the coworker's row.
+            let box_id = state
+                .coworker_computer
+                .as_ref()
+                .and_then(|status| status.box_id.clone())
+                .or_else(|| coworker.and_then(|c| c.box_id.clone()));
+            let controls = ComputerControls {
+                present: state
+                    .coworker_computer
+                    .as_ref()
+                    .is_some_and(|s| s.state != "absent"),
+                updating: state
+                    .coworker_computer
+                    .as_ref()
+                    .is_some_and(|s| s.updating()),
+                stale: state
+                    .coworker_computer
+                    .as_ref()
+                    .is_some_and(|s| s.image_stale()),
+                update_armed: state.computer_update_is_armed(),
+                reset_armed: state.computer_reset_is_armed(),
+                error: state.computer_action_error.clone().or_else(|| {
+                    state
+                        .coworker_computer
+                        .as_ref()
+                        .and_then(|s| s.update.as_ref())
+                        .filter(|u| !u.in_flight())
+                        .map(|u| u.detail())
+                }),
+            };
             let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
             let routines = state.coworker_routines(&coworker_id).to_vec();
             let has_screen = state
@@ -155,6 +186,7 @@ impl Render for ComputerPane {
                 routines,
                 has_screen,
                 state.coworker_screen.clone(),
+                controls,
             )
         };
 
@@ -176,6 +208,7 @@ impl Render for ComputerPane {
                         &routines,
                         has_screen,
                         screen,
+                        &controls,
                         muted,
                         app,
                         &theme,
@@ -197,6 +230,7 @@ impl ComputerPane {
         routines: &[AgentRoutine],
         has_screen: bool,
         screen: Option<Arc<gpui_kit::Image>>,
+        controls: &ComputerControls,
         muted: Hsla,
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
@@ -234,6 +268,7 @@ impl ComputerPane {
                                 }
                             }),
                     )
+                    .child(computer_controls(controls, muted, app.clone(), theme))
                     .child(if routines.is_empty() {
                         v_flex()
                             .w_full()
@@ -652,6 +687,101 @@ impl ComputerPane {
                 ))
             })
     }
+}
+
+/// What the Update and Reset controls need to know, read once per frame.
+#[derive(Debug, Clone, Default)]
+pub struct ComputerControls {
+    /// There is a box to act on.
+    pub present: bool,
+    /// An update is in flight; the buttons wait.
+    pub updating: bool,
+    /// The box runs an older image than a new one would get.
+    pub stale: bool,
+    pub update_armed: bool,
+    pub reset_armed: bool,
+    /// Why the last action was refused, or how the last update failed.
+    pub error: Option<String>,
+}
+
+/// The label a two-click button shows: armed, busy, or its resting word.
+pub fn confirm_label(armed: bool, busy: bool, rest: &'static str) -> &'static str {
+    if busy {
+        "Updating…"
+    } else if armed {
+        "Click again to confirm"
+    } else {
+        rest
+    }
+}
+
+/// Update and Reset for the coworker's computer, each a two-click control.
+fn computer_controls(
+    controls: &ComputerControls,
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let update_label = confirm_label(
+        controls.update_armed,
+        controls.updating,
+        if controls.stale {
+            "Update available"
+        } else {
+            "Update"
+        },
+    );
+    let reset_label = confirm_label(controls.reset_armed, controls.updating, "Reset");
+    v_flex()
+        .w_full()
+        .gap(px(6.))
+        .child(
+            h_flex()
+                .w_full()
+                .gap(px(8.))
+                .child({
+                    let button = Button::new("computer-update")
+                        .label(update_label)
+                        .small()
+                        .disabled(!controls.present || controls.updating)
+                        .on_click({
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| state.arm_computer_update(cx));
+                            }
+                        });
+                    if controls.update_armed || controls.stale {
+                        button.primary()
+                    } else {
+                        button
+                    }
+                })
+                .child(
+                    Button::new("computer-reset")
+                        .label(reset_label)
+                        .small()
+                        .disabled(!controls.present || controls.updating)
+                        .on_click({
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| state.arm_computer_reset(cx));
+                            }
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(if controls.reset_armed {
+                    "Reset starts fresh: files and logins on this computer are lost."
+                } else {
+                    "Update keeps your files and logins; installed packages are removed."
+                }),
+        )
+        .when_some(controls.error.clone(), |this, error| {
+            this.child(div().text_xs().text_color(theme.danger).child(error))
+        })
 }
 
 /// The coworker's screen. The Open pill is the control: it appears on hover

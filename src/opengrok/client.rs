@@ -562,6 +562,31 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// Rebuild the coworker's computer on the newest image, keeping its files. The server
+    /// answers at once; `coworker_computer` carries the phases.
+    pub async fn update_coworker_computer(
+        &self,
+        coworker_id: &str,
+    ) -> Result<CoworkerComputer, OpenGrokError> {
+        let path = format!("/coworkers/{coworker_id}/computer/update");
+        let response = self
+            .send_json::<()>(reqwest::Method::POST, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Destroy the coworker's computer, data and all, and start fresh.
+    pub async fn reset_coworker_computer(
+        &self,
+        coworker_id: &str,
+    ) -> Result<CoworkerComputer, OpenGrokError> {
+        let path = format!("/coworkers/{coworker_id}/computer/reset");
+        let response = self
+            .send_json::<()>(reqwest::Method::POST, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     pub async fn ensure_coworker_computer(
         &self,
         coworker_id: &str,
@@ -807,11 +832,69 @@ pub struct CoworkerComputer {
     pub state: String,
     #[serde(rename = "vncUrl", default)]
     pub vnc_url: Option<String>,
+    /// The scope's live box — after an update or a heal it differs from the id on the
+    /// coworker's own row, and it is the one a person is looking at.
+    #[serde(rename = "boxId", default)]
+    pub box_id: Option<String>,
+    /// What the box runs against what a new one would get; `None` when the provider cannot say.
+    #[serde(default)]
+    pub image: Option<ImageStatus>,
+    /// An update in flight, or the failure the last one ended in.
+    #[serde(default)]
+    pub update: Option<UpdateStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ImageStatus {
+    #[serde(default)]
+    pub running: String,
+    #[serde(default)]
+    pub latest: String,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UpdateStatus {
+    /// `pulling` | `transferring` | `starting` | `failed`.
+    pub phase: String,
+    #[serde(rename = "startedAtMs", default)]
+    pub started_at_ms: i64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl UpdateStatus {
+    pub fn in_flight(&self) -> bool {
+        self.phase != "failed"
+    }
+
+    /// The banner's second line for this phase.
+    pub fn detail(&self) -> String {
+        match self.phase.as_str() {
+            "pulling" => "Fetching the newest image".to_string(),
+            "transferring" => "Transferring your data".to_string(),
+            "starting" => "Starting the new computer".to_string(),
+            "failed" => self
+                .error
+                .clone()
+                .unwrap_or_else(|| "The update failed".to_string()),
+            other => other.to_string(),
+        }
+    }
 }
 
 impl CoworkerComputer {
     pub fn vnc_url(&self) -> Option<&str> {
         self.vnc_url.as_deref().filter(|url| !url.is_empty())
+    }
+
+    pub fn updating(&self) -> bool {
+        self.update.as_ref().is_some_and(UpdateStatus::in_flight)
+    }
+
+    pub fn image_stale(&self) -> bool {
+        self.image.as_ref().is_some_and(|image| image.stale)
     }
 }
 

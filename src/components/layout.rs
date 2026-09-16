@@ -9,7 +9,7 @@ use crate::components::login::LoginView;
 use crate::components::sidebar::SidebarView;
 use crate::state::RightPane;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme, Disableable, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -233,6 +233,7 @@ impl Render for Layout {
         let collapsed = state.sidebar_collapsed;
         let expanded_width = state.sidebar_expanded_width;
         let right_pane = state.right_pane;
+        let banner = state.computer_banner();
         let theme = cx.theme().clone();
         let main = if has_agent {
             self.chat.clone().into_any_element()
@@ -393,7 +394,55 @@ impl Render for Layout {
             .when(hidden_bots_open, |this| {
                 this.child(hidden_bots_overlay(self.state.clone(), cx))
             })
+            .when_some(banner, |this, (title, detail)| {
+                this.child(update_banner(title, detail, &theme))
+            })
     }
+}
+
+/// The pill over the app while a computer is being updated — title and the current phase.
+fn update_banner(
+    title: String,
+    detail: String,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    div()
+        .id("update-banner")
+        .absolute()
+        .top(px(12.))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            h_flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(14.))
+                .py(px(8.))
+                .rounded(px(12.))
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_md()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child("⟳"),
+                )
+                .child(
+                    v_flex()
+                        .gap(px(1.))
+                        .child(div().text_sm().child(title))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(detail),
+                        ),
+                ),
+        )
 }
 
 fn empty_agent_pane(

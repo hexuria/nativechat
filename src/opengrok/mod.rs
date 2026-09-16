@@ -20,7 +20,8 @@ pub use gen_ui::{
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 
 pub use client::{
-    ConnectedComputer, CoworkerComputer, LocalExecMode, OpenGrokClient, QueuedApproval, RunReplay,
+    ConnectedComputer, CoworkerComputer, ImageStatus, LocalExecMode, OpenGrokClient,
+    QueuedApproval, RunReplay, UpdateStatus,
 };
 pub use error::OpenGrokError;
 pub use types::{

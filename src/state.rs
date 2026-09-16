@@ -8,9 +8,10 @@ use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
-    ModelCatalogue, OpenGrokClient, ProfileUpdate, QueuedApproval, ToolCallTracker, TurnAssembler,
-    activity_from_replay, command_from_args, command_from_replay_events, enrol_this_machine,
-    local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id, visible_bot_status,
+    ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, ToolCallTracker,
+    TurnAssembler, activity_from_replay, command_from_args, command_from_replay_events,
+    enrol_this_machine, local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id,
+    visible_bot_status,
 };
 use crate::services::database::DatabaseService;
 use crate::services::tts_service::TtsService;
@@ -394,6 +395,7 @@ pub enum AppSettingsTab {
     Appearance,
     Shortcuts,
     Computer,
+    Updates,
 }
 
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
@@ -544,6 +546,15 @@ pub struct AppState {
     pub coworker_screen: Option<std::sync::Arc<gpui_kit::Image>>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
+    /// Update / Reset ask twice: the first click arms, the second within a few seconds fires.
+    /// Holds the coworker it was armed for, so a switch disarms it.
+    pub computer_update_armed: Option<(String, std::time::Instant)>,
+    pub computer_reset_armed: Option<(String, std::time::Instant)>,
+    /// What the last Update / Reset request said when it was refused; shown under the buttons.
+    pub computer_action_error: Option<String>,
+    /// The coworker whose absent computer we already asked the server to (re)provision, so a
+    /// status of `absent` heals once per visit rather than on every poll.
+    computer_heal_requested: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -661,6 +672,10 @@ impl AppState {
             computers: Vec::new(),
             coworker_computer: None,
             coworker_screen: None,
+            computer_update_armed: None,
+            computer_reset_armed: None,
+            computer_action_error: None,
+            computer_heal_requested: None,
             computer_endpoint_missing: false,
             computer_poll: None,
         };
@@ -1004,6 +1019,9 @@ impl AppState {
     fn set_right_pane(&mut self, pane: RightPane, cx: &mut Context<Self>) {
         let computer = pane == RightPane::Computer;
         self.right_pane = pane;
+        self.computer_update_armed = None;
+        self.computer_reset_armed = None;
+        self.computer_action_error = None;
         if computer {
             self.refresh_coworker_computer(cx);
             self.start_computer_poll(cx);
@@ -1107,9 +1125,20 @@ impl AppState {
                 }
                 match result {
                     Ok(status) => {
+                        // A bot with no computer gets one: ask once per visit, and let the
+                        // next poll pick up the answer. A recorded error is the server saying
+                        // it cannot, so that is left alone.
+                        let absent = status.state == "absent" && !status.updating();
                         if state.coworker_computer.as_ref() != Some(&status) {
                             state.coworker_computer = Some(status);
                             cx.notify();
+                        }
+                        if absent
+                            && state.computer_heal_requested.as_deref()
+                                != Some(coworker_id.as_str())
+                        {
+                            state.computer_heal_requested = Some(coworker_id.clone());
+                            state.ensure_coworker_computer(cx);
                         }
                     }
                     Err(error) if error.status == Some(404) => {
@@ -1174,6 +1203,153 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// Ask the server to (re)provision the active coworker's computer, and take the answer as
+    /// the current status.
+    pub fn ensure_coworker_computer(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client.ensure_coworker_computer(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(status) => {
+                        state.coworker_computer = Some(status);
+                        cx.notify();
+                    }
+                    Err(error) => eprintln!(
+                        "NativeChat computer: could not provision the computer of {coworker_id}: {}",
+                        error.message
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// How long the second click has to arrive.
+    const CONFIRM_WINDOW: Duration = Duration::from_secs(6);
+
+    fn armed(slot: &Option<(String, std::time::Instant)>, coworker_id: &str) -> bool {
+        slot.as_ref()
+            .is_some_and(|(id, at)| id == coworker_id && at.elapsed() < Self::CONFIRM_WINDOW)
+    }
+
+    pub fn computer_update_is_armed(&self) -> bool {
+        self.active_coworker_id
+            .as_deref()
+            .is_some_and(|id| Self::armed(&self.computer_update_armed, id))
+    }
+
+    pub fn computer_reset_is_armed(&self) -> bool {
+        self.active_coworker_id
+            .as_deref()
+            .is_some_and(|id| Self::armed(&self.computer_reset_armed, id))
+    }
+
+    /// First click arms ("Click again to confirm"); the second, within the window, updates.
+    pub fn arm_computer_update(&mut self, cx: &mut Context<Self>) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.computer_action_error = None;
+        if Self::armed(&self.computer_update_armed, &coworker_id) {
+            self.computer_update_armed = None;
+            self.start_computer_update(cx);
+        } else {
+            self.computer_update_armed = Some((coworker_id, std::time::Instant::now()));
+            self.computer_reset_armed = None;
+        }
+        cx.notify();
+    }
+
+    /// First click arms; the second, within the window, resets (data and all).
+    pub fn arm_computer_reset(&mut self, cx: &mut Context<Self>) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.computer_action_error = None;
+        if Self::armed(&self.computer_reset_armed, &coworker_id) {
+            self.computer_reset_armed = None;
+            self.start_computer_reset(cx);
+        } else {
+            self.computer_reset_armed = Some((coworker_id, std::time::Instant::now()));
+            self.computer_update_armed = None;
+        }
+        cx.notify();
+    }
+
+    fn start_computer_update(&mut self, cx: &mut Context<Self>) {
+        self.computer_action(cx, |client, id| {
+            Box::pin(async move { client.update_coworker_computer(&id).await })
+        });
+    }
+
+    fn start_computer_reset(&mut self, cx: &mut Context<Self>) {
+        self.computer_action(cx, |client, id| {
+            Box::pin(async move { client.reset_coworker_computer(&id).await })
+        });
+    }
+
+    /// Run one computer action for the active coworker and take its answer as the status; a
+    /// refusal is shown under the buttons. The poll carries the phases after that.
+    fn computer_action(
+        &mut self,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(
+            OpenGrokClient,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<CoworkerComputer, OpenGrokError>> + Send>,
+        > + 'static,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        let future = action(client, coworker_id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let _ = this.update(cx, |state, cx| {
+                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(status) => {
+                        state.coworker_computer = Some(status);
+                        state.coworker_screen = None;
+                    }
+                    Err(error) => state.computer_action_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The banner over the app while the active coworker's computer is being updated: the
+    /// title and what is happening now. `None` when nothing is.
+    pub fn computer_banner(&self) -> Option<(String, String)> {
+        let update = self.coworker_computer.as_ref()?.update.as_ref()?;
+        let name = self.active_bot_name();
+        if update.in_flight() {
+            Some((format!("Updating {name}'s computer"), update.detail()))
+        } else {
+            Some((
+                format!("Could not update {name}'s computer"),
+                update.detail(),
+            ))
+        }
     }
 
     pub fn open_coworker_screen(&mut self, cx: &mut Context<Self>) {
@@ -1844,6 +2020,9 @@ impl AppState {
         // The previous bot's screen must not show under this bot's name.
         self.coworker_computer = None;
         self.coworker_screen = None;
+        self.computer_update_armed = None;
+        self.computer_reset_armed = None;
+        self.computer_action_error = None;
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(
                 0,
