@@ -1,9 +1,7 @@
-mod items;
 mod sources;
 #[macro_use]
 mod sync_macros;
 
-pub use items::{render_flyout_item, render_popover_item};
 pub use sources::{AppCommand, ComposerPick, TokenKind};
 
 use crate::actions::{Library, NewChat, OpenSettings, Projects, ToggleTheme};
@@ -73,7 +71,7 @@ pub struct MessageInput {
     audio_input: Option<AudioInput>,
     state: Entity<AppState>,
     // Cached state to avoid re-rendering on every AppState change
-    selected_apps: Vec<String>,
+    picked_tools: Vec<crate::state::PickedTool>,
     is_voice_mode_open: bool,
     is_app_settings_open: bool,
     submit_chord: SubmitChord,
@@ -112,7 +110,7 @@ impl MessageInput {
 
         // Cache initial values from AppState
         let app_state = state.read(cx);
-        let selected_apps = app_state.selected_apps.clone();
+        let picked_tools = app_state.picked_tools.clone();
         let is_voice_mode_open = app_state.is_voice_mode_open;
         let is_app_settings_open = app_state.is_app_settings_open;
         let submit_chord = app_state.submit_chord;
@@ -122,7 +120,7 @@ impl MessageInput {
         let this = Self {
             state: state.clone(),
             input_state: input_state.clone(),
-            selected_apps,
+            picked_tools,
             is_voice_mode_open,
             is_app_settings_open,
             submit_chord,
@@ -147,7 +145,7 @@ impl MessageInput {
             let mut changed = false;
             {
                 let state = state.read(cx);
-                sync_field_clone!(this, state, selected_apps, changed);
+                sync_field_clone!(this, state, picked_tools, changed);
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_app_settings_open, changed);
                 sync_field_clone!(this, state, reply_to, changed);
@@ -451,7 +449,17 @@ impl MessageInput {
         match pick {
             ComposerPick::AttachFiles => self.attach_files(cx),
             ComposerPick::TeachTask => self.teach_task(cx),
-            ComposerPick::Token { kind, id, text } => self.insert_token(kind, id, text, window, cx),
+            // A tool is a chip beside the "+", not text in the message: naming a tool says
+            // something ABOUT the message, and the message should not have to carry it. A skill
+            // is the opposite — it reads as part of the sentence, so it goes in at the caret.
+            ComposerPick::Token { kind, id, text } => match kind {
+                TokenKind::Tool => {
+                    let label = text.trim_start_matches('@').to_string();
+                    self.state
+                        .update(cx, |state, cx| state.pick_tool(id, label, cx));
+                }
+                TokenKind::Skill => self.insert_token(kind, id, text, window, cx),
+            },
             ComposerPick::Command(command) => self.run_command(command, window, cx),
             ComposerPick::Nothing => {}
         }
@@ -813,13 +821,13 @@ impl Render for MessageInput {
         let foreground = theme.foreground;
         let background = theme.background;
         let border = theme.border;
-        let selected_apps = self.selected_apps.clone();
+        let picked_tools = self.picked_tools.clone();
 
         // Check if any modal is open using cached state
         let any_modal_open = self.is_voice_mode_open || self.is_app_settings_open;
         let draft = self.input_state.read(cx).value();
         let compact = !self.voice_mode
-            && self.selected_apps.is_empty()
+            && self.picked_tools.is_empty()
             && self.attachments.is_empty()
             && self.notice.is_none()
             && !draft.contains('\n');
@@ -1015,16 +1023,17 @@ impl Render for MessageInput {
                                         div().into_any_element() // Placeholder or remove entirely if not needed
                                     )
                                     .chain({
-                                        let (tool_calls, rest): (Vec<_>, Vec<_>) = selected_apps.iter()
+                                        // Grouped by what each chip IS, which the pick recorded.
+                                        // Matching names against a hardcoded list only worked
+                                        // while the names came from one hardcoded menu.
+                                        use crate::state::PickedKind;
+                                        let (tool_calls, mini_apps): (Vec<_>, Vec<_>) = picked_tools
+                                            .iter()
                                             .cloned()
-                                            .partition(|app| matches!(app.as_str(), "Web search" | "Deep Research" | "Image Generation" | "Photos" | "Thinking"));
-
-                                        let (skills, mini_apps): (Vec<_>, Vec<_>) = rest.into_iter()
-                                            .partition(|app| matches!(app.as_str(), "Study" | "Canvas"));
+                                            .partition(|picked| picked.kind == PickedKind::Tool);
 
                                         let groups = vec![
                                             ("Tools", tool_calls, "icons/wrench.svg"),
-                                            ("Skills", skills, "icons/wizard_hat.svg"),
                                             ("Apps", mini_apps, "icons/plugins.svg"),
                                         ];
 
@@ -1076,8 +1085,9 @@ impl Render for MessageInput {
                                                                 .gap_1()
                                                                 .children(
                                                                     apps_clone.iter().enumerate().map(|(i, app)| {
-                                                                        let app_name = app.clone();
-                                                                        let icon = tool_icon(&app_name);
+                                                                        let app_id = app.id.clone();
+                                                                        let app_label = app.label.clone();
+                                                                        let icon = tool_icon(&app_label);
 
                                                                         h_flex()
                                                                             .gap_2()
@@ -1092,7 +1102,7 @@ impl Render for MessageInput {
                                                                                 let state_model = state_model.clone();
                                                                                 move |_event, _window, cx| {
                                                                                     state_model.update(cx, |state, cx| {
-                                                                                        state.remove_app(app_name.clone(), cx);
+                                                                                        state.unpick_tool(&app_id, cx);
                                                                                     });
                                                                                 }
                                                                             })
@@ -1103,7 +1113,7 @@ impl Render for MessageInput {
                                                                             )
                                                                             .child(
                                                                                 div()
-                                                                                    .child(app.clone())
+                                                                                    .child(app_label.clone())
                                                                                     .text_size(px(12.0))
                                                                             )
                                                                             .child(
@@ -1123,7 +1133,8 @@ impl Render for MessageInput {
                                                 // Render individual tags
                                                 let state_model = state_model.clone();
                                                 Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
-                                                        let app_name = app.clone();
+                                                        let app_id = app.id.clone();
+                                                        let app_name = app.label.clone();
                                                         let icon = tool_icon(&app_name);
 
                                                         div()
@@ -1152,7 +1163,7 @@ impl Render for MessageInput {
                                                                         let state_model = state_model.clone();
                                                                         move |_event, _window, cx| {
                                                                             state_model.update(cx, |state, cx| {
-                                                                                state.remove_app(app_name.clone(), cx);
+                                                                                state.unpick_tool(&app_id, cx);
                                                                             });
                                                                         }
                                                                     })
