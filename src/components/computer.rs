@@ -12,9 +12,7 @@ use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Icon, Selectable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -776,7 +774,14 @@ fn screen_tile(
         })
         // The screen itself when we have it; a monitor glyph until then.
         .map(|this| match screen {
-            Some(image) => this.child(img(image).size_full().object_fit(ObjectFit::Cover)),
+            // The image carries its own rounding: the tile's overflow clip does not round a
+            // painted picture, so a loaded screen showed square corners next to the empty tile.
+            Some(image) => this.child(
+                img(image)
+                    .size_full()
+                    .rounded(px(12.))
+                    .object_fit(ObjectFit::Cover),
+            ),
             None => this.child(
                 div()
                     .absolute()
