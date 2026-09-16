@@ -852,6 +852,7 @@ fn pane_header(
 ) -> impl IntoElement {
     // Update and Reset live up here as icons, apart from the close chevron, each behind a
     // confirm dialog — the pane's body is for the screen, not for buttons.
+    let actions_app = app.clone();
     let actions = actions.map(|controls| {
         (
             !controls.update_disabled(),
@@ -885,19 +886,14 @@ fn pane_header(
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
-                }),
-        )
-        .child(
-            h_flex()
-                .items_center()
-                .gap(px(2.))
+                })
                 .when_some(actions, |this, (can_update, can_reset, stale)| {
-                    let update_app = app.clone();
-                    let reset_app = app.clone();
+                    let update_app = actions_app.clone();
+                    let reset_app = actions_app.clone();
                     this.child(
                         icon_btn_enabled(
                             "computer-update",
-                            "icons/refresh.svg",
+                            "icons/download.svg",
                             can_update,
                             move |cx| {
                                 update_app.update(cx, |state, cx| {
@@ -920,23 +916,15 @@ fn pane_header(
                             });
                         },
                     ))
-                    // The spacer: a hairline between the computer's own actions and the pane's.
-                    .child(
-                        div()
-                            .w(px(1.))
-                            .h(px(16.))
-                            .mx(px(6.))
-                            .bg(rgb(0x777777).opacity(0.35)),
-                    )
-                })
-                .child(icon_btn(
-                    "computer-close",
-                    "icons/chevrons-right.svg",
-                    move |cx| {
-                        app.update(cx, |state, cx| state.close_right_pane(cx));
-                    },
-                )),
+                }),
         )
+        .child(icon_btn(
+            "computer-close",
+            "icons/chevrons-right.svg",
+            move |cx| {
+                app.update(cx, |state, cx| state.close_right_pane(cx));
+            },
+        ))
 }
 
 /// `icon_btn` that can be greyed out: no hover, no click, until there is something to do.
