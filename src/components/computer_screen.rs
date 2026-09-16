@@ -54,6 +54,26 @@ const TEACH_SCRIPT: &str = r#"
   on('wheel',     (e, at) => { const p = scale(e); if (p) post({kind: 'wheel', dx: Math.round(e.deltaX), dy: Math.round(e.deltaY), at, ...p}); });
   on('keydown',   (e, at) => post({kind: 'keydown', key: e.key, code: e.code, at}));
   on('keyup',     (e, at) => post({kind: 'keyup', key: e.key, code: e.code, at}));
+
+  // Modifiers the page has sent DOWN to the box must go UP before the page loses the keyboard:
+  // a ⌘W or ⌘Q closes this window with Meta still held in the box's X server, and every
+  // letter after that is a shortcut there (Alt+F opens Chromium's menu, Super+E the files).
+  // noVNC sends a key-up for each key it holds when it sees the matching keyup event.
+  const releaseModifiers = () => {
+    const c = canvas();
+    if (!c) return;
+    for (const [key, code] of [
+      ['Meta', 'MetaLeft'], ['Meta', 'MetaRight'],
+      ['Alt', 'AltLeft'], ['Alt', 'AltRight'],
+      ['Control', 'ControlLeft'], ['Control', 'ControlRight'],
+      ['Shift', 'ShiftLeft'], ['Shift', 'ShiftRight'],
+    ]) {
+      c.dispatchEvent(new KeyboardEvent('keyup', { key, code, bubbles: true, cancelable: true }));
+    }
+  };
+  window.__ncRelease = releaseModifiers;
+  window.addEventListener('blur', releaseModifiers);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseModifiers(); });
 })();
 "#;
 
@@ -110,6 +130,14 @@ impl ComputerScreen {
             tape,
             teaching: None,
             last_saved: None,
+        }
+    }
+
+    /// Let go of every modifier the page holds in the box before this window stops receiving
+    /// keys — the keyup for the ⌘ that closed or hid the window would otherwise never arrive.
+    fn release_keys(&self) {
+        if let Ok(webview) = &self.webview {
+            let _ = webview.evaluate_script("window.__ncRelease && window.__ncRelease();");
         }
     }
 
@@ -268,11 +296,24 @@ impl Render for ComputerScreen {
             .track_focus(&self.focus)
             .key_context("ComputerScreen")
             .size_full()
-            // This window's keys: close or quit close only this window; the app stays.
-            .on_action(|_: &Quit, window: &mut Window, _cx: &mut App| window.remove_window())
-            .on_action(|_: &CloseWindow, window: &mut Window, _cx: &mut App| window.remove_window())
-            .on_action(|_: &Minimize, window: &mut Window, _cx: &mut App| window.minimize_window())
-            .on_action(|_: &Hide, _window: &mut Window, cx: &mut App| cx.hide())
+            // This window's keys: close or quit close only this window; the app stays. Each
+            // first lets go of the modifiers the page holds in the box (see `release_keys`).
+            .on_action(cx.listener(|this, _: &Quit, window, _cx| {
+                this.release_keys();
+                window.remove_window();
+            }))
+            .on_action(cx.listener(|this, _: &CloseWindow, window, _cx| {
+                this.release_keys();
+                window.remove_window();
+            }))
+            .on_action(cx.listener(|this, _: &Minimize, window, _cx| {
+                this.release_keys();
+                window.minimize_window();
+            }))
+            .on_action(cx.listener(|this, _: &Hide, _window, cx| {
+                this.release_keys();
+                cx.hide();
+            }))
             .child(header)
             .child(body)
     }
