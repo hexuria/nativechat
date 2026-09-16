@@ -11,8 +11,8 @@ use std::rc::Rc;
 use crate::chrome::HEADER_PX;
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    RecipeDetail, RecipeRelation, RecipeScreen, RecipeShareTarget, RecipeStep, RecipeSummary,
-    RecipeTapeEvent, RecipeVersion,
+    RecipeDetail, RecipeRelation, RecipeRun, RecipeScreen, RecipeShareTarget, RecipeStep,
+    RecipeSummary, RecipeTapeEvent, RecipeVersion,
 };
 use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -23,7 +23,7 @@ use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 type Theme = gpui_kit::component::Theme;
 
@@ -49,6 +49,16 @@ const EVENT_TIME_W: f32 = 72.;
 const SCREENSHOT_WIDTH: f32 = 520.;
 /// The bots picker's panel: wide enough for a bot's name beside its box.
 const BOTS_MENU_W: f32 = 240.;
+/// The history modal: wide enough for a run's line and the screen it kept.
+const HISTORY_MODAL_W: f32 = 560.;
+/// The history's list of runs, so the modal is the same height whichever tab is on.
+const HISTORY_RUNS_HEIGHT: f32 = 300.;
+/// How many runs of one version the history shows. The server prunes a version to this many
+/// as each run lands, so it is also how many there are.
+const RUNS_PER_VERSION: usize = 5;
+/// The column kept for what a run or a step left behind — screenshots, a recording. It is
+/// empty until the server asks the box for artifacts, keeps them and serves them.
+const ARTIFACTS_W: f32 = 28.;
 
 /// What a step does, apart from what it does it to: what Add step offers, and what decides
 /// whether a row's editor is the field in its Details cell or the modal.
@@ -237,6 +247,13 @@ pub struct RecipesView {
     draft_error: Option<String>,
     /// The bot Run plays on; the first granted one until the person picks.
     run_bot: Option<String>,
+    /// The history modal is open over the page.
+    history_open: bool,
+    /// The version whose runs the history is showing; None until someone picks a tab, so an
+    /// opened history stands on the version a run plays.
+    history_version: Option<u32>,
+    /// The run whose receipt is open under its row.
+    history_run: Option<String>,
 }
 
 /// The most parameters any step has: a drag's two corners.
@@ -286,6 +303,9 @@ impl RecipesView {
             step_fields,
             draft_error: None,
             run_bot: None,
+            history_open: false,
+            history_version: None,
+            history_run: None,
         }
     }
 
@@ -313,6 +333,9 @@ impl RecipesView {
         self.step_modal = None;
         self.draft_error = None;
         self.run_bot = None;
+        self.history_open = false;
+        self.history_version = None;
+        self.history_run = None;
         self.name_input.update(cx, |input, cx| {
             input.set_value(name, window, cx);
         });
@@ -329,6 +352,37 @@ impl RecipesView {
 
     fn select_version(&mut self, version: u32, cx: &mut Context<Self>) {
         self.selected_version = Some(version);
+        cx.notify();
+    }
+
+    /// Open the history over the page, on the version a run plays and with no run expanded.
+    fn open_history(&mut self, cx: &mut Context<Self>) {
+        self.history_open = true;
+        self.history_version = None;
+        self.history_run = None;
+        cx.notify();
+    }
+
+    fn close_history(&mut self, cx: &mut Context<Self>) {
+        self.history_open = false;
+        self.history_run = None;
+        cx.notify();
+    }
+
+    fn select_history_version(&mut self, version: u32, cx: &mut Context<Self>) {
+        self.history_version = Some(version);
+        // A run of another version is not on screen any more, so nothing is expanded.
+        self.history_run = None;
+        cx.notify();
+    }
+
+    /// A row opens its receipt under itself, and closes it when it is the open one.
+    fn toggle_history_run(&mut self, id: String, cx: &mut Context<Self>) {
+        self.history_run = if self.history_run.as_deref() == Some(id.as_str()) {
+            None
+        } else {
+            Some(id)
+        };
         cx.notify();
     }
 
@@ -363,6 +417,8 @@ impl RecipesView {
         self.draft = Some(steps);
         self.editing_step = None;
         self.step_modal = None;
+        // Only one thing stands over the page at a time.
+        self.history_open = false;
         self.draft_error = None;
         self.note_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
@@ -642,6 +698,12 @@ impl Render for RecipesView {
             .when_some(self.step_modal, |this, modal| {
                 this.child(self.step_modal_overlay(modal, &view, &theme, cx))
             })
+            .when_some(
+                self.history_open
+                    .then(|| self.state.read(cx).recipe_open.clone())
+                    .flatten(),
+                |this, detail| this.child(self.history_overlay(&detail, &view, &theme)),
+            )
     }
 }
 
@@ -810,7 +872,6 @@ impl RecipesView {
         if mine {
             sections.push(self.share_section(detail, waiting, app, theme));
         }
-        sections.push(history_section(detail, theme));
         sections
     }
 
@@ -1136,12 +1197,23 @@ impl RecipesView {
                         this.child(div().text_xs().text_color(muted).child(plays))
                     }),
             )
-            .when(mine, |this| {
-                this.child(
-                    h_flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        Button::new("recipe-history")
+                            .small()
+                            .label("History")
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.open_history(cx));
+                                }
+                            }),
+                    )
+                    .when(mine, |this| {
+                        this.child(
                             Button::new("recipe-edit-steps")
                                 .small()
                                 .label("Edit steps")
@@ -1167,9 +1239,9 @@ impl RecipesView {
                                         });
                                     }
                                 }),
-                        ),
-                )
-            })
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1333,6 +1405,9 @@ impl RecipesView {
                 })
                 .child(details),
         )
+        // What this step left behind — its screenshots — will hang here; empty until the
+        // server keeps them.
+        .child(div().w(px(ARTIFACTS_W)).flex_shrink_0())
         .when(editing, |this| {
             this.child(
                 Button::new(SharedString::from(format!("recipe-step-up-{index}")))
@@ -1587,6 +1662,355 @@ impl RecipesView {
             )
             .into_any_element()
     }
+
+    /// The history: every version a tab, and under the chosen one the runs of that version,
+    /// newest first. The server keeps five runs per version and prunes the rest as each run
+    /// lands, so five is all there ever is to show.
+    fn history_overlay(
+        &self,
+        detail: &RecipeDetail,
+        view: &Entity<Self>,
+        theme: &Theme,
+    ) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let mut versions: Vec<u32> = detail
+            .versions
+            .iter()
+            .map(|version| version.version)
+            .collect();
+        versions.sort_unstable();
+        let shown = shown_version(detail, self.history_version).map(|version| version.version);
+        let runs = shown
+            .map(|version| runs_of(detail, version))
+            .unwrap_or_default();
+        div()
+            .id("recipe-history-modal")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.32))
+            .on_mouse_down(MouseButton::Left, {
+                let view = view.clone();
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| this.close_history(cx));
+                }
+            })
+            .child(
+                v_flex()
+                    .id("recipe-history-card")
+                    .w(px(HISTORY_MODAL_W))
+                    .bg(theme.popover)
+                    .text_color(theme.foreground)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(14.))
+                    .shadow_lg()
+                    .px(px(20.))
+                    .py(px(18.))
+                    .gap(px(10.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("History"),
+                    )
+                    .child(
+                        h_flex()
+                            .id("recipe-history-versions")
+                            .w_full()
+                            .flex_wrap()
+                            .items_end()
+                            .gap(px(2.))
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .when(versions.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .py(px(8.))
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("No versions yet."),
+                                )
+                            })
+                            .children(versions.into_iter().map(|number| {
+                                history_tab(number, shown == Some(number), view, muted, theme)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("recipe-history-runs")
+                            .w_full()
+                            .h(px(HISTORY_RUNS_HEIGHT))
+                            .overflow_y_scroll()
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .when(runs.is_empty(), |this| {
+                                        this.child(
+                                            div()
+                                                .py(px(10.))
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child("No runs of this version yet."),
+                                        )
+                                    })
+                                    .children(runs.into_iter().map(|run| {
+                                        history_run_row(
+                                            run,
+                                            detail,
+                                            self.history_run.as_deref() == Some(run.id.as_str()),
+                                            view,
+                                            muted,
+                                            theme,
+                                        )
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap(px(8.))
+                            .pt(px(6.))
+                            .child(
+                                Button::new("recipe-history-close")
+                                    .label("Close")
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| this.close_history(cx));
+                                        }
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+/// The runs of one version, newest first and no more than the five the server keeps. It prunes
+/// a version to that many as each run lands, so this is a floor under a server that has not.
+fn runs_of(detail: &RecipeDetail, version: u32) -> Vec<&RecipeRun> {
+    let mut runs: Vec<&RecipeRun> = detail
+        .runs
+        .iter()
+        .filter(|run| run.version == version)
+        .collect();
+    runs.sort_by_key(|run| std::cmp::Reverse(run.at_ms));
+    runs.truncate(RUNS_PER_VERSION);
+    runs
+}
+
+/// One tab of the history: the version number, with the chosen one underlined.
+fn history_tab(
+    number: u32,
+    selected: bool,
+    view: &Entity<RecipesView>,
+    muted: Hsla,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .id(SharedString::from(format!(
+            "recipe-history-version-{number}"
+        )))
+        .px(px(10.))
+        .py(px(7.))
+        .rounded_t(px(8.))
+        .border_b_2()
+        .border_color(if selected {
+            theme.primary
+        } else {
+            theme.transparent
+        })
+        .text_sm()
+        .when(!selected, |this| this.text_color(muted))
+        .when(selected, |this| this.font_weight(FontWeight::SEMIBOLD))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.1)))
+        .on_click({
+            let view = view.clone();
+            move |_, _, cx| {
+                view.update(cx, |this, cx| this.select_history_version(number, cx));
+            }
+        })
+        .child(format!("v{number}"))
+        .into_any_element()
+}
+
+/// One run: when it ran, which bot, and what it came to — and under it, when it is the open
+/// one, what the box said of every step.
+fn history_run_row(
+    run: &RecipeRun,
+    detail: &RecipeDetail,
+    open: bool,
+    view: &Entity<RecipesView>,
+    muted: Hsla,
+    theme: &Theme,
+) -> AnyElement {
+    let outcome = if run.ok {
+        "ok".to_string()
+    } else {
+        match run.stopped_at {
+            Some(step) => format!("stopped at step {step}"),
+            None => "stopped".to_string(),
+        }
+    };
+    let error = run.error();
+    let id = run.id.clone();
+    v_flex()
+        .id(SharedString::from(format!("recipe-history-run-{id}")))
+        .w_full()
+        .gap(px(4.))
+        .px(px(10.))
+        .py(px(8.))
+        .border_b_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.1)))
+        .on_click({
+            let view = view.clone();
+            move |_, _, cx| {
+                view.update(cx, |this, cx| this.toggle_history_run(id.clone(), cx));
+            }
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(14.))
+                    .text_color(muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .truncate()
+                        .text_color(if run.ok {
+                            theme.foreground
+                        } else {
+                            theme.danger
+                        })
+                        .child(format!(
+                            "{} · {} · {outcome}",
+                            format_time(run.at_ms),
+                            detail.bot_name(&run.coworker_id)
+                        )),
+                )
+                // The artifacts a run left behind — its screen recording — go here, once the
+                // server keeps them and serves them.
+                .child(div().w(px(ARTIFACTS_W)).flex_shrink_0()),
+        )
+        .when_some(error.clone().filter(|_| !open), |this, error| {
+            this.child(
+                div()
+                    .pl(px(22.))
+                    .text_xs()
+                    .text_color(theme.danger)
+                    .truncate()
+                    .child(error),
+            )
+        })
+        .when(open, |this| {
+            this.child(history_receipt(run, error, muted, theme))
+        })
+        .into_any_element()
+}
+
+/// A run's receipt, under its row: every step as the box reported it, why it stopped, and the
+/// screen it left behind if the run kept one.
+fn history_receipt(
+    run: &RecipeRun,
+    error: Option<String>,
+    muted: Hsla,
+    theme: &Theme,
+) -> AnyElement {
+    let steps = run.receipt_steps();
+    v_flex()
+        .w_full()
+        .gap(px(4.))
+        .pl(px(22.))
+        .pt(px(4.))
+        .when(steps.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("This run kept no step-by-step receipt."),
+            )
+        })
+        .children(steps.iter().enumerate().map(|(index, (ok, step_error))| {
+            let said = match (ok, step_error) {
+                (true, _) => "ok".to_string(),
+                (false, Some(error)) => format!("stopped: {error}"),
+                (false, None) => "stopped".to_string(),
+            };
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .w(px(STEP_NUMBER_W))
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{}", index + 1)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .truncate()
+                        .text_color(if *ok { muted } else { theme.danger })
+                        .child(said),
+                )
+        }))
+        .when_some(error, |this, error| {
+            this.child(div().text_xs().text_color(theme.danger).child(error))
+        })
+        .when_some(
+            receipt_image(&run.receipt),
+            |this, (image, width, height)| {
+                let shown_width = SCREENSHOT_WIDTH.min(HISTORY_MODAL_W - 80.);
+                let shown_height = shown_width * height.max(1) as f32 / width.max(1) as f32;
+                this.child(
+                    img(image)
+                        .w(px(shown_width))
+                        .h(px(shown_height))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(theme.border),
+                )
+            },
+        )
+        .into_any_element()
+}
+
+/// The screen a receipt kept, when it kept one. The server strips the picture off a run on its
+/// way to the store, so this is only ever a receipt that came another way; the box spells the
+/// bytes `png_base64` where the run route renames them `base64`, and both are read here.
+fn receipt_image(receipt: &Value) -> Option<(std::sync::Arc<gpui_kit::Image>, u32, u32)> {
+    let shot = receipt.get("screenshot")?;
+    let frame = json!({
+        "mime": shot.get("mime").cloned().unwrap_or_else(|| Value::from("image/png")),
+        "base64": shot.get("base64").or_else(|| shot.get("png_base64")),
+        "width": shot.get("width"),
+        "height": shot.get("height"),
+    });
+    crate::opengrok::ScreenshotSpec::from_frame("recipe-history", "", &frame)
+        .map(|spec| (spec.image, spec.width, spec.height))
 }
 
 /// The version the page shows: the one the tabs picked, else the newest that can be run, else
@@ -1734,6 +2158,9 @@ fn steps_head(muted: Hsla, theme: &Theme) -> AnyElement {
                 .text_color(muted)
                 .child("Details"),
         )
+        // The column the step's screenshots will hang in, kept empty and unlabelled until the
+        // server has them to give.
+        .child(div().w(px(ARTIFACTS_W)).flex_shrink_0())
         .into_any_element()
 }
 
@@ -2328,43 +2755,6 @@ fn last_run_section(run: &RecipeRunOutcome, detail: &RecipeDetail, theme: &Theme
         .into_any_element()
 }
 
-/// Every run so far, newest first.
-fn history_section(detail: &RecipeDetail, theme: &Theme) -> AnyElement {
-    let muted = theme.muted_foreground;
-    card(theme)
-        .child(section_title("History"))
-        .when(detail.runs.is_empty(), |this| {
-            this.child(div().text_xs().text_color(muted).child("No runs yet."))
-        })
-        .children(detail.runs.iter().enumerate().map(|(index, run)| {
-            let outcome = if run.ok {
-                "ok".to_string()
-            } else {
-                match run.stopped_at {
-                    Some(step) => format!("stopped at step {step}"),
-                    None => "stopped".to_string(),
-                }
-            };
-            h_flex()
-                .id(SharedString::from(format!("recipe-run-{index}")))
-                .w_full()
-                .items_center()
-                .gap(px(8.))
-                .child(div().flex_1().min_w_0().text_sm().truncate().child(format!(
-                    "v{} · {} · {outcome}",
-                    run.version,
-                    detail.bot_name(&run.coworker_id)
-                )))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format_time(run.at_ms)),
-                )
-        }))
-        .into_any_element()
-}
-
 /// One row of the list: the name, the description, whose it is, how many versions it has and
 /// what its last run came to — and Accept and Decline when it is a share waiting on the
 /// person. The whole row opens the recipe.
@@ -2812,8 +3202,8 @@ mod tests {
     // the one the test harness wants.
     use super::{
         RecipeDetail, RecipeScreen, RecipeStep, RecipeTapeEvent, RecipeVersion, StepKind,
-        build_step, event_offset, granted_summary, shown_version, step_param_values, step_words,
-        tape_words, version_kind,
+        build_step, event_offset, granted_summary, runs_of, shown_version, step_param_values,
+        step_words, tape_words, version_kind,
     };
     use serde_json::{Value, json};
 
@@ -3032,6 +3422,33 @@ mod tests {
 
     fn values(typed: &[&str]) -> Vec<String> {
         typed.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn a_history_tab_holds_the_newest_five_runs_of_its_version() {
+        let run = |version: u32, at_ms: i64| json!({"id": format!("rrun_{version}_{at_ms}"), "version": version, "atMs": at_ms});
+        let detail: RecipeDetail = serde_json::from_value(json!({
+            "recipe": {"id": "rcp_1"},
+            "versions": [{"version": 1, "kind": "raw"}, {"version": 2, "kind": "filtered"}],
+            "runs": [
+                run(2, 10), run(2, 60), run(2, 20), run(2, 50), run(2, 30), run(2, 40),
+                run(1, 5),
+            ],
+        }))
+        .unwrap();
+        let at = |version| {
+            runs_of(&detail, version)
+                .into_iter()
+                .map(|run| run.at_ms)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            at(2),
+            vec![60, 50, 40, 30, 20],
+            "newest first, five at most"
+        );
+        assert_eq!(at(1), vec![5], "a tab holds only its own version's runs");
+        assert!(runs_of(&detail, 3).is_empty());
     }
 
     #[test]

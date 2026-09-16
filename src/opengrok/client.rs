@@ -1438,9 +1438,12 @@ pub struct RecipeGrant {
 }
 
 /// One past run of the recipe (newest first).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecipeRun {
+    /// The run's own id, `rrun_…`, which is what the history names its rows by.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub id: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub recipe_id: String,
     #[serde(default)]
@@ -1452,8 +1455,51 @@ pub struct RecipeRun {
     /// The step the run stopped at, when it did not finish.
     #[serde(default)]
     pub stopped_at: Option<u64>,
+    /// What the box said the run came to, step by step: `{ok, ran, stopped_at, steps}`. The
+    /// server keeps it without its picture, so a stored run is what happened, not a gallery.
+    #[serde(default)]
+    pub receipt: Value,
     #[serde(default)]
     pub at_ms: i64,
+}
+
+impl RecipeRun {
+    /// Every step of the run as the box reported it: whether it did what it was asked, and
+    /// what went wrong where it did not.
+    pub fn receipt_steps(&self) -> Vec<(bool, Option<String>)> {
+        self.receipt
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|step| {
+                        let ok = step.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        let error = step
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .filter(|error| !error.trim().is_empty());
+                        (ok, error)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Why the run stopped, in the box's own words.
+    pub fn error(&self) -> Option<String> {
+        self.receipt_steps()
+            .into_iter()
+            .find_map(|(_, error)| error)
+            .or_else(|| {
+                self.receipt
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|error| !error.trim().is_empty())
+    }
 }
 
 /// One of the person's own bots, as the detail lists them for grants and runs.
@@ -2143,7 +2189,8 @@ mod tests {
             // snake_case fixture here let every grant, share and run bind to nothing at all.
             "shares": [{"recipeId": "rcp_1", "scope": "org", "scopeId": "org_1", "grantedBy": "acc_1", "grantedAtMs": 3, "acceptedAtMs": null, "declinedAtMs": null}],
             "grants": [{"recipeId": "rcp_1", "coworkerId": "cw_1", "grantedBy": "acc_1", "grantedAtMs": 4}],
-            "runs": [{"id": 9, "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1", "runId": "run_1", "ok": false, "stoppedAt": 1, "receipt": {}, "atMs": 5}],
+            "runs": [{"id": "rrun_1", "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1", "runId": "run_1", "ok": false, "stoppedAt": 1,
+                      "receipt": {"ok": false, "ran": 1, "stopped_at": 1, "steps": [{"ok": true}, {"ok": false, "error": "nothing at (5, 5)"}]}, "atMs": 5}],
             "myBots": [{"id": "cw_1", "name": "Bob"}]
         }))
         .unwrap();
@@ -2159,6 +2206,19 @@ mod tests {
         assert_eq!(detail.runs[0].stopped_at, Some(1));
         assert_eq!(detail.runs[0].coworker_id, "cw_1");
         assert_eq!(detail.runs[0].at_ms, 5);
+        assert_eq!(
+            detail.runs[0].id, "rrun_1",
+            "the history names a row by this"
+        );
+        assert_eq!(
+            detail.runs[0].receipt_steps(),
+            vec![(true, None), (false, Some("nothing at (5, 5)".to_string()))]
+        );
+        assert_eq!(
+            detail.runs[0].error().as_deref(),
+            Some("nothing at (5, 5)"),
+            "a run's reason is the first step that gave one"
+        );
         assert_eq!(detail.shares[0].scope_id, "org_1");
         assert!(
             detail.versions[0].tape_events().is_none(),
