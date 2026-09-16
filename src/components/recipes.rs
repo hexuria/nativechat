@@ -1768,9 +1768,11 @@ fn page_header(
 ) -> impl IntoElement {
     h_flex()
         .id("recipes-header")
-        .w_full()
+        // Sized by what is left, not by the whole span: `w_full` here took the title bar's
+        // chat span entire and pushed whatever followed it over the right pane's header.
+        .flex_1()
+        .min_w_0()
         .h_full()
-        .flex_shrink_0()
         .items_center()
         .justify_between()
         .gap(px(12.))
