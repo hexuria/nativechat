@@ -103,12 +103,20 @@ impl Layout {
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
         let computer = cx.new(|cx| ComputerPane::new(window, state.clone(), cx));
-        let title_bar =
-            cx.new(|cx| TitleBar::new(state.clone(), chat.clone(), computer.clone(), cx));
+        let recipes = cx.new(|cx| RecipesView::new(window, state.clone(), cx));
+        // The bar draws the Recipes page's header, so the page comes before it.
+        let title_bar = cx.new(|cx| {
+            TitleBar::new(
+                state.clone(),
+                chat.clone(),
+                computer.clone(),
+                recipes.clone(),
+                cx,
+            )
+        });
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
         let bot_finder = cx.new(|cx| BotFinder::new(window, state.clone(), cx));
         let command_palette = cx.new(|cx| CommandPalette::new(window, state.clone(), cx));
-        let recipes = cx.new(|cx| RecipesView::new(window, state.clone(), cx));
         let shell = ShellRev::from_state(&state.read(cx));
 
         cx.observe(&state, |this, state, cx| {
