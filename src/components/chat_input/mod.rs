@@ -1,25 +1,27 @@
 mod items;
+mod sources;
 #[macro_use]
 mod sync_macros;
 
 pub use items::{render_flyout_item, render_popover_item};
+pub use sources::{AppCommand, ComposerPick, TokenKind};
 
-use crate::actions::{
-    SelectAppCanva, SelectAppCanvas, SelectAppCoursera, SelectAppDeepResearch, SelectAppFigma,
-    SelectAppImageGeneration, SelectAppLinear, SelectAppNotion, SelectAppPhotos, SelectAppSpotify,
-    SelectAppStudy, SelectAppThinking, SelectAppWebSearch,
-};
+use crate::actions::{Library, NewChat, OpenSettings, Projects, ToggleTheme};
 use crate::audio::AudioInput;
+use crate::components::composer_panel::{ComposerPanel, ComposerPanelEvent, ComposerPanelRow};
 use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
 use crate::state::{AppState, ReplyTo, SubmitChord};
+use sources::{SkillSource, ToolSource};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
 use gpui_kit::InteractiveElement;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName,
     button::{Button, ButtonVariants},
     h_flex,
-    input::{InputEvent, Textarea, TextareaState},
-    menu::{DropdownMenu, PopupMenuItem},
+    input::{Backspace, InputEvent, Textarea, TextareaState},
     popover::Popover,
     tooltip::Tooltip,
     v_flex,
@@ -30,6 +32,38 @@ use gpui_kit::*;
 actions!(chat, [SubmitMessage]);
 
 type SubmitCallback = Box<dyn Fn(String, &mut Context<MessageInput>)>;
+
+/// The images that may be attached. The picker itself cannot be told to show only these — GPUI's
+/// path prompt has no type filter — so the list is applied to what comes back.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// Which list the open panel is showing, and therefore what a picked row means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanelMode {
+    /// The "+" button: attach files, teach a task.
+    Plus,
+    /// `@`: the bot's tools and apps.
+    Tools,
+    /// `/`: recipes and the app's own commands.
+    Skills,
+}
+
+/// A chip in the message: what it stands for, and where its text sits.
+///
+/// The chip is text in the field, because the text field cannot host an element mid-line (see
+/// `MessageInput::chip_pills`). This is what makes it more than text: the kind and the id are
+/// kept beside it so the message can be sent as structured data rather than re-parsed out of a
+/// string that anyone could have typed by hand.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComposerToken {
+    pub kind: TokenKind,
+    /// What the thing is called where it lives: a tool's name, a recipe's id.
+    pub id: String,
+    /// What the chip reads as in the message, `@shell`.
+    pub text: String,
+    /// Where that text sits, in bytes. Kept true across edits by `resync_tokens`.
+    pub range: Range<usize>,
+}
 
 pub struct MessageInput {
     input_state: Entity<TextareaState>,
@@ -45,6 +79,25 @@ pub struct MessageInput {
     submit_chord: SubmitChord,
     reply_to: Option<ReplyTo>,
     coworker_name: String,
+    /// The one wide panel, shared by the "+" button and by the `@` and `/` triggers.
+    panel: Entity<ComposerPanel>,
+    /// Which list the panel is showing, when it is open.
+    panel_mode: Option<PanelMode>,
+    /// What each row of the open panel stands for, by row id. The panel only says which row was
+    /// picked; this is how the composer knows what to do about it.
+    picks: Vec<(SharedString, ComposerPick)>,
+    /// Where the caret was when the panel opened, which is where a chip goes.
+    caret: usize,
+    /// The chips in the message, in the order they appear.
+    tokens: Vec<ComposerToken>,
+    /// Images to send with the message, shown as thumbnails above the text.
+    attachments: Vec<PathBuf>,
+    /// A line above the field for something the person needs told: a file that was not an image,
+    /// a picker that would not open.
+    notice: Option<String>,
+    /// Where the mouse went down when a click outside shut the panel, so the click on the "+"
+    /// that shut it is not also taken as a click to open it again.
+    dismissed_at: Option<Point<Pixels>>,
 }
 
 impl MessageInput {
@@ -55,6 +108,7 @@ impl MessageInput {
                 .auto_grow(1, 20)
                 .submit_on_enter(true)
         });
+        let panel = cx.new(|cx| ComposerPanel::new(window, cx));
 
         // Cache initial values from AppState
         let app_state = state.read(cx);
@@ -78,6 +132,14 @@ impl MessageInput {
             voice_mode: false,
             voice_wave: None,
             audio_input: None,
+            panel: panel.clone(),
+            panel_mode: None,
+            picks: Vec::new(),
+            caret: 0,
+            tokens: Vec::new(),
+            attachments: Vec::new(),
+            notice: None,
+            dismissed_at: None,
         };
 
         // Subscribe to state changes to update cached values and notify only when relevant fields change
@@ -100,11 +162,28 @@ impl MessageInput {
                 }
             }
 
+            // Recipes that were still being fetched when `/` opened the panel land here.
+            if this.panel_mode == Some(PanelMode::Skills) {
+                let rows = SkillSource.rows(&state.read(cx).recipes);
+                this.remember_picks(&rows);
+                let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
+                this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
+            }
+
             if changed {
                 let send_on_enter = this.submit_chord == SubmitChord::Enter;
                 this.input_state.update(cx, |input, cx| {
                     input.set_submit_on_enter(send_on_enter, cx);
                 });
+                cx.notify();
+            }
+        })
+        .detach();
+
+        // The chips are drawn from where the field put the text, which is only known once it has
+        // been laid out; a layout that moved anything is a reason to draw them again.
+        cx.observe(&input_state, |this: &mut Self, _input, cx| {
+            if !this.tokens.is_empty() {
                 cx.notify();
             }
         })
@@ -123,8 +202,25 @@ impl MessageInput {
                         this.trigger_submit(window, cx);
                     }
                 }
-                InputEvent::Change => cx.notify(),
+                InputEvent::Change => {
+                    this.resync_tokens(cx);
+                    cx.notify();
+                }
                 _ => {}
+            },
+        )
+        .detach();
+
+        cx.subscribe_in(
+            &panel,
+            window,
+            |this, _panel, event, window, cx| match event {
+                ComposerPanelEvent::Selected(id) => this.pick_row(id.clone(), window, cx),
+                ComposerPanelEvent::Dismissed { at } => {
+                    this.dismissed_at = *at;
+                    // A click outside meant to land somewhere else; only Escape hands the caret back.
+                    this.close_panel(at.is_none(), window, cx);
+                }
             },
         )
         .detach();
@@ -143,6 +239,17 @@ impl MessageInput {
         });
     }
 
+    /// The chips in the draft, for whoever sends it. Nothing reads this yet: the message still
+    /// goes to the server as text, and carrying the chips as data is the next step.
+    pub fn tokens(&self) -> &[ComposerToken] {
+        &self.tokens
+    }
+
+    /// The images waiting on the draft. Nothing sends them yet — see `trigger_submit`.
+    pub fn attachments(&self) -> &[PathBuf] {
+        &self.attachments
+    }
+
     fn trigger_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         println!("Triggering submit...");
         let text = self.input_state.read(cx).value();
@@ -155,6 +262,15 @@ impl MessageInput {
             self.input_state.update(cx, |state, cx| {
                 state.set_value("".to_string(), window, cx);
             });
+            self.tokens.clear();
+            // The images are not on their way anywhere: nothing carries them yet, so saying so
+            // is better than leaving them over an empty composer as if they had gone with it.
+            if !self.attachments.is_empty() {
+                self.attachments.clear();
+                self.notice =
+                    Some("Images are not sent yet, so that message went without them.".into());
+            }
+            cx.notify();
             // Focus is handled by the input state usually, or we might need to re-focus
         } else {
             println!("Message is empty, ignoring.");
@@ -194,6 +310,492 @@ impl MessageInput {
             state.set_value(mock_text.to_string(), window, cx);
         });
     }
+
+    // --- The panel -------------------------------------------------------------------------
+
+    fn field_focused(&self, window: &Window, cx: &App) -> bool {
+        self.input_state
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
+    fn remember_picks(&mut self, rows: &[(ComposerPanelRow, ComposerPick)]) {
+        self.picks = rows
+            .iter()
+            .map(|(row, pick)| (row.id.clone(), pick.clone()))
+            .collect();
+    }
+
+    fn show_panel(
+        &mut self,
+        mode: PanelMode,
+        rows: Vec<(ComposerPanelRow, ComposerPick)>,
+        placeholder: &str,
+        hint: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Read the caret before the search field takes the focus, so a chip lands where the
+        // person was typing rather than at the start of the message.
+        self.caret = self.input_state.read(cx).cursor();
+        self.panel_mode = Some(mode);
+        self.dismissed_at = None;
+        self.remember_picks(&rows);
+        let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
+        self.panel.update(cx, |panel, cx| {
+            panel.open_with(rows, placeholder, hint, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_panel(&mut self, refocus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel_mode.is_none() {
+            return;
+        }
+        self.panel_mode = None;
+        self.picks.clear();
+        self.panel.update(cx, |panel, cx| panel.close(cx));
+        if refocus {
+            self.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_plus_panel(
+        &mut self,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dismissed = self.dismissed_at.take();
+        if self.panel_mode == Some(PanelMode::Plus) {
+            self.close_panel(true, window, cx);
+            return;
+        }
+        // This click is the one that shut the panel a moment ago, not a new one.
+        if mouse_down_at(event).is_some_and(|at| dismissed == Some(at)) {
+            return;
+        }
+        let rows = vec![
+            (
+                ComposerPanelRow::new(
+                    "attach",
+                    "icons/clip.svg",
+                    "Attach files",
+                    "Images from this Mac — PNG, JPEG, WebP or GIF",
+                )
+                .element_id("composer-attach"),
+                ComposerPick::AttachFiles,
+            ),
+            (
+                ComposerPanelRow::new(
+                    "teach",
+                    "icons/monitor.svg",
+                    "Teach a task",
+                    "Show the bot on its screen, and keep what it saw as a recipe",
+                )
+                .element_id("composer-teach"),
+                ComposerPick::TeachTask,
+            ),
+        ];
+        self.show_panel(
+            PanelMode::Plus,
+            rows,
+            "Search",
+            "Type @ for the bot's tools, / for its skills.",
+            window,
+            cx,
+        );
+    }
+
+    fn open_tools_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = ToolSource.rows();
+        self.show_panel(
+            PanelMode::Tools,
+            rows,
+            "Search tools",
+            "↑↓ to move, ↵ to put it in the message, esc to close.",
+            window,
+            cx,
+        );
+    }
+
+    fn open_skills_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // An empty list may only mean the recipes have never been fetched in this session; ask
+        // for them, and the observer above fills the open panel when they land.
+        if self.state.read(cx).recipes.is_empty() {
+            self.state.update(cx, |state, cx| state.refresh_recipes(cx));
+        }
+        let rows = SkillSource.rows(&self.state.read(cx).recipes);
+        self.show_panel(
+            PanelMode::Skills,
+            rows,
+            "Search skills and actions",
+            "↑↓ to move, ↵ to run it or put it in the message, esc to close.",
+            window,
+            cx,
+        );
+    }
+
+    fn pick_row(&mut self, id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pick) = self
+            .picks
+            .iter()
+            .find(|(row, _)| *row == id)
+            .map(|(_, pick)| pick.clone())
+        else {
+            return;
+        };
+        self.close_panel(true, window, cx);
+        match pick {
+            ComposerPick::AttachFiles => self.attach_files(cx),
+            ComposerPick::TeachTask => self.teach_task(cx),
+            ComposerPick::Token { kind, id, text } => self.insert_token(kind, id, text, window, cx),
+            ComposerPick::Command(command) => self.run_command(command, window, cx),
+            ComposerPick::Nothing => {}
+        }
+    }
+
+    fn run_command(&mut self, command: AppCommand, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            AppCommand::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
+            AppCommand::NewChat => window.dispatch_action(Box::new(NewChat), cx),
+            AppCommand::ToggleTheme => window.dispatch_action(Box::new(ToggleTheme), cx),
+            AppCommand::Collections => window.dispatch_action(Box::new(Library), cx),
+            AppCommand::Groups => window.dispatch_action(Box::new(Projects), cx),
+            AppCommand::SettingsTab(tab) => {
+                self.state
+                    .update(cx, |state, cx| state.open_app_settings(tab, cx));
+            }
+            AppCommand::Recipes => self.state.update(cx, |state, cx| state.open_recipes(cx)),
+        }
+    }
+
+    fn teach_task(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| state.teach_task(cx));
+    }
+
+    // --- Chips -----------------------------------------------------------------------------
+
+    /// Put a chip at the caret the panel was opened from, and leave the caret after it.
+    fn insert_token(
+        &mut self,
+        kind: TokenKind,
+        id: String,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let caret = self.caret.min(self.input_state.read(cx).value().len());
+        self.input_state.update(cx, |input, cx| {
+            input.set_selected_range(caret..caret, cx);
+            // The trailing space is what lets typing carry on after the chip instead of running
+            // into it, and it keeps the chip a token of its own.
+            input.insert(format!("{text} "), window, cx);
+        });
+        let range = caret..caret + text.len();
+        let at = self
+            .tokens
+            .iter()
+            .position(|token| token.range.start >= caret)
+            .unwrap_or(self.tokens.len());
+        self.tokens.insert(
+            at,
+            ComposerToken {
+                kind,
+                id,
+                text,
+                range,
+            },
+        );
+        // The chips after this one have moved along by what was inserted.
+        self.resync_tokens(cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Put every chip's range back where its text actually is.
+    ///
+    /// The field knows nothing about chips, so an edit anywhere moves them without telling
+    /// anyone. Scanning forward in order finds each chip's text after the one before it; a chip
+    /// whose text is no longer there was edited away, and it stops being a chip.
+    fn resync_tokens(&mut self, cx: &App) {
+        if self.tokens.is_empty() {
+            return;
+        }
+        let text = self.input_state.read(cx).value().to_string();
+        let mut from = 0usize;
+        self.tokens.retain_mut(|token| {
+            match text.get(from..).and_then(|rest| rest.find(&token.text)) {
+                Some(offset) => {
+                    let start = from + offset;
+                    token.range = start..start + token.text.len();
+                    from = token.range.end;
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
+    /// Backspace right after a chip takes the whole chip, not one character of it.
+    ///
+    /// Returns whether it did, so the caller knows whether to let the field have the key.
+    fn backspace_over_token(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.field_focused(window, cx) {
+            return false;
+        }
+        let (caret, selection) = {
+            let input = self.input_state.read(cx);
+            (input.cursor(), input.selected_range())
+        };
+        if selection.start != selection.end {
+            return false;
+        }
+        let Some(index) = self
+            .tokens
+            .iter()
+            .position(|token| token.range.end == caret)
+        else {
+            return false;
+        };
+        let range = self.tokens.remove(index).range;
+        self.input_state.update(cx, |input, cx| {
+            input.set_selected_range(range, cx);
+            input.replace("", window, cx);
+        });
+        cx.notify();
+        true
+    }
+
+    /// `@` and `/` open the panel instead of being typed.
+    ///
+    /// Returns whether the key was taken. A trigger only counts at the start of a token — at the
+    /// very start of the message or right after a space — so an email address types its `@`.
+    fn trigger_panel(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.voice_mode || self.panel_mode.is_some() || !self.field_focused(window, cx) {
+            return false;
+        }
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+            return false;
+        }
+        let mode = match event.keystroke.key_char.as_deref() {
+            Some("@") => PanelMode::Tools,
+            Some("/") => PanelMode::Skills,
+            _ => return false,
+        };
+        let (text, caret, selection) = {
+            let input = self.input_state.read(cx);
+            (
+                input.value().to_string(),
+                input.cursor(),
+                input.selected_range(),
+            )
+        };
+        // Typing over a selection replaces it, which is the field's business and not a trigger.
+        if selection.start != selection.end || !starts_token(&text, caret) {
+            return false;
+        }
+        match mode {
+            PanelMode::Tools => self.open_tools_panel(window, cx),
+            PanelMode::Skills => self.open_skills_panel(window, cx),
+            PanelMode::Plus => {}
+        }
+        true
+    }
+
+    /// The chips, as rounded fills behind the text they belong to.
+    ///
+    /// The field paints its text in one style and hosts no elements of its own, so a chip cannot
+    /// be an element in the text flow. What it can be is this: the field says where a byte range
+    /// ended up on screen, and the fill goes there, under the glyphs, which the field then paints
+    /// over it. The chip therefore reads inline and wraps and scrolls with the text, because it
+    /// is the text.
+    fn chip_pills(&self, theme: &gpui_kit::component::Theme, cx: &App) -> Vec<AnyElement> {
+        if self.tokens.is_empty() {
+            return Vec::new();
+        }
+        let input = self.input_state.read(cx);
+        let origin = input.input_bounds().origin;
+        let line_height = input.line_height();
+        self.tokens
+            .iter()
+            .filter_map(|token| {
+                let bounds = input.range_to_bounds(&token.range)?;
+                // A chip that wrapped onto a second line has no one rectangle to sit in; leave
+                // it plain rather than fill the whole box the two lines make between them.
+                let wrapped = line_height.is_some_and(|line| bounds.size.height > line * 1.5);
+                if wrapped || bounds.size.width <= px(0.) {
+                    return None;
+                }
+                Some(
+                    div()
+                        .absolute()
+                        .left(bounds.origin.x - origin.x - px(3.))
+                        .top(bounds.origin.y - origin.y - px(1.))
+                        .w(bounds.size.width + px(6.))
+                        .h(bounds.size.height + px(2.))
+                        .rounded(px(5.))
+                        .bg(theme.primary.opacity(0.16))
+                        .into_any_element(),
+                )
+            })
+            .collect()
+    }
+
+    /// The text field, with the chips' fills under it.
+    fn field(&self, theme: &gpui_kit::component::Theme, cx: &App) -> AnyElement {
+        div()
+            .relative()
+            .w_full()
+            .children(self.chip_pills(theme, cx))
+            .child(Textarea::new(&self.input_state).appearance(false).w_full())
+            .into_any_element()
+    }
+
+    // --- Attachments -----------------------------------------------------------------------
+
+    fn attach_files(&mut self, cx: &mut Context<Self>) {
+        let answer = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let chosen = answer.await;
+            let _ = this.update(cx, |this, cx| {
+                match chosen {
+                    Ok(Ok(Some(paths))) => this.add_attachments(paths),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        this.notice = Some(format!("The file picker would not open: {error}"));
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Keep the images and say so when something else was picked: the prompt cannot be told to
+    /// offer images only, so this is the only place the answer is narrowed.
+    fn add_attachments(&mut self, paths: Vec<PathBuf>) {
+        let before = self.attachments.len();
+        let mut refused = 0;
+        for path in paths {
+            if is_image(&path) {
+                if !self.attachments.contains(&path) {
+                    self.attachments.push(path);
+                }
+            } else {
+                refused += 1;
+            }
+        }
+        self.notice = (refused > 0).then(|| {
+            if self.attachments.len() == before {
+                "Only images can be attached: PNG, JPEG, WebP or GIF.".to_string()
+            } else {
+                format!("{refused} of those were not images, so they were left out.")
+            }
+        });
+    }
+
+    fn thumbnails(&self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .id("composer-attachments")
+            .w_full()
+            .flex_wrap()
+            .gap(px(8.))
+            .px(px(2.))
+            .pb(px(2.))
+            .children(self.attachments.iter().enumerate().map(|(index, path)| {
+                let group = SharedString::from(format!("composer-attachment-{index}"));
+                div()
+                    .id(SharedString::from(format!("composer-attachment-{index}")))
+                    .group(group.clone())
+                    .relative()
+                    .size(px(56.))
+                    .flex_shrink_0()
+                    .rounded(px(10.))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary)
+                    .child(
+                        img(path.clone())
+                            .size_full()
+                            .object_fit(ObjectFit::Cover)
+                            .rounded(px(10.)),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "composer-attachment-remove-{index}"
+                            )))
+                            .absolute()
+                            .top(px(2.))
+                            .right(px(2.))
+                            .size(px(18.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme.background.opacity(0.85))
+                            .cursor_pointer()
+                            .opacity(0.)
+                            .group_hover(group, |style| style.opacity(1.))
+                            .child(
+                                Icon::new(NativeIcon::Close)
+                                    .size(px(10.))
+                                    .text_color(theme.secondary_foreground),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if index < this.attachments.len() {
+                                    this.attachments.remove(index);
+                                    this.notice = None;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+            }))
+            .into_any_element()
+    }
+}
+
+/// Whether a trigger character sits at the start of a token: the start of the message, or right
+/// after a space. `me@example.com` therefore types its `@` rather than opening the panel.
+fn starts_token(text: &str, caret: usize) -> bool {
+    let caret = caret.min(text.len());
+    text[..caret]
+        .chars()
+        .next_back()
+        .is_none_or(char::is_whitespace)
+}
+
+/// Where a click's own mouse down was, for telling one click from another. A click from the
+/// keyboard has no such place, and is never the one that shut a panel.
+fn mouse_down_at(event: &ClickEvent) -> Option<Point<Pixels>> {
+    match event {
+        ClickEvent::Mouse(mouse) => Some(mouse.down.position),
+        _ => None,
+    }
+}
+
+fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| IMAGE_EXTENSIONS.contains(&extension.as_str()))
 }
 
 impl Render for MessageInput {
@@ -204,30 +806,69 @@ impl Render for MessageInput {
             input.set_placeholder(placeholder, window, cx);
         });
 
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
         let secondary = theme.secondary;
         let secondary_foreground = theme.secondary_foreground;
+        let muted_foreground = theme.muted_foreground;
+        let foreground = theme.foreground;
+        let background = theme.background;
         let border = theme.border;
-        // Removed direct state read to prevent excessive re-renders
-        // let app_state = state_model.read(cx);
         let selected_apps = self.selected_apps.clone();
 
         // Check if any modal is open using cached state
         let any_modal_open = self.is_voice_mode_open || self.is_app_settings_open;
         let draft = self.input_state.read(cx).value();
-        let compact = !self.voice_mode && self.selected_apps.is_empty() && !draft.contains('\n');
+        let compact = !self.voice_mode
+            && self.selected_apps.is_empty()
+            && self.attachments.is_empty()
+            && self.notice.is_none()
+            && !draft.contains('\n');
+        let panel_open = self.panel_mode.is_some();
+        let thumbnails = (!self.attachments.is_empty()).then(|| self.thumbnails(&theme, cx));
 
         // ChatGPT-style: centered container with max-width
         h_flex().w_full().justify_center().child(
+            v_flex()
+                .relative()
+                .max_w(px(crate::chrome::CHAT_CONTENT_MAX))
+                .w_full()
+                // `@` and `/` never reach the field: the panel opens instead, and nothing is
+                // typed. Capture, because the field would otherwise have the character first.
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if this.trigger_panel(event, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                // Backspace against a chip takes the chip. Capture, because the field binds the
+                // key to its own action, and actions are dispatched before key listeners.
+                .capture_action(cx.listener(|this, _: &Backspace, window, cx| {
+                    if this.backspace_over_token(window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .when(panel_open, |this| {
+                    this.child(deferred(
+                        // Above the composer and the width of it: `bottom: 100%` puts the
+                        // panel's bottom edge on the composer's top edge.
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom(relative(1.))
+                            .mb(px(8.))
+                            .child(self.panel.clone()),
+                    )
+                    .with_priority(3))
+                })
+                .child(
             // Input container - rounded pill shape with shadow
             v_flex()
                 .key_context("MessageInput")
-                .max_w(px(crate::chrome::CHAT_CONTENT_MAX))
                 .w_full()
                 .gap_2()
                 .when(compact, |this| this.px_3().py(px(6.)))
                 .when(!compact, |this| this.px_4().py_3())
-                .bg(theme.background) // Match chat background (white in light mode)
+                .bg(background) // Match chat background (white in light mode)
                 .border_1()
                 .border_color(border)
                 .rounded(px(26.0)) // Rounded pill shape
@@ -251,13 +892,13 @@ impl Render for MessageInput {
                                         div()
                                             .text_xs()
                                             .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                            .text_color(theme.muted_foreground)
+                                            .text_color(muted_foreground)
                                             .child("Replying"),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(theme.muted_foreground)
+                                            .text_color(muted_foreground)
                                             .truncate()
                                             .child(preview),
                                     ),
@@ -289,6 +930,46 @@ impl Render for MessageInput {
                             ),
                     )
                 })
+                .when_some(self.notice.clone(), |this, notice| {
+                    this.child(
+                        h_flex()
+                            .id("composer-notice")
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(muted_foreground)
+                                    .child(notice),
+                            )
+                            .child(
+                                div()
+                                    .id("composer-notice-dismiss")
+                                    .size(px(18.))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(secondary))
+                                    .child(
+                                        Icon::new(IconName::Close)
+                                            .size(px(10.))
+                                            .text_color(secondary_foreground),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.notice = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
+                .children(thumbnails)
                 .when(!compact, |this| {
                     this.child(
                         // Top: Input field (grows to fill space)
@@ -299,9 +980,7 @@ impl Render for MessageInput {
                                 div().into_any_element()
                             }
                         } else {
-                            Textarea::new(&self.input_state)
-                                .appearance(false)
-                                .into_any_element()
+                            self.field(&theme, cx)
                         }),
                     )
                 })
@@ -311,98 +990,15 @@ impl Render for MessageInput {
                         .when(compact, |this| this.items_center().gap_1())
                         .when(!compact, |this| this.justify_between().items_start().gap_2())
                         .child(
-                             // App Picker Popover (Moved out of wrapping container)
+                            // The one wide panel, for everything the composer offers.
                             Button::new("add-app")
                                 .icon(IconName::Plus)
                                 .ghost()
                                 .rounded_full()
                                 .when(!any_modal_open, |this| this.cursor_pointer())
-                                .dropdown_menu_with_anchor(Anchor::BottomLeft, {
-                                    let state_model = state_model.clone();
-                                    move |menu, window, cx| {
-                                        let state = state_model.read(cx);
-                                        let capabilities = state.capabilities.clone();
-
-                                        let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
-                                            let state_model = state_model.clone();
-                                            let label_string = label.to_string();
-                                            let app_name_string = app_name.to_string();
-                                            let icon_string = icon.to_string();
-                                            PopupMenuItem::new(label_string)
-                                                .icon(Icon::default().path(icon_string))
-                                                .on_click(move |_, window, cx| {
-                                                    state_model.update(cx, |state, cx| state.select_app(app_name_string.clone(), cx));
-                                                    window.dispatch_action(action.boxed_clone(), cx);
-                                                })
-                                        };
-
-                                        fn get_action(action_id: &str) -> Box<dyn Action> {
-                                            match action_id {
-                                                "SelectAppPhotos" => Box::new(SelectAppPhotos),
-                                                "SelectAppImageGeneration" => Box::new(SelectAppImageGeneration),
-                                                "SelectAppThinking" => Box::new(SelectAppThinking),
-                                                "SelectAppDeepResearch" => Box::new(SelectAppDeepResearch),
-                                                "SelectAppStudy" => Box::new(SelectAppStudy),
-                                                "SelectAppWebSearch" => Box::new(SelectAppWebSearch),
-                                                "SelectAppCanvas" => Box::new(SelectAppCanvas),
-                                                "SelectAppCanva" => Box::new(SelectAppCanva),
-                                                "SelectAppCoursera" => Box::new(SelectAppCoursera),
-                                                "SelectAppFigma" => Box::new(SelectAppFigma),
-                                                "SelectAppSpotify" => Box::new(SelectAppSpotify),
-                                                _ => Box::new(SelectAppWebSearch), // Fallback
-                                            }
-                                        }
-
-                                        let mut menu = menu;
-
-                                        // Primary Items
-                                        for cap in capabilities.iter().filter(|c| c.is_primary) {
-                                            menu = menu.item(make_item(
-                                                &cap.label,
-                                                &cap.name,
-                                                &cap.icon,
-                                                get_action(&cap.action_id),
-                                                state_model.clone()
-                                            ));
-                                        }
-
-                                        menu = menu.separator();
-
-                                        // Secondary Items ("More" submenu)
-                                        let secondary_caps: Vec<_> = capabilities.iter().filter(|c| !c.is_primary).cloned().collect();
-                                        if !secondary_caps.is_empty() {
-                                            let state_model_submenu = state_model.clone();
-                                            let secondary_caps_for_submenu = secondary_caps.clone();
-                                            menu = menu.submenu("More", window, cx, move |menu, _, _| {
-                                                let make_item = |label: &str, app_name: &str, icon: &str, action: Box<dyn Action>, state_model: Entity<AppState>| {
-                                                    let state_model = state_model.clone();
-                                                    let label_string = label.to_string();
-                                                    let app_name_string = app_name.to_string();
-                                                    let icon_string = icon.to_string();
-                                                    PopupMenuItem::new(label_string)
-                                                        .icon(Icon::default().path(icon_string))
-                                                        .on_click(move |_, window, cx| {
-                                                            state_model.update(cx, |state, cx| state.select_app(app_name_string.clone(), cx));
-                                                            window.dispatch_action(action.boxed_clone(), cx);
-                                                        })
-                                                };
-
-                                                let mut submenu = menu;
-                                                for cap in secondary_caps_for_submenu.iter() {
-                                                    submenu = submenu.item(make_item(
-                                                        &cap.label,
-                                                        &cap.name,
-                                                        &cap.icon,
-                                                        get_action(&cap.action_id),
-                                                        state_model_submenu.clone()
-                                                    ));
-                                                }
-                                                submenu
-                                            });
-                                        }
-                                        menu
-                                    }
-                                })
+                                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                    this.toggle_plus_panel(event, window, cx);
+                                })),
                         )
                         .when(!compact, |this| {
                         this.child(
@@ -580,11 +1176,7 @@ impl Render for MessageInput {
                                     .flex_1()
                                     .min_w_0()
                                     .w_full()
-                                    .child(
-                                        Textarea::new(&self.input_state)
-                                            .appearance(false)
-                                            .w_full(),
-                                    ),
+                                    .child(self.field(&theme, cx)),
                             )
                         })
                         .child(
@@ -634,15 +1226,15 @@ impl Render for MessageInput {
                                             .items_center()
                                             .justify_center()
                                             .rounded_full()
-                                            .bg(theme.foreground) // Black/White
-                                            .text_color(theme.background) // White/Black
+                                            .bg(foreground) // Black/White
+                                            .text_color(background) // White/Black
                                             .hover(move |style| {
-                                                style.bg(theme.foreground.opacity(0.8))
+                                                style.bg(foreground.opacity(0.8))
                                             })
                                             .tooltip(|w, cx| Tooltip::new("Done").build(w, cx))
                                             .child(
                                                 Icon::new(IconName::Check)
-                                                    .text_color(theme.background),
+                                                    .text_color(background),
                                             );
 
                                         if !any_modal_open {
@@ -730,17 +1322,17 @@ impl Render for MessageInput {
                                                 .items_center()
                                                 .justify_center()
                                                 .rounded_full()
-                                                .bg(theme.foreground) // Theme-aware foreground (Black in light, White in dark)
-                                                .text_color(theme.background) // Theme-aware background (White in light, Black in dark)
+                                                .bg(foreground) // Theme-aware foreground (Black in light, White in dark)
+                                                .text_color(background) // Theme-aware background (White in light, Black in dark)
                                                 .hover(move |style| {
-                                                    style.bg(theme.foreground.opacity(0.8))
+                                                    style.bg(foreground.opacity(0.8))
                                                 })
                                                 .tooltip(|w, cx| {
                                                     Tooltip::new("Send message").build(w, cx)
                                                 })
                                                 .child(
                                                     Icon::new(IconName::ArrowUp)
-                                                        .text_color(theme.background),
+                                                        .text_color(background),
                                                 );
 
                                             if !any_modal_open {
@@ -752,86 +1344,8 @@ impl Render for MessageInput {
                                     )
                                 })
                         )
-                )
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppCanva, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Canva".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppFigma, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Figma".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppNotion, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Notion".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppLinear, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Linear".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppWebSearch, _, cx| {
-                        println!("Action SelectAppWebSearch received");
-                        state.update(cx, |state, cx| state.select_app("Web search".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppCanvas, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Canvas".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppCoursera, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Coursera".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppSpotify, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Spotify".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppPhotos, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Photos".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppImageGeneration, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Image Generation".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppThinking, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Thinking".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppDeepResearch, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Deep Research".to_string(), cx));
-                    }
-                })
-                .on_action({
-                    let state = self.state.clone();
-                    move |_: &SelectAppStudy, _, cx| {
-                        state.update(cx, |state, cx| state.select_app("Study".to_string(), cx));
-                    }
-                }))
+                )),
+        )
     }
 }
 
@@ -859,4 +1373,32 @@ fn composer_bot_name(state: &AppState) -> String {
         .map(|c| c.name.clone())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "bot".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_image, starts_token};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_trigger_only_counts_at_the_start_of_a_token() {
+        assert!(starts_token("", 0), "the start of an empty message");
+        assert!(starts_token("ask ", 4), "right after a space");
+        assert!(starts_token("one\n", 4), "right after a newline");
+        assert!(
+            !starts_token("me", 2),
+            "mid-word, which is where an email address would open the panel"
+        );
+        assert!(!starts_token("path/to", 7), "mid-word for a path too");
+    }
+
+    #[test]
+    fn only_image_files_are_attached() {
+        for name in ["shot.PNG", "a.jpg", "b.jpeg", "c.webp", "d.gif"] {
+            assert!(is_image(&PathBuf::from(name)), "{name} is an image");
+        }
+        for name in ["notes.pdf", "clip.mov", "noextension"] {
+            assert!(!is_image(&PathBuf::from(name)), "{name} is not an image");
+        }
+    }
 }

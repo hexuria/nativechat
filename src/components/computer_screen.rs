@@ -247,6 +247,15 @@ impl ComputerScreen {
         }
     }
 
+    /// Start a tape, for someone who asked for one from elsewhere — the composer's Teach a task.
+    /// A tape that is already running is left alone, so the ask never stops one by accident.
+    pub fn start_teaching(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.teaching.is_some() {
+            return;
+        }
+        self.toggle_teaching(window, cx);
+    }
+
     /// Start a tape, or stop the running one: write the local copy and open the save sheet.
     fn toggle_teaching(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.teaching.take() {
