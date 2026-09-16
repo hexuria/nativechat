@@ -73,6 +73,7 @@ impl DatabaseService {
         content: &str,
         model: Option<String>,
         provider: Option<String>,
+        reply: Option<ReplyRef>,
     ) -> Result<String> {
         sqlx::query("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(session_id)
@@ -81,7 +82,7 @@ impl DatabaseService {
 
         let id = uuid::Uuid::now_v7().to_string();
         sqlx::query(
-            "INSERT INTO chat_messages (id, session_id, role, content, model, provider) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(session_id)
@@ -89,6 +90,9 @@ impl DatabaseService {
         .bind(content)
         .bind(model)
         .bind(provider)
+        .bind(reply.as_ref().map(|r| r.message_id.clone()))
+        .bind(reply.as_ref().map(|r| r.preview.clone()))
+        .bind(reply.as_ref().map(|r| i64::from(r.is_me)))
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -104,7 +108,7 @@ impl DatabaseService {
 
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let rows = sqlx::query_as::<_, ChatMessage>(
-            "SELECT id, session_id, role, content, created_at, model, provider FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -130,4 +134,16 @@ pub struct ChatMessage {
     pub created_at: String,
     pub model: Option<String>,
     pub provider: Option<String>,
+    pub reply_to_id: Option<String>,
+    pub reply_preview: Option<String>,
+    pub reply_is_me: Option<i64>,
+}
+
+/// The message a saved message answers. Rows written before replies were kept have none of it,
+/// which is why every column is nullable and this is an `Option` at the call.
+#[derive(Debug, Clone)]
+pub struct ReplyRef {
+    pub message_id: String,
+    pub preview: String,
+    pub is_me: bool,
 }

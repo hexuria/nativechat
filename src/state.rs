@@ -9,11 +9,12 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
     ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ToolCallTracker, TurnAssembler,
-    activity_from_replay, command_from_args, command_from_replay_events, enrol_this_machine,
-    local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id, visible_bot_status,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, ToolCallTracker,
+    TurnAssembler, activity_from_replay, command_from_args, command_from_replay_events,
+    deeds_from_replay, enrol_this_machine, local_exec_outcome, policy_answer, serve_local_exec,
+    stored_machine_id, tool_standin, visible_bot_status,
 };
-use crate::services::database::DatabaseService;
+use crate::services::database::{DatabaseService, ReplyRef};
 use crate::services::tts_service::TtsService;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
@@ -30,6 +31,11 @@ pub struct Message {
     pub sent_at: SystemTime,
     pub is_me: bool,
     pub reply_preview: Option<String>,
+    /// The message this one answers. The preview is what the bubble paints; this is what the
+    /// quote sent to the coworker is built from, so a reply reaches it as more than a bubble.
+    pub reply_to_id: Option<String>,
+    /// The person wrote the quoted message, rather than the coworker.
+    pub reply_is_me: bool,
     pub parts: Vec<ChatPart>,
 }
 
@@ -39,6 +45,16 @@ impl Message {
             || self.parts.iter().any(|part| match part {
                 ChatPart::Text(text) => !text.trim().is_empty(),
                 ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => true,
+            })
+    }
+
+    /// Words, as opposed to a card or a picture. A run that ends without any is a turn the
+    /// transcript has to speak for: with the error, or with what the tools did.
+    pub fn has_text_body(&self) -> bool {
+        !self.content.trim().is_empty()
+            || self.parts.iter().any(|part| match part {
+                ChatPart::Text(text) => !text.trim().is_empty(),
+                ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => false,
             })
     }
 
@@ -61,6 +77,97 @@ pub struct ReplyTo {
     pub message_id: String,
     pub preview: String,
     pub is_me: bool,
+}
+
+/// What the feed says when a run came back with nothing at all.
+pub const EMPTY_TURN_NOTE: &str = "(OpenGrok returned no assistant text.)";
+
+/// How a run's failure is spelled in the feed.
+pub const RUN_ERROR_PREFIX: &str = "OpenGrok: ";
+
+/// How much of a quoted message the coworker is shown: a reply to a long answer names it, it
+/// does not replay it. The server's `reply_context` caps the same way.
+const REPLY_QUOTE_CHARS: usize = 600;
+
+/// The app talking about a turn — the empty-turn note, a run's failure — rather than anything the
+/// coworker said. These are painted as a status line, never saved and never sent back: a line the
+/// app wrote is not a turn the coworker took, and the model would answer to it as if it were.
+///
+/// The test is the content itself so that rows an older build saved are read the same way.
+pub fn is_status_line(content: &str) -> bool {
+    let text = content.trim();
+    text == EMPTY_TURN_NOTE || text.starts_with(RUN_ERROR_PREFIX)
+}
+
+/// The stand-in a turn that acted but said nothing leaves behind, e.g.
+/// "[took a screenshot of my screen]". It is the coworker's own content — saved, and sent on
+/// later turns so it remembers what it did — but it is not speech, so the feed dims it.
+pub fn is_tool_standin(content: &str) -> bool {
+    let text = content.trim();
+    text.starts_with('[') && text.ends_with(']') && !text.contains('\n')
+}
+
+/// The bracketed line the coworker reads ahead of a reply's own words, in the sentence the
+/// server's `reply_context` already writes, so a reply reads the same whichever path carried it.
+fn reply_quote_line(quote: &ReplyQuote) -> String {
+    let who = if quote.is_me {
+        "their own earlier message"
+    } else {
+        "your earlier message"
+    };
+    format!("[Replying to {who}: \"{}\"]", quote.preview)
+}
+
+/// The quote a message carries: the words of the message it answers when that one is still in the
+/// thread — all of them, not the bubble's short preview — and the preview saved with the reply
+/// when it is not.
+fn reply_quote(messages: &[Message], message: &Message) -> Option<ReplyQuote> {
+    let message_id = message.reply_to_id.clone()?;
+    let quoted = messages.iter().find(|m| m.id == message_id);
+    let text = match quoted {
+        Some(quoted) => quoted.content.clone(),
+        None => message.reply_preview.clone()?,
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let preview = if text.chars().count() > REPLY_QUOTE_CHARS {
+        let head: String = text.chars().take(REPLY_QUOTE_CHARS).collect();
+        format!("{head}…")
+    } else {
+        text.to_string()
+    };
+    Some(ReplyQuote {
+        message_id,
+        preview,
+        is_me: quoted.map_or(message.reply_is_me, |quoted| quoted.is_me),
+    })
+}
+
+/// The thread as the coworker should see it.
+///
+/// The app's own status lines are left out, and a reply carries its quote twice: in `content`,
+/// because that is all today's server reads, and in `replyTo` for a server that would rather
+/// find the quoted message and word the context itself.
+pub fn agui_messages(messages: &[Message]) -> Vec<AguiMessage> {
+    messages
+        .iter()
+        .filter(|m| m.is_me || (!m.content.trim().is_empty() && !is_status_line(&m.content)))
+        .map(|m| {
+            let reply_to = reply_quote(messages, m);
+            AguiMessage {
+                id: m.id.clone(),
+                role: if m.is_me { "user" } else { "assistant" }.to_string(),
+                content: match &reply_to {
+                    Some(quote) => format!("{}\n\n{}", reply_quote_line(quote), m.content),
+                    None => m.content.clone(),
+                },
+                tool_call_id: None,
+                reply_to,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -2959,7 +3066,9 @@ impl AppState {
                                             content: m.content,
                                             sent_at,
                                             is_me: m.role == "user",
-                                            reply_preview: None,
+                                            reply_preview: m.reply_preview,
+                                            reply_to_id: m.reply_to_id,
+                                            reply_is_me: m.reply_is_me.unwrap_or(0) != 0,
                                             parts: Vec::new(),
                                         }
                                     })
@@ -3000,13 +3109,16 @@ impl AppState {
     }
 
     /// Keep the coworker's reply so the thread survives a relaunch.
+    ///
+    /// Only what the coworker actually said: a status line is the app's own words about the turn,
+    /// and saving it would put a line nobody spoke into the history every later turn is sent.
     fn persist_assistant_reply(
         &self,
         conversation_id: &str,
         content: String,
         cx: &mut Context<Self>,
     ) {
-        if content.trim().is_empty() {
+        if content.trim().is_empty() || is_status_line(&content) {
             return;
         }
         let Some(db) = self.database_service.clone() else {
@@ -3017,7 +3129,7 @@ impl AppState {
         cx.spawn(async move |_this, _cx| {
             let saved = match db.ensure_session(&conversation_id, &title).await {
                 Ok(()) => db
-                    .save_message(&conversation_id, "assistant", &content, None, None)
+                    .save_message(&conversation_id, "assistant", &content, None, None, None)
                     .await
                     .map(|_| ()),
                 Err(error) => Err(error),
@@ -3045,22 +3157,7 @@ impl AppState {
             .conversations
             .iter()
             .find(|c| c.id == conversation_id)
-            .map(|c| {
-                c.messages
-                    .iter()
-                    .filter(|m| !m.content.trim().is_empty() || m.is_me)
-                    .map(|m| AguiMessage {
-                        id: m.id.clone(),
-                        role: if m.is_me {
-                            "user".to_string()
-                        } else {
-                            "assistant".to_string()
-                        },
-                        content: m.content.clone(),
-                        tool_call_id: None,
-                    })
-                    .collect()
-            })
+            .map(|c| agui_messages(&c.messages))
             .unwrap_or_default();
 
         if let Some(conversation) = self
@@ -3075,6 +3172,8 @@ impl AppState {
                 sent_at: SystemTime::now(),
                 is_me: false,
                 reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
                 parts: Vec::new(),
             });
         }
@@ -3099,7 +3198,7 @@ impl AppState {
                     Err(error) => Err(error),
                 },
             };
-            let (result, waiting_approval, turn_id) = match coworker {
+            let (result, waiting_approval, turn_id, deeds) = match coworker {
                 Ok(id) => {
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
@@ -3152,6 +3251,8 @@ impl AppState {
                         .await;
                     assembler.finish();
                     let waiting_approval = assembler.waiting_approval();
+                    // What the tools did, in case the turn ends without a word about it.
+                    let deeds = tracker.deeds();
                     let (plain, parts) = assembler.snapshot();
                     let _ = this.update(cx, |state, cx| {
                         if let Some(conversation) = state
@@ -3168,9 +3269,9 @@ impl AppState {
                         }
                         cx.notify();
                     });
-                    (result, waiting_approval, Some(id))
+                    (result, waiting_approval, Some(id), deeds)
                 }
-                Err(error) => (Err(error), false, coworker_id.clone()),
+                Err(error) => (Err(error), false, coworker_id.clone(), Vec::new()),
             };
             let _ = this.update(cx, |state, cx| {
                 if let Some(conversation) = state
@@ -3179,22 +3280,30 @@ impl AppState {
                     .find(|c| c.id == conversation_id)
                 {
                     if let Some(last) = conversation.messages.last_mut() {
-                        if !last.is_me && !last.has_visible_body() {
+                        // A turn that ends without words is spoken for by the app: why it
+                        // failed, what its tools did, or the note that it said nothing at all.
+                        // A picture is not an answer, so a failed run says so even when the
+                        // turn left a screenshot behind.
+                        if !last.is_me && !last.has_text_body() {
                             match &result {
                                 Ok(text) if !text.is_empty() => last.content = text.clone(),
+                                // Parked on a permission card: the turn is not over yet.
+                                Ok(_) if waiting_approval => {}
                                 Ok(_) => {
-                                    last.content =
-                                        "(OpenGrok returned no assistant text.)".to_string()
+                                    last.content = tool_standin(&deeds)
+                                        .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
                                 }
-                                Err(error) => last.content = format!("OpenGrok: {}", error.message),
+                                Err(error) => {
+                                    last.content = format!("{RUN_ERROR_PREFIX}{}", error.message)
+                                }
                             }
                         }
                     }
                 }
                 if !waiting_approval && result.is_ok() {
                     // The run is final; a run parked on a card is saved when it finishes.
-                    // An error line is painted, never saved: it must not become history
-                    // the model is shown next turn.
+                    // A status line is painted, never saved: `persist_assistant_reply` refuses
+                    // it, so it cannot become history the model is shown next turn.
                     let reply = state
                         .conversations
                         .iter()
@@ -3388,6 +3497,13 @@ impl AppState {
                             assembler.finish();
                             let (plain, parts) = assembler.snapshot();
                             let status = replay.status.clone();
+                            // A resumed turn that only ran tools says what it did, so the
+                            // thread keeps a memory of the run the person allowed.
+                            let plain = if status == "finished" && plain.trim().is_empty() {
+                                tool_standin(&deeds_from_replay(&replay.events)).unwrap_or_default()
+                            } else {
+                                plain
+                            };
                             // The journal says what the run is doing now; "Working" only
                             // when no frame has said.
                             let activity =
@@ -3657,6 +3773,8 @@ impl AppState {
             sent_at: SystemTime::now(),
             is_me: false,
             reply_preview: None,
+            reply_to_id: None,
+            reply_is_me: false,
             parts: vec![ChatPart::Approval(spec)],
         });
     }
@@ -3757,20 +3875,24 @@ impl AppState {
         };
 
         let local_id = uuid::Uuid::now_v7().to_string();
+        // The whole reply, not just its preview: the bubble paints the preview, and the quote
+        // the coworker is sent is built from the message this one points at.
+        let reply = self.reply_to.take();
         // Add user message to UI immediately
         if let Some(conversation) = self
             .conversations
             .iter_mut()
             .find(|c| c.id == conversation_id)
         {
-            let reply_preview = self.reply_to.take().map(|r| r.preview);
             let message = Message {
                 id: local_id.clone(),
                 sender: "Me".to_string(),
                 content: content.clone(),
                 sent_at: SystemTime::now(),
                 is_me: true,
-                reply_preview,
+                reply_preview: reply.as_ref().map(|r| r.preview.clone()),
+                reply_to_id: reply.as_ref().map(|r| r.message_id.clone()),
+                reply_is_me: reply.as_ref().is_some_and(|r| r.is_me),
                 parts: Vec::new(),
             };
             conversation.messages.push(message);
@@ -3786,6 +3908,11 @@ impl AppState {
             let conversation_id_clone = conversation_id.clone();
             let title = self.conversation_title(&conversation_id);
             let local_id = local_id.clone();
+            let reply = reply.map(|reply| ReplyRef {
+                message_id: reply.message_id,
+                preview: reply.preview,
+                is_me: reply.is_me,
+            });
             cx.spawn(async move |this, cx| {
                 // A coworker thread has no session row until it first speaks.
                 if let Err(e) = db.ensure_session(&conversation_id_clone, &title).await {
@@ -3793,7 +3920,14 @@ impl AppState {
                     return;
                 }
                 match db
-                    .save_message(&conversation_id_clone, "user", &content_clone, None, None)
+                    .save_message(
+                        &conversation_id_clone,
+                        "user",
+                        &content_clone,
+                        None,
+                        None,
+                        reply,
+                    )
                     .await
                 {
                     Ok(id) => {
@@ -4258,5 +4392,120 @@ fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
         reason: "exec-consent".into(),
         output: None,
         ok: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
+    use super::{
+        EMPTY_TURN_NOTE, Message, REPLY_QUOTE_CHARS, agui_messages, is_status_line, is_tool_standin,
+    };
+    use std::time::SystemTime;
+
+    fn message(id: &str, is_me: bool, content: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            sender: if is_me { "Me" } else { "AI" }.to_string(),
+            content: content.to_string(),
+            sent_at: SystemTime::UNIX_EPOCH,
+            is_me,
+            reply_preview: None,
+            reply_to_id: None,
+            reply_is_me: false,
+            parts: Vec::new(),
+        }
+    }
+
+    fn replying_to(mut message: Message, quoted: &Message) -> Message {
+        message.reply_to_id = Some(quoted.id.clone());
+        message.reply_preview = Some(quoted.content.clone());
+        message.reply_is_me = quoted.is_me;
+        message
+    }
+
+    /// The whole point: "what am I replying to?" must arrive with the quote, because the server
+    /// answers from the array the app sends and nothing else.
+    #[test]
+    fn a_reply_reaches_the_coworker_as_a_quote_ahead_of_its_own_words() {
+        let bot = message("m1", false, "The build is green.");
+        let reply = replying_to(message("m2", true, "what am I replying to?"), &bot);
+        let sent = agui_messages(&[bot, reply]);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent[1].content,
+            "[Replying to your earlier message: \"The build is green.\"]\n\nwhat am I replying to?"
+        );
+        let quote = sent[1].reply_to.as_ref().expect("the field is filled too");
+        assert_eq!(quote.message_id, "m1");
+        assert_eq!(quote.preview, "The build is green.");
+        assert!(!quote.is_me);
+    }
+
+    #[test]
+    fn replying_to_your_own_message_is_told_apart_from_replying_to_the_bot() {
+        let mine = message("m1", true, "remind me at five");
+        let reply = replying_to(message("m2", true, "make that six"), &mine);
+        let sent = agui_messages(&[mine, reply]);
+        assert_eq!(
+            sent[1].content,
+            "[Replying to their own earlier message: \"remind me at five\"]\n\nmake that six"
+        );
+        assert!(sent[1].reply_to.as_ref().expect("a quote").is_me);
+    }
+
+    /// A reply to a long answer names it, it does not replay it.
+    #[test]
+    fn a_long_quote_is_clipped() {
+        let bot = message("m1", false, &"x".repeat(REPLY_QUOTE_CHARS + 50));
+        let reply = replying_to(message("m2", true, "go on"), &bot);
+        let sent = agui_messages(&[bot, reply]);
+        let quote = sent[1].reply_to.as_ref().expect("a quote");
+        assert_eq!(quote.preview.chars().count(), REPLY_QUOTE_CHARS + 1);
+        assert!(quote.preview.ends_with('…'));
+    }
+
+    /// A message can be deleted after it was answered; the preview saved with the reply is what
+    /// is left of it.
+    #[test]
+    fn a_quote_whose_message_is_gone_falls_back_to_the_saved_preview() {
+        let mut reply = message("m2", true, "why?");
+        reply.reply_to_id = Some("deleted".to_string());
+        reply.reply_preview = Some("The build is green.".to_string());
+        let sent = agui_messages(&[reply]);
+        assert_eq!(
+            sent[0].content,
+            "[Replying to your earlier message: \"The build is green.\"]\n\nwhy?"
+        );
+    }
+
+    /// The app's own words about a turn are not a turn: sending them back would have the model
+    /// answering a line nobody said.
+    #[test]
+    fn the_apps_status_lines_are_never_sent_back_as_the_coworkers_words() {
+        let thread = vec![
+            message("m1", true, "hi"),
+            message("m2", false, EMPTY_TURN_NOTE),
+            message("m3", true, "still there?"),
+            message("m4", false, "OpenGrok: the model returned no text"),
+            message("m5", false, "[took a screenshot of my screen]"),
+        ];
+        let sent = agui_messages(&thread);
+        let kept: Vec<&str> = sent.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["hi", "still there?", "[took a screenshot of my screen]"]
+        );
+    }
+
+    /// Both are the app talking, whether painted now or read back from an older build's rows.
+    #[test]
+    fn a_status_line_is_told_from_something_the_coworker_said() {
+        assert!(is_status_line(EMPTY_TURN_NOTE));
+        assert!(is_status_line("OpenGrok: the run failed"));
+        assert!(!is_status_line("OpenGrok is a server."));
+        assert!(!is_status_line("[took a screenshot of my screen]"));
+        assert!(is_tool_standin("[took a screenshot of my screen]"));
+        assert!(!is_tool_standin("The build is green."));
     }
 }

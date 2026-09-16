@@ -9,7 +9,7 @@ mod types;
 
 pub use activity::{
     ActivityTick, BotActivity, ToolCallTracker, activity_from_agui, activity_from_replay,
-    visible_bot_status,
+    deeds_from_replay, tool_standin, visible_bot_status,
 };
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, CompletedUiTool, FormField, FormSpec,
@@ -28,5 +28,5 @@ pub use client::{
 pub use error::OpenGrokError;
 pub use types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
-    assistant_text_from_sse,
+    ReplyQuote, assistant_text_from_sse,
 };
