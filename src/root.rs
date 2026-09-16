@@ -13,7 +13,13 @@ use crate::state::AppState;
 
 use crate::components::circular_voice_viz::CircularVoiceViz;
 use crate::components::voice_mode_modal::render_voice_mode_modal;
-use gpui_kit::component::{ActiveTheme, Root};
+use gpui_kit::component::{ActiveTheme, Root, h_flex, v_flex};
+
+/// The title bar the window paints for itself (the system one is transparent, see main.rs):
+/// tall enough for the traffic lights, and the part the person drags the window by.
+const TITLE_BAR_HEIGHT: f32 = 44.;
+/// Past the traffic lights.
+const TITLE_BAR_LEFT_PAD: f32 = 80.;
 
 #[derive(Clone)]
 pub struct RootView {
@@ -173,6 +179,35 @@ impl Render for RootView {
 
         let viz = self.circular_viz.clone();
 
+        // The system title bar is transparent (see main.rs), so this strip IS the title bar:
+        // the app's name past the traffic lights, in the app's colours, and the part the
+        // person drags the window by.
+        let theme = cx.theme().clone();
+        let title_bar = h_flex()
+            .id("main-window-header")
+            .w_full()
+            .h(px(TITLE_BAR_HEIGHT))
+            .flex_shrink_0()
+            .pl(px(TITLE_BAR_LEFT_PAD))
+            .pr(px(12.))
+            .items_center()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .id("main-window-drag")
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("NativeChat")
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move()),
+            );
+
         div()
             .relative()
             .size_full()
@@ -180,7 +215,16 @@ impl Render for RootView {
             .key_context("Root")
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(self.layout.clone())
+            // The title bar, then the sidebar, chat and right pane in what is left.
+            .child(
+                v_flex().size_full().child(title_bar).child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .w_full()
+                        .child(self.layout.clone()),
+                ),
+            )
             .on_action({
                 let state = self.state.clone();
                 let root_focus = self.focus_handle.clone();

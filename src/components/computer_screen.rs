@@ -81,6 +81,16 @@ const TEACH_SCRIPT: &str = r#"
   window.__ncRelease = releaseModifiers;
   window.addEventListener('blur', releaseModifiers);
   document.addEventListener('visibilitychange', () => { if (document.hidden) releaseModifiers(); });
+
+  // The page's own background — the letterbox around the 1280×800 screen — in the colour the
+  // app asks for (see `paint_page`), so it follows the app's theme rather than noVNC's dark.
+  window.__ncPaint = (bg) => {
+    const css = document.getElementById('nc-theme')
+      || Object.assign(document.createElement('style'), {id: 'nc-theme'});
+    css.textContent = `html, body, #noVNC_container, #noVNC_screen, .noVNC_canvas, #noVNC_fallback_error { background: ${bg} !important; }`;
+    if (!css.parentNode) (document.head || document.documentElement).appendChild(css);
+    if (document.body) document.body.style.background = bg;
+  };
 })();
 "#;
 
@@ -117,6 +127,15 @@ impl ComputerScreen {
     ) -> Self {
         // The theme is app-wide; a toggle in the main window must repaint this one too.
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        // Every render paints the page, but the page may not have loaded by the first one;
+        // paint it once more when it has had time to.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| this.paint_page(cx));
+        })
+        .detach();
         let tape: Rc<RefCell<Vec<serde_json::Value>>> = Rc::new(RefCell::new(Vec::new()));
         let sink = tape.clone();
         let webview = window
@@ -157,6 +176,23 @@ impl ComputerScreen {
     fn release_keys(&self) {
         if let Ok(webview) = &self.webview {
             let _ = webview.evaluate_script("window.__ncRelease && window.__ncRelease();");
+        }
+    }
+
+    /// The page's own background — the letterbox around the 1280×800 screen — in the app's
+    /// background colour, so it is light in the light theme and dark in the dark one rather
+    /// than noVNC's dark whatever the theme. A no-op until the page has loaded.
+    fn paint_page(&self, cx: &App) {
+        if let Ok(webview) = &self.webview {
+            let gpui::Rgba { r, g, b, .. } = cx.theme().background.into();
+            let css = format!(
+                "rgb({}, {}, {})",
+                (r * 255.).round() as u8,
+                (g * 255.).round() as u8,
+                (b * 255.).round() as u8
+            );
+            let _ =
+                webview.evaluate_script(&format!("window.__ncPaint && window.__ncPaint('{css}');"));
         }
     }
 
@@ -226,6 +262,7 @@ fn save_tape(
 
 impl Render for ComputerScreen {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.paint_page(cx);
         let theme = cx.theme().clone();
         let teaching = self.teaching.is_some();
         let count = self.tape.borrow().len();

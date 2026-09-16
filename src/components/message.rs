@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
-use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width, is_narrow_viewport};
+use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width};
 use crate::components::message_actions::{MessageToolbar, TOOLBAR_W};
 use crate::state::{AppState, RightPane};
 use gpui_kit::component::text::TextView;
@@ -213,7 +213,6 @@ fn bubble_colors(is_me: bool, cx: &App) -> (Hsla, Hsla) {
 
 impl RenderOnce for MessageBubble {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let compact = is_narrow_viewport(f32::from(window.viewport_size().width));
         let row_key = format!("{}:{}", self.source_id, self.message_id);
         let hover_state = window.use_keyed_state(
             ElementId::Name(format!("msg-hover-{row_key}").into()),
@@ -238,12 +237,6 @@ impl RenderOnce for MessageBubble {
         };
         let hovered = *hover_state.read(cx) || self.picker_open || *menu_state.read(cx);
         let show_toolbar = self.show_footer && hovered && !peeking;
-        let show_ai_time = self.timestamps_ok
-            && !self.is_me
-            && self.show_footer
-            && hovered
-            && !compact
-            && !peeking;
         let (bg, fg) = bubble_colors(self.is_me, cx);
         let muted = cx.theme().muted_foreground;
         // Grok: max-width: min(88%, 640px, calc(100% - 82px)) with width: fit-content.
@@ -327,10 +320,13 @@ impl RenderOnce for MessageBubble {
         let reaction_bg = cx.theme().background;
         let reaction_border = cx.theme().border;
         let is_me = self.is_me;
-        // Sit on the bubble's bottom edge: half the 22px chip is on the fill.
+        // The bubble shrink-wraps its text up to `max_bubble`, and yields to the toolbar's
+        // slot beside it (wrapping sooner) rather than push the slot past the row's edge.
+        // The chip sits on the bubble's bottom edge: half of its 22px is on the fill.
         let bubble_stack = div()
             .relative()
-            .flex_shrink_0()
+            .flex_shrink(1.)
+            .min_w_0()
             .when(self.reaction.is_some(), |this| this.mb(px(12.)))
             .child(bubble)
             .when_some(self.reaction.clone(), |this, emoji| {
@@ -400,7 +396,6 @@ impl RenderOnce for MessageBubble {
             .when_some(toolbar, |this, toolbar| this.child(toolbar));
 
         let time_label = self.timestamp.clone().unwrap_or_default();
-        let peek_time = peeking || show_ai_time;
 
         let main = if self.is_me {
             h_flex()
@@ -426,7 +421,8 @@ impl RenderOnce for MessageBubble {
         let hover_state_row = hover_state.clone();
 
         // Grok: --sand-ts-peek shifts every row together; timestamps slide in from
-        // the right with --sand-ts-progress. Hover time is AI-only when not peeking.
+        // the right with --sand-ts-progress. The time shows only while peeking, never on
+        // hover: the space beside the bubble is the toolbar's alone.
         let body_row = div()
             .relative()
             .w_full()
@@ -442,13 +438,7 @@ impl RenderOnce for MessageBubble {
                     .items_center()
                     .justify_end()
                     .pl(px(10.))
-                    .opacity(if peeking {
-                        progress
-                    } else if peek_time {
-                        1.
-                    } else {
-                        0.
-                    })
+                    .opacity(if peeking { progress } else { 0. })
                     .child(
                         div()
                             .text_xs()
