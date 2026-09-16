@@ -234,6 +234,9 @@ impl Render for Layout {
         let expanded_width = state.sidebar_expanded_width;
         let right_pane = state.right_pane;
         let banner = state.computer_banner();
+        let computer_confirm = state
+            .computer_confirm
+            .map(|action| (action, state.active_bot_name()));
         let theme = cx.theme().clone();
         let main = if has_agent {
             self.chat.clone().into_any_element()
@@ -397,7 +400,109 @@ impl Render for Layout {
             .when_some(banner, |this, (title, detail)| {
                 this.child(update_banner(title, detail, &theme))
             })
+            .when_some(computer_confirm, |this, (action, name)| {
+                this.child(computer_confirm_overlay(
+                    self.state.clone(),
+                    action,
+                    name,
+                    &theme,
+                ))
+            })
     }
+}
+
+/// "Update Hexuria's computer?" — the question, what it means, Cancel and Confirm. Click
+/// outside or Cancel closes it; Confirm does the thing.
+fn computer_confirm_overlay(
+    app: Entity<AppState>,
+    action: crate::state::ComputerAction,
+    name: String,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    use crate::state::ComputerAction;
+    let (title, detail, verb) = match action {
+        ComputerAction::Update => (
+            format!("Update {name}'s computer?"),
+            "Rebuilds it on the newest image. Files and logins stay; installed apps and packages are removed. The computer is briefly unavailable while its data moves.",
+            "Update",
+        ),
+        ComputerAction::Reset => (
+            format!("Reset {name}'s computer?"),
+            "Starts fresh. Everything on this computer — files, logins, installed apps — is lost.",
+            "Reset",
+        ),
+    };
+    let confirm = Button::new("computer-confirm-yes").label(verb).on_click({
+        let app = app.clone();
+        move |_, _, cx| {
+            app.update(cx, |state, cx| state.confirm_computer_action(cx));
+        }
+    });
+    let confirm = match action {
+        ComputerAction::Update => confirm.primary(),
+        ComputerAction::Reset => confirm.danger(),
+    };
+    div()
+        .id("computer-confirm-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::black().opacity(0.32))
+        .on_mouse_down(MouseButton::Left, {
+            let app = app.clone();
+            move |_, _, cx| {
+                app.update(cx, |state, cx| state.close_computer_confirm(cx));
+            }
+        })
+        .child(
+            v_flex()
+                .id("computer-confirm")
+                .w(px(420.))
+                .bg(theme.popover)
+                .text_color(theme.foreground)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(14.))
+                .shadow_lg()
+                .px(px(20.))
+                .py(px(18.))
+                .gap(px(10.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(detail),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap(px(8.))
+                        .pt(px(6.))
+                        .child(
+                            Button::new("computer-confirm-cancel")
+                                .label("Cancel")
+                                .on_click({
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| {
+                                            state.close_computer_confirm(cx)
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(confirm),
+                ),
+        )
 }
 
 /// The pill over the app while a computer is being updated — title and the current phase.

@@ -160,8 +160,11 @@ impl Render for ComputerPane {
                     .coworker_computer
                     .as_ref()
                     .is_some_and(|s| s.image_stale()),
-                update_armed: state.computer_update_is_armed(),
-                reset_armed: state.computer_reset_is_armed(),
+                current: state
+                    .coworker_computer
+                    .as_ref()
+                    .and_then(|s| s.image.as_ref())
+                    .is_some_and(|image| !image.stale),
                 error: state.computer_action_error.clone().or_else(|| {
                     state
                         .coworker_computer
@@ -237,7 +240,7 @@ impl ComputerPane {
     ) -> impl IntoElement {
         v_flex()
             .size_full()
-            .child(pane_header(None, "", app.clone()))
+            .child(pane_header(None, "", Some(controls), app.clone()))
             .child(
                 v_flex()
                     .w_full()
@@ -246,7 +249,13 @@ impl ComputerPane {
                     .pt(px(8.))
                     .pb(px(16.))
                     .gap(px(12.))
-                    .child(screen_tile(has_screen, screen, app.clone(), theme))
+                    .child(screen_tile(
+                        has_screen,
+                        screen,
+                        box_id.map(str::to_string),
+                        app.clone(),
+                        theme,
+                    ))
                     .child(
                         div()
                             .w_full()
@@ -255,20 +264,26 @@ impl ComputerPane {
                             .text_color(muted)
                             .child(format!("{agent_name}'s screen")),
                     )
-                    .child(
-                        div()
-                            .w_full()
-                            .text_center()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(match box_id {
-                                Some(id) => format!("Computer {id}"),
-                                None => {
-                                    "No computer yet. The next turn may attach a local box.".into()
-                                }
-                            }),
-                    )
-                    .child(computer_controls(controls, muted, app.clone(), theme))
+                    .when(box_id.is_none(), |this| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .text_center()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("No computer yet. The next turn may attach a local box."),
+                        )
+                    })
+                    .when_some(controls.error.clone(), |this, error| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .text_center()
+                                .text_xs()
+                                .text_color(theme.danger)
+                                .child(error),
+                        )
+                    })
                     .child(if routines.is_empty() {
                         v_flex()
                             .w_full()
@@ -473,6 +488,7 @@ impl ComputerPane {
                     }
                 }) as Rc<dyn Fn(&mut App)>),
                 "Routine",
+                None,
                 app.clone(),
             ))
             .child(
@@ -698,90 +714,34 @@ pub struct ComputerControls {
     pub updating: bool,
     /// The box runs an older image than a new one would get.
     pub stale: bool,
-    pub update_armed: bool,
-    pub reset_armed: bool,
+    /// The provider compared images and they match: nothing to update to.
+    pub current: bool,
     /// Why the last action was refused, or how the last update failed.
     pub error: Option<String>,
 }
 
-/// The label a two-click button shows: armed, busy, or its resting word.
-pub fn confirm_label(armed: bool, busy: bool, rest: &'static str) -> &'static str {
-    if busy {
-        "Updating…"
-    } else if armed {
-        "Click again to confirm"
+/// A computer button's label: its resting word, or "Updating…" while an update runs.
+pub fn confirm_label(busy: bool, rest: &'static str) -> &'static str {
+    if busy { "Updating…" } else { rest }
+}
+
+/// The Update button's resting word: what the image comparison says. Unknown (a provider that
+/// cannot compare) stays "Update" so a person can still ask.
+pub fn update_rest_label(stale: bool, current: bool) -> &'static str {
+    if stale {
+        "Update available"
+    } else if current {
+        "Up to date"
     } else {
-        rest
+        "Update"
     }
 }
 
-/// Update and Reset for the coworker's computer, each a two-click control.
-fn computer_controls(
-    controls: &ComputerControls,
-    muted: Hsla,
-    app: Entity<AppState>,
-    theme: &gpui_kit::component::Theme,
-) -> impl IntoElement {
-    let update_label = confirm_label(
-        controls.update_armed,
-        controls.updating,
-        if controls.stale {
-            "Update available"
-        } else {
-            "Update"
-        },
-    );
-    let reset_label = confirm_label(controls.reset_armed, controls.updating, "Reset");
-    v_flex()
-        .w_full()
-        .gap(px(6.))
-        .child(
-            h_flex()
-                .w_full()
-                .gap(px(8.))
-                .child({
-                    let button = Button::new("computer-update")
-                        .label(update_label)
-                        .small()
-                        .disabled(!controls.present || controls.updating)
-                        .on_click({
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                app.update(cx, |state, cx| state.arm_computer_update(cx));
-                            }
-                        });
-                    if controls.update_armed || controls.stale {
-                        button.primary()
-                    } else {
-                        button
-                    }
-                })
-                .child(
-                    Button::new("computer-reset")
-                        .label(reset_label)
-                        .small()
-                        .disabled(!controls.present || controls.updating)
-                        .on_click({
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                app.update(cx, |state, cx| state.arm_computer_reset(cx));
-                            }
-                        }),
-                ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(if controls.reset_armed {
-                    "Reset starts fresh: files and logins on this computer are lost."
-                } else {
-                    "Update keeps your files and logins; installed packages are removed."
-                }),
-        )
-        .when_some(controls.error.clone(), |this, error| {
-            this.child(div().text_xs().text_color(theme.danger).child(error))
-        })
+impl ComputerControls {
+    /// Nothing to update, or nothing to update to: the Update button waits.
+    pub fn update_disabled(&self) -> bool {
+        !self.present || self.updating || (self.current && !self.stale)
+    }
 }
 
 /// The coworker's screen. The Open pill is the control: it appears on hover
@@ -790,6 +750,7 @@ fn computer_controls(
 fn screen_tile(
     has_screen: bool,
     screen: Option<Arc<gpui_kit::Image>>,
+    box_id: Option<String>,
     app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
@@ -831,6 +792,22 @@ fn screen_tile(
                     ),
             ),
         })
+        // The box's id, small, in the corner of the screen it names.
+        .when_some(box_id, |this, id| {
+            this.child(
+                div()
+                    .absolute()
+                    .bottom(px(6.))
+                    .right(px(8.))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .bg(gpui::black().opacity(0.45))
+                    .text_xs()
+                    .text_color(gpui::white())
+                    .child(id),
+            )
+        })
         .when(has_screen, |this| {
             this.child(
                 div()
@@ -870,8 +847,19 @@ fn screen_tile(
 fn pane_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: &'static str,
+    actions: Option<&ComputerControls>,
     app: Entity<AppState>,
 ) -> impl IntoElement {
+    // Update and Reset live up here as icons, apart from the close chevron, each behind a
+    // confirm dialog — the pane's body is for the screen, not for buttons.
+    let actions_app = app.clone();
+    let actions = actions.map(|controls| {
+        (
+            !controls.update_disabled(),
+            controls.present && !controls.updating,
+            controls.stale,
+        )
+    });
     h_flex()
         .id("computer-header")
         .w_full()
@@ -898,6 +886,36 @@ fn pane_header(
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
+                })
+                .when_some(actions, |this, (can_update, can_reset, stale)| {
+                    let update_app = actions_app.clone();
+                    let reset_app = actions_app.clone();
+                    this.child(
+                        icon_btn_enabled(
+                            "computer-update",
+                            "icons/download.svg",
+                            can_update,
+                            move |cx| {
+                                update_app.update(cx, |state, cx| {
+                                    state.open_computer_confirm(
+                                        crate::state::ComputerAction::Update,
+                                        cx,
+                                    )
+                                });
+                            },
+                        )
+                        .when(stale, |this| this.text_color(gpui::blue())),
+                    )
+                    .child(icon_btn_enabled(
+                        "computer-reset",
+                        "icons/reset.svg",
+                        can_reset,
+                        move |cx| {
+                            reset_app.update(cx, |state, cx| {
+                                state.open_computer_confirm(crate::state::ComputerAction::Reset, cx)
+                            });
+                        },
+                    ))
                 }),
         )
         .child(icon_btn(
@@ -907,6 +925,29 @@ fn pane_header(
                 app.update(cx, |state, cx| state.close_right_pane(cx));
             },
         ))
+}
+
+/// `icon_btn` that can be greyed out: no hover, no click, until there is something to do.
+fn icon_btn_enabled(
+    id: &'static str,
+    path: &'static str,
+    enabled: bool,
+    on_click: impl Fn(&mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| on_click(cx))
+        })
+        .when(!enabled, |this| this.opacity(0.35))
+        .child(Icon::default().path(path).size(px(16.)))
 }
 
 fn icon_btn(
