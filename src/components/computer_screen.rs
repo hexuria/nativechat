@@ -106,6 +106,13 @@ struct Teaching {
     events: Rc<RefCell<Vec<serde_json::Value>>>,
 }
 
+/// What became of the last tape: the line the title bar shows, and the recipe it became, so
+/// that line is a way through to the recipe rather than a notice.
+struct SavedTape {
+    line: String,
+    recipe: Option<String>,
+}
+
 /// A stopped tape waiting on Save or Discard: the events, and where the local copy went.
 struct PendingTape {
     started_at_ms: i64,
@@ -128,7 +135,7 @@ pub struct ComputerScreen {
     teaching: Option<Teaching>,
     /// What became of the last tape, in the title bar: the recipe it was saved as, or that
     /// it was let go.
-    last_saved: Option<String>,
+    last_saved: Option<SavedTape>,
     /// The app: its client uploads a tape, and its Recipes list is refreshed after.
     app: Entity<AppState>,
     /// A stopped tape waiting on Save or Discard, with the sheet under the title bar.
@@ -327,8 +334,10 @@ impl ComputerScreen {
                             .map(|version| (version.version, version.body.steps.len()))
                             .unwrap_or((2, 0));
                         this.pending = None;
-                        this.last_saved =
-                            Some(format!("Saved as {name} · v{version} has {steps} steps"));
+                        this.last_saved = Some(SavedTape {
+                            line: format!("Saved as {name} · v{version} has {steps} steps"),
+                            recipe: Some(detail.recipe.id.clone()),
+                        });
                         this.app.update(cx, |state, cx| state.refresh_recipes(cx));
                     }
                     Err(error) => this.save_error = Some(error.message),
@@ -342,7 +351,10 @@ impl ComputerScreen {
     /// Let the tape go; the local copy stays where it is.
     fn discard_tape(&mut self, cx: &mut Context<Self>) {
         if let Some(pending) = self.pending.take() {
-            self.last_saved = Some(format!("Not saved · {}", pending.backup));
+            self.last_saved = Some(SavedTape {
+                line: format!("Not saved · {}", pending.backup),
+                recipe: None,
+            });
         }
         self.save_error = None;
         cx.notify();
@@ -467,6 +479,33 @@ impl Render for ComputerScreen {
         // The sheet holds a tape until it is saved or let go; no new tape until then.
         let waiting = self.pending.is_some() || self.saving;
         let count = self.tape.borrow().len();
+        // What became of the last tape. Once it is a recipe, the line is the way to it: the
+        // main window opens that recipe's page and comes forward.
+        let saved = self.last_saved.as_ref().map(|saved| match &saved.recipe {
+            Some(recipe) => div()
+                .id("teach-saved-recipe")
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.foreground))
+                .on_click({
+                    let app = self.app.clone();
+                    let recipe = recipe.clone();
+                    move |_, _, cx| {
+                        app.update(cx, |state, cx| {
+                            state.show_recipes_in_main_window(Some(recipe.clone()), cx);
+                        });
+                    }
+                })
+                .child(saved.line.clone())
+                .into_any_element(),
+            None => div()
+                .id("teach-saved")
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(saved.line.clone())
+                .into_any_element(),
+        });
         let header = h_flex()
             .id("computer-window-header")
             .w_full()
@@ -493,14 +532,7 @@ impl Render for ComputerScreen {
                     .child(self.title.clone())
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move()),
             )
-            .when_some(self.last_saved.clone(), |this, note| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(note),
-                )
-            })
+            .when_some(saved, |this, note| this.child(note))
             .when(teaching, |this| {
                 this.child(
                     div()
@@ -509,6 +541,27 @@ impl Render for ComputerScreen {
                         .child(format!("Recording · {count} events")),
                 )
             })
+            // This window draws no pages: the Recipes page belongs to the main window, and
+            // this asks that window for it.
+            .child(
+                Button::new("screen-recipes")
+                    .small()
+                    .label("Recipes")
+                    .icon(
+                        Icon::default()
+                            .path("icons/library.svg")
+                            .size(px(14.))
+                            .text_color(theme.foreground),
+                    )
+                    .on_click({
+                        let app = self.app.clone();
+                        move |_, _, cx| {
+                            app.update(cx, |state, cx| {
+                                state.show_recipes_in_main_window(None, cx);
+                            });
+                        }
+                    }),
+            )
             .child({
                 let button = Button::new("teach-task")
                     .small()
