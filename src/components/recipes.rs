@@ -8,13 +8,13 @@
 
 use std::rc::Rc;
 
-use crate::chrome::HEADER_PX;
+use crate::chrome::{HEADER_PX, chat_column_width};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     RecipeDetail, RecipeRelation, RecipeRun, RecipeScreen, RecipeShareTarget, RecipeStep,
     RecipeSummary, RecipeTapeEvent, RecipeVersion,
 };
-use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome};
+use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome, RightPane};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -59,6 +59,28 @@ const RUNS_PER_VERSION: usize = 5;
 /// The column kept for what a run or a step left behind — screenshots, a recording. It is
 /// empty until the server asks the box for artifacts, keeps them and serves them.
 const ARTIFACTS_W: f32 = 28.;
+/// The air above the filter chips, under the window's title bar, and the same again below
+/// them: the chips were sitting on the bar and the first card was sitting on the chips.
+const LIST_GAP: f32 = 50.;
+/// Under the last card, so the list does not end flush with the bottom of the window.
+const LIST_BOTTOM_PAD: f32 = 32.;
+/// A card's side padding, and what it spends instead in a column too narrow to afford it.
+const ROW_PAD: f32 = 18.;
+const ROW_PAD_NARROW: f32 = 14.;
+/// The gap between two cards. Wider than the gaps inside one, so a card reads as a thing of
+/// its own rather than as another line of the same block.
+const ROW_GAP: f32 = 12.;
+/// Below this column width a name has no room beside a badge, so the badge drops down to the
+/// facts and the name keeps the line to itself.
+const ROW_STACK_W: f32 = 520.;
+/// The empty state, however short the page is: enough for the icon, the headline and the
+/// sentence with air around them, and it scrolls rather than being squeezed below that.
+const EMPTY_MIN_H: f32 = 260.;
+/// The disc the page's own icon sits in, above the empty state's headline.
+const EMPTY_ICON_BOX: f32 = 56.;
+/// A line of the empty state's copy: short enough to be taken in at a glance, whatever the
+/// window is doing.
+const EMPTY_COPY_MAX: f32 = 380.;
 
 /// What a step does, apart from what it does it to: what Add step offers, and what decides
 /// whether a row's editor is the field in its Details cell or the modal.
@@ -693,7 +715,7 @@ impl Render for RecipesView {
             .child(if open {
                 self.detail(&theme, cx)
             } else {
-                self.list(&theme, cx)
+                self.list(window, &theme, cx)
             })
             .when_some(self.step_modal, |this, modal| {
                 this.child(self.step_modal_overlay(modal, &view, &theme, cx))
@@ -708,11 +730,13 @@ impl Render for RecipesView {
 }
 
 impl RecipesView {
-    /// The list: the filter chips, then a row per recipe.
-    fn list(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The list: the filter chips, then a card per recipe in the page's centred column. The
+    /// chips stand clear of the title bar above them and of the first card below them, and an
+    /// empty list takes the rest of the page and stands in the middle of it.
+    fn list(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let app = self.state.clone();
         let muted = theme.muted_foreground;
-        let (filter, recipes, loading, error, me, last_runs) = {
+        let (filter, recipes, loading, error, me, last_runs, page_width) = {
             let state = self.state.read(cx);
             (
                 state.recipes_filter,
@@ -721,69 +745,99 @@ impl RecipesView {
                 state.recipes_error.clone(),
                 state.account.as_ref().map(|account| account.id.clone()),
                 state.recipe_last_runs.clone(),
+                // The page takes the chat's slot, so the chat's width is this page's width.
+                chat_column_width(
+                    f32::from(window.viewport_size().width),
+                    state.sidebar_hidden,
+                    state.sidebar_collapsed,
+                    state.sidebar_expanded_width,
+                    state.right_pane != RightPane::Closed,
+                ),
             )
         };
+        let stacked = row_stacks(list_column_width(page_width));
         let pending = recipes
             .iter()
             .filter(|recipe| recipe.is_pending_invite())
             .count();
-        let empty_copy = match filter {
-            RecipeFilter::Mine => "Nothing taught yet. Open a bot's computer and use Teach a task.",
-            RecipeFilter::Shared => "Nothing has been shared with you.",
-            RecipeFilter::Org => "Nothing in your org yet.",
-        };
+        let waiting = loading && recipes.is_empty();
+        let empty = !loading && recipes.is_empty();
         v_flex()
             .size_full()
             .child(
-                div()
+                v_flex()
                     .id("recipes-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .px(px(HEADER_PX))
-                    .pb(px(24.))
-                    .child(centered(
-                        column()
-                            .child(
-                                h_flex().id("recipes-filters").gap(px(6.)).children(
+                    .pt(px(LIST_GAP))
+                    .pb(px(LIST_BOTTOM_PAD))
+                    .child(
+                        centered(
+                            h_flex()
+                                .id("recipes-filters")
+                                .w_full()
+                                .max_w(px(COLUMN_MAX))
+                                .gap(px(8.))
+                                // Three chips in a narrow window take a second line rather
+                                // than run off the side of it.
+                                .flex_wrap()
+                                .children(
                                     RecipeFilter::ALL
                                         .into_iter()
                                         .map(|chip| filter_chip(chip, filter, app.clone())),
                                 ),
-                            )
-                            .when_some(error, |this, error| {
-                                this.child(
-                                    div()
-                                        .id("recipes-error")
-                                        .text_xs()
-                                        .text_color(theme.danger)
-                                        .child(error),
-                                )
-                            })
-                            .when(loading && recipes.is_empty(), |this| {
-                                this.child(div().text_sm().text_color(muted).child("Loading…"))
-                            })
-                            .when(!loading && recipes.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .id("recipes-empty")
-                                        .text_sm()
-                                        .text_color(muted)
-                                        .child(empty_copy),
-                                )
-                            })
-                            .children(recipes.into_iter().map(|recipe| {
-                                let last_run = last_runs.get(&recipe.id).copied();
-                                recipe_row(
-                                    recipe,
-                                    last_run,
-                                    me.as_deref(),
-                                    pending == 1,
-                                    app.clone(),
-                                    theme,
-                                )
-                            })),
-                    )),
+                        )
+                        .id("recipes-filter-bar")
+                        .flex_shrink_0()
+                        .pb(px(LIST_GAP)),
+                    )
+                    .when_some(error, |this, error| {
+                        this.child(centered(
+                            div()
+                                .id("recipes-error")
+                                .w_full()
+                                .max_w(px(COLUMN_MAX))
+                                .pb(px(12.))
+                                .text_xs()
+                                .text_color(theme.danger)
+                                .child(error),
+                        ))
+                    })
+                    .when(waiting, |this| {
+                        this.child(
+                            v_flex()
+                                .id("recipes-loading")
+                                .w_full()
+                                .flex_1()
+                                .min_h(px(EMPTY_MIN_H))
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .text_color(muted)
+                                .child("Loading…"),
+                        )
+                    })
+                    .when(empty, |this| this.child(empty_state(filter, theme)))
+                    .when(!recipes.is_empty(), move |this| {
+                        this.child(centered(
+                            column().id("recipes-list").gap(px(ROW_GAP)).children(
+                                recipes.into_iter().map(|recipe| {
+                                    let last_run = last_runs.get(&recipe.id).copied();
+                                    recipe_row(
+                                        recipe,
+                                        last_run,
+                                        me.as_deref(),
+                                        pending == 1,
+                                        stacked,
+                                        app.clone(),
+                                        theme,
+                                    )
+                                }),
+                            ),
+                        ))
+                    }),
             )
             .into_any_element()
     }
@@ -2755,14 +2809,31 @@ fn last_run_section(run: &RecipeRunOutcome, detail: &RecipeDetail, theme: &Theme
         .into_any_element()
 }
 
-/// One row of the list: the name, the description, whose it is, how many versions it has and
-/// what its last run came to — and Accept and Decline when it is a share waiting on the
-/// person. The whole row opens the recipe.
+/// The column the list draws in, from the width of the page's own slot: what is left of the
+/// slot once the body has taken its padding, and never wider than the page's column.
+fn list_column_width(page_width: f32) -> f32 {
+    if !page_width.is_finite() {
+        return COLUMN_MAX;
+    }
+    (page_width - 2. * HEADER_PX).clamp(0., COLUMN_MAX)
+}
+
+/// Whether a card stacks what it holds rather than laying it out across the column. A width
+/// of zero is a window that has not been measured yet, and is taken as the roomy case.
+fn row_stacks(column_width: f32) -> bool {
+    column_width > 0. && column_width < ROW_STACK_W
+}
+
+/// One card of the list: the name as its headline, the description quieter under it, and the
+/// facts — whose it is, how many versions it has, what its last run came to and when — as
+/// small print grouped beneath that. Accept and Decline join them while a share is waiting on
+/// the person. The whole card opens the recipe.
 fn recipe_row(
     recipe: RecipeSummary,
     last_run: Option<RecipeRunNote>,
     me: Option<&str>,
     single_pending: bool,
+    stacked: bool,
     app: Entity<AppState>,
     theme: &Theme,
 ) -> AnyElement {
@@ -2789,20 +2860,50 @@ fn recipe_row(
             format!("recipe-decline-{id}"),
         )
     };
-    let run_line = last_run.map(|note| format!("{} · {}", note.label(), format_time(note.at_ms)));
+    let name = if recipe.name.trim().is_empty() {
+        "Untitled task".to_string()
+    } else {
+        recipe.name.clone()
+    };
+    let description = recipe.description.trim().to_string();
+    let facts = format!(
+        "by {owner} · {}",
+        count_of(recipe.latest_version as usize, "version")
+    );
+    // A share waiting on the person is the one thing on the card they have to answer, so its
+    // badge takes the ink; the rest only name a relation and stay quiet.
+    let relation_badge =
+        relation.map(|label| pill(label, if pending { theme.primary } else { muted }));
+    // Wide, the badge sits beside the name; narrow, it drops in with the facts so the name
+    // keeps the line to itself instead of being squeezed into a word and an ellipsis.
+    let (head_badge, meta_badge) = if stacked {
+        (None, relation_badge)
+    } else {
+        (relation_badge, None)
+    };
+    let run_badge = last_run.map(|note| {
+        pill(
+            note.label(),
+            status_tone(if note.ok { theme.success } else { theme.danger }, theme),
+        )
+    });
+    let run_time = last_run.map(|note| format_time(note.at_ms));
     v_flex()
         .id(SharedString::from(format!("recipe-{id}")))
         .w_full()
-        .gap(px(4.))
-        .px(px(14.))
-        .py(px(12.))
-        .rounded(px(12.))
+        .gap(px(6.))
+        .px(px(if stacked { ROW_PAD_NARROW } else { ROW_PAD }))
+        .py(px(14.))
+        .rounded(px(14.))
         .border_1()
         .border_color(theme.border)
         .cursor_pointer()
+        // The card lifts under the pointer: the whole of it is the way into the recipe, not
+        // the chevron at the end of its first line.
         .hover(|s| {
-            s.bg(rgb(0x777777).opacity(0.12))
-                .border_color(theme.primary)
+            s.bg(rgb(0x777777).opacity(0.1))
+                .border_color(theme.primary.opacity(0.4))
+                .shadow_sm()
         })
         .on_click({
             let app = app.clone();
@@ -2815,36 +2916,35 @@ fn recipe_row(
             h_flex()
                 .w_full()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(10.))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_sm()
+                        .text_base()
                         .font_weight(FontWeight::SEMIBOLD)
                         .truncate()
-                        .child(if recipe.name.trim().is_empty() {
-                            "Untitled task".to_string()
-                        } else {
-                            recipe.name.clone()
-                        }),
+                        .child(name),
                 )
-                .when_some(relation, |this, label| {
-                    this.child(badge(label, muted, theme))
-                })
+                .children(head_badge)
                 .child(
-                    Icon::new(IconName::ChevronRight)
-                        .size(px(14.))
-                        .text_color(muted),
+                    div().flex_shrink_0().flex().items_center().child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(16.))
+                            .text_color(muted),
+                    ),
                 ),
         )
-        .when(!recipe.description.trim().is_empty(), |this| {
+        .when(!description.is_empty(), |this| {
             this.child(
                 div()
-                    .text_xs()
+                    .w_full()
+                    .text_sm()
                     .text_color(muted)
-                    .truncate()
-                    .child(recipe.description.clone()),
+                    // Two lines of it: a long description wraps in a narrow column rather than
+                    // being cut off after a few words, and a card still cannot run away.
+                    .line_clamp(2)
+                    .child(description),
             )
         })
         .child(
@@ -2852,25 +2952,27 @@ fn recipe_row(
                 .w_full()
                 .items_center()
                 .gap(px(8.))
+                .pt(px(4.))
+                // The facts sit together at the left rather than stretching to both edges of
+                // the card, and take a second line when the column is too narrow for them.
+                .flex_wrap()
                 .child(
                     div()
-                        .flex_1()
                         .min_w_0()
                         .text_xs()
                         .text_color(muted)
                         .truncate()
-                        .child(format!(
-                            "by {owner} · {}",
-                            count_of(recipe.latest_version as usize, "version")
-                        )),
+                        .child(facts),
                 )
-                .when_some(run_line, |this, line| {
+                .children(meta_badge)
+                .children(run_badge)
+                .when_some(run_time, |this, time| {
                     this.child(
                         div()
                             .flex_shrink_0()
                             .text_xs()
                             .text_color(muted)
-                            .child(line),
+                            .child(time),
                     )
                 }),
         )
@@ -2878,7 +2980,8 @@ fn recipe_row(
             this.child(
                 h_flex()
                     .gap(px(8.))
-                    .pt(px(4.))
+                    .pt(px(6.))
+                    .flex_wrap()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(answer_button(
                         SharedString::from(accept_id),
@@ -2899,6 +3002,97 @@ fn recipe_row(
             )
         })
         .into_any_element()
+}
+
+/// An empty list is not an error: the page's own icon, what is missing, why, and — where
+/// there is one — the thing a person would do to fill it. It stands in the middle of what is
+/// left of the page rather than hanging under the chips.
+fn empty_state(filter: RecipeFilter, theme: &Theme) -> AnyElement {
+    let (headline, sentence, hint) = empty_words(filter);
+    let muted = theme.muted_foreground;
+    v_flex()
+        .id("recipes-empty")
+        .w_full()
+        .flex_1()
+        .min_h(px(EMPTY_MIN_H))
+        .items_center()
+        .justify_center()
+        .gap(px(10.))
+        .child(
+            div()
+                .id("recipes-empty-icon")
+                .size(px(EMPTY_ICON_BOX))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_color(theme.border)
+                .bg(muted.opacity(0.08))
+                .child(
+                    Icon::default()
+                        .path("icons/record.svg")
+                        .size(px(22.))
+                        .text_color(muted),
+                ),
+        )
+        .child(
+            div()
+                .text_base()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_center()
+                .child(headline),
+        )
+        .child(
+            div()
+                .max_w(px(EMPTY_COPY_MAX))
+                .text_sm()
+                .text_color(muted)
+                .text_center()
+                .child(sentence),
+        )
+        .when_some(hint, |this, hint| {
+            this.child(
+                div()
+                    .id("recipes-empty-hint")
+                    .max_w(px(EMPTY_COPY_MAX))
+                    .mt(px(2.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .text_color(muted)
+                    .text_center()
+                    .child(hint),
+            )
+        })
+        .into_any_element()
+}
+
+/// What an empty list says under each chip: the headline, the sentence under it, and the step
+/// that would fill it where the person is the one who would take it — nobody can make another
+/// person share a task with them, so that one ends at the sentence.
+fn empty_words(filter: RecipeFilter) -> (&'static str, &'static str, Option<&'static str>) {
+    match filter {
+        RecipeFilter::Mine => (
+            "No tasks taught yet",
+            "A recipe is a task you teach a bot once on its computer; it plays that back whenever you ask.",
+            Some("Open a bot's computer and use Teach a task."),
+        ),
+        RecipeFilter::Shared => (
+            "Nothing shared with you",
+            "A task someone shares with you waits here until you accept it.",
+            None,
+        ),
+        RecipeFilter::Org => (
+            "Nothing in your org yet",
+            "Tasks shared with the whole org land here, for anyone in it to run.",
+            Some("Open one of your own and use Share with org."),
+        ),
+    }
 }
 
 /// Accept or Decline a shared recipe; the click stays off the row under it.
@@ -3133,7 +3327,7 @@ fn column() -> Div {
 }
 
 /// The column in the middle of the slot, however wide the slot is.
-fn centered(column: Div) -> Div {
+fn centered(column: impl IntoElement) -> Div {
     div().w_full().flex().justify_center().child(column)
 }
 
@@ -3146,6 +3340,35 @@ fn section_title(label: &'static str) -> Div {
 
 fn field_label(label: &'static str, muted: Hsla) -> Div {
     div().text_xs().text_color(muted).child(label)
+}
+
+/// A status colour as words rather than as a fill. The theme pitches success and danger for
+/// a filled button, where what is written on them is white; on a light page the same green and
+/// red are too pale to read, so a light theme takes them a shade deeper.
+fn status_tone(tone: Hsla, theme: &Theme) -> Hsla {
+    if theme.is_dark() {
+        return tone;
+    }
+    let mut deeper = tone;
+    deeper.l *= 0.72;
+    deeper
+}
+
+/// A small pill: a word or two tinted by what they say — a relation, or what a run came to.
+/// The tint is faint and the text is not, so the fact reads at a glance without shouting over
+/// the name above it.
+fn pill(label: impl Into<SharedString>, tone: Hsla) -> Div {
+    div()
+        .flex_shrink_0()
+        .px(px(8.))
+        .py(px(2.))
+        .rounded_full()
+        .bg(tone.opacity(0.12))
+        .border_1()
+        .border_color(tone.opacity(0.3))
+        .text_xs()
+        .text_color(tone)
+        .child(label.into())
 }
 
 fn badge(label: &'static str, muted: Hsla, theme: &Theme) -> Div {
@@ -3201,9 +3424,10 @@ mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over
     // the one the test harness wants.
     use super::{
-        RecipeDetail, RecipeScreen, RecipeStep, RecipeTapeEvent, RecipeVersion, StepKind,
-        build_step, event_offset, granted_summary, runs_of, shown_version, step_param_values,
-        step_words, tape_words, version_kind,
+        COLUMN_MAX, RecipeDetail, RecipeFilter, RecipeScreen, RecipeStep, RecipeTapeEvent,
+        RecipeVersion, StepKind, build_step, empty_words, event_offset, granted_summary,
+        list_column_width, row_stacks, runs_of, shown_version, step_param_values, step_words,
+        tape_words, version_kind,
     };
     use serde_json::{Value, json};
 
@@ -3422,6 +3646,48 @@ mod tests {
 
     fn values(typed: &[&str]) -> Vec<String> {
         typed.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn a_card_stacks_its_badge_once_the_column_is_narrow() {
+        assert_eq!(
+            list_column_width(2000.),
+            COLUMN_MAX,
+            "the column is capped however wide the window is"
+        );
+        assert!(!row_stacks(list_column_width(1200.)));
+        assert!(
+            row_stacks(list_column_width(480.)),
+            "a phone-width window has no room beside the name"
+        );
+        assert!(
+            !row_stacks(list_column_width(0.)),
+            "a window that has not been measured yet is not a narrow one"
+        );
+    }
+
+    #[test]
+    fn every_filter_says_what_is_missing_and_what_would_fill_it() {
+        let mut headlines = Vec::new();
+        for filter in RecipeFilter::ALL {
+            let (headline, sentence, _) = empty_words(filter);
+            assert!(!headline.is_empty() && !sentence.is_empty());
+            headlines.push(headline);
+        }
+        headlines.sort_unstable();
+        headlines.dedup();
+        assert_eq!(headlines.len(), 3, "each chip has its own empty state");
+        assert!(
+            empty_words(RecipeFilter::Mine)
+                .2
+                .is_some_and(|hint| hint.contains("Teach a task")),
+            "the hint names the control that fills the list"
+        );
+        assert_eq!(
+            empty_words(RecipeFilter::Shared).2,
+            None,
+            "there is nothing a person can do to be shared with"
+        );
     }
 
     #[test]
