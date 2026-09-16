@@ -13,11 +13,15 @@ pub const AVATAR_PX: f32 = 36.0;
 pub const AVATAR_TRIGGER_PX: f32 = 64.0;
 pub const MASCOT_BOX_PX: f32 = 46.0;
 pub const AUTO_COLLAPSE_WIDTH: f32 = 900.0;
-/// The header row of the chat pane and of every right pane (Settings, Computer, Routine):
-/// one height, so a title or control in one sits level with those in the others.
-pub const PANE_HEADER_H: f32 = 60.0;
-/// The header rows' horizontal padding: the chat header's, kept by the right panes.
-pub const PANE_HEADER_PX: f32 = 16.0;
+/// The window's title bar, which the app paints itself (see main.rs and title_bar.rs): the
+/// traffic lights at the left, then the chat's and the right pane's headers over their
+/// columns. 52px centres the 28px controls and, with the light position in main.rs, the
+/// traffic lights.
+pub const TITLE_BAR_H: f32 = 52.0;
+/// Past the traffic lights; nothing sits under them.
+pub const TITLE_BAR_LEFT_PAD: f32 = 80.0;
+/// The headers' horizontal padding, in the title bar and in a floating pane.
+pub const HEADER_PX: f32 = 16.0;
 /// Below this chat-column width, timestamps (hover and peek) are hidden —
 /// Grok keeps an 82px rail, but a squeezed bubble makes the time useless.
 pub const CHAT_TIMESTAMP_MIN_WIDTH: f32 = 480.0;
