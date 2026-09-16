@@ -35,6 +35,9 @@ pub struct MessageBubble {
     debug_mode: bool,
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_color: Option<Hsla>,
+    /// Being read aloud right now / paused mid-read: the toolbar's menu says so.
+    native_speaking: bool,
+    native_paused: bool,
     find_marks: Vec<(std::ops::Range<usize>, bool)>,
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_reply: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
@@ -62,6 +65,8 @@ impl MessageBubble {
             debug_mode: false,
             highlight_range: None,
             highlight_color: None,
+            native_speaking: false,
+            native_paused: false,
             find_marks: Vec::new(),
             on_read_aloud: None,
             on_reply: None,
@@ -186,10 +191,12 @@ impl MessageBubble {
         self
     }
 
-    pub fn is_native_speaking(self, _is: bool) -> Self {
+    pub fn is_native_speaking(mut self, is: bool) -> Self {
+        self.native_speaking = is;
         self
     }
-    pub fn is_native_paused(self, _is: bool) -> Self {
+    pub fn is_native_paused(mut self, is: bool) -> Self {
+        self.native_paused = is;
         self
     }
     pub fn is_native_loading(self, _is: bool) -> Self {
@@ -399,6 +406,7 @@ impl RenderOnce for MessageBubble {
             let menu_state = menu_state.clone();
             Some(
                 MessageToolbar::new(app, row_key.clone(), source_id)
+                    .reading(self.native_speaking, self.native_paused)
                     .message_text(self.copy_text.clone())
                     .preview(preview)
                     .is_me(self.is_me)

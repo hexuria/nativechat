@@ -94,6 +94,11 @@ impl TtsService {
     pub fn pause_native(&self) {
         #[cfg(target_os = "macos")]
         if let Some(bridge) = &self.native_provider {
+            // Pausing an idle synthesizer leaves it paused for the next utterance, which then
+            // starts and halts at once; only a running one is paused.
+            if !bridge.is_speaking() || self.native_paused.load(Ordering::SeqCst) {
+                return;
+            }
             bridge.pause();
             self.native_paused.store(true, Ordering::SeqCst);
         }

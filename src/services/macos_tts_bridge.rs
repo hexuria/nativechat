@@ -148,8 +148,12 @@ impl MacTtsBridge {
         }
     }
 
+    /// Stops, whether or not the synthesizer is paused. A paused NSSpeechSynthesizer keeps its
+    /// paused state across `stopSpeaking` / `startSpeakingString:`, so the next utterance starts
+    /// and halts at once and `isSpeaking` stays YES forever; lifting the pause first is the cure.
     pub fn stop(&self) {
         unsafe {
+            let _: () = msg_send![self.synthesizer, continueSpeaking];
             let _: () = msg_send![self.synthesizer, stopSpeaking];
         }
     }

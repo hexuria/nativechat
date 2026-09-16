@@ -32,6 +32,10 @@ pub struct MessageToolbar {
     on_read_aloud: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_reply: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     on_menu_open: Option<Rc<dyn Fn(bool, &mut App)>>,
+    /// This message is the one being read aloud (and whether it is paused), so the menu says
+    /// what a click will do instead of "Read aloud" again.
+    reading: bool,
+    paused: bool,
 }
 
 impl MessageToolbar {
@@ -50,7 +54,15 @@ impl MessageToolbar {
             on_read_aloud: None,
             on_reply: None,
             on_menu_open: None,
+            reading: false,
+            paused: false,
         }
+    }
+
+    pub fn reading(mut self, reading: bool, paused: bool) -> Self {
+        self.reading = reading;
+        self.paused = paused;
+        self
     }
 
     pub fn message_text(mut self, text: impl Into<String>) -> Self {
@@ -189,6 +201,12 @@ impl RenderOnce for MessageToolbar {
                     let source_id = source_id.clone();
                     let text = self.message_text.clone();
                     let on_read_aloud = self.on_read_aloud.clone();
+                    let (reading, paused) = (self.reading, self.paused);
+                    let (read_label, read_icon) = match (reading, paused) {
+                        (true, true) => ("Resume reading", NativeIcon::Play),
+                        (true, false) => ("Pause reading", NativeIcon::Pause),
+                        _ => ("Read aloud", NativeIcon::ReadAloud),
+                    };
                     move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::new("Delete")
@@ -205,8 +223,8 @@ impl RenderOnce for MessageToolbar {
                                 }),
                         )
                         .item(
-                            PopupMenuItem::new("Read aloud")
-                                .icon(Icon::new(NativeIcon::ReadAloud))
+                            PopupMenuItem::new(read_label)
+                                .icon(Icon::new(read_icon))
                                 .on_click({
                                     let on_read_aloud = on_read_aloud.clone();
                                     move |_, window, cx| {
@@ -217,6 +235,19 @@ impl RenderOnce for MessageToolbar {
                                     }
                                 }),
                         )
+                        .when(reading, |menu| {
+                            menu.item(
+                                PopupMenuItem::new("Stop reading")
+                                    .icon(Icon::new(NativeIcon::ReadAloud))
+                                    .on_click({
+                                        let app = app.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            app.update(cx, |state, cx| state.stop_read_aloud(cx));
+                                        }
+                                    }),
+                            )
+                        })
                         .item(
                             PopupMenuItem::new("Copy")
                                 .icon(Icon::new(IconName::Copy))

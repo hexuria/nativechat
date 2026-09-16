@@ -3707,7 +3707,9 @@ impl AppState {
         if let Some(service) = &self.tts_service {
             if self.native_tts.message_id.is_some() && !self.native_tts.is_paused {
                 service.pause_native();
-                self.native_tts.is_paused = true;
+                self.native_tts.is_paused = service
+                    .native_paused
+                    .load(std::sync::atomic::Ordering::SeqCst);
             }
             cx.notify();
         }
@@ -3729,6 +3731,9 @@ impl AppState {
             .and_then(|s| s.get_active_word_range())
     }
 
+    /// The one entry the menu and F8 use: reads a message; on the message being read, pauses;
+    /// on a paused one, resumes. A message still loading its voice is left alone, so a double
+    /// click cannot pause a synthesizer that has not started (which would wedge the next start).
     pub fn toggle_read_aloud(
         &mut self,
         message_id: String,
@@ -3737,22 +3742,24 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let _ = mode;
-        if let Some(service) = &self.tts_service {
-            if self.native_tts.message_id.as_ref() == Some(&message_id) {
-                if self.native_tts.is_paused {
-                    service.resume_native();
-                    self.native_tts.is_paused = false;
-                } else {
-                    service.pause_native();
-                    self.native_tts.is_paused = true;
-                }
-                cx.notify();
-            } else {
-                self.read_aloud(text, message_id, TtsSource::Native, cx);
+        if self.native_tts.message_id.as_ref() == Some(&message_id) {
+            if self.native_tts.is_loading {
+                return;
             }
-        } else {
-            self.read_aloud(text, message_id, TtsSource::Native, cx);
+            if self.native_tts.is_paused {
+                self.resume_read_aloud(cx);
+            } else {
+                self.pause_read_aloud(cx);
+            }
+            return;
         }
+        self.read_aloud(text, message_id, TtsSource::Native, cx);
+    }
+
+    /// Whether this message is the one being read, and whether it is paused.
+    pub fn read_aloud_state(&self, message_id: &str) -> (bool, bool) {
+        let reading = self.native_tts.message_id.as_deref() == Some(message_id);
+        (reading, reading && self.native_tts.is_paused)
     }
 }
 
