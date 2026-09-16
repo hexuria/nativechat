@@ -17,6 +17,60 @@ pub enum ChatPart {
     Ui(UiSpec),
     /// A tool the person must allow or refuse before the run continues.
     Approval(ApprovalSpec),
+    /// The bot's screen after a `computer` action: a picture in the feed.
+    Screenshot(ScreenshotSpec),
+}
+
+/// A screenshot the run produced, decoded once and shared by every row that paints it.
+#[derive(Debug, Clone)]
+pub struct ScreenshotSpec {
+    pub call_id: String,
+    /// The tool's own words, e.g. "clicking at 120,40; screenshot of the 1280x800 screen attached".
+    pub caption: String,
+    pub image: std::sync::Arc<gpui_kit::Image>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PartialEq for ScreenshotSpec {
+    /// One screenshot per call: the bytes need not be compared to know it is the same one.
+    fn eq(&self, other: &Self) -> bool {
+        self.call_id == other.call_id
+            && self.caption == other.caption
+            && self.width == other.width
+            && self.height == other.height
+    }
+}
+
+impl ScreenshotSpec {
+    /// From a `TOOL_CALL_RESULT` frame's `image` (`{mime, base64, width, height}`), or `None`
+    /// when it is not a PNG we can paint.
+    pub fn from_frame(call_id: &str, caption: &str, image: &Value) -> Option<Self> {
+        use base64::Engine as _;
+        let mime = image
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or("image/png");
+        if mime != "image/png" {
+            return None;
+        }
+        let encoded = image.get("base64").and_then(Value::as_str)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let width = image.get("width").and_then(Value::as_u64)? as u32;
+        let height = image.get("height").and_then(Value::as_u64)? as u32;
+        Some(Self {
+            call_id: call_id.to_string(),
+            caption: caption.to_string(),
+            image: std::sync::Arc::new(gpui_kit::Image::from_bytes(
+                gpui_kit::ImageFormat::Png,
+                bytes,
+            )),
+            width,
+            height,
+        })
+    }
 }
 
 /// The fields `POST /ag-ui/runs/{runId}/answer` needs, plus what the card shows.
@@ -319,8 +373,17 @@ impl TurnAssembler {
         if let Some(ChatPart::Approval(spec)) = self.committed.iter_mut().find(
             |part| matches!(part, ChatPart::Approval(existing) if existing.call_id == call_id),
         ) {
-            spec.output = Some(content);
+            spec.output = Some(content.clone());
             spec.ok = ok;
+        }
+        // A result with a picture is the bot's screen; it gets its own row in the feed.
+        if let Some(shot) = event
+            .get("image")
+            .and_then(|image| ScreenshotSpec::from_frame(&call_id, &content, image))
+        {
+            self.committed
+                .retain(|part| !matches!(part, ChatPart::Screenshot(existing) if existing.call_id == call_id));
+            self.committed.push(ChatPart::Screenshot(shot));
         }
     }
 
@@ -345,7 +408,7 @@ impl TurnAssembler {
         self.committed.retain(|part| match part {
             ChatPart::Ui(UiSpec::BarChart(_)) => !chart,
             ChatPart::Ui(UiSpec::Form(_)) => chart,
-            ChatPart::Text(_) | ChatPart::Approval(_) => true,
+            ChatPart::Text(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => true,
         });
         self.committed.push(ChatPart::Ui(spec));
         self.completed_ui.retain(|tool| tool.name != name);
@@ -633,7 +696,7 @@ fn plain_text(parts: &[ChatPart]) -> String {
         .iter()
         .filter_map(|part| match part {
             ChatPart::Text(text) => Some(text.as_str()),
-            ChatPart::Ui(_) | ChatPart::Approval(_) => None,
+            ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => None,
         })
         .collect()
 }
@@ -1191,5 +1254,55 @@ mod tests {
         assert_eq!(policy_answer(&local, None), None);
         assert_eq!(policy_answer(&boxed, Some(LocalExecMode::Always)), None);
         assert_eq!(policy_answer(&boxed, Some(LocalExecMode::Never)), None);
+    }
+
+    /// A 1x1 transparent PNG: enough bytes to be a picture, small enough to read.
+    const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn a_tool_result_with_a_picture_is_a_screenshot_row() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({"type":"TEXT_MESSAGE_CONTENT","delta":"Looking."}));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "c9",
+            "content": "clicking at 10,10; screenshot of the 1280x800 screen attached",
+            "ok": true,
+            "image": {"mime": "image/png", "base64": TINY_PNG, "width": 1280, "height": 800}
+        }));
+        turn.finish();
+        let (_, parts) = turn.snapshot();
+        let shot = parts
+            .iter()
+            .find_map(|part| match part {
+                ChatPart::Screenshot(spec) => Some(spec),
+                _ => None,
+            })
+            .expect("a screenshot part");
+        assert_eq!(shot.call_id, "c9");
+        assert_eq!((shot.width, shot.height), (1280, 800));
+        assert!(shot.caption.starts_with("clicking at 10,10"));
+        assert!(!shot.image.bytes.is_empty());
+        // Words before the picture stay words.
+        assert!(matches!(parts.first(), Some(ChatPart::Text(text)) if text.contains("Looking.")));
+    }
+
+    #[test]
+    fn a_result_without_a_png_is_not_a_screenshot() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "c1",
+            "content": "wrote /tmp/x",
+            "ok": true,
+            "image": {"mime": "image/jpeg", "base64": TINY_PNG, "width": 1, "height": 1}
+        }));
+        turn.finish();
+        let (_, parts) = turn.snapshot();
+        assert!(
+            !parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Screenshot(_)))
+        );
     }
 }

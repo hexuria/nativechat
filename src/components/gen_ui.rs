@@ -1,6 +1,8 @@
 //! Native AG-UI widgets. Not markdown, not KaTeX.
 
-use crate::opengrok::{ApprovalSpec, BarChartSpec, FormSpec, LocalExecResolution, UiSpec};
+use crate::opengrok::{
+    ApprovalSpec, BarChartSpec, FormSpec, LocalExecResolution, ScreenshotSpec, UiSpec,
+};
 use crate::state::{AppState, ApprovalDecision};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
@@ -17,6 +19,30 @@ pub fn render_ui_spec(
         UiSpec::BarChart(chart) => render_bar_chart(chart, cx),
         UiSpec::Form(form) => render_form(form, message_id, app, cx),
     }
+}
+
+/// The bot's screen as a card: the picture at the feed's width, its own words underneath.
+pub fn render_screenshot(spec: &ScreenshotSpec, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let width = 520.0_f32;
+    let height = width * spec.height.max(1) as f32 / spec.width.max(1) as f32;
+    v_flex()
+        .gap(px(6.))
+        .child(
+            img(spec.image.clone())
+                .w(px(width))
+                .h(px(height))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.border),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(spec.caption.clone()),
+        )
+        .into_any_element()
 }
 
 pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &App) -> AnyElement {

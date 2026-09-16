@@ -6,11 +6,11 @@ use crate::chrome::{CHAT_CONTENT_MAX, chat_column_width, timestamps_fit};
 use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
-use crate::components::gen_ui::{render_approval, render_ui_spec};
+use crate::components::gen_ui::{render_approval, render_screenshot, render_ui_spec};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::find_text::{FindHit, marks_for_row, project_hits};
-use crate::opengrok::{ApprovalSpec, ChatPart, UiSpec, collapse_open_approvals};
+use crate::opengrok::{ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, collapse_open_approvals};
 use crate::state::{AppState, EmojiPickerOpen};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::FontWeight;
@@ -152,6 +152,7 @@ struct ChatRow {
     widget: Option<UiSpec>,
     approval: Option<ApprovalSpec>,
     status_line: Option<String>,
+    screenshot: Option<ScreenshotSpec>,
 }
 
 impl ChatRow {
@@ -181,6 +182,7 @@ impl ChatRow {
             widget: None,
             approval: None,
             status_line: None,
+            screenshot: None,
         }
     }
 }
@@ -259,6 +261,14 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     rows.push(ChatRow {
                         widget: Some(spec),
                         ..ChatRow::slot(format!("{}-ui-{ui_n}", msg.id), msg.id.clone())
+                    });
+                    ui_n += 1;
+                }
+                ChatPart::Screenshot(spec) => {
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    rows.push(ChatRow {
+                        screenshot: Some(spec),
+                        ..ChatRow::slot(format!("{}-shot-{ui_n}", msg.id), msg.id.clone())
                     });
                     ui_n += 1;
                 }
@@ -605,6 +615,16 @@ impl Render for ChatTranscript {
                             .child(div().w_full().max_w(px(CHAT_CONTENT_MAX * 0.72)).child(
                                 render_ui_spec(spec, &row.source_id, Some(app_state.clone()), cx),
                             ))
+                            .into_any_element();
+                    }
+                    if let Some(shot) = &row.screenshot {
+                        return div()
+                            .id(ElementId::Name(row.id.clone().into()))
+                            .w_full()
+                            .flex()
+                            .justify_start()
+                            .py(px(6.))
+                            .child(render_screenshot(shot, cx))
                             .into_any_element();
                     }
                     if let Some(line) = &row.status_line {

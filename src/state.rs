@@ -37,7 +37,7 @@ impl Message {
         !self.content.trim().is_empty()
             || self.parts.iter().any(|part| match part {
                 ChatPart::Text(text) => !text.trim().is_empty(),
-                ChatPart::Ui(_) | ChatPart::Approval(_) => true,
+                ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => true,
             })
     }
 

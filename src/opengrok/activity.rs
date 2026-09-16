@@ -174,6 +174,25 @@ fn describe_tool(name: &str, args: Option<&str>) -> String {
             .map(|c| format!("On your machine: {}", short_command(c)))
             .unwrap_or_else(|| "On your machine".into()),
         "Computer" | "Screenshot" | "computerUseToolCall" => "On its computer".into(),
+        "computer" => match parsed
+            .as_ref()
+            .and_then(|v| v.get("action").and_then(Value::as_str))
+        {
+            Some("screenshot") => "Looking at its screen".into(),
+            Some("type") => "Typing on its computer".into(),
+            Some("key") => "Pressing a key on its computer".into(),
+            Some("scroll") => "Scrolling on its computer".into(),
+            Some("click" | "double_click" | "right_click" | "drag" | "move") => {
+                "Clicking on its computer".into()
+            }
+            _ => "On its computer".into(),
+        },
+        "open_url" => parsed
+            .as_ref()
+            .and_then(|v| v.get("url").and_then(Value::as_str))
+            .and_then(|url| url.split("://").nth(1).or(Some(url)))
+            .map(|rest| format!("Opening {}", rest.split('/').next().unwrap_or(rest)))
+            .unwrap_or_else(|| "Opening a page on its computer".into()),
         "" => "Working".into(),
         other => format!("Using {other}"),
     }
@@ -269,6 +288,30 @@ mod tests {
         let mut finished = events.clone();
         finished.push(json!({"type":"RUN_FINISHED"}));
         assert_eq!(activity_from_replay(&finished), None);
+    }
+
+    #[test]
+    fn screen_tools_say_what_the_bot_is_doing_on_its_computer() {
+        let ev = json!({"type":"TOOL_CALL_START","toolCallName":"computer"});
+        assert_eq!(
+            activity_from_agui(&ev, Some(r#"{"action":"screenshot"}"#)),
+            ActivityTick::Set(BotActivity {
+                label: "Looking at its screen".into()
+            })
+        );
+        assert_eq!(
+            activity_from_agui(&ev, Some(r#"{"action":"click","coordinate":[1,2]}"#)),
+            ActivityTick::Set(BotActivity {
+                label: "Clicking on its computer".into()
+            })
+        );
+        let ev = json!({"type":"TOOL_CALL_START","toolCallName":"open_url"});
+        assert_eq!(
+            activity_from_agui(&ev, Some(r#"{"url":"https://facebook.com/login"}"#)),
+            ActivityTick::Set(BotActivity {
+                label: "Opening facebook.com".into()
+            })
+        );
     }
 
     #[test]
