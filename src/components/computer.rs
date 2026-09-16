@@ -752,14 +752,20 @@ fn screen_tile(
     app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
+    // The tile is the screen's own shape (the box is 1280x800), so the picture fills it edge to
+    // edge with nothing cropped and nothing letterboxed — the way the reference client draws it.
+    let width = INFO_PANE_WIDTH - 32.;
+    let height = width * 800. / 1280.;
     div()
         .id("agent-screen")
         .group("agent-screen")
         .relative()
-        .w_full()
-        .h(px(168.))
+        .w(px(width))
+        .h(px(height))
         .flex_shrink_0()
         .rounded(px(12.))
+        .border_1()
+        .border_color(theme.border)
         .bg(rgb(0x2a2a2a))
         .overflow_hidden()
         .when(has_screen, |this| {
@@ -775,12 +781,13 @@ fn screen_tile(
         // The screen itself when we have it; a monitor glyph until then.
         .map(|this| match screen {
             // The image carries its own rounding: the tile's overflow clip does not round a
-            // painted picture, so a loaded screen showed square corners next to the empty tile.
+            // painted picture. Fill, not Cover: the tile already has the screen's aspect, and a
+            // Cover that overflowed the tile lost its bottom corners to the rectangular clip.
             Some(image) => this.child(
                 img(image)
                     .size_full()
-                    .rounded(px(12.))
-                    .object_fit(ObjectFit::Cover),
+                    .rounded(px(11.))
+                    .object_fit(ObjectFit::Fill),
             ),
             None => this.child(
                 div()
@@ -819,6 +826,8 @@ fn screen_tile(
                     .id("agent-screen-open")
                     .absolute()
                     .inset_0()
+                    // Same corners as the tile, or the hover shade sticks out past them.
+                    .rounded(px(11.))
                     .opacity(0.)
                     .group_hover("agent-screen", |style| style.opacity(1.))
                     .flex()
