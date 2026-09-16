@@ -341,6 +341,9 @@ impl ComputerPane {
                             .child(error),
                     )
                 })
+                // A task is taught on this screen, so the page that keeps those tasks belongs
+                // next to it: this is the way in from where a recipe is born and used.
+                .child(recipes_entry(muted, app.clone(), theme))
                 .child(if routines.is_empty() {
                     v_flex()
                         .w_full()
@@ -761,6 +764,46 @@ impl ComputerControls {
     pub fn update_disabled(&self) -> bool {
         !self.present || self.updating || (self.current && !self.stale)
     }
+}
+
+/// The way from this screen to the tasks taught on it: the Recipes page, in the main slot.
+fn recipes_entry(
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    h_flex()
+        .id("computer-recipes")
+        .w_full()
+        .gap(px(8.))
+        .px(px(10.))
+        .py(px(8.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.1)))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            app.update(cx, |state, cx| state.open_recipes(cx));
+        })
+        .child(
+            Icon::default()
+                .path("icons/record.svg")
+                .size(px(14.))
+                .text_color(muted),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .child(div().text_sm().child("Recipes"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Tasks taught on this screen"),
+                ),
+        )
 }
 
 /// The coworker's screen. The Open pill is the control: it appears on hover

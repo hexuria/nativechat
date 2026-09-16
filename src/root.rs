@@ -31,6 +31,11 @@ impl RootView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let layout = cx.new(|cx| Layout::new(window, state.clone(), cx));
         let focus_handle = cx.focus_handle();
+        // This is the window the pages are drawn in; a coworker's screen window hands its
+        // "Recipes" over to it rather than drawing a page of its own.
+        state.update(cx, |state, _| {
+            state.set_main_window(window.window_handle());
+        });
 
         Self {
             layout,

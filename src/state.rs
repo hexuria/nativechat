@@ -447,6 +447,33 @@ impl RecipeFilter {
     }
 }
 
+/// What a recipe's newest run came to, as far as this session has been told. A detail carries
+/// a recipe's runs and the list's summaries carry none, so a row says what the app has already
+/// been shown and nothing where it has not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecipeRunNote {
+    pub ok: bool,
+    pub version: u32,
+    /// The step the run stopped at, when it did not finish.
+    pub stopped_at: Option<u64>,
+    pub at_ms: i64,
+}
+
+impl RecipeRunNote {
+    /// "last run ok · v3", "last run stopped at step 7 · v3".
+    pub fn label(&self) -> String {
+        let version = self.version;
+        if self.ok {
+            format!("last run ok · v{version}")
+        } else {
+            match self.stopped_at {
+                Some(step) => format!("last run stopped at step {step} · v{version}"),
+                None => format!("last run stopped · v{version}"),
+            }
+        }
+    }
+}
+
 /// What the last Run on… came back with, decoded for the page.
 #[derive(Clone)]
 pub struct RecipeRunOutcome {
@@ -694,6 +721,12 @@ pub struct AppState {
     pub recipe_run_result: Option<RecipeRunOutcome>,
     /// Delete asks first: the dialog over the app, until Delete or Cancel.
     pub recipe_delete_confirm: bool,
+    /// What each recipe's newest run came to, kept as details are read, so a row in the list
+    /// can say what became of that recipe last time.
+    pub recipe_last_runs: HashMap<String, RecipeRunNote>,
+    /// The window the app's pages live in. A second window — a coworker's screen — has no
+    /// page of its own: it asks this one to show the Recipes page and brings it forward.
+    main_window: Option<AnyWindowHandle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -829,6 +862,8 @@ impl AppState {
             recipe_error: None,
             recipe_run_result: None,
             recipe_delete_confirm: false,
+            recipe_last_runs: HashMap::new(),
+            main_window: None,
             #[cfg(target_os = "macos")]
             computer_windows: std::collections::HashMap::new(),
         };
@@ -1480,15 +1515,37 @@ impl AppState {
         }
     }
 
-    /// The Recipes page in the main slot, with the list for the current filter.
+    /// The Recipes page in the main slot, with the list for the current filter. A docked pane
+    /// steps aside: a table of steps wants the whole width left of the sidebar, and the pane
+    /// is one click away in the title bar.
     pub fn open_recipes(&mut self, cx: &mut Context<Self>) {
         self.dismiss_popovers(cx);
+        self.close_right_pane(cx);
         if self.page != MainPage::Recipes {
             self.page = MainPage::Recipes;
             self.record_nav();
         }
         self.refresh_recipes(cx);
         cx.notify();
+    }
+
+    /// The window that draws the pages, for a second window to hand work to.
+    pub fn set_main_window(&mut self, window: AnyWindowHandle) {
+        self.main_window = Some(window);
+    }
+
+    /// The Recipes page, asked for from another window (a coworker's screen). The page is
+    /// drawn in the main window, so that window comes forward with it; `recipe` opens one
+    /// recipe's own page rather than the list.
+    pub fn show_recipes_in_main_window(&mut self, recipe: Option<String>, cx: &mut Context<Self>) {
+        cx.activate(true);
+        if let Some(window) = self.main_window {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+        self.open_recipes(cx);
+        if let Some(id) = recipe {
+            self.open_recipe(id, cx);
+        }
     }
 
     /// Back to the chat from a page.
@@ -1568,13 +1625,30 @@ impl AppState {
                 }
                 state.recipe_loading = false;
                 match result {
-                    Ok(detail) => state.recipe_open = Some(detail),
+                    Ok(detail) => state.set_open_recipe(detail),
                     Err(error) => state.recipe_error = Some(error.message),
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Take a detail as the open recipe, keeping what its newest run came to: the list is told
+    /// nothing about runs, so this is the only place the app learns it.
+    fn set_open_recipe(&mut self, detail: RecipeDetail) {
+        if let Some(run) = detail.runs.first() {
+            self.recipe_last_runs.insert(
+                detail.recipe.id.clone(),
+                RecipeRunNote {
+                    ok: run.ok,
+                    version: run.version,
+                    stopped_at: run.stopped_at,
+                    at_ms: run.at_ms,
+                },
+            );
+        }
+        self.recipe_open = Some(detail);
     }
 
     pub fn close_recipe(&mut self, cx: &mut Context<Self>) {
@@ -1620,7 +1694,7 @@ impl AppState {
                 state.recipe_busy = None;
                 match result {
                     Ok(detail) => {
-                        state.recipe_open = Some(detail);
+                        state.set_open_recipe(detail);
                         state.refresh_recipes(cx);
                     }
                     Err(error) => state.recipe_error = Some(error.message),
@@ -1711,7 +1785,7 @@ impl AppState {
                 match result {
                     Ok(detail) => {
                         if open {
-                            state.recipe_open = Some(detail);
+                            state.set_open_recipe(detail);
                         }
                         state.refresh_recipes(cx);
                     }
