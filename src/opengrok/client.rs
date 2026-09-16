@@ -7,7 +7,7 @@ use reqwest::cookie::{CookieStore, Jar};
 use reqwest::header::{ACCEPT, CACHE_CONTROL, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::error::OpenGrokError;
 use super::types::{
@@ -150,6 +150,37 @@ impl OpenGrokClient {
         None
     }
 
+    /// Seconds until the access token expires, read from the JWT's `exp` without verifying
+    /// it — the server verifies; this only decides whether to refresh first.
+    fn token_seconds_left(&self) -> Option<i64> {
+        use base64::Engine as _;
+        let token = self.access_token()?;
+        let payload = token.split('.').nth(1)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?;
+        let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let exp = claims.get("exp")?.as_i64()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(exp - now)
+    }
+
+    /// Refresh before a token dies, not after. An expired bearer is not always a 401: `/ag-ui`
+    /// runs it as nobody and the turn is held with no word to the person. Thirty seconds of
+    /// slack covers a request that is slow to leave. Best effort; the request goes out either
+    /// way and a 401 gets one more chance below.
+    async fn ensure_fresh_token(&self, path: &str) {
+        if path.starts_with("/auth/") {
+            return;
+        }
+        if matches!(self.token_seconds_left(), Some(left) if left < 30) {
+            let _ = self.refresh().await;
+        }
+    }
+
     fn url(&self, path: &str) -> Result<Url, OpenGrokError> {
         self.base
             .join(path)
@@ -163,16 +194,33 @@ impl OpenGrokClient {
         body: Option<&T>,
     ) -> Result<reqwest::Response, OpenGrokError> {
         let url = self.url(path)?;
-        let mut req = self.http.request(method, url);
-        if let Some(token) = self.access_token() {
-            req = req.bearer_auth(token);
-        }
-        if let Some(body) = body {
-            req = req.json(body);
-        }
-        req.send()
+        self.ensure_fresh_token(path).await;
+        let build = |token: Option<String>| {
+            let mut req = self.http.request(method.clone(), url.clone());
+            if let Some(token) = token {
+                req = req.bearer_auth(token);
+            }
+            if let Some(body) = body {
+                req = req.json(body);
+            }
+            req
+        };
+        let response = build(self.access_token())
+            .send()
             .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        // A 401 on a signed-in session is a token that died between checks: refresh once and
+        // send again. Auth routes are exempt, or a bad password would loop here.
+        if response.status() == StatusCode::UNAUTHORIZED
+            && !path.starts_with("/auth/")
+            && self.refresh().await.is_ok()
+        {
+            return build(self.access_token())
+                .send()
+                .await
+                .map_err(|e| OpenGrokError::message(e.to_string()));
+        }
+        Ok(response)
     }
 
     async fn read_error(response: reqwest::Response) -> OpenGrokError {
@@ -226,15 +274,30 @@ impl OpenGrokClient {
         }
     }
 
+    /// Trade the refresh cookie for a new access token. Sent directly rather than through
+    /// `send_json`, which would refresh before refreshing.
     pub async fn refresh(&self) -> Result<(), OpenGrokError> {
-        let response = self
-            .send_json::<()>(reqwest::Method::POST, "/auth/refresh", None)
-            .await?;
+        let url = self.url("/auth/refresh")?;
+        let mut req = self.http.post(url);
+        if let Some(token) = self.access_token() {
+            req = req.bearer_auth(token);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::message(e.to_string()))?;
         if response.status().is_success() {
             self.save_session();
             Ok(())
         } else {
-            Err(Self::read_error(response).await)
+            let error = Self::read_error(response).await;
+            // "session expired": the refresh token is gone, so the saved session is worthless
+            // and every later request would try this again. Forget it; the next request fails
+            // plainly with 401 and the person signs in.
+            if error.is_unauthorized() {
+                self.clear_session();
+            }
+            Err(error)
         }
     }
 
@@ -357,6 +420,7 @@ impl OpenGrokClient {
             "forwardedProps": { "coworkerId": coworker_id },
         });
         let url = self.url("/ag-ui")?;
+        self.ensure_fresh_token("/ag-ui").await;
         let mut req = self
             .http
             .post(url)
@@ -482,6 +546,16 @@ impl OpenGrokClient {
         coworker_id: &str,
     ) -> Result<CoworkerComputer, OpenGrokError> {
         let path = format!("/coworkers/{coworker_id}/computer");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// The coworker's screen right now: `{mime, base64, width, height}`, the same shape as the
+    /// `image` on a `TOOL_CALL_RESULT`, so `ScreenshotSpec::from_frame` decodes both.
+    pub async fn coworker_screen(&self, coworker_id: &str) -> Result<Value, OpenGrokError> {
+        let path = format!("/coworkers/{coworker_id}/screen");
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;

@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::chrome::INFO_PANE_WIDTH;
 use crate::components::fields::field_input;
@@ -128,7 +129,7 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, box_id, routines, has_screen) = {
+        let (view, agent_name, coworker_id, box_id, routines, has_screen, screen) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -153,6 +154,7 @@ impl Render for ComputerPane {
                 box_id,
                 routines,
                 has_screen,
+                state.coworker_screen.clone(),
             )
         };
 
@@ -173,6 +175,7 @@ impl Render for ComputerPane {
                         box_id.as_deref(),
                         &routines,
                         has_screen,
+                        screen,
                         muted,
                         app,
                         &theme,
@@ -193,6 +196,7 @@ impl ComputerPane {
         box_id: Option<&str>,
         routines: &[AgentRoutine],
         has_screen: bool,
+        screen: Option<Arc<gpui_kit::Image>>,
         muted: Hsla,
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
@@ -208,7 +212,7 @@ impl ComputerPane {
                     .pt(px(8.))
                     .pb(px(16.))
                     .gap(px(12.))
-                    .child(screen_tile(has_screen, app.clone(), theme))
+                    .child(screen_tile(has_screen, screen, app.clone(), theme))
                     .child(
                         div()
                             .w_full()
@@ -655,6 +659,7 @@ impl ComputerPane {
 /// click — a blank monitor must not provision a box behind the person's back.
 fn screen_tile(
     has_screen: bool,
+    screen: Option<Arc<gpui_kit::Image>>,
     app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
@@ -678,20 +683,24 @@ fn screen_tile(
                 }
             })
         })
-        .child(
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    Icon::default()
-                        .path("icons/monitor.svg")
-                        .size(px(22.))
-                        .text_color(rgb(0x888888)),
-                ),
-        )
+        // The screen itself when we have it; a monitor glyph until then.
+        .map(|this| match screen {
+            Some(image) => this.child(img(image).size_full().object_fit(ObjectFit::Cover)),
+            None => this.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::default()
+                            .path("icons/monitor.svg")
+                            .size(px(22.))
+                            .text_color(rgb(0x888888)),
+                    ),
+            ),
+        })
         .when(has_screen, |this| {
             this.child(
                 div()
