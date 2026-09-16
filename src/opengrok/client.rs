@@ -1333,8 +1333,9 @@ impl RecipeStep {
     }
 }
 
-/// Who a recipe has been shared with (snake_case from the server; only the owner sees these).
+/// Who a recipe has been shared with (only the owner sees these).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecipeShare {
     #[serde(default, deserialize_with = "null_as_default")]
     pub recipe_id: String,
@@ -1366,8 +1367,9 @@ impl RecipeShare {
     }
 }
 
-/// A bot that may run the recipe (snake_case from the server).
+/// A bot that may run the recipe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecipeGrant {
     #[serde(default, deserialize_with = "null_as_default")]
     pub recipe_id: String,
@@ -1379,8 +1381,9 @@ pub struct RecipeGrant {
     pub granted_at_ms: i64,
 }
 
-/// One past run of the recipe (snake_case from the server; newest first).
+/// One past run of the recipe (newest first).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecipeRun {
     #[serde(default, deserialize_with = "null_as_default")]
     pub recipe_id: String,
@@ -2079,9 +2082,11 @@ mod tests {
                 {"version": 2, "kind": "filtered", "note": null, "createdBy": null, "createdAtMs": 2,
                  "body": {"steps": [{"op": "click", "x": 1, "y": 2, "button": "left"}, {"op": "wait", "ms": 200}], "stop_on_error": true, "screenshot": null}}
             ],
-            "shares": [{"recipe_id": "rcp_1", "scope": "org", "scope_id": "org_1", "granted_by": "acc_1", "granted_at_ms": 3, "accepted_at_ms": null, "declined_at_ms": null}],
-            "grants": [{"recipe_id": "rcp_1", "coworker_id": "cw_1", "granted_by": "acc_1", "granted_at_ms": 4}],
-            "runs": [{"id": 9, "recipe_id": "rcp_1", "version": 2, "coworker_id": "cw_1", "run_id": "run_1", "ok": false, "stopped_at": 1, "receipt": {}, "at_ms": 5}],
+            // Exactly the shape the server sends: its row structs are camelCase too, and a
+            // snake_case fixture here let every grant, share and run bind to nothing at all.
+            "shares": [{"recipeId": "rcp_1", "scope": "org", "scopeId": "org_1", "grantedBy": "acc_1", "grantedAtMs": 3, "acceptedAtMs": null, "declinedAtMs": null}],
+            "grants": [{"recipeId": "rcp_1", "coworkerId": "cw_1", "grantedBy": "acc_1", "grantedAtMs": 4}],
+            "runs": [{"id": 9, "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1", "runId": "run_1", "ok": false, "stoppedAt": 1, "receipt": {}, "atMs": 5}],
             "myBots": [{"id": "cw_1", "name": "Bob"}]
         }))
         .unwrap();
@@ -2095,6 +2100,9 @@ mod tests {
         assert_eq!(detail.bot_name("cw_1"), "Bob");
         assert_eq!(detail.bot_name("cw_2"), "cw_2");
         assert_eq!(detail.runs[0].stopped_at, Some(1));
+        assert_eq!(detail.runs[0].coworker_id, "cw_1");
+        assert_eq!(detail.runs[0].at_ms, 5);
+        assert_eq!(detail.shares[0].scope_id, "org_1");
     }
 
     #[test]
