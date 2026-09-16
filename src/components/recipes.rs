@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::chrome::{CHAT_CONTENT_MAX, PANE_HEADER_H, PANE_HEADER_PX};
+use crate::chrome::{CHAT_CONTENT_MAX, HEADER_PX};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     RecipeDetail, RecipeRelation, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeVersion,
@@ -323,14 +323,13 @@ impl RecipesView {
         };
         v_flex()
             .size_full()
-            .child(page_header(None, "Recipes".to_string(), None, muted))
             .child(
                 div()
                     .id("recipes-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(PANE_HEADER_PX))
+                    .px(px(HEADER_PX))
                     .pb(px(24.))
                     .child(centered(
                         column()
@@ -399,14 +398,13 @@ impl RecipesView {
         };
         v_flex()
             .size_full()
-            .child(page_header(Some(back), title, busy.clone(), muted))
             .child(
                 div()
                     .id("recipe-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(PANE_HEADER_PX))
+                    .px(px(HEADER_PX))
                     .pb(px(24.))
                     .child(centered(
                         column()
@@ -1446,8 +1444,40 @@ fn filter_chip(chip: RecipeFilter, current: RecipeFilter, app: Entity<AppState>)
     }
 }
 
-/// The page's header row, level with the chat's: a back chevron when there is somewhere to go
-/// back to, the title, and what the page is doing on the right.
+/// What the title bar shows while the Recipes page is open: a back chevron when a recipe is
+/// open, the title, and what the page is doing. The app has ONE header row and it is the title
+/// bar, so the page itself draws none.
+pub fn recipes_header(app: Entity<AppState>, theme: &Theme, cx: &App) -> AnyElement {
+    let state = app.read(cx);
+    let open = state.recipe_open.is_some() || state.recipe_open_id.is_some();
+    let title = state
+        .recipe_open
+        .as_ref()
+        .map(|detail| detail.recipe.name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| {
+            if open {
+                "Recipe".to_string()
+            } else {
+                "Recipes".to_string()
+            }
+        });
+    let note = if open {
+        state.recipe_busy.clone()
+    } else {
+        state.recipes_loading.then(|| "Loading…".to_string())
+    };
+    let back: Option<Rc<dyn Fn(&mut App)>> = open.then(|| {
+        let app = app.clone();
+        Rc::new(move |cx: &mut App| {
+            app.update(cx, |state, cx| state.close_recipe(cx));
+        }) as Rc<dyn Fn(&mut App)>
+    });
+    page_header(back, title, note, theme.muted_foreground).into_any_element()
+}
+
+/// The header's content: a back chevron when there is somewhere to go back to, the title, and
+/// what the page is doing on the right.
 fn page_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: String,
@@ -1457,8 +1487,7 @@ fn page_header(
     h_flex()
         .id("recipes-header")
         .w_full()
-        .h(px(PANE_HEADER_H))
-        .px(px(PANE_HEADER_PX))
+        .h_full()
         .flex_shrink_0()
         .items_center()
         .justify_between()

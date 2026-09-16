@@ -10,7 +10,8 @@ use crate::components::agent_settings::settings_header;
 use crate::components::chat::ChatView;
 use crate::components::computer::ComputerPane;
 use crate::components::persona::PersonaMark;
-use crate::state::{AppState, RightPane};
+use crate::components::recipes::recipes_header;
+use crate::state::{AppState, MainPage, RightPane};
 use gpui_kit::component::{ActiveTheme, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -96,7 +97,12 @@ impl Render for TitleBar {
             None
         };
 
+        // The Recipes page owns the header row while it is open: its title and back chevron
+        // stand where the coworker's name stands in a chat.
+        let page = state.page;
         let app = self.state.clone();
+        let recipes_span = (signed_in && page == MainPage::Recipes)
+            .then(|| recipes_header(self.state.clone(), &theme, cx));
         let chat_span = h_flex()
             .id("chat-header")
             .flex_1()
@@ -105,8 +111,10 @@ impl Render for TitleBar {
             .px(px(HEADER_PX))
             .items_center()
             .gap_2()
-            .map(|this| match (&coworker, signed_in) {
-                (Some((id, name, shape, color)), _) => this.child(
+            .map(|this| match (recipes_span, &coworker, signed_in) {
+                // The Recipes page's own title and back chevron, in place of a bot's name.
+                (Some(header), _, _) => this.child(header),
+                (None, Some((id, name, shape, color)), _) => this.child(
                     div()
                         .id("header-coworker")
                         .flex()
@@ -134,7 +142,7 @@ impl Render for TitleBar {
                         ),
                 ),
                 // No bot: the page's title, in the same place and style.
-                (None, true) => this.child(window_drag(
+                (None, None, true) => this.child(window_drag(
                     div()
                         .h_full()
                         .flex()
@@ -143,7 +151,7 @@ impl Render for TitleBar {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Bots"),
                 )),
-                (None, false) => this,
+                (None, None, false) => this,
             })
             .child(window_drag(div().flex_1().h_full()))
             .when(coworker.is_some(), |this| {
