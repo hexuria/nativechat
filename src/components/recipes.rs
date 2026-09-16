@@ -1065,9 +1065,13 @@ impl RecipesView {
                 // A tape the server sent whole reads as a table of its own; one it stripped to
                 // a count can only say how much there was.
                 None => match shown.and_then(RecipeVersion::tape_events) {
-                    Some(events) if !events.is_empty() => {
-                        this.child(tape_table(events, muted, theme))
-                    }
+                    Some(events) if !events.is_empty() => this.child(tape_table(
+                        events,
+                        shown.map(RecipeVersion::event_count).unwrap_or_default(),
+                        shown.is_some_and(RecipeVersion::tape_truncated),
+                        muted,
+                        theme,
+                    )),
                     _ => this.child(tape_frame(shown, muted, theme)),
                 },
             })
@@ -2233,7 +2237,13 @@ fn step_words(step: &RecipeStep) -> (String, String) {
 /// The tape itself, in the frame the steps use: every event as it was taken, in order and
 /// unfiltered, with how long after the first one it came. This is what a raw version holds,
 /// and the only place a person can see what was actually taped.
-fn tape_table(events: &[RecipeTapeEvent], muted: Hsla, theme: &Theme) -> AnyElement {
+fn tape_table(
+    events: &[RecipeTapeEvent],
+    taped: u64,
+    truncated: bool,
+    muted: Hsla,
+    theme: &Theme,
+) -> AnyElement {
     // The tape's own clock is the wall clock; only the distance from its start is readable.
     let start = events.first().map(|event| event.at).unwrap_or_default();
     v_flex()
@@ -2289,6 +2299,23 @@ fn tape_table(events: &[RecipeTapeEvent], muted: Hsla, theme: &Theme) -> AnyElem
                     },
                 ))),
         )
+        // A long teach is mostly pointer moves, so the server sends the front of the tape and
+        // says it did; without this line the table would quietly look like the whole thing.
+        .when(truncated, |this| {
+            this.child(
+                div()
+                    .id("recipe-events-truncated")
+                    .w_full()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!(
+                        "showing the first {} of {taped} events",
+                        events.len()
+                    )),
+            )
+        })
         .into_any_element()
 }
 
