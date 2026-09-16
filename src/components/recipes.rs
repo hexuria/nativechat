@@ -10,16 +10,18 @@ use std::rc::Rc;
 
 use crate::chrome::{HEADER_PX, chat_column_width};
 use crate::components::fields::field_input;
+use crate::components::multi_select::{
+    MultiSelectEvent, MultiSelectIds, MultiSelectOption, MultiSelectState,
+};
 use crate::opengrok::{
-    RecipeDetail, RecipeRelation, RecipeRun, RecipeScreen, RecipeShareTarget, RecipeStep,
-    RecipeSummary, RecipeTapeEvent, RecipeVersion,
+    RecipeDetail, RecipeRelation, RecipeRun, RecipeScreen, RecipeShare, RecipeShareTarget,
+    RecipeStep, RecipeSummary, RecipeTapeEvent, RecipeVersion,
 };
 use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome, RightPane};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::popover::Popover;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -47,8 +49,12 @@ const STEP_VERB_W: f32 = 116.;
 const EVENT_TIME_W: f32 = 72.;
 /// The run's screenshot, at the width the chat draws the bot's screen.
 const SCREENSHOT_WIDTH: f32 = 520.;
-/// The bots picker's panel: wide enough for a bot's name beside its box.
-const BOTS_MENU_W: f32 = 240.;
+/// The share modal: wide enough for an email address on one line and for the bots picker's
+/// panel under its trigger.
+const SHARE_MODAL_W: f32 = 460.;
+/// The share modal's body, so the modal is the same height whichever tab is on and the bots
+/// picker's panel has somewhere to hang.
+const SHARE_BODY_HEIGHT: f32 = 300.;
 /// The history modal: wide enough for a run's line and the screen it kept.
 const HISTORY_MODAL_W: f32 = 560.;
 /// The history's list of runs, so the modal is the same height whichever tab is on.
@@ -82,8 +88,8 @@ const EMPTY_ICON_BOX: f32 = 56.;
 /// window is doing.
 const EMPTY_COPY_MAX: f32 = 380.;
 
-/// What a step does, apart from what it does it to: what Add step offers, and what decides
-/// whether a row's editor is the field in its Details cell or the modal.
+/// What a step does, apart from what it does it to: what Add step offers, and what the modal
+/// asks for when a step of that kind is added or opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepKind {
     Click,
@@ -144,8 +150,9 @@ impl StepKind {
         }
     }
 
-    /// The parameters the modal edits, none for a step of one value (those are edited in the
-    /// row itself).
+    /// The parameters the modal asks for, one labelled field each. Every kind has at least
+    /// one: a step is only ever edited in the modal, so a kind with no field would be a step
+    /// that cannot be changed.
     fn params(self) -> &'static [StepParam] {
         const PLACE: [StepParam; 2] = [
             StepParam::new("x", "X", ParamKind::X),
@@ -168,12 +175,17 @@ impl StepKind {
             StepParam::new("dx", "By X", ParamKind::Amount),
             StepParam::new("dy", "By Y", ParamKind::Amount),
         ];
+        const TYPE: [StepParam; 1] = [StepParam::new("text", "Text", ParamKind::Text)];
+        const KEY: [StepParam; 1] = [StepParam::new("key", "Key", ParamKind::Key)];
+        const WAIT: [StepParam; 1] = [StepParam::new("ms", "Milliseconds", ParamKind::Wait)];
         match self {
             Self::Click => &CLICK,
             Self::DoubleClick => &PLACE,
             Self::Drag => &DRAG,
             Self::Scroll => &SCROLL,
-            Self::Type | Self::Key | Self::Wait => &[],
+            Self::Type => &TYPE,
+            Self::Key => &KEY,
+            Self::Wait => &WAIT,
         }
     }
 
@@ -219,6 +231,14 @@ enum ParamKind {
     Amount,
     /// Which mouse button, as a word or as the number the tape used.
     Button,
+    /// The text to type, which may be anything at all — spaces at either end included, since
+    /// those are as much a part of what is typed as the letters between them.
+    Text,
+    /// A key by the name the box knows it as, such as Return.
+    Key,
+    /// How long to wait, in milliseconds. Past the server's cap the wait is shortened rather
+    /// than refused, and the page says so.
+    Wait,
 }
 
 /// One parameter of a step as the modal edits it: the word in its element id, the label over
@@ -236,12 +256,45 @@ impl StepParam {
     }
 }
 
-/// The row whose parameters the modal is showing, and of what kind, so Save knows what to
-/// build from the fields.
+/// What the modal is editing, and of what kind, so Save knows what to build from the fields
+/// and where to put it.
 #[derive(Debug, Clone, Copy)]
 struct StepModal {
-    index: usize,
+    /// The row under edit, or None while a step is being added: a step added from the picker
+    /// joins the draft when it is saved, so Cancel leaves no half-filled row behind.
+    index: Option<usize>,
     kind: StepKind,
+}
+
+/// The tabs of the share modal: the three ways a recipe goes somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShareTab {
+    Bots,
+    Org,
+    Email,
+}
+
+impl ShareTab {
+    /// Bots first: it is the one tab everyone who can see the recipe gets, since only an owner
+    /// may pass a recipe on.
+    const ALL: [Self; 3] = [Self::Bots, Self::Org, Self::Email];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bots => "Bots",
+            Self::Org => "Org",
+            Self::Email => "Email",
+        }
+    }
+
+    /// The word in the element id, `recipe-share-tab-bots`.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Bots => "bots",
+            Self::Org => "org",
+            Self::Email => "email",
+        }
+    }
 }
 
 pub struct RecipesView {
@@ -250,7 +303,9 @@ pub struct RecipesView {
     description_input: Entity<InputState>,
     share_email_input: Entity<InputState>,
     note_input: Entity<InputState>,
-    step_input: Entity<InputState>,
+    /// The bots picker in the share modal. It holds no truth of its own: it says what was
+    /// ticked and the server's answer comes back as the detail's grants.
+    bots: Entity<MultiSelectState>,
     /// The recipe whose name and description the fields hold; refilled when another opens.
     synced_id: Option<String>,
     /// The version the tabs have chosen. None until someone picks one, so a page that has
@@ -258,15 +313,21 @@ pub struct RecipesView {
     selected_version: Option<u32>,
     /// The steps under edit (the owner's Edit steps), until Save as new version or Cancel.
     draft: Option<Vec<RecipeStep>>,
-    /// The draft row whose text, key or wait is in `step_input`.
-    editing_step: Option<usize>,
-    /// The row the modal is editing, for a step of more than one parameter.
+    /// The step the modal is on: a row of the draft, or one being added.
     step_modal: Option<StepModal>,
     /// The modal's fields, one per parameter of the longest step there is. They are reused
     /// rather than made per step, so opening the modal costs no entities.
     step_fields: Vec<Entity<InputState>>,
     /// Why the draft cannot be saved as it is.
     draft_error: Option<String>,
+    /// The share modal is open over the page, and on which tab.
+    share_open: bool,
+    share_tab: ShareTab,
+    /// The modal was opened from a row of the list, so closing it puts the person back on the
+    /// list rather than on the recipe the row stood for.
+    share_from_list: bool,
+    /// The version whose Delete version is waiting on a yes.
+    delete_version_confirm: Option<u32>,
     /// The bot Run plays on; the first granted one until the person picks.
     run_bot: Option<String>,
     /// The history modal is open over the page.
@@ -289,15 +350,37 @@ impl RecipesView {
         let share_email_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("name@company.com"));
         let note_input = cx.new(|cx| InputState::new(window, cx).placeholder("What changed"));
-        let step_input = cx.new(|cx| InputState::new(window, cx));
         let step_fields: Vec<Entity<InputState>> = (0..STEP_FIELDS)
             .map(|_| cx.new(|cx| InputState::new(window, cx)))
             .collect();
+        let bots = cx.new(|cx| {
+            MultiSelectState::new(
+                MultiSelectIds {
+                    trigger: "recipe-bots".into(),
+                    search: "recipe-bots-search".into(),
+                    select_all: "recipe-bots-all".into(),
+                    clear_all: "recipe-bots-none".into(),
+                    option_prefix: "recipe-bot-".into(),
+                },
+                window,
+                cx,
+            )
+            .placeholder("No bots")
+        });
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
-        // Enter closes the cell being edited, as it would in any table.
-        cx.subscribe(&step_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.commit_step_edit(cx);
+        // A tick in the picker is a grant, and an untick takes it back; the server's answer is
+        // what the picker is filled from next.
+        cx.subscribe(&bots, |this, _, event: &MultiSelectEvent, cx| {
+            let app = this.state.clone();
+            match event {
+                MultiSelectEvent::Toggled { id, selected } => {
+                    let (id, selected) = (id.clone(), *selected);
+                    app.update(cx, |state, cx| state.set_recipe_grant(id, selected, cx));
+                }
+                MultiSelectEvent::Bulk { ids, selected } => {
+                    let (ids, selected) = (ids.clone(), *selected);
+                    app.update(cx, |state, cx| state.set_recipe_grants(ids, selected, cx));
+                }
             }
         })
         .detach();
@@ -316,14 +399,17 @@ impl RecipesView {
             description_input,
             share_email_input,
             note_input,
-            step_input,
+            bots,
             synced_id: None,
             selected_version: None,
             draft: None,
-            editing_step: None,
             step_modal: None,
             step_fields,
             draft_error: None,
+            share_open: false,
+            share_tab: ShareTab::Bots,
+            share_from_list: false,
+            delete_version_confirm: None,
             run_bot: None,
             history_open: false,
             history_version: None,
@@ -351,13 +437,15 @@ impl RecipesView {
         self.synced_id = id;
         self.selected_version = None;
         self.draft = None;
-        self.editing_step = None;
         self.step_modal = None;
         self.draft_error = None;
+        self.delete_version_confirm = None;
         self.run_bot = None;
         self.history_open = false;
         self.history_version = None;
         self.history_run = None;
+        // The share modal is left alone: the share icon on a row of the list opens a recipe
+        // and the modal over it, and the detail landing here is the answer to that click.
         self.name_input.update(cx, |input, cx| {
             input.set_value(name, window, cx);
         });
@@ -372,8 +460,86 @@ impl RecipesView {
         });
     }
 
+    /// The picker follows the open recipe: the person's bots as its options, the ones this
+    /// recipe is granted to as its selection, and nothing tickable while a grant is in flight.
+    fn sync_bots(&self, cx: &mut Context<Self>) {
+        let (options, selected, busy) = {
+            let state = self.state.read(cx);
+            match state.recipe_open.as_ref() {
+                Some(detail) => (
+                    detail
+                        .my_bots
+                        .iter()
+                        .map(|bot| MultiSelectOption::new(&bot.id, bot_label(&bot.name, &bot.id)))
+                        .collect(),
+                    detail
+                        .my_bots
+                        .iter()
+                        .filter(|bot| detail.is_granted(&bot.id))
+                        .map(|bot| bot.id.clone())
+                        .collect(),
+                    state.recipe_busy.is_some(),
+                ),
+                None => (Vec::new(), Vec::new(), state.recipe_loading),
+            }
+        };
+        self.bots
+            .update(cx, |picker, cx| picker.sync(options, selected, busy, cx));
+    }
+
+    /// Open the share modal over the page, on Bots. Only one thing stands over the page at a
+    /// time, so whatever else was open goes.
+    fn open_share(&mut self, from_list: bool, cx: &mut Context<Self>) {
+        self.share_open = true;
+        self.share_from_list = from_list;
+        self.share_tab = ShareTab::Bots;
+        self.history_open = false;
+        self.step_modal = None;
+        self.delete_version_confirm = None;
+        cx.notify();
+    }
+
+    /// Close it, and put someone who opened it from a row back on the list they opened it from.
+    fn close_share(&mut self, cx: &mut Context<Self>) {
+        self.share_open = false;
+        self.bots.update(cx, |picker, cx| picker.close(cx));
+        if self.share_from_list {
+            self.share_from_list = false;
+            self.state.update(cx, |state, cx| state.close_recipe(cx));
+        }
+        cx.notify();
+    }
+
+    fn select_share_tab(&mut self, tab: ShareTab, cx: &mut Context<Self>) {
+        self.share_tab = tab;
+        self.bots.update(cx, |picker, cx| picker.close(cx));
+        cx.notify();
+    }
+
     fn select_version(&mut self, version: u32, cx: &mut Context<Self>) {
         self.selected_version = Some(version);
+        cx.notify();
+    }
+
+    fn ask_delete_version(&mut self, version: u32, cx: &mut Context<Self>) {
+        self.delete_version_confirm = Some(version);
+        cx.notify();
+    }
+
+    fn cancel_delete_version(&mut self, cx: &mut Context<Self>) {
+        self.delete_version_confirm = None;
+        cx.notify();
+    }
+
+    /// Delete the version the dialog asked about. The tabs let go of it at the same moment, so
+    /// what is left is shown on the newest version rather than on a tab that is no longer there.
+    fn confirm_delete_version(&mut self, cx: &mut Context<Self>) {
+        let Some(version) = self.delete_version_confirm.take() else {
+            return;
+        };
+        self.selected_version = None;
+        self.state
+            .update(cx, |state, cx| state.delete_recipe_version(version, cx));
         cx.notify();
     }
 
@@ -419,25 +585,31 @@ impl RecipesView {
             .or_else(|| detail.my_bots.first().map(|bot| bot.id.clone()))
     }
 
-    /// Start editing: a copy of the steps of the version on screen, or of the one a run plays
-    /// when the tape is what is on screen.
+    /// Start editing: a copy of the filtered version, which is what an edit is meant to start
+    /// from — an edit of an edit carries whatever the last one got wrong. The one exception is
+    /// a tab the person went to themselves: if they are standing on an edited version, that is
+    /// the one they asked to change. The tab the page opens on does not count, since that is
+    /// the newest edit and starting from it is the thing this avoids.
     fn begin_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = {
             let state = self.state.read(cx);
             let Some(detail) = state.recipe_open.as_ref() else {
                 return;
             };
-            shown_version(detail, self.selected_version)
-                .filter(|version| version.is_runnable())
+            self.selected_version
+                .and_then(|number| version_of(detail, number))
+                .filter(|version| version.is_edited())
+                .or_else(|| filtered_version(detail))
                 .or_else(|| detail.runnable_version())
                 .map(|version| (version.version, version.body.steps.clone()))
         };
         let Some((version, steps)) = picked else {
             return;
         };
+        // The tab moves to the version the draft came from, so the line under the toolbar says
+        // which one that was.
         self.selected_version = Some(version);
         self.draft = Some(steps);
-        self.editing_step = None;
         self.step_modal = None;
         // Only one thing stands over the page at a time.
         self.history_open = false;
@@ -450,7 +622,6 @@ impl RecipesView {
 
     fn cancel_draft(&mut self, cx: &mut Context<Self>) {
         self.draft = None;
-        self.editing_step = None;
         self.step_modal = None;
         self.draft_error = None;
         cx.notify();
@@ -472,12 +643,6 @@ impl RecipesView {
             return;
         }
         draft.swap(index, other);
-        // The row being edited moves with its step.
-        if self.editing_step == Some(index) {
-            self.editing_step = Some(other);
-        } else if self.editing_step == Some(other) {
-            self.editing_step = Some(index);
-        }
         cx.notify();
     }
 
@@ -489,11 +654,6 @@ impl RecipesView {
             return;
         }
         draft.remove(index);
-        match self.editing_step {
-            Some(editing) if editing == index => self.editing_step = None,
-            Some(editing) if editing > index => self.editing_step = Some(editing - 1),
-            _ => {}
-        }
         cx.notify();
     }
 
@@ -507,11 +667,12 @@ impl RecipesView {
             .unwrap_or_default()
     }
 
-    /// Add step: a step of the chosen kind at the end of the draft, with its editor open, so
-    /// the defaults it starts on are never what gets saved by accident.
+    /// Add step: the modal on a step of the chosen kind, filled with sensible defaults. It
+    /// joins the draft when it is saved, so a step that was thought better of leaves no row at
+    /// the bottom of a table the person would have to scroll to to be rid of.
     fn add_step(&mut self, kind: StepKind, window: &mut Window, cx: &mut Context<Self>) {
         let screen = self.screen(cx);
-        let Some(draft) = self.draft.as_mut() else {
+        let Some(draft) = self.draft.as_ref() else {
             return;
         };
         if draft.len() >= MAX_STEPS {
@@ -519,104 +680,48 @@ impl RecipesView {
             cx.notify();
             return;
         }
-        draft.push(kind.new_step(screen));
-        let index = draft.len() - 1;
         self.draft_error = None;
-        self.open_step_editor(index, window, cx);
+        self.fill_step_modal(
+            StepModal { index: None, kind },
+            &kind.new_step(screen),
+            window,
+            cx,
+        );
     }
 
-    /// A row's editor: the field in its Details cell for a step of one value, the modal for a
-    /// step of several.
+    /// A row's editor, which is the modal whatever the step is: a field in the table was a
+    /// second way of editing that only some kinds of step had, and it sat in the part of the
+    /// page that scrolls.
     fn open_step_editor(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(step) = self.draft.as_ref().and_then(|draft| draft.get(index)) else {
+        let Some(step) = self
+            .draft
+            .as_ref()
+            .and_then(|draft| draft.get(index))
+            .cloned()
+        else {
             return;
         };
-        if StepKind::of(step).params().is_empty() {
-            self.begin_step_edit(index, window, cx);
-        } else {
-            self.open_step_modal(index, window, cx);
-        }
-    }
-
-    /// Put the step's text, key or wait in the field and open that cell for editing.
-    fn begin_step_edit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let value = match self.draft.as_ref().and_then(|draft| draft.get(index)) {
-            Some(RecipeStep::Type { text }) => text.clone(),
-            Some(RecipeStep::Key { key }) => key.clone(),
-            Some(RecipeStep::Wait { ms }) => ms.to_string(),
-            _ => return,
-        };
-        self.editing_step = Some(index);
-        self.step_modal = None;
-        self.draft_error = None;
-        self.step_input.update(cx, |input, cx| {
-            input.set_value(value, window, cx);
-        });
-        cx.notify();
-    }
-
-    fn commit_step_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.editing_step else {
-            return;
-        };
-        let value = self.step_input.read(cx).value().to_string();
-        let Some(step) = self.draft.as_mut().and_then(|draft| draft.get_mut(index)) else {
-            self.editing_step = None;
-            return;
-        };
-        let mut note = None;
-        match step {
-            RecipeStep::Type { text } => *text = value,
-            RecipeStep::Key { key } => {
-                let typed = value.trim();
-                if typed.is_empty() {
-                    self.draft_error =
-                        Some("A key step needs a key, such as Return or a.".to_string());
-                    cx.notify();
-                    return;
-                }
-                *key = typed.to_string();
-            }
-            RecipeStep::Wait { ms } => match value.trim().parse::<u64>() {
-                Ok(parsed) => {
-                    *ms = parsed.min(MAX_WAIT_MS);
-                    if parsed > MAX_WAIT_MS {
-                        note = Some(format!(
-                            "A wait is at most {MAX_WAIT_MS} ms, so that one was shortened."
-                        ));
-                    }
-                }
-                Err(_) => {
-                    self.draft_error = Some(format!(
-                        "A wait is a number of milliseconds, up to {MAX_WAIT_MS}."
-                    ));
-                    cx.notify();
-                    return;
-                }
+        let kind = StepKind::of(&step);
+        self.fill_step_modal(
+            StepModal {
+                index: Some(index),
+                kind,
             },
-            _ => {}
-        }
-        self.editing_step = None;
-        self.draft_error = note;
-        cx.notify();
+            &step,
+            window,
+            cx,
+        );
     }
 
-    fn cancel_step_edit(&mut self, cx: &mut Context<Self>) {
-        self.editing_step = None;
-        cx.notify();
-    }
-
-    /// Open the modal on a row: one field per parameter of the step, filled with what it holds.
-    fn open_step_modal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(step) = self.draft.as_ref().and_then(|draft| draft.get(index)) else {
-            return;
-        };
-        let kind = StepKind::of(step);
-        let values = step_param_values(step);
-        if values.is_empty() {
-            return;
-        }
-        for (field, value) in self.step_fields.iter().zip(values) {
+    /// Open the modal on a step: one field per parameter, filled with what the step holds.
+    fn fill_step_modal(
+        &mut self,
+        modal: StepModal,
+        step: &RecipeStep,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (field, value) in self.step_fields.iter().zip(step_param_values(step)) {
             field.update(cx, |input, cx| {
                 input.set_value(value, window, cx);
             });
@@ -626,14 +731,15 @@ impl RecipesView {
         if let Some(first) = self.step_fields.first() {
             first.update(cx, |input, cx| input.focus(window, cx));
         }
-        self.editing_step = None;
-        self.step_modal = Some(StepModal { index, kind });
+        self.step_modal = Some(modal);
         self.draft_error = None;
         cx.notify();
     }
 
-    /// The modal's Save: the fields as a step, or the reason they are not one on the page's
-    /// error line, with the modal left open on what was typed.
+    /// The modal's Save: the fields as a step, in the row it was opened on or at the end of
+    /// the draft when it was opened by Add step. A refusal shows on the page's error line with
+    /// the modal left open on what was typed; a wait that was only shortened is saved, and the
+    /// same line says so.
     fn save_step_modal(&mut self, cx: &mut Context<Self>) {
         let Some(modal) = self.step_modal else {
             return;
@@ -642,25 +748,36 @@ impl RecipesView {
         let typed: Vec<String> = self
             .step_fields
             .iter()
-            .map(|field| field.read(cx).value().trim().to_string())
+            .map(|field| field.read(cx).value().to_string())
             .collect();
-        let step = match build_step(modal.kind, &typed, screen) {
-            Ok(step) => step,
+        let (step, note) = match build_step(modal.kind, &typed, screen) {
+            Ok(built) => built,
             Err(reason) => {
                 self.draft_error = Some(reason);
                 cx.notify();
                 return;
             }
         };
-        if let Some(slot) = self
-            .draft
-            .as_mut()
-            .and_then(|draft| draft.get_mut(modal.index))
-        {
-            *slot = step;
+        let Some(draft) = self.draft.as_mut() else {
+            return;
+        };
+        match modal.index {
+            Some(index) => {
+                if let Some(slot) = draft.get_mut(index) {
+                    *slot = step;
+                }
+            }
+            None => {
+                if draft.len() >= MAX_STEPS {
+                    self.draft_error = Some(format!("A version holds at most {MAX_STEPS} steps."));
+                    cx.notify();
+                    return;
+                }
+                draft.push(step);
+            }
         }
         self.step_modal = None;
-        self.draft_error = None;
+        self.draft_error = note;
         cx.notify();
     }
 
@@ -692,7 +809,6 @@ impl RecipesView {
         // The saved version is the newest, and the newest is what a fresh page stands on.
         self.selected_version = None;
         self.draft = None;
-        self.editing_step = None;
         self.step_modal = None;
         self.draft_error = None;
         cx.notify();
@@ -702,13 +818,14 @@ impl RecipesView {
 impl Render for RecipesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_fields(window, cx);
+        self.sync_bots(cx);
         let theme = cx.theme().clone();
         let open = self.state.read(cx).recipe_open_id.is_some();
         let view = cx.entity();
         v_flex()
             .id("page-recipes")
             .size_full()
-            // The step modal hangs off the page, so it is centred on the page's own slot.
+            // The modals hang off the page, so they are centred on the page's own slot.
             .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
@@ -717,8 +834,14 @@ impl Render for RecipesView {
             } else {
                 self.list(window, &theme, cx)
             })
+            .when(self.share_open, |this| {
+                this.child(self.share_overlay(&view, &theme, cx))
+            })
             .when_some(self.step_modal, |this, modal| {
                 this.child(self.step_modal_overlay(modal, &view, &theme, cx))
+            })
+            .when_some(self.delete_version_confirm, |this, version| {
+                this.child(self.delete_version_overlay(version, &view, &theme))
             })
             .when_some(
                 self.history_open
@@ -735,6 +858,7 @@ impl RecipesView {
     /// empty list takes the rest of the page and stands in the middle of it.
     fn list(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let app = self.state.clone();
+        let view = cx.entity();
         let muted = theme.muted_foreground;
         let (filter, recipes, loading, error, me, last_runs, page_width) = {
             let state = self.state.read(cx);
@@ -832,6 +956,7 @@ impl RecipesView {
                                         pending == 1,
                                         stacked,
                                         app.clone(),
+                                        &view,
                                         theme,
                                     )
                                 }),
@@ -900,8 +1025,9 @@ impl RecipesView {
     }
 
     /// The cards of the detail, for what the person may do with this recipe: everything for
-    /// its owner; the steps, the bots, a run and the history for someone it is shared with;
-    /// only Accept and Decline for someone it is offered to.
+    /// its owner; the steps, a run and the history for someone it is shared with; only Accept
+    /// and Decline for someone it is offered to. Who else may have it is not a card at all —
+    /// it is the share icon on the About card, and the modal that opens under it.
     fn sections(
         &self,
         detail: &RecipeDetail,
@@ -912,19 +1038,14 @@ impl RecipesView {
         view: &Entity<Self>,
         theme: &Theme,
     ) -> Vec<AnyElement> {
-        let mine = detail.recipe.is_mine();
         let waiting = busy.is_some();
-        let mut sections = vec![self.about_section(detail, waiting, me, app, theme)];
+        let mut sections = vec![self.about_section(detail, waiting, me, app, view, theme)];
         if detail.recipe.is_pending_invite() {
             return sections;
         }
         sections.push(self.steps_section(detail, busy, app, view, theme));
         if let Some(run) = run {
             sections.push(last_run_section(&run, detail, theme));
-        }
-        sections.push(bots_section(detail, waiting, app, theme));
-        if mine {
-            sections.push(self.share_section(detail, waiting, app, theme));
         }
         sections
     }
@@ -935,6 +1056,7 @@ impl RecipesView {
         busy: bool,
         me: Option<&str>,
         app: &Entity<AppState>,
+        view: &Entity<Self>,
         theme: &Theme,
     ) -> AnyElement {
         let muted = theme.muted_foreground;
@@ -986,7 +1108,14 @@ impl RecipesView {
             let name_input = self.name_input.clone();
             let description_input = self.description_input.clone();
             return card(theme)
-                .child(section_title("About"))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .child(section_title("About"))
+                        .child(detail_share_icon(view, muted, theme)),
+                )
                 .child(field_label("Name", muted))
                 .child(
                     div()
@@ -1035,10 +1164,20 @@ impl RecipesView {
         }
         card(theme)
             .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(recipe.name.clone()),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(recipe.name.clone()),
+                    )
+                    .child(detail_share_icon(view, muted, theme)),
             )
             .when(!recipe.description.trim().is_empty(), |this| {
                 this.child(
@@ -1142,7 +1281,8 @@ impl RecipesView {
     }
 
     /// What may be done with the recipe, above the table and out of its scroll: Run, Edit
-    /// steps and Delete, or the editor's own controls while a draft is open.
+    /// steps, Delete version and Delete recipe, or the editor's own controls while a draft is
+    /// open.
     fn steps_toolbar(
         &self,
         detail: &RecipeDetail,
@@ -1202,6 +1342,13 @@ impl RecipesView {
                 .into_any_element();
         }
         let mine = detail.recipe.is_mine();
+        // Only a version someone wrote by editing may go on its own, and only its owner may
+        // send it: the tape and the steps filtered from it are what the recipe is.
+        let deletable = mine
+            .then(|| shown_version(detail, self.selected_version))
+            .flatten()
+            .filter(|version| version.is_edited())
+            .map(|version| version.version);
         let running = busy == Some("Running…");
         let picked = self.picked_bot(detail);
         let granted = granted_bots(detail);
@@ -1283,11 +1430,39 @@ impl RecipesView {
                                     }
                                 }),
                         )
+                        .when_some(deletable, |this, number| {
+                            this.child(
+                                Button::new("recipe-delete-version")
+                                    .small()
+                                    .label("Delete version")
+                                    .tooltip(format!("Remove v{number}, not the recipe"))
+                                    .disabled(waiting)
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.ask_delete_version(number, cx)
+                                            });
+                                        }
+                                    }),
+                            )
+                        })
+                        // A rule between the two deletes, because the one on its right takes
+                        // every version with it and the one on its left takes only the version
+                        // on screen.
+                        .child(
+                            div()
+                                .w(px(1.))
+                                .h(px(18.))
+                                .mx(px(2.))
+                                .flex_shrink_0()
+                                .bg(theme.border),
+                        )
                         .child(
                             Button::new("recipe-delete")
                                 .small()
                                 .danger()
-                                .label("Delete")
+                                .label("Delete recipe")
                                 .disabled(waiting)
                                 .on_click({
                                     let app = app.clone();
@@ -1348,8 +1523,8 @@ impl RecipesView {
             .into_any_element()
     }
 
-    /// One row of the table: its number, what it does, and to what. In edit mode the details
-    /// of a type or a wait open in place, and the row carries move and delete.
+    /// One row of the table: its number, what it does, and to what. In edit mode a double
+    /// click on the details opens the step's modal, and the row carries move and delete.
     fn step_row(
         &self,
         index: usize,
@@ -1362,7 +1537,6 @@ impl RecipesView {
     ) -> AnyElement {
         let (verb, details) = step_words(step);
         let editable = editing;
-        let open = editing && self.editing_step == Some(index);
         let row = h_flex()
             .id(SharedString::from(format!("recipe-step-{index}")))
             .w_full()
@@ -1388,51 +1562,6 @@ impl RecipesView {
                     .truncate()
                     .child(verb),
             );
-        if open {
-            let hint = match step {
-                RecipeStep::Wait { .. } => "milliseconds, up to 10000",
-                RecipeStep::Key { .. } => "a key, such as Return",
-                _ => "the text to type",
-            };
-            return row
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(field_input(&self.step_input).id("recipe-step-input")),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(hint),
-                )
-                .child(
-                    Button::new("recipe-step-done")
-                        .xsmall()
-                        .primary()
-                        .label("Done")
-                        .on_click({
-                            let view = view.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |this, cx| this.commit_step_edit(cx));
-                            }
-                        }),
-                )
-                .child(
-                    Button::new("recipe-step-cancel")
-                        .xsmall()
-                        .label("Cancel")
-                        .on_click({
-                            let view = view.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |this, cx| this.cancel_step_edit(cx));
-                            }
-                        }),
-                )
-                .into_any_element();
-        }
         row.child(
             div()
                 .id(SharedString::from(format!("recipe-step-edit-{index}")))
@@ -1509,40 +1638,164 @@ impl RecipesView {
         .into_any_element()
     }
 
-    /// The owner's sharing: the org, one person by email, and who has it now.
-    fn share_section(
+    /// Sharing, all of it in one place: the bots that may run this recipe, the whole org, and
+    /// one person by email. Three tabs rather than three cards, because they are one question
+    /// — who else gets this task — asked of three kinds of somebody.
+    fn share_overlay(&self, view: &Entity<Self>, theme: &Theme, cx: &App) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let state = self.state.read(cx);
+        let detail = state.recipe_open.clone();
+        let busy = state.recipe_busy.is_some();
+        let loading = state.recipe_loading && detail.is_none();
+        // Only an owner may pass a recipe on; everyone else may still say which of their own
+        // bots is allowed to run it, so they get that tab and no other.
+        let mine = detail
+            .as_ref()
+            .is_some_and(|detail| detail.recipe.is_mine());
+        let tabs: Vec<ShareTab> = ShareTab::ALL
+            .into_iter()
+            .filter(|tab| mine || *tab == ShareTab::Bots)
+            .collect();
+        let shown = if tabs.contains(&self.share_tab) {
+            self.share_tab
+        } else {
+            ShareTab::Bots
+        };
+        let app = self.state.clone();
+        div()
+            .id("recipe-share-modal")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.32))
+            .on_mouse_down(MouseButton::Left, {
+                let view = view.clone();
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| this.close_share(cx));
+                }
+            })
+            .child(
+                v_flex()
+                    .id("recipe-share-card")
+                    .w(px(SHARE_MODAL_W))
+                    .bg(theme.popover)
+                    .text_color(theme.foreground)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(14.))
+                    .shadow_lg()
+                    .px(px(20.))
+                    .py(px(18.))
+                    .gap(px(10.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Share"),
+                    )
+                    .child(
+                        h_flex()
+                            .id("recipe-share-tabs")
+                            .w_full()
+                            .items_end()
+                            .gap(px(2.))
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .children(
+                                tabs.into_iter()
+                                    .map(|tab| share_tab(tab, tab == shown, view, muted, theme)),
+                            ),
+                    )
+                    .child(
+                        // The body is the same height whichever tab is on, so the modal does
+                        // not jump about as a person moves between them, and the bots picker's
+                        // panel has room to hang open.
+                        v_flex()
+                            .id("recipe-share-body")
+                            .w_full()
+                            .h(px(SHARE_BODY_HEIGHT))
+                            .gap(px(8.))
+                            .when(loading, |this| {
+                                this.child(div().text_xs().text_color(muted).child("Loading…"))
+                            })
+                            .when_some(detail, |this, detail| {
+                                this.child(match shown {
+                                    ShareTab::Bots => self.share_bots_tab(&detail, muted),
+                                    ShareTab::Org => {
+                                        share_org_tab(&detail, busy, &app, muted, theme)
+                                    }
+                                    ShareTab::Email => {
+                                        self.share_email_tab(&detail, busy, &app, muted, theme)
+                                    }
+                                })
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap(px(8.))
+                            .pt(px(6.))
+                            .child(Button::new("recipe-share-close").label("Close").on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.close_share(cx));
+                                }
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The Bots tab: which of the person's own bots may run this recipe. Ticking one grants it
+    /// and unticking takes the grant back, each on its own request.
+    fn share_bots_tab(&self, detail: &RecipeDetail, muted: Hsla) -> AnyElement {
+        if detail.my_bots.is_empty() {
+            return div()
+                .text_xs()
+                .text_color(muted)
+                .child("You have no bots yet.")
+                .into_any_element();
+        }
+        let granted = granted_bots(detail).len();
+        v_flex()
+            .w_full()
+            .gap(px(8.))
+            .child(div().text_xs().text_color(muted).child(
+                "A ticked bot may run this recipe on its own computer, and Run plays it on one of them.",
+            ))
+            .child(self.bots.clone())
+            .child(div().text_xs().text_color(muted).child(if granted == 0 {
+                "No bot may run this recipe yet.".to_string()
+            } else {
+                format!("{} may run this recipe.", count_of(granted, "bot"))
+            }))
+            .into_any_element()
+    }
+
+    /// The Email tab: the address, Share, and the people it has gone to with a way to take it
+    /// back from each.
+    fn share_email_tab(
         &self,
         detail: &RecipeDetail,
         busy: bool,
         app: &Entity<AppState>,
+        muted: Hsla,
         theme: &Theme,
     ) -> AnyElement {
-        let muted = theme.muted_foreground;
-        let org_shared = detail.shares.iter().any(|share| share.scope == "org");
         let email_input = self.share_email_input.clone();
-        card(theme)
-            .child(section_title("Share"))
-            .child(
-                h_flex().w_full().gap(px(8.)).items_center().child(
-                    Button::new("recipe-share-org")
-                        .small()
-                        .label(if org_shared {
-                            "Shared with the org"
-                        } else {
-                            "Share with org"
-                        })
-                        .disabled(busy || org_shared)
-                        .on_click({
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                app.update(cx, |state, cx| {
-                                    state.share_open_recipe(RecipeShareTarget::Org, cx);
-                                });
-                            }
-                        }),
-                ),
-            )
-            .child(field_label("Share with a person", muted))
+        let people: Vec<&RecipeShare> = detail
+            .shares
+            .iter()
+            .filter(|share| share.scope != "org")
+            .collect();
+        v_flex()
+            .w_full()
+            .gap(px(8.))
+            .child(field_label("Share with a person in your org", muted))
             .child(
                 h_flex()
                     .w_full()
@@ -1580,53 +1833,37 @@ impl RecipesView {
                             }),
                     ),
             )
-            .when(!detail.shares.is_empty(), |this| {
-                this.child(field_label("Shared with", muted))
+            .child(field_label("Shared with", muted))
+            .when(people.is_empty(), |this| {
+                this.child(div().text_xs().text_color(muted).child("Nobody yet."))
             })
-            .children(detail.shares.iter().map(|share| {
-                let who = if share.scope == "org" {
-                    "Everyone in the org".to_string()
-                } else {
-                    share.scope_id.clone()
-                };
-                let scope = share.scope.clone();
-                let scope_id = share.scope_id.clone();
-                let row_id = format!("recipe-share-{scope}-{scope_id}");
-                let unshare_id = format!("recipe-unshare-{scope}-{scope_id}");
-                h_flex()
-                    .id(SharedString::from(row_id))
+            .child(
+                div()
+                    .id("recipe-share-people")
                     .w_full()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(div().flex_1().min_w_0().text_sm().truncate().child(who))
-                    .child(div().text_xs().text_color(muted).child(share.state_label()))
-                    .child(
-                        Button::new(SharedString::from(unshare_id))
-                            .xsmall()
-                            .ghost()
-                            .label("✕")
-                            .disabled(busy)
-                            .on_click({
-                                let app = app.clone();
-                                move |_, _, cx| {
-                                    app.update(cx, |state, cx| {
-                                        state.unshare_open_recipe(
-                                            scope.clone(),
-                                            scope_id.clone(),
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }),
-                    )
-            }))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(v_flex().w_full().children(people.into_iter().map(|share| {
+                        share_row(
+                            share.scope_id.clone(),
+                            share.scope.clone(),
+                            share.scope_id.clone(),
+                            share.state_label(),
+                            busy,
+                            app,
+                            muted,
+                            theme,
+                        )
+                    }))),
+            )
             .into_any_element()
     }
 
-    /// The modal a step of more than one parameter opens on: one labelled field per parameter,
-    /// Cancel and Save. It mirrors the delete dialog — the same scrim, the same centred card —
-    /// and a click on the scrim is its Cancel, because a dialog that traps a stray click is
-    /// worse than one that is easy to leave.
+    /// The modal every step is added and edited in: one labelled field per parameter, Cancel
+    /// and Save. It mirrors the delete dialog — the same scrim, the same centred card — and a
+    /// click on the scrim is its Cancel, because a dialog that traps a stray click is worse
+    /// than one that is easy to leave.
     fn step_modal_overlay(
         &self,
         modal: StepModal,
@@ -1637,6 +1874,10 @@ impl RecipesView {
         let muted = theme.muted_foreground;
         let screen = self.screen(cx);
         let params = modal.kind.params();
+        let title = match modal.index {
+            Some(index) => format!("Step {}: {}", index + 1, modal.kind.label()),
+            None => format!("Add step: {}", modal.kind.label()),
+        };
         div()
             .id("recipe-step-modal")
             .absolute()
@@ -1669,12 +1910,14 @@ impl RecipesView {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("Step {}: {}", modal.index + 1, modal.kind.label())),
+                            .child(title),
                     )
-                    .child(div().text_xs().text_color(muted).child(format!(
-                        "This recipe's screen is {} × {}.",
-                        screen.width, screen.height
-                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(step_modal_note(modal.kind, screen)),
+                    )
                     .children(params.iter().zip(&self.step_fields).map(|(param, field)| {
                         v_flex()
                             .w_full()
@@ -1721,6 +1964,86 @@ impl RecipesView {
             .into_any_element()
     }
 
+    /// "Delete v3?" — the version on screen and nothing else. It says what goes with it and
+    /// what stays, because the other Delete on the same toolbar takes the whole recipe.
+    fn delete_version_overlay(
+        &self,
+        version: u32,
+        view: &Entity<Self>,
+        theme: &Theme,
+    ) -> AnyElement {
+        div()
+            .id("recipe-delete-version-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.32))
+            .on_mouse_down(MouseButton::Left, {
+                let view = view.clone();
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| this.cancel_delete_version(cx));
+                }
+            })
+            .child(
+                v_flex()
+                    .id("recipe-delete-version-confirm")
+                    .w(px(420.))
+                    .bg(theme.popover)
+                    .text_color(theme.foreground)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(14.))
+                    .shadow_lg()
+                    .px(px(20.))
+                    .py(px(18.))
+                    .gap(px(10.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("Delete version {version}?")),
+                    )
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(
+                        "Only this version goes, with the runs that played it. The recipe, the tape it was taught from and its other versions stay.",
+                    ))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap(px(8.))
+                            .pt(px(6.))
+                            .child(
+                                Button::new("recipe-delete-version-cancel")
+                                    .label("Cancel")
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.cancel_delete_version(cx)
+                                            });
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("recipe-delete-version-yes")
+                                    .danger()
+                                    .label(format!("Delete v{version}"))
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.confirm_delete_version(cx)
+                                            });
+                                        }
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
     /// The history: every version a tab, and under the chosen one the runs of that version,
     /// newest first. The server keeps five runs per version and prunes the rest as each run
     /// lands, so five is all there ever is to show.
@@ -1846,6 +2169,212 @@ impl RecipesView {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// The share icon: what opens the modal, from the About card and from a row of the list. An
+/// icon and not a button, because it sits beside a heading and a name rather than in a row of
+/// things to do. It carries no click of its own — the one on a row has a recipe to open first.
+fn share_icon(id: impl Into<ElementId>, muted: Hsla, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(28.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.14)))
+        .tooltip(|window, cx| Tooltip::new("Share").build(window, cx))
+        .child(
+            Icon::default()
+                .path("icons/share.svg")
+                .size(px(14.))
+                .text_color(muted),
+        )
+}
+
+/// The About card's share icon, on a recipe that is already open.
+fn detail_share_icon(view: &Entity<RecipesView>, muted: Hsla, theme: &Theme) -> Stateful<Div> {
+    share_icon("recipe-share-open", muted, theme).on_click({
+        let view = view.clone();
+        move |_, _, cx| {
+            view.update(cx, |this, cx| this.open_share(false, cx));
+        }
+    })
+}
+
+/// One tab of the share modal, the way a version tab reads: the word, underlined when it is
+/// the one on screen.
+fn share_tab(
+    tab: ShareTab,
+    selected: bool,
+    view: &Entity<RecipesView>,
+    muted: Hsla,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .id(SharedString::from(format!(
+            "recipe-share-tab-{}",
+            tab.slug()
+        )))
+        .px(px(10.))
+        .py(px(7.))
+        .rounded_t(px(8.))
+        .border_b_2()
+        .border_color(if selected {
+            theme.primary
+        } else {
+            theme.transparent
+        })
+        .text_sm()
+        .when(!selected, |this| this.text_color(muted))
+        .when(selected, |this| this.font_weight(FontWeight::SEMIBOLD))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.1)))
+        .on_click({
+            let view = view.clone();
+            move |_, _, cx| {
+                view.update(cx, |this, cx| this.select_share_tab(tab, cx));
+            }
+        })
+        .child(tab.label())
+        .into_any_element()
+}
+
+/// The Org tab: everyone in the org, on or off. It is one share and not a list, so it says
+/// where it stands and offers the one thing left to do with it.
+fn share_org_tab(
+    detail: &RecipeDetail,
+    busy: bool,
+    app: &Entity<AppState>,
+    muted: Hsla,
+    theme: &Theme,
+) -> AnyElement {
+    let org = detail.shares.iter().find(|share| share.scope == "org");
+    v_flex()
+        .w_full()
+        .gap(px(8.))
+        .child(div().text_xs().text_color(muted).child(
+            "Everyone in your org can find a recipe shared this way and run it on their own bots.",
+        ))
+        .when(org.is_none(), |this| {
+            this.child(
+                h_flex().w_full().child(
+                    Button::new("recipe-share-org")
+                        .small()
+                        .primary()
+                        .label("Share with org")
+                        .disabled(busy)
+                        .on_click({
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| {
+                                    state.share_open_recipe(RecipeShareTarget::Org, cx);
+                                });
+                            }
+                        }),
+                ),
+            )
+        })
+        .when_some(org, |this, share| {
+            this.child(field_label("Shared with", muted))
+                .child(share_row(
+                    "Everyone in the org".to_string(),
+                    share.scope.clone(),
+                    share.scope_id.clone(),
+                    share.state_label(),
+                    busy,
+                    app,
+                    muted,
+                    theme,
+                ))
+        })
+        .into_any_element()
+}
+
+/// One line of who has the recipe: who they are, where the share stands with them, and the ✕
+/// that takes it back.
+#[allow(clippy::too_many_arguments)]
+fn share_row(
+    who: String,
+    scope: String,
+    scope_id: String,
+    state: &'static str,
+    busy: bool,
+    app: &Entity<AppState>,
+    muted: Hsla,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let unshare_id = format!("recipe-unshare-{scope}-{scope_id}");
+    h_flex()
+        .id(SharedString::from(format!(
+            "recipe-share-{scope}-{scope_id}"
+        )))
+        .w_full()
+        .items_center()
+        .gap(px(8.))
+        .py(px(4.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().flex_1().min_w_0().text_sm().truncate().child(who))
+        .child(div().text_xs().text_color(muted).child(state))
+        .child(
+            Button::new(SharedString::from(unshare_id))
+                .xsmall()
+                .ghost()
+                .label("✕")
+                .tooltip("Stop sharing")
+                .disabled(busy)
+                .on_click({
+                    let app = app.clone();
+                    move |_, _, cx| {
+                        let (scope, scope_id) = (scope.clone(), scope_id.clone());
+                        app.update(cx, |state, cx| {
+                            state.unshare_open_recipe(scope, scope_id, cx);
+                        });
+                    }
+                }),
+        )
+}
+
+/// The version of that number, when the recipe still has one.
+fn version_of(detail: &RecipeDetail, number: u32) -> Option<&RecipeVersion> {
+    detail
+        .versions
+        .iter()
+        .find(|version| version.version == number)
+}
+
+/// The steps the server filtered off the tape, which is v2 unless a server numbers them
+/// otherwise. A version named `filtered` is the plain case; the number is the fallback.
+fn filtered_version(detail: &RecipeDetail) -> Option<&RecipeVersion> {
+    detail
+        .versions
+        .iter()
+        .find(|version| version.kind == "filtered")
+        .or_else(|| {
+            detail
+                .versions
+                .iter()
+                .find(|version| version.version == 2 && version.is_runnable())
+        })
+}
+
+/// The line under the step modal's title: what bounds what may be typed into it, in the terms
+/// of the kind being edited.
+fn step_modal_note(kind: StepKind, screen: RecipeScreen) -> String {
+    match kind {
+        StepKind::Wait => format!("A wait is a number of milliseconds, up to {MAX_WAIT_MS}."),
+        StepKind::Key => "A key by the name the box knows it as, such as Return or a.".to_string(),
+        StepKind::Type => "The text to type, exactly as it should be typed.".to_string(),
+        _ => format!(
+            "This recipe's screen is {} × {}.",
+            screen.width, screen.height
+        ),
     }
 }
 
@@ -2074,12 +2603,7 @@ fn receipt_image(receipt: &Value) -> Option<(std::sync::Arc<gpui_kit::Image>, u3
 /// The version the page shows: the one the tabs picked, else the newest that can be run, else
 /// the newest of all (a recipe whose tape has not been filtered yet).
 fn shown_version(detail: &RecipeDetail, picked: Option<u32>) -> Option<&RecipeVersion> {
-    if let Some(picked) = picked
-        && let Some(found) = detail
-            .versions
-            .iter()
-            .find(|version| version.version == picked)
-    {
+    if let Some(found) = picked.and_then(|picked| version_of(detail, picked)) {
         return Some(found);
     }
     detail
@@ -2461,7 +2985,7 @@ fn event_offset(ms: i64) -> String {
 }
 
 /// A step's parameters as the modal's fields start out, in the order [`StepKind::params`] puts
-/// them. A step of one value has none: that one is edited in its own row.
+/// them.
 fn step_param_values(step: &RecipeStep) -> Vec<String> {
     match step {
         RecipeStep::Click { x, y, button } => vec![
@@ -2483,17 +3007,61 @@ fn step_param_values(step: &RecipeStep) -> Vec<String> {
         RecipeStep::Scroll { x, y, dx, dy } => {
             vec![x.to_string(), y.to_string(), dx.to_string(), dy.to_string()]
         }
-        RecipeStep::Type { .. } | RecipeStep::Key { .. } | RecipeStep::Wait { .. } => Vec::new(),
+        RecipeStep::Type { text } => vec![text.clone()],
+        RecipeStep::Key { key } => vec![key.clone()],
+        RecipeStep::Wait { ms } => vec![ms.to_string()],
     }
 }
 
-/// The modal's fields as a step, or why they are not one. A bot plays a recipe on a screen of
-/// its own, so a coordinate off that screen is a step that would miss whatever it was aimed at.
+/// The modal's fields as a step and, where the step was taken but not quite as it was typed,
+/// what to say about that. A bot plays a recipe on a screen of its own, so a coordinate off
+/// that screen is a step that would miss whatever it was aimed at; a wait past the server's cap
+/// is shortened rather than refused, since the person meant "a long time" and the server has a
+/// longest one.
 fn build_step(
     kind: StepKind,
     typed: &[String],
     screen: RecipeScreen,
-) -> Result<RecipeStep, String> {
+) -> Result<(RecipeStep, Option<String>), String> {
+    match kind {
+        // What is typed is what is typed: a space at either end of it is as much a part of the
+        // text as the letters between them, so this one value is not trimmed.
+        StepKind::Type => {
+            return Ok((
+                RecipeStep::Type {
+                    text: typed.first().cloned().unwrap_or_default(),
+                },
+                None,
+            ));
+        }
+        StepKind::Key => {
+            let key = typed.first().map(|value| value.trim()).unwrap_or_default();
+            if key.is_empty() {
+                return Err("A key step needs a key, such as Return or a.".to_string());
+            }
+            return Ok((
+                RecipeStep::Key {
+                    key: key.to_string(),
+                },
+                None,
+            ));
+        }
+        StepKind::Wait => {
+            let typed = typed.first().map(|value| value.trim()).unwrap_or_default();
+            let ms = typed
+                .parse::<u64>()
+                .map_err(|_| format!("A wait is a number of milliseconds, up to {MAX_WAIT_MS}."))?;
+            let note = (ms > MAX_WAIT_MS)
+                .then(|| format!("A wait is at most {MAX_WAIT_MS} ms, so that one was shortened."));
+            return Ok((
+                RecipeStep::Wait {
+                    ms: ms.min(MAX_WAIT_MS),
+                },
+                note,
+            ));
+        }
+        _ => {}
+    }
     let params = kind.params();
     let mut numbers: Vec<i64> = Vec::with_capacity(params.len());
     let mut button: Option<Value> = None;
@@ -2501,6 +3069,7 @@ fn build_step(
         match param.kind {
             ParamKind::X | ParamKind::Y | ParamKind::Amount => {
                 let number = value
+                    .trim()
                     .parse::<i64>()
                     .map_err(|_| format!("{} is a whole number.", param.label))?;
                 let bound = match param.kind {
@@ -2519,9 +3088,11 @@ fn build_step(
                 numbers.push(number);
             }
             ParamKind::Button => button = parse_button(value)?,
+            // The kinds of one value answered above, before any field was read as a number.
+            ParamKind::Text | ParamKind::Key | ParamKind::Wait => {}
         }
     }
-    Ok(match kind {
+    let step = match kind {
         StepKind::Click => RecipeStep::Click {
             x: numbers[0],
             y: numbers[1],
@@ -2543,9 +3114,10 @@ fn build_step(
             dx: numbers[2],
             dy: numbers[3],
         },
-        // A step of one value never opens the modal, so its fields are never built from.
+        // Answered above, each from its own one field.
         StepKind::Type | StepKind::Key | StepKind::Wait => kind.new_step(screen),
-    })
+    };
+    Ok((step, None))
 }
 
 /// Which button a click uses: the word the box knows, the number the tape used, or nothing at
@@ -2594,158 +3166,6 @@ fn run_outcome(run: &RecipeRunOutcome, detail: &RecipeDetail, theme: &Theme) -> 
             )
         })
         .into_any_element()
-}
-
-/// The one place bots are dealt with: which of the person's bots may run this recipe, and so
-/// which one Run may play it on. One control rather than a list of checkboxes beside a row of
-/// chips, because checking a bot and choosing a bot were the same choice said twice.
-fn bots_section(
-    detail: &RecipeDetail,
-    busy: bool,
-    app: &Entity<AppState>,
-    theme: &Theme,
-) -> AnyElement {
-    let muted = theme.muted_foreground;
-    let bots: Vec<(String, String, bool)> = detail
-        .my_bots
-        .iter()
-        .map(|bot| {
-            (
-                bot.id.clone(),
-                bot_label(&bot.name, &bot.id),
-                detail.is_granted(&bot.id),
-            )
-        })
-        .collect();
-    let summary = granted_summary(&bots);
-    let ungranted: Vec<String> = bots
-        .iter()
-        .filter(|(_, _, granted)| !granted)
-        .map(|(id, _, _)| id.clone())
-        .collect();
-    let granted: Vec<String> = bots
-        .iter()
-        .filter(|(_, _, granted)| *granted)
-        .map(|(id, _, _)| id.clone())
-        .collect();
-    card(theme)
-        .child(section_title("Bots"))
-        .child(div().text_xs().text_color(muted).child(
-            "A checked bot may run this recipe on its own computer, and Run plays it on one of them.",
-        ))
-        .when(bots.is_empty(), |this| {
-            this.child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("You have no bots yet."),
-            )
-        })
-        .when(!bots.is_empty(), |this| {
-            this.child(
-                Popover::new("recipe-bots-popover")
-                    .w(px(BOTS_MENU_W))
-                    .trigger(
-                        // The trigger only opens the panel, so it stays live while a grant is
-                        // in flight; it is the checkboxes inside that wait for the answer.
-                        Button::new("recipe-bots")
-                            .small()
-                            .label(summary)
-                            .icon(Icon::new(IconName::ChevronDown).size(px(14.))),
-                    )
-                    .content({
-                        let app = app.clone();
-                        let theme = theme.clone();
-                        move |_, _, _| bots_menu(&bots, &granted, &ungranted, busy, &app, &theme)
-                    }),
-            )
-        })
-        .into_any_element()
-}
-
-/// The picker's panel: Select all and Deselect all over one checkbox per bot. Checking grants
-/// the recipe to that bot and unchecking takes it back, each on its own request.
-fn bots_menu(
-    bots: &[(String, String, bool)],
-    granted: &[String],
-    ungranted: &[String],
-    busy: bool,
-    app: &Entity<AppState>,
-    theme: &Theme,
-) -> AnyElement {
-    v_flex()
-        .id("recipe-bots-menu")
-        .w_full()
-        .gap(px(6.))
-        .child(
-            h_flex()
-                .w_full()
-                .gap(px(6.))
-                .child(
-                    Button::new("recipe-bots-all")
-                        .xsmall()
-                        .label("Select all")
-                        .disabled(busy || ungranted.is_empty())
-                        .on_click({
-                            let app = app.clone();
-                            let ungranted = ungranted.to_vec();
-                            move |_, _, cx| {
-                                let ungranted = ungranted.clone();
-                                app.update(cx, |state, cx| {
-                                    state.set_recipe_grants(ungranted, true, cx);
-                                });
-                            }
-                        }),
-                )
-                .child(
-                    Button::new("recipe-bots-none")
-                        .xsmall()
-                        .label("Deselect all")
-                        .disabled(busy || granted.is_empty())
-                        .on_click({
-                            let app = app.clone();
-                            let granted = granted.to_vec();
-                            move |_, _, cx| {
-                                let granted = granted.clone();
-                                app.update(cx, |state, cx| {
-                                    state.set_recipe_grants(granted, false, cx);
-                                });
-                            }
-                        }),
-                ),
-        )
-        .child(div().w_full().h(px(1.)).bg(theme.border))
-        .children(bots.iter().map(|(id, label, granted)| {
-            let id = id.clone();
-            let app = app.clone();
-            Checkbox::new(SharedString::from(format!("recipe-bot-{id}")))
-                .checked(*granted)
-                .label(label.clone())
-                .disabled(busy)
-                .on_click(move |checked, _, cx| {
-                    let granted = *checked;
-                    let id = id.clone();
-                    app.update(cx, |state, cx| {
-                        state.set_recipe_grant(id, granted, cx);
-                    });
-                })
-        }))
-        .into_any_element()
-}
-
-/// What the picker's trigger says: "hex", "hex and 2 others", or "No bots" when none is
-/// checked.
-fn granted_summary(bots: &[(String, String, bool)]) -> String {
-    let names: Vec<&str> = bots
-        .iter()
-        .filter(|(_, _, granted)| *granted)
-        .map(|(_, label, _)| label.as_str())
-        .collect();
-    match names.split_first() {
-        None => "No bots".to_string(),
-        Some((first, [])) => (*first).to_string(),
-        Some((first, rest)) => format!("{first} and {}", count_of(rest.len(), "other")),
-    }
 }
 
 /// The person's bots this recipe is granted to, in the order the picker lists them.
@@ -2855,6 +3275,7 @@ fn row_stacks(column_width: f32) -> bool {
 /// facts — whose it is, how many versions it has, what its last run came to and when — as
 /// small print grouped beneath that. Accept and Decline join them while a share is waiting on
 /// the person. The whole card opens the recipe.
+#[allow(clippy::too_many_arguments)]
 fn recipe_row(
     recipe: RecipeSummary,
     last_run: Option<RecipeRunNote>,
@@ -2862,6 +3283,7 @@ fn recipe_row(
     single_pending: bool,
     stacked: bool,
     app: Entity<AppState>,
+    view: &Entity<RecipesView>,
     theme: &Theme,
 ) -> AnyElement {
     let muted = theme.muted_foreground;
@@ -2954,6 +3376,27 @@ fn recipe_row(
                         .child(name),
                 )
                 .children(head_badge)
+                .when(!pending, |this| {
+                    this.child(
+                        share_icon(
+                            SharedString::from(format!("recipe-share-open-{id}")),
+                            muted,
+                            theme,
+                        )
+                        .on_click({
+                            let app = app.clone();
+                            let view = view.clone();
+                            let id = id.clone();
+                            move |_, _, cx| {
+                                // The modal needs the recipe itself — its bots, its shares —
+                                // so the row opens it and the modal stands over it.
+                                cx.stop_propagation();
+                                app.update(cx, |state, cx| state.open_recipe(id.clone(), cx));
+                                view.update(cx, |this, cx| this.open_share(true, cx));
+                            }
+                        }),
+                    )
+                })
                 .child(
                     div().flex_shrink_0().flex().items_center().child(
                         Icon::new(IconName::ChevronRight)
@@ -3451,10 +3894,10 @@ mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over
     // the one the test harness wants.
     use super::{
-        COLUMN_MAX, RecipeDetail, RecipeFilter, RecipeScreen, RecipeStep, RecipeTapeEvent,
-        RecipeVersion, StepKind, build_step, empty_words, event_offset, granted_summary,
-        list_column_width, row_stacks, runs_of, shown_version, step_param_values, step_words,
-        tape_words, version_kind,
+        COLUMN_MAX, MAX_WAIT_MS, RecipeDetail, RecipeFilter, RecipeScreen, RecipeStep,
+        RecipeTapeEvent, RecipeVersion, StepKind, build_step, empty_words, event_offset,
+        filtered_version, list_column_width, row_stacks, runs_of, shown_version, step_param_values,
+        step_words, tape_words, version_kind, version_of,
     };
     use serde_json::{Value, json};
 
@@ -3583,27 +4026,6 @@ mod tests {
     }
 
     #[test]
-    fn the_bots_trigger_says_which_bots_are_checked() {
-        let bots = |checked: &[bool]| -> Vec<(String, String, bool)> {
-            ["hex", "ada", "bo"]
-                .iter()
-                .zip(checked)
-                .map(|(name, on)| (format!("cw_{name}"), name.to_string(), *on))
-                .collect()
-        };
-        assert_eq!(granted_summary(&bots(&[false, false, false])), "No bots");
-        assert_eq!(granted_summary(&bots(&[true, false, false])), "hex");
-        assert_eq!(
-            granted_summary(&bots(&[true, true, false])),
-            "hex and 1 other"
-        );
-        assert_eq!(
-            granted_summary(&bots(&[true, true, true])),
-            "hex and 2 others"
-        );
-    }
-
-    #[test]
     fn the_modal_fills_from_the_step_and_builds_one_back() {
         let screen = RecipeScreen {
             width: 1280,
@@ -3617,11 +4039,11 @@ mod tests {
         };
         assert_eq!(step_param_values(&drag), vec!["10", "10", "200", "40"]);
         assert_eq!(
-            build_step(StepKind::Drag, &values(&["10", "10", "200", "40"]), screen).unwrap(),
+            built(StepKind::Drag, &["10", "10", "200", "40"], screen),
             drag
         );
         assert_eq!(
-            build_step(StepKind::Click, &values(&["412", "88", ""]), screen).unwrap(),
+            built(StepKind::Click, &["412", "88", ""], screen),
             RecipeStep::Click {
                 x: 412,
                 y: 88,
@@ -3630,7 +4052,7 @@ mod tests {
             "no button named is the left one"
         );
         assert_eq!(
-            build_step(StepKind::Click, &values(&["412", "88", "Right"]), screen).unwrap(),
+            built(StepKind::Click, &["412", "88", "Right"], screen),
             RecipeStep::Click {
                 x: 412,
                 y: 88,
@@ -3638,12 +4060,7 @@ mod tests {
             }
         );
         assert_eq!(
-            build_step(
-                StepKind::Scroll,
-                &values(&["640", "400", "0", "-120"]),
-                screen
-            )
-            .unwrap(),
+            built(StepKind::Scroll, &["640", "400", "0", "-120"], screen),
             RecipeStep::Scroll {
                 x: 640,
                 y: 400,
@@ -3652,6 +4069,157 @@ mod tests {
             },
             "a scroll may go either way, however far"
         );
+    }
+
+    #[test]
+    fn a_step_of_one_value_fills_and_builds_the_same_way() {
+        let screen = RecipeScreen {
+            width: 1280,
+            height: 800,
+        };
+        let text = RecipeStep::Type {
+            text: "example.com".to_string(),
+        };
+        assert_eq!(step_param_values(&text), vec!["example.com"]);
+        assert_eq!(built(StepKind::Type, &["example.com"], screen), text);
+        assert_eq!(
+            built(StepKind::Type, &["  two words  "], screen),
+            RecipeStep::Type {
+                text: "  two words  ".to_string()
+            },
+            "a space at either end is part of what is typed"
+        );
+        assert_eq!(
+            step_param_values(&RecipeStep::Key {
+                key: "Return".to_string()
+            }),
+            vec!["Return"]
+        );
+        assert_eq!(
+            built(StepKind::Key, &[" Return "], screen),
+            RecipeStep::Key {
+                key: "Return".to_string()
+            }
+        );
+        assert!(
+            build_step(StepKind::Key, &values(&[" "]), screen)
+                .unwrap_err()
+                .contains("Return"),
+            "a key step with no key says what one looks like"
+        );
+        assert_eq!(
+            step_param_values(&RecipeStep::Wait { ms: 500 }),
+            vec!["500"]
+        );
+        assert_eq!(
+            built(StepKind::Wait, &["500"], screen),
+            RecipeStep::Wait { ms: 500 }
+        );
+        let (step, note) = build_step(StepKind::Wait, &values(&["99999"]), screen).unwrap();
+        assert_eq!(
+            step,
+            RecipeStep::Wait { ms: MAX_WAIT_MS },
+            "a longer wait is shortened rather than refused"
+        );
+        assert!(
+            note.is_some_and(|note| note.contains(&MAX_WAIT_MS.to_string())),
+            "and the page is told it was"
+        );
+        assert!(
+            build_step(StepKind::Wait, &values(&["soon"]), screen)
+                .unwrap_err()
+                .contains("milliseconds")
+        );
+    }
+
+    #[test]
+    fn every_kind_of_step_is_edited_in_the_modal() {
+        for kind in StepKind::ALL {
+            assert!(
+                !kind.params().is_empty(),
+                "{} has no field, so it could not be edited anywhere",
+                kind.label()
+            );
+        }
+    }
+
+    /// What [`super::RecipesView::begin_draft`] picks, apart from the entity that holds the
+    /// tab: the tab the person went to when that is an edit of their own, else the filtered
+    /// version, else whatever can be run at all.
+    fn draft_seed(detail: &RecipeDetail, tab: Option<u32>) -> Option<u32> {
+        tab.and_then(|number| version_of(detail, number))
+            .filter(|version| version.is_edited())
+            .or_else(|| filtered_version(detail))
+            .or_else(|| detail.runnable_version())
+            .map(|version| version.version)
+    }
+
+    #[test]
+    fn a_new_version_starts_from_the_filtered_one() {
+        let detail = detail_of(&[(1, "raw"), (2, "filtered"), (3, "edited")]);
+        assert_eq!(
+            draft_seed(&detail, None),
+            Some(2),
+            "the page stands on v3, and an edit still starts from the filtered steps"
+        );
+        assert_eq!(
+            draft_seed(&detail, Some(3)),
+            Some(3),
+            "a tab the person went to themselves is the one they asked to change"
+        );
+        assert_eq!(
+            draft_seed(&detail, Some(1)),
+            Some(2),
+            "the tape cannot be edited, so that one starts from the filtered steps too"
+        );
+        assert_eq!(
+            draft_seed(&detail_of(&[(1, "raw"), (2, "filtered")]), None),
+            Some(2)
+        );
+        assert_eq!(
+            filtered_version(&detail).map(|version| version.version),
+            Some(2),
+            "an edit starts from the steps the server filtered, not from the last edit"
+        );
+        let taped = detail_of(&[(1, "raw")]);
+        assert_eq!(
+            filtered_version(&taped).map(|version| version.version),
+            None,
+            "a tape nothing has been filtered from yet has nothing to start from"
+        );
+        let unnamed: RecipeDetail = serde_json::from_value(json!({
+            "recipe": {"id": "rcp_1"},
+            "versions": [{"version": 1, "kind": "raw"}, {"version": 2, "kind": ""}],
+        }))
+        .unwrap();
+        assert_eq!(
+            filtered_version(&unnamed).map(|version| version.version),
+            Some(2),
+            "a server that names no kind still numbers them"
+        );
+    }
+
+    #[test]
+    fn only_a_version_someone_edited_may_be_deleted_on_its_own() {
+        let detail = detail_of(&[(1, "raw"), (2, "filtered"), (3, "edited"), (4, "")]);
+        let edited: Vec<u32> = detail
+            .versions
+            .iter()
+            .filter(|version| version.is_edited())
+            .map(|version| version.version)
+            .collect();
+        assert_eq!(
+            edited,
+            vec![3, 4],
+            "the tape and the steps filtered from it are what the recipe is"
+        );
+    }
+
+    /// The step a set of typed values builds, for the cases that are never shortened.
+    fn built(kind: StepKind, typed: &[&str], screen: RecipeScreen) -> RecipeStep {
+        let (step, note) = build_step(kind, &values(typed), screen).unwrap();
+        assert!(note.is_none(), "nothing to say about this one");
+        step
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod layout;
 pub mod login;
 pub mod message;
 pub mod message_actions;
+pub mod multi_select;
 pub mod persona;
 pub mod recipes;
 pub mod sidebar;

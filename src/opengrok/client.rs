@@ -774,6 +774,21 @@ impl OpenGrokClient {
         }
     }
 
+    /// Remove one edited version and the runs that played it. The tape (v1) and the steps the
+    /// server filtered from it (v2) are what the recipe is, so the server refuses those with a
+    /// sentence saying as much; it is that sentence the page shows.
+    pub async fn delete_recipe_version(&self, id: &str, version: u32) -> Result<(), OpenGrokError> {
+        let path = format!("/recipes/{id}/versions/{version}");
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
     pub async fn enrol_daemon(
         &self,
         label: &str,
@@ -1243,6 +1258,13 @@ impl RecipeVersion {
     /// The tape is kept, not run; every other kind carries steps.
     pub fn is_runnable(&self) -> bool {
         self.kind != "raw"
+    }
+
+    /// A version someone wrote by editing, which is the only kind the server will delete on
+    /// its own: the tape is v1 and the steps filtered from it are v2, and those two are what
+    /// the recipe is. A server that names no kind still numbers them, so the number stands in.
+    pub fn is_edited(&self) -> bool {
+        self.kind == "edited" || (self.version > 2 && self.is_runnable())
     }
 
     /// How many tape events a raw version holds: the server sends the count, or the events.
