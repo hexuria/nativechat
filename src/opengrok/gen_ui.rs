@@ -691,14 +691,45 @@ fn complete_json_len(s: &str) -> Option<usize> {
     None
 }
 
+/// A turn's words, with the things that are not words left out.
+///
+/// Text arrives in deltas and each one is committed as its own part, so neighbouring text parts
+/// are halves of the same sentence and are joined with nothing between them. A picture or a card
+/// between them is not: the stream broke the text there, and the person read what came after as
+/// a new bubble, so those keep a blank line between them. Joining those too was what turned a
+/// recipe run into "…using the taught recipe.YouTube is open on my box…", one run-on paragraph
+/// in the feed and in the history the model is sent next turn.
+///
+/// A chart is the exception: it is cut out of the middle of a sentence that was streamed whole,
+/// and "See this <chart> and more" is one sentence with a picture in it.
 fn plain_text(parts: &[ChatPart]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            ChatPart::Text(text) => Some(text.as_str()),
-            ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => None,
-        })
-        .collect()
+    let mut out = String::new();
+    let mut run = String::new();
+    for part in parts {
+        match part {
+            ChatPart::Text(text) => run.push_str(text),
+            ChatPart::Ui(_) => {}
+            ChatPart::Approval(_) | ChatPart::Screenshot(_) => {
+                push_run(&mut out, std::mem::take(&mut run))
+            }
+        }
+    }
+    push_run(&mut out, run);
+    out
+}
+
+/// One bubble's worth of words onto the end of the turn, a blank line after the last.
+fn push_run(out: &mut String, run: String) {
+    if run.trim().is_empty() {
+        return;
+    }
+    if out.is_empty() {
+        out.push_str(&run);
+        return;
+    }
+    out.truncate(out.trim_end().len());
+    out.push_str("\n\n");
+    out.push_str(run.trim_start());
 }
 
 pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
@@ -1285,6 +1316,36 @@ mod tests {
         assert!(!shot.image.bytes.is_empty());
         // Words before the picture stay words.
         assert!(matches!(parts.first(), Some(ChatPart::Text(text)) if text.contains("Looking.")));
+    }
+
+    /// The giveaway of the bug the person reported: two things the coworker said either side of
+    /// a picture were glued into "…using the taught recipe.YouTube is open…" the moment the turn
+    /// was flattened to text. Deltas of one sentence still join with nothing between them.
+    #[test]
+    fn words_either_side_of_a_picture_are_two_paragraphs() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_CONTENT", "delta": "I'll open YouTube on my box "
+        }));
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_CONTENT", "delta": "using the taught recipe."
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "c1",
+            "content": "ran recipe \"youtube\" (v2): 6 steps",
+            "ok": true,
+            "image": {"mime": "image/png", "base64": TINY_PNG, "width": 1280, "height": 800}
+        }));
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_CONTENT", "delta": "YouTube is open on my box."
+        }));
+        turn.finish();
+        let (plain, _) = turn.snapshot();
+        assert_eq!(
+            plain,
+            "I'll open YouTube on my box using the taught recipe.\n\nYouTube is open on my box."
+        );
     }
 
     #[test]

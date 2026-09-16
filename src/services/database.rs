@@ -4,6 +4,7 @@ use crate::db::DbPool;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::collections::HashMap;
 
 /// Database service for local session/message cache.
 #[derive(Clone)]
@@ -66,6 +67,10 @@ impl DatabaseService {
         Ok(())
     }
 
+    /// A message and, when it was more than words, the pieces it was made of.
+    ///
+    /// The two go in together: a half-written turn would come back as a bubble whose picture
+    /// never arrived, which is the very thing keeping the pieces is here to stop.
     pub async fn save_message(
         &self,
         session_id: &str,
@@ -74,10 +79,12 @@ impl DatabaseService {
         model: Option<String>,
         provider: Option<String>,
         reply: Option<ReplyRef>,
+        parts: &[MessagePart],
     ) -> Result<String> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         let id = uuid::Uuid::now_v7().to_string();
@@ -93,8 +100,25 @@ impl DatabaseService {
         .bind(reply.as_ref().map(|r| r.message_id.clone()))
         .bind(reply.as_ref().map(|r| r.preview.clone()))
         .bind(reply.as_ref().map(|r| i64::from(r.is_me)))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        for (ord, part) in parts.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO chat_message_parts (message_id, ord, kind, text, call_id, image, width, height) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(ord as i64)
+            .bind(part.kind())
+            .bind(part.text())
+            .bind(part.call_id())
+            .bind(part.image())
+            .bind(part.width())
+            .bind(part.height())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -106,13 +130,33 @@ impl DatabaseService {
         Ok(())
     }
 
+    /// A thread's messages, each carrying the pieces saved under it. A message written before
+    /// pieces were kept has none, and reads back as the words in `content`.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
-        let rows = sqlx::query_as::<_, ChatMessage>(
+        let mut rows = sqlx::query_as::<_, ChatMessage>(
             "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
+
+        let part_rows = sqlx::query_as::<_, PartRow>(
+            "SELECT p.message_id, p.kind, p.text, p.call_id, p.image, p.width, p.height FROM chat_message_parts p JOIN chat_messages m ON m.id = p.message_id WHERE m.session_id = ? ORDER BY p.message_id, p.ord",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut by_message: HashMap<String, Vec<MessagePart>> = HashMap::new();
+        for row in part_rows {
+            by_message
+                .entry(row.message_id.clone())
+                .or_default()
+                .push(row.into_part());
+        }
+        for row in &mut rows {
+            row.parts = by_message.remove(&row.id).unwrap_or_default();
+        }
         Ok(rows)
     }
 }
@@ -137,6 +181,106 @@ pub struct ChatMessage {
     pub reply_to_id: Option<String>,
     pub reply_preview: Option<String>,
     pub reply_is_me: Option<i64>,
+    /// The pieces of the message, in the order they were seen. They live in a table of their own
+    /// so the picture bytes stay off this row; `get_messages` is what fills this in.
+    #[sqlx(skip)]
+    pub parts: Vec<MessagePart>,
+}
+
+/// One piece of a saved message: the words of a bubble, or a picture of the box's screen with
+/// the caption the tool wrote under it.
+///
+/// A permission card is deliberately not one of these. It belongs to a run that is long over by
+/// the time the thread is opened again, and reviving it would ask the person to allow something
+/// that has already happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessagePart {
+    Text(String),
+    Screenshot {
+        call_id: String,
+        caption: String,
+        /// The PNG as it arrived, not base64: a third smaller, and out of the text column.
+        image: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl MessagePart {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::Screenshot { .. } => "screenshot",
+        }
+    }
+
+    /// One text column serves both: a text part's words, a screenshot's caption.
+    fn text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Screenshot { caption, .. } => caption.clone(),
+        }
+    }
+
+    fn call_id(&self) -> Option<String> {
+        match self {
+            Self::Text(_) => None,
+            Self::Screenshot { call_id, .. } => Some(call_id.clone()),
+        }
+    }
+
+    fn image(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Text(_) => None,
+            Self::Screenshot { image, .. } => Some(image.clone()),
+        }
+    }
+
+    fn width(&self) -> Option<i64> {
+        match self {
+            Self::Text(_) => None,
+            Self::Screenshot { width, .. } => Some(i64::from(*width)),
+        }
+    }
+
+    fn height(&self) -> Option<i64> {
+        match self {
+            Self::Text(_) => None,
+            Self::Screenshot { height, .. } => Some(i64::from(*height)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct PartRow {
+    message_id: String,
+    kind: String,
+    text: Option<String>,
+    call_id: Option<String>,
+    image: Option<Vec<u8>>,
+    width: Option<i64>,
+    height: Option<i64>,
+}
+
+impl PartRow {
+    /// A row this build cannot paint as a picture — an unknown kind, or a screenshot whose bytes
+    /// are gone — still has words on it, so it comes back as text rather than as nothing.
+    fn into_part(self) -> MessagePart {
+        let text = self.text.unwrap_or_default();
+        if self.kind == "screenshot"
+            && let Some(image) = self.image
+            && let (Some(width), Some(height)) = (self.width, self.height)
+        {
+            return MessagePart::Screenshot {
+                call_id: self.call_id.unwrap_or_default(),
+                caption: text,
+                image,
+                width: width.max(0) as u32,
+                height: height.max(0) as u32,
+            };
+        }
+        MessagePart::Text(text)
+    }
 }
 
 /// The message a saved message answers. Rows written before replies were kept have none of it,

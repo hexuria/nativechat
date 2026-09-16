@@ -14,7 +14,7 @@ use crate::opengrok::{
     deeds_from_replay, enrol_this_machine, local_exec_outcome, policy_answer, serve_local_exec,
     stored_machine_id, tool_standin, visible_bot_status,
 };
-use crate::services::database::{DatabaseService, ReplyRef};
+use crate::services::database::{DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
@@ -70,6 +70,98 @@ impl Message {
             if pm { "PM" } else { "AM" }
         )
     }
+}
+
+/// What is worth keeping of a message the person watched arrive: its words and the pictures of
+/// the box's screen, in the order they appeared.
+///
+/// A turn that was only words keeps nothing here — `content` already holds them, and a second
+/// copy would double every thread on disk. Cards are left out on purpose; see `MessagePart`.
+/// Because a card is dropped, the words on either side of one are kept apart by a blank line,
+/// the same break `content` gets, rather than running together into one sentence. A chart, which
+/// is cut out of the middle of a sentence, leaves that sentence whole.
+fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
+    let mut saved: Vec<MessagePart> = Vec::new();
+    let mut words = String::new();
+    for part in parts {
+        match part {
+            ChatPart::Text(text) => words.push_str(text),
+            ChatPart::Screenshot(spec) => {
+                close_text_run(&mut words, &mut saved);
+                saved.push(MessagePart::Screenshot {
+                    call_id: spec.call_id.clone(),
+                    caption: spec.caption.clone(),
+                    image: spec.image.bytes.clone(),
+                    width: spec.width,
+                    height: spec.height,
+                });
+            }
+            ChatPart::Ui(_) => {}
+            ChatPart::Approval(_) => break_paragraph(&mut words),
+        }
+    }
+    close_text_run(&mut words, &mut saved);
+    if saved
+        .iter()
+        .all(|part| matches!(part, MessagePart::Text(_)))
+    {
+        return Vec::new();
+    }
+    saved
+}
+
+/// The words so far become a bubble of their own. Whitespace is not a bubble, so a run of it is
+/// dropped; the edges are trimmed because a run boundary is where one bubble ends and the next
+/// begins, and a blank first line there is only noise.
+fn close_text_run(words: &mut String, saved: &mut Vec<MessagePart>) {
+    let text = std::mem::take(words);
+    let text = text.trim();
+    if !text.is_empty() {
+        saved.push(MessagePart::Text(text.to_string()));
+    }
+}
+
+fn break_paragraph(words: &mut String) {
+    if words.trim().is_empty() || words.ends_with("\n\n") {
+        return;
+    }
+    words.truncate(words.trim_end().len());
+    words.push_str("\n\n");
+}
+
+/// A saved message as the feed draws it.
+///
+/// A row with no pieces — every row an older build wrote, and every turn that was only words —
+/// is the single bubble its words already were, so old threads read exactly as they did.
+fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
+    if saved.is_empty() {
+        if content.trim().is_empty() {
+            return Vec::new();
+        }
+        return vec![ChatPart::Text(content.to_string())];
+    }
+    saved
+        .into_iter()
+        .map(|part| match part {
+            MessagePart::Text(text) => ChatPart::Text(text),
+            MessagePart::Screenshot {
+                call_id,
+                caption,
+                image,
+                width,
+                height,
+            } => ChatPart::Screenshot(crate::opengrok::ScreenshotSpec {
+                call_id,
+                caption,
+                image: Arc::new(gpui_kit::Image::from_bytes(
+                    gpui_kit::ImageFormat::Png,
+                    image,
+                )),
+                width,
+                height,
+            }),
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3277,6 +3369,10 @@ impl AppState {
                                         .map(|dt| SystemTime::from(dt.and_utc()))
                                         .unwrap_or(SystemTime::now());
 
+                                        // The pieces the turn was made of, so a thread reopened
+                                        // shows the bubbles and the pictures it showed live.
+                                        let content = m.content;
+                                        let parts = restored_parts(&content, m.parts);
                                         Message {
                                             id: m.id,
                                             sender: if m.role == "user" {
@@ -3284,13 +3380,13 @@ impl AppState {
                                             } else {
                                                 "AI".to_string()
                                             },
-                                            content: m.content,
+                                            content,
                                             sent_at,
                                             is_me: m.role == "user",
                                             reply_preview: m.reply_preview,
                                             reply_to_id: m.reply_to_id,
                                             reply_is_me: m.reply_is_me.unwrap_or(0) != 0,
-                                            parts: Vec::new(),
+                                            parts,
                                         }
                                     })
                                     .collect();
@@ -3333,10 +3429,14 @@ impl AppState {
     ///
     /// Only what the coworker actually said: a status line is the app's own words about the turn,
     /// and saving it would put a line nobody spoke into the history every later turn is sent.
+    ///
+    /// The pieces go with it. A recipe run is several bubbles with pictures of the box's screen
+    /// between them, and a reply flattened to its text would come back as one long paragraph.
     fn persist_assistant_reply(
         &self,
         conversation_id: &str,
         content: String,
+        parts: &[ChatPart],
         cx: &mut Context<Self>,
     ) {
         if content.trim().is_empty() || is_status_line(&content) {
@@ -3347,10 +3447,19 @@ impl AppState {
         };
         let title = self.conversation_title(conversation_id);
         let conversation_id = conversation_id.to_string();
+        let parts = saved_parts(parts);
         cx.spawn(async move |_this, _cx| {
             let saved = match db.ensure_session(&conversation_id, &title).await {
                 Ok(()) => db
-                    .save_message(&conversation_id, "assistant", &content, None, None, None)
+                    .save_message(
+                        &conversation_id,
+                        "assistant",
+                        &content,
+                        None,
+                        None,
+                        None,
+                        &parts,
+                    )
                     .await
                     .map(|_| ()),
                 Err(error) => Err(error),
@@ -3531,9 +3640,9 @@ impl AppState {
                         .find(|c| c.id == conversation_id)
                         .and_then(|c| c.messages.last())
                         .filter(|m| !m.is_me)
-                        .map(|m| m.content.clone());
-                    if let Some(reply) = reply {
-                        state.persist_assistant_reply(&conversation_id, reply, cx);
+                        .map(|m| (m.content.clone(), m.parts.clone()));
+                    if let Some((content, parts)) = reply {
+                        state.persist_assistant_reply(&conversation_id, content, &parts, cx);
                     }
                 }
                 if waiting_approval {
@@ -3766,7 +3875,12 @@ impl AppState {
                                     "finished" => {
                                         state.finish_responding(coworker_id.as_deref(), false);
                                         if let Some(id) = conversation_id.as_ref() {
-                                            state.persist_assistant_reply(id, plain.clone(), cx);
+                                            state.persist_assistant_reply(
+                                                id,
+                                                plain.clone(),
+                                                &parts,
+                                                cx,
+                                            );
                                         }
                                     }
                                     "failed" => {
@@ -4148,6 +4262,7 @@ impl AppState {
                         None,
                         None,
                         reply,
+                        &[],
                     )
                     .await
                 {
@@ -4630,9 +4745,11 @@ mod tests {
     }
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        EMPTY_TURN_NOTE, Message, PickedKind, REPLY_QUOTE_CHARS, agui_messages, is_status_line,
-        is_tool_standin,
+        ChatPart, DatabaseService, EMPTY_TURN_NOTE, Message, PickedKind, REPLY_QUOTE_CHARS,
+        agui_messages, is_status_line, is_tool_standin, restored_parts, saved_parts,
     };
+    use std::str::FromStr;
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     fn message(id: &str, is_me: bool, content: &str) -> Message {
@@ -4728,6 +4845,139 @@ mod tests {
             kept,
             vec!["hi", "still there?", "[took a screenshot of my screen]"]
         );
+    }
+
+    /// The app's own schema on a database that lives for the length of the test. One connection:
+    /// a second connection to `:memory:` would open a second, empty database.
+    async fn test_db() -> DatabaseService {
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
+            .expect("an in-memory database")
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("a pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("the app's schema");
+        DatabaseService::new(pool)
+    }
+
+    /// Bytes stand in for a PNG: nothing in this path decodes one, and distinct bytes prove the
+    /// right picture came back under the right caption.
+    fn screenshot(call_id: &str, caption: &str, bytes: &[u8], size: (u32, u32)) -> ChatPart {
+        ChatPart::Screenshot(crate::opengrok::ScreenshotSpec {
+            call_id: call_id.to_string(),
+            caption: caption.to_string(),
+            image: Arc::new(gpui_kit::Image::from_bytes(
+                gpui_kit::ImageFormat::Png,
+                bytes.to_vec(),
+            )),
+            width: size.0,
+            height: size.1,
+        })
+    }
+
+    /// Order, kind and contents in one line per part. `ChatPart`'s own `PartialEq` takes one
+    /// screenshot per call id on trust and never looks at the bytes, so the bytes are spelled
+    /// out here instead.
+    fn shape(parts: &[ChatPart]) -> Vec<String> {
+        parts
+            .iter()
+            .map(|part| match part {
+                ChatPart::Text(text) => format!("text {text}"),
+                ChatPart::Screenshot(spec) => format!(
+                    "shot {} {}x{} {:?} {}",
+                    spec.call_id, spec.width, spec.height, spec.image.bytes, spec.caption
+                ),
+                ChatPart::Ui(_) => "ui".to_string(),
+                ChatPart::Approval(_) => "approval".to_string(),
+            })
+            .collect()
+    }
+
+    /// The bug the person reported: a recipe run is several bubbles with pictures of the box's
+    /// screen between them, and switching to another bot and back brought it all back as one
+    /// paragraph with every picture gone.
+    #[tokio::test]
+    async fn a_turn_of_words_and_pictures_comes_back_the_way_it_was_seen() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Recipes").await.expect("a session");
+        let live = vec![
+            ChatPart::Text("I'll open YouTube on my box using the taught recipe.".to_string()),
+            screenshot(
+                "c1",
+                "ran recipe \"youtube\" (v2): 6 steps; screenshot of the screen afterwards attached",
+                b"png-one",
+                (1280, 800),
+            ),
+            ChatPart::Text("YouTube is open on my box (not your Mac).".to_string()),
+            screenshot(
+                "c2",
+                "clicking at 175,705; screenshot of the 1280x800 screen attached",
+                b"png-two",
+                (640, 480),
+            ),
+        ];
+        let content = "I'll open YouTube on my box using the taught recipe.\n\nYouTube is open on my box (not your Mac).";
+
+        db.save_message(
+            "s1",
+            "assistant",
+            content,
+            None,
+            None,
+            None,
+            &saved_parts(&live),
+        )
+        .await
+        .expect("the turn is saved");
+
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows.len(), 1);
+        let restored = restored_parts(&rows[0].content, rows[0].parts.clone());
+        assert_eq!(shape(&restored), shape(&live));
+    }
+
+    /// A row written before pieces were kept has none of them — which is also every row the
+    /// build in the person's hands is writing right now. It must still open, as the one bubble
+    /// its words always were.
+    #[tokio::test]
+    async fn a_row_with_only_words_still_loads_as_a_single_bubble() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Old").await.expect("a session");
+        db.save_message(
+            "s1",
+            "assistant",
+            "The build is green.",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("the message is saved");
+
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert!(rows[0].parts.is_empty(), "no pieces were written");
+        assert_eq!(
+            shape(&restored_parts(&rows[0].content, rows[0].parts.clone())),
+            vec!["text The build is green.".to_string()]
+        );
+    }
+
+    /// Words alone are already in `content`. Writing them a second time would double every
+    /// thread on disk for nothing.
+    #[test]
+    fn a_turn_that_was_only_words_saves_no_pieces() {
+        let live = vec![
+            ChatPart::Text("The build ".to_string()),
+            ChatPart::Text("is green.".to_string()),
+        ];
+        assert!(saved_parts(&live).is_empty());
     }
 
     /// Both are the app talking, whether painted now or read back from an older build's rows.
