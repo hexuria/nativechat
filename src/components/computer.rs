@@ -12,7 +12,9 @@ use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, Selectable, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Icon, Selectable, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -740,6 +742,7 @@ fn computer_controls(
                 .child({
                     let button = Button::new("computer-update")
                         .label(update_label)
+                        .small()
                         .disabled(!controls.present || controls.updating)
                         .on_click({
                             let app = app.clone();
@@ -756,6 +759,7 @@ fn computer_controls(
                 .child(
                     Button::new("computer-reset")
                         .label(reset_label)
+                        .small()
                         .disabled(!controls.present || controls.updating)
                         .on_click({
                             let app = app.clone();

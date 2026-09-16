@@ -3,7 +3,7 @@ use crate::opengrok::LocalExecMode;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -289,6 +289,7 @@ fn updates_page(
                     {
                         let button = Button::new("settings-computer-update")
                             .label(update_label)
+                            .small()
                             .disabled(!controls.present || controls.updating)
                             .on_click({
                                 let app = app.clone();
@@ -309,6 +310,7 @@ fn updates_page(
                     "Start fresh if the computer gets stuck. Everything on it is lost.",
                     Button::new("settings-computer-reset")
                         .label(reset_label)
+                        .small()
                         .disabled(!controls.present || controls.updating)
                         .on_click({
                             let app = app.clone();
