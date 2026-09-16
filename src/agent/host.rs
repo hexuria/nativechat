@@ -173,6 +173,15 @@ struct ApprovalSnap {
 }
 
 /// `approval-<call_id>-<verb>` → the answer it stands for.
+/// A recipe row's id, and only a row's. Every control on the recipe page is named
+/// `recipe-<something>` too, so a bare prefix match turned a click on a version tab into a
+/// fetch of a recipe called "version-1" — the page then said "no such recipe" and the driver
+/// could not work the page at all. A recipe's id is what the server mints, `rcp_…`.
+fn recipe_row_target(target: &str) -> Option<String> {
+    let rest = target.strip_prefix("recipe-")?;
+    rest.starts_with("rcp_").then(|| rest.to_string())
+}
+
 fn approval_target(target: &str) -> Option<(String, LocalExecResolution)> {
     let rest = target.strip_prefix("approval-")?;
     let verbs = [
@@ -630,8 +639,8 @@ impl NativeChatHost {
             )
         } else if let Some((id, accept)) = self.recipe_answer_target(target) {
             Command::AnswerRecipeShare { id, accept }
-        } else if let Some(id) = target.strip_prefix("recipe-") {
-            Command::OpenRecipe(id.to_string())
+        } else if let Some(id) = recipe_row_target(target) {
+            Command::OpenRecipe(id)
         } else if let Some(id) = target.strip_prefix("coworker-") {
             Command::SelectCoworker(id.to_string())
         } else if let Some(id) = target.strip_prefix("session-") {
@@ -808,5 +817,33 @@ impl AgentHost for NativeChatHost {
         Err(gpui_agent::screenshot_unavailable(
             "screenshot is intercepted on the UI thread",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe_row_target;
+
+    #[test]
+    fn only_a_recipe_row_opens_a_recipe() {
+        assert_eq!(
+            recipe_row_target("recipe-rcp_01a0a97d"),
+            Some("rcp_01a0a97d".to_string())
+        );
+        // The page's controls are all named `recipe-…` too; a bare prefix match sent a click on
+        // a version tab off to fetch a recipe called "version-1", and the page said there was
+        // no such recipe.
+        for control in [
+            "recipe-version-1",
+            "recipe-step-2",
+            "recipe-run",
+            "recipe-delete",
+            "recipe-history",
+            "recipe-bots",
+            "recipe-add-step",
+        ] {
+            assert_eq!(recipe_row_target(control), None, "{control}");
+        }
+        assert_eq!(recipe_row_target("recipes-filter-mine"), None);
     }
 }
