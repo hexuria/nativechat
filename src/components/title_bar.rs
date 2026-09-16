@@ -100,6 +100,7 @@ impl Render for TitleBar {
         // The Recipes page owns the header row while it is open: its title and back chevron
         // stand where the coworker's name stands in a chat.
         let page = state.page;
+        let on_a_page = page != MainPage::Chat;
         let app = self.state.clone();
         let recipes_span = (signed_in && page == MainPage::Recipes)
             .then(|| recipes_header(self.state.clone(), &theme, cx));
@@ -154,7 +155,9 @@ impl Render for TitleBar {
                 (None, None, false) => this,
             })
             .child(window_drag(div().flex_1().h_full()))
-            .when(coworker.is_some(), |this| {
+            // The find bar and the screen button act on the chat; another page has no chat, and
+            // drawing them there pushed them out of the span and over the right pane's header.
+            .when(coworker.is_some() && !on_a_page, |this| {
                 this.child(
                     h_flex().gap_2().items_center().children(find_bar).child(
                         div()
