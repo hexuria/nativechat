@@ -601,132 +601,154 @@ impl Render for ChatTranscript {
             .size_full()
             .on_scroll_wheel(cx.listener(Self::on_timestamp_wheel))
             .child(
-                MessageScroller::new("chat-messages", self.scroller.clone(), move |ix, _, cx| {
-                    let Some(row) = rows.get(ix) else {
-                        return div().into_any_element();
-                    };
-                    if let Some(spec) = &row.widget {
-                        return div()
-                            .id(ElementId::Name(row.id.clone().into()))
-                            .w_full()
-                            .flex()
-                            .justify_start()
-                            .py(px(6.))
-                            .child(div().w_full().max_w(px(CHAT_CONTENT_MAX * 0.72)).child(
-                                render_ui_spec(spec, &row.source_id, Some(app_state.clone()), cx),
-                            ))
-                            .into_any_element();
-                    }
-                    if let Some(shot) = &row.screenshot {
-                        return div()
-                            .id(ElementId::Name(row.id.clone().into()))
-                            .w_full()
-                            .flex()
-                            .justify_start()
-                            .py(px(6.))
-                            .child(render_screenshot(shot, cx))
-                            .into_any_element();
-                    }
-                    if let Some(line) = &row.status_line {
-                        return div()
-                            .id(ElementId::Name(row.id.clone().into()))
-                            .w_full()
-                            .flex()
-                            .justify_center()
-                            .py(px(8.))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(palette.secondary_foreground.opacity(0.7))
-                                    .child(line.clone()),
-                            )
-                            .into_any_element();
-                    }
-                    if let Some(spec) = &row.approval {
-                        return div()
-                            .id(ElementId::Name(row.id.clone().into()))
-                            .w_full()
-                            .flex()
-                            .justify_start()
-                            .py(px(6.))
-                            .child(div().w_full().max_w(px(560.)).child(render_approval(
-                                spec,
-                                Some(app_state.clone()),
-                                cx,
-                            )))
-                            .into_any_element();
-                    }
-                    let highlight_color = if row.highlight_range.is_some() {
-                        if row.highlight_native {
-                            Some(palette.yellow.opacity(0.4))
-                        } else {
-                            Some(palette.green.opacity(0.4))
-                        }
-                    } else {
-                        None
-                    };
-                    let (bg_color, text_color) = if row.is_me {
-                        (palette.primary, palette.primary_foreground)
-                    } else {
-                        (palette.secondary, palette.secondary_foreground)
-                    };
-                    let state_entity = app_state.clone();
-                    let source_id = row.source_id.clone();
-                    let tts_text = row.tts_text.to_string();
-                    let show_footer = row.show_footer;
-                    let picker_open = picker_id.as_ref() == Some(&row.source_id);
-                    let mut bubble = MessageBubble::new(row.content.to_string())
-                        .message_id(row.id.clone())
-                        .source_id(row.source_id.clone())
-                        .is_me(row.is_me)
-                        .bg_color(bg_color)
-                        .text_color(text_color)
-                        .timestamp(row.timestamp.to_string())
-                        .debug_mode(debug_mode)
-                        .can_read_aloud(can_read_aloud && show_footer)
-                        .is_native_speaking(row.is_native_speaking)
-                        .is_native_paused(row.is_native_paused)
-                        .is_native_loading(row.is_native_loading)
-                        .is_ai_speaking(row.is_ai_speaking)
-                        .is_ai_paused(row.is_ai_paused)
-                        .is_ai_loading(row.is_ai_loading)
-                        .is_cached(row.is_cached)
-                        .highlight_range(row.highlight_range.clone())
-                        .highlight_color(highlight_color)
-                        .find_marks(marks_for_row(ix, &find_hits, find_current))
-                        .use_markdown(row.use_markdown)
-                        .show_footer(show_footer)
-                        .reply_preview(row.reply_preview.clone())
-                        .reaction(row.reaction.clone())
-                        .picker_open(picker_open)
-                        .ts_peek(ts_peek)
-                        .timestamps_ok(timestamps_ok)
-                        .app_state(app_state.clone());
-                    if show_footer {
-                        let state_for_tts = state_entity.clone();
-                        let source_for_tts = source_id.clone();
-                        let tts = tts_text.clone();
-                        bubble = bubble
-                            .copy_text(tts_text.clone())
-                            .on_read_aloud(move |_, cx| {
-                                state_for_tts.update(cx, |state, cx| {
-                                    state.toggle_read_aloud(
-                                        source_for_tts.clone(),
-                                        tts.clone(),
-                                        crate::actions::TtsSource::Native,
+                MessageScroller::new(
+                    "chat-messages",
+                    self.scroller.clone(),
+                    move |ix, window, cx| {
+                        // Every row is laid out in the same centred column the transcript used to
+                        // sit in, so bubbles and timestamps do not move — only the scrollbar did.
+                        let row_body = |ix: usize,
+                                        _window: &mut Window,
+                                        cx: &mut App|
+                         -> AnyElement {
+                            let Some(row) = rows.get(ix) else {
+                                return div().into_any_element();
+                            };
+                            if let Some(spec) = &row.widget {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(div().w_full().max_w(px(CHAT_CONTENT_MAX * 0.72)).child(
+                                        render_ui_spec(
+                                            spec,
+                                            &row.source_id,
+                                            Some(app_state.clone()),
+                                            cx,
+                                        ),
+                                    ))
+                                    .into_any_element();
+                            }
+                            if let Some(shot) = &row.screenshot {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(render_screenshot(shot, cx))
+                                    .into_any_element();
+                            }
+                            if let Some(line) = &row.status_line {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_center()
+                                    .py(px(8.))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(palette.secondary_foreground.opacity(0.7))
+                                            .child(line.clone()),
+                                    )
+                                    .into_any_element();
+                            }
+                            if let Some(spec) = &row.approval {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(div().w_full().max_w(px(560.)).child(render_approval(
+                                        spec,
+                                        Some(app_state.clone()),
                                         cx,
-                                    );
+                                    )))
+                                    .into_any_element();
+                            }
+                            let highlight_color = if row.highlight_range.is_some() {
+                                if row.highlight_native {
+                                    Some(palette.yellow.opacity(0.4))
+                                } else {
+                                    Some(palette.green.opacity(0.4))
+                                }
+                            } else {
+                                None
+                            };
+                            let (bg_color, text_color) = if row.is_me {
+                                (palette.primary, palette.primary_foreground)
+                            } else {
+                                (palette.secondary, palette.secondary_foreground)
+                            };
+                            let state_entity = app_state.clone();
+                            let source_id = row.source_id.clone();
+                            let tts_text = row.tts_text.to_string();
+                            let show_footer = row.show_footer;
+                            let picker_open = picker_id.as_ref() == Some(&row.source_id);
+                            let mut bubble = MessageBubble::new(row.content.to_string())
+                                .message_id(row.id.clone())
+                                .source_id(row.source_id.clone())
+                                .is_me(row.is_me)
+                                .bg_color(bg_color)
+                                .text_color(text_color)
+                                .timestamp(row.timestamp.to_string())
+                                .debug_mode(debug_mode)
+                                .can_read_aloud(can_read_aloud && show_footer)
+                                .is_native_speaking(row.is_native_speaking)
+                                .is_native_paused(row.is_native_paused)
+                                .is_native_loading(row.is_native_loading)
+                                .is_ai_speaking(row.is_ai_speaking)
+                                .is_ai_paused(row.is_ai_paused)
+                                .is_ai_loading(row.is_ai_loading)
+                                .is_cached(row.is_cached)
+                                .highlight_range(row.highlight_range.clone())
+                                .highlight_color(highlight_color)
+                                .find_marks(marks_for_row(ix, &find_hits, find_current))
+                                .use_markdown(row.use_markdown)
+                                .show_footer(show_footer)
+                                .reply_preview(row.reply_preview.clone())
+                                .reaction(row.reaction.clone())
+                                .picker_open(picker_open)
+                                .ts_peek(ts_peek)
+                                .timestamps_ok(timestamps_ok)
+                                .app_state(app_state.clone());
+                            if show_footer {
+                                let state_for_tts = state_entity.clone();
+                                let source_for_tts = source_id.clone();
+                                let tts = tts_text.clone();
+                                bubble = bubble.copy_text(tts_text.clone()).on_read_aloud(
+                                    move |_, cx| {
+                                        state_for_tts.update(cx, |state, cx| {
+                                            state.toggle_read_aloud(
+                                                source_for_tts.clone(),
+                                                tts.clone(),
+                                                crate::actions::TtsSource::Native,
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                );
+                                let input = input.clone();
+                                bubble = bubble.on_reply(move |window, cx| {
+                                    input.update(cx, |input, cx| {
+                                        input.focus(window, cx);
+                                    });
                                 });
-                            });
-                        let input = input.clone();
-                        bubble = bubble.on_reply(move |window, cx| {
-                            input.update(cx, |input, cx| {
-                                input.focus(window, cx);
-                            });
-                        });
-                    }
-                    bubble.into_any_element()
-                })
+                            }
+                            bubble.into_any_element()
+                        };
+                        div().w_full().flex().justify_center().px_4().child(
+                            div()
+                                .w_full()
+                                .max_w(px(CHAT_CONTENT_MAX))
+                                .child(row_body(ix, window, cx)),
+                        )
+                    },
+                )
                 .pt(px(80.0))
                 .with_jump_button_transition(Duration::ZERO),
             )
@@ -1091,24 +1113,15 @@ impl Render for ChatView {
                     .min_h_0()
                     .relative()
                     .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .justify_center()
-                            .px_4()
-                            .child(
-                                div()
-                                    .id("chat-content-col")
-                                    .w_full()
-                                    .max_w(px(CHAT_CONTENT_MAX))
-                                    .h_full()
-                                    .child(
-                                        self.transcript
-                                            .clone()
-                                            .cached(StyleRefinement::default().size_full()),
-                                    ),
+                        // The transcript spans the whole slot so its scrollbar sits on the
+                        // pane's edge; each row centres itself inside (see `ChatTranscript`).
+                        div().absolute().inset_0().child(
+                            div().id("chat-content-col").size_full().child(
+                                self.transcript
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full()),
                             ),
+                        ),
                     )
                     .when_some(self.emoji_open.clone(), |this, open| {
                         this.child(self.render_emoji_overlay(open, cx))
