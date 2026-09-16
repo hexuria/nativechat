@@ -61,6 +61,7 @@ impl Render for TitleBar {
         let coworker = state
             .active_coworker_id
             .as_ref()
+            .filter(|_| !state.is_app_settings_open)
             .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
             .map(|c| {
                 let name = c.name.trim();
@@ -100,7 +101,9 @@ impl Render for TitleBar {
         // The Recipes page owns the header row while it is open: its title and back chevron
         // stand where the coworker's name stands in a chat.
         let page = state.page;
-        let on_a_page = page != MainPage::Chat;
+        // The full settings page covers the window, chrome and all. The bot it happened to be
+        // opened from is not what the person is looking at, so the bar does not name it there.
+        let on_a_page = page != MainPage::Chat || state.is_app_settings_open;
         let app = self.state.clone();
         let recipes_span = (signed_in && page == MainPage::Recipes)
             .then(|| recipes_header(self.state.clone(), &theme, cx));
