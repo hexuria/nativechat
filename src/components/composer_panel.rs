@@ -6,6 +6,7 @@
 //! time a row changes. It holds no catalogue of its own: the caller hands it the rows it should
 //! show and hears back which one was picked, so what is on offer stays with whoever knows.
 
+use crate::actions::PickFinderItem;
 use crate::components::fields::field_input;
 use gpui_kit::component::input::{Escape, InputEvent, InputState, MoveDown, MoveUp};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
@@ -17,6 +18,13 @@ use gpui_kit::*;
 const ROW_HEIGHT: f32 = 52.;
 /// How many rows the panel shows before it scrolls.
 const MAX_VISIBLE_ROWS: usize = 6;
+/// How far down the list the ⌘1…⌘9 keys reach. Ten keys would need ⌘0, which reads as zero and
+/// not as tenth, so the numbers stop at nine and the rest of the list is arrowed to.
+const QUICK_KEYS: usize = 9;
+/// The glyphs a chord starts with, so a chord can be drawn as one keycap per key. Anything that
+/// is not one of these is the key itself, which may be a word — "esc", "enter" — and so is never
+/// split into letters.
+const MODIFIER_GLYPHS: &[char] = &['⌘', '⇧', '⌥', '⌃', '^', '❖', '⊞'];
 
 /// One thing the panel offers: an icon, what it is, what it does, and what kind of thing it is.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,8 +38,10 @@ pub struct ComposerPanelRow {
     pub description: SharedString,
     /// The kind of thing this is, right-aligned: "Tool", "Skill", "Action".
     pub label: Option<SharedString>,
-    /// A key glyph drawn before the label, for a row that stands for a command.
-    pub glyph: Option<SharedString>,
+    /// The chord that does this row's work from anywhere in the app, as the keyboard shows it —
+    /// "⌘,". It is drawn as keycaps before the label, and it is `None` for a row with nothing
+    /// bound: a command glyph with no key beside it promises a shortcut that does not exist.
+    pub shortcut: Option<SharedString>,
     /// A row that says something rather than offering it. It is dimmed, the arrow keys step
     /// over it, and Enter never lands on it.
     pub selectable: bool,
@@ -54,7 +64,7 @@ impl ComposerPanelRow {
             title: title.into(),
             description: description.into(),
             label: None,
-            glyph: None,
+            shortcut: None,
             selectable: true,
             element_id: None,
         }
@@ -70,8 +80,8 @@ impl ComposerPanelRow {
         self
     }
 
-    pub fn glyph(mut self, glyph: impl Into<SharedString>) -> Self {
-        self.glyph = Some(glyph.into());
+    pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
+        self.shortcut = Some(shortcut.into());
         self
     }
 
@@ -253,6 +263,25 @@ impl ComposerPanel {
         cx.notify();
     }
 
+    /// Which of the shown rows can be picked, in the order they are drawn. The ⌘ numbers are
+    /// counted over this, so they follow the search rather than the roster behind it.
+    fn shown_selectable(&self) -> Vec<bool> {
+        (0..self.filtered.len())
+            .map(|position| self.row_at(position).is_some_and(|row| row.selectable))
+            .collect()
+    }
+
+    /// Take the row ⌘1…⌘9 asked for, counting from zero the way the keymap does.
+    fn quick_pick(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(id) = quick_position(&self.shown_selectable(), index)
+            .and_then(|position| self.row_at(position))
+            .map(|row| row.id.clone())
+        else {
+            return;
+        };
+        cx.emit(ComposerPanelEvent::Selected(id));
+    }
+
     fn confirm(&mut self, cx: &mut Context<Self>) {
         let Some(row) = self
             .highlighted
@@ -273,6 +302,7 @@ impl ComposerPanel {
         &self,
         position: usize,
         row: &ComposerPanelRow,
+        quick: Option<usize>,
         theme: &gpui_kit::component::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -342,8 +372,17 @@ impl ComposerPanel {
                         )
                     }),
             )
-            .when_some(row.glyph.clone(), |this, glyph| {
-                this.child(keycap(glyph, theme.muted_foreground))
+            .when_some(row.shortcut.clone(), |this, shortcut| {
+                this.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "composer-panel-shortcut-{}",
+                            row.id
+                        )))
+                        .gap(px(3.))
+                        .flex_shrink_0()
+                        .children(chord_keys(&shortcut, theme.muted_foreground)),
+                )
             })
             .when_some(row.label.clone(), |this, label| {
                 this.child(
@@ -352,6 +391,24 @@ impl ComposerPanel {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(label),
+                )
+            })
+            // The number a person can hold ⌘ with to take this row without arrowing to it. It
+            // sits where the ⌘K palette puts the same thing, so one habit works in both.
+            .when_some(quick, |this, number| {
+                this.child(
+                    h_flex()
+                        .id(SharedString::from(format!(
+                            "composer-panel-quick-{}",
+                            row.id
+                        )))
+                        .gap(px(3.))
+                        .flex_shrink_0()
+                        .child(keycap("⌘".into(), theme.muted_foreground))
+                        .child(keycap(
+                            SharedString::from(number.to_string()),
+                            theme.muted_foreground,
+                        )),
                 )
             })
             .when(selectable, |this| {
@@ -367,16 +424,17 @@ impl Render for ComposerPanel {
             return div().into_any_element();
         }
         let theme = cx.theme().clone();
+        let selectable = self.shown_selectable();
         let rows: Vec<AnyElement> = self
             .filtered
             .clone()
             .into_iter()
             .enumerate()
             .filter_map(|(position, index)| {
-                self.rows
-                    .get(index)
-                    .cloned()
-                    .map(|row| self.row_element(position, &row, &theme, cx))
+                self.rows.get(index).cloned().map(|row| {
+                    let quick = quick_number(&selectable, position);
+                    self.row_element(position, &row, quick, &theme, cx)
+                })
             })
             .collect();
         let empty = rows.is_empty();
@@ -413,6 +471,14 @@ impl Render for ComposerPanel {
                 cx.stop_propagation();
                 cx.emit(ComposerPanelEvent::Dismissed { at: None });
                 this.close(cx);
+            }))
+            // ⌘1…⌘9 are already bound app-wide for the bot finder and the ⌘K palette, and the
+            // panel answers the same action rather than asking for a keymap of its own: one
+            // number key picks the nth row in every picker, and taking it in the capture phase
+            // keeps the row under the panel from being picked instead.
+            .capture_action(cx.listener(|this, pick: &PickFinderItem, _, cx| {
+                cx.stop_propagation();
+                this.quick_pick(pick.index, cx);
             }))
             .child(
                 h_flex()
@@ -475,6 +541,44 @@ impl Render for ComposerPanel {
     }
 }
 
+/// The ⌘ number the row at this position in the shown list answers to, if it has one. Only the
+/// rows that can be picked are counted, so a notice in the middle of the list neither takes a
+/// number nor pushes the rows under it along.
+fn quick_number(selectable: &[bool], position: usize) -> Option<usize> {
+    if !selectable.get(position).copied().unwrap_or(false) {
+        return None;
+    }
+    let number = selectable[..position].iter().filter(|it| **it).count() + 1;
+    (number <= QUICK_KEYS).then_some(number)
+}
+
+/// Where in the shown list ⌘<index + 1> lands, counting from zero the way the keymap does.
+fn quick_position(selectable: &[bool], index: usize) -> Option<usize> {
+    selectable
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| **it)
+        .map(|(position, _)| position)
+        .nth(index)
+}
+
+/// A chord as keycaps, one per key: "⌘⇧B" is three caps, "⌘," is two.
+fn chord_keys(chord: &str, muted: Hsla) -> Vec<AnyElement> {
+    let mut keys: Vec<AnyElement> = chord
+        .chars()
+        .take_while(|key| MODIFIER_GLYPHS.contains(key))
+        .map(|key| keycap(SharedString::from(key.to_string()), muted).into_any_element())
+        .collect();
+    let key: String = chord
+        .chars()
+        .skip_while(|key| MODIFIER_GLYPHS.contains(key))
+        .collect();
+    if !key.is_empty() {
+        keys.push(keycap(SharedString::from(key), muted).into_any_element());
+    }
+    keys
+}
+
 fn keycap(label: SharedString, muted: Hsla) -> impl IntoElement {
     div()
         .min_w(px(20.))
@@ -493,7 +597,7 @@ fn keycap(label: SharedString, muted: Hsla) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::ComposerPanelRow;
+    use super::{ComposerPanelRow, chord_keys, quick_number, quick_position};
 
     fn roster() -> Vec<ComposerPanelRow> {
         vec![
@@ -531,5 +635,56 @@ mod tests {
         let rows = roster();
         assert!(rows[0].selectable);
         assert!(!rows[2].selectable, "a notice is not a thing to pick");
+    }
+
+    #[test]
+    fn the_numbers_skip_a_notice_and_stop_at_nine() {
+        // A notice sits third, and eleven rows are shown in all.
+        let mut selectable = vec![true; 11];
+        selectable[2] = false;
+        assert_eq!(quick_number(&selectable, 0), Some(1));
+        assert_eq!(quick_number(&selectable, 1), Some(2));
+        assert_eq!(
+            quick_number(&selectable, 2),
+            None,
+            "a notice cannot be picked, so no key is offered for it"
+        );
+        assert_eq!(
+            quick_number(&selectable, 3),
+            Some(3),
+            "the notice is stepped over rather than counted"
+        );
+        assert_eq!(quick_number(&selectable, 9), Some(9));
+        assert_eq!(
+            quick_number(&selectable, 10),
+            None,
+            "past nine there is no number key left to show"
+        );
+    }
+
+    #[test]
+    fn a_number_takes_the_row_it_is_drawn_on() {
+        let mut selectable = vec![true; 5];
+        selectable[2] = false;
+        // ⌘1 is index 0, and the third pickable row is the fourth one shown.
+        assert_eq!(quick_position(&selectable, 0), Some(0));
+        assert_eq!(quick_position(&selectable, 2), Some(3));
+        assert_eq!(
+            quick_position(&selectable, 4),
+            None,
+            "there is no fifth row to pick once the notice is left out"
+        );
+    }
+
+    #[test]
+    fn a_chord_is_one_cap_per_key() {
+        let muted = gpui_kit::hsla(0., 0., 0., 1.);
+        assert_eq!(chord_keys("⌘,", muted).len(), 2);
+        assert_eq!(chord_keys("⌘⇧B", muted).len(), 3);
+        assert_eq!(
+            chord_keys("⌘esc", muted).len(),
+            2,
+            "a key with a name is one cap, not one per letter"
+        );
     }
 }
