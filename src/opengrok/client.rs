@@ -1250,9 +1250,18 @@ impl RecipeVersion {
         self.body.events.as_ref().map_or(0, RecipeTape::count)
     }
 
-    /// The tape itself, when the server sent it rather than only its size.
+    /// The tape itself, when the server sent it rather than only its size. It arrives under
+    /// `tape` beside the count; a body that puts the events under `events` reads the same.
     pub fn tape_events(&self) -> Option<&[RecipeTapeEvent]> {
+        if !self.body.tape.is_empty() {
+            return Some(&self.body.tape);
+        }
         self.body.events.as_ref().and_then(RecipeTape::events)
+    }
+
+    /// Whether the tape that arrived is only the front of a longer one.
+    pub fn tape_truncated(&self) -> bool {
+        self.body.truncated
     }
 }
 
@@ -1262,6 +1271,13 @@ impl RecipeVersion {
 pub struct RecipeVersionBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<RecipeTape>,
+    /// The tape itself. The server sends the count under `events` and the events under `tape`,
+    /// cut at a cap with `truncated` saying so; a body that carries the events under `events`
+    /// instead is read the same way, so either shape shows a tape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tape: Vec<RecipeTapeEvent>,
+    #[serde(default)]
+    pub truncated: bool,
     #[serde(default)]
     pub steps: Vec<RecipeStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1270,9 +1286,8 @@ pub struct RecipeVersionBody {
     pub screenshot: Option<Value>,
 }
 
-/// What a raw version carries under `events`: the tape itself, or only how many events were
-/// taped. The detail route strips a tape to its count today (see `RECIPE-RAW-TAPE.md`), so both
-/// shapes have to parse, and an unexpected third one must not fail the whole detail.
+/// What a raw version carries under `events`: how many events were taped, or the tape itself.
+/// Both shapes parse, and an unexpected third one must not fail the whole detail.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RecipeTape {
@@ -2174,6 +2189,40 @@ mod tests {
             serde_json::from_value(json!({"id": "rcp_2", "relation": "custodian"})).unwrap();
         assert_eq!(odd.relation, RecipeRelation::None);
         assert_eq!(odd.screen, RecipeScreen::default());
+    }
+
+    #[test]
+    fn a_raw_version_reads_the_tape_the_server_sends() {
+        // The server sends the count under `events` and the tape under `tape`, cut at a cap.
+        let sent: RecipeVersion = serde_json::from_value(json!({
+            "version": 1, "kind": "raw", "createdAtMs": 1,
+            "body": {"events": 3100, "truncated": true, "tape": [
+                {"kind": "down", "x": 640, "y": 60, "button": 0, "at": 1000},
+                {"kind": "keydown", "key": "e", "code": "KeyE", "at": 1900}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(sent.event_count(), 3100, "the count is the whole tape's");
+        assert_eq!(sent.tape_events().map(<[_]>::len), Some(2));
+        assert!(sent.tape_truncated());
+
+        // A body that puts the events under `events` instead reads the same way.
+        let inline: RecipeVersion = serde_json::from_value(json!({
+            "version": 1, "kind": "raw", "createdAtMs": 1,
+            "body": {"events": [{"kind": "up", "x": 1, "y": 2, "at": 5}]}
+        }))
+        .unwrap();
+        assert_eq!(inline.event_count(), 1);
+        assert_eq!(inline.tape_events().map(<[_]>::len), Some(1));
+        assert!(!inline.tape_truncated());
+
+        // And a count alone still says how much was taped, with no tape to show.
+        let counted: RecipeVersion = serde_json::from_value(json!({
+            "version": 1, "kind": "raw", "createdAtMs": 1, "body": {"events": 14}
+        }))
+        .unwrap();
+        assert_eq!(counted.event_count(), 14);
+        assert!(counted.tape_events().is_none());
     }
 
     #[test]
