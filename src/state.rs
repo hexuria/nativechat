@@ -539,6 +539,9 @@ pub struct AppState {
     /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
     /// endpoint, so polling stops until the roster reloads.
     pub computer_endpoint_missing: bool,
+    /// The active coworker's screen as last fetched, painted in the Computer
+    /// pane's tile. Polled with the status, only while the box has a screen.
+    pub coworker_screen: Option<std::sync::Arc<gpui_kit::Image>>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
 }
@@ -657,6 +660,7 @@ impl AppState {
             expanded_shell_output: HashSet::new(),
             computers: Vec::new(),
             coworker_computer: None,
+            coworker_screen: None,
             computer_endpoint_missing: false,
             computer_poll: None,
         };
@@ -1072,6 +1076,7 @@ impl AppState {
                 let alive = this.update(cx, |state, cx| {
                     if state.right_pane == RightPane::Computer {
                         state.refresh_coworker_computer(cx);
+                        state.refresh_coworker_screen(cx);
                     }
                 });
                 if alive.is_err() {
@@ -1087,6 +1092,7 @@ impl AppState {
         };
         let Some(coworker_id) = self.active_coworker_id.clone() else {
             self.coworker_computer = None;
+            self.coworker_screen = None;
             return;
         };
         if self.computer_endpoint_missing {
@@ -1117,6 +1123,50 @@ impl AppState {
                         // Say it once, when the status is lost, not every two seconds.
                         if state.coworker_computer.take().is_some() {
                             eprintln!("NativeChat computer: {}", error.message);
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Fetch the screen for the tile. Only while the status says there is one — a headless or
+    /// stopped box is not asked, and a 404 (no screen after all) just clears the picture.
+    pub fn refresh_coworker_screen(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        let has_screen = self
+            .coworker_computer
+            .as_ref()
+            .and_then(|status| status.vnc_url())
+            .is_some();
+        if !has_screen {
+            if self.coworker_screen.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client.coworker_screen(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(frame) => {
+                        state.coworker_screen =
+                            crate::opengrok::ScreenshotSpec::from_frame("screen", "", &frame)
+                                .map(|spec| spec.image);
+                        cx.notify();
+                    }
+                    Err(_) => {
+                        if state.coworker_screen.take().is_some() {
                             cx.notify();
                         }
                     }
@@ -1793,6 +1843,7 @@ impl AppState {
         self.active_coworker_id = Some(id.clone());
         // The previous bot's screen must not show under this bot's name.
         self.coworker_computer = None;
+        self.coworker_screen = None;
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(
                 0,
