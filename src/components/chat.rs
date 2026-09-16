@@ -499,22 +499,23 @@ impl ChatTranscript {
         .detach();
     }
 
-    fn on_timestamp_wheel(
-        &mut self,
-        event: &ScrollWheelEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let delta = event.delta.pixel_delta(px(16.));
-        let dx = f32::from(delta.x);
-        let dy = f32::from(delta.y);
-        if dx.abs() <= dy.abs() {
-            return;
+    /// Whether a wheel event is the timestamp gesture: a sideways swipe, or any sideways
+    /// movement while the timestamps are already peeking. Decided in the CAPTURE phase, before
+    /// the list underneath sees the event — the list scrolls by the vertical part of whatever
+    /// reaches it, which is what made a sideways swipe creep up and down.
+    fn is_peek_gesture(&self, dx: f32, dy: f32) -> bool {
+        if self.ts_peek > 0.0 {
+            dx.abs() > 0.5
+        } else {
+            dx.abs() > dy.abs() && dx.abs() >= 1.5
         }
-        if self.ts_peek <= 0.0 && dx.abs() < 1.5 {
-            return;
-        }
-        let win = f32::from(_window.viewport_size().width);
+    }
+
+    /// Move the timestamp peek by a swipe. Natural scrolling: fingers moving left give a
+    /// negative dx, and that is the swipe that reveals — the bubbles slide left to make room, as
+    /// on the phone. So the peek grows with `-dx`.
+    fn peek_by(&mut self, dx: f32, window: &Window, cx: &mut Context<Self>) {
+        let win = f32::from(window.viewport_size().width);
         let app = self.app_state.read(cx);
         let chat_w = chat_column_width(
             win,
@@ -526,8 +527,7 @@ impl ChatTranscript {
         if !timestamps_fit(chat_w) {
             return;
         }
-        cx.stop_propagation();
-        self.ts_peek = (self.ts_peek + dx).clamp(0.0, TS_PEEK_MAX);
+        self.ts_peek = (self.ts_peek - dx).clamp(0.0, TS_PEEK_MAX);
         self.arm_peek_release(cx);
         cx.notify();
     }
@@ -599,7 +599,42 @@ impl Render for ChatTranscript {
         div()
             .id("chat-timestamp-peek")
             .size_full()
-            .on_scroll_wheel(cx.listener(Self::on_timestamp_wheel))
+            .relative()
+            // The gesture is taken in the capture phase over the whole transcript, so a
+            // sideways swipe never reaches the list (no vertical creep) while a vertical one
+            // passes through untouched. A canvas is the one element that can register a
+            // capture-phase mouse handler from here.
+            .child({
+                let this = cx.entity().downgrade();
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _cx| {
+                        let this = this.clone();
+                        window.on_mouse_event(
+                            move |event: &ScrollWheelEvent, phase, window, cx| {
+                                if phase != gpui::DispatchPhase::Capture
+                                    || !bounds.contains(&event.position)
+                                {
+                                    return;
+                                }
+                                let Some(this) = this.upgrade() else {
+                                    return;
+                                };
+                                let delta = event.delta.pixel_delta(px(16.));
+                                let dx = f32::from(delta.x);
+                                let dy = f32::from(delta.y);
+                                if !this.read(cx).is_peek_gesture(dx, dy) {
+                                    return;
+                                }
+                                this.update(cx, |this, cx| this.peek_by(dx, window, cx));
+                                cx.stop_propagation();
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .inset_0()
+            })
             .child(
                 MessageScroller::new(
                     "chat-messages",
