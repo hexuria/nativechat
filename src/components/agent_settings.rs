@@ -1,5 +1,6 @@
 use crate::chrome::{
-    AVATAR_COLORS, AVATAR_SHAPES, AVATAR_TRIGGER_PX, INFO_PANE_WIDTH, PANE_HEADER_H, PANE_HEADER_PX,
+    AVATAR_COLORS, AVATAR_SHAPES, AVATAR_TRIGGER_PX, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H,
+    chrome_floats,
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
@@ -207,6 +208,55 @@ fn notify_switch(on: bool) -> Div {
         )
 }
 
+/// The pane's header: "Settings", and the chevron that closes the pane. In the title bar
+/// over the pane while the pane is docked (then the title is a handle to drag the window
+/// by), in the pane itself while it floats over the chat.
+pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
+    div()
+        .id("agent-settings-header")
+        .w_full()
+        .h(px(TITLE_BAR_H))
+        .px(px(HEADER_PX))
+        .flex()
+        .items_center()
+        .justify_between()
+        .flex_shrink_0()
+        .child(
+            div()
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Settings")
+                .when(drag, |this| {
+                    this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+                }),
+        )
+        .child(
+            div()
+                .id("header-settings")
+                .size(px(28.))
+                .rounded(px(8.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    app.update(cx, |state, cx| {
+                        state.close_right_pane(cx);
+                    });
+                })
+                .child(
+                    Icon::default()
+                        .path("icons/chevrons-right.svg")
+                        .size(px(16.)),
+                ),
+        )
+}
+
 impl Render for AgentSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_fields(window, cx);
@@ -240,6 +290,9 @@ impl Render for AgentSettings {
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
+        // Floating over the chat (a narrow window), the pane carries its own header; docked,
+        // the title bar shows it over the pane.
+        let floats = chrome_floats(f32::from(window.viewport_size().width));
 
         v_flex()
             .id("agent-settings")
@@ -259,47 +312,7 @@ impl Render for AgentSettings {
                     });
                 }
             })
-            .child(
-                div()
-                    .id("agent-settings-header")
-                    .w_full()
-                    .px(px(PANE_HEADER_PX))
-                    .h(px(PANE_HEADER_H))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .flex_shrink_0()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Settings"),
-                    )
-                    .child(
-                        div()
-                            .id("header-settings")
-                            .size(px(28.))
-                            .rounded(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
-                            .on_mouse_down(MouseButton::Left, {
-                                let app = app.clone();
-                                move |_, _, cx| {
-                                    app.update(cx, |state, cx| {
-                                        state.close_right_pane(cx);
-                                    });
-                                }
-                            })
-                            .child(
-                                Icon::default()
-                                    .path("icons/chevrons-right.svg")
-                                    .size(px(16.)),
-                            ),
-                    ),
-            )
+            .when(floats, |this| this.child(settings_header(app.clone(), false)))
             .child(
                 div()
                     .id("avatar-trigger-row")

@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::chrome::{INFO_PANE_WIDTH, PANE_HEADER_H, PANE_HEADER_PX};
+use crate::chrome::{HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats};
 use crate::components::fields::field_input;
 use crate::state::{
     AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
@@ -145,33 +145,7 @@ impl Render for ComputerPane {
                 .as_ref()
                 .and_then(|status| status.box_id.clone())
                 .or_else(|| coworker.and_then(|c| c.box_id.clone()));
-            let controls = ComputerControls {
-                present: state
-                    .coworker_computer
-                    .as_ref()
-                    .is_some_and(|s| s.state != "absent"),
-                updating: state
-                    .coworker_computer
-                    .as_ref()
-                    .is_some_and(|s| s.updating()),
-                stale: state
-                    .coworker_computer
-                    .as_ref()
-                    .is_some_and(|s| s.image_stale()),
-                current: state
-                    .coworker_computer
-                    .as_ref()
-                    .and_then(|s| s.image.as_ref())
-                    .is_some_and(|image| !image.stale),
-                error: state.computer_action_error.clone().or_else(|| {
-                    state
-                        .coworker_computer
-                        .as_ref()
-                        .and_then(|s| s.update.as_ref())
-                        .filter(|u| !u.in_flight())
-                        .map(|u| u.detail())
-                }),
-            };
+            let controls = ComputerControls::from_state(state);
             let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
             let routines = state.coworker_routines(&coworker_id).to_vec();
             let has_screen = state
@@ -191,6 +165,14 @@ impl Render for ComputerPane {
             )
         };
 
+        // Floating over the chat (a narrow window), the pane carries its own header; docked,
+        // the title bar shows it over the pane.
+        let floats = chrome_floats(f32::from(window.viewport_size().width));
+        let floating_header = if floats {
+            Some(self.header(cx, false))
+        } else {
+            None
+        };
         v_flex()
             .id("computer-pane")
             .h_full()
@@ -200,6 +182,7 @@ impl Render for ComputerPane {
             .border_color(theme.border)
             .bg(theme.sidebar)
             .text_color(theme.foreground)
+            .children(floating_header)
             .child(match view {
                 ComputerView::Overview => self
                     .overview(
@@ -223,6 +206,85 @@ impl Render for ComputerPane {
 }
 
 impl ComputerPane {
+    /// Writes the editor's fields back to the routine being edited (nothing for a new one):
+    /// the back control and each field's change run it.
+    fn persist_routine(
+        &self,
+        app: Entity<AppState>,
+        coworker_id: String,
+        id: Option<String>,
+    ) -> Rc<dyn Fn(&mut App)> {
+        let name_input = self.name_input.clone();
+        let instruction_input = self.instruction_input.clone();
+        let webhook_url = self.webhook_url.clone();
+        let webhook_key = self.webhook_key.clone();
+        let webhook_header = self.webhook_header.clone();
+        let custom_cron = self.custom_cron.clone();
+        Rc::new(move |cx: &mut App| {
+            let Some(rid) = id.clone() else {
+                return;
+            };
+            let name = name_input.read(cx).value().to_string();
+            let instruction = instruction_input.read(cx).value().to_string();
+            let url = webhook_url.read(cx).value().to_string();
+            let key = webhook_key.read(cx).value().to_string();
+            let header = webhook_header.read(cx).value().to_string();
+            let cron = custom_cron.read(cx).value().to_string();
+            app.update(cx, |state, cx| {
+                state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
+                if let Some(sid) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
+                    row.triggers.iter().rev().find_map(|t| match t {
+                        RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                }) {
+                    if let Some(row) = state.routine_mut(&coworker_id, &rid)
+                        && let Some(RoutineTrigger::Schedule { spec, .. }) =
+                            row.triggers.iter_mut().find(|t| t.id() == sid)
+                        && spec.mode == ScheduleUiMode::Custom
+                    {
+                        spec.expr = cron;
+                    }
+                }
+                if let Some(hook) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
+                    row.triggers.iter().rev().find_map(|t| match t {
+                        RoutineTrigger::Webhook { id, .. } => Some(id.clone()),
+                        _ => None,
+                    })
+                }) {
+                    state.update_webhook(&coworker_id, &rid, &hook, url, key, header, cx);
+                }
+            });
+        })
+    }
+
+    /// The pane's header row. In the title bar over the pane while the pane is docked (then
+    /// its title and empty run drag the window), in the pane itself while it floats.
+    /// Overview: Update and Reset, then the close chevron; Routine: back, which keeps the
+    /// fields, and the title, then the close chevron.
+    pub fn header(&self, cx: &App, drag: bool) -> AnyElement {
+        let app = self.state.clone();
+        let state = self.state.read(cx);
+        match state.computer_view.clone() {
+            ComputerView::Overview => {
+                let controls = ComputerControls::from_state(state);
+                pane_header(None, "", Some(&controls), app, drag).into_any_element()
+            }
+            ComputerView::Editor { id } => {
+                let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
+                let persist = self.persist_routine(app.clone(), coworker_id, id);
+                let back = {
+                    let app = app.clone();
+                    Rc::new(move |cx: &mut App| {
+                        persist(cx);
+                        app.update(cx, |state, cx| state.back_to_computer(cx));
+                    }) as Rc<dyn Fn(&mut App)>
+                };
+                pane_header(Some(back), "Routine", None, app, drag).into_any_element()
+            }
+        }
+    }
+
     fn overview(
         &self,
         agent_name: &str,
@@ -236,165 +298,160 @@ impl ComputerPane {
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
     ) -> impl IntoElement {
-        v_flex()
-            .size_full()
-            .child(pane_header(None, "", Some(controls), app.clone()))
-            .child(
-                v_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .px(px(16.))
-                    .pt(px(8.))
-                    .pb(px(16.))
-                    .gap(px(12.))
-                    .child(screen_tile(
-                        has_screen,
-                        screen,
-                        box_id.map(str::to_string),
-                        app.clone(),
-                        theme,
-                    ))
-                    .child(
+        v_flex().size_full().child(
+            v_flex()
+                .w_full()
+                .flex_shrink_0()
+                .px(px(16.))
+                .pt(px(8.))
+                .pb(px(16.))
+                .gap(px(12.))
+                .child(screen_tile(
+                    has_screen,
+                    screen,
+                    box_id.map(str::to_string),
+                    app.clone(),
+                    theme,
+                ))
+                .child(
+                    div()
+                        .w_full()
+                        .text_center()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{agent_name}'s screen")),
+                )
+                .when(box_id.is_none(), |this| {
+                    this.child(
                         div()
                             .w_full()
                             .text_center()
                             .text_xs()
                             .text_color(muted)
-                            .child(format!("{agent_name}'s screen")),
+                            .child("No computer yet. The next turn may attach a local box."),
                     )
-                    .when(box_id.is_none(), |this| {
-                        this.child(
+                })
+                .when_some(controls.error.clone(), |this, error| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .text_xs()
+                            .text_color(theme.danger)
+                            .child(error),
+                    )
+                })
+                .child(if routines.is_empty() {
+                    v_flex()
+                        .w_full()
+                        .gap(px(10.))
+                        .child(
                             div()
-                                .w_full()
-                                .text_center()
-                                .text_xs()
+                                .text_sm()
                                 .text_color(muted)
-                                .child("No computer yet. The next turn may attach a local box."),
+                                .child("Routines are recurring tasks this Bot runs on a schedule."),
                         )
-                    })
-                    .when_some(controls.error.clone(), |this, error| {
-                        this.child(
+                        .child(
                             div()
-                                .w_full()
-                                .text_center()
-                                .text_xs()
-                                .text_color(theme.danger)
-                                .child(error),
-                        )
-                    })
-                    .child(if routines.is_empty() {
-                        v_flex()
-                            .w_full()
-                            .gap(px(10.))
-                            .child(
-                                div().text_sm().text_color(muted).child(
-                                    "Routines are recurring tasks this Bot runs on a schedule.",
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .id("create-routine")
-                                    .px(px(12.))
-                                    .py(px(8.))
-                                    .rounded(px(8.))
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
-                                    .on_mouse_down(MouseButton::Left, {
-                                        let app = app.clone();
-                                        move |_, _, cx| {
-                                            app.update(cx, |state, cx| {
-                                                state.open_routine_editor(None, cx);
-                                            });
-                                        }
-                                    })
-                                    .child(div().text_sm().child("Create routine")),
-                            )
-                            .into_any_element()
-                    } else {
-                        v_flex()
-                            .w_full()
-                            .gap(px(8.))
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_between()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Routines"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("add-routine")
-                                            .px(px(8.))
-                                            .py(px(4.))
-                                            .rounded(px(8.))
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
-                                            .on_mouse_down(MouseButton::Left, {
-                                                let app = app.clone();
-                                                move |_, _, cx| {
-                                                    app.update(cx, |state, cx| {
-                                                        state.open_routine_editor(None, cx);
-                                                    });
-                                                }
-                                            })
-                                            .child(div().text_sm().child("+")),
-                                    ),
-                            )
-                            .children(routines.iter().map(|row| {
-                                let id = row.id.clone();
-                                let name = if row.name.trim().is_empty() {
-                                    "Untitled routine".to_string()
-                                } else {
-                                    row.name.clone()
-                                };
-                                let paused = !row.active;
-                                let app = app.clone();
-                                h_flex()
-                                    .id(SharedString::from(format!("routine-{id}")))
-                                    .w_full()
-                                    .gap(px(8.))
-                                    .px(px(10.))
-                                    .py(px(8.))
-                                    .rounded(px(10.))
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x777777).opacity(0.1)))
-                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                .id("create-routine")
+                                .px(px(12.))
+                                .py(px(8.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(theme.border)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
                                         app.update(cx, |state, cx| {
-                                            state.open_routine_editor(Some(id.clone()), cx);
+                                            state.open_routine_editor(None, cx);
                                         });
-                                    })
-                                    .child(
-                                        Icon::default()
-                                            .path("icons/sparkles.svg")
-                                            .size(px(14.))
-                                            .text_color(muted),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .child(div().text_sm().truncate().child(name))
-                                            .when(paused, |this| {
-                                                this.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(muted)
-                                                        .child("Paused"),
-                                                )
-                                            }),
-                                    )
-                            }))
-                            .into_any_element()
-                    }),
-            )
+                                    }
+                                })
+                                .child(div().text_sm().child("Create routine")),
+                        )
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .w_full()
+                        .gap(px(8.))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Routines"),
+                                )
+                                .child(
+                                    div()
+                                        .id("add-routine")
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(8.))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
+                                        .on_mouse_down(MouseButton::Left, {
+                                            let app = app.clone();
+                                            move |_, _, cx| {
+                                                app.update(cx, |state, cx| {
+                                                    state.open_routine_editor(None, cx);
+                                                });
+                                            }
+                                        })
+                                        .child(div().text_sm().child("+")),
+                                ),
+                        )
+                        .children(routines.iter().map(|row| {
+                            let id = row.id.clone();
+                            let name = if row.name.trim().is_empty() {
+                                "Untitled routine".to_string()
+                            } else {
+                                row.name.clone()
+                            };
+                            let paused = !row.active;
+                            let app = app.clone();
+                            h_flex()
+                                .id(SharedString::from(format!("routine-{id}")))
+                                .w_full()
+                                .gap(px(8.))
+                                .px(px(10.))
+                                .py(px(8.))
+                                .rounded(px(10.))
+                                .border_1()
+                                .border_color(theme.border)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x777777).opacity(0.1)))
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    app.update(cx, |state, cx| {
+                                        state.open_routine_editor(Some(id.clone()), cx);
+                                    });
+                                })
+                                .child(
+                                    Icon::default()
+                                        .path("icons/sparkles.svg")
+                                        .size(px(14.))
+                                        .text_color(muted),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(div().text_sm().truncate().child(name))
+                                        .when(paused, |this| {
+                                            this.child(
+                                                div().text_xs().text_color(muted).child("Paused"),
+                                            )
+                                        }),
+                                )
+                        }))
+                        .into_any_element()
+                }),
+        )
     }
 
     fn editor(
@@ -420,197 +477,130 @@ impl ComputerPane {
             .as_ref()
             .map(|r| r.runs.clone())
             .unwrap_or_default();
-        let name_input = self.name_input.clone();
-        let instruction_input = self.instruction_input.clone();
-        let webhook_url = self.webhook_url.clone();
-        let webhook_key = self.webhook_key.clone();
-        let webhook_header = self.webhook_header.clone();
-        let custom_cron = self.custom_cron.clone();
-        let persist = {
-            let app = app.clone();
-            let coworker_id = coworker_id.clone();
-            let id = id.clone();
-            let name_input = name_input.clone();
-            let instruction_input = instruction_input.clone();
-            let webhook_url = webhook_url.clone();
-            let webhook_key = webhook_key.clone();
-            let webhook_header = webhook_header.clone();
-            let custom_cron = custom_cron.clone();
-            Rc::new(move |cx: &mut App| {
-                let Some(rid) = id.clone() else {
-                    return;
-                };
-                let name = name_input.read(cx).value().to_string();
-                let instruction = instruction_input.read(cx).value().to_string();
-                let url = webhook_url.read(cx).value().to_string();
-                let key = webhook_key.read(cx).value().to_string();
-                let header = webhook_header.read(cx).value().to_string();
-                let cron = custom_cron.read(cx).value().to_string();
-                app.update(cx, |state, cx| {
-                    state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
-                    if let Some(sid) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
-                        row.triggers.iter().rev().find_map(|t| match t {
-                            RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
-                            _ => None,
-                        })
-                    }) {
-                        if let Some(row) = state.routine_mut(&coworker_id, &rid)
-                            && let Some(RoutineTrigger::Schedule { spec, .. }) =
-                                row.triggers.iter_mut().find(|t| t.id() == sid)
-                            && spec.mode == ScheduleUiMode::Custom
-                        {
-                            spec.expr = cron;
-                        }
-                    }
-                    if let Some(hook) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
-                        row.triggers.iter().rev().find_map(|t| match t {
-                            RoutineTrigger::Webhook { id, .. } => Some(id.clone()),
-                            _ => None,
-                        })
-                    }) {
-                        state.update_webhook(&coworker_id, &rid, &hook, url, key, header, cx);
-                    }
-                });
-            })
-        };
+        let persist = self.persist_routine(app.clone(), coworker_id.clone(), id.clone());
 
-        v_flex()
-            .size_full()
-            .child(pane_header(
-                Some(Rc::new({
-                    let persist = persist.clone();
-                    let app = app.clone();
-                    move |cx: &mut App| {
-                        persist(cx);
-                        app.update(cx, |state, cx| state.back_to_computer(cx));
-                    }
-                }) as Rc<dyn Fn(&mut App)>),
-                "Routine",
-                None,
-                app.clone(),
-            ))
-            .child(
-                v_flex()
-                    .id("routine-editor-scroll")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .px(px(16.))
-                    .py(px(12.))
-                    .gap(px(16.))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap(px(8.))
-                            .items_center()
-                            .child(
-                                Switch::new("routine-active")
-                                    .checked(active)
-                                    .label("Active")
+        v_flex().size_full().child(
+            v_flex()
+                .id("routine-editor-scroll")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .px(px(16.))
+                .py(px(12.))
+                .gap(px(16.))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap(px(8.))
+                        .items_center()
+                        .child(
+                            Switch::new("routine-active")
+                                .checked(active)
+                                .label("Active")
+                                .on_click({
+                                    let app = app.clone();
+                                    let coworker_id = coworker_id.clone();
+                                    let id = id.clone();
+                                    move |checked, _, cx| {
+                                        if let Some(id) = id.clone() {
+                                            app.update(cx, |state, cx| {
+                                                state.set_routine_active(
+                                                    &coworker_id,
+                                                    &id,
+                                                    *checked,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    }
+                                }),
+                        )
+                        .child(div().flex_1())
+                        .when(id.is_some(), |this| {
+                            this.child(
+                                Button::new("routine-delete")
+                                    .ghost()
+                                    .label("Delete")
                                     .on_click({
                                         let app = app.clone();
                                         let coworker_id = coworker_id.clone();
                                         let id = id.clone();
-                                        move |checked, _, cx| {
+                                        move |_, _, cx| {
                                             if let Some(id) = id.clone() {
                                                 app.update(cx, |state, cx| {
-                                                    state.set_routine_active(
-                                                        &coworker_id,
-                                                        &id,
-                                                        *checked,
-                                                        cx,
-                                                    );
+                                                    state.delete_routine(&coworker_id, &id, cx);
                                                 });
                                             }
                                         }
                                     }),
                             )
-                            .child(div().flex_1())
-                            .when(id.is_some(), |this| {
-                                this.child(
-                                    Button::new("routine-delete")
-                                        .ghost()
-                                        .label("Delete")
-                                        .on_click({
-                                            let app = app.clone();
-                                            let coworker_id = coworker_id.clone();
-                                            let id = id.clone();
-                                            move |_, _, cx| {
-                                                if let Some(id) = id.clone() {
-                                                    app.update(cx, |state, cx| {
-                                                        state.delete_routine(&coworker_id, &id, cx);
-                                                    });
-                                                }
-                                            }
-                                        }),
-                                )
-                            })
-                            .child(
-                                Button::new("routine-test")
-                                    .primary()
-                                    .label("Test run")
-                                    .on_click({
-                                        let persist = persist.clone();
-                                        let app = app.clone();
-                                        let coworker_id = coworker_id.clone();
-                                        let id = id.clone();
-                                        move |_, _, cx| {
-                                            persist(cx);
-                                            if let Some(id) = id.clone() {
-                                                app.update(cx, |state, cx| {
-                                                    state.record_routine_run(&coworker_id, &id, cx);
-                                                });
-                                            }
+                        })
+                        .child(
+                            Button::new("routine-test")
+                                .primary()
+                                .label("Test run")
+                                .on_click({
+                                    let persist = persist.clone();
+                                    let app = app.clone();
+                                    let coworker_id = coworker_id.clone();
+                                    let id = id.clone();
+                                    move |_, _, cx| {
+                                        persist(cx);
+                                        if let Some(id) = id.clone() {
+                                            app.update(cx, |state, cx| {
+                                                state.record_routine_run(&coworker_id, &id, cx);
+                                            });
                                         }
-                                    }),
-                            ),
-                    )
-                    .child(field_label("Name", muted))
-                    .child(field_input(&self.name_input))
-                    .child(field_label("Instruction", muted))
-                    .child(field_textarea(&self.instruction_input, theme))
-                    .child(field_label("When to run", muted))
-                    .child(self.triggers_box(
-                        &triggers,
-                        &coworker_id,
-                        id.clone(),
-                        muted,
-                        app.clone(),
-                        theme,
-                        persist.clone(),
-                        cx,
-                    ))
-                    .child(field_label("Run history", muted))
-                    .child(if runs.is_empty() {
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("No runs yet")
-                            .into_any_element()
-                    } else {
-                        v_flex()
-                            .w_full()
-                            .gap(px(6.))
-                            .children(runs.into_iter().enumerate().map(|(i, run)| {
-                                h_flex()
-                                    .id(SharedString::from(format!("run-{i}")))
-                                    .w_full()
-                                    .justify_between()
-                                    .items_center()
-                                    .py(px(4.))
-                                    .child(div().text_sm().child(run.at))
-                                    .when(run.ok, |this| {
-                                        this.child(
-                                            Icon::default()
-                                                .path("icons/check.svg")
-                                                .size(px(14.))
-                                                .text_color(rgb(0x34c759)),
-                                        )
-                                    })
-                            }))
-                            .into_any_element()
-                    }),
-            )
+                                    }
+                                }),
+                        ),
+                )
+                .child(field_label("Name", muted))
+                .child(field_input(&self.name_input))
+                .child(field_label("Instruction", muted))
+                .child(field_textarea(&self.instruction_input, theme))
+                .child(field_label("When to run", muted))
+                .child(self.triggers_box(
+                    &triggers,
+                    &coworker_id,
+                    id.clone(),
+                    muted,
+                    app.clone(),
+                    theme,
+                    persist.clone(),
+                    cx,
+                ))
+                .child(field_label("Run history", muted))
+                .child(if runs.is_empty() {
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("No runs yet")
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .w_full()
+                        .gap(px(6.))
+                        .children(runs.into_iter().enumerate().map(|(i, run)| {
+                            h_flex()
+                                .id(SharedString::from(format!("run-{i}")))
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .py(px(4.))
+                                .child(div().text_sm().child(run.at))
+                                .when(run.ok, |this| {
+                                    this.child(
+                                        Icon::default()
+                                            .path("icons/check.svg")
+                                            .size(px(14.))
+                                            .text_color(rgb(0x34c759)),
+                                    )
+                                })
+                        }))
+                        .into_any_element()
+                }),
+        )
     }
 
     fn triggers_box(
@@ -736,6 +726,37 @@ pub fn update_rest_label(stale: bool, current: bool) -> &'static str {
 }
 
 impl ComputerControls {
+    /// What the app state says of the active coworker's box, read once per frame.
+    pub fn from_state(state: &AppState) -> Self {
+        Self {
+            present: state
+                .coworker_computer
+                .as_ref()
+                .is_some_and(|s| s.state != "absent"),
+            updating: state
+                .coworker_computer
+                .as_ref()
+                .is_some_and(|s| s.updating()),
+            stale: state
+                .coworker_computer
+                .as_ref()
+                .is_some_and(|s| s.image_stale()),
+            current: state
+                .coworker_computer
+                .as_ref()
+                .and_then(|s| s.image.as_ref())
+                .is_some_and(|image| !image.stale),
+            error: state.computer_action_error.clone().or_else(|| {
+                state
+                    .coworker_computer
+                    .as_ref()
+                    .and_then(|s| s.update.as_ref())
+                    .filter(|u| !u.in_flight())
+                    .map(|u| u.detail())
+            }),
+        }
+    }
+
     /// Nothing to update, or nothing to update to: the Update button waits.
     pub fn update_disabled(&self) -> bool {
         !self.present || self.updating || (self.current && !self.stale)
@@ -865,6 +886,7 @@ fn pane_header(
     title: &'static str,
     actions: Option<&ComputerControls>,
     app: Entity<AppState>,
+    drag: bool,
 ) -> impl IntoElement {
     // Update and Reset live up here as icons, apart from the close chevron, each behind a
     // confirm dialog — the pane's body is for the screen, not for buttons.
@@ -879,8 +901,8 @@ fn pane_header(
     h_flex()
         .id("computer-header")
         .w_full()
-        .px(px(PANE_HEADER_PX))
-        .h(px(PANE_HEADER_H))
+        .px(px(HEADER_PX))
+        .h(px(TITLE_BAR_H))
         .items_center()
         .justify_between()
         .flex_shrink_0()
@@ -900,7 +922,12 @@ fn pane_header(
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
+                            .child(title)
+                            .when(drag, |this| {
+                                this.on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.start_window_move()
+                                })
+                            }),
                     )
                 })
                 .when_some(actions, |this, (can_update, can_reset, stale)| {
@@ -934,6 +961,11 @@ fn pane_header(
                     ))
                 }),
         )
+        // The empty run between the controls: in the title bar, the handle to drag the
+        // window by.
+        .child(div().flex_1().h_full().when(drag, |this| {
+            this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+        }))
         .child(icon_btn(
             "computer-close",
             "icons/chevrons-right.svg",

@@ -9,6 +9,7 @@ use nativechat::actions::{
     ToggleFps, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
+use nativechat::chrome::TITLE_BAR_H;
 use nativechat::components::chat_input::SubmitMessage;
 use nativechat::config::Config;
 use nativechat::db::{create_pool, run_migrations};
@@ -214,13 +215,13 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(520.), px(400.))),
-                // The title bar is ours: transparent, with the traffic lights left where they
-                // are, so the strip RootView paints IS the title bar and follows the app's
-                // theme rather than the system's.
+                // The title bar is ours: transparent, with the traffic lights centred in the
+                // row the app paints in its place (see components/title_bar.rs), which
+                // holds the chat's and the right pane's headers and follows the app's theme.
                 titlebar: Some(TitlebarOptions {
                     title: Some("NativeChat".into()),
                     appears_transparent: true,
-                    traffic_light_position: Some(point(px(12.), px(14.))),
+                    traffic_light_position: Some(point(px(12.), px((TITLE_BAR_H - 14.) / 2.))),
                 }),
                 ..WindowOptions::default()
             };

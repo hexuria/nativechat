@@ -22,5 +22,6 @@ pub mod persona;
 pub mod recipes;
 pub mod sidebar;
 pub mod sidebar_chat_item;
+pub mod title_bar;
 pub mod voice_mode_modal;
 pub mod voice_wave;

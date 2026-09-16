@@ -2,9 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
-use crate::chrome::{
-    CHAT_CONTENT_MAX, PANE_HEADER_H, PANE_HEADER_PX, chat_column_width, timestamps_fit,
-};
+use crate::chrome::{CHAT_CONTENT_MAX, chat_column_width, timestamps_fit};
 use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
@@ -15,12 +13,11 @@ use crate::find_text::{FindHit, marks_for_row, project_hits};
 use crate::opengrok::{ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, collapse_open_approvals};
 use crate::state::{AppState, EmojiPickerOpen};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
-use gpui_kit::FontWeight;
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::rc::Rc;
@@ -786,7 +783,8 @@ impl Render for ChatTranscript {
                         )
                     },
                 )
-                .pt(px(80.0))
+                // Straight under the title bar, which holds the chat's header.
+                .pt(px(20.0))
                 .with_jump_button_transition(Duration::ZERO),
             )
     }
@@ -817,6 +815,41 @@ impl ChatView {
         self.input.update(cx, |input, cx| {
             input.focus(window, cx);
         });
+    }
+
+    /// The find bar, while a search is open: the title bar shows it in the chat's header.
+    pub fn find_bar(&self, view: Entity<Self>, cx: &App) -> Option<AnyElement> {
+        if !self.find_open {
+            return None;
+        }
+        let (find_current, find_total, find_has_query) = self.transcript.read(cx).find_status();
+        Some(
+            find_bar_element(
+                &self.find_input,
+                find_current,
+                find_total,
+                find_has_query,
+                {
+                    let view = view.clone();
+                    move |_, cx| {
+                        view.update(cx, |this, cx| this.find_prev(cx));
+                    }
+                },
+                {
+                    let view = view.clone();
+                    move |_, cx| {
+                        view.update(cx, |this, cx| this.find_next(cx));
+                    }
+                },
+                move |window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.close_find(window, cx);
+                    });
+                },
+                cx,
+            )
+            .into_any_element(),
+        )
     }
 
     pub fn open_find(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1089,8 +1122,6 @@ impl Render for ChatView {
         let theme = cx.theme().clone();
 
         let app = self.state.clone();
-        let view = cx.entity();
-        let (find_current, find_total, find_has_query) = self.transcript.read(cx).find_status();
         v_flex()
             .size_full()
             .bg(theme.background)
@@ -1162,117 +1193,7 @@ impl Render for ChatView {
                     )
                     .when_some(self.emoji_open.clone(), |this, open| {
                         this.child(self.render_emoji_overlay(open, cx))
-                    })
-                    .child(
-                        // Header - Absolute positioned at top
-                        h_flex()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .h(px(PANE_HEADER_H))
-                            .pt(px(20.0))
-                            .pb_5()
-                            .items_center()
-                            .justify_between()
-                            .px(px(PANE_HEADER_PX))
-                            .bg(theme.background.opacity(0.9)) // Slight transparency for glass effect if desired, or solid
-                            .child(
-                                h_flex().gap_2().items_center().child(
-                                    div()
-                                        .id("header-coworker")
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .cursor_pointer()
-                                        .on_mouse_down(MouseButton::Left, {
-                                            let state = self.state.clone();
-                                            move |_, _, cx| {
-                                                state.update(cx, |state, cx| {
-                                                    state.toggle_agent_settings(cx);
-                                                });
-                                            }
-                                        })
-                                        .when_some(self.coworker_id.clone(), |this, id| {
-                                            this.child(
-                                                PersonaMark::new(id)
-                                                    .shape(self.coworker_shape.clone())
-                                                    .color(self.coworker_color.clone())
-                                                    .size(px(24.))
-                                                    .dark(theme.is_dark()),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child(
-                                                    self.coworker_name
-                                                        .clone()
-                                                        .unwrap_or_else(|| "Native Chat".into()),
-                                                ),
-                                        ),
-                                ),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .when(self.find_open, |this| {
-                                        this.child(find_bar_element(
-                                            &self.find_input,
-                                            find_current,
-                                            find_total,
-                                            find_has_query,
-                                            {
-                                                let view = view.clone();
-                                                move |_, cx| {
-                                                    view.update(cx, |this, cx| this.find_prev(cx));
-                                                }
-                                            },
-                                            {
-                                                let view = view.clone();
-                                                move |_, cx| {
-                                                    view.update(cx, |this, cx| this.find_next(cx));
-                                                }
-                                            },
-                                            {
-                                                let view = view.clone();
-                                                move |window, cx| {
-                                                    view.update(cx, |this, cx| {
-                                                        this.close_find(window, cx);
-                                                    });
-                                                }
-                                            },
-                                            cx,
-                                        ))
-                                    })
-                                    .child(
-                                        div()
-                                            .id("header-monitor")
-                                            .size(px(28.))
-                                            .rounded(px(8.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
-                                            .on_mouse_down(MouseButton::Left, {
-                                                let state = self.state.clone();
-                                                move |_, _, cx| {
-                                                    state.update(cx, |state, cx| {
-                                                        state.toggle_computer_pane(cx);
-                                                    });
-                                                }
-                                            })
-                                            .child(
-                                                Icon::default()
-                                                    .path("icons/monitor.svg")
-                                                    .size(px(16.)),
-                                            ),
-                                    ),
-                            ),
-                    ),
+                    }),
             )
             .child(
                 v_flex()

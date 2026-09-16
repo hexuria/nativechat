@@ -8,6 +8,7 @@ use crate::components::hidden_bots::hidden_bots_overlay;
 use crate::components::login::LoginView;
 use crate::components::recipes::{RecipesView, recipe_delete_overlay};
 use crate::components::sidebar::SidebarView;
+use crate::components::title_bar::TitleBar;
 use crate::state::{MainPage, RightPane};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme, Disableable, h_flex, v_flex};
@@ -84,6 +85,7 @@ pub struct Layout {
     login: Entity<LoginView>,
     agent_settings: Entity<AgentSettings>,
     computer: Entity<ComputerPane>,
+    title_bar: Entity<TitleBar>,
     app_settings: Entity<AppSettings>,
     bot_finder: Entity<BotFinder>,
     command_palette: Entity<CommandPalette>,
@@ -101,6 +103,8 @@ impl Layout {
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
         let computer = cx.new(|cx| ComputerPane::new(window, state.clone(), cx));
+        let title_bar =
+            cx.new(|cx| TitleBar::new(state.clone(), chat.clone(), computer.clone(), cx));
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
         let bot_finder = cx.new(|cx| BotFinder::new(window, state.clone(), cx));
         let command_palette = cx.new(|cx| CommandPalette::new(window, state.clone(), cx));
@@ -122,6 +126,7 @@ impl Layout {
             login,
             agent_settings,
             computer,
+            title_bar,
             app_settings,
             bot_finder,
             command_palette,
@@ -216,23 +221,27 @@ impl Render for Layout {
         let command_palette_open = state.command_palette_open;
         let hidden_bots_open = state.hidden_bots_open;
         if !state.is_signed_in() {
-            return div()
-                .size_full()
-                .relative()
-                .child(self.login.clone())
-                .when(app_settings_open, |this| {
-                    this.child(
-                        div()
-                            .id("app-settings-overlay")
-                            .absolute()
-                            .inset_0()
-                            .occlude()
-                            .child(self.app_settings.clone()),
-                    )
-                })
-                .when(command_palette_open, |this| {
-                    this.child(self.command_palette.clone())
-                });
+            return v_flex().size_full().child(self.title_bar.clone()).child(
+                div()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(self.login.clone())
+                    .when(app_settings_open, |this| {
+                        this.child(
+                            div()
+                                .id("app-settings-overlay")
+                                .absolute()
+                                .inset_0()
+                                .occlude()
+                                .child(self.app_settings.clone()),
+                        )
+                    })
+                    .when(command_palette_open, |this| {
+                        this.child(self.command_palette.clone())
+                    }),
+            );
         }
         let has_agent = state.active_coworker_id.is_some();
         let hiring = state.hiring;
@@ -268,8 +277,10 @@ impl Render for Layout {
             RightPane::Closed => div().into_any_element(),
         };
 
-        div()
-            .size_full()
+        let row = div()
+            .w_full()
+            .flex_1()
+            .min_h_0()
             .flex()
             .relative()
             .when(dragging, |this| {
@@ -423,7 +434,13 @@ impl Render for Layout {
             })
             .when_some(recipe_delete, |this, name| {
                 this.child(recipe_delete_overlay(self.state.clone(), name, &theme))
-            })
+            });
+
+        // The title bar, then the sidebar, chat and right pane in what is left.
+        v_flex()
+            .size_full()
+            .child(self.title_bar.clone())
+            .child(row)
     }
 }
 
