@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
 use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width};
-use crate::components::message_actions::{MessageToolbar, TOOLBAR_W};
+use crate::components::message_actions::{CONTROL_PX, MessageToolbar, TOOLBAR_W};
 use crate::state::{AppState, RightPane};
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
@@ -10,6 +10,16 @@ use gpui_kit::{prelude::FluentBuilder, *};
 
 pub const TIMESTAMP_W: f32 = 82.0;
 pub const TS_PEEK_MAX: f32 = 82.0;
+/// The transcript's padding either side of a row (px_4 in chat.rs).
+const ROW_PAD: f32 = 16.0;
+/// Between the bubble and the toolbar's slot, when the slot is in the row.
+const TOOLBAR_GAP: f32 = 8.0;
+/// The narrowest bubble worth keeping the toolbar's slot beside. Below it the toolbar floats
+/// over the bubble's corner instead, and the bubble keeps its width.
+const MIN_COMFORTABLE_BUBBLE: f32 = 260.0;
+/// How far a floating toolbar reaches past the bubble's edge, into the row's margin: the
+/// bubble's cap (chat_w - 82) leaves at least 50px there.
+const FLOAT_OUT: f32 = 44.0;
 
 #[derive(Clone, IntoElement)]
 pub struct MessageBubble {
@@ -257,7 +267,18 @@ impl RenderOnce for MessageBubble {
             })
             .unwrap_or(win)
             .min(CHAT_CONTENT_MAX);
-        let max_bubble = px((chat_w * 0.88).min(640.0).min((chat_w - 82.0).max(160.0)));
+        let max_bubble = (chat_w * 0.88).min(640.0).min((chat_w - 82.0).max(160.0));
+        // The bubble comes first. The toolbar's slot sits beside it only while the bubble
+        // that leaves is still comfortable to read; narrower than that, the toolbar floats
+        // over the bubble's corner and takes no width from the row.
+        let row_w = (chat_w - 2.0 * ROW_PAD).max(0.0);
+        let room = row_w - (TOOLBAR_W + TOOLBAR_GAP);
+        let toolbar_floats = room < MIN_COMFORTABLE_BUBBLE;
+        let max_bubble = px(if toolbar_floats {
+            max_bubble
+        } else {
+            max_bubble.min(room)
+        });
 
         let body = if self.debug_mode {
             div()
@@ -320,9 +341,9 @@ impl RenderOnce for MessageBubble {
         let reaction_bg = cx.theme().background;
         let reaction_border = cx.theme().border;
         let is_me = self.is_me;
-        // The bubble shrink-wraps its text up to `max_bubble`, and yields to the toolbar's
-        // slot beside it (wrapping sooner) rather than push the slot past the row's edge.
-        // The chip sits on the bubble's bottom edge: half of its 22px is on the fill.
+        // The bubble shrink-wraps its text up to its cap; the shrink is a safety net only, for
+        // a row narrower than chat_w says. The chip sits on the bubble's bottom edge: half of
+        // its 22px is on the fill.
         let bubble_stack = div()
             .relative()
             .flex_shrink(1.)
@@ -383,36 +404,61 @@ impl RenderOnce for MessageBubble {
             )
         });
 
-        // Fixed slot: always occupies TOOLBAR_W so the bubble never jumps or
-        // reaches the trailing edge. Icons fade in on row hover.
-        let toolbar_slot = div()
-            .w(px(TOOLBAR_W))
-            .h(px(28.))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .when(self.is_me, |this| this.justify_end())
-            .opacity(if show_toolbar { 1. } else { 0. })
-            .when_some(toolbar, |this, toolbar| this.child(toolbar));
+        let (slot_toolbar, float_toolbar) = if toolbar_floats {
+            (None, toolbar)
+        } else {
+            (toolbar, None)
+        };
+        // In the row: a slot of the toolbar's own width, always there so the bubble never
+        // jumps, with the icons fading in on hover.
+        let toolbar_slot = (!toolbar_floats).then(|| {
+            div()
+                .w(px(TOOLBAR_W))
+                .h(px(CONTROL_PX))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .when(is_me, |this| this.justify_end())
+                .opacity(if show_toolbar { 1. } else { 0. })
+                .when_some(slot_toolbar, |this, toolbar| this.child(toolbar))
+        });
+        // Floating: on hover only, over the bubble's outer bottom corner and reaching into
+        // the row's margin, so it takes nothing from the bubble's width.
+        let bubble_stack =
+            bubble_stack.when_some(float_toolbar.filter(|_| show_toolbar), |this, toolbar| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(px(2.))
+                        .when(is_me, |this| this.left(px(-FLOAT_OUT)))
+                        .when(!is_me, |this| this.right(px(-FLOAT_OUT)))
+                        .p(px(2.))
+                        .rounded(px(8.))
+                        .bg(reaction_bg)
+                        .border_1()
+                        .border_color(reaction_border)
+                        .shadow_sm()
+                        .child(toolbar),
+                )
+            });
 
         let time_label = self.timestamp.clone().unwrap_or_default();
 
-        let main = if self.is_me {
+        let main = if is_me {
             h_flex()
                 .w_full()
                 .items_center()
-                .gap(px(8.))
-                .child(div().flex_1().min_w(px(0.)))
-                .child(toolbar_slot)
+                .justify_end()
+                .gap(px(TOOLBAR_GAP))
+                .children(toolbar_slot)
                 .child(bubble_stack)
         } else {
             h_flex()
                 .w_full()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(TOOLBAR_GAP))
                 .child(bubble_stack)
-                .child(toolbar_slot)
-                .child(div().flex_1().min_w(px(0.)))
+                .children(toolbar_slot)
         };
 
         let copy_text = self.copy_text.clone();

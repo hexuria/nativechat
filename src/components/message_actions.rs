@@ -6,12 +6,15 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     menu::{DropdownMenu, PopupMenuItem},
-    tooltip::Tooltip,
 };
 use gpui_kit::{prelude::FluentBuilder, prelude::*, *};
 use std::rc::Rc;
 
-pub const TOOLBAR_W: f32 = 108.0;
+/// Every control in the toolbar is this square, whatever it holds.
+pub const CONTROL_PX: f32 = 28.0;
+const CONTROL_GAP: f32 = 2.0;
+/// The toolbar's own width: three controls and the gaps between them, nothing more.
+pub const TOOLBAR_W: f32 = 3.0 * CONTROL_PX + 2.0 * CONTROL_GAP;
 
 #[derive(Clone, Copy)]
 struct BtnBounds {
@@ -83,35 +86,24 @@ impl MessageToolbar {
         self
     }
 
-    fn icon_btn(
-        id: SharedString,
-        icon: impl Into<Icon>,
-        tooltip: &'static str,
-        cx: &App,
-        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        let hover = cx.theme().secondary;
+    /// One control of the toolbar. All three come from here so they cannot drift: the same
+    /// square, radius, icon size and hover, whatever the control does.
+    fn control(id: SharedString, icon: impl Into<Icon>, tooltip: &'static str, cx: &App) -> Button {
         let color = cx.theme().muted_foreground;
-        div()
-            .id(id)
-            .size(px(28.))
-            .flex()
-            .items_center()
-            .justify_center()
+        Button::new(ElementId::Name(id))
+            .icon(icon.into().text_color(color))
+            .ghost()
+            // Medium is the 16px icon; the square itself is set below, over the preset.
+            .with_size(Size::Medium)
+            .size(px(CONTROL_PX))
+            .p_0()
             .rounded(px(6.))
-            .cursor_pointer()
-            .text_color(color)
-            .hover(move |s| s.bg(hover))
-            .tooltip(move |w, cx| Tooltip::new(tooltip).build(w, cx))
-            .child(icon.into().size(px(16.)).text_color(color))
-            .on_click(on_click)
+            .tooltip(tooltip)
     }
 }
 
 impl RenderOnce for MessageToolbar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let hover = cx.theme().secondary;
-        let color = cx.theme().muted_foreground;
         let message_id = self.message_id.clone();
         let source_id = self.source_id.clone();
         let app = self.app.clone();
@@ -125,47 +117,43 @@ impl RenderOnce for MessageToolbar {
 
         h_flex()
             .id(SharedString::from(format!("toolbar-{message_id}")))
-            .gap(px(2.))
+            .gap(px(CONTROL_GAP))
             .items_center()
             .flex_shrink_0()
             .child({
                 let bounds_state = bounds_state.clone();
                 let app = app.clone();
                 let source_id = source_id.clone();
-                div()
-                    .id(SharedString::from(format!("emoji-{message_id}")))
-                    .size(px(28.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .text_color(color)
-                    .hover(move |s| s.bg(hover))
-                    .tooltip(move |w, cx| Tooltip::new("Add reaction").build(w, cx))
-                    .child(Icon::new(NativeIcon::Smile).size(px(16.)).text_color(color))
-                    .on_prepaint({
-                        let bounds_state = bounds_state.clone();
-                        move |bounds, _, cx| {
-                            bounds_state.update(cx, |state, _| {
-                                state.bounds = bounds;
-                            });
-                        }
-                    })
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        let bounds = bounds_state.read(cx).bounds;
-                        app.update(cx, |state, cx| {
-                            state.open_emoji_picker(source_id.clone(), bounds, cx);
+                Self::control(
+                    SharedString::from(format!("emoji-{message_id}")),
+                    NativeIcon::Smile,
+                    "Add reaction",
+                    cx,
+                )
+                .on_prepaint({
+                    let bounds_state = bounds_state.clone();
+                    move |bounds, _, cx| {
+                        bounds_state.update(cx, |state, _| {
+                            state.bounds = bounds;
                         });
-                    })
+                    }
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let bounds = bounds_state.read(cx).bounds;
+                    app.update(cx, |state, cx| {
+                        state.open_emoji_picker(source_id.clone(), bounds, cx);
+                    });
+                })
             })
-            .child(Self::icon_btn(
-                SharedString::from(format!("reply-{message_id}")),
-                NativeIcon::Reply,
-                "Reply",
-                cx,
-                {
+            .child(
+                Self::control(
+                    SharedString::from(format!("reply-{message_id}")),
+                    NativeIcon::Reply,
+                    "Reply",
+                    cx,
+                )
+                .on_click({
                     let app = app.clone();
                     let source_id = source_id.clone();
                     let preview = self.preview.clone();
@@ -187,72 +175,71 @@ impl RenderOnce for MessageToolbar {
                             cb(window, cx);
                         }
                     }
-                },
-            ))
+                }),
+            )
             .child(
-                Button::new(ElementId::Name(format!("more-{message_id}").into()))
-                    .icon(IconName::Ellipsis)
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .compact()
-                    .rounded(px(6.))
-                    .tooltip("More actions")
-                    .dropdown_menu_with_anchor(Anchor::BottomLeft, {
-                        let app = app.clone();
-                        let source_id = source_id.clone();
-                        let text = self.message_text.clone();
-                        let on_read_aloud = self.on_read_aloud.clone();
-                        move |menu, _, _| {
-                            menu.item(
-                                PopupMenuItem::new("Delete")
-                                    .icon(Icon::new(NativeIcon::Trash))
-                                    .on_click({
-                                        let app = app.clone();
-                                        let source_id = source_id.clone();
-                                        move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            app.update(cx, |state, cx| {
-                                                state.delete_message(&source_id, cx);
-                                            });
+                Self::control(
+                    SharedString::from(format!("more-{message_id}")),
+                    IconName::Ellipsis,
+                    "More actions",
+                    cx,
+                )
+                .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                    let app = app.clone();
+                    let source_id = source_id.clone();
+                    let text = self.message_text.clone();
+                    let on_read_aloud = self.on_read_aloud.clone();
+                    move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::new("Delete")
+                                .icon(Icon::new(NativeIcon::Trash))
+                                .on_click({
+                                    let app = app.clone();
+                                    let source_id = source_id.clone();
+                                    move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        app.update(cx, |state, cx| {
+                                            state.delete_message(&source_id, cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Read aloud")
+                                .icon(Icon::new(NativeIcon::ReadAloud))
+                                .on_click({
+                                    let on_read_aloud = on_read_aloud.clone();
+                                    move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(cb) = on_read_aloud.as_ref() {
+                                            cb(window, cx);
                                         }
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("Read aloud")
-                                    .icon(Icon::new(NativeIcon::ReadAloud))
-                                    .on_click({
-                                        let on_read_aloud = on_read_aloud.clone();
-                                        move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            if let Some(cb) = on_read_aloud.as_ref() {
-                                                cb(window, cx);
-                                            }
-                                        }
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("Copy")
-                                    .icon(Icon::new(IconName::Copy))
-                                    .on_click({
-                                        let text = text.clone();
-                                        move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                text.clone(),
-                                            ));
-                                        }
-                                    }),
-                            )
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Copy")
+                                .icon(Icon::new(IconName::Copy))
+                                .on_click({
+                                    let text = text.clone();
+                                    move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            text.clone(),
+                                        ));
+                                    }
+                                }),
+                        )
+                    }
+                })
+                .on_open_change({
+                    let on_menu_open = self.on_menu_open.clone();
+                    move |open, _, cx| {
+                        if let Some(cb) = on_menu_open.as_ref() {
+                            cb(*open, cx);
                         }
-                    })
-                    .on_open_change({
-                        let on_menu_open = self.on_menu_open.clone();
-                        move |open, _, cx| {
-                            if let Some(cb) = on_menu_open.as_ref() {
-                                cb(*open, cx);
-                            }
-                        }
-                    }),
+                    }
+                }),
             )
     }
 }
