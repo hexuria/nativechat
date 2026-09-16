@@ -49,7 +49,7 @@ enum PanelMode {
 /// A chip in the message: what it stands for, and where its text sits.
 ///
 /// The chip is text in the field, because the text field cannot host an element mid-line (see
-/// `MessageInput::chip_pills`). This is what makes it more than text: the kind and the id are
+/// `MessageInput::chip_fills`). This is what makes it more than text: the kind and the id are
 /// kept beside it so the message can be sent as structured data rather than re-parsed out of a
 /// string that anyone could have typed by hand.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,7 +57,8 @@ pub struct ComposerToken {
     pub kind: TokenKind,
     /// What the thing is called where it lives: a tool's name, a recipe's id.
     pub id: String,
-    /// What the chip reads as in the message, `@shell`.
+    /// What the chip reads as in the message: the skill's name, without the `/` that opened the
+    /// panel, because that was how it was asked for and not part of what is being said.
     pub text: String,
     /// Where that text sits, in bytes. Kept true across edits by `resync_tokens`.
     pub range: Range<usize>,
@@ -140,8 +141,10 @@ impl MessageInput {
             dismissed_at: None,
         };
 
-        // Subscribe to state changes to update cached values and notify only when relevant fields change
-        cx.observe(&state, |this: &mut Self, state, cx| {
+        // Subscribe to state changes to update cached values and notify only when relevant
+        // fields change. It watches with the window, because rows built here have to be able to
+        // ask the window what keys are bound, the same as rows built when the panel opened.
+        cx.observe_in(&state, window, |this: &mut Self, state, window, cx| {
             let mut changed = false;
             {
                 let state = state.read(cx);
@@ -162,7 +165,8 @@ impl MessageInput {
 
             // Recipes that were still being fetched when `/` opened the panel land here.
             if this.panel_mode == Some(PanelMode::Skills) {
-                let rows = SkillSource.rows(&state.read(cx).recipes);
+                let mut rows = SkillSource.rows(&state.read(cx).recipes);
+                apply_shortcuts(&mut rows, window);
                 this.remember_picks(&rows);
                 let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
                 this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
@@ -401,7 +405,7 @@ impl MessageInput {
             PanelMode::Plus,
             rows,
             "Search",
-            "Type @ for the bot's tools, / for its skills.",
+            "⌘1–9 picks a row. Type @ for the bot's tools, / for its skills.",
             window,
             cx,
         );
@@ -413,7 +417,7 @@ impl MessageInput {
             PanelMode::Tools,
             rows,
             "Search tools",
-            "↑↓ to move, ↵ to put it in the message, esc to close.",
+            "↑↓ to move, ⌘1–9 to take one straight away, ↵ to put it in the message, esc to close.",
             window,
             cx,
         );
@@ -425,12 +429,13 @@ impl MessageInput {
         if self.state.read(cx).recipes.is_empty() {
             self.state.update(cx, |state, cx| state.refresh_recipes(cx));
         }
-        let rows = SkillSource.rows(&self.state.read(cx).recipes);
+        let mut rows = SkillSource.rows(&self.state.read(cx).recipes);
+        apply_shortcuts(&mut rows, window);
         self.show_panel(
             PanelMode::Skills,
             rows,
             "Search skills and actions",
-            "↑↓ to move, ↵ to run it or put it in the message, esc to close.",
+            "↑↓ to move, ⌘1–9 to take one straight away, ↵ to run it or put it in the message, esc to close.",
             window,
             cx,
         );
@@ -466,17 +471,21 @@ impl MessageInput {
     }
 
     fn run_command(&mut self, command: AppCommand, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(action) = command_action(command) {
+            window.dispatch_action(action, cx);
+            return;
+        }
         match command {
-            AppCommand::Settings => window.dispatch_action(Box::new(OpenSettings), cx),
-            AppCommand::NewChat => window.dispatch_action(Box::new(NewChat), cx),
-            AppCommand::ToggleTheme => window.dispatch_action(Box::new(ToggleTheme), cx),
-            AppCommand::Collections => window.dispatch_action(Box::new(Library), cx),
-            AppCommand::Groups => window.dispatch_action(Box::new(Projects), cx),
             AppCommand::SettingsTab(tab) => {
                 self.state
                     .update(cx, |state, cx| state.open_app_settings(tab, cx));
             }
             AppCommand::Recipes => self.state.update(cx, |state, cx| state.open_recipes(cx)),
+            AppCommand::Settings
+            | AppCommand::NewChat
+            | AppCommand::ToggleTheme
+            | AppCommand::Collections
+            | AppCommand::Groups => {}
         }
     }
 
@@ -619,19 +628,17 @@ impl MessageInput {
         true
     }
 
-    /// The chips, as rounded fills behind the text they belong to.
+    /// Where each chip's fill goes, in the window's own coordinates.
     ///
     /// The field paints its text in one style and hosts no elements of its own, so a chip cannot
     /// be an element in the text flow. What it can be is this: the field says where a byte range
-    /// ended up on screen, and the fill goes there, under the glyphs, which the field then paints
-    /// over it. The chip therefore reads inline and wraps and scrolls with the text, because it
-    /// is the text.
-    fn chip_pills(&self, theme: &gpui_kit::component::Theme, cx: &App) -> Vec<AnyElement> {
+    /// ended up in the window, and a fill goes there, under the glyphs the field paints over it.
+    /// The chip therefore reads inline and wraps with the text, because it is the text.
+    fn chip_fills(&self, cx: &App) -> Vec<Bounds<Pixels>> {
         if self.tokens.is_empty() {
             return Vec::new();
         }
         let input = self.input_state.read(cx);
-        let origin = input.input_bounds().origin;
         let line_height = input.line_height();
         self.tokens
             .iter()
@@ -643,27 +650,48 @@ impl MessageInput {
                 if wrapped || bounds.size.width <= px(0.) {
                     return None;
                 }
-                Some(
-                    div()
-                        .absolute()
-                        .left(bounds.origin.x - origin.x - px(3.))
-                        .top(bounds.origin.y - origin.y - px(1.))
-                        .w(bounds.size.width + px(6.))
-                        .h(bounds.size.height + px(2.))
-                        .rounded(px(5.))
-                        .bg(theme.primary.opacity(0.16))
-                        .into_any_element(),
-                )
+                // A little more than the glyphs, so the fill reads as a chip around the word.
+                Some(Bounds::new(
+                    bounds.origin - point(px(3.), px(1.)),
+                    bounds.size + size(px(6.), px(2.)),
+                ))
             })
             .collect()
     }
 
     /// The text field, with the chips' fills under it.
+    ///
+    /// The fills are painted rather than placed as elements because the field's text does not
+    /// start where this box does: the input keeps its own padding between the two, and an
+    /// absolutely placed fill, whose offsets can only be measured from the text, therefore lands
+    /// above and to the left of the word it belongs to by exactly that padding. What the field
+    /// reports is a rectangle in the window, so the window is where it is painted. The canvas
+    /// covers this box and clips to it, which keeps a chip that has scrolled out of a tall draft
+    /// from being painted over whatever is above the composer.
     fn field(&self, theme: &gpui_kit::component::Theme, cx: &App) -> AnyElement {
+        let fills = self.chip_fills(cx);
+        let color = theme.primary.opacity(0.16);
         div()
             .relative()
             .w_full()
-            .children(self.chip_pills(theme, cx))
+            .when(!fills.is_empty(), |this| {
+                this.child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                for chip in fills {
+                                    window.paint_quad(
+                                        fill(chip, color).corner_radii(Corners::all(px(5.))),
+                                    );
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .child(Textarea::new(&self.input_state).appearance(false).w_full())
             .into_any_element()
     }
@@ -777,6 +805,46 @@ impl MessageInput {
                     )
             }))
             .into_any_element()
+    }
+}
+
+/// The action one of the app's own commands dispatches, for the commands that have one. The
+/// rest reach the app through [`AppState`] instead, and so have no chord to show or to send.
+/// One table serves both, so a row can never advertise a key that runs something else.
+fn command_action(command: AppCommand) -> Option<Box<dyn Action>> {
+    match command {
+        AppCommand::Settings => Some(Box::new(OpenSettings)),
+        AppCommand::NewChat => Some(Box::new(NewChat)),
+        AppCommand::ToggleTheme => Some(Box::new(ToggleTheme)),
+        AppCommand::Collections => Some(Box::new(Library)),
+        AppCommand::Groups => Some(Box::new(Projects)),
+        AppCommand::SettingsTab(_) | AppCommand::Recipes => None,
+    }
+}
+
+/// Put the real chord on every row that stands for one of the app's commands, read from the
+/// keymap the app registered rather than written out beside the row. A row whose command has no
+/// binding — and there are several — keeps its empty chord and shows no keys at all.
+fn apply_shortcuts(rows: &mut [(ComposerPanelRow, ComposerPick)], window: &Window) {
+    for (row, pick) in rows {
+        let ComposerPick::Command(command) = pick else {
+            continue;
+        };
+        let Some(action) = command_action(*command) else {
+            continue;
+        };
+        let Some(binding) = window.highest_precedence_binding_for_action(action.as_ref()) else {
+            continue;
+        };
+        let chord = binding
+            .keystrokes()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !chord.is_empty() {
+            row.shortcut = Some(chord.into());
+        }
     }
 }
 

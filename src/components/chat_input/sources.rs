@@ -3,8 +3,8 @@
 //! Every list sits behind one small type, so the rows can come from the server later without
 //! the panel or the composer changing: `ToolSource` answers from a hardcoded roster of the
 //! server's built-in tools until the composer can ask for the real one, and `SkillSource`
-//! answers from the recipes the app has already loaded plus a fixed roster of the app's own
-//! commands.
+//! answers from the recipes the app has already loaded, one example skill that stands in until
+//! the server has a skills registry, and a fixed roster of the app's own commands.
 
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::RecipeSummary;
@@ -23,7 +23,11 @@ pub enum ComposerPick {
         kind: TokenKind,
         /// What the thing is called where it lives: a tool's name, a recipe's id.
         id: String,
-        /// What goes into the message, `@shell` or `/Weekly report`.
+        /// The chip's own words: `Weekly report` for a skill, which is what goes into the
+        /// message, and `@shell` for a tool, which is what the chip beside the "+" is named
+        /// after. The `/` a person typed to open the panel is how they asked, not part of what
+        /// they are saying, so a skill's chip does not carry it; the kind rides along in
+        /// [`TokenKind`] instead.
         text: String,
     },
     /// One of the app's own commands, run now.
@@ -144,25 +148,48 @@ impl SkillSource {
                     ComposerPick::Token {
                         kind: TokenKind::Skill,
                         id: recipe.id.clone(),
-                        text: format!("/{name}"),
+                        text: name,
                     },
                 )
             })
             .collect();
+        rows.push(example_skill());
         rows.extend(
             APP_COMMANDS
                 .iter()
                 .map(|(key, icon, title, description, command)| {
                     (
+                        // The chord is left empty here and filled in from the keymap the app
+                        // registered, so a row shows the keys that really work or none at all.
                         ComposerPanelRow::new(format!("action:{key}"), *icon, *title, *description)
-                            .label("Action")
-                            .glyph("⌘"),
+                            .label("Action"),
                         ComposerPick::Command(*command),
                     )
                 }),
         );
         rows
     }
+}
+
+/// PLACEHOLDER. One made-up skill, so the inline chip a skill leaves in the message can be seen
+/// while the server has no skills registry to list. It is named and described as an example on
+/// purpose: picking it puts its chip in the message the way a real skill would, and nothing else
+/// happens. Delete this function and its call the day the server reports real skills.
+fn example_skill() -> (ComposerPanelRow, ComposerPick) {
+    (
+        ComposerPanelRow::new(
+            "skill:example",
+            "icons/sparkles.svg",
+            "example-skill",
+            "Example only — a placeholder that does nothing yet, until your bots' skills are listed here",
+        )
+        .label("Skill"),
+        ComposerPick::Token {
+            kind: TokenKind::Skill,
+            id: "example-skill".to_string(),
+            text: "example-skill".to_string(),
+        },
+    )
 }
 
 /// A recipe with no name still has to be readable in a list.
@@ -283,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recipe_becomes_a_slash_chip_named_after_it() {
+    fn a_recipe_becomes_a_chip_named_after_it_without_the_slash() {
         let recipe: RecipeSummary =
             serde_json::from_value(serde_json::json!({ "id": "rec_1", "name": "Weekly  report" }))
                 .expect("a recipe needs nothing but an id and a name");
@@ -293,8 +320,9 @@ mod tests {
             ComposerPick::Token {
                 kind: TokenKind::Skill,
                 id: "rec_1".into(),
-                // The run of spaces in the name is collapsed: a chip is one token.
-                text: "/Weekly report".into(),
+                // The run of spaces in the name is collapsed: a chip is one token. The `/` that
+                // opened the panel is how it was asked for, not part of the name.
+                text: "Weekly report".into(),
             }
         );
         assert_eq!(rows[0].0.label.as_deref(), Some("Skill"));
@@ -303,11 +331,47 @@ mod tests {
     #[test]
     fn the_app_commands_come_after_the_recipes_and_say_so() {
         let rows = SkillSource.rows(&[]);
-        assert!(rows.iter().all(|(row, _)| row.id.starts_with("action:")));
+        let commands: Vec<_> = rows
+            .iter()
+            .skip_while(|(row, _)| !row.id.starts_with("action:"))
+            .collect();
         assert!(
-            rows.iter()
+            commands
+                .iter()
+                .all(|(row, _)| row.id.starts_with("action:"))
+        );
+        assert!(
+            commands
+                .iter()
                 .all(|(row, _)| row.label.as_deref() == Some("Action")),
             "a command is an Action, so the list says which rows do something to the app"
+        );
+        assert!(
+            commands.iter().all(|(row, _)| row.shortcut.is_none()),
+            "the chord comes from the keymap the app registered, not from this table"
+        );
+    }
+
+    #[test]
+    fn the_example_skill_is_a_chip_and_says_it_is_only_an_example() {
+        let rows = SkillSource.rows(&[]);
+        let (row, pick) = rows
+            .iter()
+            .find(|(row, _)| row.id == "skill:example")
+            .expect("one example skill stands in until the server lists real ones");
+        assert_eq!(row.label.as_deref(), Some("Skill"));
+        assert!(
+            row.description.to_lowercase().contains("example"),
+            "the row has to read as an example rather than as a skill someone can count on"
+        );
+        assert_eq!(
+            *pick,
+            ComposerPick::Token {
+                kind: TokenKind::Skill,
+                id: "example-skill".into(),
+                text: "example-skill".into(),
+            },
+            "picking it leaves the same inline chip a real skill would"
         );
     }
 }
