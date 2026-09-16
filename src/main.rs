@@ -214,9 +214,13 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(520.), px(400.))),
+                // The title bar is ours: transparent, with the traffic lights left where they
+                // are, so the strip RootView paints IS the title bar and follows the app's
+                // theme rather than the system's.
                 titlebar: Some(TitlebarOptions {
                     title: Some("NativeChat".into()),
-                    ..TitlebarOptions::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(14.))),
                 }),
                 ..WindowOptions::default()
             };
