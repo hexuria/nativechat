@@ -13,6 +13,8 @@ use crate::components::fields::field_input;
 use crate::components::multi_select::{
     MultiSelectEvent, MultiSelectIds, MultiSelectOption, MultiSelectState,
 };
+use crate::components::title_bar::window_drag;
+use crate::icons::NativeIcon;
 use crate::opengrok::{
     RecipeDetail, RecipeRelation, RecipeRun, RecipeScreen, RecipeShare, RecipeShareTarget,
     RecipeStep, RecipeSummary, RecipeTapeEvent, RecipeVersion,
@@ -21,6 +23,7 @@ use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome, Righ
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -87,6 +90,12 @@ const EMPTY_ICON_BOX: f32 = 56.;
 /// A line of the empty state's copy: short enough to be taken in at a glance, whatever the
 /// window is doing.
 const EMPTY_COPY_MAX: f32 = 380.;
+/// The spinner that stands where the list or the recipe will: big enough to read as the page
+/// working, small enough not to read as the page's content.
+const SPINNER_PX: f32 = 28.;
+/// How long the About card says "Saved" after an auto-save lands. Long enough to be seen,
+/// short enough that it is gone before the person wonders what it is still doing there.
+const SAVED_FOR: std::time::Duration = std::time::Duration::from_millis(1800);
 
 /// What a step does, apart from what it does it to: what Add step offers, and what the modal
 /// asks for when a step of that kind is added or opened.
@@ -337,6 +346,14 @@ pub struct RecipesView {
     history_version: Option<u32>,
     /// The run whose receipt is open under its row.
     history_run: Option<String>,
+    /// An auto-save of the name and description is in flight, so the About card can say so
+    /// and the answer to it can be turned into a word or left to the page's error line.
+    saving: bool,
+    /// The About card is saying "Saved", until its tick takes the word away.
+    saved: bool,
+    /// The tick that takes it away. Held rather than detached, so a second save drops the
+    /// first one's tick instead of letting it clear the newer word.
+    saved_tick: Option<Task<()>>,
 }
 
 /// The most parameters any step has: a drag's two corners.
@@ -367,7 +384,11 @@ impl RecipesView {
             )
             .placeholder("No bots")
         });
-        cx.observe(&state, |_this, _, cx| cx.notify()).detach();
+        cx.observe(&state, |this, _, cx| {
+            this.settle_save(cx);
+            cx.notify();
+        })
+        .detach();
         // A tick in the picker is a grant, and an untick takes it back; the server's answer is
         // what the picker is filled from next.
         cx.subscribe(&bots, |this, _, event: &MultiSelectEvent, cx| {
@@ -384,6 +405,16 @@ impl RecipesView {
             }
         })
         .detach();
+        // There is no Save button on the About card: leaving a field is the save, so the
+        // fields say when they were left and what they hold is compared with the server's.
+        for field in [&name_input, &description_input] {
+            cx.subscribe(field, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    this.save_about(cx);
+                }
+            })
+            .detach();
+        }
         // Enter in any of the modal's fields is its Save, as it would be in any dialog.
         for field in &step_fields {
             cx.subscribe(field, |this, _, event: &InputEvent, cx| {
@@ -414,6 +445,9 @@ impl RecipesView {
             history_open: false,
             history_version: None,
             history_run: None,
+            saving: false,
+            saved: false,
+            saved_tick: None,
         }
     }
 
@@ -444,6 +478,9 @@ impl RecipesView {
         self.history_open = false;
         self.history_version = None;
         self.history_run = None;
+        self.saving = false;
+        self.saved = false;
+        self.saved_tick = None;
         // The share modal is left alone: the share icon on a row of the list opens a recipe
         // and the modal over it, and the detail landing here is the answer to that click.
         self.name_input.update(cx, |input, cx| {
@@ -458,6 +495,67 @@ impl RecipesView {
         self.note_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
+    }
+
+    /// Save the name and the description when a field is left holding something other than
+    /// what the server last sent. There is no Save button on the card any more: tabbing away
+    /// is the save, and saving on every keystroke would be one request per letter.
+    fn save_about(&mut self, cx: &mut Context<Self>) {
+        let name = self.name_input.read(cx).value().trim().to_string();
+        let description = self.description_input.read(cx).value().trim().to_string();
+        {
+            let state = self.state.read(cx);
+            let worth_saving = state.recipe_open.as_ref().is_some_and(|detail| {
+                // Only an owner may rename, and only an owner's card draws these fields.
+                detail.recipe.is_mine() && about_edited(&detail.recipe, &name, &description)
+            });
+            // One request at a time: a second over the first would race it for which answer
+            // the page ends up standing on.
+            if !worth_saving || state.recipe_busy.is_some() {
+                return;
+            }
+        }
+        self.state.update(cx, |state, cx| {
+            state.rename_open_recipe(name, description, cx)
+        });
+        // The page is only waiting on a save if the request actually went.
+        self.saving = self.state.read(cx).recipe_busy.is_some();
+        self.saved = false;
+        self.saved_tick = None;
+        cx.notify();
+    }
+
+    /// What became of that save, once it is no longer in flight: "Saved" for a moment, or
+    /// nothing at all when it was refused — the reason is on the page's error line by then,
+    /// and the field still holds what the person typed.
+    fn settle_save(&mut self, cx: &mut Context<Self>) {
+        if !self.saving || self.state.read(cx).recipe_busy.is_some() {
+            return;
+        }
+        self.saving = false;
+        if self.state.read(cx).recipe_error.is_some() {
+            return;
+        }
+        self.saved = true;
+        self.saved_tick = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVED_FOR).await;
+            let _ = this.update(cx, |this, cx| {
+                this.saved = false;
+                this.saved_tick = None;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// What the About card's meta line says about the save, while there is anything to say.
+    fn save_note(&self) -> Option<&'static str> {
+        if self.saving {
+            Some("Saving…")
+        } else if self.saved {
+            Some("Saved")
+        } else {
+            None
+        }
     }
 
     /// The picker follows the open recipe: the person's bots as its options, the ones this
@@ -859,7 +957,6 @@ impl RecipesView {
     fn list(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let app = self.state.clone();
         let view = cx.entity();
-        let muted = theme.muted_foreground;
         let (filter, recipes, loading, error, me, last_runs, page_width) = {
             let state = self.state.read(cx);
             (
@@ -884,8 +981,7 @@ impl RecipesView {
             .iter()
             .filter(|recipe| recipe.is_pending_invite())
             .count();
-        let waiting = loading && recipes.is_empty();
-        let empty = !loading && recipes.is_empty();
+        let body = list_body(loading, recipes.len());
         v_flex()
             .size_full()
             .child(
@@ -929,23 +1025,10 @@ impl RecipesView {
                                 .child(error),
                         ))
                     })
-                    .when(waiting, |this| {
-                        this.child(
-                            v_flex()
-                                .id("recipes-loading")
-                                .w_full()
-                                .flex_1()
-                                .min_h(px(EMPTY_MIN_H))
-                                .items_center()
-                                .justify_center()
-                                .text_sm()
-                                .text_color(muted)
-                                .child("Loading…"),
-                        )
-                    })
-                    .when(empty, |this| this.child(empty_state(filter, theme)))
-                    .when(!recipes.is_empty(), move |this| {
-                        this.child(centered(
+                    .map(move |this| match body {
+                        ListBody::Loading => this.child(loading_state("recipes-loading", theme)),
+                        ListBody::Empty => this.child(empty_state(filter, theme)),
+                        ListBody::List => this.child(centered(
                             column().id("recipes-list").gap(px(ROW_GAP)).children(
                                 recipes.into_iter().map(|recipe| {
                                     let last_run = last_runs.get(&recipe.id).copied();
@@ -961,7 +1044,7 @@ impl RecipesView {
                                     )
                                 }),
                             ),
-                        ))
+                        )),
                     }),
             )
             .into_any_element()
@@ -972,7 +1055,6 @@ impl RecipesView {
     fn detail(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let app = self.state.clone();
         let view = cx.entity();
-        let muted = theme.muted_foreground;
         let (detail, loading, busy, error, run, me) = {
             let state = self.state.read(cx);
             (
@@ -984,42 +1066,47 @@ impl RecipesView {
                 state.account.as_ref().map(|account| account.id.clone()),
             )
         };
+        let waiting = loading && detail.is_none();
         v_flex()
             .size_full()
             .child(
-                div()
+                v_flex()
                     .id("recipe-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .px(px(HEADER_PX))
                     .pb(px(24.))
-                    .child(centered(
-                        column()
-                            .when_some(error, |this, error| {
-                                this.child(
-                                    div()
-                                        .id("recipe-error")
-                                        .text_xs()
-                                        .text_color(theme.danger)
-                                        .child(error),
-                                )
-                            })
-                            .when(loading && detail.is_none(), |this| {
-                                this.child(div().text_sm().text_color(muted).child("Loading…"))
-                            })
-                            .when_some(detail, |this, detail| {
-                                this.children(self.sections(
-                                    &detail,
-                                    busy.as_deref(),
-                                    run,
-                                    me.as_deref(),
-                                    &app,
-                                    &view,
-                                    theme,
-                                ))
-                            }),
-                    )),
+                    // Card frames with nothing in them read as a recipe that holds nothing,
+                    // so until it is here the page shows only that it is coming.
+                    .map(|this| {
+                        if waiting {
+                            return this.child(loading_state("recipe-loading", theme));
+                        }
+                        this.child(centered(
+                            column()
+                                .when_some(error, |this, error| {
+                                    this.child(
+                                        div()
+                                            .id("recipe-error")
+                                            .text_xs()
+                                            .text_color(theme.danger)
+                                            .child(error),
+                                    )
+                                })
+                                .when_some(detail, |this, detail| {
+                                    this.children(self.sections(
+                                        &detail,
+                                        busy.as_deref(),
+                                        run,
+                                        me.as_deref(),
+                                        &app,
+                                        &view,
+                                        theme,
+                                    ))
+                                }),
+                        ))
+                    }),
             )
             .into_any_element()
     }
@@ -1027,7 +1114,7 @@ impl RecipesView {
     /// The cards of the detail, for what the person may do with this recipe: everything for
     /// its owner; the steps, a run and the history for someone it is shared with; only Accept
     /// and Decline for someone it is offered to. Who else may have it is not a card at all —
-    /// it is the share icon on the About card, and the modal that opens under it.
+    /// it is the share icon in the title bar, and the modal that opens under it.
     fn sections(
         &self,
         detail: &RecipeDetail,
@@ -1039,7 +1126,7 @@ impl RecipesView {
         theme: &Theme,
     ) -> Vec<AnyElement> {
         let waiting = busy.is_some();
-        let mut sections = vec![self.about_section(detail, waiting, me, app, view, theme)];
+        let mut sections = vec![self.about_section(detail, waiting, me, app, theme)];
         if detail.recipe.is_pending_invite() {
             return sections;
         }
@@ -1056,7 +1143,6 @@ impl RecipesView {
         busy: bool,
         me: Option<&str>,
         app: &Entity<AppState>,
-        view: &Entity<Self>,
         theme: &Theme,
     ) -> AnyElement {
         let muted = theme.muted_foreground;
@@ -1105,8 +1191,6 @@ impl RecipesView {
                 .into_any_element();
         }
         if recipe.is_mine() {
-            let name_input = self.name_input.clone();
-            let description_input = self.description_input.clone();
             return card(theme)
                 .child(
                     h_flex()
@@ -1114,7 +1198,7 @@ impl RecipesView {
                         .items_center()
                         .justify_between()
                         .child(section_title("About"))
-                        .child(detail_share_icon(view, muted, theme)),
+                        .child(delete_icon(app, busy, theme)),
                 )
                 .child(field_label("Name", muted))
                 .child(
@@ -1138,46 +1222,31 @@ impl RecipesView {
                             recipe.latest_version,
                             format_time(recipe.updated_at_ms)
                         )))
-                        .child(
-                            Button::new("recipe-save-meta")
-                                .small()
-                                .primary()
-                                .label("Save")
-                                .disabled(busy)
-                                .on_click({
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        let name = name_input.read(cx).value().trim().to_string();
-                                        let description =
-                                            description_input.read(cx).value().trim().to_string();
-                                        if name.is_empty() {
-                                            return;
-                                        }
-                                        app.update(cx, |state, cx| {
-                                            state.rename_open_recipe(name, description, cx);
-                                        });
-                                    }
-                                }),
-                        ),
+                        // What the card is doing with what was typed, said quietly: the
+                        // fields save themselves, so the line is the only word of it.
+                        .when_some(self.save_note(), |this, note| {
+                            this.child(
+                                div()
+                                    .id("recipe-save-note")
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(note),
+                            )
+                        }),
                 )
                 .into_any_element();
         }
         card(theme)
             .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .truncate()
-                            .child(recipe.name.clone()),
-                    )
-                    .child(detail_share_icon(view, muted, theme)),
+                h_flex().w_full().items_center().gap(px(8.)).child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(recipe.name.clone()),
+                ),
             )
             .when(!recipe.description.trim().is_empty(), |this| {
                 this.child(
@@ -1430,6 +1499,8 @@ impl RecipesView {
                                     }
                                 }),
                         )
+                        // Only this version goes: the recipe itself is the trash icon on the
+                        // About card, well away from a toolbar meant for the one on screen.
                         .when_some(deletable, |this, number| {
                             this.child(
                                 Button::new("recipe-delete-version")
@@ -1447,32 +1518,6 @@ impl RecipesView {
                                     }),
                             )
                         })
-                        // A rule between the two deletes, because the one on its right takes
-                        // every version with it and the one on its left takes only the version
-                        // on screen.
-                        .child(
-                            div()
-                                .w(px(1.))
-                                .h(px(18.))
-                                .mx(px(2.))
-                                .flex_shrink_0()
-                                .bg(theme.border),
-                        )
-                        .child(
-                            Button::new("recipe-delete")
-                                .small()
-                                .danger()
-                                .label("Delete recipe")
-                                .disabled(waiting)
-                                .on_click({
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        app.update(cx, |state, cx| {
-                                            state.open_recipe_delete_confirm(cx)
-                                        });
-                                    }
-                                }),
-                        )
                     }),
             )
             .into_any_element()
@@ -2172,7 +2217,7 @@ impl RecipesView {
     }
 }
 
-/// The share icon: what opens the modal, from the About card and from a row of the list. An
+/// The share icon: what opens the modal, from the title bar and from a row of the list. An
 /// icon and not a button, because it sits beside a heading and a name rather than in a row of
 /// things to do. It carries no click of its own — the one on a row has a recipe to open first.
 fn share_icon(id: impl Into<ElementId>, muted: Hsla, theme: &Theme) -> Stateful<Div> {
@@ -2197,14 +2242,54 @@ fn share_icon(id: impl Into<ElementId>, muted: Hsla, theme: &Theme) -> Stateful<
         )
 }
 
-/// The About card's share icon, on a recipe that is already open.
-fn detail_share_icon(view: &Entity<RecipesView>, muted: Hsla, theme: &Theme) -> Stateful<Div> {
+/// The title bar's share icon, at the far right of the row the open recipe's name is on.
+fn header_share_icon(view: &Entity<RecipesView>, muted: Hsla, theme: &Theme) -> Stateful<Div> {
     share_icon("recipe-share-open", muted, theme).on_click({
         let view = view.clone();
         move |_, _, cx| {
             view.update(cx, |this, cx| this.open_share(false, cx));
         }
     })
+}
+
+/// The About card's trash icon: the one way a whole recipe goes, in the corner the share icon
+/// used to hold. It only asks — the dialog it opens is what deletes — and it says nothing
+/// while another request is in flight, so a recipe cannot go out from under one.
+fn delete_icon(app: &Entity<AppState>, busy: bool, theme: &Theme) -> Stateful<Div> {
+    let tone = if busy {
+        theme.muted_foreground
+    } else {
+        status_tone(theme.danger, theme)
+    };
+    let wash = theme.danger.opacity(0.14);
+    div()
+        .id("recipe-delete")
+        .size(px(28.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .tooltip(|window, cx| Tooltip::new("Delete recipe").build(window, cx))
+        .when(!busy, |this| {
+            this.cursor_pointer().hover(move |s| s.bg(wash)).on_click({
+                let app = app.clone();
+                move |_, _, cx| {
+                    app.update(cx, |state, cx| state.open_recipe_delete_confirm(cx));
+                }
+            })
+        })
+        .child(Icon::new(NativeIcon::Trash).size(px(14.)).text_color(tone))
+}
+
+/// Whether what the About card's fields hold is worth saving: there is a name, and one of the
+/// two is not what the server last sent. Trimmed on both sides, because the save trims and a
+/// trailing space is not an edit worth a request.
+fn about_edited(recipe: &RecipeSummary, name: &str, description: &str) -> bool {
+    let (name, description) = (name.trim(), description.trim());
+    !name.is_empty() && (recipe.name.trim() != name || recipe.description.trim() != description)
 }
 
 /// One tab of the share modal, the way a version tab reads: the word, underlined when it is
@@ -3474,6 +3559,46 @@ fn recipe_row(
         .into_any_element()
 }
 
+/// What stands in the page's content area: one of three things, never two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListBody {
+    Loading,
+    Empty,
+    List,
+}
+
+/// Which of the three it is. While the answer is on its way it is the spinner and nothing
+/// else: the list a chip is leaving belongs to the chip before it, and "No tasks taught yet"
+/// is a thing the page does not know yet — it showed for an instant and was a lie.
+fn list_body(loading: bool, count: usize) -> ListBody {
+    if loading {
+        ListBody::Loading
+    } else if count == 0 {
+        ListBody::Empty
+    } else {
+        ListBody::List
+    }
+}
+
+/// The page working, in the place the list or the recipe is about to take: the kit's spinner,
+/// alone and in the middle. A word at the top of the page flashed and was gone before it could
+/// be read; a turning ring in the middle reads as an answer on its way.
+fn loading_state(id: impl Into<ElementId>, theme: &Theme) -> AnyElement {
+    v_flex()
+        .id(id)
+        .w_full()
+        .flex_1()
+        .min_h(px(EMPTY_MIN_H))
+        .items_center()
+        .justify_center()
+        .child(
+            Spinner::new()
+                .with_size(px(SPINNER_PX))
+                .color(theme.muted_foreground),
+        )
+        .into_any_element()
+}
+
 /// An empty list is not an error: the page's own icon, what is missing, why, and — where
 /// there is one — the thing a person would do to fill it. It stands in the middle of what is
 /// left of the page rather than hanging under the chips.
@@ -3602,9 +3727,15 @@ fn filter_chip(chip: RecipeFilter, current: RecipeFilter, app: Entity<AppState>)
 }
 
 /// What the title bar shows while the Recipes page is open: a back chevron when a recipe is
-/// open, the title, and what the page is doing. The app has ONE header row and it is the title
-/// bar, so the page itself draws none.
-pub fn recipes_header(app: Entity<AppState>, theme: &Theme, cx: &App) -> AnyElement {
+/// open, the title, what the page is doing, and — on an open recipe — the share icon at the
+/// far right. The app has ONE header row and it is the title bar, so the page itself draws
+/// none, and sharing belongs on the line the recipe's name is on rather than inside a card.
+pub fn recipes_header(
+    app: Entity<AppState>,
+    recipes: &Entity<RecipesView>,
+    theme: &Theme,
+    cx: &App,
+) -> AnyElement {
     let state = app.read(cx);
     let open = state.recipe_open.is_some() || state.recipe_open_id.is_some();
     let title = state
@@ -3619,26 +3750,32 @@ pub fn recipes_header(app: Entity<AppState>, theme: &Theme, cx: &App) -> AnyElem
                 "Recipes".to_string()
             }
         });
-    let note = if open {
-        state.recipe_busy.clone()
-    } else {
-        state.recipes_loading.then(|| "Loading…".to_string())
-    };
+    // The list says it is loading with the spinner in the middle of the page; a word up here
+    // came and went before it could be read.
+    let note = open.then(|| state.recipe_busy.clone()).flatten();
+    // A recipe that is here and is the person's to pass on: there is nothing to share of one
+    // still being fetched, and an invite is answered before it is anyone's to share.
+    let shareable = state
+        .recipe_open
+        .as_ref()
+        .is_some_and(|detail| !detail.recipe.is_pending_invite());
+    let share = shareable.then(|| header_share_icon(recipes, theme.muted_foreground, theme));
     let back: Option<Rc<dyn Fn(&mut App)>> = open.then(|| {
         let app = app.clone();
         Rc::new(move |cx: &mut App| {
             app.update(cx, |state, cx| state.close_recipe(cx));
         }) as Rc<dyn Fn(&mut App)>
     });
-    page_header(back, title, note, theme.muted_foreground).into_any_element()
+    page_header(back, title, note, share, theme.muted_foreground).into_any_element()
 }
 
 /// The header's content: a back chevron when there is somewhere to go back to, the title, and
-/// what the page is doing on the right.
+/// what the page is doing and the share icon on the right.
 fn page_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: String,
     note: Option<String>,
+    share: Option<Stateful<Div>>,
     muted: Hsla,
 ) -> impl IntoElement {
     h_flex()
@@ -3681,16 +3818,26 @@ fn page_header(
                         .child(title),
                 ),
         )
-        .when_some(note, |this, note| {
-            this.child(
-                div()
-                    .id("recipe-busy")
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(note),
-            )
-        })
+        // The bar between the title and what is on the right is nothing but a handle to drag
+        // the window by, as the rest of the title bar is.
+        .child(window_drag(div().flex_1().h_full()))
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(8.))
+                .when_some(note, |this, note| {
+                    this.child(
+                        div()
+                            .id("recipe-busy")
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(note),
+                    )
+                })
+                .children(share),
+        )
 }
 
 /// "Delete Open the mail?" — the question, what it means, Cancel and Delete. Click outside or
@@ -3894,10 +4041,11 @@ mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over
     // the one the test harness wants.
     use super::{
-        COLUMN_MAX, MAX_WAIT_MS, RecipeDetail, RecipeFilter, RecipeScreen, RecipeStep,
-        RecipeTapeEvent, RecipeVersion, StepKind, build_step, empty_words, event_offset,
-        filtered_version, list_column_width, row_stacks, runs_of, shown_version, step_param_values,
-        step_words, tape_words, version_kind, version_of,
+        COLUMN_MAX, ListBody, MAX_WAIT_MS, RecipeDetail, RecipeFilter, RecipeScreen, RecipeStep,
+        RecipeSummary, RecipeTapeEvent, RecipeVersion, StepKind, about_edited, build_step,
+        empty_words, event_offset, filtered_version, list_body, list_column_width, row_stacks,
+        runs_of, shown_version, step_param_values, step_words, tape_words, version_kind,
+        version_of,
     };
     use serde_json::{Value, json};
 
@@ -4283,6 +4431,50 @@ mod tests {
             None,
             "there is nothing a person can do to be shared with"
         );
+    }
+
+    #[test]
+    fn only_a_field_that_changed_is_worth_a_save() {
+        let recipe: RecipeSummary = serde_json::from_value(json!({
+            "id": "rcp_1",
+            "name": "Open the mail",
+            "description": "Opens Mail and reads the newest one",
+        }))
+        .unwrap();
+        let edited = |name, description| about_edited(&recipe, name, description);
+        assert!(
+            !edited("Open the mail", "Opens Mail and reads the newest one"),
+            "tabbing through a field nobody touched is not a save"
+        );
+        assert!(
+            !edited("  Open the mail  ", "Opens Mail and reads the newest one"),
+            "the save trims, so a space either side is not an edit"
+        );
+        assert!(edited(
+            "Open the post",
+            "Opens Mail and reads the newest one"
+        ));
+        assert!(edited("Open the mail", "Opens Mail"));
+        assert!(
+            !edited("", "Opens Mail"),
+            "a recipe with no name is refused, and the field would be left holding what was never stored"
+        );
+    }
+
+    #[test]
+    fn the_page_says_nothing_of_the_list_until_it_has_one() {
+        assert_eq!(list_body(true, 0), ListBody::Loading);
+        assert_eq!(
+            list_body(true, 3),
+            ListBody::Loading,
+            "the list a chip is leaving is not this chip's answer"
+        );
+        assert_eq!(
+            list_body(false, 0),
+            ListBody::Empty,
+            "only an answer that came back empty is an empty state"
+        );
+        assert_eq!(list_body(false, 3), ListBody::List);
     }
 
     #[test]

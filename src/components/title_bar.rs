@@ -10,7 +10,7 @@ use crate::components::agent_settings::settings_header;
 use crate::components::chat::ChatView;
 use crate::components::computer::ComputerPane;
 use crate::components::persona::PersonaMark;
-use crate::components::recipes::recipes_header;
+use crate::components::recipes::{RecipesView, recipes_header};
 use crate::state::{AppState, MainPage, RightPane};
 use gpui_kit::component::{ActiveTheme, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -25,6 +25,9 @@ pub struct TitleBar {
     state: Entity<AppState>,
     chat: Entity<ChatView>,
     computer: Entity<ComputerPane>,
+    /// The Recipes page, for the header it draws in this bar: the share icon there opens the
+    /// page's own modal, which is the page's to hold and not the app's.
+    recipes: Entity<RecipesView>,
 }
 
 impl TitleBar {
@@ -32,6 +35,7 @@ impl TitleBar {
         state: Entity<AppState>,
         chat: Entity<ChatView>,
         computer: Entity<ComputerPane>,
+        recipes: Entity<RecipesView>,
         cx: &mut Context<Self>,
     ) -> Self {
         // The bar shows the bot, the panes and the chat's find bar: it follows the app state
@@ -42,6 +46,7 @@ impl TitleBar {
             state,
             chat,
             computer,
+            recipes,
         }
     }
 }
@@ -105,8 +110,9 @@ impl Render for TitleBar {
         // opened from is not what the person is looking at, so the bar does not name it there.
         let on_a_page = page != MainPage::Chat || state.is_app_settings_open;
         let app = self.state.clone();
-        let recipes_span = (signed_in && page == MainPage::Recipes)
-            .then(|| recipes_header(self.state.clone(), &theme, cx));
+        let on_recipes = signed_in && page == MainPage::Recipes;
+        let recipes_span =
+            on_recipes.then(|| recipes_header(self.state.clone(), &self.recipes, &theme, cx));
         let chat_span = h_flex()
             .id("chat-header")
             .flex_1()
@@ -157,7 +163,12 @@ impl Render for TitleBar {
                 )),
                 (None, None, false) => this,
             })
-            .child(window_drag(div().flex_1().h_full()))
+            // The Recipes page's header keeps the whole span: its share icon belongs at the
+            // far right of the bar, and a filler beside it would leave the icon mid-window.
+            // The page's own header carries the handle to drag the window by instead.
+            .when(!on_recipes, |this| {
+                this.child(window_drag(div().flex_1().h_full()))
+            })
             // The find bar and the screen button act on the chat; another page has no chat, and
             // drawing them there pushed them out of the span and over the right pane's header.
             .when(coworker.is_some() && !on_a_page, |this| {
