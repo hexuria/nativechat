@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::actions::{PauseReadAloud, ResumeReadAloud, StopReadAloud, ToggleReadAloud};
-use crate::chrome::{CHAT_CONTENT_MAX, chat_column_width, timestamps_fit};
+use crate::chrome::{
+    CHAT_CONTENT_MAX, PANE_HEADER_H, PANE_HEADER_PX, chat_column_width, timestamps_fit,
+};
 use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
@@ -1168,12 +1170,12 @@ impl Render for ChatView {
                             .top_0()
                             .left_0()
                             .right_0()
-                            .h(px(60.0))
+                            .h(px(PANE_HEADER_H))
                             .pt(px(20.0))
                             .pb_5()
                             .items_center()
                             .justify_between()
-                            .px_4()
+                            .px(px(PANE_HEADER_PX))
                             .bg(theme.background.opacity(0.9)) // Slight transparency for glass effect if desired, or solid
                             .child(
                                 h_flex().gap_2().items_center().child(

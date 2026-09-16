@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::chrome::INFO_PANE_WIDTH;
+use crate::chrome::{INFO_PANE_WIDTH, PANE_HEADER_H, PANE_HEADER_PX};
 use crate::components::fields::field_input;
 use crate::state::{
     AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
@@ -879,8 +879,8 @@ fn pane_header(
     h_flex()
         .id("computer-header")
         .w_full()
-        .px(px(8.))
-        .h(px(44.))
+        .px(px(PANE_HEADER_PX))
+        .h(px(PANE_HEADER_H))
         .items_center()
         .justify_between()
         .flex_shrink_0()
