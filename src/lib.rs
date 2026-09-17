@@ -11,6 +11,7 @@ pub mod error;
 pub mod find_text;
 pub mod icons;
 pub mod opengrok;
+pub mod reachability;
 pub mod root;
 pub mod services;
 pub mod state;

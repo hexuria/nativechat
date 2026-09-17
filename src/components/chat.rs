@@ -11,7 +11,10 @@ use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::find_text::{FindHit, marks_for_row, project_hits};
 use crate::opengrok::{ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, collapse_open_approvals};
-use crate::state::{AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, is_status_line, is_tool_standin};
+use crate::state::{
+    AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, TURN_UNREACHED_NOTE, is_status_line,
+    is_tool_standin,
+};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -153,6 +156,8 @@ struct ChatRow {
     status_line: Option<String>,
     /// A status line about a run that failed, painted in the danger colour rather than dimmed.
     status_failed: bool,
+    /// A status line for a turn that never left, which carries the offer to send it again.
+    status_retry: bool,
     /// The pictures of one stretch of a turn, which the row paints as one strip and the
     /// lightbox pages through as one set.
     screenshots: Vec<ScreenshotSpec>,
@@ -186,6 +191,7 @@ impl ChatRow {
             approval: None,
             status_line: None,
             status_failed: false,
+            status_retry: false,
             screenshots: Vec::new(),
         }
     }
@@ -207,6 +213,9 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     else {
         return Arc::new(Vec::new());
     };
+    // The one turn the thread would send again, if it has one. Asked once rather than per row,
+    // and by id, because only the thread's last turn is the one a retry would be about.
+    let retryable = state.retryable_turn();
     let mut rows = Vec::new();
     for msg in &conv.messages {
         let is_native_speaking = state.native_tts.message_id.as_ref() == Some(&msg.id);
@@ -253,9 +262,13 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             if !msg.is_me && (is_status_line(&text) || is_tool_standin(&text)) {
                 rows.push(ChatRow {
                     // Red is for a turn that went wrong. A turn the person stopped went exactly
-                    // as they asked, so it gets the quiet grey the stand-ins get; painting it in
+                    // as they asked, and a turn that never left did not go wrong either — it did
+                    // not go — so both get the quiet grey the stand-ins get; painting either in
                     // the colour of a failure would send someone looking for what broke.
-                    status_failed: is_status_line(&text) && text.trim() != STOPPED_TURN_NOTE,
+                    status_failed: is_status_line(&text)
+                        && text.trim() != STOPPED_TURN_NOTE
+                        && text.trim() != TURN_UNREACHED_NOTE,
+                    status_retry: retryable.as_ref() == Some(&msg.id),
                     content: SharedString::from(text.clone()),
                     status_line: Some(text),
                     ..ChatRow::slot(id, msg.id.clone())
@@ -778,8 +791,32 @@ impl Render for ChatTranscript {
                                     .w_full()
                                     .flex()
                                     .justify_center()
+                                    .items_center()
+                                    .gap(px(8.))
                                     .py(px(8.))
                                     .child(div().text_sm().text_color(color).child(line.clone()))
+                                    // A turn that never left is the one status line worth
+                                    // answering: retyping the message was the only way back
+                                    // from it, and the message is still right there.
+                                    .when(row.status_retry, |this| {
+                                        let state = app_state.clone();
+                                        this.child(
+                                            div()
+                                                .id("retry-turn")
+                                                .text_sm()
+                                                .text_color(palette.primary)
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_, _, cx| {
+                                                        state.update(cx, |state, cx| {
+                                                            state.retry_turn(cx);
+                                                        });
+                                                    },
+                                                )
+                                                .child("Try again"),
+                                        )
+                                    })
                                     .into_any_element();
                             }
                             if let Some(spec) = &row.approval {

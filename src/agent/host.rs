@@ -88,6 +88,9 @@ pub enum Command {
     /// Stop the turn the open thread has in flight, which is what the composer's button does
     /// while it is a stop button.
     StopTurn,
+    /// Send the open thread's last turn again, which is what "Try again" does on the row of a
+    /// turn that never left.
+    RetryTurn,
     ToggleComputerPane,
     OpenCoworkerScreen,
     /// Update / Reset the active bot's computer: open the confirm dialog, then answer it.
@@ -154,6 +157,7 @@ impl Command {
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
             Self::StopTurn => state.stop_turn(cx),
+            Self::RetryTurn => state.retry_turn(cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
             Self::OpenCoworkerScreen => state.open_coworker_screen(cx),
             Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
@@ -524,6 +528,16 @@ pub struct NativeChatHost {
     computer_confirm: Option<String>,
     /// The update banner's two lines, when one is showing.
     update_banner: Option<String>,
+    /// The reconnecting pill's two lines and the machine it names, while something cannot be
+    /// reached. Absent is the whole assertion for "it went away", which is the half of this that
+    /// the transcript line it replaced could never be checked for.
+    reconnect: Option<(String, &'static str)>,
+    /// The open thread's last turn did not go through, and the feed is offering it again.
+    can_retry_turn: bool,
+    /// How many routes the Model field can offer, and the server's note about why that is not
+    /// more — which is the sentence the person read under the field while the gateway was down.
+    model_count: usize,
+    model_note: Option<String>,
     /// The Recipes page, when it fills the main slot: its rows, and the recipe open in it.
     recipes_open: bool,
     recipes_filter: &'static str,
@@ -635,6 +649,17 @@ impl NativeChatHost {
             update_banner: state
                 .computer_banner()
                 .map(|(title, detail)| format!("{title} — {detail}")),
+            reconnect: state.reachability_indicator().map(|(title, detail)| {
+                (
+                    format!("{title} — {detail}"),
+                    state
+                        .unreachable()
+                        .map_or("", crate::opengrok::Unreachable::as_str),
+                )
+            }),
+            can_retry_turn: state.retryable_turn().is_some(),
+            model_count: state.model_catalogue.models.len(),
+            model_note: state.model_catalogue.note.clone(),
             computer_status: if state.computer_endpoint_missing {
                 "endpoint missing".to_string()
             } else {
@@ -720,6 +745,11 @@ impl NativeChatHost {
                 .with_child(UiNode::button(ids::LOGIN_SUBMIT, "Sign in"));
             if let Some(error) = &self.auth_error {
                 login = login.with_child(UiNode::new(ids::LOGIN_ERROR, "status", error.clone()));
+            }
+            // The sign-in page shows the pill too, and so does the tree: a password typed at a
+            // server that is not answering fails for a reason that has nothing to do with it.
+            if let Some(node) = self.reconnect_node() {
+                login = login.with_child(node);
             }
             return UiTree {
                 app: "nativechat".into(),
@@ -852,12 +882,41 @@ impl NativeChatHost {
         if let Some(banner) = &self.update_banner {
             page = page.with_child(UiNode::new("update-banner", "status", banner.clone()));
         }
+        if let Some(node) = self.reconnect_node() {
+            page = page.with_child(node);
+        }
+        if self.can_retry_turn {
+            page = page.with_child(UiNode::button("retry-turn", "Try again"));
+        }
         if let Some(question) = &self.computer_confirm {
             page = page.with_child(
                 UiNode::new("computer-confirm", "dialog", question.clone())
                     .with_child(UiNode::button("computer-confirm-yes", "Confirm"))
                     .with_child(UiNode::button("computer-confirm-cancel", "Cancel")),
             );
+        }
+
+        let mut settings = UiNode::dialog(ids::AGENT_SETTINGS, "Agent Settings")
+            .with_visible(self.agent_settings_open)
+            .with_child(UiNode::button("avatar-trigger", "Edit avatar"))
+            .with_child(
+                UiNode::new("avatar-editor", "dialog", "Avatar editor")
+                    .with_visible(self.avatar_editor_open),
+            )
+            .with_child(UiNode::button("agent-model-field", "Model"))
+            .with_child(
+                UiNode::new("agent-model-list", "list", "Models")
+                    // How many routes the field can offer. The bug was this going to nothing and
+                    // staying there, so it is the number a driver watches — always in the tree,
+                    // because "none" is as much an answer as any other count.
+                    .with_value(self.model_count.to_string())
+                    .with_visible(self.model_picker_open),
+            );
+        if let Some(note) = &self.model_note {
+            // The server's word about why the list is not fuller, under the field, exactly where
+            // the person read it. In the tree only while there is one, so its absence is the
+            // assertion that the gateway answered.
+            settings = settings.with_child(UiNode::status("agent-model-note", note.clone()));
         }
 
         UiTree {
@@ -877,20 +936,7 @@ impl NativeChatHost {
                         UiNode::dialog(ids::DIALOG_VOICE, "Voice Mode")
                             .with_visible(self.voice_open),
                     )
-                    .with_child(
-                        UiNode::dialog(ids::AGENT_SETTINGS, "Agent Settings")
-                            .with_visible(self.agent_settings_open)
-                            .with_child(UiNode::button("avatar-trigger", "Edit avatar"))
-                            .with_child(
-                                UiNode::new("avatar-editor", "dialog", "Avatar editor")
-                                    .with_visible(self.avatar_editor_open),
-                            )
-                            .with_child(UiNode::button("agent-model-field", "Model"))
-                            .with_child(
-                                UiNode::new("agent-model-list", "list", "Models")
-                                    .with_visible(self.model_picker_open),
-                            ),
-                    )
+                    .with_child(settings)
                     .with_child(UiNode::button(
                         "agent-model-dismiss",
                         "Dismiss model picker",
@@ -901,6 +947,20 @@ impl NativeChatHost {
                     )),
             ],
         }
+    }
+
+    /// The reconnecting pill, while something cannot be reached.
+    ///
+    /// In the tree only while it is on screen, so `assert --exists false` is how a driver says
+    /// the app has reconnected — which is the half of this the red transcript line it replaced
+    /// could never be checked for, because that line never went away.
+    fn reconnect_node(&self) -> Option<UiNode> {
+        let (banner, machine) = self.reconnect.as_ref()?;
+        let mut node = UiNode::status("reconnect-banner", banner.clone());
+        // The machine as a state as well as in the copy, for an assert that would rather not
+        // match on a sentence.
+        node.states.push((*machine).to_string());
+        Some(node)
     }
 
     /// The composer's one action button, in whichever of its two states it is in.
@@ -1105,6 +1165,15 @@ impl NativeChatHost {
                 ));
             }
             Command::OpenLightbox { index }
+        } else if target == "retry-turn" {
+            if !self.can_retry_turn {
+                return Err(
+                    "there is no turn to send again: the open thread's last turn is not one \
+                     that failed to go out"
+                        .to_string(),
+                );
+            }
+            Command::RetryTurn
         } else if target == ids::COMPOSER_SEND {
             if !self.turn_in_flight {
                 // Sending belongs to the keyboard like the rest of the composer: `key composer
@@ -1586,6 +1655,69 @@ mod tests {
             .collect();
         assert!(rows.contains(&"composer-param-city"), "{rows:?}");
         assert!(rows.contains(&"composer-param-shorts"), "{rows:?}");
+    }
+
+    /// The whole point of the pill over the red line it replaced: it goes away, and a driver
+    /// can say so. A transcript message is in the tree forever, because a transcript message is
+    /// a thing that happened.
+    #[test]
+    fn the_reconnecting_pill_names_its_machine_and_leaves_the_tree_when_it_clears() {
+        let mut host = host();
+        assert!(host.snapshot().find("reconnect-banner").is_none());
+
+        host.reconnect = Some((
+            "Waiting for the model gateway… — OpenGrok is answering; the model gateway behind \
+             it is not."
+                .to_string(),
+            "gateway",
+        ));
+        let node = host
+            .snapshot()
+            .find("reconnect-banner")
+            .cloned()
+            .expect("the pill is on screen, so it is in the tree");
+        assert_eq!(node.states, vec!["gateway".to_string()]);
+        assert!(node.name.contains("OpenGrok is answering"), "{}", node.name);
+
+        host.reconnect = None;
+        assert!(
+            host.snapshot().find("reconnect-banner").is_none(),
+            "`assert --exists false` is how a driver says the app reconnected"
+        );
+    }
+
+    /// The Model field's own account of the outage: the list it can still offer, and the note
+    /// saying why it is not longer. The note goes when the gateway answers; the count does not
+    /// drop to nothing while it is away.
+    #[test]
+    fn the_model_field_says_how_many_routes_it_has_and_why_it_has_no_more() {
+        let mut host = host();
+        host.model_count = 12;
+        host.model_note = Some("the gateway could not be reached: …".to_string());
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-model-list")
+                .and_then(|n| n.value.as_deref()),
+            Some("12")
+        );
+        assert!(tree.find("agent-model-note").is_some());
+
+        host.model_note = None;
+        assert!(host.snapshot().find("agent-model-note").is_none());
+    }
+
+    /// A turn that never left is offered again, and the offer is a click a driver can make.
+    #[test]
+    fn the_turn_that_never_left_is_offered_again_and_only_while_there_is_one() {
+        let mut host = host();
+        assert!(host.snapshot().find("retry-turn").is_none());
+        let refused = host.dispatch(&Op::click("retry-turn")).unwrap_err();
+        assert!(refused.contains("no turn to send again"), "{refused}");
+
+        host.can_retry_turn = true;
+        assert!(host.snapshot().find("retry-turn").is_some());
+        host.dispatch(&Op::click("retry-turn")).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::RetryTurn)));
     }
 
     /// The button a driver has to be able to see change, and to press once it has. The person

@@ -31,6 +31,10 @@ struct ShellRev {
     signed_in: bool,
     signing_in: bool,
     auth_error: Option<String>,
+    /// The reconnecting pill's two lines, while something cannot be reached. Part of the
+    /// revision because the shell repaints only when this struct changes, and a pill that
+    /// appears and disappears on its own has to be one of the things that counts as a change.
+    reconnect: Option<(String, String)>,
     right_pane: u8,
     computer_editor: bool,
     model_picker: bool,
@@ -55,6 +59,7 @@ impl ShellRev {
             signed_in: state.is_signed_in(),
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
+            reconnect: state.reachability_indicator(),
             right_pane: match state.right_pane {
                 RightPane::Closed => 0,
                 RightPane::Settings => 1,
@@ -228,7 +233,12 @@ impl Render for Layout {
         let bot_finder_open = state.bot_finder_open;
         let command_palette_open = state.command_palette_open;
         let hidden_bots_open = state.hidden_bots_open;
+        let reconnect = state.reachability_indicator();
         if !state.is_signed_in() {
+            // The sign-in page gets the pill too: a server that is not answering is exactly why
+            // somebody is looking at this page, and a password typed against it will not work
+            // however carefully it is typed.
+            let theme = cx.theme().clone();
             return v_flex().size_full().child(self.title_bar.clone()).child(
                 div()
                     .w_full()
@@ -236,6 +246,9 @@ impl Render for Layout {
                     .min_h_0()
                     .relative()
                     .child(self.login.clone())
+                    .when_some(reconnect, |this, (title, detail)| {
+                        this.child(reconnect_banner(title, detail, &theme))
+                    })
                     .when(app_settings_open, |this| {
                         this.child(
                             div()
@@ -258,7 +271,14 @@ impl Render for Layout {
         let collapsed = state.sidebar_collapsed;
         let expanded_width = state.sidebar_expanded_width;
         let right_pane = state.right_pane;
-        let banner = state.computer_banner();
+        // One pill at a time, and reachability takes it. A computer whose update the app cannot
+        // ask after is a computer whose phase on screen is already stale, so the line that says
+        // why nothing is arriving is worth more than the line that has stopped moving.
+        let banner = if reconnect.is_some() {
+            None
+        } else {
+            state.computer_banner()
+        };
         let computer_confirm = state
             .computer_confirm
             .map(|action| (action, state.active_bot_name()));
@@ -432,6 +452,9 @@ impl Render for Layout {
             .when_some(banner, |this, (title, detail)| {
                 this.child(update_banner(title, detail, &theme))
             })
+            .when_some(reconnect, |this, (title, detail)| {
+                this.child(reconnect_banner(title, detail, &theme))
+            })
             .when_some(computer_confirm, |this, (action, name)| {
                 this.child(computer_confirm_overlay(
                     self.state.clone(),
@@ -552,8 +575,32 @@ fn update_banner(
     detail: String,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
+    banner_pill("update-banner", title, detail, theme)
+}
+
+/// The pill over the app while something cannot be reached — which machine, and why the app
+/// thinks so.
+///
+/// It is the same pill the computer update already uses, on purpose: this is not a new kind of
+/// thing on screen, it is the app's existing way of saying "something is going on and it will
+/// stop". The point of it being a pill rather than a line in the transcript is that a pill can
+/// go away again, and this one does, the moment a request gets through.
+fn reconnect_banner(
+    title: String,
+    detail: String,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    banner_pill("reconnect-banner", title, detail, theme)
+}
+
+fn banner_pill(
+    id: &'static str,
+    title: String,
+    detail: String,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
     div()
-        .id("update-banner")
+        .id(id)
         .absolute()
         .top(px(12.))
         .left_0()
@@ -580,6 +627,7 @@ fn update_banner(
                 .child(
                     v_flex()
                         .gap(px(1.))
+                        .max_w(px(460.))
                         .child(div().text_sm().child(title))
                         .child(
                             div()

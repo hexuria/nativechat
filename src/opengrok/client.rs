@@ -208,7 +208,7 @@ impl OpenGrokClient {
         let response = build(self.access_token())
             .send()
             .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+            .map_err(|e| OpenGrokError::transport(&e))?;
         // A 401 on a signed-in session is a token that died between checks: refresh once and
         // send again. Auth routes are exempt, or a bad password would loop here.
         if response.status() == StatusCode::UNAUTHORIZED
@@ -218,7 +218,7 @@ impl OpenGrokClient {
             return build(self.access_token())
                 .send()
                 .await
-                .map_err(|e| OpenGrokError::message(e.to_string()));
+                .map_err(|e| OpenGrokError::transport(&e));
         }
         Ok(response)
     }
@@ -226,7 +226,10 @@ impl OpenGrokClient {
     async fn read_error(response: reqwest::Response) -> OpenGrokError {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        OpenGrokError::status(status, error_message_from_body(&body))
+        // `from_server` rather than `status`, because some of what the server refuses with is
+        // not a refusal at all: "the gateway could not be reached" is the server reporting a
+        // machine it could not get to, which is a state and not a verdict about the request.
+        OpenGrokError::from_server(Some(status), error_message_from_body(&body))
     }
 
     /// The body as `T` on a 2xx, the server's error otherwise.
@@ -239,7 +242,7 @@ impl OpenGrokClient {
         response
             .json()
             .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))
+            .map_err(|e| OpenGrokError::transport(&e))
     }
 
     pub async fn health(&self) -> Result<(), OpenGrokError> {
@@ -249,7 +252,7 @@ impl OpenGrokClient {
             .get(url)
             .send()
             .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+            .map_err(|e| OpenGrokError::transport(&e))?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -282,10 +285,7 @@ impl OpenGrokClient {
         if let Some(token) = self.access_token() {
             req = req.bearer_auth(token);
         }
-        let response = req
-            .send()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
         if response.status().is_success() {
             self.save_session();
             Ok(())
@@ -446,10 +446,7 @@ impl OpenGrokClient {
         if let Some(token) = self.access_token() {
             req = req.bearer_auth(token);
         }
-        let response = req
-            .send()
-            .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
@@ -457,7 +454,7 @@ impl OpenGrokClient {
         let mut buf = String::new();
         let mut assistant = String::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| OpenGrokError::message(e.to_string()))?;
+            let chunk = chunk.map_err(|e| OpenGrokError::transport(&e))?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(idx) = buf.find("\n\n") {
                 let frame = buf[..idx].to_string();
@@ -479,7 +476,10 @@ impl OpenGrokClient {
                             .get("message")
                             .and_then(|v| v.as_str())
                             .unwrap_or("run failed");
-                        return Err(OpenGrokError::message(message));
+                        // The stream itself is a `200`: the run began and the server ended it
+                        // badly, and the sentence it ends with is the only thing that says
+                        // whether the model refused or the gateway was never reached.
+                        return Err(OpenGrokError::from_server(None, message));
                     }
                     if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
                         if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
@@ -920,7 +920,7 @@ impl OpenGrokClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+            .map_err(|e| OpenGrokError::transport(&e))?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -946,14 +946,14 @@ impl OpenGrokClient {
             .bearer_auth(daemon_token)
             .send()
             .await
-            .map_err(|e| OpenGrokError::message(e.to_string()))?;
+            .map_err(|e| OpenGrokError::transport(&e))?;
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| OpenGrokError::message(e.to_string()))?;
+            let chunk = chunk.map_err(|e| OpenGrokError::transport(&e))?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(idx) = buf.find("\n\n") {
                 let frame = buf[..idx].to_string();
