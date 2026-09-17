@@ -85,6 +85,10 @@ impl Render for TitleBar {
         // ends, or past the traffic lights when the sidebar is its rail or gone. A floating
         // sidebar or pane (a narrow window) keeps its header to itself, over the chat.
         let docked = signed_in && !floats;
+        // Whether there is a sidebar under that span at all. `docked` only says the chrome is
+        // not floating; the sidebar can still be hidden, and then the span over it is just the
+        // traffic lights' corner with the chat behind it.
+        let sidebar_shown = docked && left > 0.0;
         let chat_x = if docked {
             left.max(TITLE_BAR_LEFT_PAD)
         } else {
@@ -121,6 +125,13 @@ impl Render for TitleBar {
             .px(px(HEADER_PX))
             .items_center()
             .gap_2()
+            // THE RULE UNDER THE BAR BELONGS TO THE CHAT COLUMN ALONE. It marks where the
+            // header ends and the transcript begins, and neither neighbour has that boundary:
+            // the sidebar runs unbroken from the window's top edge to the account row, and the
+            // right pane's header flows straight into its own fields. Drawn across the whole
+            // row it cut both of them in half for no reason a reader could name.
+            .border_b_1()
+            .border_color(theme.border)
             .map(|this| match (recipes_span, &coworker, signed_in) {
                 // The Recipes page's own title and back chevron, in place of a bot's name.
                 (Some(header), _, _) => this.child(header),
@@ -202,10 +213,26 @@ impl Render for TitleBar {
             .items_center()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .border_b_1()
-            .border_color(theme.border)
-            // The traffic lights' corner and the sidebar's span: nothing but a handle.
-            .child(window_drag(div().w(px(chat_x)).h_full().flex_shrink_0()))
+            // EACH SPAN WEARS THE COLUMN'S OWN FILL. A bar painted one colour end to end put a
+            // white band above a grey sidebar and a white band above a grey pane, so both read
+            // as starting below the chrome instead of at the window's top edge. Only the chat
+            // is the same colour as the bar, because the bar IS the chat's header.
+            .child(
+                window_drag(div().w(px(chat_x)).h_full().flex_shrink_0()).map(|this| {
+                    if sidebar_shown {
+                        // The sidebar's own edge, carried up through the bar so the column
+                        // reads as one piece from the window's top to the account row.
+                        this.bg(theme.sidebar)
+                            .border_r_1()
+                            .border_color(theme.border)
+                    } else {
+                        // No sidebar under it, so no edge to continue and nothing to tint.
+                        // The chat's rule runs on under the traffic lights instead, out to
+                        // the window's edge, rather than stopping short of it.
+                        this.border_b_1().border_color(theme.border)
+                    }
+                }),
+            )
             .child(chat_span)
             .when_some(right_header, |this, header| {
                 this.child(
@@ -213,6 +240,7 @@ impl Render for TitleBar {
                         .w(px(INFO_PANE_WIDTH))
                         .h_full()
                         .flex_shrink_0()
+                        .bg(theme.sidebar)
                         .border_l_1()
                         .border_color(theme.border)
                         .child(header),
