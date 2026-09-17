@@ -3391,9 +3391,9 @@ impl AppState {
             .collect()
     }
 
-    /// Put a recipe on the next message, from the list the composer picked it out of. An id
-    /// that is not a recipe — the example skill's — leaves the draft as it was, and says so, so
-    /// the composer knows whether it has a recipe to show.
+    /// Put a recipe on the next message, from the list the composer picked it out of. An id the
+    /// list does not hold leaves the draft as it was, and says so, so the composer knows whether
+    /// it has a recipe to show.
     pub fn start_recipe(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
         let Some(recipe) = self.recipes.iter().find(|recipe| recipe.id == id) else {
             return false;

@@ -3,7 +3,7 @@ use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::chat_input::PanelMode;
 use crate::components::chat_input::sources::{
-    ParameterSource, SkillSource, ToolSource, ValueSource,
+    ParameterSource, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::{
@@ -355,7 +355,7 @@ fn panel_rows(
             ];
         }
         PanelMode::Tools => ToolSource.rows(),
-        PanelMode::Skills => SkillSource.rows(recipes),
+        PanelMode::Slash => SlashSource.rows(recipes),
         PanelMode::Parameters => match active {
             Some(recipe) => ParameterSource.rows(recipe),
             None => Vec::new(),
@@ -390,7 +390,7 @@ fn panel_name(mode: PanelMode, recipe: Option<&RecipeBarSnap>) -> String {
     match mode {
         PanelMode::Plus => "Attach or teach".to_string(),
         PanelMode::Tools => "Tools".to_string(),
-        PanelMode::Skills => "Skills and actions".to_string(),
+        PanelMode::Slash => "Recipes and actions".to_string(),
         PanelMode::Parameters => match recipe {
             Some(recipe) => format!("What {} needs told", recipe.name),
             None => "What the recipe needs told".to_string(),
@@ -1848,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_row_carries_the_id_the_panel_gives_it() {
+    fn a_recipe_row_carries_the_id_the_panel_gives_it() {
         let row = ComposerPanelRow::new("recipe:rcp_1", "icons/record.svg", "Weekly", "A task");
         assert_eq!(row_id(&row), "composer-panel-row-recipe:rcp_1");
         assert_eq!(

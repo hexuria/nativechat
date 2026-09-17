@@ -36,7 +36,7 @@ pub struct ComposerPanelRow {
     pub icon: SharedString,
     pub title: SharedString,
     pub description: SharedString,
-    /// The kind of thing this is, right-aligned: "Tool", "Skill", "Action".
+    /// The kind of thing this is, right-aligned: "Tool", "Recipe", "Action".
     pub label: Option<SharedString>,
     /// The chord that does this row's work from anywhere in the app, as the keyboard shows it —
     /// "⌘,". It is drawn as keycaps before the label, and it is `None` for a row with nothing
