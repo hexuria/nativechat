@@ -1011,6 +1011,10 @@ impl Default for AppState {
     }
 }
 
+/// What a caller hears once a patch is over: nothing when the server took it, the server's
+/// message when it refused.
+pub type PatchDone = Box<dyn FnOnce(Option<String>, &mut App)>;
+
 impl AppState {
     pub fn new() -> Self {
         let mut state = Self {
@@ -2650,84 +2654,67 @@ impl AppState {
     }
 
     pub fn patch_active_agent(&mut self, patch: CoworkerPatch, cx: &mut Context<Self>) {
+        self.patch_active_agent_then(patch, None, cx);
+    }
+
+    /// The same patch, with `done` called once the request is over, carrying the server's
+    /// message when it refused. A control that was put out of the person's hands for the
+    /// length of the request has no other way of hearing that the request has ended.
+    pub fn patch_active_agent_then(
+        &mut self,
+        patch: CoworkerPatch,
+        done: Option<PatchDone>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.opengrok.clone() else {
-            self.auth_error = Some("OpenGrok is not configured".into());
-            cx.notify();
+            self.refuse_patch("OpenGrok is not configured", done, cx);
             return;
         };
         let Some(id) = self.active_coworker_id.clone() else {
-            self.auth_error = Some("No agent selected".into());
-            cx.notify();
+            self.refuse_patch("No agent selected", done, cx);
             return;
         };
+        // The roster takes the patch before the server has seen it so the pane answers the
+        // click at once, and keeps what it held before it so that guess can be taken back:
+        // `settle_patch` replaces it with the server's word either way.
+        let before = self.coworkers.iter().find(|c| c.id == id).cloned();
         if let Some(existing) = self.coworkers.iter_mut().find(|c| c.id == id) {
-            if let Some(name) = patch.name.clone() {
-                existing.name = name;
-            }
-            if let Some(model) = patch.model.clone() {
-                existing.model = model;
-            }
-            if let Some(role) = patch.role.clone() {
-                existing.role = if role.trim().is_empty() {
-                    None
-                } else {
-                    Some(role)
-                };
-            }
-            if let Some(title) = patch.title.clone() {
-                existing.title = if title.trim().is_empty() {
-                    None
-                } else {
-                    Some(title)
-                };
-            }
-            if let Some(shape) = patch.avatar_shape.clone() {
-                existing.avatar_shape = if shape.is_empty() { None } else { Some(shape) };
-            }
-            if let Some(color) = patch.avatar_color.clone() {
-                existing.avatar_color = if color.is_empty() { None } else { Some(color) };
-            }
-            if let Some(notify) = patch.notify_on_updates {
-                existing.notify_on_updates = Some(notify);
-            }
+            apply_patch(existing, &patch);
         }
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.patch_coworker(&id, &patch).await;
+            let error = result.as_ref().err().map(|error| error.message.clone());
             let _ = this.update(cx, |state, cx| {
-                match result {
-                    Ok(updated) => {
-                        if let Some(existing) = state.coworkers.iter_mut().find(|c| c.id == id) {
-                            if !updated.name.is_empty() {
-                                existing.name = updated.name;
-                            }
-                            if !updated.model.is_empty() {
-                                existing.model = updated.model;
-                            }
-                            if updated.role.is_some() {
-                                existing.role = updated.role;
-                            }
-                            if updated.title.is_some() {
-                                existing.title = updated.title;
-                            }
-                            if updated.avatar_shape.is_some() {
-                                existing.avatar_shape = updated.avatar_shape;
-                            }
-                            if updated.avatar_color.is_some() {
-                                existing.avatar_color = updated.avatar_color;
-                            }
-                            if updated.notify_on_updates.is_some() {
-                                existing.notify_on_updates = updated.notify_on_updates;
-                            }
-                        }
-                        state.auth_error = None;
-                    }
-                    Err(error) => state.auth_error = Some(error.message),
+                if let Some(before) = before.as_ref()
+                    && let Some(existing) = state.coworkers.iter_mut().find(|c| c.id == id)
+                {
+                    settle_patch(existing, &patch, result.as_ref().ok(), before);
                 }
+                state.auth_error = error.clone();
                 cx.notify();
             });
+            if let Some(done) = done {
+                // Outside the roster's own update, so that whoever was waiting on the patch is
+                // free to reach for anything the app holds, this roster included.
+                cx.update(|cx| done(error, cx));
+            }
         })
         .detach();
+    }
+
+    /// A patch that never left the app. The settings pane paints the reason, and whoever is
+    /// waiting on the request still has to hear that it is over.
+    fn refuse_patch(&mut self, reason: &str, done: Option<PatchDone>, cx: &mut Context<Self>) {
+        let reason = reason.to_string();
+        self.auth_error = Some(reason.clone());
+        cx.notify();
+        if let Some(done) = done {
+            // This one is answered without the server, so the answer would land while the
+            // click that asked for the patch is still being handled and the asking view is
+            // still on the stack. It waits for the end of the effect cycle instead.
+            cx.defer(move |cx| done(Some(reason), cx));
+        }
     }
 
     pub fn update_opengrok_profile(
@@ -4731,6 +4718,118 @@ fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
     }
 }
 
+/// One of a coworker's optional fields as the roster keeps it. The app asks for such a field
+/// to be cleared by patching it with nothing in it.
+fn some_unless_blank(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+/// The roster's copy of a coworker brought up to what a patch asks for, before the server has
+/// been asked at all.
+fn apply_patch(coworker: &mut Coworker, patch: &CoworkerPatch) {
+    if let Some(name) = patch.name.as_ref() {
+        coworker.name = name.clone();
+    }
+    if let Some(model) = patch.model.as_ref() {
+        coworker.model = model.clone();
+    }
+    if let Some(role) = patch.role.as_deref() {
+        coworker.role = some_unless_blank(role);
+    }
+    if let Some(title) = patch.title.as_deref() {
+        coworker.title = some_unless_blank(title);
+    }
+    if let Some(shape) = patch.avatar_shape.as_deref() {
+        coworker.avatar_shape = some_unless_blank(shape);
+    }
+    if let Some(color) = patch.avatar_color.as_deref() {
+        coworker.avatar_color = some_unless_blank(color);
+    }
+    if let Some(notify) = patch.notify_on_updates {
+        coworker.notify_on_updates = Some(notify);
+    }
+}
+
+/// The roster's copy of a coworker once the server has answered, for the fields the patch
+/// asked about and no others.
+///
+/// What was written optimistically is not evidence of anything: the server may have refused
+/// the patch, or taken the request and stored none of it, which is what this one still does
+/// with several of these fields. So a field the server echoed back is the server's, and a
+/// field it said nothing about goes back to what the roster held before the request. The value
+/// the app guessed is kept nowhere. `echo` is `None` when the request failed, which leaves
+/// every patched field as it was.
+///
+/// A patch that asks for a field to be cleared is the one place where a silent answer is
+/// taken for agreement: there is no value to be wrong about, and a server that leaves empty
+/// fields out of its answer would otherwise make clearing an avatar impossible. A refused
+/// request is not a silent answer but no answer at all, and takes the clearing back with
+/// everything else.
+fn settle_patch(
+    coworker: &mut Coworker,
+    patch: &CoworkerPatch,
+    echo: Option<&Coworker>,
+    before: &Coworker,
+) {
+    let answered = echo.is_some();
+    if patch.name.is_some() {
+        coworker.name = settled_text(echo.map(|c| c.name.as_str()), &before.name);
+    }
+    if patch.model.is_some() {
+        coworker.model = settled_text(echo.map(|c| c.model.as_str()), &before.model);
+    }
+    if let Some(role) = patch.role.as_deref() {
+        coworker.role = settled_option(
+            echo.and_then(|c| c.role.clone()),
+            answered && some_unless_blank(role).is_none(),
+            before.role.clone(),
+        );
+    }
+    if let Some(title) = patch.title.as_deref() {
+        coworker.title = settled_option(
+            echo.and_then(|c| c.title.clone()),
+            answered && some_unless_blank(title).is_none(),
+            before.title.clone(),
+        );
+    }
+    if let Some(shape) = patch.avatar_shape.as_deref() {
+        coworker.avatar_shape = settled_option(
+            echo.and_then(|c| c.avatar_shape.clone()),
+            answered && some_unless_blank(shape).is_none(),
+            before.avatar_shape.clone(),
+        );
+    }
+    if let Some(color) = patch.avatar_color.as_deref() {
+        coworker.avatar_color = settled_option(
+            echo.and_then(|c| c.avatar_color.clone()),
+            answered && some_unless_blank(color).is_none(),
+            before.avatar_color.clone(),
+        );
+    }
+    if patch.notify_on_updates.is_some() {
+        coworker.notify_on_updates = echo
+            .and_then(|c| c.notify_on_updates)
+            .or(before.notify_on_updates);
+    }
+}
+
+/// A field a coworker always has, after the server has answered. An answer that left the field
+/// out says nothing about it, and nothing is not a name or a model.
+fn settled_text(echo: Option<&str>, before: &str) -> String {
+    echo.filter(|text| !text.is_empty())
+        .unwrap_or(before)
+        .to_string()
+}
+
+/// A field a coworker may not have, after the server has answered.
+fn settled_option(echo: Option<String>, cleared: bool, before: Option<String>) -> Option<String> {
+    match echo {
+        Some(value) => Some(value),
+        None if cleared => None,
+        None => before,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -4989,5 +5088,140 @@ mod tests {
         assert!(!is_status_line("[took a screenshot of my screen]"));
         assert!(is_tool_standin("[took a screenshot of my screen]"));
         assert!(!is_tool_standin("The build is green."));
+    }
+
+    // The patch reconciliation, apart from the app: what the roster holds for a coworker once
+    // the server has answered.
+    use super::{Coworker, CoworkerPatch, apply_patch, settle_patch};
+
+    fn bob() -> Coworker {
+        Coworker {
+            id: "cw_1".to_string(),
+            name: "Bob".to_string(),
+            model: "xai/grok-4.6@sub".to_string(),
+            role: Some("Research".to_string()),
+            title: Some("Analyst".to_string()),
+            avatar_shape: Some("circle".to_string()),
+            avatar_color: Some("blue".to_string()),
+            notify_on_updates: Some(false),
+            updated_at_ms: 17,
+            hidden_from_sidebar: false,
+            box_id: None,
+        }
+    }
+
+    /// The roster took the new name before the server was asked. The server answered without a
+    /// word about the name — which is what a route that quietly drops the field does — so the
+    /// new name was never stored, and the roster must not go on showing it.
+    #[test]
+    fn a_rename_the_server_never_echoed_does_not_stay_on_the_roster() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            name: Some("Roberta".to_string()),
+            title: Some("Analyst".to_string()),
+            role: Some("Research".to_string()),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
+        assert_eq!(roster.name, "Roberta", "the click is answered at once");
+
+        let echo = Coworker {
+            name: String::new(),
+            ..before.clone()
+        };
+        settle_patch(&mut roster, &patch, Some(&echo), &before);
+        assert_eq!(
+            roster.name, "Bob",
+            "an answer that says nothing about the name leaves the stored name standing"
+        );
+    }
+
+    /// The same, for a server that answers with the name it kept rather than with no name at
+    /// all: the echo is the truth even when it is the old value.
+    #[test]
+    fn the_servers_echo_wins_over_what_the_app_sent() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            name: Some("Roberta".to_string()),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
+        settle_patch(&mut roster, &patch, Some(&before), &before);
+        assert_eq!(roster.name, "Bob");
+    }
+
+    /// Nothing was stored, so nothing the patch asked for may be left behind — including the
+    /// fields the app had already written into the roster to look quick.
+    #[test]
+    fn a_refused_patch_leaves_the_roster_as_it_was() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            name: Some("Roberta".to_string()),
+            title: Some(String::new()),
+            role: Some("Marketing".to_string()),
+            notify_on_updates: Some(true),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
+        assert_eq!(roster.title, None, "the click is answered at once");
+
+        settle_patch(&mut roster, &patch, None, &before);
+        assert_eq!(roster, before);
+    }
+
+    /// A field the patch never mentioned is none of the reconciliation's business, which is
+    /// what keeps a server that answers with half a coworker from blanking the other half.
+    #[test]
+    fn a_field_outside_the_patch_is_left_alone() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            model: Some("xai/grok-4.7@sub".to_string()),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
+        let echo = Coworker {
+            id: "cw_1".to_string(),
+            name: String::new(),
+            model: "xai/grok-4.7@sub".to_string(),
+            role: None,
+            title: None,
+            avatar_shape: None,
+            avatar_color: None,
+            notify_on_updates: None,
+            updated_at_ms: 0,
+            hidden_from_sidebar: false,
+            box_id: None,
+        };
+        settle_patch(&mut roster, &patch, Some(&echo), &before);
+        assert_eq!(roster.model, "xai/grok-4.7@sub");
+        assert_eq!(roster.name, "Bob", "a partial answer blanks nothing else");
+        assert_eq!(roster.title.as_deref(), Some("Analyst"));
+        assert_eq!(roster.updated_at_ms, 17);
+    }
+
+    /// Clearing is the one thing an answer with nothing in it confirms: the avatar the person
+    /// reset stays reset rather than coming back on the next frame.
+    #[test]
+    fn a_cleared_field_stays_cleared_when_the_server_echoes_nothing() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            avatar_shape: Some(String::new()),
+            avatar_color: Some(String::new()),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
+        let echo = Coworker {
+            avatar_shape: None,
+            avatar_color: None,
+            ..before.clone()
+        };
+        settle_patch(&mut roster, &patch, Some(&echo), &before);
+        assert_eq!(roster.avatar_shape, None);
+        assert_eq!(roster.avatar_color, None);
     }
 }
