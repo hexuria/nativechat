@@ -111,6 +111,9 @@ pub struct AgentSettings {
     /// The row Enter takes, counted over the routes the field's text leaves rather than over
     /// the whole catalogue: what the arrows walk is what a person can see.
     model_highlight: usize,
+    /// Whether the field's text is a query or still the value it was opened with. A combobox
+    /// field is each in turn, and which one it is decides whether the list is narrowed by it.
+    model_query_live: bool,
     /// Whether the list was open at the last look. A highlight belongs to one opening of the
     /// list, and an opening the pane did not ask for itself — the chevron's — is only ever
     /// heard of here.
@@ -147,11 +150,17 @@ impl AgentSettings {
         let model_input = cx.new(|cx| InputState::new(window, cx).placeholder("xai/grok-4.6@sub"));
         cx.observe(&state, |this, state, cx| {
             // The chevron opens the list through the app's state, so the pane learns of that
-            // opening here or not at all. Every opening starts on the first match: the row the
+            // opening here or not at all. Every opening starts the highlight afresh: the row the
             // arrows were left on last time belongs to a list that is no longer up.
             let open = state.read(cx).model_picker_open;
             if open && !this.model_open {
-                this.reset_model_highlight();
+                this.reset_model_highlight(cx);
+            }
+            // The list is down, so what stands in the field is the coworker's route again
+            // rather than something being looked up, however it got there. The next opening
+            // shows the whole catalogue.
+            if !open && this.model_open {
+                this.model_query_live = false;
             }
             this.model_open = open;
             cx.notify();
@@ -162,12 +171,14 @@ impl AgentSettings {
             window,
             |this, _input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => {
-                    // What is typed in the field is the filter, so typing opens the list too:
-                    // someone typing a route is choosing one, and the routes that answer to
-                    // what they have typed are no use behind a shut list. Only a person's own
-                    // edit arrives here — `set_value` says nothing — so taking a route does not
-                    // reopen the list that taking it just closed.
-                    this.reset_model_highlight();
+                    // A keystroke is what turns the field's text from the coworker's route into
+                    // something being looked for, and from here on the list is narrowed by it.
+                    // Typing opens the list too: someone typing a route is choosing one, and the
+                    // routes that answer to what they have typed are no use behind a shut list.
+                    // Only a person's own edit arrives here — `set_value` says nothing — so
+                    // taking a route does not reopen the list that taking it just closed.
+                    this.model_query_live = true;
+                    this.reset_model_highlight(cx);
                     this.state.update(cx, |state, cx| {
                         state.set_model_picker_open(true, cx);
                     });
@@ -187,6 +198,7 @@ impl AgentSettings {
             role_input,
             model_input,
             model_highlight: FIRST_MATCH,
+            model_query_live: false,
             model_open: false,
             model_scroll: ScrollHandle::new(),
             synced_id: None,
@@ -227,17 +239,49 @@ impl AgentSettings {
         self.model_input.update(cx, |input, cx| {
             input.set_value(coworker.model.clone(), window, cx);
         });
+        // The pane has just written another coworker's route into the field, so what stands
+        // there is a value again whatever was being looked up before it.
+        self.model_query_live = false;
+        self.reset_model_highlight(cx);
     }
 
-    /// The routes the field's text leaves, in the catalogue's order.
+    /// The route the coworker is on, as the roster has it.
+    fn current_model(&self, cx: &App) -> String {
+        let state = self.state.read(cx);
+        state
+            .active_coworker_id
+            .as_ref()
+            .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
+            .map(|coworker| coworker.model.clone())
+            .unwrap_or_default()
+    }
+
+    /// What the list is narrowed by: nothing at all while the field's text is still the value
+    /// the pane put there, the text itself once somebody has typed into it.
+    fn model_filter(&self, cx: &App) -> String {
+        let text = self.model_input.read(cx).value().to_string();
+        filter_text(&text, self.model_query_live).to_string()
+    }
+
+    /// The routes the filter leaves, in the catalogue's order.
     fn model_matches(&self, cx: &App) -> Vec<String> {
-        let query = self.model_input.read(cx).value().to_string();
-        matching_models(&self.state.read(cx).model_catalogue.models, &query)
+        matching_models(
+            &self.state.read(cx).model_catalogue.models,
+            &self.model_filter(cx),
+        )
     }
 
-    fn reset_model_highlight(&mut self) {
-        self.model_highlight = FIRST_MATCH;
-        self.model_scroll.scroll_to_item(FIRST_MATCH);
+    /// Put the highlight where a fresh list starts: on the route the coworker is already on
+    /// while the whole catalogue is on show, so the list opens on where they are and Enter takes
+    /// what they have rather than moving them to the top of a list they have not read; on the
+    /// first match once the text is a query.
+    fn reset_model_highlight(&mut self, cx: &App) {
+        self.model_highlight = if self.model_query_live {
+            FIRST_MATCH
+        } else {
+            current_model_row(&self.model_matches(cx), &self.current_model(cx))
+        };
+        self.model_scroll.scroll_to_item(self.model_highlight);
     }
 
     /// Step the highlight, and claim the keystroke while the list is open: these keys belong to
@@ -259,7 +303,7 @@ impl AgentSettings {
         if !self.state.read(cx).model_picker_open {
             return;
         }
-        let query = self.model_input.read(cx).value().to_string();
+        let query = self.model_filter(cx);
         let catalogue = self.state.read(cx).model_catalogue.models.clone();
         // Nothing matched what was typed, so there is nothing for Enter to take and the text
         // stands as it is: it may well be a route this catalogue has not heard of, and Save
@@ -435,9 +479,9 @@ impl Render for AgentSettings {
             )
         };
         let model_focus = self.model_input.read(cx).focus_handle(cx);
-        // The list is what the field's text leaves of the catalogue, and the row Enter takes is
+        // The list is what the filter leaves of the catalogue, and the row Enter takes is
         // counted over that rather than over the catalogue behind it.
-        let model_query = self.model_input.read(cx).value().trim().to_string();
+        let model_query = self.model_filter(cx);
         let model_matches = matching_models(&catalogue, &model_query);
         let model_highlight = self.model_highlight;
         let model_scroll = self.model_scroll.clone();
@@ -1024,10 +1068,32 @@ fn avatar_editor_panel(
         )
 }
 
-/// The row the highlight goes back to whenever the filter changes or the list opens: the first
-/// of the matches. The row the arrows were left on stands for something else once the list under
-/// it has changed, and the top of a list is where a person who has just typed is looking.
+/// The row the highlight goes back to whenever the filter changes: the first of the matches.
+/// The row the arrows were left on stands for something else once the list under it has changed,
+/// and the top of a list is where a person who has just typed is looking. It is the first row of
+/// anything, so it is also where a list with nothing to point at starts.
 const FIRST_MATCH: usize = 0;
+
+/// What the list is narrowed by, given what the field holds and whether anybody has typed into
+/// it since it was opened.
+///
+/// The field carries the coworker's own route the whole time the pane is up, so reading that
+/// text as a query would leave the chevron — the one control that says here are your choices —
+/// opening onto the single choice already made. The text is a value until a keystroke turns it
+/// into a query, and shutting the list turns it back into a value.
+fn filter_text(text: &str, live: bool) -> &str {
+    if live { text.trim() } else { "" }
+}
+
+/// Where the highlight starts when the whole catalogue is on show: on the route the coworker is
+/// already on, so the list opens on where they are and Enter takes what they have. A route this
+/// catalogue does not hold, or no route at all, starts at the first row like anything else.
+fn current_model_row(shown: &[String], current: &str) -> usize {
+    shown
+        .iter()
+        .position(|id| id == current)
+        .unwrap_or(FIRST_MATCH)
+}
 
 /// The routes a typed query leaves, in the order the catalogue gives them.
 ///
@@ -1243,7 +1309,10 @@ impl AgentSettings {
 mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over the
     // one the test harness wants.
-    use super::{FIRST_MATCH, highlighted_model, matching_models, stepped_highlight};
+    use super::{
+        FIRST_MATCH, current_model_row, filter_text, highlighted_model, matching_models,
+        stepped_highlight,
+    };
     use crate::opengrok::ModelEntry;
 
     fn catalogue() -> Vec<ModelEntry> {
@@ -1310,6 +1379,40 @@ mod tests {
             None,
             "Enter has nothing to take, so what was typed stands"
         );
+    }
+
+    #[test]
+    fn an_untouched_field_is_a_value_and_the_chevron_opens_on_the_whole_catalogue() {
+        let catalogue = catalogue();
+        let current = "OAG/Fast";
+        // The coworker's route is in the field whenever the pane is up, so narrowing the list by
+        // it would open the chevron onto the one choice already made.
+        let shown = matching_models(&catalogue, filter_text(current, false));
+        assert_eq!(shown, matching_models(&catalogue, ""));
+        assert_eq!(
+            current_model_row(&shown, current),
+            2,
+            "the list opens on the row the coworker is already on"
+        );
+    }
+
+    #[test]
+    fn the_first_keystroke_turns_the_value_into_a_query() {
+        let catalogue = catalogue();
+        let shown = matching_models(&catalogue, filter_text("oag", true));
+        assert_eq!(shown, vec!["oag/cheap", "OAG/Fast"]);
+        assert_eq!(
+            highlighted_model(&catalogue, filter_text("oag", true), FIRST_MATCH).unwrap(),
+            "oag/cheap",
+            "a query lights its first match, wherever the coworker's own route sits"
+        );
+    }
+
+    #[test]
+    fn a_route_the_catalogue_does_not_hold_starts_at_the_first_row() {
+        let shown = matching_models(&catalogue(), "");
+        assert_eq!(current_model_row(&shown, "who/knows"), FIRST_MATCH);
+        assert_eq!(current_model_row(&[], "oag/cheap"), FIRST_MATCH);
     }
 
     #[test]
