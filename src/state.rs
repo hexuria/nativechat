@@ -829,6 +829,14 @@ pub struct AppState {
     /// composer is in recipe mode: `@` offers this recipe's parameters instead of the bot's
     /// tools, because a turn that is already a recipe run has no use for a tool roster.
     pub active_recipe: Option<ActiveRecipe>,
+    /// Which of the composer's lists is open, as the composer publishes it.
+    ///
+    /// The panel itself lives in the composer's own view and nothing outside that view can read
+    /// it. This is the one bit of it the rest of the app can see, and it is what lets an agent
+    /// driver — which is handed this state and nothing else — tell that typing `/` opened
+    /// anything. The rows are not copied here: they are rebuilt from the same sources the panel
+    /// draws them from.
+    pub composer_panel: Option<crate::components::chat_input::PanelMode>,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -1120,6 +1128,7 @@ impl AppState {
             more_menu_open: false,
             picked_tools: Vec::new(),
             active_recipe: None,
+            composer_panel: None,
             is_app_settings_open: false,
             bot_finder_open: false,
             command_palette_open: false,
@@ -2670,6 +2679,19 @@ impl AppState {
         self.active_recipe = Some(ActiveRecipe::from_summary(recipe));
         cx.notify();
         true
+    }
+
+    /// Say which of the composer's lists is open, or that none is. Called by the composer, and
+    /// read by anything that cannot see into the composer's own view.
+    pub fn set_composer_panel(
+        &mut self,
+        panel: Option<crate::components::chat_input::PanelMode>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_panel != panel {
+            self.composer_panel = panel;
+            cx.notify();
+        }
     }
 
     /// Take the recipe back off the draft.
