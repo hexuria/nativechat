@@ -1479,9 +1479,10 @@ pub struct RecipeSummary {
     pub relation: RecipeRelation,
     #[serde(default)]
     pub share_state: Option<RecipeShareState>,
-    /// A taped sequence or a decision tree. A server that has never heard of workflows sends no
-    /// word at all, and every row it sends is a recipe, which is what the default says.
-    #[serde(default)]
+    /// A taped sequence or a decision tree. A server that has never heard of workflows leaves
+    /// the word off the row, or sends it empty; either way every row it sends is a recipe, which
+    /// is what the default says.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub kind: RecipeKind,
     /// What the runnable version needs told before it runs. It rides on the summary so the
     /// composer knows what a recipe wants the moment it is picked, with no second fetch: a
@@ -2112,6 +2113,30 @@ mod tests {
     /// A URL nothing is listening on. These tests only ever read the jar, and a base that
     /// cannot be connected to is the guarantee that they never do anything else.
     const NOWHERE: &str = "http://127.0.0.1:1/";
+
+    /// The one word that tells the two apart on a listing that carries both. A kind this client
+    /// has never heard of has to land somewhere readable rather than fail the whole listing and
+    /// take every recipe on it down with a row nobody asked about.
+    #[test]
+    fn a_row_says_which_of_the_two_it_is_and_an_unknown_word_is_still_a_row() {
+        let listing: Vec<RecipeSummary> = serde_json::from_value(json!([
+            { "id": "rcp_1", "name": "tape", "kind": "recipe" },
+            { "id": "rcp_2", "name": "tree", "kind": "workflow" },
+            { "id": "rcp_3", "name": "older server", "kind": null },
+            { "id": "rcp_4", "name": "something new" },
+            { "id": "rcp_5", "name": "a word from the future", "kind": "lesson" }
+        ]))
+        .expect("an unknown kind must not fail the listing");
+        assert_eq!(
+            listing
+                .iter()
+                .map(|row| row.kind.label())
+                .collect::<Vec<_>>(),
+            vec!["Recipe", "Workflow", "Recipe", "Recipe", "Recipe"]
+        );
+        assert!(listing[1].is_workflow());
+        assert!(!listing[4].is_workflow());
+    }
 
     fn put_cookie(client: &OpenGrokClient, set_cookie: &str) {
         let header = HeaderValue::from_str(set_cookie).unwrap();
