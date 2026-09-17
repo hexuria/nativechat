@@ -507,6 +507,25 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// Stop a run that is still going.
+    ///
+    /// The turn is not the app's to abandon. A run drives a box — it opens pages and types into
+    /// them — and closing the stream here would only stop the app watching it do that, which is
+    /// the difference between a stop and looking away. So "stop" is a thing said to the server,
+    /// and this is the saying of it.
+    ///
+    /// Idempotent by the route's own contract: stopping a run that has already ended answers as
+    /// a success, so nothing has to be checked about the run before asking. A `404` is a run the
+    /// server has never heard of or one belonging to somebody else, which from here means the
+    /// same thing — there is nothing of ours left running under that id.
+    pub async fn stop_run(&self, run_id: &str) -> Result<StopReply, OpenGrokError> {
+        let path = format!("/ag-ui/runs/{run_id}/stop");
+        let response = self
+            .send_json::<()>(reqwest::Method::POST, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     pub async fn replay_run(&self, run_id: &str) -> Result<RunReplay, OpenGrokError> {
         let path = format!("/ag-ui/runs/{run_id}");
         let response = self
@@ -963,6 +982,17 @@ pub struct AnswerReply {
     pub already_answered: bool,
     #[serde(default)]
     pub continuing: bool,
+}
+
+/// What `POST /ag-ui/runs/{run_id}/stop` answers with: the run, and what it is now.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StopReply {
+    #[serde(rename = "runId", default)]
+    pub run_id: String,
+    /// `stopped`, including for a run that had already ended — the route is idempotent, so this
+    /// says what is true of the run now rather than whether this call is what made it true.
+    #[serde(default)]
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2324,6 +2354,46 @@ mod tests {
         let reply = client.answer_run("run-1", "call-9", true).await.unwrap();
         assert!(!reply.already_answered);
         assert!(reply.continuing);
+    }
+
+    /// The route is idempotent, so the status is what is true of the run now rather than an
+    /// account of what this call did: a turn that ended a moment before the press answers the
+    /// same way one that was still going does.
+    #[tokio::test]
+    async fn stopping_a_run_posts_to_its_own_route_and_reads_the_status_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/runs/run-1/stop"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(json!({ "runId": "run-1", "status": "stopped" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client.stop_run("run-1").await.unwrap();
+        assert_eq!(reply.run_id, "run-1");
+        assert_eq!(reply.status, "stopped");
+    }
+
+    /// The run is not there, or is not ours. Both are `404`, and from the app's side they mean
+    /// the same thing - nothing of ours is running under that id - so the caller is the one that
+    /// decides whether that is worth saying anything about.
+    #[tokio::test]
+    async fn stopping_a_run_that_is_not_there_comes_back_as_a_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/runs/run-gone/stop"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "error": "no such run" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.stop_run("run-gone").await.unwrap_err();
+        assert_eq!(error.status, Some(404));
     }
 
     #[tokio::test]

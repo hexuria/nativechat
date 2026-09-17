@@ -27,6 +27,9 @@ pub mod ids {
     pub const FOOTER_ACCOUNT: &str = "footer-account";
     pub const FOOTER_SIGN_OUT: &str = "footer-sign-out";
     pub const COMPOSER: &str = "composer";
+    /// The one button at the right of the composer: the send arrow, or the stop square while a
+    /// turn is running. One id, because it is one button in one place.
+    pub const COMPOSER_SEND: &str = "composer-send";
     /// The one wide list `+`, `@` and `/` all open above the composer.
     pub const COMPOSER_PANEL: &str = "composer-panel";
     /// The field inside that list, which takes the caret the moment the list opens.
@@ -82,6 +85,9 @@ pub enum Command {
     SelectSession(String),
     SelectCoworker(String),
     SendMessage(String),
+    /// Stop the turn the open thread has in flight, which is what the composer's button does
+    /// while it is a stop button.
+    StopTurn,
     ToggleComputerPane,
     OpenCoworkerScreen,
     /// Update / Reset the active bot's computer: open the confirm dialog, then answer it.
@@ -147,6 +153,7 @@ impl Command {
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
+            Self::StopTurn => state.stop_turn(cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
             Self::OpenCoworkerScreen => state.open_coworker_screen(cx),
             Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
@@ -499,6 +506,10 @@ pub struct NativeChatHost {
     login_password: String,
     last_assistant: String,
     bot_status: Option<String>,
+    /// The open thread has a turn in flight. It is what the composer's button is showing, and
+    /// it is a steadier answer to "is it still doing something" than `bot_status`: the live turn
+    /// is kept per thread, so it survives looking at another bot and coming back.
+    turn_in_flight: bool,
     agent_settings_open: bool,
     model_picker_open: bool,
     avatar_editor_open: bool,
@@ -581,6 +592,7 @@ impl NativeChatHost {
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
             bot_status: state.visible_bot_status(),
+            turn_in_flight: state.is_turn_in_flight(),
             agent_settings_open: state.is_agent_settings_open(),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
@@ -776,6 +788,7 @@ impl NativeChatHost {
 
         let mut page = UiNode::page(ids::PAGE, "Chat")
             .with_child(UiNode::textbox(ids::COMPOSER, "Type a message..."))
+            .with_child(self.composer_send_node())
             .with_child(UiNode::new(
                 "transcript-tail",
                 "status",
@@ -888,6 +901,26 @@ impl NativeChatHost {
                     )),
             ],
         }
+    }
+
+    /// The composer's one action button, in whichever of its two states it is in.
+    ///
+    /// Always in the tree, because it is always on screen: a driver reads what it says now
+    /// rather than testing whether it is there at all. The label is the button's own word and
+    /// the `running` state is the same fact for an assert that would rather not match on copy.
+    fn composer_send_node(&self) -> UiNode {
+        let mut node = UiNode::button(
+            ids::COMPOSER_SEND,
+            if self.turn_in_flight {
+                "Stop"
+            } else {
+                "Send message"
+            },
+        );
+        if self.turn_in_flight {
+            node.states.push("running".into());
+        }
+        node
     }
 
     /// The composer's panel, while one is open: the field the caret is in, and every row by the
@@ -1072,6 +1105,17 @@ impl NativeChatHost {
                 ));
             }
             Command::OpenLightbox { index }
+        } else if target == ids::COMPOSER_SEND {
+            if !self.turn_in_flight {
+                // Sending belongs to the keyboard like the rest of the composer: `key composer
+                // Enter` runs what a person's Enter runs, chips and recipe and all. The button
+                // is a click target only while it is the stop button, which no key is bound to.
+                return Err(format!(
+                    "`{target}` reads \"Send message\": there is no turn to stop. Send with \
+                     `key composer Enter`; this is clicked while it reads \"Stop\"."
+                ));
+            }
+            Command::StopTurn
         } else if target.starts_with("composer-") {
             // The composer's panel and its bar are worked from the keyboard, the way a person
             // works them, because that is the only path that runs what the composer runs. Say
@@ -1542,6 +1586,27 @@ mod tests {
             .collect();
         assert!(rows.contains(&"composer-param-city"), "{rows:?}");
         assert!(rows.contains(&"composer-param-shorts"), "{rows:?}");
+    }
+
+    /// The button a driver has to be able to see change, and to press once it has. The person
+    /// asked for two things — to know whether the bot is still doing something, and to be able
+    /// to stop it — and this is both of them in one node.
+    #[test]
+    fn the_composers_button_says_which_of_its_two_it_is_and_is_clicked_only_as_the_stop() {
+        let mut host = host();
+        let idle = host.snapshot().find(ids::COMPOSER_SEND).cloned().unwrap();
+        assert_eq!(idle.name, "Send message");
+        assert!(idle.states.is_empty());
+        let refused = host.dispatch(&Op::click(ids::COMPOSER_SEND)).unwrap_err();
+        assert!(refused.contains("no turn to stop"), "{refused}");
+        assert!(host.take_command().is_none());
+
+        host.turn_in_flight = true;
+        let running = host.snapshot().find(ids::COMPOSER_SEND).cloned().unwrap();
+        assert_eq!(running.name, "Stop");
+        assert!(running.states.contains(&"running".to_string()));
+        host.dispatch(&Op::click(ids::COMPOSER_SEND)).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::StopTurn)));
     }
 
     #[test]
