@@ -1425,6 +1425,10 @@ pub struct RecipeVersion {
     pub created_by: Option<String>,
     #[serde(default)]
     pub created_at_ms: i64,
+    /// What this version needs told before it runs. See [`RecipeVersion::declared`] for why it
+    /// is read from here and from the body both.
+    #[serde(default)]
+    pub parameters: Vec<RecipeParameter>,
     #[serde(default)]
     pub body: RecipeVersionBody,
 }
@@ -1433,6 +1437,17 @@ impl RecipeVersion {
     /// The tape is kept, not run; every other kind carries steps.
     pub fn is_runnable(&self) -> bool {
         self.kind != "raw"
+    }
+
+    /// What this version declares it needs told, which is the declaration a run of it binds
+    /// values to. It arrives beside the version's own fields or inside its body, and either
+    /// shape reads the same here, the way a tape does: the declaration belongs to the version
+    /// whichever half of the row the server writes it on.
+    pub fn declared(&self) -> &[RecipeParameter] {
+        if !self.parameters.is_empty() {
+            return &self.parameters;
+        }
+        &self.body.parameters
     }
 
     /// A version someone wrote by editing, which is the only kind the server will delete on
@@ -1477,6 +1492,10 @@ pub struct RecipeVersionBody {
     pub truncated: bool,
     #[serde(default)]
     pub steps: Vec<RecipeStep>,
+    /// The version's declaration, when the server writes it inside the body rather than beside
+    /// it. Read through [`RecipeVersion::declared`], which takes either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<RecipeParameter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_on_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2530,6 +2549,35 @@ mod tests {
             RecipeParameterKind::Text,
             "a kind this client has no word for leaves a field that can still be typed into"
         );
+    }
+
+    #[test]
+    fn a_version_declares_what_it_needs_told_whichever_half_of_the_row_it_is_on() {
+        let beside: RecipeVersion = serde_json::from_value(json!({
+            "version": 2, "kind": "filtered", "createdAtMs": 2,
+            "parameters": [{"name": "search_term", "required": true, "kind": "text"}],
+            "body": {"steps": []}
+        }))
+        .unwrap();
+        assert_eq!(beside.declared().len(), 1);
+        assert_eq!(beside.declared()[0].name, "search_term");
+
+        let inside: RecipeVersion = serde_json::from_value(json!({
+            "version": 2, "kind": "filtered", "createdAtMs": 2,
+            "body": {"steps": [], "parameters": [
+                {"name": "search_term", "required": true, "kind": "text"}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(inside.declared(), beside.declared());
+
+        // A version taught before parameters existed declares nothing, and reads as it always
+        // did rather than failing.
+        let older: RecipeVersion =
+            serde_json::from_value(json!({"version": 1, "kind": "raw", "body": {"events": 3}}))
+                .unwrap();
+        assert!(older.declared().is_empty());
+        assert_eq!(older.event_count(), 3);
     }
 
     #[test]

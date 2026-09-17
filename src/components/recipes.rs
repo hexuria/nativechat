@@ -16,8 +16,8 @@ use crate::components::multi_select::{
 use crate::components::title_bar::window_drag;
 use crate::icons::NativeIcon;
 use crate::opengrok::{
-    RecipeDetail, RecipeRelation, RecipeRun, RecipeScreen, RecipeShare, RecipeShareTarget,
-    RecipeStep, RecipeSummary, RecipeTapeEvent, RecipeVersion,
+    RecipeDetail, RecipeParameter, RecipeRelation, RecipeRun, RecipeScreen, RecipeShare,
+    RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTapeEvent, RecipeVersion,
 };
 use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome, RightPane};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -1322,6 +1322,7 @@ impl RecipesView {
             )
             .child(self.steps_toolbar(detail, busy, app, view, theme))
             .child(version_line(shown, editing, muted))
+            .child(parameters_line(shown, muted, theme))
             .map(|this| match steps {
                 Some(steps) => this.child(self.steps_table(steps, editing, view, muted, theme)),
                 // A tape the server sent whole reads as a table of its own; one it stripped to
@@ -2790,6 +2791,79 @@ fn version_line(version: Option<&RecipeVersion>, editing: bool, muted: Hsla) -> 
         .into_any_element()
 }
 
+/// What the version on screen declares it needs told before it runs, read only: one row for
+/// each, with what it is called, what it takes, whether it is required and what it is for.
+///
+/// A version that declares nothing shows nothing at all, which is every version taught before
+/// parameters existed and every recipe that simply does not need telling anything.
+fn parameters_line(version: Option<&RecipeVersion>, muted: Hsla, theme: &Theme) -> AnyElement {
+    let declared = version.map(RecipeVersion::declared).unwrap_or_default();
+    if declared.is_empty() {
+        return div().into_any_element();
+    }
+    v_flex()
+        .id("recipe-version-parameters")
+        .w_full()
+        .gap(px(4.))
+        .pt(px(8.))
+        .child(div().text_xs().text_color(muted).child(format!(
+            "{} it needs told",
+            count_of(declared.len(), "thing")
+        )))
+        .children(declared.iter().map(|parameter| {
+            h_flex()
+                .id(SharedString::from(format!(
+                    "recipe-parameter-{}",
+                    parameter.name
+                )))
+                .w_full()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(parameter.name.clone()),
+                )
+                .child(badge(parameter.kind.label(), muted, theme))
+                .child(badge(
+                    if parameter.required {
+                        "required"
+                    } else {
+                        "optional"
+                    },
+                    muted,
+                    theme,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(parameter_detail(parameter)),
+                )
+        }))
+        .into_any_element()
+}
+
+/// What a declared parameter is for, and anything else the declaration pins down about it.
+fn parameter_detail(parameter: &RecipeParameter) -> String {
+    let mut said: Vec<String> = Vec::new();
+    let description = parameter.description.trim();
+    if !description.is_empty() {
+        said.push(description.to_string());
+    }
+    if let Some(allowed) = parameter.allowed() {
+        said.push(format!("one of: {}", allowed.join(", ")));
+    }
+    if let Some(default) = parameter.default.as_deref().filter(|it| !it.is_empty()) {
+        said.push(format!("{default} unless told otherwise"));
+    }
+    said.join(" · ")
+}
+
 /// The table's header row. It sits above the scroll, so it stays while the steps move.
 fn steps_head(muted: Hsla, theme: &Theme) -> AnyElement {
     h_flex()
@@ -4041,11 +4115,11 @@ mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over
     // the one the test harness wants.
     use super::{
-        COLUMN_MAX, ListBody, MAX_WAIT_MS, RecipeDetail, RecipeFilter, RecipeScreen, RecipeStep,
-        RecipeSummary, RecipeTapeEvent, RecipeVersion, StepKind, about_edited, build_step,
-        empty_words, event_offset, filtered_version, list_body, list_column_width, row_stacks,
-        runs_of, shown_version, step_param_values, step_words, tape_words, version_kind,
-        version_of,
+        COLUMN_MAX, ListBody, MAX_WAIT_MS, RecipeDetail, RecipeFilter, RecipeParameter,
+        RecipeScreen, RecipeStep, RecipeSummary, RecipeTapeEvent, RecipeVersion, StepKind,
+        about_edited, build_step, empty_words, event_offset, filtered_version, list_body,
+        list_column_width, parameter_detail, row_stacks, runs_of, shown_version, step_param_values,
+        step_words, tape_words, version_kind, version_of,
     };
     use serde_json::{Value, json};
 
@@ -4063,6 +4137,37 @@ mod tests {
             "versions": versions,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_declared_parameter_says_what_it_is_for_and_what_it_will_take() {
+        let declared = |value: Value| -> RecipeParameter { serde_json::from_value(value).unwrap() };
+        assert_eq!(
+            parameter_detail(&declared(json!({
+                "name": "search_term", "description": "What to search YouTube for",
+                "required": true, "kind": "text", "default": null, "values": null
+            }))),
+            "What to search YouTube for"
+        );
+        assert_eq!(
+            parameter_detail(&declared(json!({
+                "name": "lang", "description": "Which language", "kind": "text",
+                "values": ["en", "es"]
+            }))),
+            "Which language · one of: en, es"
+        );
+        assert_eq!(
+            parameter_detail(&declared(json!({
+                "name": "count", "description": "", "kind": "number", "default": 5
+            }))),
+            "5 unless told otherwise",
+            "a parameter the declaration says nothing about still says what it stands at"
+        );
+        assert_eq!(
+            parameter_detail(&declared(json!({"name": "bare", "kind": "text"}))),
+            "",
+            "and one the declaration pins down nothing about says nothing"
+        );
     }
 
     #[test]
