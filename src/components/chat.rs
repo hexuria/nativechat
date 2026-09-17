@@ -345,10 +345,26 @@ impl ChatPalette {
     }
 }
 
-/// The air between the last bubble and the composer floating over it. The list's own `py_2`
-/// used to be the whole gap after the last row; the padding that clears the composer replaces
-/// that bottom edge, so the breathing room has to be put back by hand.
-const COMPOSER_GAP: f32 = 8.0;
+/// The air the transcript keeps at either end: above the first bubble, and between the last
+/// one and the composer floating over it, on top of the composer's own height.
+///
+/// `MessageScroller` gives its list this much as `py_2`, and the rows have to carry it
+/// instead, because the list must have no padding at all. GPUI measures the list's scroll
+/// twice and only one of the two counts that padding: the wheel reads the offset in the items'
+/// own space, where the floor is `items + padding - viewport`, while the mask that turns the
+/// wheel into an offset clamps against `items - viewport` and writes the clamped value back.
+/// Room held in the padding is therefore a teleport of exactly that much on the first scroll
+/// away from the bottom. Room held inside a row is part of `items` and both readings agree.
+const TRANSCRIPT_EDGE_GAP: f32 = 8.0;
+
+/// The room a row keeps beneath itself, which only the last one has any of.
+///
+/// The composer floats over the transcript's bottom, so the final bubble has to be able to
+/// come to rest above it rather than under it, and that room has to be part of the row's own
+/// measured height — see [`TRANSCRIPT_EDGE_GAP`] for why it cannot be the list's padding.
+fn tail_room(ix: usize, row_count: usize, composer_height: Pixels) -> Option<Pixels> {
+    (row_count > 0 && ix + 1 == row_count).then(|| composer_height + px(TRANSCRIPT_EDGE_GAP))
+}
 
 struct ChatTranscript {
     app_state: Entity<AppState>,
@@ -457,6 +473,14 @@ impl ChatTranscript {
             return;
         }
         self.composer_height = height;
+        // The room belongs to the last row's own height, so the list is holding a measurement
+        // of that row taken against the composer as it used to stand. Nothing else about the
+        // row changed, so only that one is worth taking again.
+        self.scroller.update(cx, |scroller, cx| {
+            if let Some(last) = scroller.item_count().checked_sub(1) {
+                let _ = scroller.remeasure_items(last..last + 1, cx);
+            }
+        });
         cx.notify();
     }
 
@@ -840,23 +864,31 @@ impl Render for ChatTranscript {
                             }
                             bubble.into_any_element()
                         };
-                        div().w_full().flex().justify_center().px_4().child(
-                            div()
-                                .w_full()
-                                .max_w(px(CHAT_CONTENT_MAX))
-                                .child(row_body(ix, window, cx)),
-                        )
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .px_4()
+                            // The transcript's own edges, carried by the rows that sit against
+                            // them rather than by the list's padding (see `tail_room`).
+                            .when(ix == 0, |this| this.pt(px(TRANSCRIPT_EDGE_GAP)))
+                            .when_some(tail_room(ix, rows.len(), composer_height), |this, room| {
+                                this.pb(room)
+                            })
+                            .child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(CHAT_CONTENT_MAX))
+                                    .child(row_body(ix, window, cx)),
+                            )
                     },
                 )
                 // Straight under the title bar, which holds the chat's header.
                 .pt(px(20.0))
-                // The list's floor, not the viewport's: rows still scroll on under the
-                // composer, and it is only the run-out after the last one that is held back,
-                // which is what lets the final bubble be read clear of the pill. The list
-                // counts its own padding towards the scroll, so the end of the transcript —
-                // the chevron's destination, and where a new message lands — moves down with
-                // it.
-                .with_list_style(StyleRefinement::default().pb(composer_height + px(COMPOSER_GAP)))
+                // No padding on the list. The room at both ends travels with the rows, so
+                // that the height of the items is the whole of the transcript and the two
+                // ways GPUI measures the scroll cannot disagree — see `TRANSCRIPT_EDGE_GAP`.
+                .with_list_style(StyleRefinement::default().py(px(0.)))
                 // The chevron belongs over the chat, not behind the composer, so lift it off
                 // the scroller's floor by exactly what the composer covers; the rem the
                 // scroller already holds it by then reads from the composer's top edge.
@@ -1319,7 +1351,31 @@ impl Render for ChatView {
                         .inset_0()
                     })
                     .child(
+                        // Everything the composer is made of is in this column, and it is
+                        // exactly as wide as the pill, so this is the one box that may take
+                        // the mouse. The chat runs on behind the band to either side of it,
+                        // and a click there is a click on the chat: the band itself must stay
+                        // as invisible to the mouse as it is to the eye, or it would be the
+                        // wall again with nothing to show for it. Occluding is what makes a
+                        // click on the pill the field's own — without it the click also
+                        // reaches whatever row of the transcript happens to be underneath,
+                        // which opened pictures in the lightbox while the person was only
+                        // trying to type.
                         v_flex()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, {
+                                // Taking the click also takes it from the chat's own surface,
+                                // and what that surface does with one is shut the right pane's
+                                // popovers — see this view's root, and the sidebar's.
+                                let app = self.state.clone();
+                                move |_, _, cx| {
+                                    app.update(cx, |state, cx| {
+                                        if state.model_picker_open || state.avatar_editor_open {
+                                            state.dismiss_popovers(cx);
+                                        }
+                                    });
+                                }
+                            })
                             .w_full()
                             .max_w(px(CHAT_CONTENT_MAX))
                             .gap_2()
@@ -1370,7 +1426,40 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatRow, ScreenshotSpec, joins_previous_set, text_row_id};
+    use super::{
+        ChatRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, joins_previous_set, tail_room, text_row_id,
+    };
+    use gpui_kit::px;
+
+    /// The room is the last bubble's alone: give it to every row and the transcript would be
+    /// mostly air, and the rows above the composer would each hold a composer's worth of it.
+    #[test]
+    fn only_the_last_bubble_keeps_room_for_the_composer() {
+        let composer = px(96.);
+        assert_eq!(tail_room(0, 3, composer), None);
+        assert_eq!(tail_room(1, 3, composer), None);
+        assert_eq!(
+            tail_room(2, 3, composer),
+            Some(composer + px(TRANSCRIPT_EDGE_GAP))
+        );
+    }
+
+    /// The composer grows with the draft, the recipe bar and the working line, and the room
+    /// under the last bubble is what keeps it clear of all of that.
+    #[test]
+    fn the_room_under_the_last_bubble_follows_the_composers_height() {
+        let short = tail_room(0, 1, px(72.));
+        let tall = tail_room(0, 1, px(220.));
+        assert_eq!(short, Some(px(72. + TRANSCRIPT_EDGE_GAP)));
+        assert_eq!(tall, Some(px(220. + TRANSCRIPT_EDGE_GAP)));
+        assert!(tall > short, "a taller composer has to take more room");
+    }
+
+    /// A transcript with nothing in it has no last bubble to hold anything off the floor.
+    #[test]
+    fn an_empty_transcript_holds_nothing_back() {
+        assert_eq!(tail_room(0, 0, px(96.)), None);
+    }
 
     #[test]
     fn text_rows_of_one_message_get_distinct_ids() {
