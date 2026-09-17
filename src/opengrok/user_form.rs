@@ -37,12 +37,22 @@
 //!
 //! # Gap until [opengrok-server#140](https://github.com/hexuria/opengrok-server/issues/140)
 //!
-//! Today's AG-UI CUSTOM carries `callId` (the tool call), not the gateway
-//! `e_…` id. Pure AgUiSink does not call `emit_suspension`, so NativeChat
-//! has no gateway card to read. Until #140 stamps `entryId` on the CUSTOM
-//! (or emits the send-message card onto AG-UI), Continue / Dismiss stay
-//! gated — we do **not** POST `callId` as `entryId` and we do not fake a
-//! fill.
+//! Open Grok is implementing #140 **on** [opengrok-server#139](https://github.com/hexuria/opengrok-server/pull/139)
+//! (`emit_user_form_from_agui` after `POST /ag-ui`). That appends a gateway
+//! `send-message` card (`id` = `e_{uuid}`) **after** the AG-UI SSE. CUSTOM
+//! `run-awaiting-approval` is kept as-is: still `callId`, still no
+//! `entryId` on that stream. NativeChat does not consume
+//! `transcript:{agentId}`, so that mint is not a fill target here.
+//!
+//! Fields we will take **when the server stamps one we can read** — we do
+//! not invent an id:
+//!
+//! - CUSTOM `entryId` (same key submit REST uses)
+//! - send-message envelope `id` on a `value` we already parse
+//!
+//! `callId`, `toolCallId`, and a generic AG-UI event `id` are **not**
+//! `entryId`. Until one of the accepted fields appears, Continue / Dismiss
+//! stay gated — we do not fake Submitted.
 //!
 //! [`USER_FORM_SERVER_FILL_AVAILABLE`] defaults true (this server has the
 //! verbs). AppState flips it off after a 404. Fill still needs
@@ -277,7 +287,8 @@ pub enum UserFormActionReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserFormSpec {
     /// Gateway transcript card id (`e_{uuid}`). Required to POST. Empty on
-    /// today's AG-UI CUSTOM until #140 stamps `entryId`.
+    /// today's AG-UI CUSTOM until the server stamps `entryId` (or a
+    /// send-message `id`) on a value we already parse. Never invented.
     pub entry_id: String,
     /// AG-UI tool call id. Used to merge events. **Never** sent as `entryId`.
     pub call_id: String,

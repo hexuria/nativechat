@@ -4,9 +4,10 @@
 //!
 //! Continue / Open the screen / Dismiss POST `/ag-ui/user-form/submit|dismiss`
 //! when the server has the verbs **and** the card has a gateway `entryId`.
-//! Without `entryId` (today's AG-UI CUSTOM until opengrok-server#140) the
-//! buttons stay gated — we do not POST `callId`. Secrets collected here go
-//! only in the REST body, never `send_message` / AG-UI `content` / sqlite.
+//! Without `entryId` on AG-UI (CUSTOM still has `callId` only until #140
+//! stamps a field we can read) the buttons stay gated — we do not invent
+//! an id. Secrets collected here go only in the REST body, never
+//! `send_message` / AG-UI `content` / sqlite.
 
 use crate::components::fields::field_input;
 use crate::opengrok::{
