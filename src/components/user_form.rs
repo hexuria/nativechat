@@ -18,8 +18,7 @@ use crate::opengrok::{
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputContentType, InputState, Textarea, TextareaState};
-use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::HashMap;
@@ -512,7 +511,7 @@ fn action_button(
     coming_from_server: bool,
     on_click: Option<impl Fn(&mut App) + 'static>,
 ) -> AnyElement {
-    let button = Button::new(id).label(label).disabled(disabled).small();
+    let button = Button::new(id).label(label).disabled(disabled);
     let button = match kind {
         ButtonKind::Primary => button.primary(),
         ButtonKind::Secondary => button.outline(),
@@ -522,12 +521,9 @@ fn action_button(
         Some(on_click) => button.on_click(move |_, _, cx| on_click(cx)),
         None => button,
     };
-    if coming_from_server {
-        div()
-            .tooltip(move |window, cx| Tooltip::new("Coming from the server").build(window, cx))
-            .child(button)
-            .into_any_element()
-    } else {
-        button.into_any_element()
-    }
+    button
+        .when(coming_from_server, |this| {
+            this.tooltip("Coming from the server")
+        })
+        .into_any_element()
 }

@@ -4814,13 +4814,14 @@ impl AppState {
                                     // Into the thread the run belongs to, and into the row the run
                                     // was given — not the thread that happens to be open, and not
                                     // whichever row happens to be last in it.
+                                    let grafted = state.graft_user_forms(parts.clone());
                                     if let Some(message) = streaming_message_mut(
                                         &mut state.conversations,
                                         &conversation_id,
                                         &reply_id,
                                     ) {
                                         message.content = plain.clone();
-                                        message.parts = state.graft_user_forms(parts.clone());
+                                        message.parts = grafted;
                                         cx.notify();
                                     }
                                     if assembler.waiting_approval() {
@@ -4847,13 +4848,14 @@ impl AppState {
                     let deeds = tracker.deeds();
                     let (plain, parts) = assembler.snapshot();
                     let _ = this.update(cx, |state, cx| {
+                        let grafted = state.graft_user_forms(parts);
                         if let Some(message) = streaming_message_mut(
                             &mut state.conversations,
                             &conversation_id,
                             &reply_id,
                         ) {
                             message.content = plain;
-                            message.parts = state.graft_user_forms(parts);
+                            message.parts = grafted;
                         }
                         cx.notify();
                     });
