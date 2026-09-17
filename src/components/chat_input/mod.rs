@@ -494,7 +494,9 @@ impl MessageInput {
                     "teach",
                     "icons/monitor.svg",
                     "Teach a task",
-                    "Show the bot on its screen, and keep what it saw as a recipe",
+                    // Not "as a recipe" any more: stopping the tape asks which of three things
+                    // to make of it, and only one of the three is a recipe.
+                    "Show the bot on its screen, and keep what it saw",
                 )
                 .element_id("composer-teach"),
                 ComposerPick::TeachTask,

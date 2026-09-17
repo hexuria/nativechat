@@ -6,8 +6,10 @@
 //! "Teach a task" control, and it answers the window keys itself: ⌘W and ⌘Q
 //! close this window only, ⌘M minimizes it, ⌘H hides the app.
 //!
-//! A stopped tape is written to disk and offered on a sheet under the title bar: named, it
-//! goes up as a recipe (`POST /recipes`), and the Recipes page lists it.
+//! A stopped tape is written to disk and offered on a sheet under the title bar: named, and told
+//! which of three things to become, it goes up as a recipe (`POST /recipes`) and the Recipes page
+//! lists it. The other two outcomes are offered and say plainly that they cannot be made yet;
+//! see [`TeachOutcome`] for what each is still missing.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -100,6 +102,93 @@ const TEACH_SCRIPT: &str = r#"
 })();
 "#;
 
+/// What a stopped tape can become.
+///
+/// Three outcomes, three prices, and only one of them has an engine behind it today. They are
+/// all offered because the choice is the point — a person who has just taught something knows
+/// which of the three they meant, and a menu that offers one of them silently decides for them —
+/// and the two that cannot be made say so on the sheet instead of being quietly unavailable.
+///
+/// WHAT THE OTHER TWO ARE WAITING FOR, precisely:
+///
+/// - A SKILL is a lesson: a written summary of what was done, which the model reads. It is the
+///   cheapest of the three to build, because there is no engine behind it — but "no engine" is
+///   not "no server". Nothing writes the summary (reading a tape into prose is a model call the
+///   app cannot make on its own), and there is nowhere to keep it: a `recipe_version` is `raw`,
+///   `filtered`, `edited` or `workflow`, and a lesson is none of the four. It needs a kind of its
+///   own on the version table, a route that writes one from a tape, and a line in the turn's
+///   system message the way a chosen recipe already gets one.
+/// - A WORKFLOW is a decision tree. The server stores and walks one now (`POST /workflows`), and
+///   it takes a TREE — named steps, branches, a question for Jev at each fork. A tape is none of
+///   that: it is a list of clicks with nothing in it that ever decided anything, and no filter
+///   turns one into the other. It needs either something that proposes a tree from a recording,
+///   or an editor in this app to write one by hand. Sending a one-step tree that only plays the
+///   recipe would be a workflow in name — a tape with a longer route to the same box — which is
+///   worse than saying not yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TeachOutcome {
+    /// The tape, filtered into steps. What Save has always made, and the default: it is free to
+    /// run, instant, and the only one of the three that exists end to end.
+    #[default]
+    Recipe,
+    /// A lesson: written notes on how the task is done, which the model reads.
+    Skill,
+    /// A decision tree that drives recipes.
+    Workflow,
+}
+
+impl TeachOutcome {
+    /// The three, in the order the sheet offers them: cheapest to run first.
+    pub const ALL: [TeachOutcome; 3] = [Self::Recipe, Self::Skill, Self::Workflow];
+
+    /// What this outcome is called where a person reads it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recipe => "Recipe",
+            Self::Skill => "Skill",
+            Self::Workflow => "Workflow",
+        }
+    }
+
+    /// The id its button answers to, so a driver can pick one by name.
+    pub fn element_id(self) -> &'static str {
+        match self {
+            Self::Recipe => "teach-make-recipe",
+            Self::Skill => "teach-make-skill",
+            Self::Workflow => "teach-make-workflow",
+        }
+    }
+
+    /// What this outcome is, in one line, for the person choosing between three things they
+    /// have never had to tell apart before.
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Recipe => "The tape, filtered into steps. Your bot replays it exactly.",
+            Self::Skill => "A lesson your bot reads before it works, in its own words.",
+            Self::Workflow => "A decision tree that looks, chooses, and plays recipes.",
+        }
+    }
+
+    /// Why this outcome cannot be made yet, in the words the sheet shows, or `None` when it can.
+    ///
+    /// A sentence rather than a flag, because "not yet" on its own is a dead end: what is asked
+    /// for here is what somebody would have to build next, named on the screen where the wish
+    /// occurs.
+    pub fn blocked(self) -> Option<&'static str> {
+        match self {
+            Self::Recipe => None,
+            Self::Skill => Some(
+                "Not yet — a lesson has nowhere to be kept and nothing to write it. It needs a \
+                 kind of its own on the server, and a model to read the tape into words.",
+            ),
+            Self::Workflow => Some(
+                "Not yet — the server stores and walks a tree, but nothing turns a tape into \
+                 decisions. It needs a tree: proposed from the recording, or written by hand.",
+            ),
+        }
+    }
+}
+
 /// A task being taught: when it started and what the page has reported so far.
 struct Teaching {
     started_at_ms: i64,
@@ -140,6 +229,8 @@ pub struct ComputerScreen {
     app: Entity<AppState>,
     /// A stopped tape waiting on Save or Discard, with the sheet under the title bar.
     pending: Option<PendingTape>,
+    /// Which of the three things the tape on the sheet is to become.
+    outcome: TeachOutcome,
     name_input: Entity<InputState>,
     description_input: Entity<InputState>,
     /// An upload is on its way.
@@ -205,6 +296,7 @@ impl ComputerScreen {
             last_saved: None,
             app,
             pending: None,
+            outcome: TeachOutcome::default(),
             name_input,
             description_input,
             saving: false,
@@ -292,6 +384,9 @@ impl ComputerScreen {
                 });
                 self.last_saved = None;
                 self.save_error = None;
+                // Each tape is asked about on its own. A choice left standing from the last one
+                // would decide this one silently, which is the thing the choice exists to stop.
+                self.outcome = TeachOutcome::default();
                 self.pending = Some(PendingTape {
                     started_at_ms: session.started_at_ms,
                     events,
@@ -302,10 +397,32 @@ impl ComputerScreen {
         cx.notify();
     }
 
+    /// Which of the three the tape is to become. The button for a blocked one is still there to
+    /// be pressed: reading why it cannot be made is the only thing it has to offer, and a button
+    /// that refuses to be pressed cannot say it.
+    fn choose_outcome(&mut self, outcome: TeachOutcome, cx: &mut Context<Self>) {
+        if self.saving || self.outcome == outcome {
+            return;
+        }
+        self.outcome = outcome;
+        // The refusal from an earlier Save was about the outcome that was picked then.
+        self.save_error = None;
+        cx.notify();
+    }
+
     /// Upload the tape on the sheet as a recipe. The sheet stays, with the reason, when the
     /// server refuses it; on success the title bar says what it became.
+    ///
+    /// An outcome that cannot be made is refused here as well as being unpressable on the sheet,
+    /// because this is where the work is: a guard on the button alone is a guard on one of the
+    /// ways in.
     fn save_recipe(&mut self, cx: &mut Context<Self>) {
         if self.saving {
+            return;
+        }
+        if let Some(why) = self.outcome.blocked() {
+            self.save_error = Some(why.to_string());
+            cx.notify();
             return;
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -369,8 +486,8 @@ impl ComputerScreen {
         cx.notify();
     }
 
-    /// The strip under the title bar after Stop: a name, a description, Save and Discard, and
-    /// what the tape holds or why the upload was refused.
+    /// The strip under the title bar after Stop: which of the three to make, a name, a
+    /// description, Save and Discard, and what the tape holds or why it cannot go up.
     fn save_sheet(
         &self,
         pending: &PendingTape,
@@ -378,13 +495,36 @@ impl ComputerScreen {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let saving = self.saving;
-        let (note, note_color) = match &self.save_error {
-            Some(error) => (error.clone(), theme.danger),
-            None => (
-                format!("{} events · {}", pending.events.len(), pending.backup),
+        let blocked = self.outcome.blocked();
+        // What the line under the sheet says, in the order it matters: a refusal from the last
+        // Save, then an outcome that cannot be made at all, then what was taped. The chosen
+        // outcome's own line goes beside it, because "what is this" and "why can it not be
+        // made" are two different things to be reading.
+        let (note, note_color) = match (&self.save_error, blocked) {
+            (Some(error), _) => (error.clone(), theme.danger),
+            (None, Some(why)) => (why.to_string(), theme.muted_foreground),
+            (None, None) => (
+                format!(
+                    "{} · {} events · {}",
+                    self.outcome.summary(),
+                    pending.events.len(),
+                    pending.backup
+                ),
                 theme.muted_foreground,
             ),
         };
+        let choices: Vec<AnyElement> = TeachOutcome::ALL
+            .into_iter()
+            .map(|outcome| {
+                let picked = outcome == self.outcome;
+                let button = Button::new(outcome.element_id())
+                    .small()
+                    .label(outcome.label())
+                    .disabled(saving)
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_outcome(outcome, cx)));
+                if picked { button.primary() } else { button }.into_any_element()
+            })
+            .collect();
         h_flex()
             .id("teach-save-sheet")
             .w_full()
@@ -398,6 +538,16 @@ impl ComputerScreen {
             .text_color(theme.foreground)
             .border_b_1()
             .border_color(theme.border)
+            // What to make of it comes first, because it is the question the rest of the sheet
+            // is answering: a name and a description are a name and a description for something.
+            .child(
+                h_flex()
+                    .id("teach-make")
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(4.))
+                    .children(choices),
+            )
             .child(
                 div().w(px(240.)).child(
                     field_input(&self.name_input)
@@ -416,8 +566,14 @@ impl ComputerScreen {
                 Button::new("teach-save")
                     .small()
                     .primary()
-                    .label(if saving { "Saving…" } else { "Save" })
-                    .disabled(saving)
+                    .label(if saving {
+                        "Saving…".to_string()
+                    } else {
+                        format!("Save as {}", self.outcome.label().to_lowercase())
+                    })
+                    // An outcome nothing can make is not a Save waiting to happen, and a button
+                    // that looks ready would be the half-wired thing this sheet is avoiding.
+                    .disabled(saving || blocked.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.save_recipe(cx))),
             )
             .child(
@@ -655,5 +811,75 @@ impl Render for ComputerScreen {
             .child(header)
             .when_some(sheet, |this, sheet| this.child(sheet))
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TeachOutcome;
+
+    /// Stopping a tape used to make one thing without asking. It now asks which of three, and
+    /// the answer a person gives has to mean something: the one that works does the work, and
+    /// the two that do not say what they are waiting for rather than failing later.
+    #[test]
+    fn stopping_a_tape_offers_three_outcomes_and_only_one_can_be_made_today() {
+        assert_eq!(
+            TeachOutcome::ALL
+                .iter()
+                .map(|outcome| outcome.label())
+                .collect::<Vec<_>>(),
+            vec!["Recipe", "Skill", "Workflow"],
+            "the three words are the vocabulary, in the order they cost to run"
+        );
+        assert_eq!(
+            TeachOutcome::default(),
+            TeachOutcome::Recipe,
+            "the cheapest, and the only one with an engine behind it, is what Save still makes"
+        );
+        assert!(
+            TeachOutcome::Recipe.blocked().is_none(),
+            "a tape filtered into steps is what the server has always taken"
+        );
+    }
+
+    /// A blocked outcome that only said "no" would be a dead end. Each names what is missing,
+    /// on the screen where somebody is wishing for it.
+    #[test]
+    fn an_outcome_that_cannot_be_made_says_what_it_is_waiting_for() {
+        let skill = TeachOutcome::Skill
+            .blocked()
+            .expect("nothing writes a lesson or keeps one yet");
+        assert!(skill.starts_with("Not yet"), "{skill}");
+        assert!(
+            skill.contains("kept") && skill.contains("model"),
+            "a lesson needs somewhere to live and something to write it, and it read {skill:?}"
+        );
+
+        let workflow = TeachOutcome::Workflow
+            .blocked()
+            .expect("a tape is not a tree, and nothing turns one into the other");
+        assert!(workflow.starts_with("Not yet"), "{workflow}");
+        assert!(
+            workflow.contains("tree"),
+            "the server stores a tree and this has none, which is the whole of the reason, \
+             and it read {workflow:?}"
+        );
+    }
+
+    /// The buttons a driver picks between, each answering to its own name.
+    #[test]
+    fn each_outcome_has_an_id_of_its_own() {
+        let ids: Vec<&str> = TeachOutcome::ALL
+            .iter()
+            .map(|outcome| outcome.element_id())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "teach-make-recipe",
+                "teach-make-skill",
+                "teach-make-workflow"
+            ]
+        );
     }
 }
