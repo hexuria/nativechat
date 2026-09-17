@@ -157,7 +157,7 @@ const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
 /// What `/` lists: the recipes and workflows the app has, and the app's own commands.
 ///
 /// Named after the key that opens it, the way [`crate::components::chat_input::PanelMode::Plus`]
-/// is named after the button, because what it lists is four kinds of thing and no one noun
+/// is named after the button, because what it lists is several kinds of thing and no one noun
 /// covers them.
 ///
 /// ONE LIST, ONE FETCH. Recipes and workflows arrive on the same listing, told apart by the

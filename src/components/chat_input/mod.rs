@@ -57,7 +57,7 @@ pub enum PanelMode {
     Plus,
     /// `@` with no recipe on the draft: the bot's tools and apps.
     Tools,
-    /// `/`: recipes and the app's own commands.
+    /// `/`: the recipes and workflows the bot can be pointed at, and the app's own actions.
     Slash,
     /// `@` with a recipe on the draft: what that recipe needs told.
     Parameters,
