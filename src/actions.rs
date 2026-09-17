@@ -63,7 +63,11 @@ actions!(
         ReportMessage,
         PauseReadAloud,
         ResumeReadAloud,
-        StopReadAloud
+        StopReadAloud,
+        /// The picture overlay: close it, and step through the set it opened.
+        CloseLightbox,
+        LightboxPrev,
+        LightboxNext
     ]
 );
 

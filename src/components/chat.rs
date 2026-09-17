@@ -6,7 +6,7 @@ use crate::chrome::{CHAT_CONTENT_MAX, chat_column_width, timestamps_fit};
 use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
-use crate::components::gen_ui::{render_approval, render_screenshot, render_ui_spec};
+use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_spec};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::find_text::{FindHit, marks_for_row, project_hits};
@@ -153,7 +153,9 @@ struct ChatRow {
     status_line: Option<String>,
     /// A status line about a run that failed, painted in the danger colour rather than dimmed.
     status_failed: bool,
-    screenshot: Option<ScreenshotSpec>,
+    /// The pictures of one stretch of a turn, which the row paints as one strip and the
+    /// lightbox pages through as one set.
+    screenshots: Vec<ScreenshotSpec>,
 }
 
 impl ChatRow {
@@ -184,9 +186,17 @@ impl ChatRow {
             approval: None,
             status_line: None,
             status_failed: false,
-            screenshot: None,
+            screenshots: Vec::new(),
         }
     }
+}
+
+/// Whether a picture belongs to the strip the row before it already holds. Pictures are one
+/// set when they came from the same turn with nothing but pictures between them — that is
+/// what makes a strip, rather than a column of full-width screens nobody scrolls past.
+fn joins_previous_set(rows: &[ChatRow], message_id: &str) -> bool {
+    rows.last()
+        .is_some_and(|last| !last.screenshots.is_empty() && last.source_id == message_id)
 }
 
 fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
@@ -279,8 +289,14 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 }
                 ChatPart::Screenshot(spec) => {
                     flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    if joins_previous_set(&rows, &msg.id) {
+                        if let Some(last) = rows.last_mut() {
+                            last.screenshots.push(spec);
+                        }
+                        continue;
+                    }
                     rows.push(ChatRow {
-                        screenshot: Some(spec),
+                        screenshots: vec![spec],
                         ..ChatRow::slot(format!("{}-shot-{ui_n}", msg.id), msg.id.clone())
                     });
                     ui_n += 1;
@@ -681,14 +697,18 @@ impl Render for ChatTranscript {
                                     ))
                                     .into_any_element();
                             }
-                            if let Some(shot) = &row.screenshot {
+                            if !row.screenshots.is_empty() {
                                 return div()
                                     .id(ElementId::Name(row.id.clone().into()))
                                     .w_full()
                                     .flex()
                                     .justify_start()
                                     .py(px(6.))
-                                    .child(render_screenshot(shot, cx))
+                                    .child(render_screenshots(
+                                        &row.screenshots,
+                                        Some(app_state.clone()),
+                                        cx,
+                                    ))
                                     .into_any_element();
                             }
                             if let Some(line) = &row.status_line {
@@ -1272,12 +1292,64 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::text_row_id;
+    use super::{ChatRow, ScreenshotSpec, joins_previous_set, text_row_id};
 
     #[test]
     fn text_rows_of_one_message_get_distinct_ids() {
         assert_eq!(text_row_id("m1", 0), "m1");
         assert_eq!(text_row_id("m1", 1), "m1-t1");
         assert_ne!(text_row_id("m1", 1), text_row_id("m1", 2));
+    }
+
+    fn shot(call_id: &str) -> ScreenshotSpec {
+        ScreenshotSpec {
+            call_id: call_id.to_string(),
+            caption: String::new(),
+            image: std::sync::Arc::new(gpui_kit::Image::from_bytes(
+                gpui_kit::ImageFormat::Png,
+                Vec::new(),
+            )),
+            width: 1280,
+            height: 800,
+        }
+    }
+
+    fn picture_row(message_id: &str, call_id: &str) -> ChatRow {
+        ChatRow {
+            screenshots: vec![shot(call_id)],
+            ..ChatRow::slot(format!("{message_id}-shot-0"), message_id.to_string())
+        }
+    }
+
+    fn word_row(message_id: &str) -> ChatRow {
+        ChatRow::slot(message_id.to_string(), message_id.to_string())
+    }
+
+    /// Several pictures in a row from one turn are one set, so the transcript shows a strip
+    /// and the lightbox can page through all of them.
+    #[test]
+    fn pictures_that_follow_one_another_in_a_turn_are_one_set() {
+        let rows = vec![word_row("m1"), picture_row("m1", "call-1")];
+        assert!(joins_previous_set(&rows, "m1"));
+    }
+
+    /// A turn's pictures are its own: the next turn starts a strip of its own, however many
+    /// pictures the one before it ended on.
+    #[test]
+    fn the_next_turns_pictures_start_their_own_set() {
+        let rows = vec![picture_row("m1", "call-1")];
+        assert!(!joins_previous_set(&rows, "m2"));
+    }
+
+    /// Words between two pictures break the strip: what the bot said belongs between them.
+    #[test]
+    fn words_between_two_pictures_end_the_set() {
+        let rows = vec![picture_row("m1", "call-1"), word_row("m1")];
+        assert!(!joins_previous_set(&rows, "m1"));
+    }
+
+    #[test]
+    fn the_first_picture_of_the_transcript_has_nothing_to_join() {
+        assert!(!joins_previous_set(&[], "m1"));
     }
 }

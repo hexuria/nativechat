@@ -16,6 +16,7 @@ pub mod fields;
 pub mod gen_ui;
 pub mod hidden_bots;
 pub mod layout;
+pub mod lightbox;
 pub mod login;
 pub mod message;
 pub mod message_actions;

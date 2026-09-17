@@ -904,6 +904,8 @@ pub struct AppState {
     computer_heal_requested: Option<String>,
     /// What the main slot shows: the chat, or the Recipes page.
     pub page: MainPage,
+    /// The pictures of one turn, opened full window from a tile in the transcript.
+    pub lightbox: Option<crate::components::lightbox::Lightbox>,
     pub recipes: Vec<RecipeSummary>,
     pub recipes_filter: RecipeFilter,
     pub recipes_loading: bool,
@@ -1086,6 +1088,7 @@ impl AppState {
             computer_endpoint_missing: false,
             computer_poll: None,
             page: MainPage::Chat,
+            lightbox: None,
             recipes: Vec::new(),
             recipes_filter: RecipeFilter::Mine,
             recipes_loading: false,
@@ -4715,6 +4718,84 @@ impl AppState {
     pub fn read_aloud_state(&self, message_id: &str) -> (bool, bool) {
         let reading = self.native_tts.message_id.as_deref() == Some(message_id);
         (reading, reading && self.native_tts.is_paused)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lightbox. Everything the picture overlay does to the app's state lives here;
+// the overlay itself is components/lightbox.rs.
+// ---------------------------------------------------------------------------
+
+use crate::components::lightbox::Lightbox;
+
+impl AppState {
+    /// Show a turn's pictures full window, starting at the one that was clicked.
+    pub fn open_lightbox(
+        &mut self,
+        shots: Vec<crate::opengrok::ScreenshotSpec>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(last) = shots.len().checked_sub(1) else {
+            return;
+        };
+        self.lightbox = Some(Lightbox {
+            shots,
+            index: index.min(last),
+        });
+        cx.notify();
+    }
+
+    pub fn close_lightbox(&mut self, cx: &mut Context<Self>) {
+        if self.lightbox.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The next (+1) or previous (-1) picture of the set. A set is a ring: the arrows never
+    /// dead-end, they come round again.
+    pub fn step_lightbox(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(open) = self.lightbox.as_mut() else {
+            return;
+        };
+        let total = open.shots.len() as i32;
+        if total < 2 {
+            return;
+        }
+        open.index = (open.index as i32 + delta).rem_euclid(total) as usize;
+        cx.notify();
+    }
+
+    /// The picture the filmstrip was clicked on.
+    pub fn show_lightbox_image(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(open) = self.lightbox.as_mut() else {
+            return;
+        };
+        if index >= open.shots.len() || open.index == index {
+            return;
+        }
+        open.index = index;
+        cx.notify();
+    }
+
+    /// Write the picture being shown into the person's Downloads folder. The bytes are the
+    /// ones the run already decoded, so nothing is re-encoded and nothing is asked of the
+    /// person: a file dialog over a picture they are looking at helps no one.
+    pub fn download_lightbox_image(&self) -> Result<String, String> {
+        let open = self
+            .lightbox
+            .as_ref()
+            .ok_or_else(|| "No picture is open.".to_string())?;
+        let shot = open
+            .current()
+            .ok_or_else(|| "No picture is open.".to_string())?;
+        let dir = directories::UserDirs::new()
+            .and_then(|dirs| dirs.download_dir().map(std::path::Path::to_path_buf))
+            .ok_or_else(|| "This Mac has no Downloads folder.".to_string())?;
+        let stamp = Local::now().format("%Y%m%d-%H%M%S");
+        let path = dir.join(format!("nativechat-{stamp}-{}.png", open.index + 1));
+        std::fs::write(&path, &shot.image.bytes).map_err(|error| error.to_string())?;
+        Ok(path.display().to_string())
     }
 }
 

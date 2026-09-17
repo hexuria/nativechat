@@ -2,11 +2,12 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
     About, BranchInNewChat, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind,
-    CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput, Hide, HideOthers,
-    Minimize, NavBack, NavForward, NewChat, OpenCommandPalette, OpenSettings, PaletteNextTab,
-    PalettePrevTab, PaletteSelectNext, PaletteSelectPrev, PickFinderItem, Quit, ReadAloud,
-    ReportMessage, Search, ShowAll, ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown,
-    ToggleFps, ToggleMiniSidebar, ToggleSidebar, ToggleTheme, Zoom,
+    CloseLightbox, CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput,
+    Hide, HideOthers, LightboxNext, LightboxPrev, Minimize, NavBack, NavForward, NewChat,
+    OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab, PaletteSelectNext,
+    PaletteSelectPrev, PickFinderItem, Quit, ReadAloud, ReportMessage, Search, ShowAll,
+    ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar,
+    ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::chrome::TITLE_BAR_H;
@@ -128,6 +129,11 @@ fn main() {
                 KeyBinding::new("escape", CloseBotFinder, Some("BotFinder")),
                 KeyBinding::new("escape", CloseCommandPalette, Some("CommandPalette")),
                 KeyBinding::new("escape", CloseCommandPalette, Some("Root")),
+                // The overlay holds focus while it is open, so its own context sits deeper in
+                // the stack than Root's and takes escape back off the command palette.
+                KeyBinding::new("escape", CloseLightbox, Some("Lightbox")),
+                KeyBinding::new("left", LightboxPrev, Some("Lightbox")),
+                KeyBinding::new("right", LightboxNext, Some("Lightbox")),
                 KeyBinding::new("tab", PaletteNextTab, Some("CommandPalette")),
                 KeyBinding::new("shift-tab", PalettePrevTab, Some("CommandPalette")),
                 KeyBinding::new("down", PaletteSelectNext, Some("CommandPalette")),
