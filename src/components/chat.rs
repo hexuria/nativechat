@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,21 +11,26 @@ use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_spec};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
+use crate::components::user_form::{
+    UserFormInputMap, UserFormTextareaMap, field_key, render_user_form,
+};
 use crate::find_text::{FindHit, marks_for_row, project_hits};
-use crate::opengrok::{ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, collapse_open_approvals};
+use crate::opengrok::{
+    ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, UserFormSpec, UserFormValues,
+    collapse_open_approvals,
+};
 use crate::state::{
     AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, is_status_line, is_tool_standin,
     is_unsent_turn_note,
 };
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::base::{Align, Placement, Positioner};
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use std::rc::Rc;
 
 /// Cheap fingerprint so ChatView does not rebuild markdown on unrelated AppState
 /// changes (sidebar toggle, theme, amplitude, etc.).
@@ -35,6 +42,8 @@ struct ChatFeedRev {
     last_len: usize,
     last_ui: usize,
     form_picks: Vec<(String, String, String)>,
+    user_form_picks: Vec<(String, String, String)>,
+    user_forms: Vec<(String, String)>,
     is_ai_responding: bool,
     debug_mode: bool,
     can_read_aloud: bool,
@@ -79,6 +88,40 @@ impl ChatFeedRev {
                     .collect();
                 picks.sort();
                 picks
+            },
+            user_form_picks: {
+                let mut picks: Vec<(String, String, String)> = state
+                    .user_form_picks
+                    .iter()
+                    .flat_map(|(entry, fields)| {
+                        fields
+                            .iter()
+                            .map(|(field, value)| (entry.clone(), field.clone(), value.clone()))
+                    })
+                    .collect();
+                picks.sort();
+                picks
+            },
+            user_forms: {
+                let mut cards: Vec<(String, String)> = conv
+                    .map(|c| {
+                        c.messages
+                            .iter()
+                            .flat_map(|m| m.parts.iter())
+                            .filter_map(|part| match part {
+                                ChatPart::UserForm(spec) => Some((
+                                    spec.entry_id.clone(),
+                                    spec.effective_resolution()
+                                        .map(|r| r.as_str().to_string())
+                                        .unwrap_or_else(|| "idle".into()),
+                                )),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                cards.sort();
+                cards
             },
             is_ai_responding: state.is_active_bot_responding(),
             debug_mode: state.debug_markdown_disabled,
@@ -161,6 +204,7 @@ struct ChatRow {
     /// The pictures of one stretch of a turn, which the row paints as one strip and the
     /// lightbox pages through as one set.
     screenshots: Vec<ScreenshotSpec>,
+    user_form: Option<UserFormSpec>,
 }
 
 impl ChatRow {
@@ -193,6 +237,7 @@ impl ChatRow {
             status_failed: false,
             status_retry: false,
             screenshots: Vec::new(),
+            user_form: None,
         }
     }
 }
@@ -330,6 +375,14 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     });
                     ui_n += 1;
                 }
+                ChatPart::UserForm(spec) => {
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    rows.push(ChatRow {
+                        user_form: Some(spec),
+                        ..ChatRow::slot(format!("{}-user-form-{ui_n}", msg.id), msg.id.clone())
+                    });
+                    ui_n += 1;
+                }
             }
         }
         flush_text(&mut rows, &mut text_buf, &mut text_n);
@@ -404,6 +457,8 @@ struct ChatTranscript {
     /// composer itself last measured it (see `ChatView::render`). Zero until that first
     /// measurement lands, which is one frame.
     composer_height: Pixels,
+    user_form_inputs: UserFormInputMap,
+    user_form_textareas: UserFormTextareaMap,
 }
 
 impl ChatTranscript {
@@ -471,6 +526,8 @@ impl ChatTranscript {
             find_hits: Vec::new(),
             find_current: None,
             composer_height: px(0.),
+            user_form_inputs: HashMap::new(),
+            user_form_textareas: HashMap::new(),
         };
         if this.feed_rev.native_speaking_id.is_some() {
             this.start_highlight_pump(cx);
@@ -665,12 +722,109 @@ impl ChatTranscript {
         })
         .detach();
     }
+
+    fn sync_user_form_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut needed: HashMap<String, (bool, bool, Option<String>, Option<String>)> =
+            HashMap::new();
+        for row in self.rows.iter() {
+            let Some(spec) = &row.user_form else {
+                continue;
+            };
+            if !spec.is_unresolved() {
+                continue;
+            }
+            for field in &spec.fields {
+                match field.kind {
+                    crate::opengrok::UserFormFieldKind::Checkbox
+                    | crate::opengrok::UserFormFieldKind::Select => {}
+                    crate::opengrok::UserFormFieldKind::Textarea => {
+                        needed.insert(
+                            field_key(&spec.entry_id, &field.id),
+                            (
+                                true,
+                                field.masked(),
+                                field.placeholder.clone(),
+                                field.prefill.clone(),
+                            ),
+                        );
+                    }
+                    _ => {
+                        needed.insert(
+                            field_key(&spec.entry_id, &field.id),
+                            (
+                                false,
+                                field.masked(),
+                                field.placeholder.clone(),
+                                field.prefill.clone(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        self.user_form_inputs
+            .retain(|key, _| needed.get(key).is_some_and(|(textarea, _, _, _)| !textarea));
+        self.user_form_textareas
+            .retain(|key, _| needed.get(key).is_some_and(|(textarea, _, _, _)| *textarea));
+        for (key, (textarea, masked, placeholder, prefill)) in needed {
+            if textarea {
+                if self.user_form_textareas.contains_key(&key) {
+                    continue;
+                }
+                let placeholder = placeholder.unwrap_or_default();
+                let prefill = prefill.unwrap_or_default();
+                let state = cx.new(|cx| {
+                    let mut state = TextareaState::new(window, cx);
+                    if !placeholder.is_empty() {
+                        state = state.placeholder(placeholder);
+                    }
+                    if !prefill.is_empty() {
+                        state = state.default_value(prefill);
+                    }
+                    state
+                });
+                cx.subscribe(&state, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                })
+                .detach();
+                self.user_form_textareas.insert(key, state);
+            } else if !self.user_form_inputs.contains_key(&key) {
+                let placeholder = placeholder.unwrap_or_default();
+                let prefill = prefill.unwrap_or_default();
+                let state = cx.new(|cx| {
+                    let mut state = InputState::new(window, cx);
+                    if !placeholder.is_empty() {
+                        state = state.placeholder(placeholder);
+                    }
+                    if masked {
+                        state = state.masked(true);
+                    }
+                    if !prefill.is_empty() {
+                        state = state.default_value(prefill);
+                    }
+                    state
+                });
+                cx.subscribe(&state, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                })
+                .detach();
+                self.user_form_inputs.insert(key, state);
+            }
+        }
+    }
 }
 
 impl Render for ChatTranscript {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_user_form_fields(window, cx);
         let rows = self.rows.clone();
         let app_state = self.app_state.clone();
+        let user_form_inputs = self.user_form_inputs.clone();
+        let user_form_textareas = self.user_form_textareas.clone();
         let input = self.input.clone();
         let debug_mode = self.debug_mode;
         let can_read_aloud = self.can_read_aloud;
@@ -686,7 +840,7 @@ impl Render for ChatTranscript {
         let find_current = self.find_current;
         let composer_height = self.composer_height;
         let timestamps_ok = {
-            let win = f32::from(_window.viewport_size().width);
+            let win = f32::from(window.viewport_size().width);
             let app = self.app_state.read(cx);
             timestamps_fit(chat_column_width(
                 win,
@@ -830,6 +984,57 @@ impl Render for ChatTranscript {
                                     .py(px(6.))
                                     .child(div().w_full().max_w(px(560.)).child(render_approval(
                                         spec,
+                                        Some(app_state.clone()),
+                                        cx,
+                                    )))
+                                    .into_any_element();
+                            }
+                            if let Some(spec) = &row.user_form {
+                                let picks = app_state
+                                    .read(cx)
+                                    .user_form_picks
+                                    .get(&spec.entry_id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let mut values = UserFormValues { by_id: picks };
+                                for field in &spec.fields {
+                                    if values.by_id.contains_key(&field.id) {
+                                        continue;
+                                    }
+                                    let key = field_key(&spec.entry_id, &field.id);
+                                    let raw = if let Some(state) = user_form_textareas.get(&key) {
+                                        Some(state.read(cx).value().to_string())
+                                    } else {
+                                        user_form_inputs
+                                            .get(&key)
+                                            .map(|state| state.read(cx).value().to_string())
+                                    };
+                                    let Some(raw) = raw else {
+                                        continue;
+                                    };
+                                    // Presence only for secrets: the typed value stays in
+                                    // InputState, never in this map, never on AppState.
+                                    let stored = if field.masked() {
+                                        if raw.trim().is_empty() {
+                                            continue;
+                                        }
+                                        "1".to_string()
+                                    } else {
+                                        raw
+                                    };
+                                    values.by_id.insert(field.id.clone(), stored);
+                                }
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(div().w_full().max_w(px(560.)).child(render_user_form(
+                                        spec,
+                                        &user_form_inputs,
+                                        &user_form_textareas,
+                                        &values,
                                         Some(app_state.clone()),
                                         cx,
                                     )))

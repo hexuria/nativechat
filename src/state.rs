@@ -11,9 +11,10 @@ use crate::opengrok::{
     LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
     QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
     RecipeStep, RecipeSummary, ReplyQuote, RunReplay, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, Unreachable, activity_from_replay, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
-    policy_answer, reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
+    TurnAssembler, TurnRecipe, Unreachable, WAITING_FOR_YOU, activity_from_replay,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    local_exec_outcome, policy_answer, reads_as_gateway_unreachable, serve_local_exec,
+    stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -51,7 +52,10 @@ impl Message {
         !self.content.trim().is_empty()
             || self.parts.iter().any(|part| match part {
                 ChatPart::Text(text) => !text.trim().is_empty(),
-                ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => true,
+                ChatPart::Ui(_)
+                | ChatPart::Approval(_)
+                | ChatPart::Screenshot(_)
+                | ChatPart::UserForm(_) => true,
             })
     }
 
@@ -61,7 +65,10 @@ impl Message {
         !self.content.trim().is_empty()
             || self.parts.iter().any(|part| match part {
                 ChatPart::Text(text) => !text.trim().is_empty(),
-                ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => false,
+                ChatPart::Ui(_)
+                | ChatPart::Approval(_)
+                | ChatPart::Screenshot(_)
+                | ChatPart::UserForm(_) => false,
             })
     }
 
@@ -104,7 +111,7 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
                 });
             }
             ChatPart::Ui(_) => {}
-            ChatPart::Approval(_) => break_paragraph(&mut words),
+            ChatPart::Approval(_) | ChatPart::UserForm(_) => break_paragraph(&mut words),
         }
     }
     close_text_run(&mut words, &mut saved);
@@ -230,6 +237,18 @@ pub const TURN_SIGNED_OUT_NOTE: &str = "This turn was not sent: the app is signe
 /// thread's own line for it before deciding the turn is over, and a spelling that drifted
 /// between the two would end the turn out from under the person's answer.
 const WAITING_APPROVAL_STATUS: &str = "Waiting for approval";
+
+/// The working line while an unresolved user-form card is on screen. Distinct from
+/// [`WAITING_APPROVAL_STATUS`]: that one is a yes/no on a command, this one is credentials
+/// the bot must not see.
+const WAITING_FOR_YOU_STATUS: &str = WAITING_FOR_YOU;
+
+fn is_waiting_on_person(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some(WAITING_APPROVAL_STATUS) | Some(WAITING_FOR_YOU_STATUS)
+    )
+}
 
 /// A turn that never reached the server, in either of the two ways that happens.
 ///
@@ -1314,6 +1333,9 @@ pub struct AppState {
     pub message_reactions: HashMap<String, String>,
     pub emoji_picker: Option<EmojiPickerOpen>,
     pub form_picks: HashMap<String, HashMap<String, String>>,
+    /// Checkbox / select picks on a user-form. Never passwords or other secrets —
+    /// those stay in the transcript view's input state and are never written here.
+    pub user_form_picks: HashMap<String, HashMap<String, String>>,
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
@@ -1642,6 +1664,7 @@ impl AppState {
             message_reactions: HashMap::new(),
             emoji_picker: None,
             form_picks: HashMap::new(),
+            user_form_picks: HashMap::new(),
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
@@ -1916,16 +1939,23 @@ impl AppState {
     /// bot's ending clearing another's line, and it leaked both ways. Keyed by thread there is
     /// nothing to guard: A's ending can no more reach B's line than B's frames can reach A's.
     fn finish_responding(&mut self, conversation_id: Option<&str>, waiting_approval: bool) {
+        self.end_turn_waiting(
+            conversation_id,
+            waiting_approval.then_some(WAITING_APPROVAL_STATUS),
+        );
+    }
+
+    fn end_turn_waiting(&mut self, conversation_id: Option<&str>, waiting: Option<&str>) {
         let Some(conversation_id) = conversation_id else {
             return;
         };
-        if waiting_approval {
+        if let Some(label) = waiting {
             let activity = self
                 .thread_activity
                 .entry(conversation_id.to_string())
                 .or_default();
             activity.responding = false;
-            activity.label = Some(WAITING_APPROVAL_STATUS.to_string());
+            activity.label = Some(label.to_string());
         } else {
             self.thread_activity.remove(conversation_id);
         }
@@ -4483,11 +4513,18 @@ impl AppState {
                 self.fill_open_approval_commands(cx);
             }
             "finished" => {
-                self.finish_responding(Some(conversation_id), false);
+                let waiting_form = parts
+                    .iter()
+                    .any(|part| matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved()));
+                if waiting_form {
+                    self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+                } else {
+                    self.finish_responding(Some(conversation_id), false);
+                }
                 // Only when nobody has written this turn down yet. The live stream may have come
                 // back and settled it while the replay was in the air, and a turn saved twice is
                 // a thread that says everything twice.
-                if self.turn_is_unsettled(conversation_id, &turn.run_id) {
+                if !waiting_form && self.turn_is_unsettled(conversation_id, &turn.run_id) {
                     self.persist_assistant_reply(
                         conversation_id,
                         plain,
@@ -4727,7 +4764,7 @@ impl AppState {
                     Err(error) => Err(error),
                 },
             };
-            let (result, waiting_approval, deeds) = match coworker {
+            let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
@@ -4791,6 +4828,7 @@ impl AppState {
                         .await;
                     assembler.finish();
                     let waiting_approval = assembler.waiting_approval();
+                    let waiting_user_form = assembler.waiting_user_form();
                     // What the tools did, in case the turn ends without a word about it.
                     let deeds = tracker.deeds();
                     let (plain, parts) = assembler.snapshot();
@@ -4805,9 +4843,9 @@ impl AppState {
                         }
                         cx.notify();
                     });
-                    (result, waiting_approval, deeds)
+                    (result, waiting_approval, waiting_user_form, deeds)
                 }
-                Err(error) => (Err(error), false, Vec::new()),
+                Err(error) => (Err(error), false, false, Vec::new()),
             };
             let _ = this.update(cx, |state, cx| {
                 // Something else has already decided what this turn came to: the person stopped
@@ -4831,8 +4869,8 @@ impl AppState {
                     if !message.has_text_body() {
                         match &result {
                             Ok(text) if !text.is_empty() => message.content = text.clone(),
-                            // Parked on a permission card: the turn is not over yet.
-                            Ok(_) if waiting_approval => {}
+                            // Parked on a permission card or a user-form: the turn is not over yet.
+                            Ok(_) if waiting_approval || waiting_user_form => {}
                             Ok(_) => {
                                 message.content = tool_standin(&deeds)
                                     .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
@@ -4860,7 +4898,7 @@ impl AppState {
                         }
                     }
                 }
-                if !waiting_approval && result.is_ok() {
+                if !waiting_approval && !waiting_user_form && result.is_ok() {
                     // The run is final; a run parked on a card is saved when it finishes.
                     // A status line is painted, never saved: `persist_assistant_reply` refuses
                     // it, so it cannot become history the model is shown next turn. Settling the
@@ -4888,7 +4926,9 @@ impl AppState {
                     // here instead.
                     state.release_live_turn(&conversation_id, &run_id);
                 }
-                if waiting_approval {
+                if waiting_user_form {
+                    state.end_turn_waiting(Some(&conversation_id), Some(WAITING_FOR_YOU_STATUS));
+                } else if waiting_approval {
                     let open = state
                         .conversations
                         .iter()
@@ -5355,15 +5395,28 @@ impl AppState {
                                         );
                                     }
                                     "finished" => {
-                                        state.finish_responding(conversation_id.as_deref(), false);
-                                        if let Some(id) = conversation_id.as_ref() {
-                                            state.persist_assistant_reply(
-                                                id,
-                                                plain.clone(),
-                                                &parts,
-                                                Some(&run_id),
-                                                cx,
+                                        let waiting_form = parts.iter().any(|part| {
+                                            matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved())
+                                        });
+                                        if waiting_form {
+                                            state.end_turn_waiting(
+                                                conversation_id.as_deref(),
+                                                Some(WAITING_FOR_YOU_STATUS),
                                             );
+                                        } else {
+                                            state.finish_responding(
+                                                conversation_id.as_deref(),
+                                                false,
+                                            );
+                                            if let Some(id) = conversation_id.as_ref() {
+                                                state.persist_assistant_reply(
+                                                    id,
+                                                    plain.clone(),
+                                                    &parts,
+                                                    Some(&run_id),
+                                                    cx,
+                                                );
+                                            }
                                         }
                                     }
                                     "failed" => {
@@ -5397,10 +5450,11 @@ impl AppState {
                 // This thread's own line, not the app's: a poll that has run out of patience
                 // must not decide that some other bot's turn is over, and must not end this one
                 // while it is stopped at a card waiting for a person.
-                let waiting = conversation_id
-                    .as_deref()
-                    .and_then(|id| state.thread_status(id))
-                    == Some(WAITING_APPROVAL_STATUS);
+                let waiting = is_waiting_on_person(
+                    conversation_id
+                        .as_deref()
+                        .and_then(|id| state.thread_status(id)),
+                );
                 if !waiting {
                     state.finish_responding(conversation_id.as_deref(), false);
                 }
@@ -5669,7 +5723,39 @@ impl AppState {
         cx.notify();
     }
 
+    /// Non-secret user-form control (checkbox / select). Do not call this with a
+    /// password or otp; those never belong on `AppState`.
+    pub fn pick_user_form_option(
+        &mut self,
+        entry_id: String,
+        field_id: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let masked = self.conversations.iter().any(|conversation| {
+            conversation.messages.iter().any(|message| {
+                message.parts.iter().any(|part| match part {
+                    ChatPart::UserForm(spec) if spec.entry_id == entry_id => spec
+                        .fields
+                        .iter()
+                        .any(|field| field.id == field_id && field.masked()),
+                    _ => false,
+                })
+            })
+        });
+        if masked {
+            return;
+        }
+        self.user_form_picks
+            .entry(entry_id)
+            .or_default()
+            .insert(field_id, value);
+        cx.notify();
+    }
+
     pub fn submit_form(&mut self, message_id: String, spec: FormSpec, cx: &mut Context<Self>) {
+        // Generative UI only. User-form secrets must never take this path:
+        // it concatenates values into `send_message` / AG-UI `content`.
         let picks = self
             .form_picks
             .get(&message_id)
@@ -5801,9 +5887,13 @@ impl AppState {
             .detach();
         }
 
-        if self.has_open_approval(&conversation_id) {
+        if self.has_open_approval(&conversation_id) || self.has_open_user_form(&conversation_id) {
             // The card is this thread's, and so is the line saying what it is waiting for.
-            self.finish_responding(Some(&conversation_id), true);
+            if self.has_open_user_form(&conversation_id) {
+                self.end_turn_waiting(Some(&conversation_id), Some(WAITING_FOR_YOU_STATUS));
+            } else {
+                self.finish_responding(Some(&conversation_id), true);
+            }
             cx.notify();
             return;
         }
@@ -5832,6 +5922,23 @@ impl AppState {
                     }
                     _ => false,
                 })
+        })
+    }
+
+    fn has_open_user_form(&self, conversation_id: &str) -> bool {
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return false;
+        };
+        conversation.messages.iter().rev().any(|message| {
+            !message.is_me
+                && message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved()))
         })
     }
 
@@ -6725,7 +6832,84 @@ mod tests {
         let kept: Vec<&str> = sent.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             kept,
-            vec!["hi", "still there?", "[took a screenshot of my screen]"]
+            vec![
+                "hi",
+                "still there?",
+                "[took a screenshot of my screen]"
+            ]
+        );
+    }
+
+    /// A user-form card's typed values — especially a password — must never become the
+    /// next turn's AG-UI `content`. The card lives in `parts`; `content` is the prose.
+    #[test]
+    fn user_form_values_never_enter_agui_content() {
+        let spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "entry-pw",
+                "formRequest": {
+                    "title": "Google password",
+                    "fields": [{
+                        "id": "password",
+                        "label": "Password",
+                        "type": "password",
+                        "required": true,
+                        "value": "s3cret-pass"
+                    }]
+                }
+            }),
+            None,
+        )
+        .expect("a card");
+        assert!(spec.fields[0].prefill.is_none());
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let sent = agui_messages(&[bot]);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].content, "I'll sign you in.");
+        assert!(
+            !sent[0].content.contains("s3cret-pass"),
+            "password leaked into AguiMessage.content: {}",
+            sent[0].content
+        );
+        let dump = format!("{sent:?}");
+        assert!(
+            !dump.contains("s3cret-pass"),
+            "password in Debug of messages: {dump}"
+        );
+    }
+
+    #[test]
+    fn saved_parts_drop_user_form_cards_and_keep_no_password() {
+        let spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "entry-pw",
+                "formRequest": {
+                    "title": "Google password",
+                    "fields": [{
+                        "id": "password",
+                        "label": "Password",
+                        "type": "password",
+                        "value": "s3cret-pass"
+                    }]
+                }
+            }),
+            None,
+        )
+        .expect("a card");
+        let live = vec![
+            ChatPart::Text("I'll sign you in.".into()),
+            ChatPart::UserForm(spec),
+            ChatPart::Text("The page is ready.".into()),
+        ];
+        let saved = saved_parts(&live);
+        let blob = format!("{saved:?}");
+        assert!(!blob.contains("s3cret-pass"));
+        assert!(
+            saved
+                .iter()
+                .all(|part| matches!(part, crate::services::database::MessagePart::Text(_))),
+            "a card is not a saved part: {saved:?}"
         );
     }
 
@@ -6777,6 +6961,13 @@ mod tests {
                 ),
                 ChatPart::Ui(_) => "ui".to_string(),
                 ChatPart::Approval(_) => "approval".to_string(),
+                ChatPart::UserForm(spec) => format!(
+                    "user-form {} {}",
+                    spec.entry_id,
+                    spec.effective_resolution()
+                        .map(|r| r.as_str())
+                        .unwrap_or("idle")
+                ),
             })
             .collect()
     }

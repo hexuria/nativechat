@@ -460,6 +460,8 @@ fn render_form(
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
+    // Generative choice chips → `submit_form` → `send_message`. Never used for
+    // passwords; those are `render_user_form`.
     let theme = cx.theme();
     let picks = app
         .as_ref()

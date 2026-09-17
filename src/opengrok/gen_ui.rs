@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::client::LocalExecMode;
+use super::user_form::{UserFormSpec, is_user_form_tool};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatPart {
@@ -19,6 +20,8 @@ pub enum ChatPart {
     Approval(ApprovalSpec),
     /// The bot's screen after a `computer` action: a picture in the feed.
     Screenshot(ScreenshotSpec),
+    /// In-chat credentials that fill the box page. Not [`UiSpec::Form`], not a vault.
+    UserForm(UserFormSpec),
 }
 
 /// A screenshot the run produced, decoded once and shared by every row that paints it.
@@ -185,6 +188,10 @@ pub struct BarItem {
     pub value: f32,
 }
 
+/// Generative choice-chip form. Answers go through `send_message` as chat text.
+///
+/// This is **not** user-form credentials. Password / otp / `secret` fields must
+/// never be routed here — those are [`UserFormSpec`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct FormSpec {
     pub title: Option<String>,
@@ -262,7 +269,7 @@ impl TurnAssembler {
                         }
                     }
                 }
-                if is_ui_tool(name) {
+                if is_ui_tool(name) || is_user_form_tool(name) {
                     self.flush_text();
                     self.tool = Some(OpenTool {
                         id,
@@ -291,11 +298,7 @@ impl TurnAssembler {
             "TOOL_CALL_END" => {
                 self.flush_text();
                 if let Some(tool) = self.tool.take() {
-                    if let Ok(value) = serde_json::from_str::<Value>(&tool.args) {
-                        if let Some(spec) = UiSpec::from_tool(&tool.name, &value) {
-                            self.push_ui(spec, tool.id, tool.name);
-                        }
-                    }
+                    self.close_tool(tool);
                 }
             }
             "CUSTOM" => {
@@ -318,6 +321,9 @@ impl TurnAssembler {
                         self.committed.push(ChatPart::Approval(spec));
                         self.waiting_approval = true;
                     }
+                } else if let Some(spec) = UserFormSpec::from_custom_event(event) {
+                    self.flush_text();
+                    self.push_user_form(spec);
                 } else {
                     let value = event.get("value").cloned().unwrap_or(Value::Null);
                     if let Some(spec) = UiSpec::from_custom(name, &value) {
@@ -353,6 +359,13 @@ impl TurnAssembler {
 
     pub fn waiting_approval(&self) -> bool {
         self.waiting_approval
+    }
+
+    /// An unresolved user-form card is on the turn. Distinct from a permission card.
+    pub fn waiting_user_form(&self) -> bool {
+        self.committed
+            .iter()
+            .any(|part| matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved()))
     }
 
     fn attach_tool_result(&mut self, event: &Value) {
@@ -391,12 +404,34 @@ impl TurnAssembler {
     pub fn finish(&mut self) {
         self.flush_text();
         if let Some(tool) = self.tool.take() {
-            if let Ok(value) = serde_json::from_str::<Value>(&tool.args) {
-                if let Some(spec) = UiSpec::from_tool(&tool.name, &value) {
-                    self.push_ui(spec, tool.id, tool.name);
-                }
-            }
+            self.close_tool(tool);
         }
+    }
+
+    fn close_tool(&mut self, tool: OpenTool) {
+        let Ok(value) = serde_json::from_str::<Value>(&tool.args) else {
+            return;
+        };
+        if is_user_form_tool(&tool.name) {
+            if let Some(spec) = UserFormSpec::from_tool_args(&value, &tool.id) {
+                self.push_user_form(spec);
+            }
+            return;
+        }
+        if let Some(spec) = UiSpec::from_tool(&tool.name, &value) {
+            self.push_ui(spec, tool.id, tool.name);
+        }
+    }
+
+    fn push_user_form(&mut self, spec: UserFormSpec) {
+        if let Some(existing) = self.committed.iter_mut().find_map(|part| match part {
+            ChatPart::UserForm(existing) if existing.entry_id == spec.entry_id => Some(existing),
+            _ => None,
+        }) {
+            existing.merge(spec);
+            return;
+        }
+        self.committed.push(ChatPart::UserForm(spec));
     }
 
     pub fn take_completed_ui_tools(&mut self) -> Vec<CompletedUiTool> {
@@ -408,7 +443,10 @@ impl TurnAssembler {
         self.committed.retain(|part| match part {
             ChatPart::Ui(UiSpec::BarChart(_)) => !chart,
             ChatPart::Ui(UiSpec::Form(_)) => chart,
-            ChatPart::Text(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => true,
+            ChatPart::Text(_)
+            | ChatPart::Approval(_)
+            | ChatPart::Screenshot(_)
+            | ChatPart::UserForm(_) => true,
         });
         self.committed.push(ChatPart::Ui(spec));
         self.completed_ui.retain(|tool| tool.name != name);
@@ -709,7 +747,7 @@ fn plain_text(parts: &[ChatPart]) -> String {
         match part {
             ChatPart::Text(text) => run.push_str(text),
             ChatPart::Ui(_) => {}
-            ChatPart::Approval(_) | ChatPart::Screenshot(_) => {
+            ChatPart::Approval(_) | ChatPart::Screenshot(_) | ChatPart::UserForm(_) => {
                 push_run(&mut out, std::mem::take(&mut run))
             }
         }
@@ -1365,5 +1403,217 @@ mod tests {
                 .iter()
                 .any(|part| matches!(part, ChatPart::Screenshot(_)))
         );
+    }
+
+    fn user_form_custom(entry: &str, request: Value, resolution: Value) -> Value {
+        json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "entryId": entry,
+                "formRequest": request,
+                "formResolution": resolution
+            }
+        })
+    }
+
+    fn password_request() -> Value {
+        json!({
+            "title": "Google password",
+            "instruction": "Enter the password for that account.",
+            "fields": [
+                {
+                    "id": "password",
+                    "label": "Password",
+                    "type": "password",
+                    "required": true,
+                    "value": "s3cret-pass"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn a_user_form_custom_is_not_a_generative_form() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&user_form_custom(
+            "entry-pw",
+            password_request(),
+            Value::Null,
+        ));
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "", "field values must not become chat text");
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.title, "Google password");
+                assert!(spec.fields[0].masked());
+                assert!(spec.fields[0].prefill.is_none());
+                assert!(spec.is_unresolved());
+            }
+            other => panic!("expected UserForm, got {other:?}"),
+        }
+        assert!(
+            parts.iter().all(|part| !matches!(part, ChatPart::Ui(_))),
+            "user-form must not mount as UiSpec::Form: {parts:?}"
+        );
+        let dump = format!("{parts:?}");
+        assert!(
+            !dump.contains("s3cret-pass"),
+            "password must not appear in the assembler snapshot: {dump}"
+        );
+        assert!(turn.waiting_user_form());
+        assert!(!turn.waiting_approval());
+    }
+
+    #[test]
+    fn form_resolution_settles_the_same_entry() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&user_form_custom(
+            "entry-pw",
+            password_request(),
+            Value::Null,
+        ));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": { "entryId": "entry-pw", "formResolution": "fill_failed" }
+        }));
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "");
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.pill(), Some("Not filled"));
+                assert!(!spec.is_unresolved());
+            }
+            other => panic!("expected one settled card, got {other:?}"),
+        }
+        assert!(!turn.waiting_user_form());
+    }
+
+    #[test]
+    fn request_user_form_tool_mounts_as_user_form() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_START",
+            "toolCallId": "c-form",
+            "toolCallName": "request_user_form"
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_ARGS",
+            "toolCallId": "c-form",
+            "delta": "{\"formRequest\":{\"title\":\"Code\",\"fields\":[{\"id\":\"otp\",\"label\":\"Code\",\"type\":\"otp\",\"required\":true,\"value\":\"654321\"}]}}"
+        }));
+        turn.push_event(&json!({"type":"TOOL_CALL_END","toolCallId":"c-form"}));
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "");
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.fields[0].kind, crate::opengrok::UserFormFieldKind::Otp);
+                assert!(spec.fields[0].prefill.is_none());
+            }
+            other => panic!("expected UserForm from tool, got {other:?}"),
+        }
+        let dump = format!("{parts:?}");
+        assert!(
+            !dump.contains("654321"),
+            "otp must not appear in snapshot: {dump}"
+        );
+    }
+
+    #[test]
+    fn a_custom_form_event_is_still_generative_ui() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type":"CUSTOM",
+            "name":"ui",
+            "value":{
+                "component":"form",
+                "title":"Next",
+                "fields":[{"id":"go","label":"Go","options":["Yes","No"]}],
+                "submit":"Send"
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        assert!(matches!(parts.as_slice(), [ChatPart::Ui(UiSpec::Form(_))]));
+        assert!(!turn.waiting_user_form());
+    }
+
+    #[test]
+    fn user_form_does_not_use_formspec_submit_copy() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&user_form_custom(
+            "e1",
+            json!({
+                "title": "Email",
+                "fields": [{"id":"email","label":"Email","type":"email","required":true}]
+            }),
+            Value::Null,
+        ));
+        let (_, parts) = turn.snapshot();
+        let dump = format!("{parts:?}");
+        assert!(
+            !dump.contains("Fill in the required field to continue"),
+            "must not steal plugin-setup copy: {dump}"
+        );
+        assert!(!matches!(parts.as_slice(), [ChatPart::Ui(UiSpec::Form(_))]));
+    }
+
+    #[test]
+    fn a_form_named_custom_is_still_generative_choice_chips() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type":"CUSTOM",
+            "name":"form",
+            "value":{
+                "title":"Next",
+                "fields":[{"id":"go","label":"Go","options":["Yes","No"]}],
+                "submit":"Send"
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::Ui(UiSpec::Form(spec))] => {
+                assert_eq!(spec.title.as_deref(), Some("Next"));
+                assert_eq!(spec.fields[0].options, vec!["Yes", "No"]);
+            }
+            other => panic!("expected FormSpec, got {other:?}"),
+        }
+        assert!(!turn.waiting_user_form());
+    }
+
+    #[test]
+    fn official_send_message_envelope_mounts_as_user_form() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "kind": "send-message",
+                "id": "entry-email",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": {
+                        "title": "Google account email",
+                        "instruction": "Enter the other Gmail address you want to sign in with.",
+                        "fields": [
+                            {"id": "email", "label": "Email or phone", "type": "email", "required": true}
+                        ],
+                        "domain": "accounts.google.com",
+                        "liveHost": "accounts.google.com"
+                    }
+                },
+                "formResolution": null
+            }
+        }));
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "");
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "entry-email");
+                assert_eq!(spec.title, "Google account email");
+                assert!(spec.is_unresolved());
+            }
+            other => panic!("expected UserForm from official envelope, got {other:?}"),
+        }
     }
 }

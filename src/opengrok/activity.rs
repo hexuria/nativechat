@@ -176,6 +176,9 @@ fn deed_from_tool(name: &str, args: Option<&str>) -> Option<String> {
                 format!("opened {host}")
             })
             .unwrap_or_else(|| "opened a page on my screen".into()),
+        "request_user_form" | "request-user-form" | "user-form" => {
+            "asked you to fill a form".into()
+        }
         other => format!("used {other}"),
     };
     Some(deed)
@@ -216,6 +219,21 @@ pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTic
                 ActivityTick::Set(BotActivity {
                     label: "Waiting for approval".into(),
                 })
+            } else if super::user_form::is_user_form_event(
+                event.get("name").and_then(Value::as_str).unwrap_or(""),
+                event.get("value").unwrap_or(event),
+            ) {
+                let unresolved = super::user_form::UserFormSpec::from_custom_event(event)
+                    .map(|spec| spec.is_unresolved())
+                    .unwrap_or(true);
+                if unresolved {
+                    ActivityTick::Set(BotActivity {
+                        label: super::user_form::WAITING_FOR_YOU.into(),
+                    })
+                } else {
+                    // Settled: do not leave "Waiting for you" over the compact pill.
+                    ActivityTick::Clear
+                }
             } else {
                 ActivityTick::Keep
             }
@@ -287,6 +305,9 @@ fn describe_tool(name: &str, args: Option<&str>) -> String {
             .and_then(|url| url.split("://").nth(1).or(Some(url)))
             .map(|rest| format!("Opening {}", rest.split('/').next().unwrap_or(rest)))
             .unwrap_or_else(|| "Opening a page on its computer".into()),
+        "request_user_form" | "request-user-form" | "user-form" => {
+            super::user_form::WAITING_FOR_YOU.into()
+        }
         "" => "Working".into(),
         other => format!("Using {other}"),
     }
@@ -462,6 +483,40 @@ mod tests {
             activity_from_agui(&ev, None),
             ActivityTick::Set(BotActivity {
                 label: "Waiting for approval".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_live_user_form_is_waiting_for_you_not_approval() {
+        let ev = json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "entryId": "e1",
+                "formRequest": {
+                    "title": "Google account email",
+                    "fields": [{"id":"email","label":"Email","type":"email","required":true}]
+                }
+            }
+        });
+        assert_eq!(
+            activity_from_agui(&ev, None),
+            ActivityTick::Set(BotActivity {
+                label: "Waiting for you".into()
+            })
+        );
+        let settled = json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": { "entryId": "e1", "formResolution": "submitted" }
+        });
+        assert_eq!(activity_from_agui(&settled, None), ActivityTick::Clear);
+        let tool = json!({"type":"TOOL_CALL_START","toolCallName":"request_user_form"});
+        assert_eq!(
+            activity_from_agui(&tool, None),
+            ActivityTick::Set(BotActivity {
+                label: "Waiting for you".into()
             })
         );
     }

@@ -6,6 +6,7 @@ mod error;
 mod gen_ui;
 mod local_exec;
 mod types;
+mod user_form;
 
 pub use activity::{
     ActivityTick, BotActivity, ToolCallTracker, activity_from_agui, activity_from_replay,
@@ -18,6 +19,11 @@ pub use gen_ui::{
     command_from_args, command_from_replay_events, local_exec_outcome, policy_answer,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
+pub use user_form::{
+    FormResolution, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_SERVER_FILL_AVAILABLE,
+    UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues, WAITING_FOR_YOU,
+    continue_enabled, is_user_form_custom_name, is_user_form_event, is_user_form_tool,
+};
 
 pub use client::{
     ConnectedComputer, CoworkerComputer, ImageStatus, LocalExecMode, OpenGrokClient,
