@@ -1641,9 +1641,10 @@ mod tests {
         let mut host = host();
         assert!(host.snapshot().find(ids::COMPOSER_PANEL).is_none());
 
-        let active = recipe(&[("city", "London")]);
+        // Nothing told yet: the list is everything the recipe needs.
+        let untold = recipe(&[]);
         host.composer_panel = Some(PanelMode::Parameters);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&active));
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&untold));
         let tree = host.snapshot();
         let panel = tree.find(ids::COMPOSER_PANEL).unwrap();
         assert!(tree.find(ids::COMPOSER_PANEL_SEARCH).unwrap().focused);
@@ -1654,6 +1655,22 @@ mod tests {
             .map(|child| child.id.as_str())
             .collect();
         assert!(rows.contains(&"composer-param-city"), "{rows:?}");
+        assert!(rows.contains(&"composer-param-shorts"), "{rows:?}");
+
+        // THE LIST IS WHAT IS LEFT TO TELL, NOT WHAT THE RECIPE HAS. Once a value is in, the
+        // parameter leaves this list and lives in the bar above the composer, where it can still
+        // be changed. A driver asserting on the panel must read it as the outstanding work.
+        let told = recipe(&[("city", "London")]);
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&told));
+        let tree = host.snapshot();
+        let rows: Vec<&str> = tree
+            .find(ids::COMPOSER_PANEL)
+            .unwrap()
+            .children
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect();
+        assert!(!rows.contains(&"composer-param-city"), "{rows:?}");
         assert!(rows.contains(&"composer-param-shorts"), "{rows:?}");
     }
 
