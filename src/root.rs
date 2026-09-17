@@ -12,6 +12,7 @@ use gpui_kit::{InteractiveElement, *};
 use crate::state::AppState;
 
 use crate::components::circular_voice_viz::CircularVoiceViz;
+use crate::components::lightbox::LightboxView;
 use crate::components::voice_mode_modal::render_voice_mode_modal;
 use gpui_kit::component::{ActiveTheme, Root};
 
@@ -19,6 +20,9 @@ use gpui_kit::component::{ActiveTheme, Root};
 pub struct RootView {
     layout: Entity<Layout>,
     state: Entity<AppState>,
+    /// The picture overlay is mounted here, not in the layout, because it covers the title
+    /// bar and the panes alike.
+    lightbox: Entity<LightboxView>,
     circular_viz: Option<Entity<CircularVoiceViz>>,
     pub focus_handle: FocusHandle,
     show_fps: bool,
@@ -30,6 +34,7 @@ pub struct RootView {
 impl RootView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let layout = cx.new(|cx| Layout::new(window, state.clone(), cx));
+        let lightbox = cx.new(|cx| LightboxView::new(state.clone(), cx));
         let focus_handle = cx.focus_handle();
         // This is the window the pages are drawn in; a coworker's screen window hands its
         // "Recipes" over to it rather than drawing a page of its own.
@@ -40,6 +45,7 @@ impl RootView {
         Self {
             layout,
             state,
+            lightbox,
             circular_viz: None,
             focus_handle,
             show_fps: true,
@@ -147,13 +153,14 @@ impl Render for RootView {
         #[cfg(feature = "agent")]
         self.drain_agent(window, cx);
 
-        let (is_voice_mode_open, amplitude, ai_amplitude, signed_in) = {
+        let (is_voice_mode_open, amplitude, ai_amplitude, signed_in, lightbox_open) = {
             let app_state = self.state.read(cx);
             (
                 app_state.is_voice_mode_open,
                 app_state.amplitude.clone(),
                 app_state.ai_amplitude.clone(),
                 app_state.is_signed_in(),
+                app_state.lightbox.is_some(),
             )
         };
         if signed_in && !self.was_signed_in {
@@ -405,6 +412,9 @@ impl Render for RootView {
             } else {
                 None
             })
+            // A picture from the feed, over the whole window. It is mounted before the root
+            // layers so that the note saying where a download landed still lands on top of it.
+            .when(lightbox_open, |this| this.child(self.lightbox.clone()))
             // Root overlay layers
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))

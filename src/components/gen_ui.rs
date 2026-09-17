@@ -5,7 +5,7 @@ use crate::opengrok::{
 };
 use crate::state::{AppState, ApprovalDecision};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -21,28 +21,154 @@ pub fn render_ui_spec(
     }
 }
 
-/// The bot's screen as a card: the picture at the feed's width, its own words underneath.
-pub fn render_screenshot(spec: &ScreenshotSpec, cx: &App) -> AnyElement {
+/// How many tiles the strip shows before it starts counting the rest.
+const STRIP_TILES: usize = 3;
+const STRIP_TILE_H: f32 = 110.0;
+/// The single picture's width in the feed, unchanged since the card was all there was.
+const CARD_W: f32 = 520.0;
+/// Every picture in the transcript belongs to this hover group, so the eye appears on the
+/// one the mouse is over. The name is looked up inside each tile's own subtree, so tiles
+/// can share it.
+const IMAGE_GROUP: &str = "chat-image";
+
+/// The pictures the strip cannot show, which is the number its last tile carries.
+fn overflow_count(total: usize) -> usize {
+    total.saturating_sub(STRIP_TILES)
+}
+
+/// The bot's screens in the feed. One picture is a card at the feed's width with the tool's
+/// own words underneath; several from one turn are a strip of tiles with the words in a
+/// tooltip. Either way a click opens the set in the lightbox.
+pub fn render_screenshots(
+    shots: &[ScreenshotSpec],
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
-    let width = 520.0_f32;
-    let height = width * spec.height.max(1) as f32 / spec.width.max(1) as f32;
-    v_flex()
-        .gap(px(6.))
-        .child(
-            img(spec.image.clone())
-                .w(px(width))
-                .h(px(height))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(theme.border),
-        )
+    if shots.len() == 1 {
+        let Some(spec) = shots.first() else {
+            return div().into_any_element();
+        };
+        let height = CARD_W * spec.height.max(1) as f32 / spec.width.max(1) as f32;
+        return v_flex()
+            .gap(px(6.))
+            .child(
+                screenshot_tile("image-thumb-0", shots, 0, app)
+                    .child(
+                        img(spec.image.clone())
+                            .w(px(CARD_W))
+                            .h(px(height))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(theme.border),
+                    )
+                    .child(eye_scrim(8.)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(spec.caption.clone()),
+            )
+            .into_any_element();
+    }
+    let hidden = overflow_count(shots.len());
+    let mut strip = h_flex().gap(px(6.)).flex_wrap();
+    for (ix, spec) in shots.iter().take(STRIP_TILES).enumerate() {
+        let width = STRIP_TILE_H * spec.width.max(1) as f32 / spec.height.max(1) as f32;
+        let counts_the_rest = hidden > 0 && ix + 1 == STRIP_TILES;
+        let caption = spec.caption.clone();
+        strip = strip.child(
+            screenshot_tile(&format!("image-thumb-{ix}"), shots, ix, app.clone())
+                .when(!caption.trim().is_empty(), |this| {
+                    this.tooltip(move |window, cx| Tooltip::new(caption.clone()).build(window, cx))
+                })
+                .child(
+                    img(spec.image.clone())
+                        .w(px(width))
+                        .h(px(STRIP_TILE_H))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(theme.border),
+                )
+                // On the tile that stands for the ones with no room, the count is the
+                // affordance; an eye on top of it would only hide the number.
+                .map(|this| {
+                    if counts_the_rest {
+                        this.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded(px(8.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(gpui::black().opacity(0.55))
+                                .text_xl()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(gpui::white())
+                                .child(format!("+{hidden}")),
+                        )
+                    } else {
+                        this.child(eye_scrim(8.))
+                    }
+                }),
+        );
+    }
+    strip.into_any_element()
+}
+
+/// A picture in the transcript: the hover group, the pointer, and the click that opens the
+/// whole set in the lightbox at this one.
+fn screenshot_tile(
+    id: &str,
+    shots: &[ScreenshotSpec],
+    index: usize,
+    app: Option<Entity<AppState>>,
+) -> Stateful<Div> {
+    let set = shots.to_vec();
+    div()
+        .id(ElementId::Name(id.to_string().into()))
+        .group(IMAGE_GROUP)
+        .relative()
+        .flex_shrink_0()
+        .cursor_pointer()
+        .when_some(app, |this, app| {
+            this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                let set = set.clone();
+                app.update(cx, |state, cx| state.open_lightbox(set, index, cx));
+            })
+        })
+}
+
+/// What hovering a picture says: a light wash over it and an eye on a dark chip, meaning
+/// this one can be looked at properly.
+fn eye_scrim(radius: f32) -> impl IntoElement {
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(px(radius))
+        .opacity(0.)
+        .group_hover(IMAGE_GROUP, |style| style.opacity(1.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::white().opacity(0.16))
         .child(
             div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(spec.caption.clone()),
+                .size(px(38.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.55))
+                .child(
+                    Icon::default()
+                        .path("icons/eye.svg")
+                        .size(px(18.))
+                        .text_color(gpui::white()),
+                ),
         )
-        .into_any_element()
 }
 
 pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &App) -> AnyElement {
@@ -436,4 +562,24 @@ fn render_form(
             }),
     )
     .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STRIP_TILES, overflow_count};
+
+    /// The strip shows three tiles; the count on the last one is what is left over, so a
+    /// set of five reads "+2" and every picture is still one click away.
+    #[test]
+    fn the_last_tile_counts_the_pictures_with_no_room() {
+        assert_eq!(overflow_count(5), 2);
+        assert_eq!(overflow_count(STRIP_TILES + 1), 1);
+    }
+
+    #[test]
+    fn a_set_the_strip_fits_counts_nothing() {
+        assert_eq!(overflow_count(0), 0);
+        assert_eq!(overflow_count(2), 0);
+        assert_eq!(overflow_count(STRIP_TILES), 0);
+    }
 }
