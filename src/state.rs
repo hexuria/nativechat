@@ -10,11 +10,12 @@ use crate::opengrok::{
     Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
     ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
     RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    ToolCallTracker, TurnAssembler, TurnRecipe, activity_from_replay, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
-    policy_answer, serve_local_exec, stored_machine_id, tool_standin, visible_bot_status,
+    RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    activity_from_replay, command_from_args, command_from_replay_events, deeds_from_replay,
+    enrol_this_machine, local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id,
+    tool_standin, visible_bot_status,
 };
-use crate::services::database::{DatabaseService, MessagePart, ReplyRef};
+use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
@@ -37,6 +38,10 @@ pub struct Message {
     /// The person wrote the quoted message, rather than the coworker.
     pub reply_is_me: bool,
     pub parts: Vec<ChatPart>,
+    /// The run this reply came out of, for a reply that came out of one. It is how the thread
+    /// knows which of the server's runs it can already account for, so reconciling against the
+    /// server adds what is missing instead of saying everything a second time.
+    pub run_id: Option<String>,
 }
 
 impl Message {
@@ -311,6 +316,248 @@ impl Conversation {
             let years = secs / 31536000;
             format!("{}y ago", years)
         }
+    }
+}
+
+/// A turn this thread is still answerable for.
+///
+/// It exists from the moment the turn is sent until the turn's outcome has reached SQLite. In
+/// between, the thread is holding something the database does not have — the reply filling in,
+/// the pictures the run took, and for a moment the person's own message — which is why a thread
+/// with one of these is never refilled from the database, and why the run id has to be kept: the
+/// server has the whole of the run under it, and that is what the thread is reconciled against
+/// instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveTurn {
+    /// The id the turn was sent under, so `GET /ag-ui/runs/{run_id}` can be asked what became
+    /// of it. Minted before the request, because after the stream is lost there is nothing left
+    /// to learn it from.
+    pub run_id: String,
+    /// The row the run is being painted into. Named, rather than "the last one": the last row
+    /// stops being this one the moment anything else touches the list.
+    pub message_id: String,
+    /// Whose turn it is, so a replay can put the status line back on the right bot.
+    pub coworker_id: Option<String>,
+    /// The reply has been handed to the database. Set the moment the app decides what the turn
+    /// came to, so a replay landing afterwards does not write the same reply down a second
+    /// time; the turn itself is not let go until the write lands, because until then the
+    /// database still does not have it.
+    pub persisting: bool,
+}
+
+/// The row a run is writing into, found by the id the turn gave it when it started.
+///
+/// "The last one, if it isn't mine" is only true while nothing else touches the list, and a
+/// reload, a deleted message or a second turn all make it false — after which the run quietly
+/// fills in a bubble belonging to something else, which reads exactly like the run having
+/// stopped. By id it is the same row wherever it has drifted to, and honestly nothing at all
+/// when it is gone.
+fn streaming_message_mut<'a>(
+    conversations: &'a mut [Conversation],
+    conversation_id: &str,
+    message_id: &str,
+) -> Option<&'a mut Message> {
+    conversations
+        .iter_mut()
+        .find(|c| c.id == conversation_id)?
+        .messages
+        .iter_mut()
+        .find(|m| m.id == message_id)
+}
+
+/// A thread brought up to what the database holds — unless it is in the middle of a turn, in
+/// which case it is left exactly as it is and this answers false.
+///
+/// Nothing of a turn in flight is in SQLite: `persist_assistant_reply` writes the reply only
+/// once the turn is over, and the message that asked for it is still on its way down when the
+/// turn begins. So for such a thread the persisted set is a strict subset of what is on screen,
+/// and swapping one for the other can only take away the bubble the person is watching fill in
+/// along with every picture under it. Re-grafting the live row onto the reloaded list would keep
+/// the bubble but still drop whatever else had not landed yet, and it would have to guess where
+/// the row belongs; refusing the reload keeps the whole thread, and gives up nothing, because
+/// the rows the database has are the rows already on screen.
+fn apply_reload(
+    conversation: &mut Conversation,
+    live: Option<&LiveTurn>,
+    rows: Vec<ChatMessage>,
+) -> bool {
+    if live.is_some() {
+        return false;
+    }
+    conversation.messages = rows.into_iter().map(restored_message).collect();
+    true
+}
+
+/// A saved row as the feed paints it, with the pieces the turn was made of, so a thread reopened
+/// shows the bubbles and the pictures it showed live.
+fn restored_message(row: ChatMessage) -> Message {
+    let sent_at = NaiveDateTime::parse_from_str(&row.created_at, "%Y-%m-%d %H:%M:%S")
+        .map(|dt| SystemTime::from(dt.and_utc()))
+        .unwrap_or_else(|_| SystemTime::now());
+    let content = row.content;
+    let parts = restored_parts(&content, row.parts);
+    Message {
+        id: row.id,
+        sender: if row.role == "user" { "Me" } else { "AI" }.to_string(),
+        content,
+        sent_at,
+        is_me: row.role == "user",
+        reply_preview: row.reply_preview,
+        reply_to_id: row.reply_to_id,
+        reply_is_me: row.reply_is_me.unwrap_or(0) != 0,
+        parts,
+        run_id: row.run_id,
+    }
+}
+
+/// A run rebuilt from the frames the server kept, as the live stream would have painted it.
+///
+/// The same assembler the stream feeds, over the same frames in the same order, because a turn
+/// watched live and a turn read back afterwards must come to the same bubbles and the same
+/// pictures — otherwise "where was I?" and "what happened?" are two different answers and the
+/// person has to decide which to believe. A run still going keeps its last frames held, exactly
+/// as the live stream holds them: a tool whose arguments are still arriving is not a widget yet,
+/// and forcing it out would paint half a chart and then take it away again.
+fn reply_from_replay(events: &[serde_json::Value], status: &str) -> (String, Vec<ChatPart>) {
+    let mut assembler = TurnAssembler::default();
+    for event in events {
+        assembler.push_event(event);
+    }
+    if status != "running" {
+        assembler.finish();
+    }
+    assembler.snapshot()
+}
+
+/// How many of a thread's runs are asked for when reconciling it against the server.
+///
+/// Not politeness: a run comes back with every frame it emitted, and a computer-use run's frames
+/// carry screenshots, so a whole thread's history is megabytes. Only the newest runs can disagree
+/// with what is already on disk — an older run's reply was written down when it happened, and a
+/// reply on disk is final — so a handful is all it takes to find what is missing.
+const RECONCILE_RUNS: usize = 5;
+
+/// A reply the server has and this thread does not.
+#[derive(Debug, Clone, PartialEq)]
+struct RecoveredReply {
+    run_id: String,
+    content: String,
+    parts: Vec<ChatPart>,
+    /// The run has not ended. The bubble is painted but not written down: a turn is saved when
+    /// it is over, whoever happens to be watching.
+    live: bool,
+    /// When the run started, which is where in the thread its reply belongs.
+    started_at: SystemTime,
+}
+
+/// What a thread is missing, told by comparing the runs the server kept against the runs the
+/// thread can already account for.
+///
+/// A run this thread already has a reply for is settled and is not looked at again: that reply
+/// was built from these very frames, and rebuilding it could only risk saying it differently.
+/// A run it has no reply for happened while the app was elsewhere — or not running at all — and
+/// comes back as a bubble.
+///
+/// Where the thread's knowledge begins is the newest run it can name, and nothing at or before
+/// that is looked at: a run older than one we already have a reply for is a run whose reply is
+/// older still. This is a position in the list rather than a comparison of timestamps on
+/// purpose — the run's clock is the server's and the row's clock is this Mac's, and a second of
+/// disagreement between them would decide whether a turn appears once or twice.
+///
+/// A thread that can name no run at all is the thread every build before this one wrote, and on
+/// it a finished run and an already-saved one are indistinguishable. Guessing there would put
+/// the last few turns into the transcript a second time, so only a run that has not ended is
+/// taken: nothing writes a run down before it ends, so a live run cannot already be here. The
+/// thread's next turn carries an id, and from then on the diff is exact.
+///
+/// A run that emitted nothing worth painting is skipped. A run can be started and die before it
+/// says anything, and a blank bubble in the transcript is worse than the absence of one.
+fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredReply> {
+    let known: HashSet<&str> = messages
+        .iter()
+        .filter_map(|message| message.run_id.as_deref())
+        .collect();
+    let anchor = runs
+        .iter()
+        .rposition(|run| known.contains(run.run_id.as_str()));
+    let from = anchor.map_or(0, |index| index + 1);
+    // Nothing the coworker said is here yet, so there is no older reply to mistake a run for.
+    let trusted = anchor.is_some() || messages.iter().all(|message| message.is_me);
+    runs[from.min(runs.len())..]
+        .iter()
+        .filter(|run| !run.run_id.trim().is_empty() && (trusted || run.is_live()))
+        .filter_map(|run| {
+            let (plain, parts) = reply_from_replay(&run.events, &run.status);
+            let plain = replayed_ending(&run.events, &run.status, run.failure.as_deref(), &plain)
+                .unwrap_or(plain);
+            if plain.trim().is_empty() && parts.is_empty() {
+                return None;
+            }
+            Some(RecoveredReply {
+                run_id: run.run_id.clone(),
+                content: plain,
+                parts,
+                live: run.is_live(),
+                started_at: SystemTime::UNIX_EPOCH
+                    + Duration::from_millis(run.started_at_ms.max(0) as u64),
+            })
+        })
+        .collect()
+}
+
+/// A recovered reply put back where it happened, rather than on the end.
+///
+/// The thread is in the order things were said, and a reply that arrives late is still a reply
+/// to the message that asked for it. Placing it by when its run started puts it after that
+/// message and before whatever the person said next — which is the difference between a
+/// transcript and a pile.
+fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
+    let id = uuid::Uuid::now_v7().to_string();
+    let at = messages
+        .iter()
+        .position(|message| message.sent_at > reply.started_at)
+        .unwrap_or(messages.len());
+    messages.insert(
+        at,
+        Message {
+            id: id.clone(),
+            sender: "AI".to_string(),
+            content: reply.content.clone(),
+            sent_at: reply.started_at,
+            is_me: false,
+            reply_preview: None,
+            reply_to_id: None,
+            reply_is_me: false,
+            parts: reply.parts.clone(),
+            run_id: Some(reply.run_id.clone()),
+        },
+    );
+    id
+}
+
+/// What the feed says for a turn that is over but said nothing.
+///
+/// The same three stand-ins the live path writes — why it failed, what its tools did, or the
+/// note that it said nothing at all — so a turn read back off the server ends the way that turn
+/// would have ended had anyone been watching it. `None` when the run spoke for itself.
+fn replayed_ending(
+    events: &[serde_json::Value],
+    status: &str,
+    failure: Option<&str>,
+    plain: &str,
+) -> Option<String> {
+    if !plain.trim().is_empty() {
+        return None;
+    }
+    match status {
+        "failed" => Some(format!(
+            "{RUN_ERROR_PREFIX}{}",
+            failure.unwrap_or("the run failed")
+        )),
+        "finished" => Some(
+            tool_standin(&deeds_from_replay(events)).unwrap_or_else(|| EMPTY_TURN_NOTE.to_string()),
+        ),
+        _ => None,
     }
 }
 
@@ -810,6 +1057,15 @@ pub enum AuthStatus {
 
 pub struct AppState {
     pub conversations: Vec<Conversation>,
+    /// The turns still in flight, by the thread each belongs to. A thread on this list is not
+    /// refilled from the database, its run is written into by name rather than by position, and
+    /// coming back to it asks the server what became of the run.
+    live_turns: HashMap<String, LiveTurn>,
+    /// Threads already reconciled against the server this session. Once is enough: after it, the
+    /// app has been watching, and every turn since has gone through the same door on its way to
+    /// disk. Asking again on every visit would fetch a thread's frames — screenshots and all —
+    /// to learn nothing.
+    reconciled_threads: HashSet<String>,
     /// Last send/receive per coworker. Beats an unopened session's empty `messages`.
     pub last_active_at: HashMap<String, SystemTime>,
     pub active_conversation_id: Option<String>,
@@ -1135,6 +1391,8 @@ impl AppState {
     pub fn new() -> Self {
         let mut state = Self {
             conversations: Vec::new(),
+            live_turns: HashMap::new(),
+            reconciled_threads: HashSet::new(),
             last_active_at: HashMap::new(),
             active_conversation_id: None,
             theme_mode: "light".to_string(),
@@ -3494,6 +3752,11 @@ impl AppState {
         }
     }
 
+    /// Refill a thread from the database.
+    ///
+    /// Whether the rows are taken is decided when they arrive rather than when they are asked
+    /// for, because a turn can begin while the query is still in the air, and the thread it
+    /// begins in is one this must not touch. `apply_reload` is where that is judged.
     pub fn load_session_messages(&mut self, session_id: String, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             let session_id_clone = session_id.clone();
@@ -3501,45 +3764,19 @@ impl AppState {
                 async move |this, cx| match db.get_messages(&session_id_clone).await {
                     Ok(db_messages) => {
                         this.update(cx, |state, cx| {
+                            let live = state.live_turns.get(&session_id_clone).cloned();
                             if let Some(conversation) = state
                                 .conversations
                                 .iter_mut()
                                 .find(|c| c.id == session_id_clone)
                             {
-                                conversation.messages = db_messages
-                                    .into_iter()
-                                    .map(|m| {
-                                        let sent_at = NaiveDateTime::parse_from_str(
-                                            &m.created_at,
-                                            "%Y-%m-%d %H:%M:%S",
-                                        )
-                                        .map(|dt| SystemTime::from(dt.and_utc()))
-                                        .unwrap_or(SystemTime::now());
-
-                                        // The pieces the turn was made of, so a thread reopened
-                                        // shows the bubbles and the pictures it showed live.
-                                        let content = m.content;
-                                        let parts = restored_parts(&content, m.parts);
-                                        Message {
-                                            id: m.id,
-                                            sender: if m.role == "user" {
-                                                "Me".to_string()
-                                            } else {
-                                                "AI".to_string()
-                                            },
-                                            content,
-                                            sent_at,
-                                            is_me: m.role == "user",
-                                            reply_preview: m.reply_preview,
-                                            reply_to_id: m.reply_to_id,
-                                            reply_is_me: m.reply_is_me.unwrap_or(0) != 0,
-                                            parts,
-                                        }
-                                    })
-                                    .collect();
+                                apply_reload(conversation, live.as_ref(), db_messages);
                                 state.sync_pending_approvals(cx);
                                 cx.notify();
                             }
+                            // Only once the cache has been painted, so the server's answer is
+                            // corrected onto a thread rather than racing the rows it corrects.
+                            state.reconcile_thread(&session_id_clone, cx);
                         })
                         .ok();
                     }
@@ -3547,6 +3784,7 @@ impl AppState {
                         eprintln!("Failed to load messages: {}", e);
                         let _ = this.update(cx, |state, cx| {
                             state.sync_pending_approvals(cx);
+                            state.reconcile_thread(&session_id_clone, cx);
                         });
                     }
                 },
@@ -3554,14 +3792,262 @@ impl AppState {
             .detach();
         } else {
             self.sync_pending_approvals(cx);
+            self.reconcile_thread(&session_id, cx);
         }
+    }
+
+    /// Bring a thread up to what the server says was said in it.
+    ///
+    /// The app has been treating its own SQLite as the record of a conversation, which it never
+    /// was: the turn happens on the server, and the app is one of the things that may or may not
+    /// have been watching. So the database is a cache — it paints the thread at once and works
+    /// with no network — and this is where the record corrects it. A turn that ran while the
+    /// person was in another thread, or while the app was not running at all, is found here and
+    /// nowhere else.
+    ///
+    /// Once per thread per session, and only for the thread being read. After that the app has
+    /// been watching, and every turn since has gone to disk through the same door.
+    fn reconcile_thread(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        if self.active_conversation_id.as_deref() != Some(conversation_id) {
+            return;
+        }
+        if !self.reconciled_threads.insert(conversation_id.to_string()) {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let thread = client.replay_thread(&conversation_id, RECONCILE_RUNS).await;
+            let _ = this.update(cx, |state, cx| {
+                match thread {
+                    Ok(thread) => state.apply_thread_replay(&conversation_id, &thread, cx),
+                    // A server that cannot answer leaves the thread exactly as the cache drew
+                    // it, and leaves it un-reconciled so the next visit tries again — an offline
+                    // app is still a usable one, it is just not up to date.
+                    Err(_) => {
+                        state.reconciled_threads.remove(&conversation_id);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The runs the server has that this thread has not, put back into it.
+    ///
+    /// A run that ended goes onto the thread and into the database, through the same
+    /// `persist_assistant_reply` a turn watched to the end goes through, so its screenshots land
+    /// in `chat_message_parts` like any other turn's. A run still going is a turn that outlived
+    /// whatever stopped watching it — a bot switch, or the app closing — and is re-attached to:
+    /// the bubble comes back, the status line comes back, and the rest of the turn arrives in it.
+    fn apply_thread_replay(
+        &mut self,
+        conversation_id: &str,
+        thread: &ThreadReplay,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation) = self.conversations.iter().find(|c| c.id == conversation_id) else {
+            return;
+        };
+        let missing = missing_replies(&conversation.messages, &thread.runs);
+        if missing.is_empty() {
+            return;
+        }
+        let coworker_id = self
+            .coworkers
+            .iter()
+            .find(|coworker| coworker.id == conversation_id)
+            .map(|coworker| coworker.id.clone())
+            .or_else(|| self.active_coworker_id.clone());
+        for reply in missing {
+            let Some(conversation) = self
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == conversation_id)
+            else {
+                return;
+            };
+            let message_id = graft_reply(&mut conversation.messages, &reply);
+            if reply.live {
+                // Whatever stopped watching this run, the run did not stop. Registering it makes
+                // the thread hold still for it again, and following it brings the rest of the
+                // turn in.
+                self.live_turns.insert(
+                    conversation_id.to_string(),
+                    LiveTurn {
+                        run_id: reply.run_id.clone(),
+                        message_id,
+                        coworker_id: coworker_id.clone(),
+                        persisting: false,
+                    },
+                );
+                self.begin_responding(coworker_id.as_deref(), "Working");
+                self.follow_run(
+                    reply.run_id.clone(),
+                    Some(conversation_id.to_string()),
+                    coworker_id.clone(),
+                    cx,
+                );
+            } else {
+                self.persist_assistant_reply(
+                    conversation_id,
+                    reply.content,
+                    &reply.parts,
+                    Some(&reply.run_id),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
         self.active_conversation_id = Some(conversation_id.clone());
-        self.load_session_messages(conversation_id, cx);
+        self.load_session_messages(conversation_id.clone(), cx);
+        // Coming back to a thread whose turn never stopped. What the app is still holding is a
+        // guess about a run it stopped watching; the server holds the run itself, so that is
+        // what the thread is rebuilt from — including the case where the turn ended out of
+        // sight, which is the only chance there is to write that ending down.
+        self.resync_live_turn(&conversation_id, cx);
         self.sync_pending_approvals(cx);
         cx.notify();
+    }
+
+    /// Re-attach a thread to the run the server is keeping for it.
+    ///
+    /// `GET /ag-ui/runs/{run_id}` answers with every frame the run emitted, in order, whether or
+    /// not anybody was listening when it did — so this is the whole of the user's instinct made
+    /// real: they should not have to stay on a thread for its turn to survive, because the turn
+    /// was never the app's to keep in the first place.
+    fn resync_live_turn(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        let Some(turn) = self.live_turns.get(conversation_id).cloned() else {
+            return;
+        };
+        if turn.run_id.trim().is_empty() {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let replay = client.replay_run(&turn.run_id).await;
+            let _ = this.update(cx, |state, cx| {
+                match replay {
+                    Ok(replay) => state.apply_replayed_turn(&conversation_id, &turn, &replay, cx),
+                    Err(_) => {
+                        // The server has no such run: it never started, or it is old enough to
+                        // have been forgotten. Holding the thread out of reload after that would
+                        // strand it on a bubble nothing will ever finish, so the turn is let go
+                        // and the thread reads from the database like any other.
+                        state.live_turns.remove(&conversation_id);
+                        state.load_session_messages(conversation_id.clone(), cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A thread repainted from what the server says its run came to.
+    ///
+    /// A run still going is only painted: the stream, if it is still attached, is a frame or two
+    /// ahead and will say so shortly. A run that is over is also written down — through the same
+    /// `persist_assistant_reply` a turn watched to the end goes through, so the pieces reach
+    /// `chat_message_parts` and the screenshots are still there the next time the thread is
+    /// opened. That door is used once: if the live path already decided what to save, this one
+    /// only paints, because a turn saved twice is a thread that says everything twice.
+    fn apply_replayed_turn(
+        &mut self,
+        conversation_id: &str,
+        turn: &LiveTurn,
+        replay: &RunReplay,
+        cx: &mut Context<Self>,
+    ) {
+        let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
+        let plain = replayed_ending(
+            &replay.events,
+            &replay.status,
+            replay.failure.as_deref(),
+            &plain,
+        )
+        .unwrap_or(plain);
+        if let Some(message) =
+            streaming_message_mut(&mut self.conversations, conversation_id, &turn.message_id)
+        {
+            message.content = plain.clone();
+            message.parts = parts.clone();
+        }
+        // A card whose command already ran is not a question any more, so the thread stops
+        // asking it.
+        for part in &parts {
+            if let ChatPart::Approval(spec) = part
+                && spec.output.is_some()
+            {
+                self.approval_decisions
+                    .insert(spec.call_id.clone(), ApprovalDecision::AllowOnce);
+            }
+        }
+        match replay.status.as_str() {
+            "running" => {
+                let activity = activity_from_replay(&replay.events).unwrap_or(BotActivity {
+                    label: "Working".into(),
+                });
+                self.begin_responding(turn.coworker_id.as_deref(), &activity.label);
+            }
+            "awaiting-approval" => {
+                self.finish_responding(turn.coworker_id.as_deref(), true);
+                self.fill_open_approval_commands(cx);
+            }
+            "finished" => {
+                self.finish_responding(turn.coworker_id.as_deref(), false);
+                // Only when nobody has written this turn down yet. The live stream may have come
+                // back and settled it while the replay was in the air, and a turn saved twice is
+                // a thread that says everything twice.
+                let ours = self
+                    .live_turns
+                    .get(conversation_id)
+                    .is_some_and(|live| !live.persisting && live.run_id == turn.run_id);
+                if ours {
+                    self.persist_assistant_reply(
+                        conversation_id,
+                        plain,
+                        &parts,
+                        Some(&turn.run_id),
+                        cx,
+                    );
+                }
+            }
+            "failed" => {
+                self.finish_responding(turn.coworker_id.as_deref(), false);
+                self.release_live_turn(conversation_id, &turn.run_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// This thread is no longer answerable for a turn.
+    ///
+    /// The other way out is `persist_assistant_reply`, which lets go once the reply reaches the
+    /// database. This one is for the turns that end with nothing to write down — a run that
+    /// failed leaves a line the app wrote about it, and a line the app wrote is never saved — so
+    /// waiting for a write that will never come would strand the thread on its own reply
+    /// forever.
+    ///
+    /// Named by run, because the turn being let go has to be the turn that ended: a thread whose
+    /// next turn has already begun must not be let go by the last one finishing late.
+    fn release_live_turn(&mut self, conversation_id: &str, run_id: &str) {
+        if self
+            .live_turns
+            .get(conversation_id)
+            .is_some_and(|turn| turn.run_id == run_id)
+        {
+            self.live_turns.remove(conversation_id);
+        }
     }
 
     fn conversation_title(&self, id: &str) -> String {
@@ -3579,23 +4065,50 @@ impl AppState {
     ///
     /// The pieces go with it. A recipe run is several bubbles with pictures of the box's screen
     /// between them, and a reply flattened to its text would come back as one long paragraph.
+    ///
+    /// The run id goes with it. A reply on disk that cannot say which run it came out of is a
+    /// reply a later reconcile cannot recognise, and the thread would grow a second copy of it
+    /// every time the app was opened.
+    ///
+    /// This is also where a turn stops being in flight, because that is the same event: the
+    /// thread is held out of reload exactly while the database does not yet have the turn. A
+    /// reply this refuses — the app's own status line, or nothing at all — is never going to
+    /// reach the database, so the thread is let go at once; a reply on its way down is let go
+    /// when the write lands, so that switching away in the moment between deciding and writing
+    /// cannot lose it either.
     fn persist_assistant_reply(
-        &self,
+        &mut self,
         conversation_id: &str,
         content: String,
         parts: &[ChatPart],
+        run_id: Option<&str>,
         cx: &mut Context<Self>,
     ) {
+        let settles = run_id.is_some_and(|run_id| {
+            self.live_turns
+                .get(conversation_id)
+                .is_some_and(|turn| turn.run_id == run_id)
+        });
         if content.trim().is_empty() || is_status_line(&content) {
+            if settles {
+                self.live_turns.remove(conversation_id);
+            }
             return;
         }
         let Some(db) = self.database_service.clone() else {
+            if settles {
+                self.live_turns.remove(conversation_id);
+            }
             return;
         };
+        if settles && let Some(turn) = self.live_turns.get_mut(conversation_id) {
+            turn.persisting = true;
+        }
         let title = self.conversation_title(conversation_id);
         let conversation_id = conversation_id.to_string();
+        let run_id = run_id.map(str::to_string);
         let parts = saved_parts(parts);
-        cx.spawn(async move |_this, _cx| {
+        cx.spawn(async move |this, cx| {
             let saved = match db.ensure_session(&conversation_id, &title).await {
                 Ok(()) => db
                     .save_message(
@@ -3606,6 +4119,7 @@ impl AppState {
                         None,
                         None,
                         &parts,
+                        run_id.as_deref(),
                     )
                     .await
                     .map(|_| ()),
@@ -3613,6 +4127,13 @@ impl AppState {
             };
             if let Err(error) = saved {
                 eprintln!("Failed to save assistant message: {error}");
+            }
+            if settles {
+                let _ = this.update(cx, |state, _| {
+                    if let Some(run_id) = run_id.as_deref() {
+                        state.release_live_turn(&conversation_id, run_id);
+                    }
+                });
             }
         })
         .detach();
@@ -3640,13 +4161,19 @@ impl AppState {
             .map(|c| agui_messages(&c.messages))
             .unwrap_or_default();
 
+        // Both ids are minted here, before anything is sent. The run id because the server files
+        // every frame under it and this is the app's only handle on the run once the stream is
+        // gone; the message id because the run has to be able to find the bubble it is filling
+        // in by name, whatever else happens to the thread meanwhile.
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let reply_id = uuid::Uuid::now_v7().to_string();
         if let Some(conversation) = self
             .conversations
             .iter_mut()
             .find(|c| c.id == conversation_id)
         {
             conversation.messages.push(Message {
-                id: uuid::Uuid::now_v7().to_string(),
+                id: reply_id.clone(),
                 sender: "AI".to_string(),
                 content: String::new(),
                 sent_at: SystemTime::now(),
@@ -3655,8 +4182,18 @@ impl AppState {
                 reply_to_id: None,
                 reply_is_me: false,
                 parts: Vec::new(),
+                run_id: Some(run_id.clone()),
             });
         }
+        self.live_turns.insert(
+            conversation_id.clone(),
+            LiveTurn {
+                run_id: run_id.clone(),
+                message_id: reply_id.clone(),
+                coworker_id: coworker_id.clone(),
+                persisting: false,
+            },
+        );
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -3672,6 +4209,12 @@ impl AppState {
                         let _ = this.update(cx, |state, _| {
                             state.active_coworker_id = Some(id.clone());
                             state.coworkers = vec![hired];
+                            // The turn was registered before there was a coworker to register it
+                            // against, so the bot a replay puts the status line back on is named
+                            // now that one exists.
+                            if let Some(turn) = state.live_turns.get_mut(&conversation_id) {
+                                turn.coworker_id = Some(id.clone());
+                            }
                         });
                         Ok(id)
                     }
@@ -3683,51 +4226,57 @@ impl AppState {
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let result = client
-                        .run_turn(&id, &conversation_id, &history, recipe.as_ref(), |event| {
-                            match tracker.tick(event) {
-                                ActivityTick::Keep => {}
-                                tick => {
-                                    let turn_id = id.clone();
-                                    let _ = this.update(cx, |state, cx| {
-                                        let before = state.bot_status.clone();
-                                        state.apply_turn_status(Some(&turn_id), tick);
-                                        if state.bot_status != before {
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            }
-                            assembler.push_event(&event);
-                            let (plain, parts) = assembler.snapshot();
-                            let _ = this.update(cx, |state, cx| {
-                                if let Some(conversation) = state
-                                    .conversations
-                                    .iter_mut()
-                                    .find(|c| c.id == conversation_id)
-                                {
-                                    if let Some(last) = conversation.messages.last_mut() {
-                                        if !last.is_me {
-                                            last.content = plain.clone();
-                                            last.parts = parts.clone();
-                                            cx.notify();
-                                        }
+                        .run_turn(
+                            &id,
+                            &conversation_id,
+                            &run_id,
+                            &history,
+                            recipe.as_ref(),
+                            |event| {
+                                match tracker.tick(event) {
+                                    ActivityTick::Keep => {}
+                                    tick => {
+                                        let turn_id = id.clone();
+                                        let _ = this.update(cx, |state, cx| {
+                                            let before = state.bot_status.clone();
+                                            state.apply_turn_status(Some(&turn_id), tick);
+                                            if state.bot_status != before {
+                                                cx.notify();
+                                            }
+                                        });
                                     }
                                 }
-                                if assembler.waiting_approval() {
-                                    let open = parts.iter().rev().find_map(|part| match part {
-                                        ChatPart::Approval(spec) => Some(spec.clone()),
-                                        _ => None,
-                                    });
-                                    if let Some(spec) = open {
-                                        if let Some(resolution) =
-                                            state.auto_resolve_local_exec(&spec)
-                                        {
-                                            state.answer_approval(spec, resolution, cx);
+                                assembler.push_event(&event);
+                                let (plain, parts) = assembler.snapshot();
+                                let _ = this.update(cx, |state, cx| {
+                                    // Into the thread the run belongs to, and into the row the run
+                                    // was given — not the thread that happens to be open, and not
+                                    // whichever row happens to be last in it.
+                                    if let Some(message) = streaming_message_mut(
+                                        &mut state.conversations,
+                                        &conversation_id,
+                                        &reply_id,
+                                    ) {
+                                        message.content = plain.clone();
+                                        message.parts = parts.clone();
+                                        cx.notify();
+                                    }
+                                    if assembler.waiting_approval() {
+                                        let open = parts.iter().rev().find_map(|part| match part {
+                                            ChatPart::Approval(spec) => Some(spec.clone()),
+                                            _ => None,
+                                        });
+                                        if let Some(spec) = open {
+                                            if let Some(resolution) =
+                                                state.auto_resolve_local_exec(&spec)
+                                            {
+                                                state.answer_approval(spec, resolution, cx);
+                                            }
                                         }
                                     }
-                                }
-                            });
-                        })
+                                });
+                            },
+                        )
                         .await;
                     assembler.finish();
                     let waiting_approval = assembler.waiting_approval();
@@ -3735,17 +4284,13 @@ impl AppState {
                     let deeds = tracker.deeds();
                     let (plain, parts) = assembler.snapshot();
                     let _ = this.update(cx, |state, cx| {
-                        if let Some(conversation) = state
-                            .conversations
-                            .iter_mut()
-                            .find(|c| c.id == conversation_id)
-                        {
-                            if let Some(last) = conversation.messages.last_mut() {
-                                if !last.is_me {
-                                    last.content = plain;
-                                    last.parts = parts;
-                                }
-                            }
+                        if let Some(message) = streaming_message_mut(
+                            &mut state.conversations,
+                            &conversation_id,
+                            &reply_id,
+                        ) {
+                            message.content = plain;
+                            message.parts = parts;
                         }
                         cx.notify();
                     });
@@ -3754,28 +4299,24 @@ impl AppState {
                 Err(error) => (Err(error), false, coworker_id.clone(), Vec::new()),
             };
             let _ = this.update(cx, |state, cx| {
-                if let Some(conversation) = state
-                    .conversations
-                    .iter_mut()
-                    .find(|c| c.id == conversation_id)
+                if let Some(message) =
+                    streaming_message_mut(&mut state.conversations, &conversation_id, &reply_id)
                 {
-                    if let Some(last) = conversation.messages.last_mut() {
-                        // A turn that ends without words is spoken for by the app: why it
-                        // failed, what its tools did, or the note that it said nothing at all.
-                        // A picture is not an answer, so a failed run says so even when the
-                        // turn left a screenshot behind.
-                        if !last.is_me && !last.has_text_body() {
-                            match &result {
-                                Ok(text) if !text.is_empty() => last.content = text.clone(),
-                                // Parked on a permission card: the turn is not over yet.
-                                Ok(_) if waiting_approval => {}
-                                Ok(_) => {
-                                    last.content = tool_standin(&deeds)
-                                        .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
-                                }
-                                Err(error) => {
-                                    last.content = format!("{RUN_ERROR_PREFIX}{}", error.message)
-                                }
+                    // A turn that ends without words is spoken for by the app: why it
+                    // failed, what its tools did, or the note that it said nothing at all.
+                    // A picture is not an answer, so a failed run says so even when the
+                    // turn left a screenshot behind.
+                    if !message.has_text_body() {
+                        match &result {
+                            Ok(text) if !text.is_empty() => message.content = text.clone(),
+                            // Parked on a permission card: the turn is not over yet.
+                            Ok(_) if waiting_approval => {}
+                            Ok(_) => {
+                                message.content = tool_standin(&deeds)
+                                    .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
+                            }
+                            Err(error) => {
+                                message.content = format!("{RUN_ERROR_PREFIX}{}", error.message)
                             }
                         }
                     }
@@ -3783,17 +4324,30 @@ impl AppState {
                 if !waiting_approval && result.is_ok() {
                     // The run is final; a run parked on a card is saved when it finishes.
                     // A status line is painted, never saved: `persist_assistant_reply` refuses
-                    // it, so it cannot become history the model is shown next turn.
+                    // it, so it cannot become history the model is shown next turn. Settling the
+                    // reply is also what lets the thread go: from here it reads from the
+                    // database again, because from here the database has the turn.
                     let reply = state
                         .conversations
                         .iter()
                         .find(|c| c.id == conversation_id)
-                        .and_then(|c| c.messages.last())
-                        .filter(|m| !m.is_me)
+                        .and_then(|c| c.messages.iter().find(|m| m.id == reply_id))
                         .map(|m| (m.content.clone(), m.parts.clone()));
                     if let Some((content, parts)) = reply {
-                        state.persist_assistant_reply(&conversation_id, content, &parts, cx);
+                        state.persist_assistant_reply(
+                            &conversation_id,
+                            content,
+                            &parts,
+                            Some(&run_id),
+                            cx,
+                        );
                     }
+                }
+                if result.is_err() {
+                    // A run that failed leaves the app's own words in the feed and those are
+                    // never written down, so there is nothing to wait for: the thread is let go
+                    // here instead.
+                    state.release_live_turn(&conversation_id, &run_id);
                 }
                 if waiting_approval {
                     let open = state
@@ -3873,7 +4427,17 @@ impl AppState {
                     .first()
                     .map(|computer| computer.machine_id.clone())
             });
-        let conversation_id = self.active_conversation_id.clone();
+        // The thread the run belongs to, not the thread that happens to be open: a card can be
+        // answered from the notification while the person is reading somewhere else, and the
+        // resumed run must go on filling in its own bubble. Falling back to the open thread only
+        // covers a card the app never saw start, which is how cards off the approval queue
+        // arrive.
+        let conversation_id = self
+            .live_turns
+            .iter()
+            .find(|(_, turn)| turn.run_id == spec.run_id)
+            .map(|(id, _)| id.clone())
+            .or_else(|| self.active_conversation_id.clone());
         let (approved, decision, mode) = match resolution {
             LocalExecResolution::Always => (true, ApprovalDecision::Always, Some("bypass")),
             LocalExecResolution::AllowOnce => (true, ApprovalDecision::AllowOnce, None),
@@ -3926,12 +4490,7 @@ impl AppState {
                         let coworker_id = state.active_coworker_id.clone();
                         if approved {
                             state.begin_responding(coworker_id.as_deref(), "Running commands");
-                            state.follow_answered_run(
-                                run_id.clone(),
-                                conversation_id,
-                                coworker_id,
-                                cx,
-                            );
+                            state.follow_run(run_id.clone(), conversation_id, coworker_id, cx);
                         } else {
                             state.finish_responding(coworker_id.as_deref(), false);
                         }
@@ -3953,7 +4512,13 @@ impl AppState {
         .detach();
     }
 
-    fn follow_answered_run(
+    /// Watch a run to its end through the replay route, painting the thread as it goes.
+    ///
+    /// Two runs need this and they need the same thing: one the person has just allowed to
+    /// continue, whose remainder never comes down the original stream, and one that outlived the
+    /// app that started it and has no stream to come down at all. Both are runs the app is not
+    /// listening to and has to ask about instead.
+    fn follow_run(
         &mut self,
         run_id: String,
         conversation_id: Option<String>,
@@ -3965,25 +4530,27 @@ impl AppState {
         };
         cx.spawn(async move |this, cx| {
             let mut last_len = 0usize;
+            let mut last_status = String::new();
             for _ in 0..400 {
                 match client.replay_run(&run_id).await {
                     Ok(replay) => {
-                        if replay.events.len() != last_len {
+                        // The status counts as news of its own: the frame that ends a run is
+                        // often one the last poll already saw, and a run that stopped holding
+                        // its text back has words to show for it even when nothing new arrived.
+                        if replay.events.len() != last_len || replay.status != last_status {
                             last_len = replay.events.len();
-                            let mut assembler = TurnAssembler::default();
-                            for event in &replay.events {
-                                assembler.push_event(event);
-                            }
-                            assembler.finish();
-                            let (plain, parts) = assembler.snapshot();
+                            last_status = replay.status.clone();
+                            let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
                             let status = replay.status.clone();
                             // A resumed turn that only ran tools says what it did, so the
                             // thread keeps a memory of the run the person allowed.
-                            let plain = if status == "finished" && plain.trim().is_empty() {
-                                tool_standin(&deeds_from_replay(&replay.events)).unwrap_or_default()
-                            } else {
-                                plain
-                            };
+                            let plain = replayed_ending(
+                                &replay.events,
+                                &status,
+                                replay.failure.as_deref(),
+                                &plain,
+                            )
+                            .unwrap_or(plain);
                             // The journal says what the run is doing now; "Working" only
                             // when no frame has said.
                             let activity =
@@ -3991,13 +4558,27 @@ impl AppState {
                                     label: "Working".into(),
                                 });
                             let _ = this.update(cx, |state, cx| {
+                                // The bubble this run has been filling in all along, by the name
+                                // it was given when the turn started — the resumed half of a turn
+                                // belongs to the same row as the half before the card.
+                                let target = conversation_id.as_ref().and_then(|id| {
+                                    state.live_turns.get(id).map(|turn| turn.message_id.clone())
+                                });
                                 if let Some(conversation_id) = conversation_id.as_ref()
                                     && let Some(conversation) = state
                                         .conversations
                                         .iter_mut()
                                         .find(|c| &c.id == conversation_id)
-                                    && let Some(last) =
-                                        conversation.messages.iter_mut().rev().find(|m| !m.is_me)
+                                    && let Some(last) = match target.as_deref() {
+                                        Some(id) => {
+                                            conversation.messages.iter_mut().find(|m| m.id == id)
+                                        }
+                                        None => conversation
+                                            .messages
+                                            .iter_mut()
+                                            .rev()
+                                            .find(|m| !m.is_me),
+                                    }
                                 {
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
@@ -4029,12 +4610,16 @@ impl AppState {
                                                 id,
                                                 plain.clone(),
                                                 &parts,
+                                                Some(&run_id),
                                                 cx,
                                             );
                                         }
                                     }
                                     "failed" => {
                                         state.finish_responding(coworker_id.as_deref(), false);
+                                        if let Some(id) = conversation_id.as_ref() {
+                                            state.release_live_turn(id, &run_id);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -4260,6 +4845,7 @@ impl AppState {
             reply_preview: None,
             reply_to_id: None,
             reply_is_me: false,
+            run_id: Some(spec.run_id.clone()),
             parts: vec![ChatPart::Approval(spec)],
         });
     }
@@ -4379,6 +4965,7 @@ impl AppState {
                 reply_to_id: reply.as_ref().map(|r| r.message_id.clone()),
                 reply_is_me: reply.as_ref().is_some_and(|r| r.is_me),
                 parts: Vec::new(),
+                run_id: None,
             };
             conversation.messages.push(message);
         }
@@ -4413,6 +5000,9 @@ impl AppState {
                         None,
                         reply,
                         &[],
+                        // The person's own message came out of no run. The server's record of a
+                        // thread is its runs, and a run is only the coworker's half of a turn.
+                        None,
                     )
                     .await
                 {
@@ -5215,13 +5805,14 @@ mod tests {
 
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        ActiveRecipe, ChatPart, DatabaseService, EMPTY_TURN_NOTE, Message, PickedKind,
-        REPLY_QUOTE_CHARS, RecipeSummary, agui_messages, is_status_line, is_tool_standin,
-        restored_parts, saved_parts,
+        ActiveRecipe, ChatMessage, ChatPart, Conversation, DatabaseService, EMPTY_TURN_NOTE,
+        LiveTurn, Message, PickedKind, REPLY_QUOTE_CHARS, RecipeSummary, RecoveredReply, ThreadRun,
+        TurnAssembler, agui_messages, apply_reload, graft_reply, is_status_line, is_tool_standin,
+        missing_replies, reply_from_replay, restored_parts, saved_parts, streaming_message_mut,
     };
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     fn message(id: &str, is_me: bool, content: &str) -> Message {
         Message {
@@ -5234,6 +5825,7 @@ mod tests {
             reply_to_id: None,
             reply_is_me: false,
             parts: Vec::new(),
+            run_id: None,
         }
     }
 
@@ -5403,6 +5995,7 @@ mod tests {
             None,
             None,
             &saved_parts(&live),
+            Some("run_1"),
         )
         .await
         .expect("the turn is saved");
@@ -5411,6 +6004,12 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let restored = restored_parts(&rows[0].content, rows[0].parts.clone());
         assert_eq!(shape(&restored), shape(&live));
+        assert_eq!(
+            rows[0].run_id.as_deref(),
+            Some("run_1"),
+            "the row says which run it came out of, which is how reconciling against the server \
+             knows it already has this turn"
+        );
     }
 
     /// A row written before pieces were kept has none of them — which is also every row the
@@ -5428,6 +6027,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("the message is saved");
@@ -5595,5 +6195,364 @@ mod tests {
         settle_patch(&mut roster, &patch, Some(&echo), &before);
         assert_eq!(roster.avatar_shape, None);
         assert_eq!(roster.avatar_color, None);
+    }
+
+    // ---- A turn survives looking away -------------------------------------------------------
+
+    fn at(mut message: Message, at_ms: u64) -> Message {
+        message.sent_at = SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms);
+        message
+    }
+
+    /// A reply already on disk, which is to say a run this thread can account for.
+    fn from_run(id: &str, content: &str, run_id: &str, at_ms: u64) -> Message {
+        let mut message = at(message(id, false, content), at_ms);
+        message.run_id = Some(run_id.to_string());
+        message
+    }
+
+    fn thread(id: &str, messages: Vec<Message>) -> Conversation {
+        Conversation {
+            id: id.to_string(),
+            title: id.to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages,
+            unread_count: 0,
+        }
+    }
+
+    fn ids(messages: &[Message]) -> Vec<&str> {
+        messages.iter().map(|message| message.id.as_str()).collect()
+    }
+
+    /// A row as the local database hands it back.
+    fn row(id: &str, role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.to_string(),
+            session_id: "cw_1".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            created_at: "2026-09-17 10:00:00".to_string(),
+            model: None,
+            provider: None,
+            reply_to_id: None,
+            reply_preview: None,
+            reply_is_me: None,
+            run_id: None,
+            parts: Vec::new(),
+        }
+    }
+
+    fn in_flight() -> LiveTurn {
+        LiveTurn {
+            run_id: "run_1".to_string(),
+            message_id: "m_live".to_string(),
+            coworker_id: Some("cw_1".to_string()),
+            persisting: false,
+        }
+    }
+
+    /// One turn's frames as the server kept them: some words, a tool that took a picture of the
+    /// box's screen, more words. The picture arrives base64 inside the frame, because that is
+    /// how a frame carries one, and decoding it is part of what the two paths have to agree on.
+    fn turn_frames() -> Vec<serde_json::Value> {
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD.encode(b"png-one");
+        vec![
+            serde_json::json!({ "type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_1" }),
+            serde_json::json!({
+                "type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Opening YouTube "
+            }),
+            serde_json::json!({
+                "type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "on my box."
+            }),
+            serde_json::json!({
+                "type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": "computer"
+            }),
+            serde_json::json!({ "type": "TOOL_CALL_END", "toolCallId": "c1" }),
+            serde_json::json!({
+                "type": "TOOL_CALL_RESULT",
+                "toolCallId": "c1",
+                "content": "screenshot of the 1280x800 screen attached",
+                "image": { "mime": "image/png", "base64": png, "width": 1280, "height": 800 }
+            }),
+            serde_json::json!({
+                "type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "It is open."
+            }),
+            serde_json::json!({ "type": "RUN_FINISHED", "runId": "run_1" }),
+        ]
+    }
+
+    fn thread_run(
+        run_id: &str,
+        status: &str,
+        started_at_ms: i64,
+        events: &[serde_json::Value],
+    ) -> ThreadRun {
+        ThreadRun {
+            run_id: run_id.to_string(),
+            status: status.to_string(),
+            started_at_ms,
+            updated_at_ms: started_at_ms,
+            failure: None,
+            events: events.to_vec(),
+        }
+    }
+
+    /// The turn as the stream painted it: every frame pushed as it arrived, the feed repainted
+    /// from a snapshot each time, and the closing the end of the stream gives it.
+    fn watched_live(events: &[serde_json::Value]) -> (String, Vec<ChatPart>) {
+        let mut assembler = TurnAssembler::default();
+        for event in events {
+            assembler.push_event(event);
+            let _ = assembler.snapshot();
+        }
+        assembler.finish();
+        assembler.snapshot()
+    }
+
+    /// The bug the person reported, in the place it happens: switching bots mid-turn reloaded
+    /// the thread from a database that does not yet have the reply, and the bubble and every
+    /// picture under it went with it.
+    #[test]
+    fn a_thread_with_a_turn_in_flight_is_not_reloaded_out_from_under_it() {
+        let mut conversation = thread(
+            "cw_1",
+            vec![
+                at(message("m_ask", true, "open youtube"), 1_000),
+                at(message("m_live", false, "Opening YouTube "), 2_000),
+            ],
+        );
+        // What SQLite has: the person's message and nothing else. The reply is not written down
+        // until the turn ends, so the persisted set is a subset of what is on screen.
+        let rows = vec![row("db_ask", "user", "open youtube")];
+
+        assert!(
+            !apply_reload(&mut conversation, Some(&in_flight()), rows.clone()),
+            "a thread in the middle of a turn refuses the rows"
+        );
+        assert_eq!(ids(&conversation.messages), vec!["m_ask", "m_live"]);
+        assert_eq!(
+            conversation.messages[1].content, "Opening YouTube ",
+            "the bubble being filled in is still the one being filled in"
+        );
+
+        assert!(
+            apply_reload(&mut conversation, None, rows),
+            "with no turn in flight the rows are taken, which is what every other reload is"
+        );
+        assert_eq!(ids(&conversation.messages), vec!["db_ask"]);
+    }
+
+    /// "The last one, if it isn't mine" was the whole of the old rule, and everything that
+    /// touches the list breaks it — after which the run fills in a bubble belonging to something
+    /// else, which reads exactly like the run having stopped.
+    #[test]
+    fn a_run_finds_its_bubble_after_the_thread_moved_underneath_it() {
+        let mut conversations = vec![
+            thread("cw_other", vec![message("m_live", false, "another bot")]),
+            thread(
+                "cw_1",
+                vec![
+                    at(message("m_ask", true, "open youtube"), 1_000),
+                    at(message("m_live", false, ""), 2_000),
+                ],
+            ),
+        ];
+        // A permission card, a reload, a recovered older reply: each of these makes some other
+        // row the last one.
+        conversations[1]
+            .messages
+            .push(at(message("m_card", false, "may I?"), 3_000));
+        conversations[1]
+            .messages
+            .insert(0, at(message("m_older", false, "yesterday"), 100));
+
+        let found = streaming_message_mut(&mut conversations, "cw_1", "m_live")
+            .expect("the bubble the turn was given");
+        found.content = "Opening YouTube on my box.".to_string();
+        assert_eq!(
+            conversations[1].messages[2].content, "Opening YouTube on my box.",
+            "the words went where the run's own bubble had drifted to"
+        );
+        assert_eq!(
+            conversations[1].messages[3].content, "may I?",
+            "and nowhere near the row that happens to be last"
+        );
+
+        assert_eq!(
+            conversations[0].messages[0].content, "another bot",
+            "and not into the thread the person switched to, which holds a row under the very \
+             same id — the thread is looked up first, and only then the row"
+        );
+
+        conversations[1].messages.retain(|m| m.id != "m_live");
+        assert!(
+            streaming_message_mut(&mut conversations, "cw_1", "m_live").is_none(),
+            "a bubble that is genuinely gone is written nowhere at all"
+        );
+    }
+
+    /// The two paths must not drift. A turn watched live and the same turn read back off the
+    /// server have to come to the same bubbles and the same pictures, or "where was I?" and
+    /// "what happened?" are two different answers and the person has to pick one to believe.
+    #[test]
+    fn a_turn_read_back_off_the_server_comes_to_what_the_same_turn_watched_live_came_to() {
+        let events = turn_frames();
+        let (live_plain, live_parts) = watched_live(&events);
+        let (replayed_plain, replayed_parts) = reply_from_replay(&events, "finished");
+
+        assert_eq!(replayed_plain, live_plain);
+        assert_eq!(shape(&replayed_parts), shape(&live_parts));
+        assert!(
+            shape(&live_parts)
+                .iter()
+                .any(|part| part.starts_with("shot c1 1280x800")),
+            "the picture is in the turn, or this proves nothing about pictures"
+        );
+        // And through the door both go to disk by, since that is where the pictures are kept.
+        assert_eq!(saved_parts(&replayed_parts), saved_parts(&live_parts));
+        assert!(
+            saved_parts(&replayed_parts).iter().any(|part| matches!(
+                part,
+                crate::services::database::MessagePart::Screenshot { .. }
+            )),
+            "a rebuilt turn saves its picture, or coming back to it loses the picture again"
+        );
+    }
+
+    /// Reconciling is a diff, not a rebuild: a run the thread already has a reply for was built
+    /// from these very frames, and saying it again would put the same turn in twice.
+    #[test]
+    fn reconciling_takes_only_the_runs_the_thread_cannot_account_for() {
+        let events = turn_frames();
+        let runs = vec![
+            thread_run("run_1", "finished", 1_000, &events),
+            thread_run("run_2", "finished", 5_000, &events),
+            thread_run("run_3", "running", 9_000, &events[..3]),
+        ];
+        let messages = vec![
+            at(message("m_ask", true, "open youtube"), 900),
+            from_run("m_run1", "Opening YouTube on my box.", "run_1", 1_100),
+            at(message("m_ask2", true, "again"), 4_900),
+        ];
+
+        let missing = missing_replies(&messages, &runs);
+        assert_eq!(
+            missing
+                .iter()
+                .map(|reply| reply.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run_2", "run_3"],
+            "oldest first, and run_1 is already written down"
+        );
+        assert!(
+            !missing[0].live,
+            "a run that ended is one to show and write down"
+        );
+        assert!(
+            missing[1].live,
+            "a run still going is one to re-attach to, which is how a restart mid-turn recovers"
+        );
+        assert!(
+            shape(&missing[0].parts)
+                .iter()
+                .any(|part| part.starts_with("shot c1 ")),
+            "a recovered turn brings its pictures back with it"
+        );
+
+        // Nothing missing is the ordinary case, and it must cost the thread nothing.
+        let settled = vec![
+            from_run("m_run1", "…", "run_1", 1_100),
+            from_run("m_run2", "…", "run_2", 5_100),
+            from_run("m_run3", "…", "run_3", 9_100),
+        ];
+        assert!(missing_replies(&settled, &runs).is_empty());
+    }
+
+    /// Every thread the build in the person's hands wrote has replies that cannot say which run
+    /// they came out of. On one of those a finished run and an already-saved one look the same,
+    /// and guessing would put the last few turns into the transcript twice.
+    #[test]
+    fn a_thread_that_can_name_no_run_takes_only_the_one_still_going() {
+        let events = turn_frames();
+        let runs = vec![
+            thread_run("run_1", "finished", 1_000, &events),
+            thread_run("run_2", "finished", 5_000, &events),
+            thread_run("run_3", "running", 9_000, &events[..3]),
+        ];
+        // What an older build left behind: replies with no run id on them at all.
+        let legacy = vec![
+            at(message("m_ask", true, "open youtube"), 900),
+            at(
+                message("m_said", false, "Opening YouTube on my box."),
+                1_100,
+            ),
+            at(message("m_ask2", true, "again"), 4_900),
+            at(message("m_said2", false, "Open again."), 5_100),
+        ];
+        let missing = missing_replies(&legacy, &runs);
+        assert_eq!(
+            missing
+                .iter()
+                .map(|reply| reply.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run_3"],
+            "the finished runs are left alone; only the one that cannot already be here is taken"
+        );
+
+        // One reply that names its run is all it takes: from there the diff is exact again, and
+        // the runs before it are behind the thread's knowledge rather than missing from it.
+        let mut named = legacy.clone();
+        named[3].run_id = Some("run_2".to_string());
+        assert_eq!(
+            missing_replies(&named, &runs)
+                .iter()
+                .map(|reply| reply.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run_3"],
+            "run_1 is older than a run the thread can name, so its reply is older still"
+        );
+    }
+
+    /// A run can be started and die before it says anything. A blank bubble in the transcript is
+    /// worse than the absence of one.
+    #[test]
+    fn a_run_that_said_nothing_at_all_is_not_grafted_as_an_empty_bubble() {
+        let silent = vec![serde_json::json!({
+            "type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_9"
+        })];
+        let runs = vec![thread_run("run_9", "running", 1_000, &silent)];
+        assert!(missing_replies(&[], &runs).is_empty());
+    }
+
+    /// The thread is in the order things were said, and a reply that arrives late is still a
+    /// reply to the message that asked for it.
+    #[test]
+    fn a_recovered_reply_goes_back_where_it_happened_rather_than_on_the_end() {
+        let mut messages = vec![
+            at(message("m_ask", true, "open youtube"), 1_000),
+            at(message("m_ask2", true, "and close it"), 5_000),
+        ];
+        let reply = RecoveredReply {
+            run_id: "run_1".to_string(),
+            content: "Opening.".to_string(),
+            parts: vec![ChatPart::Text("Opening.".to_string())],
+            live: false,
+            started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(2_000),
+        };
+
+        let id = graft_reply(&mut messages, &reply);
+        assert_eq!(
+            ids(&messages),
+            vec!["m_ask", id.as_str(), "m_ask2"],
+            "after the message that asked for it, before whatever was said next"
+        );
+        assert_eq!(
+            messages[1].run_id.as_deref(),
+            Some("run_1"),
+            "and it says which run it came out of, so the next reconcile leaves it alone"
+        );
     }
 }

@@ -71,6 +71,10 @@ impl DatabaseService {
     ///
     /// The two go in together: a half-written turn would come back as a bubble whose picture
     /// never arrived, which is the very thing keeping the pieces is here to stop.
+    ///
+    /// `run_id` is the run a coworker's reply came out of, and is what lets a thread be
+    /// reconciled against the server without saying everything twice. The person's own messages
+    /// came out of no run and carry none.
     pub async fn save_message(
         &self,
         session_id: &str,
@@ -80,6 +84,7 @@ impl DatabaseService {
         provider: Option<String>,
         reply: Option<ReplyRef>,
         parts: &[MessagePart],
+        run_id: Option<&str>,
     ) -> Result<String> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
@@ -89,7 +94,7 @@ impl DatabaseService {
 
         let id = uuid::Uuid::now_v7().to_string();
         sqlx::query(
-            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(session_id)
@@ -100,6 +105,7 @@ impl DatabaseService {
         .bind(reply.as_ref().map(|r| r.message_id.clone()))
         .bind(reply.as_ref().map(|r| r.preview.clone()))
         .bind(reply.as_ref().map(|r| i64::from(r.is_me)))
+        .bind(run_id)
         .execute(&mut *tx)
         .await?;
 
@@ -134,7 +140,7 @@ impl DatabaseService {
     /// pieces were kept has none, and reads back as the words in `content`.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let mut rows = sqlx::query_as::<_, ChatMessage>(
-            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -181,6 +187,10 @@ pub struct ChatMessage {
     pub reply_to_id: Option<String>,
     pub reply_preview: Option<String>,
     pub reply_is_me: Option<i64>,
+    /// The run this reply came out of, when it came out of one. It is how a thread being
+    /// reconciled against the server tells a run it has already written down from one it has
+    /// only just heard about.
+    pub run_id: Option<String>,
     /// The pieces of the message, in the order they were seen. They live in a table of their own
     /// so the picture bytes stay off this row; `get_messages` is what fills this in.
     #[sqlx(skip)]

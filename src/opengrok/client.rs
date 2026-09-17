@@ -405,10 +405,17 @@ impl OpenGrokClient {
     ///
     /// A recipe the person put on this turn goes in `forwardedProps` beside the coworker, with
     /// the values its parameters were given. The messages are untouched by it.
+    ///
+    /// The run id is the caller's. The server keeps every frame a run emits under it and will
+    /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
+    /// client that only learns the id from the frames it already saw: the one moment the id is
+    /// needed is the moment the stream has been lost. So it is minted before the turn is sent,
+    /// by whoever will have to ask about it later.
     pub async fn run_turn<F>(
         &self,
         coworker_id: &str,
         thread_id: &str,
+        run_id: &str,
         messages: &[AguiMessage],
         recipe: Option<&TurnRecipe>,
         mut on_event: F,
@@ -423,7 +430,7 @@ impl OpenGrokClient {
         }
         let body = json!({
             "threadId": thread_id,
-            "runId": uuid::Uuid::now_v7().to_string(),
+            "runId": run_id,
             "messages": messages,
             "tools": super::gen_ui::agui_tools(),
             "forwardedProps": forwarded,
@@ -502,6 +509,24 @@ impl OpenGrokClient {
 
     pub async fn replay_run(&self, run_id: &str) -> Result<RunReplay, OpenGrokError> {
         let path = format!("/ag-ui/runs/{run_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Every run this thread has, oldest first, with the frames each one emitted.
+    ///
+    /// This is the thread as the server has it, which is the only copy that survives the app
+    /// being closed. `limit` is not politeness: a run carries every frame it emitted and a
+    /// computer-use run's frames carry screenshots, so asking for a whole thread's history is
+    /// asking for megabytes. Only the newest runs can disagree with what is already on disk.
+    pub async fn replay_thread(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<ThreadReplay, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}?limit={limit}");
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
@@ -946,10 +971,52 @@ pub struct RunReplay {
     pub run_id: String,
     #[serde(default)]
     pub status: String,
+    /// Why a `failed` run failed, in the server's words. A turn that died after the app stopped
+    /// listening has no error to report from its own stream, so this is the only account of it.
+    #[serde(default)]
+    pub failure: Option<String>,
     #[serde(default)]
     pub events: Vec<serde_json::Value>,
     #[serde(default)]
     pub pending: Option<serde_json::Value>,
+}
+
+/// A thread's runs as the server kept them, from `GET /ag-ui/threads/{thread_id}`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ThreadReplay {
+    #[serde(rename = "threadId", default)]
+    pub thread_id: String,
+    /// Oldest first, so the list reads in the order things happened.
+    #[serde(default)]
+    pub runs: Vec<ThreadRun>,
+}
+
+/// One turn of a thread, as the server kept it.
+///
+/// `events` are the frames the run *emitted*, which is to say the coworker's side of the turn.
+/// What the person typed was consumed by the run and never journaled, so a thread rebuilt from
+/// these alone would be a conversation with one voice in it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThreadRun {
+    #[serde(rename = "runId", default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(rename = "startedAtMs", default)]
+    pub started_at_ms: i64,
+    #[serde(rename = "updatedAtMs", default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub failure: Option<String>,
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+}
+
+impl ThreadRun {
+    /// The run has not ended: it is still working, or parked on a permission card.
+    pub fn is_live(&self) -> bool {
+        self.status == "running" || self.status == "awaiting-approval"
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2062,6 +2129,7 @@ mod tests {
             .run_turn(
                 "cw",
                 "t",
+                "run_1",
                 &[AguiMessage {
                     id: "u1".into(),
                     role: "user".into(),
@@ -2129,7 +2197,14 @@ mod tests {
             ]),
         };
         client
-            .run_turn("cw_1", "thread_1", &[message], Some(&recipe), |_| {})
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_1",
+                &[message],
+                Some(&recipe),
+                |_| {},
+            )
             .await
             .unwrap();
 
@@ -2147,12 +2222,18 @@ mod tests {
             body["messages"][0]["content"], "find me something",
             "a parameter value is not prose: the message stays exactly what was written"
         );
+        assert_eq!(
+            body["runId"], "run_1",
+            "the run is filed under the id the caller minted, which is the only id it still has \
+             to ask `GET /ag-ui/runs/{{id}}` with once the stream is gone"
+        );
 
         // No recipe on the turn leaves the props as they were, so an ordinary chat is unchanged.
         client
             .run_turn(
                 "cw_1",
                 "thread_1",
+                "run_2",
                 &[AguiMessage {
                     id: "u2".into(),
                     role: "user".into(),

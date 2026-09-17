@@ -1,0 +1,11 @@
+-- Which run a coworker's reply came out of.
+--
+-- The server keeps every frame a run emitted and will hand them back by run id, which makes it
+-- the record of what was said and this table a cache of it. A cache has to be able to answer
+-- "have I already got this one?", and without the run id on the row it cannot: two replies to
+-- two turns look alike, so a thread reconciled against the server after a restart would either
+-- write every finished run down a second time or refuse to write down the one that is missing.
+--
+-- Null on every row written before this, and on every row that is the person's own message,
+-- neither of which came out of a run.
+ALTER TABLE chat_messages ADD COLUMN run_id TEXT;
