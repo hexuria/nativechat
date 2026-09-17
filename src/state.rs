@@ -5203,12 +5203,26 @@ impl AppState {
                         // one being read: a card answered from the notification leaves the
                         // person somewhere else entirely, and the working line belongs where the
                         // work is.
-                        if approved {
-                            state.begin_responding(conversation_id.as_deref(), "Running commands");
-                            state.follow_run(run_id.clone(), conversation_id, cx);
-                        } else {
-                            state.finish_responding(conversation_id.as_deref(), false);
-                        }
+                        // A NO IS FOLLOWED TOO, and for the same reason a yes is: the run
+                        // carries on either way. Answering puts it back to running whichever way
+                        // the person answered, because the refusal still has to reach the
+                        // coworker — it is told what it may not use, and it answers that rather
+                        // than being cut off mid-tool with a call nobody ever resolved.
+                        //
+                        // This branch used to end the turn here instead, and the composer paid
+                        // for it: the working line went, so nothing looked busy, while the turn
+                        // stayed registered and the send button stayed a stop button over a turn
+                        // the app was no longer watching. Following it is what lets the ordinary
+                        // ending arrive and settle the thread.
+                        state.begin_responding(
+                            conversation_id.as_deref(),
+                            if approved {
+                                "Running commands"
+                            } else {
+                                "Telling them no"
+                            },
+                        );
+                        state.follow_run(run_id.clone(), conversation_id, cx);
                     }
                     Err(error) => {
                         if error.message.contains("no such run") {
@@ -7414,6 +7428,46 @@ mod tests {
             state.turn_to_stop().is_none(),
             "so a stop pressed here finds nothing, rather than stopping somebody else's turn"
         );
+    }
+
+    /// Clearing the working line is NOT an ending, and the composer is where the difference shows.
+    ///
+    /// THIS IS THE PAIR A PERSON REPORTED AS A BUG on 18 Sep 2026: they denied a command, no
+    /// coworker was thinking any more — and the send button was still a stop button. The denial
+    /// path had reached for `finish_responding` as though it ended the turn. It does not: it
+    /// takes away the line that says somebody is working, and leaves the turn registered against
+    /// the thread, which is the fact the button is drawn from.
+    ///
+    /// Both real endings do more than this — `persist_assistant_reply` marks the turn while the
+    /// reply goes to disk, `release_live_turn` lets go of a turn with nothing to write down — so
+    /// this test is here to say that the third thing, on its own, is neither.
+    #[test]
+    fn clearing_the_working_line_does_not_let_go_of_the_turn() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        assert_eq!(state.thread_status("cw_1"), Some("Working"));
+
+        state.finish_responding(Some("cw_1"), false);
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "nothing looks busy in the thread any more"
+        );
+        assert!(
+            state.is_turn_in_flight(),
+            "but the turn is still this thread's, so the composer still offers to stop it — \
+             which is exactly the pair that reads as a bug: no coworker working, and a stop \
+             button over it"
+        );
+
+        // Waiting on a card is the one time the two are meant to differ, and it says so rather
+        // than falling silent: the turn is genuinely still in flight, stopped on a person.
+        state.finish_responding(Some("cw_1"), true);
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_APPROVAL_STATUS));
+        assert!(state.is_turn_in_flight());
+
+        // And an ending is what lets the button go back to a send arrow.
+        state.release_live_turn("cw_1", "run_1");
+        assert!(!state.is_turn_in_flight());
     }
 
     /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".
