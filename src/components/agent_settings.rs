@@ -9,7 +9,7 @@ use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::{ActiveTheme, Icon, Selectable, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Selectable, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -43,13 +43,19 @@ impl RenderOnce for AvatarEditorTrigger {
     }
 }
 
+/// Where the model list hangs from: an element of its own under the field and the width of
+/// it, so the list lines up with the field.
+///
+/// The field itself cannot be the popover's trigger. A trigger swallows every mouse down over
+/// everything it holds, and the model field is a field a person has to be able to click into,
+/// place the caret in and select text in. So the trigger anchors the list and nothing else:
+/// the chevron beside the field opens it.
 #[derive(IntoElement)]
-struct ModelFieldTrigger {
+struct ModelPopAnchor {
     selected: bool,
-    field: Input,
 }
 
-impl Selectable for ModelFieldTrigger {
+impl Selectable for ModelPopAnchor {
     fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
@@ -60,13 +66,37 @@ impl Selectable for ModelFieldTrigger {
     }
 }
 
-impl RenderOnce for ModelFieldTrigger {
+impl RenderOnce for ModelPopAnchor {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        div()
-            .id("agent-model-field")
-            .w(px(PANE_INNER))
-            .child(self.field)
+        div().id("agent-model-anchor").w(px(PANE_INNER)).h(px(0.))
     }
+}
+
+/// The chevron that opens the model list, drawn inside the field's own border at its right
+/// edge so the two read as one control.
+fn model_chevron(app: Entity<AppState>, open: bool, muted: Hsla) -> impl IntoElement {
+    div()
+        .id("agent-model-chevron")
+        .size(px(20.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.16)))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            // The pane shuts its popovers on any mouse down that reaches it, so the click that
+            // opens one has to stop here.
+            cx.stop_propagation();
+            app.update(cx, |state, cx| {
+                state.set_model_picker_open(!open, cx);
+            });
+        })
+        .child(
+            Icon::new(IconName::ChevronDown)
+                .size(px(14.))
+                .text_color(muted),
+        )
 }
 
 pub struct AgentSettings {
@@ -76,6 +106,9 @@ pub struct AgentSettings {
     role_input: Entity<TextareaState>,
     model_input: Entity<InputState>,
     synced_id: Option<String>,
+    /// The profile is with the server. The Save button is out of the person's hands until the
+    /// answer comes back, whichever way it goes.
+    saving: bool,
     usage_open: bool,
     auto_review_open: bool,
     auto_review_mode: AutoReviewMode,
@@ -107,6 +140,7 @@ impl AgentSettings {
             role_input,
             model_input,
             synced_id: None,
+            saving: false,
             usage_open: false,
             auto_review_open: false,
             auto_review_mode: AutoReviewMode::Inherit,
@@ -145,25 +179,49 @@ impl AgentSettings {
         });
     }
 
-    fn patch(&self, patch: CoworkerPatch, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            state.patch_active_agent(patch, cx);
-        });
-    }
-
     fn commit_profile(&mut self, cx: &mut Context<Self>) {
-        let name = self.name_input.read(cx).value().to_string();
-        let title = self.label_input.read(cx).value().to_string();
-        let role = self.role_input.read(cx).value().to_string();
-        self.patch(
-            CoworkerPatch {
-                name: Some(name),
-                title: Some(title),
-                role: Some(role),
-                ..Default::default()
-            },
-            cx,
-        );
+        // A second Save while the first is still out would send the same profile twice and,
+        // with the two answers arriving in any order, settle the roster on whichever landed
+        // last. The button is inert while it spins, and this is the same rule for a Save that
+        // arrives by any other road.
+        if self.saving {
+            return;
+        }
+        // The Model field is a field, so Save means it too. Picking from the list already
+        // patches the model on the spot; a route id typed by hand had nowhere to go, and a
+        // person who edits a box and presses the button beside it has said what they want just
+        // as plainly as one who picked from a list. Blank is the exception and is left out: an
+        // empty box is a field nobody filled, not an instruction to unpin the model, and a
+        // coworker with no route cannot answer at all.
+        let model = self.model_input.read(cx).value().trim().to_string();
+        let patch = CoworkerPatch {
+            name: Some(self.name_input.read(cx).value().to_string()),
+            title: Some(self.label_input.read(cx).value().to_string()),
+            role: Some(self.role_input.read(cx).value().to_string()),
+            model: (!model.is_empty()).then_some(model),
+            ..Default::default()
+        };
+        self.saving = true;
+        let settings = cx.entity().downgrade();
+        self.state.update(cx, |state, cx| {
+            state.patch_active_agent_then(
+                patch,
+                Some(Box::new(move |error, cx| {
+                    let _ = settings.update(cx, |settings, cx| {
+                        settings.saving = false;
+                        // The roster now holds what the server stored rather than what was
+                        // typed. The fields have to say the same thing, or a name the server
+                        // never took would go on sitting in the field as though it had.
+                        if error.is_none() {
+                            settings.synced_id = None;
+                        }
+                        cx.notify();
+                    });
+                })),
+                cx,
+            );
+        });
+        cx.notify();
     }
 }
 
@@ -285,6 +343,8 @@ impl Render for AgentSettings {
                 state.avatar_editor_open,
             )
         };
+        let model_focus = self.model_input.read(cx).focus_handle(cx);
+        let saving = self.saving;
         let usage_open = self.usage_open;
         let auto_review_open = self.auto_review_open;
         let auto_review_mode = self.auto_review_mode;
@@ -460,14 +520,42 @@ impl Render for AgentSettings {
                                     )
                                     .child(heading("Model", muted))
                                     .child(
-                                        div()
+                                        v_flex()
                                             .id("agent-model")
                                             .w_full()
+                                            .on_key_down(cx.listener(
+                                                |this, event: &KeyDownEvent, _, cx| {
+                                                    // Focus is in the field and not in the
+                                                    // panel, so the popover never hears the
+                                                    // Escape itself. The pane shuts the list,
+                                                    // and the field keeps what was typed.
+                                                    if event.keystroke.key == "escape" {
+                                                        this.state.update(cx, |state, cx| {
+                                                            state.set_model_picker_open(false, cx);
+                                                        });
+                                                    }
+                                                },
+                                            ))
+                                            .child(
+                                                settings_input(&self.model_input)
+                                                    .id("agent-model-field")
+                                                    .w(px(PANE_INNER))
+                                                    .suffix(model_chevron(
+                                                        app.clone(),
+                                                        model_open,
+                                                        muted,
+                                                    )),
+                                            )
                                             .child(
                                                 Popover::new("agent-model-pop")
                                                     .appearance(false)
                                                     .overlay_closable(true)
                                                     .open(model_open)
+                                                    // Opening the list must not take the
+                                                    // keyboard off the field: a popover focuses
+                                                    // its own panel unless it is told whose
+                                                    // keystrokes these are.
+                                                    .track_focus(&model_focus)
                                                     .on_open_change({
                                                         let app = app.clone();
                                                         move |open, _, cx| {
@@ -478,18 +566,19 @@ impl Render for AgentSettings {
                                                             });
                                                         }
                                                     })
-                                                    .trigger(ModelFieldTrigger {
+                                                    .trigger(ModelPopAnchor {
                                                         selected: model_open,
-                                                        field: settings_input(&self.model_input),
                                                     })
                                                     .content({
                                                         let app = app.clone();
                                                         let theme = theme.clone();
                                                         let model = model.clone();
                                                         let catalogue = catalogue.clone();
+                                                        let field = self.model_input.clone();
                                                         move |_, _, _| {
                                                             model_picker_panel(
                                                                 app.clone(),
+                                                                field.clone(),
                                                                 catalogue.clone(),
                                                                 model.clone(),
                                                                 dark,
@@ -620,6 +709,14 @@ impl Render for AgentSettings {
                                             Button::new("agent-save-btn")
                                                 .label("Save")
                                                 .primary()
+                                                // The icon slot is what the button spins, so
+                                                // the spinner only appears while there is
+                                                // something to wait for.
+                                                .when(saving, |this| {
+                                                    this.icon(IconName::Loader)
+                                                })
+                                                .loading(saving)
+                                                .disabled(saving)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.commit_profile(cx);
                                                 })),
@@ -800,6 +897,7 @@ fn avatar_editor_panel(
 
 fn model_picker_panel(
     app: Entity<AppState>,
+    field: Entity<InputState>,
     catalogue: Vec<ModelEntry>,
     current: String,
     dark: bool,
@@ -826,6 +924,7 @@ fn model_picker_panel(
             let mid = m.id;
             let selected = mid == current;
             let app = app.clone();
+            let field = field.clone();
             div()
                 .id(SharedString::from(format!("model-{mid}")))
                 .px(px(8.))
@@ -836,7 +935,14 @@ fn model_picker_panel(
                 .hover(|s| s.bg(rgb(0x777777).opacity(0.16)))
                 .on_mouse_down(MouseButton::Left, {
                     let mid = mid.clone();
-                    move |_, _, cx| {
+                    let field = field.clone();
+                    move |_, window, cx| {
+                        // The field is a field, so a pick has to land in it as text. Nothing
+                        // else puts the roster's model back into the field while the same
+                        // agent stays open.
+                        field.update(cx, |input, cx| {
+                            input.set_value(mid.clone(), window, cx);
+                        });
                         app.update(cx, |state, cx| {
                             state.set_model_picker_open(false, cx);
                             state.patch_active_agent(
