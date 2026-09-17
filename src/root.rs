@@ -16,7 +16,6 @@ use crate::components::lightbox::LightboxView;
 use crate::components::voice_mode_modal::render_voice_mode_modal;
 use gpui_kit::component::{ActiveTheme, Root};
 
-#[derive(Clone)]
 pub struct RootView {
     layout: Entity<Layout>,
     state: Entity<AppState>,
@@ -29,6 +28,23 @@ pub struct RootView {
     was_signed_in: bool,
     #[cfg(feature = "agent")]
     mailbox: Option<crate::agent::AgentMailbox>,
+    /// Requests taken off the mailbox and not answered yet, because the keys of the op before
+    /// them are still going in. They are held here rather than left in the mailbox because the
+    /// mailbox is drained whole.
+    #[cfg(feature = "agent")]
+    agent_backlog: std::collections::VecDeque<gpui_agent::mailbox::MailboxRequest>,
+    /// Keys a driver asked for, in the order they were asked for.
+    #[cfg(feature = "agent")]
+    agent_keys: std::collections::VecDeque<crate::agent::ComposePlan>,
+    /// The caret has just been put in the composer and the frame that paints it there has not
+    /// been drawn yet, so the keys wait for it.
+    #[cfg(feature = "agent")]
+    agent_focused: bool,
+    /// Keys are going in right now, just after a frame. Pressing one can draw the window, and
+    /// that draw renders this view again, so this is what keeps the second pass from answering
+    /// the ops that are waiting on those keys.
+    #[cfg(feature = "agent")]
+    agent_pressing: bool,
 }
 
 impl RootView {
@@ -52,6 +68,14 @@ impl RootView {
             was_signed_in: false,
             #[cfg(feature = "agent")]
             mailbox: None,
+            #[cfg(feature = "agent")]
+            agent_backlog: std::collections::VecDeque::new(),
+            #[cfg(feature = "agent")]
+            agent_keys: std::collections::VecDeque::new(),
+            #[cfg(feature = "agent")]
+            agent_focused: false,
+            #[cfg(feature = "agent")]
+            agent_pressing: false,
         }
     }
 
@@ -86,12 +110,73 @@ impl RootView {
         self
     }
 
+    /// Press the keys a driver asked for. Returns whether the composer is still owed some, in
+    /// which case no other op may be answered yet.
+    ///
+    /// Two things are true of a keystroke and neither is obvious. It reaches a field down the
+    /// dispatch tree of the last frame that was *painted*, and that same paint is what installs
+    /// the field's input handler — so the caret has to be in the composer for one whole frame
+    /// before anything typed into it can land, or the driver is told a key went in that went
+    /// nowhere. And GPUI draws the window before dispatching a key whenever something has
+    /// changed since that frame, which from inside this render would be a draw within a draw:
+    /// the keys are therefore pressed just after this frame rather than in it.
+    #[cfg(feature = "agent")]
+    fn type_for_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(plan) = self.agent_keys.front() else {
+            return false;
+        };
+        if plan.focus_composer && !self.agent_focused {
+            self.agent_focused = true;
+            let state = self.state.clone();
+            let layout = self.layout.clone();
+            let root_focus = self.focus_handle.clone();
+            focus_composer(&state, &layout, &root_focus, window, cx);
+            return true;
+        }
+        let Some(plan) = self.agent_keys.pop_front() else {
+            return false;
+        };
+        self.agent_focused = false;
+        self.agent_pressing = true;
+        let this = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            for key in &plan.keys {
+                match Keystroke::parse(key) {
+                    // The call a real key arrives by. GPUI takes it down the focus path, so the
+                    // composer's own capture listener gets `/` and `@` first and opens its
+                    // panel, and everything else reaches the field as text.
+                    Ok(keystroke) => {
+                        window.dispatch_keystroke(keystroke, cx);
+                    }
+                    // Every key here came out of the host's own table, so one GPUI will not
+                    // spell is a bug in that table rather than something the driver said.
+                    Err(err) => eprintln!("agent: gpui would not parse the key `{key}`: {err}"),
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.agent_pressing = false;
+                cx.notify();
+            })
+            .ok();
+        });
+        true
+    }
+
     #[cfg(feature = "agent")]
     fn drain_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mailbox) = self.mailbox.clone() else {
             return;
         };
-        for posted in mailbox.take() {
+        self.agent_backlog.extend(mailbox.take());
+        // Keys go before anything else is answered. A snapshot taken between two of them would
+        // show a half-typed draft, and one taken between the focus and the first key would show
+        // a panel that is about to open as shut. The flag is read first because pressing a key
+        // can draw the window, and that draw comes back through here.
+        if self.agent_pressing || self.type_for_agent(window, cx) {
+            cx.notify();
+            return;
+        }
+        while let Some(posted) = self.agent_backlog.pop_front() {
             if let gpui_agent::Op::Screenshot {
                 path, mode, target, ..
             } = &posted.request.op
@@ -123,7 +208,11 @@ impl RootView {
                 let id = posted.request.id.clone();
                 posted.reply(gpui_agent::Response::err(
                     id,
-                    gpui_agent::virtual_unavailable("NativeChat agent host is semantic-only"),
+                    gpui_agent::virtual_unavailable(
+                        "virtual delivery is not wired: a semantic type or key already goes in \
+                         as a GPUI keystroke, and a virtual click would need pointer synthesis \
+                         this host does not do. Use delivery=semantic.",
+                    ),
                 ));
                 continue;
             }
@@ -139,11 +228,19 @@ impl RootView {
                     cx.quit();
                 }
             }
+            if let Some(plan) = host.take_compose() {
+                self.agent_keys.push_back(plan);
+            }
             posted.reply(response);
             if shutdown {
                 cx.quit();
             }
             cx.notify();
+            // The rest of the backlog waits for those keys: the op after a `type` is nearly
+            // always the one asking what the typing did.
+            if !self.agent_keys.is_empty() {
+                break;
+            }
         }
     }
 }

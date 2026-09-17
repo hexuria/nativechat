@@ -1,8 +1,15 @@
 use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
-use crate::opengrok::{CoworkerPatch, LocalExecResolution};
-use crate::state::AppState;
+use crate::components::chat_input::PanelMode;
+use crate::components::chat_input::sources::{
+    ParameterSource, SkillSource, ToolSource, ValueSource,
+};
+use crate::components::composer_panel::ComposerPanelRow;
+use crate::opengrok::{
+    ChatPart, CoworkerPatch, LocalExecResolution, RecipeSummary, ScreenshotSpec,
+};
+use crate::state::{ActiveRecipe, AppState};
 
 pub mod ids {
     pub const WINDOW: &str = "app-window";
@@ -20,6 +27,13 @@ pub mod ids {
     pub const FOOTER_ACCOUNT: &str = "footer-account";
     pub const FOOTER_SIGN_OUT: &str = "footer-sign-out";
     pub const COMPOSER: &str = "composer";
+    /// The one wide list `+`, `@` and `/` all open above the composer.
+    pub const COMPOSER_PANEL: &str = "composer-panel";
+    /// The field inside that list, which takes the caret the moment the list opens.
+    pub const COMPOSER_PANEL_SEARCH: &str = "composer-panel-search";
+    /// The line above the field saying which recipe the next message runs.
+    pub const COMPOSER_RECIPE_BAR: &str = "composer-recipe-bar";
+    pub const LIGHTBOX: &str = "lightbox";
     pub const PAGE_LOGIN: &str = "page-login";
     pub const LOGIN_EMAIL: &str = "login-email";
     pub const LOGIN_PASSWORD: &str = "login-password";
@@ -37,6 +51,18 @@ pub mod ids {
 
     pub fn coworker(id: &str) -> String {
         format!("coworker-{id}")
+    }
+
+    /// One picture of the newest set in the transcript, named as the feed names its tiles.
+    pub fn image_thumb(index: usize) -> String {
+        format!("image-thumb-{index}")
+    }
+
+    /// One parameter's chip on the recipe bar. The bar's chips and the `@` panel's rows are two
+    /// different things on screen, so they keep the two different ids the composer gives them:
+    /// `composer-recipe-param-<name>` here, `composer-param-<name>` in the panel.
+    pub fn recipe_param(name: &str) -> String {
+        format!("composer-recipe-param-{name}")
     }
 }
 
@@ -74,6 +100,11 @@ pub enum Command {
     AnswerApproval {
         call_id: String,
         resolution: LocalExecResolution,
+    },
+    /// Open the newest set of pictures in the transcript at one of them, which is what a click
+    /// on a tile does.
+    OpenLightbox {
+        index: usize,
     },
     Login {
         email: String,
@@ -132,6 +163,10 @@ impl Command {
             } => {
                 state.answer_approval_by_id(&call_id, resolution, cx);
             }
+            Self::OpenLightbox { index } => {
+                let shots = last_screenshot_set(state);
+                state.open_lightbox(shots, index, cx);
+            }
             Self::Login { email, password } => state.login(email, password, cx),
             Self::SetLoginDraft { email, password } => {
                 if let Some(email) = email {
@@ -147,11 +182,260 @@ impl Command {
     }
 }
 
+/// The keys one typing op asks the window for.
+///
+/// Typing is not a write to a field. `/` and `@` never reach the composer's text at all — the
+/// composer takes them in the capture phase and opens its panel instead (see
+/// [`crate::components::chat_input`]) — so a driver that set the draft would leave the panel
+/// shut while the test said the text was there. The host therefore plans keystrokes and
+/// [`crate::root::RootView`], which has the window, presses them one painted frame at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposePlan {
+    /// Put the caret in the composer before pressing anything. `false` means "whatever holds
+    /// the caret now", which is how the panel's own search field is reached.
+    pub focus_composer: bool,
+    /// GPUI keystroke tokens, in order: `a`, `space`, `enter`, `escape`, `up`, `cmd-a`.
+    pub keys: Vec<String>,
+}
+
+/// The chord the text field binds to `SelectAll`, which is how a person replaces what is in it.
+///
+/// `set_value` means "replace", and the only honest way to replace text in a field that is
+/// driven by keys is to take all of it and delete it first. The chord is the field's own
+/// (gpui-base binds it in the `Input` context), not something invented here.
+fn select_all_chord() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    }
+}
+
+/// A protocol key name in GPUI's spelling.
+///
+/// The arrows are named here; everything else goes to [`gpui_agent::keystroke_token`], so the
+/// modifier-free rule the protocol promises is kept by the crate that promises it. A chord
+/// belongs on `op keybinding`, not here.
+fn key_token(key: &str) -> Result<String, String> {
+    match key.trim().to_ascii_lowercase().as_str() {
+        "up" | "arrowup" => Ok("up".into()),
+        "down" | "arrowdown" => Ok("down".into()),
+        "left" | "arrowleft" => Ok("left".into()),
+        "right" | "arrowright" => Ok("right".into()),
+        _ => gpui_agent::keystroke_token(key).map_err(plain),
+    }
+}
+
+/// One keystroke per character, the way a person would type the text.
+fn text_tokens(text: &str) -> Result<Vec<String>, String> {
+    gpui_agent::text_keystrokes(text).map_err(plain)
+}
+
+/// Drop the `virtual_unavailable:` label off a message from the keystroke tables.
+///
+/// The label is about the virtual delivery mode, and these ops are answered semantically; the
+/// half of the sentence that says which key could not be spelled is the useful half.
+fn plain(error: String) -> String {
+    error
+        .strip_prefix(gpui_agent::VIRTUAL_UNAVAILABLE)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .map(str::to_string)
+        .unwrap_or(error)
+}
+
+/// Where a typing op is aimed, or the error saying that nothing there takes text.
+fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> {
+    match target {
+        ids::COMPOSER => Ok(ComposePlan {
+            focus_composer: true,
+            keys,
+        }),
+        // The protocol's own "the focused editable widget". It is how everything the composer
+        // opens is worked: a panel's search field takes the caret as it opens, and the keys
+        // that filter and pick a row are meant for that field rather than for the message.
+        "" | "focused" => Ok(ComposePlan {
+            focus_composer: false,
+            keys,
+        }),
+        other => Err(not_editable(other)),
+    }
+}
+
+fn not_editable(target: &str) -> String {
+    format!(
+        "`{target}` is not editable (composer, login-email, login-password, \
+         or \"\" for whatever holds the caret)"
+    )
+}
+
+/// The login page's two fields. The page keeps its own text; what the host keeps is the draft
+/// the rest of the app reads, which is what `click login-submit` signs in with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginField {
+    Email,
+    Password,
+}
+
+fn login_field(target: &str) -> Option<LoginField> {
+    match target {
+        ids::LOGIN_EMAIL => Some(LoginField::Email),
+        ids::LOGIN_PASSWORD => Some(LoginField::Password),
+        _ => None,
+    }
+}
+
+/// `image-thumb-3` → 3.
+fn thumb_target(target: &str) -> Option<usize> {
+    gpui_agent::parse_numbered_id("image-thumb-", target).map(|index| index as usize)
+}
+
+/// The pictures of the newest set in the transcript, which is the set `image-thumb-<n>` names.
+///
+/// The feed numbers each strip from zero and starts again at the next one, so only one strip
+/// can be named without ambiguity — and the newest is the one a driver has just caused. Words
+/// between two pictures end a strip in the feed, so they end it here too.
+fn last_screenshot_set(state: &AppState) -> Vec<ScreenshotSpec> {
+    let Some(conversation) = state
+        .conversations
+        .iter()
+        .find(|conversation| Some(&conversation.id) == state.active_conversation_id.as_ref())
+    else {
+        return Vec::new();
+    };
+    for message in conversation.messages.iter().rev() {
+        let mut set: Vec<ScreenshotSpec> = Vec::new();
+        for part in message.parts.iter().rev() {
+            match part {
+                ChatPart::Screenshot(spec) => set.push(spec.clone()),
+                ChatPart::Text(text) if text.trim().is_empty() => {}
+                _ if !set.is_empty() => break,
+                _ => {}
+            }
+        }
+        if !set.is_empty() {
+            set.reverse();
+            return set;
+        }
+    }
+    Vec::new()
+}
+
+/// The rows of the composer's open panel, taken from the sources the panel itself draws from.
+///
+/// Rebuilt rather than copied out of the composer: the lists move under an open panel — recipes
+/// land after `/` was pressed, a value fills in while its parameter's list is up — and a copy
+/// taken when the panel opened would name rows that are no longer the rows on screen.
+fn panel_rows(
+    mode: PanelMode,
+    recipes: &[RecipeSummary],
+    active: Option<&ActiveRecipe>,
+) -> Vec<PanelRow> {
+    let rows = match mode {
+        // The "+" list is the composer's own two fixed rows rather than a source, so they are
+        // named here by the element ids the composer gives them.
+        PanelMode::Plus => {
+            return vec![
+                PanelRow::fixed("composer-attach", "Attach files"),
+                PanelRow::fixed("composer-teach", "Teach a task"),
+            ];
+        }
+        PanelMode::Tools => ToolSource.rows(),
+        PanelMode::Skills => SkillSource.rows(recipes),
+        PanelMode::Parameters => match active {
+            Some(recipe) => ParameterSource.rows(recipe),
+            None => Vec::new(),
+        },
+        PanelMode::Value { parameter } => match active
+            .and_then(|recipe| recipe.parameters.get(parameter).map(|p| (recipe, p)))
+        {
+            Some((recipe, declared)) => ValueSource.rows(declared, recipe.value(&declared.name)),
+            None => Vec::new(),
+        },
+    };
+    rows.into_iter()
+        .map(|(row, _)| PanelRow {
+            id: row_id(&row),
+            title: row.title.to_string(),
+            note: !row.selectable,
+        })
+        .collect()
+}
+
+/// The element id a row answers to on screen: the one it asked for, or the one built from its
+/// key — the same fallback [`crate::components::composer_panel`] uses when it draws the row.
+fn row_id(row: &ComposerPanelRow) -> String {
+    row.element_id
+        .as_ref()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| format!("composer-panel-row-{}", row.id))
+}
+
+/// What the open panel is called, which is what the driver reads in the tree.
+fn panel_name(mode: PanelMode, recipe: Option<&RecipeBarSnap>) -> String {
+    match mode {
+        PanelMode::Plus => "Attach or teach".to_string(),
+        PanelMode::Tools => "Tools".to_string(),
+        PanelMode::Skills => "Skills and actions".to_string(),
+        PanelMode::Parameters => match recipe {
+            Some(recipe) => format!("What {} needs told", recipe.name),
+            None => "What the recipe needs told".to_string(),
+        },
+        PanelMode::Value { parameter } => {
+            match recipe.and_then(|recipe| recipe.parameters.get(parameter)) {
+                Some(parameter) => format!("Value for {}", parameter.name),
+                None => "Value".to_string(),
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SessionSnap {
     id: String,
     title: String,
     active: bool,
+}
+
+/// One row of the composer's open panel, by the id the panel gives it on screen.
+#[derive(Clone)]
+struct PanelRow {
+    id: String,
+    title: String,
+    /// A row that only says something: dimmed, stepped over by the arrows, never picked.
+    note: bool,
+}
+
+impl PanelRow {
+    fn fixed(id: &str, title: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            title: title.to_string(),
+            note: false,
+        }
+    }
+}
+
+/// The recipe on the draft, as the composer's bar shows it.
+#[derive(Clone)]
+struct RecipeBarSnap {
+    name: String,
+    parameters: Vec<ParamSnap>,
+}
+
+/// One of that recipe's parameters: its name, what it has been told, and whether it must be.
+#[derive(Clone)]
+struct ParamSnap {
+    name: String,
+    value: Option<String>,
+    required: bool,
+}
+
+/// The picture overlay, while it is open.
+#[derive(Clone)]
+struct LightboxSnap {
+    index: usize,
+    total: usize,
+    caption: String,
 }
 
 /// One row of the Recipes page.
@@ -197,6 +481,10 @@ fn approval_target(target: &str) -> Option<(String, LocalExecResolution)> {
     })
 }
 
+/// `Default` is the host with nothing in it — signed out, no sessions, no panel. Typing ops
+/// are planned without reading the app at all, so that empty host is what the tests plan
+/// against; everything else comes through [`NativeChatHost::from_app`].
+#[derive(Default)]
 pub struct NativeChatHost {
     ready: bool,
     sidebar_collapsed: bool,
@@ -230,7 +518,19 @@ pub struct NativeChatHost {
     recipes_filter: &'static str,
     recipes: Vec<RecipeSnap>,
     recipe_open: Option<String>,
+    /// The composer's panel, when one is open: which list it is, and the rows in it.
+    composer_panel: Option<PanelMode>,
+    panel_rows: Vec<PanelRow>,
+    /// The recipe the next message runs, as the composer's bar shows it.
+    recipe_bar: Option<RecipeBarSnap>,
+    /// The captions of the newest set of pictures in the transcript, in tile order.
+    thumbs: Vec<String>,
+    /// The picture overlay, while it is open.
+    lightbox: Option<LightboxSnap>,
     pending: Option<Command>,
+    /// Keys the last op asked the window for. The host has no window; the root view presses
+    /// them (see [`Self::take_compose`]).
+    compose: Option<ComposePlan>,
 }
 
 impl NativeChatHost {
@@ -354,12 +654,50 @@ impl NativeChatHost {
                 })
                 .collect(),
             recipe_open: state.recipe_open_id.clone(),
+            composer_panel: state.composer_panel,
+            panel_rows: state
+                .composer_panel
+                .map(|mode| panel_rows(mode, &state.recipes, state.active_recipe.as_ref()))
+                .unwrap_or_default(),
+            recipe_bar: state.active_recipe.as_ref().map(|recipe| RecipeBarSnap {
+                name: recipe.name.clone(),
+                parameters: recipe
+                    .parameters
+                    .iter()
+                    .map(|parameter| ParamSnap {
+                        value: recipe.value(&parameter.name).map(str::to_string),
+                        name: parameter.name.clone(),
+                        required: parameter.required,
+                    })
+                    .collect(),
+            }),
+            thumbs: last_screenshot_set(state)
+                .iter()
+                .map(|shot| shot.caption.clone())
+                .collect(),
+            lightbox: state.lightbox.as_ref().map(|open| LightboxSnap {
+                index: open.index,
+                total: open.shots.len(),
+                caption: open
+                    .current()
+                    .map(|shot| shot.caption.clone())
+                    .unwrap_or_default(),
+            }),
             pending: None,
+            compose: None,
         }
     }
 
     pub fn take_command(&mut self) -> Option<Command> {
         self.pending.take()
+    }
+
+    /// The keys the last op asked for, if it asked for any.
+    ///
+    /// They are not a command because they are not a change to the state: they are keys, and
+    /// only the window can press them. [`crate::root::RootView`] takes them from here.
+    pub fn take_compose(&mut self) -> Option<ComposePlan> {
+        self.compose.take()
     }
 
     fn tree(&self) -> UiTree {
@@ -450,6 +788,21 @@ impl NativeChatHost {
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
         }
+        // What typing produces: the list `/` or `@` opened, the recipe that picking one put on
+        // the draft, and the pictures a turn came back with. Each is in the tree only while it
+        // is on screen, so `assert --exists false` is the way to say a panel is shut.
+        if let Some(panel) = self.composer_panel_node() {
+            page = page.with_child(panel);
+        }
+        if let Some(bar) = self.recipe_bar_node() {
+            page = page.with_child(bar);
+        }
+        for (index, caption) in self.thumbs.iter().enumerate() {
+            page = page.with_child(UiNode::button(ids::image_thumb(index), caption.clone()));
+        }
+        if let Some(lightbox) = self.lightbox_node() {
+            page = page.with_child(lightbox);
+        }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
             let mut card = UiNode::new(
@@ -535,6 +888,67 @@ impl NativeChatHost {
                     )),
             ],
         }
+    }
+
+    /// The composer's panel, while one is open: the field the caret is in, and every row by the
+    /// id the panel gives it on screen.
+    ///
+    /// A row is not clicked. The panel is a keyboard list — typing filters it, the arrows move
+    /// the highlight and Enter takes the row — and that is the path `op type` and `op key` now
+    /// take. The rows are here to be read and asserted on, not as click targets the host would
+    /// have to serve by another route than the person's.
+    fn composer_panel_node(&self) -> Option<UiNode> {
+        let mode = self.composer_panel?;
+        let mut panel = UiNode::list(
+            ids::COMPOSER_PANEL,
+            panel_name(mode, self.recipe_bar.as_ref()),
+        )
+        .with_child(
+            UiNode::textbox(ids::COMPOSER_PANEL_SEARCH, "Search")
+                // The panel takes the caret as it opens, which is why typing with no target
+                // goes here and not into the message.
+                .with_focused(true),
+        );
+        for row in &self.panel_rows {
+            let mut item = UiNode::listitem(row.id.clone(), row.title.clone());
+            if row.note {
+                item.states.push("note".into());
+            }
+            panel = panel.with_child(item);
+        }
+        Some(panel)
+    }
+
+    /// The bar above the field: which recipe the next message runs, and what it has been told.
+    fn recipe_bar_node(&self) -> Option<UiNode> {
+        let bar = self.recipe_bar.as_ref()?;
+        let mut node = UiNode::new(
+            ids::COMPOSER_RECIPE_BAR,
+            role::STATUS,
+            format!("Recipe · {}", bar.name),
+        );
+        for parameter in &bar.parameters {
+            let mut chip = UiNode::note(ids::recipe_param(&parameter.name), parameter.name.clone());
+            match &parameter.value {
+                Some(value) => {
+                    chip = chip.with_value(value.clone());
+                    chip.states.push("filled".into());
+                }
+                None if parameter.required => chip.states.push("needed".into()),
+                None => {}
+            }
+            node = node.with_child(chip);
+        }
+        Some(node)
+    }
+
+    /// The picture overlay, while it is open, with the same line the overlay itself prints.
+    fn lightbox_node(&self) -> Option<UiNode> {
+        let open = self.lightbox.as_ref()?;
+        Some(UiNode::dialog(
+            ids::LIGHTBOX,
+            crate::components::lightbox::caption_line(&open.caption, open.index, open.total),
+        ))
     }
 
     /// The Recipes page as the driver sees it: the filter chips, the rows with their Accept
@@ -650,11 +1064,131 @@ impl NativeChatHost {
                 call_id,
                 resolution,
             }
+        } else if let Some(index) = thumb_target(target) {
+            if index >= self.thumbs.len() {
+                return Err(format!(
+                    "no picture `{target}` in the newest set ({} there)",
+                    self.thumbs.len()
+                ));
+            }
+            Command::OpenLightbox { index }
+        } else if target.starts_with("composer-") {
+            // The composer's panel and its bar are worked from the keyboard, the way a person
+            // works them, because that is the only path that runs what the composer runs. Say
+            // so rather than let this fall through to "unknown target": these ids are in the
+            // tree now, so a driver will reasonably try to click one.
+            return Err(format!(
+                "`{target}` is not clicked: the composer is worked from the keyboard \
+                 (`type composer /`, then `type \"\" <words>` to filter and `key \"\" Enter` \
+                 to take the row)"
+            ));
         } else {
             return Err(format!("unknown click target `{target}`"));
         };
         self.pending = Some(cmd);
         Ok(DispatchResult::empty())
+    }
+
+    /// Replace what is in a field.
+    ///
+    /// On the composer that is select-all, delete, then type it — the three things a person
+    /// does — so a value beginning with `/` or `@` opens the panel exactly as typing it would.
+    /// A set-value that wrote the draft behind the field's back would leave the panel shut.
+    fn set_value(&mut self, target: &str, value: &str) -> Result<DispatchResult, String> {
+        if let Some(field) = login_field(target) {
+            return self.set_login(field, value.to_string());
+        }
+        // The target is read before the text, here and in the two below: a wrong address is
+        // worth saying before anything about what was going to be typed into it.
+        let plan = compose_plan(target, Vec::new())?;
+        let mut keys = vec![select_all_chord().to_string(), "backspace".to_string()];
+        keys.extend(text_tokens(value)?);
+        self.plan(ComposePlan { keys, ..plan })
+    }
+
+    /// Add text to the end of what a field holds, one keystroke per character.
+    fn type_into(&mut self, target: &str, text: &str) -> Result<DispatchResult, String> {
+        if let Some(field) = login_field(target) {
+            let value = match field {
+                LoginField::Email => format!("{}{text}", self.login_email),
+                LoginField::Password => format!("{}{text}", self.login_password),
+            };
+            return self.set_login(field, value);
+        }
+        let plan = compose_plan(target, Vec::new())?;
+        self.plan(ComposePlan {
+            keys: text_tokens(text)?,
+            ..plan
+        })
+    }
+
+    /// Press one key. No modifiers: a chord is `op keybinding`'s business, not this one's.
+    fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
+        if let Some(field) = login_field(target) {
+            return self.login_key(field, target, key);
+        }
+        let plan = compose_plan(target, Vec::new())?;
+        self.plan(ComposePlan {
+            keys: vec![key_token(key)?],
+            ..plan
+        })
+    }
+
+    /// Hold the keys for the window and tell the driver what was planned.
+    fn plan(&mut self, plan: ComposePlan) -> Result<DispatchResult, String> {
+        let result = DispatchResult::json(serde_json::json!({
+            "target": if plan.focus_composer { ids::COMPOSER } else { "focused" },
+            "keys": plan.keys,
+            "path": "gpui.dispatch_keystroke",
+        }));
+        self.compose = Some(plan);
+        Ok(result)
+    }
+
+    /// Write one of the login drafts. The page draws its own fields; this is the copy the rest
+    /// of the app reads, and the one `click login-submit` signs in with.
+    fn set_login(&mut self, field: LoginField, value: String) -> Result<DispatchResult, String> {
+        let (email, password) = match field {
+            LoginField::Email => {
+                self.login_email = value.clone();
+                (Some(value), None)
+            }
+            LoginField::Password => {
+                self.login_password = value.clone();
+                (None, Some(value))
+            }
+        };
+        self.pending = Some(Command::SetLoginDraft { email, password });
+        Ok(DispatchResult::empty())
+    }
+
+    fn login_key(
+        &mut self,
+        field: LoginField,
+        target: &str,
+        key: &str,
+    ) -> Result<DispatchResult, String> {
+        match key_token(key)?.as_str() {
+            // What the page does with Enter on either field: it tries to sign in.
+            "enter" => {
+                self.pending = Some(Command::Login {
+                    email: self.login_email.clone(),
+                    password: self.login_password.clone(),
+                });
+                Ok(DispatchResult::empty())
+            }
+            "backspace" => {
+                let mut value = match field {
+                    LoginField::Email => self.login_email.clone(),
+                    LoginField::Password => self.login_password.clone(),
+                };
+                value.pop();
+                self.set_login(field, value)
+            }
+            other => Err(format!(
+                "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+            )),
+        }
     }
 
     fn invoke(&mut self, name: &str, args: &serde_json::Value) -> Result<DispatchResult, String> {
@@ -776,7 +1310,9 @@ impl AgentHost for NativeChatHost {
     fn dispatch(&mut self, op: &Op) -> Result<DispatchResult, String> {
         if op.is_virtual_input() {
             return Err(virtual_unavailable(
-                "NativeChat agent host is semantic-only (no virtual GPUI events yet)",
+                "virtual delivery is not wired: a semantic type or key already goes in as a \
+                 GPUI keystroke, and a virtual click would need pointer synthesis this host \
+                 does not do. Use delivery=semantic.",
             ));
         }
         match op {
@@ -786,26 +1322,9 @@ impl AgentHost for NativeChatHost {
                 self.pending = Some(Command::Shutdown);
                 Ok(DispatchResult::empty())
             }
-            Op::SetValue { target, value, .. } => {
-                if target == ids::LOGIN_EMAIL {
-                    self.login_email = value.clone();
-                    self.pending = Some(Command::SetLoginDraft {
-                        email: Some(value.clone()),
-                        password: None,
-                    });
-                    Ok(DispatchResult::empty())
-                } else if target == ids::LOGIN_PASSWORD {
-                    self.login_password = value.clone();
-                    self.pending = Some(Command::SetLoginDraft {
-                        email: None,
-                        password: Some(value.clone()),
-                    });
-                    Ok(DispatchResult::empty())
-                } else {
-                    Err("composer typing is not wired yet".into())
-                }
-            }
-            Op::Type { .. } | Op::Key { .. } => Err("composer typing is not wired yet".into()),
+            Op::SetValue { target, value, .. } => self.set_value(target, value),
+            Op::Type { target, text, .. } => self.type_into(target, text),
+            Op::Key { target, key, .. } => self.key(target, key),
             _ => Ok(DispatchResult::empty()),
         }
     }
@@ -822,7 +1341,309 @@ impl AgentHost for NativeChatHost {
 
 #[cfg(test)]
 mod tests {
-    use super::recipe_row_target;
+    use super::*;
+    use crate::opengrok::{RecipeParameter, RecipeParameterKind};
+
+    /// A host with a bot and a session, which is what the chat tree is drawn for.
+    fn host() -> NativeChatHost {
+        NativeChatHost {
+            ready: true,
+            signed_in: true,
+            sessions: vec![SessionSnap {
+                id: "bot-1".into(),
+                title: "Ada".into(),
+                active: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn recipe(values: &[(&str, &str)]) -> ActiveRecipe {
+        ActiveRecipe {
+            id: "rcp_1".into(),
+            name: "Weekly report".into(),
+            parameters: vec![
+                RecipeParameter {
+                    name: "city".into(),
+                    description: "Where".into(),
+                    required: true,
+                    kind: RecipeParameterKind::Text,
+                    default: None,
+                    values: None,
+                },
+                RecipeParameter {
+                    name: "shorts".into(),
+                    description: "Short ones only".into(),
+                    required: false,
+                    kind: RecipeParameterKind::Boolean,
+                    default: None,
+                    values: None,
+                },
+            ],
+            values: values
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    fn keys(host: &mut NativeChatHost, op: Op) -> ComposePlan {
+        host.dispatch(&op).unwrap();
+        host.take_compose().unwrap()
+    }
+
+    #[test]
+    fn a_trigger_is_typed_as_a_key_and_not_written_into_the_draft() {
+        let mut host = host();
+        let plan = keys(&mut host, Op::type_text(ids::COMPOSER, "/hi"));
+        // `/` is the whole point: the composer takes it before the field does and opens its
+        // panel, which only happens if it arrives as a key.
+        assert_eq!(plan.keys, ["/", "h", "i"]);
+        assert!(plan.focus_composer);
+        assert!(host.take_command().is_none());
+    }
+
+    #[test]
+    fn a_space_and_a_newline_are_the_keys_a_person_presses_for_them() {
+        let mut host = host();
+        let plan = keys(&mut host, Op::type_text(ids::COMPOSER, "a b\n"));
+        assert_eq!(plan.keys, ["a", "space", "b", "enter"]);
+    }
+
+    #[test]
+    fn set_value_on_the_composer_leaves_the_draft_that_typing_it_would() {
+        let mut host = host();
+        let replaced = keys(
+            &mut host,
+            Op::SetValue {
+                target: ids::COMPOSER.into(),
+                value: "/weekly".into(),
+            },
+        );
+        let typed = keys(&mut host, Op::type_text(ids::COMPOSER, "/weekly"));
+        // Replace is take-it-all, delete, then type: after the clearing the two press exactly
+        // the same keys, so the field ends up holding the same thing either way.
+        assert_eq!(replaced.keys[..2], [select_all_chord(), "backspace"]);
+        assert_eq!(replaced.keys[2..], typed.keys[..]);
+        assert!(replaced.focus_composer);
+    }
+
+    #[test]
+    fn typing_with_no_target_goes_where_the_caret_is() {
+        let mut host = host();
+        // This is how the panel `/` opened is worked: its search field has the caret.
+        for target in ["", "focused"] {
+            let plan = keys(&mut host, Op::type_text(target, "we"));
+            assert!(!plan.focus_composer, "{target}");
+            assert_eq!(plan.keys, ["w", "e"]);
+        }
+        assert!(!keys(&mut host, Op::key("", "Enter")).focus_composer);
+    }
+
+    #[test]
+    fn every_key_the_protocol_names_is_spelled_for_gpui() {
+        let mut host = host();
+        for (asked, token) in [
+            ("Enter", "enter"),
+            ("Backspace", "backspace"),
+            ("Escape", "escape"),
+            ("Tab", "tab"),
+            ("Up", "up"),
+            ("Down", "down"),
+            ("Left", "left"),
+            ("Right", "right"),
+            ("ArrowUp", "up"),
+            ("space", "space"),
+        ] {
+            let plan = keys(&mut host, Op::key(ids::COMPOSER, asked));
+            assert_eq!(plan.keys, [token], "{asked}");
+            assert!(plan.focus_composer, "{asked}");
+        }
+    }
+
+    #[test]
+    fn a_key_nobody_can_press_is_refused() {
+        let mut host = host();
+        let unknown = host.dispatch(&Op::key(ids::COMPOSER, "F13")).unwrap_err();
+        assert!(unknown.to_lowercase().contains("f13"), "{unknown}");
+        // A chord is `op keybinding`'s business: free-form keys stay modifier-free.
+        let chord = host.dispatch(&Op::key(ids::COMPOSER, "cmd-q")).unwrap_err();
+        assert!(chord.contains("keybinding"), "{chord}");
+        // Neither left any keys behind for the window to press.
+        assert!(host.take_compose().is_none());
+    }
+
+    #[test]
+    fn a_target_that_holds_no_text_is_refused() {
+        let mut host = host();
+        for op in [
+            Op::type_text(ids::SIDEBAR, "hi"),
+            Op::key(ids::SIDEBAR, "Enter"),
+            Op::SetValue {
+                target: ids::SIDEBAR.into(),
+                value: "hi".into(),
+            },
+        ] {
+            let error = host.dispatch(&op).unwrap_err();
+            assert!(error.contains("is not editable"), "{error}");
+        }
+        assert!(host.take_compose().is_none());
+        assert!(host.take_command().is_none());
+    }
+
+    #[test]
+    fn the_login_drafts_take_text_and_enter_signs_in() {
+        let mut host = host();
+        host.dispatch(&Op::type_text(ids::LOGIN_EMAIL, "ada@"))
+            .unwrap();
+        host.dispatch(&Op::type_text(ids::LOGIN_EMAIL, "example.com"))
+            .unwrap();
+        assert_eq!(host.login_email, "ada@example.com");
+        // The page draws its own fields; this draft is the one `click login-submit` reads, so
+        // typing and setting have to leave it saying the same thing.
+        host.dispatch(&Op::SetValue {
+            target: ids::LOGIN_PASSWORD.into(),
+            value: "hunter2".into(),
+        })
+        .unwrap();
+        host.dispatch(&Op::key(ids::LOGIN_PASSWORD, "Backspace"))
+            .unwrap();
+        assert_eq!(host.login_password, "hunter");
+        host.dispatch(&Op::key(ids::LOGIN_EMAIL, "Enter")).unwrap();
+        match host.take_command() {
+            Some(Command::Login { email, password }) => {
+                assert_eq!(email, "ada@example.com");
+                assert_eq!(password, "hunter");
+            }
+            other => panic!("expected a login, got {other:?}"),
+        }
+        let refused = host
+            .dispatch(&Op::key(ids::LOGIN_EMAIL, "Escape"))
+            .unwrap_err();
+        assert!(refused.contains("unhandled key"), "{refused}");
+    }
+
+    #[test]
+    fn the_open_panel_and_its_rows_are_in_the_tree() {
+        let mut host = host();
+        assert!(host.snapshot().find(ids::COMPOSER_PANEL).is_none());
+
+        let active = recipe(&[("city", "London")]);
+        host.composer_panel = Some(PanelMode::Parameters);
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&active));
+        let tree = host.snapshot();
+        let panel = tree.find(ids::COMPOSER_PANEL).unwrap();
+        assert!(tree.find(ids::COMPOSER_PANEL_SEARCH).unwrap().focused);
+        // The ids are the composer's own, so a driver reads back what the person sees.
+        let rows: Vec<&str> = panel
+            .children
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect();
+        assert!(rows.contains(&"composer-param-city"), "{rows:?}");
+        assert!(rows.contains(&"composer-param-shorts"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_skill_row_carries_the_id_the_panel_gives_it() {
+        let row = ComposerPanelRow::new("recipe:rcp_1", "icons/record.svg", "Weekly", "A task");
+        assert_eq!(row_id(&row), "composer-panel-row-recipe:rcp_1");
+        assert_eq!(
+            row_id(&row.element_id("composer-param-city")),
+            "composer-param-city"
+        );
+    }
+
+    #[test]
+    fn the_recipe_bar_says_what_is_filled_in_and_what_is_still_needed() {
+        let mut host = host();
+        assert!(host.snapshot().find(ids::COMPOSER_RECIPE_BAR).is_none());
+
+        let active = recipe(&[("city", "London")]);
+        host.recipe_bar = Some(RecipeBarSnap {
+            name: active.name.clone(),
+            parameters: active
+                .parameters
+                .iter()
+                .map(|parameter| ParamSnap {
+                    value: active.value(&parameter.name).map(str::to_string),
+                    name: parameter.name.clone(),
+                    required: parameter.required,
+                })
+                .collect(),
+        });
+        let tree = host.snapshot();
+        let bar = tree.find(ids::COMPOSER_RECIPE_BAR).unwrap();
+        assert!(bar.name.contains("Weekly report"));
+        let city = tree.find(&ids::recipe_param("city")).unwrap();
+        assert_eq!(city.value.as_deref(), Some("London"));
+        assert!(city.states.contains(&"filled".to_string()));
+        let shorts = tree.find(&ids::recipe_param("shorts")).unwrap();
+        assert!(shorts.value.is_none());
+        // Not required, so nothing is missing from it.
+        assert!(shorts.states.is_empty());
+    }
+
+    #[test]
+    fn a_picture_is_a_node_and_a_click_opens_the_overlay() {
+        let mut host = host();
+        assert!(host.snapshot().find(&ids::image_thumb(0)).is_none());
+
+        host.thumbs = vec!["the 1280x800 screen".into(), "after the click".into()];
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::image_thumb(1)).unwrap().name,
+            "after the click"
+        );
+        host.dispatch(&Op::click(ids::image_thumb(1))).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenLightbox { index: 1 })
+        ));
+        let missing = host.dispatch(&Op::click(ids::image_thumb(7))).unwrap_err();
+        assert!(missing.contains("no picture"), "{missing}");
+    }
+
+    #[test]
+    fn the_overlay_is_in_the_tree_only_while_it_is_open() {
+        let mut host = host();
+        assert!(host.snapshot().find(ids::LIGHTBOX).is_none());
+        host.lightbox = Some(LightboxSnap {
+            index: 1,
+            total: 3,
+            caption: "after the click".into(),
+        });
+        assert_eq!(
+            host.snapshot().find(ids::LIGHTBOX).unwrap().name,
+            "after the click · 2 / 3"
+        );
+    }
+
+    #[test]
+    fn the_composer_is_not_clicked_and_says_so() {
+        let mut host = host();
+        for target in [
+            "composer-panel-row-recipe:rcp_1",
+            "composer-param-city",
+            ids::COMPOSER_RECIPE_BAR,
+        ] {
+            let error = host.dispatch(&Op::click(target)).unwrap_err();
+            assert!(error.contains("keyboard"), "{target}: {error}");
+        }
+    }
+
+    #[test]
+    fn virtual_delivery_is_still_refused_rather_than_faked() {
+        let mut host = host();
+        let error = host
+            .dispatch(&Op::type_text_virtual(ids::COMPOSER, "hi"))
+            .unwrap_err();
+        assert!(
+            error.starts_with(gpui_agent::VIRTUAL_UNAVAILABLE),
+            "{error}"
+        );
+        assert!(host.take_compose().is_none());
+    }
 
     #[test]
     fn only_a_recipe_row_opens_a_recipe() {

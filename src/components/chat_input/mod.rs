@@ -1,4 +1,6 @@
-mod sources;
+// Public because the agent host rebuilds the open panel's rows from the very same sources, so
+// the id it hands a driver is the id the row on screen answers to.
+pub mod sources;
 #[macro_use]
 mod sync_macros;
 
@@ -45,8 +47,12 @@ type SubmitCallback = Box<dyn Fn(String, &mut Context<MessageInput>)>;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
 
 /// Which list the open panel is showing, and therefore what a picked row means.
+///
+/// Public because [`AppState`] keeps a copy of it: the panel itself belongs to this view, and
+/// anything outside the view — the agent host, which is built from the state alone — can only
+/// tell that `/` opened something if the state says so.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PanelMode {
+pub enum PanelMode {
     /// The "+" button: attach files, teach a task.
     Plus,
     /// `@` with no recipe on the draft: the bot's tools and apps.
@@ -415,6 +421,11 @@ impl MessageInput {
         // person was typing rather than at the start of the message.
         self.caret = self.input_state.read(cx).cursor();
         self.panel_mode = Some(mode);
+        // Say on the state which list is open. The panel is drawn from this view and nothing
+        // outside it can read the view, so this is the only place an agent driver — which sees
+        // the state and nothing else — can learn that a `/` did anything.
+        self.state
+            .update(cx, |state, cx| state.set_composer_panel(Some(mode), cx));
         self.dismissed_at = None;
         self.remember_picks(&rows);
         let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
@@ -429,6 +440,8 @@ impl MessageInput {
             return;
         }
         self.panel_mode = None;
+        self.state
+            .update(cx, |state, cx| state.set_composer_panel(None, cx));
         self.picks.clear();
         self.panel.update(cx, |panel, cx| panel.close(cx));
         if refocus {

@@ -6,14 +6,19 @@
 //!
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
-//! `composer`.
+//! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
+//! `image-thumb-{n}`, `lightbox`.
+//!
+//! Typing goes in as GPUI keystrokes. `type`, `key` and `set_value` on the composer are
+//! planned here ([`ComposePlan`]) and pressed by [`RootView`](crate::root::RootView), because
+//! `/` and `@` are keys the composer takes before the text field ever sees them.
 
 mod host;
 #[cfg(target_os = "macos")]
 mod macos_window;
 
 pub use gpui_agent::mailbox::AgentMailbox;
-pub use host::{Command, NativeChatHost, ids};
+pub use host::{Command, ComposePlan, NativeChatHost, ids};
 
 use std::time::Duration;
 
