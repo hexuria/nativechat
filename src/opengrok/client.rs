@@ -15,6 +15,38 @@ use super::types::{
     error_message_from_body,
 };
 
+/// The cookie the server puts the access JWT in. It is also what goes out as the Bearer.
+const ACCESS_COOKIE: &str = "og_access";
+
+/// The cookie that can be traded for a new access token, and therefore the difference between a
+/// session the app can still rescue by itself and one only a person can.
+const REFRESH_COOKIE: &str = "og_refresh";
+
+/// How close to its expiry an access token is refreshed rather than used. Enough for a request
+/// that is slow to leave; short enough that a token is not thrown away while it still works.
+const REFRESH_SLACK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the app says when the session is gone and the server sent no sentence of its own.
+///
+/// Addressed to the person, because signing in is a thing only a person can do, and it names no
+/// machine: nothing is broken and nothing is out of reach.
+const SIGNED_OUT_MESSAGE: &str = "OpenGrok does not know who this app is signed in as.";
+
+/// Whether the access token needs replacing before the next request goes out.
+///
+/// The argument is seconds left on the token, and `None` is the answer that matters: it means
+/// the question could not be answered at all, which almost always means there is no token to
+/// ask about. This used to read `None` as "no deadline, carry on", and that one reading is the
+/// bug — the cookie jar drops a cookie the moment it expires, so a token that has run out does
+/// not present as a token with no time left, it presents as nothing at all. The request then
+/// went out with no `Authorization` header and the server, with no principal to bill, held it.
+fn needs_refresh(seconds_left: Option<i64>) -> bool {
+    match seconds_left {
+        Some(left) => left < REFRESH_SLACK.as_secs() as i64,
+        None => true,
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenGrokClient {
     base: Url,
@@ -133,16 +165,19 @@ impl OpenGrokClient {
         }
     }
 
-    /// AG-UI `principal_from_bearer` only reads `Authorization`, not cookies.
-    /// The console login stores the same JWT as `og_access`; send it as Bearer
-    /// the way the desktop sends it as `x-opengrok-account` on Seam A.
-    fn access_token(&self) -> Option<String> {
+    /// One cookie out of the jar, by name.
+    ///
+    /// The jar only ever hands back cookies that have not expired yet — `Jar::cookies` goes
+    /// through `cookie_store`'s `matches`, which filters on `is_expired` — so a name that is
+    /// missing here means one of two things that look identical from the outside: it was never
+    /// set, or it was set and its moment has passed. Both are "the app is holding nothing".
+    fn cookie(&self, name: &str) -> Option<String> {
         let header = CookieStore::cookies(self.jar.as_ref(), &self.base)?;
         let raw = header.to_str().ok()?;
         for pair in raw.split(';') {
             let pair = pair.trim();
-            if let Some((name, value)) = pair.split_once('=')
-                && name.trim() == "og_access"
+            if let Some((found, value)) = pair.split_once('=')
+                && found.trim() == name
             {
                 return Some(value.trim().to_string());
             }
@@ -150,8 +185,30 @@ impl OpenGrokClient {
         None
     }
 
+    /// AG-UI `principal_from_bearer` only reads `Authorization`, not cookies.
+    /// The console login stores the same JWT as `og_access`; send it as Bearer
+    /// the way the desktop sends it as `x-opengrok-account` on Seam A.
+    fn access_token(&self) -> Option<String> {
+        self.cookie(ACCESS_COOKIE)
+    }
+
+    /// Whether the app is holding anything at all that could authenticate a request: a token to
+    /// send, or the refresh cookie that can still be traded for one.
+    ///
+    /// This is not "is the person signed in". That is the app's belief about itself, and the
+    /// belief is exactly what went wrong: the roster stayed on screen, the composer stayed
+    /// ready, and the jar had nothing left in it. This question is about what is actually there
+    /// to put in the header, and it is answerable without a round trip.
+    pub fn has_session(&self) -> bool {
+        self.access_token().is_some() || self.cookie(REFRESH_COOKIE).is_some()
+    }
+
     /// Seconds until the access token expires, read from the JWT's `exp` without verifying
     /// it — the server verifies; this only decides whether to refresh first.
+    ///
+    /// `None` does not mean "plenty of time". It means the question could not be answered, and
+    /// the commonest reason for that is that there is no token to ask about — see
+    /// [`Self::ensure_fresh_token`], where reading `None` as "nothing to do" is the bug.
     fn token_seconds_left(&self) -> Option<i64> {
         use base64::Engine as _;
         let token = self.access_token()?;
@@ -169,14 +226,27 @@ impl OpenGrokClient {
     }
 
     /// Refresh before a token dies, not after. An expired bearer is not always a 401: `/ag-ui`
-    /// runs it as nobody and the turn is held with no word to the person. Thirty seconds of
+    /// runs it as nobody and the turn is held with no word to the person. [`REFRESH_SLACK`] of
     /// slack covers a request that is slow to leave. Best effort; the request goes out either
     /// way and a 401 gets one more chance below.
+    ///
+    /// A token that could not be read at all counts as a token that needs replacing, and that
+    /// sentence is the whole of today's bug. The check used to be "some time left, and less than
+    /// the slack" — which is never true once the token is *gone*, because the jar drops a cookie
+    /// the moment it expires. So an app left idle past the access token's lifetime read `None`
+    /// here, did nothing about it, and sent the next turn with no `Authorization` header at all.
+    /// The server had no principal to bill and held the turn, and its sentence about spend
+    /// arrived in the transcript as a red line.
     async fn ensure_fresh_token(&self, path: &str) {
         if path.starts_with("/auth/") {
             return;
         }
-        if matches!(self.token_seconds_left(), Some(left) if left < 30) {
+        // Nothing in the jar to trade. This runs before every request, so asking anyway would
+        // be a round trip per request whose answer is already here.
+        if !self.has_session() {
+            return;
+        }
+        if needs_refresh(self.token_seconds_left()) {
             let _ = self.refresh().await;
         }
     }
@@ -205,22 +275,43 @@ impl OpenGrokClient {
             }
             req
         };
-        let response = build(self.access_token())
+        let mut response = build(self.access_token())
             .send()
             .await
             .map_err(|e| OpenGrokError::transport(&e))?;
         // A 401 on a signed-in session is a token that died between checks: refresh once and
         // send again. Auth routes are exempt, or a bad password would loop here.
-        if response.status() == StatusCode::UNAUTHORIZED
-            && !path.starts_with("/auth/")
-            && self.refresh().await.is_ok()
-        {
-            return build(self.access_token())
-                .send()
-                .await
-                .map_err(|e| OpenGrokError::transport(&e));
+        if response.status() == StatusCode::UNAUTHORIZED && !path.starts_with("/auth/") {
+            if self.refresh().await.is_ok() {
+                response = build(self.access_token())
+                    .send()
+                    .await
+                    .map_err(|e| OpenGrokError::transport(&e))?;
+            }
+            // Still refused after the one thing the app can do about it on its own. The session
+            // is gone, and that is decided here because here is where the route is known: the
+            // same status on `/auth/login` is a wrong password, which is a verdict about what
+            // somebody typed and belongs under the field they typed it in.
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return Err(Self::signed_out_error(response).await);
+            }
         }
         Ok(response)
+    }
+
+    /// A `401` read as the session being gone, keeping the server's own sentence.
+    ///
+    /// The sentence is kept and not matched on. The server has one for this case today and it
+    /// may have a different one tomorrow; what makes this a signed-out failure is the status and
+    /// the route, both of which the caller already knows.
+    async fn signed_out_error(response: reqwest::Response) -> OpenGrokError {
+        let body = response.text().await.unwrap_or_default();
+        let message = error_message_from_body(&body);
+        if message.trim().is_empty() {
+            OpenGrokError::signed_out(SIGNED_OUT_MESSAGE)
+        } else {
+            OpenGrokError::signed_out(message)
+        }
     }
 
     async fn read_error(response: reqwest::Response) -> OpenGrokError {
@@ -437,16 +528,29 @@ impl OpenGrokClient {
         });
         let url = self.url("/ag-ui")?;
         self.ensure_fresh_token("/ag-ui").await;
-        let mut req = self
+        // The turn does not leave without a credential on it. It used to: the header was
+        // attached only `if let Some(token)`, and the `else` was to send the turn anyway. A turn
+        // with no principal on it is a turn the server cannot bill to anybody, so it held it and
+        // said so — a round trip, and a red line in the transcript, for something knowable here.
+        let Some(token) = self.access_token() else {
+            return Err(OpenGrokError::signed_out(SIGNED_OUT_MESSAGE));
+        };
+        let response = self
             .http
             .post(url)
             .header(ACCEPT, "text/event-stream")
             .header(CACHE_CONTROL, "no-cache")
-            .json(&body);
-        if let Some(token) = self.access_token() {
-            req = req.bearer_auth(token);
+            .json(&body)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        // `ensure_fresh_token` has already spent the app's one refresh, so a 401 here is the
+        // session being gone rather than a token that aged out mid-flight. Read before the
+        // general failure path, which would file it as a verdict about the turn.
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(Self::signed_out_error(response).await);
         }
-        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
@@ -1946,6 +2050,223 @@ mod tests {
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// A URL nothing is listening on. These tests only ever read the jar, and a base that
+    /// cannot be connected to is the guarantee that they never do anything else.
+    const NOWHERE: &str = "http://127.0.0.1:1/";
+
+    fn put_cookie(client: &OpenGrokClient, set_cookie: &str) {
+        let header = HeaderValue::from_str(set_cookie).unwrap();
+        CookieStore::set_cookies(client.jar.as_ref(), &mut [header].iter(), &client.base);
+    }
+
+    /// A `Set-Cookie` for an access token with an `exp` far enough out that nothing refreshes
+    /// before using it.
+    ///
+    /// Tests that watch what goes over the wire need the client to send exactly one request, and
+    /// a token whose expiry cannot be read is a token the client replaces first — rightly, since
+    /// that is the whole fix. Assembled rather than written down as a literal, so the file
+    /// carries no string shaped like a credential.
+    fn live_session() -> String {
+        use base64::Engine as _;
+        let part = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        // 2100-01-01, which outlives any test run and any machine running one.
+        let token = format!(
+            "{}.{}.not-a-signature",
+            part(r#"{"alg":"HS256","typ":"JWT"}"#),
+            part(r#"{"exp":4102444800}"#)
+        );
+        format!("og_access={token}; Path=/")
+    }
+
+    /// How the token went missing, pinned.
+    ///
+    /// `Jar::cookies` goes through `cookie_store`'s `matches`, which filters on `is_expired`, so
+    /// the moment an access cookie's `Max-Age` passes it stops existing as far as the app is
+    /// concerned — indistinguishable from one that was never set. An app left idle past the
+    /// token's lifetime therefore had nothing to put in the header, and nothing in the old code
+    /// noticed: the freshness check only fired on a token that was still *there*.
+    #[test]
+    fn an_expired_access_cookie_is_gone_rather_than_old() {
+        let client = OpenGrokClient::new(NOWHERE).unwrap();
+        put_cookie(&client, "og_access=tok-a; Path=/; Max-Age=300");
+        assert_eq!(client.access_token().as_deref(), Some("tok-a"));
+        assert!(client.has_session());
+
+        // The server's own expiry arriving, or simply time passing: same thing to the jar.
+        put_cookie(&client, "og_access=tok-a; Path=/; Max-Age=0");
+        assert_eq!(
+            client.access_token(),
+            None,
+            "the jar hands back nothing, not something stale"
+        );
+        assert_eq!(
+            client.token_seconds_left(),
+            None,
+            "and there is no `exp` to read, because there is no token to read it from"
+        );
+        assert!(
+            !client.has_session(),
+            "nothing left to send and nothing left to trade: this is the signed-out case"
+        );
+    }
+
+    /// The refresh cookie outliving the access token is a session the app can still rescue.
+    #[test]
+    fn a_refresh_cookie_alone_is_still_a_session() {
+        let client = OpenGrokClient::new(NOWHERE).unwrap();
+        put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
+        assert_eq!(client.access_token(), None);
+        assert!(
+            client.has_session(),
+            "there is something to trade for a token, so the turn is worth attempting"
+        );
+    }
+
+    /// The one line of the bug, as a truth table.
+    #[test]
+    fn a_token_that_cannot_be_read_is_a_token_that_needs_replacing() {
+        assert!(
+            needs_refresh(None),
+            "no readable token is not the same as plenty of time"
+        );
+        assert!(needs_refresh(Some(0)), "expired to the second");
+        assert!(needs_refresh(Some(-600)), "expired ten minutes ago");
+        assert!(needs_refresh(Some(29)), "inside the slack");
+        assert!(!needs_refresh(Some(31)));
+        assert!(!needs_refresh(Some(900)));
+    }
+
+    /// The turn does not leave, and the app does not learn that from the server.
+    ///
+    /// Nothing goes out at all here: there is neither a token to send nor a refresh cookie to
+    /// trade for one, so both the turn and the rescue attempt are round trips whose answer the
+    /// jar already holds. What used to happen was the `/ag-ui` request going out bare — a round
+    /// trip, and a red line in somebody's transcript, for a question already answered.
+    #[tokio::test]
+    async fn a_turn_is_not_sent_when_there_is_nothing_to_sign_it_with() {
+        let server = MockServer::start().await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client
+            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.is_signed_out());
+
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(paths.is_empty(), "nothing went out at all: {paths:?}");
+    }
+
+    /// An access token that has expired out of the jar, with the refresh cookie still there.
+    ///
+    /// This is today's bug end to end. The app looks signed in, has nothing to put in the
+    /// header, and used to send the turn regardless. It now trades the refresh cookie for a
+    /// token first and the turn goes out carrying it — no banner, no red line, nobody told.
+    #[tokio::test]
+    async fn an_expired_token_is_refreshed_before_the_turn_rather_than_sent_without_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200).append_header("set-cookie", live_session().as_str()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        // What the jar looks like after an access cookie's `Max-Age` passes: the refresh cookie
+        // is all that is left, and the app is still showing a roster.
+        put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
+        client
+            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .await
+            .expect("the turn goes out, on a token the app fetched for itself");
+
+        let turn = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .into_iter()
+            .find(|request| request.url.path() == "/ag-ui")
+            .expect("the turn was sent");
+        assert!(
+            turn.headers.contains_key("authorization"),
+            "and it carried a bearer, which is the whole of the bug: auth_len was 0"
+        );
+    }
+
+    /// A `401` on a turn is the session, not a verdict about the turn.
+    ///
+    /// The server's sentence is kept and is not what decides this: the status and the route are.
+    /// Matching on the words would tie the app to copy the server is free to rewrite, and this
+    /// one has already been rewritten once.
+    #[tokio::test]
+    async fn a_401_on_a_turn_reads_as_the_session_being_gone() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": "this turn names a coworker but says whose it is nowhere — sign in again"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let error = client
+            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.is_signed_out());
+        assert_eq!(
+            error.unreachable(),
+            None,
+            "the server answered, so nothing is out of reach and nothing is reconnecting"
+        );
+        assert!(
+            error.message.contains("sign in again"),
+            "the server's own words survive: {}",
+            error.message
+        );
+    }
+
+    /// A refusal on a turn with a reason stays a verdict, and still reaches the transcript.
+    #[tokio::test]
+    async fn a_refusal_on_a_turn_is_still_a_verdict() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+                "error": "spend cap reached for this org"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let error = client
+            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .await
+            .unwrap_err();
+        assert!(!error.is_signed_out(), "nobody should be asked to sign in");
+        assert_eq!(error.unreachable(), None);
+        assert_eq!(error.message, "spend cap reached for this org");
+    }
+
     #[tokio::test]
     async fn login_sets_cookies_and_me_succeeds() {
         let server = MockServer::start().await;
@@ -2153,6 +2474,7 @@ mod tests {
         });
 
         let client = OpenGrokClient::new(&format!("http://{addr}")).unwrap();
+        put_cookie(&client, &live_session());
         let first_at = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
         let start = Instant::now();
         let text = client
@@ -2211,6 +2533,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
         let message = AguiMessage {
             id: "u1".into(),
             role: "user".into(),

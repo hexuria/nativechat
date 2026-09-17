@@ -7,17 +7,19 @@ use crate::chrome::{
 use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
-    Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
-    ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
-    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, Unreachable,
-    activity_from_replay, command_from_args, command_from_replay_events, deeds_from_replay,
-    enrol_this_machine, local_exec_outcome, policy_answer, reads_as_gateway_unreachable,
-    serve_local_exec, stored_machine_id, tool_standin, visible_bot_status,
+    Coworker, CoworkerComputer, CoworkerPatch, Failure, FormSpec, LocalExecMode,
+    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
+    QueuedApproval, RecipeDetail, RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep,
+    RecipeSummary, ReplyQuote, RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, Unreachable, activity_from_replay, command_from_args, command_from_replay_events,
+    deeds_from_replay, enrol_this_machine, local_exec_outcome, policy_answer,
+    reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
+    visible_bot_status,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
+use crate::session::Session;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -211,6 +213,29 @@ pub const STOP_UNSENT_NOTE: &str =
 /// that simply did not leave.
 pub const TURN_UNREACHED_NOTE: &str = "This turn did not go through.";
 
+/// What the feed says for a turn that was not sent because the app had no session.
+///
+/// Its own line rather than [`TURN_UNREACHED_NOTE`], because "did not go through" reads as the
+/// wire and would send somebody to look at a network that is working perfectly. And not spelled
+/// with [`RUN_ERROR_PREFIX`], for the same reason as the other two: the run is not what went
+/// wrong — there was no run, and no verdict about one.
+///
+/// It says what happened and leaves what to do about it to the banner, which is live where this
+/// line is a record of one moment. Like the unreached note, it is offered again: the turn never
+/// left, so sending it after signing in does nothing twice.
+pub const TURN_SIGNED_OUT_NOTE: &str = "This turn was not sent: the app is signed out.";
+
+/// A turn that never reached the server, in either of the two ways that happens.
+///
+/// Both rows mean the same thing about the transcript — nothing ran, nothing was decided, and
+/// the turn is there to be sent again — so both are offered again and neither is ever saved.
+/// They are two sentences rather than one because the thing to do about them differs, and the
+/// sentence is the only place a person learns that.
+pub fn is_unsent_turn_note(content: &str) -> bool {
+    let text = content.trim();
+    text == TURN_UNREACHED_NOTE || text == TURN_SIGNED_OUT_NOTE
+}
+
 /// How much of a quoted message the coworker is shown: a reply to a long answer names it, it
 /// does not replay it. The server's `reply_context` caps the same way.
 const REPLY_QUOTE_CHARS: usize = 600;
@@ -225,7 +250,7 @@ pub fn is_status_line(content: &str) -> bool {
     let text = content.trim();
     text == EMPTY_TURN_NOTE
         || text == STOPPED_TURN_NOTE
-        || text == TURN_UNREACHED_NOTE
+        || is_unsent_turn_note(text)
         || text.starts_with(RUN_ERROR_PREFIX)
 }
 
@@ -1228,6 +1253,14 @@ pub struct AppState {
     /// retry loop has to be started and stopped with it, and that is what `note_failure` and
     /// `came_back` are for.
     reachability: Reachability,
+    /// Whether the app still has a session, as a state that only a person clears.
+    ///
+    /// The third field of its kind, and it is a third because it is a third thing. `auth_error`
+    /// holds verdicts, `reachability` holds the state that clears itself, and this holds the one
+    /// that does neither: the wire is fine, the server answered, and nothing will work until
+    /// somebody signs in. Private for the same reason as `reachability` — setting it has to also
+    /// stop the app sending, and that is what `note_signed_out` and `sign_in_again` are for.
+    session: Session,
     /// A retry loop is running. Only one at a time: it is asking one question of one server.
     reconnecting: bool,
     /// Which retry loop. Bumped to start one and bumped again to end it, so a loop that is
@@ -1549,6 +1582,7 @@ impl AppState {
             auth_status: AuthStatus::SignedOut,
             auth_error: None,
             reachability: Reachability::default(),
+            session: Session::default(),
             reconnecting: false,
             reconnect_epoch: 0,
             login_epoch: 0,
@@ -1840,6 +1874,9 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        // The one thing that clears a session the server had stopped
+                        // recognising, and the reason the banner asks for it by name.
+                        state.session.signed_in();
                         state.note_server_answered(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
@@ -1865,6 +1902,9 @@ impl AppState {
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.auth_error = None;
+        // A person who has just signed out is not somebody who needs telling they are signed
+        // out. The banner is for the case where the app believed otherwise.
+        self.session.signed_in();
         self.coworkers.clear();
         self.last_active_at.clear();
         self.active_coworker_id = None;
@@ -1978,14 +2018,36 @@ impl AppState {
     ///
     /// A refusal is a verdict about what was asked, and it goes where verdicts have always gone.
     /// A transport failure is not about what was asked at all — it is the state of the wire, it
-    /// stops being true on its own, and it starts the app asking again.
+    /// stops being true on its own, and it starts the app asking again. A session that has gone
+    /// is the third thing: the wire is fine, nothing was decided about the request, and it goes
+    /// to the one state a retry loop cannot help with.
     fn note_failure(&mut self, error: &OpenGrokError, cx: &mut Context<Self>) {
-        match error.unreachable() {
-            Some(what) => self.note_unreachable(what, &error.message, cx),
-            None => {
+        // The session reads every failure for itself and takes only the one kind that is about
+        // who the app is; see `Session::note` for why the other two must leave it alone.
+        if self.session.note(error.failure()) {
+            cx.notify();
+        }
+        match error.failure() {
+            Failure::OutOfReach(what) => self.note_unreachable(what, &error.message, cx),
+            // Nothing in `auth_error`, because this is not a verdict about what was asked, and
+            // no retry loop, because there is no question left to ask — by the time a 401 gets
+            // here the client has already spent its one refresh on it. The 401 does clear the
+            // server's own reachability state: an answer, any answer, is proof of the wire.
+            Failure::SignedOut => self.note_server_answered(cx),
+            Failure::Verdict => {
                 self.auth_error = Some(error.message.clone());
                 self.note_server_answered(cx);
             }
+        }
+    }
+
+    /// The app looked in the jar before sending and found nothing to send with.
+    ///
+    /// The same state a `401` puts it in, reached without the round trip that would have
+    /// produced one.
+    fn note_signed_out(&mut self, cx: &mut Context<Self>) {
+        if self.session.note(Failure::SignedOut) {
+            cx.notify();
         }
     }
 
@@ -2077,6 +2139,40 @@ impl AppState {
     /// Which machine the app cannot reach, if it is failing to reach one.
     pub fn unreachable(&self) -> Option<Unreachable> {
         self.reachability.unreachable()
+    }
+
+    /// The two lines the signed-out banner shows, or `None` while the session holds.
+    pub fn session_banner(&self) -> Option<(String, String)> {
+        self.session.banner()
+    }
+
+    /// The app has been told its session is gone.
+    pub fn is_session_expired(&self) -> bool {
+        self.session.is_expired()
+    }
+
+    /// Whether the app holds something it could send a turn with.
+    ///
+    /// Asked before a turn is built rather than after it has failed, which is the whole point:
+    /// the jar is right here and the answer costs nothing, where the same answer from the server
+    /// costs a round trip and arrives as a line in somebody's transcript.
+    fn can_send_turn(&self) -> bool {
+        let holds_credential = self
+            .opengrok
+            .as_ref()
+            .is_some_and(OpenGrokClient::has_session);
+        self.session.may_send(holds_credential)
+    }
+
+    /// Take the person to the sign-in page, which is what the banner's button does.
+    ///
+    /// The app does not do this to them the moment the 401 lands. Their thread is on screen and
+    /// still worth reading, and yanking it away to a login form is most of what a relaunch did.
+    /// So the banner waits, and this runs when they say so — at which point the app is plainly
+    /// signed out rather than signed in with nothing to show for it, and the sign-in page is
+    /// what the shell draws for that.
+    pub fn sign_in_again(&mut self, cx: &mut Context<Self>) {
+        self.logout(cx);
     }
 
     pub fn is_right_pane_open(&self) -> bool {
@@ -3597,8 +3693,17 @@ impl AppState {
                     }
                     // "is OpenGrok running at …?" was this app's one attempt at saying the
                     // server was out of reach, in a field that never cleared. It has a home of
-                    // its own now, and one that goes away when the server comes back.
-                    Err(error) if error.unreachable().is_some() => state.note_failure(&error, cx),
+                    // its own now, and one that goes away when the server comes back — and so
+                    // does a session that has gone, which that question misdirects even further:
+                    // OpenGrok is running, it answered, it simply did not know who was asking.
+                    Err(error)
+                        if matches!(
+                            error.failure(),
+                            Failure::OutOfReach(_) | Failure::SignedOut
+                        ) =>
+                    {
+                        state.note_failure(&error, cx)
+                    }
                     Err(error) => {
                         state.auth_error = Some(format!(
                             "Could not create agent: {} (is OpenGrok running at {}?)",
@@ -4467,6 +4572,14 @@ impl AppState {
             cx.notify();
             return;
         };
+        // The other door into this is "Try again" on a turn that did not go out, which reaches
+        // here without passing `send_message`'s guard — and it is exactly the button somebody
+        // presses while the session is gone. A turn is a turn: it does not leave while the app
+        // knows it has nothing to sign it with.
+        if !self.can_send_turn() {
+            self.note_signed_out(cx);
+            return;
+        }
         let coworker_id = self.active_coworker_id.clone();
         // The recipe as it stands now, not when the turn reaches the wire: the composer clears
         // the draft the moment it is sent, and the turn should carry what was on the message.
@@ -4652,6 +4765,14 @@ impl AppState {
                             Err(error) if error.unreachable().is_some() => {
                                 message.content = TURN_UNREACHED_NOTE.to_string()
                             }
+                            // The server answered and did not know who was asking. Not a verdict
+                            // about the turn — it never got as far as being one — so the row
+                            // says the turn was not sent, and the banner says what to do. The
+                            // red line this replaces was the bug: the server's sentence about
+                            // whose spend it was, read as if the model had refused.
+                            Err(error) if error.is_signed_out() => {
+                                message.content = TURN_SIGNED_OUT_NOTE.to_string()
+                            }
                             Err(error) => {
                                 message.content = format!("{RUN_ERROR_PREFIX}{}", error.message)
                             }
@@ -4716,16 +4837,17 @@ impl AppState {
                 // A failed run has already ended the last assistant row, with the server's
                 // sentence or with the note that the turn never left; `auth_error` is the
                 // sign-in / settings error and the settings pane paints it, so a run's failure
-                // must not land there too. Reachability is the exception, and only because it
-                // is not a verdict about the run at all: a turn is the one request that goes
-                // the whole way, so whether it arrived is the freshest word anything has about
-                // the wire, in either direction.
+                // must not land there too.
                 match &result {
                     // Parked on a card counts: the model asked for the tool, so the answer came
                     // through the gateway like any other.
                     Ok(_) => state.note_gateway_answered(cx),
                     Err(error) => {
-                        if error.unreachable().is_some() {
+                        // Reachability and the session are the two exceptions, and for the same
+                        // reason: neither is a verdict about the run. A turn is the one request
+                        // that goes the whole way, so it is the freshest word the app has about
+                        // both — whether it arrived, and whether the server knew whose it was.
+                        if matches!(error.failure(), Failure::OutOfReach(_) | Failure::SignedOut) {
                             state.note_failure(error, cx);
                         }
                         eprintln!("NativeChat: the turn failed: {}", error.message);
@@ -4745,12 +4867,18 @@ impl AppState {
         if self.is_turn_in_flight() {
             return None;
         }
+        // Not while the app has been told its session is gone. Pressing it then sends nothing —
+        // the guard on the way out sees to that — so it would be a button that does nothing,
+        // under a banner already saying why. It comes back when somebody signs in.
+        if self.session.is_expired() {
+            return None;
+        }
         let conversation = self
             .conversations
             .iter()
             .find(|c| Some(&c.id) == self.active_conversation_id.as_ref())?;
         let last = conversation.messages.last()?;
-        (!last.is_me && last.content.trim() == TURN_UNREACHED_NOTE).then(|| last.id.clone())
+        (!last.is_me && is_unsent_turn_note(&last.content)).then(|| last.id.clone())
     }
 
     /// Send the turn that did not go through, again.
@@ -5459,6 +5587,14 @@ impl AppState {
         if !self.is_signed_in() {
             self.auth_error = Some("Sign in first".to_string());
             cx.notify();
+            return;
+        }
+        // Signed in by the app's own reckoning and holding nothing to prove it. That gap is the
+        // bug: the roster was on screen, the composer took the message, and the turn went out
+        // bare. Nothing is put in the thread and nothing is sent — the banner is already saying
+        // why, and a turn sent from here would only fetch the same answer back from the server.
+        if !self.can_send_turn() {
+            self.note_signed_out(cx);
             return;
         }
         if self.active_coworker_id.is_none() {
@@ -6334,12 +6470,12 @@ mod tests {
         ActiveRecipe, AppState, ChatMessage, ChatPart, Conversation, DatabaseService,
         EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind, REPLY_QUOTE_CHARS,
         RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE,
-        TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler, agui_messages, apply_catalogue,
-        apply_reload, graft_reply, is_status_line, is_tool_standin, missing_replies,
-        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
-        streaming_message_mut,
+        TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler, agui_messages,
+        apply_catalogue, apply_reload, graft_reply, is_status_line, is_tool_standin,
+        is_unsent_turn_note, missing_replies, reads_as_gateway_unreachable, reply_from_replay,
+        restored_parts, saved_parts, streaming_message_mut,
     };
-    use crate::opengrok::ModelEntry;
+    use crate::opengrok::{Failure, ModelEntry, OpenGrokClient};
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
@@ -7406,6 +7542,124 @@ mod tests {
         assert!(
             !TURN_UNREACHED_NOTE.starts_with(RUN_ERROR_PREFIX),
             "which is what keeps it out of the colour of a failure"
+        );
+    }
+
+    /// The three endings a turn can have that are not the coworker speaking read as three
+    /// different things, and the signed-out one is the newest of them.
+    ///
+    /// It was a red line with the server's sentence in it — "this turn does not say whose spend
+    /// it is" — which read as a verdict about the turn and sent somebody looking at spend
+    /// limits. It is now its own quiet line, distinct from the wire's, because the thing to do
+    /// about it is different and the sentence is where a person learns that.
+    #[test]
+    fn a_turn_that_was_not_sent_says_so_without_naming_a_machine_or_a_verdict() {
+        assert!(is_status_line(TURN_SIGNED_OUT_NOTE));
+        assert!(
+            !TURN_SIGNED_OUT_NOTE.starts_with(RUN_ERROR_PREFIX),
+            "nothing about the run went wrong, so it is not painted as a failure"
+        );
+        assert_ne!(
+            TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE,
+            "one is fixed by waiting and one is fixed by signing in"
+        );
+        assert!(
+            !TURN_SIGNED_OUT_NOTE.contains("go through"),
+            "which would send somebody to look at a network that is working"
+        );
+
+        // And, like every other line the app writes itself, it is never handed back to the model
+        // as something the coworker said.
+        let sent = agui_messages(&[
+            message("m1", true, "open youtube"),
+            message("m2", false, TURN_SIGNED_OUT_NOTE),
+        ]);
+        assert_eq!(
+            sent.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["open youtube"]
+        );
+    }
+
+    /// Both turns that never left are offered again, and nothing else is.
+    ///
+    /// A turn that was not sent ran nothing and decided nothing, so sending it after signing in
+    /// does nothing twice — which is the whole reason it can be offered at all.
+    #[test]
+    fn a_turn_the_app_never_sent_is_offered_again_once_there_is_a_session() {
+        assert!(is_unsent_turn_note(TURN_SIGNED_OUT_NOTE));
+        assert!(is_unsent_turn_note(TURN_UNREACHED_NOTE));
+        assert!(
+            !is_unsent_turn_note(&format!("{RUN_ERROR_PREFIX}the model gateway refused")),
+            "a run that happened and was refused is not a run to repeat"
+        );
+        assert!(!is_unsent_turn_note(STOPPED_TURN_NOTE));
+
+        let mut state = AppState::new();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![
+                at(message("m_ask", true, "open youtube"), 10),
+                at(message("m_unsent", false, TURN_SIGNED_OUT_NOTE), 20),
+            ],
+        ));
+        state.active_conversation_id = Some("cw_1".to_string());
+        assert_eq!(state.retryable_turn().as_deref(), Some("m_unsent"));
+
+        // Not while the app is still signed out, though: it would send nothing, and a button
+        // that does nothing under a banner explaining why is worse than no button.
+        state.session.note(Failure::SignedOut);
+        assert_eq!(state.retryable_turn(), None);
+        state.session.signed_in();
+        assert_eq!(state.retryable_turn().as_deref(), Some("m_unsent"));
+    }
+
+    /// With no session, a turn is not attempted.
+    ///
+    /// Two ways of knowing and the app takes either: nothing in the jar to sign the turn with,
+    /// or a `401` already heard back. The first is the one that was missing — the roster was on
+    /// screen, the composer took the message, and the turn went out with no credential on it.
+    #[test]
+    fn a_turn_is_not_attempted_while_the_app_has_no_session() {
+        let mut state = AppState::new();
+        state.opengrok =
+            Some(OpenGrokClient::new("http://127.0.0.1:1/").expect("a URL that parses"));
+        assert!(
+            !state.can_send_turn(),
+            "an empty jar is an answer the app already has, without spending a round trip on it"
+        );
+        assert_eq!(
+            state.session_banner(),
+            None,
+            "though it has not been told yet, so there is nothing on screen about it"
+        );
+
+        // Being told is what puts it on screen, and it stays there: no retry loop can help.
+        state.session.note(Failure::SignedOut);
+        assert!(state.is_session_expired());
+        assert!(state.session_banner().is_some());
+        assert!(!state.can_send_turn());
+
+        // And a machine out of reach must not do any of that. Signing in cannot fix a router.
+        let mut wire = AppState::new();
+        wire.session
+            .note(crate::opengrok::OpenGrokError::from_server(Some(502), "Bad Gateway").failure());
+        assert!(!wire.is_session_expired());
+        assert_eq!(wire.session_banner(), None);
+    }
+
+    /// Signing in clears it, and so does signing out on purpose.
+    #[test]
+    fn signing_in_clears_the_signed_out_state() {
+        let mut state = AppState::new();
+        state.session.note(Failure::SignedOut);
+        assert!(state.is_session_expired());
+
+        state.session.signed_in();
+        assert!(!state.is_session_expired());
+        assert_eq!(state.session_banner(), None);
+        assert!(
+            state.session.may_send(true),
+            "and turns can be sent again the moment there is something to send them with"
         );
     }
 }

@@ -124,6 +124,9 @@ pub enum Command {
         password: Option<String>,
     },
     Logout,
+    /// The signed-out banner's button: go to the sign-in page, which is the only way out of
+    /// that state and the reason the banner is a banner rather than a line in the transcript.
+    SignInAgain,
     Shutdown,
 }
 
@@ -188,6 +191,7 @@ impl Command {
                 }
             }
             Self::Logout => state.logout(cx),
+            Self::SignInAgain => state.sign_in_again(cx),
             Self::Shutdown => {}
         }
     }
@@ -532,6 +536,12 @@ pub struct NativeChatHost {
     /// reached. Absent is the whole assertion for "it went away", which is the half of this that
     /// the transcript line it replaced could never be checked for.
     reconnect: Option<(String, &'static str)>,
+    /// The signed-out banner's two lines, while the server does not know who the app is.
+    ///
+    /// Separate from `reconnect` on purpose, and never both in one field: the two look alike on
+    /// screen and are opposite in the one way that matters, which is what makes them go away.
+    /// A driver that could not tell them apart is a driver that would have passed the bug.
+    signed_out: Option<String>,
     /// The open thread's last turn did not go through, and the feed is offering it again.
     can_retry_turn: bool,
     /// How many routes the Model field can offer, and the server's note about why that is not
@@ -657,6 +667,9 @@ impl NativeChatHost {
                         .map_or("", crate::opengrok::Unreachable::as_str),
                 )
             }),
+            signed_out: state
+                .session_banner()
+                .map(|(title, detail)| format!("{title} — {detail}")),
             can_retry_turn: state.retryable_turn().is_some(),
             model_count: state.model_catalogue.models.len(),
             model_note: state.model_catalogue.note.clone(),
@@ -885,6 +898,9 @@ impl NativeChatHost {
         if let Some(node) = self.reconnect_node() {
             page = page.with_child(node);
         }
+        for node in self.signed_out_nodes() {
+            page = page.with_child(node);
+        }
         if self.can_retry_turn {
             page = page.with_child(UiNode::button("retry-turn", "Try again"));
         }
@@ -961,6 +977,22 @@ impl NativeChatHost {
         // match on a sentence.
         node.states.push((*machine).to_string());
         Some(node)
+    }
+
+    /// The signed-out banner and its button, while the server does not know who the app is.
+    ///
+    /// Both go in and out together, so `assert --exists false` on either says the app has a
+    /// session again — and the button is in the tree because it is the whole of the recovery:
+    /// a driver, like a person, has to be able to get out of this state without a relaunch.
+    fn signed_out_nodes(&self) -> Vec<UiNode> {
+        let Some(banner) = &self.signed_out else {
+            return Vec::new();
+        };
+        let mut node = UiNode::status("signed-out-banner", banner.clone());
+        // The bare fact as a state, so an assert does not have to match the copy — and so that
+        // it is plainly not the reconnect pill, which is the confusion that made the bug.
+        node.states.push("signed-out".to_string());
+        vec![node, UiNode::button("signed-out-sign-in", "Sign in again")]
     }
 
     /// The composer's one action button, in whichever of its two states it is in.
@@ -1130,6 +1162,13 @@ impl NativeChatHost {
             }
         } else if target == ids::FOOTER_SIGN_OUT {
             Command::Logout
+        } else if target == "signed-out-sign-in" {
+            if self.signed_out.is_none() {
+                return Err(
+                    "there is nothing to sign in again for: the app has a session".to_string(),
+                );
+            }
+            Command::SignInAgain
         } else if target == ids::NAV_SEARCH
             || target == ids::NAV_LIBRARY
             || target == ids::NAV_PROJECTS
@@ -1363,6 +1402,9 @@ impl NativeChatHost {
                 Command::Login { email, password }
             }
             "auth.logout" => Command::Logout,
+            // What the signed-out banner's button does, under a name, so a driver can take the
+            // way out without having to find the button first.
+            "auth.sign-in-again" => Command::SignInAgain,
             "chat.send" => {
                 let text = args
                     .get("text")
@@ -1721,6 +1763,49 @@ mod tests {
 
         host.model_note = None;
         assert!(host.snapshot().find("agent-model-note").is_none());
+    }
+
+    /// The signed-out banner appears, carries its own way out, and leaves when there is a
+    /// session again.
+    ///
+    /// It is a separate node from the reconnecting pill and never the same one, because the two
+    /// are opposite in the way that matters: the pill goes when the wire returns, and this goes
+    /// only when somebody signs in. A driver that could not tell them apart is a driver that
+    /// would have watched the bug happen and reported the app as reconnecting.
+    #[test]
+    fn the_signed_out_banner_carries_its_own_way_out_and_is_not_the_reconnecting_pill() {
+        let mut host = host();
+        assert!(host.snapshot().find("signed-out-banner").is_none());
+        assert!(host.snapshot().find("signed-out-sign-in").is_none());
+        let refused = host.dispatch(&Op::click("signed-out-sign-in")).unwrap_err();
+        assert!(refused.contains("has a session"), "{refused}");
+
+        host.signed_out = Some(
+            "You are signed out. — OpenGrok no longer recognises this app, so nothing is being \
+             sent. Sign in again to carry on."
+                .to_string(),
+        );
+        let tree = host.snapshot();
+        let node = tree
+            .find("signed-out-banner")
+            .expect("the banner is on screen, so it is in the tree");
+        assert_eq!(node.states, vec!["signed-out".to_string()]);
+        assert!(
+            tree.find("reconnect-banner").is_none(),
+            "nothing here is reconnecting, and saying so would send somebody to the wrong fix"
+        );
+
+        // The way out, which is the half a relaunch used to be.
+        host.dispatch(&Op::click("signed-out-sign-in")).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::SignInAgain)));
+
+        host.signed_out = None;
+        let tree = host.snapshot();
+        assert!(
+            tree.find("signed-out-banner").is_none(),
+            "`assert --exists false` is how a driver says the app has a session again"
+        );
+        assert!(tree.find("signed-out-sign-in").is_none());
     }
 
     /// A turn that never left is offered again, and the offer is a click a driver can make.

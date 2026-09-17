@@ -12,8 +12,8 @@ use crate::components::persona::PersonaMark;
 use crate::find_text::{FindHit, marks_for_row, project_hits};
 use crate::opengrok::{ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, collapse_open_approvals};
 use crate::state::{
-    AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, TURN_UNREACHED_NOTE, is_status_line,
-    is_tool_standin,
+    AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, is_status_line, is_tool_standin,
+    is_unsent_turn_note,
 };
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::base::{Align, Placement, Positioner};
@@ -264,10 +264,12 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     // Red is for a turn that went wrong. A turn the person stopped went exactly
                     // as they asked, and a turn that never left did not go wrong either — it did
                     // not go — so both get the quiet grey the stand-ins get; painting either in
-                    // the colour of a failure would send someone looking for what broke.
+                    // the colour of a failure would send someone looking for what broke. A turn
+                    // the app would not send while it had no session is the second of those: the
+                    // red line about spend limits is exactly what this replaces.
                     status_failed: is_status_line(&text)
                         && text.trim() != STOPPED_TURN_NOTE
-                        && text.trim() != TURN_UNREACHED_NOTE,
+                        && !is_unsent_turn_note(&text),
                     status_retry: retryable.as_ref() == Some(&msg.id),
                     content: SharedString::from(text.clone()),
                     status_line: Some(text),
