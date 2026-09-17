@@ -10,11 +10,12 @@ use crate::opengrok::{
     Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
     ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
     RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, Unreachable,
     activity_from_replay, command_from_args, command_from_replay_events, deeds_from_replay,
-    enrol_this_machine, local_exec_outcome, policy_answer, serve_local_exec, stored_machine_id,
-    tool_standin, visible_bot_status,
+    enrol_this_machine, local_exec_outcome, policy_answer, reads_as_gateway_unreachable,
+    serve_local_exec, stored_machine_id, tool_standin, visible_bot_status,
 };
+use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
@@ -198,6 +199,18 @@ pub const STOPPED_TURN_NOTE: &str = "You stopped this turn.";
 pub const STOP_UNSENT_NOTE: &str =
     "OpenGrok: the stop did not reach the server, so the turn may still be running.";
 
+/// What the feed says for a turn that never got through.
+///
+/// It names no machine, on purpose. The line is a historical record — this turn, at this time,
+/// did not happen — and which machine was out of reach at that moment may not be the one that is
+/// out of reach by the time anybody reads it. What is down *now* is the indicator's job, and the
+/// indicator is live where this line is not.
+///
+/// Like [`STOPPED_TURN_NOTE`] it is not spelled with [`RUN_ERROR_PREFIX`]: nothing went wrong
+/// with the run, because there was no run. Red would send someone looking for a fault in a turn
+/// that simply did not leave.
+pub const TURN_UNREACHED_NOTE: &str = "This turn did not go through.";
+
 /// How much of a quoted message the coworker is shown: a reply to a long answer names it, it
 /// does not replay it. The server's `reply_context` caps the same way.
 const REPLY_QUOTE_CHARS: usize = 600;
@@ -210,7 +223,10 @@ const REPLY_QUOTE_CHARS: usize = 600;
 /// The test is the content itself so that rows an older build saved are read the same way.
 pub fn is_status_line(content: &str) -> bool {
     let text = content.trim();
-    text == EMPTY_TURN_NOTE || text == STOPPED_TURN_NOTE || text.starts_with(RUN_ERROR_PREFIX)
+    text == EMPTY_TURN_NOTE
+        || text == STOPPED_TURN_NOTE
+        || text == TURN_UNREACHED_NOTE
+        || text.starts_with(RUN_ERROR_PREFIX)
 }
 
 /// The stand-in a turn that acted but said nothing leaves behind, e.g.
@@ -403,6 +419,27 @@ fn apply_reload(
     }
     conversation.messages = rows.into_iter().map(restored_message).collect();
     true
+}
+
+/// Take a freshly fetched model catalogue, or keep the one already held. Answers with the note
+/// the server sent, when it sent one.
+///
+/// `/models` never fails: a gateway it cannot reach yields an empty list and the reason, with a
+/// `200` on it. Taking that answer wholesale is what emptied the Model field and left it empty —
+/// a list the app already had, and could still perfectly well offer, replaced by nothing because
+/// of a machine that was down for ninety seconds. So an empty catalogue that arrives with a
+/// reason is read as "ask again later" rather than as the catalogue: what is held stays, wearing
+/// the server's note so the field can say why it may be stale.
+///
+/// An empty catalogue with no note is a real answer — this key routes to nothing — and is taken.
+fn apply_catalogue(held: &mut ModelCatalogue, fresh: ModelCatalogue) -> Option<String> {
+    let note = fresh.note.clone();
+    if fresh.models.is_empty() && !held.models.is_empty() && note.is_some() {
+        held.note = note.clone();
+        return note;
+    }
+    *held = fresh;
+    note
 }
 
 /// A line of the app's own, as a row of the transcript.
@@ -1181,7 +1218,22 @@ pub struct AppState {
     pub opengrok: Option<OpenGrokClient>,
     pub account: Option<Account>,
     pub auth_status: AuthStatus,
+    /// What the server refused, and why. Verdicts only: a sign-in that was turned down, a patch
+    /// the server would not take, a bot that could not be hired. Nothing about the wire goes in
+    /// here — that is `reachability` — because a field holding both is a field the app cannot
+    /// read: it can neither retry the half that is worth retrying nor stop showing the half that
+    /// has stopped being true.
     pub auth_error: Option<String>,
+    /// What the app can and cannot reach, as a state that clears itself. Private because the
+    /// retry loop has to be started and stopped with it, and that is what `note_failure` and
+    /// `came_back` are for.
+    reachability: Reachability,
+    /// A retry loop is running. Only one at a time: it is asking one question of one server.
+    reconnecting: bool,
+    /// Which retry loop. Bumped to start one and bumped again to end it, so a loop that is
+    /// mid-wait when the connection comes back finds itself out of date and stops — the shape
+    /// `login_epoch` and `recipes_epoch` already use in this file.
+    reconnect_epoch: u64,
     login_epoch: u64,
     pub login_email: String,
     pub login_password: String,
@@ -1496,6 +1548,9 @@ impl AppState {
             account: None,
             auth_status: AuthStatus::SignedOut,
             auth_error: None,
+            reachability: Reachability::default(),
+            reconnecting: false,
+            reconnect_epoch: 0,
             login_epoch: 0,
             login_email: String::new(),
             login_password: String::new(),
@@ -1602,14 +1657,26 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        state.note_server_answered(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.refresh_computers(cx);
                         state.sync_pending_approvals(cx);
                     }
-                    Err(_) => {
+                    Err(error) => {
                         state.account = None;
                         state.auth_status = AuthStatus::SignedOut;
+                        match error.unreachable() {
+                            // A saved session the app could not check is not a session that was
+                            // refused, and the sign-in page should not imply it was. The
+                            // indicator says the server is not answering and the loop keeps
+                            // asking; signing in works as soon as it does.
+                            Some(_) => state.note_failure(&error, cx),
+                            // A session the server refused is a session to sign in again for,
+                            // and the page says that by being the page — it is not worth a red
+                            // line above the fields before anybody has typed anything.
+                            None => state.note_server_answered(cx),
+                        }
                     }
                 }
                 cx.notify();
@@ -1773,6 +1840,7 @@ impl AppState {
                         state.account = Some(account);
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
+                        state.note_server_answered(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.refresh_computers(cx);
@@ -1781,7 +1849,9 @@ impl AppState {
                     Err(error) => {
                         state.account = None;
                         state.auth_status = AuthStatus::SignedOut;
-                        state.auth_error = Some(error.message);
+                        // A password the server never saw was not a wrong password: the failure
+                        // goes to the indicator, not under the fields.
+                        state.note_failure(&error, cx);
                     }
                 }
                 cx.notify();
@@ -1846,8 +1916,11 @@ impl AppState {
                                 state.select_coworker(first.id, cx);
                             }
                         }
+                        // The roster is a server route and says nothing about the gateway, so
+                        // this clears the server's state only.
+                        state.note_server_answered(cx);
                     }
-                    Err(error) => state.auth_error = Some(error.message),
+                    Err(error) => state.note_failure(&error, cx),
                 }
                 cx.notify();
             });
@@ -1863,14 +1936,147 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.list_models().await;
             let _ = this.update(cx, |state, cx| {
-                match result {
-                    Ok(catalogue) => state.model_catalogue = catalogue,
-                    Err(error) => state.auth_error = Some(error.message),
-                }
+                state.settle_models(result, cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// What a `/models` answer means — for the Model field, and for whether the gateway is there.
+    ///
+    /// This is also the reconnect loop's probe, which is why it answers whether everything is
+    /// reachable now: one request settles both questions, and its success *is* the refill.
+    fn settle_models(
+        &mut self,
+        result: Result<ModelCatalogue, OpenGrokError>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match result {
+            Ok(catalogue) => {
+                let note = apply_catalogue(&mut self.model_catalogue, catalogue);
+                match note.filter(|note| reads_as_gateway_unreachable(note)) {
+                    Some(note) => {
+                        self.note_unreachable(Unreachable::Gateway, &note, cx);
+                        false
+                    }
+                    // Models, from the gateway, through the server: the whole path worked.
+                    None => {
+                        self.note_gateway_answered(cx);
+                        true
+                    }
+                }
+            }
+            Err(error) => {
+                self.note_failure(&error, cx);
+                error.unreachable().is_none()
+            }
+        }
+    }
+
+    /// Every failure the app hears about is sorted here, once, so that no call site has to guess.
+    ///
+    /// A refusal is a verdict about what was asked, and it goes where verdicts have always gone.
+    /// A transport failure is not about what was asked at all — it is the state of the wire, it
+    /// stops being true on its own, and it starts the app asking again.
+    fn note_failure(&mut self, error: &OpenGrokError, cx: &mut Context<Self>) {
+        match error.unreachable() {
+            Some(what) => self.note_unreachable(what, &error.message, cx),
+            None => {
+                self.auth_error = Some(error.message.clone());
+                self.note_server_answered(cx);
+            }
+        }
+    }
+
+    fn note_unreachable(&mut self, what: Unreachable, detail: &str, cx: &mut Context<Self>) {
+        if self.reachability.fail(what, detail) {
+            cx.notify();
+        }
+        self.start_reconnect(cx);
+    }
+
+    /// The server answered, whatever it answered. Clears the server's own state and nothing else.
+    fn note_server_answered(&mut self, cx: &mut Context<Self>) {
+        if self.reachability.server_answered() {
+            self.came_back(cx);
+        }
+    }
+
+    /// Something came through the whole path, gateway included.
+    fn note_gateway_answered(&mut self, cx: &mut Context<Self>) {
+        if self.reachability.all_clear() {
+            self.came_back(cx);
+        }
+    }
+
+    /// Everything is reachable again, having not been a moment ago.
+    ///
+    /// Reached only on the transition, so the refill below happens once rather than on every
+    /// request that succeeds. The roster is what a spell out of reach may have emptied, and
+    /// asking for it asks for the catalogue too — so the Model field fills again without anybody
+    /// going and looking at it.
+    fn came_back(&mut self, cx: &mut Context<Self>) {
+        self.reconnecting = false;
+        self.reconnect_epoch += 1;
+        if self.is_signed_in() {
+            self.refresh_coworkers(cx);
+        }
+        cx.notify();
+    }
+
+    /// Ask again, waiting longer each time, until something answers.
+    ///
+    /// The probe is `/models`: it is the one request that answers both questions at once — a
+    /// failure at the socket is the server, a `200` carrying the gateway's reason is the gateway,
+    /// and a list of models is everything working — and its success is itself the refill the
+    /// Model field needs. A refusal (a `401`, a `500`) also ends the loop, because a server that
+    /// refuses is a server that is being reached; what it refused is not this loop's business.
+    fn start_reconnect(&mut self, cx: &mut Context<Self>) {
+        if self.reconnecting {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        self.reconnecting = true;
+        self.reconnect_epoch += 1;
+        let epoch = self.reconnect_epoch;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(Some(wait)) = this.update(cx, |state, _| {
+                    (state.reconnect_epoch == epoch).then(|| state.reachability.wait())
+                }) else {
+                    return;
+                };
+                cx.background_executor().timer(wait).await;
+                let result = client.list_models().await;
+                let Ok(reachable) = this.update(cx, |state, cx| {
+                    if state.reconnect_epoch != epoch {
+                        return true;
+                    }
+                    let reachable = state.settle_models(result, cx);
+                    cx.notify();
+                    reachable
+                }) else {
+                    return;
+                };
+                if reachable {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The two lines the reconnecting indicator shows, or `None` while everything answers.
+    pub fn reachability_indicator(&self) -> Option<(String, String)> {
+        self.reachability.indicator()
+    }
+
+    /// Which machine the app cannot reach, if it is failing to reach one.
+    pub fn unreachable(&self) -> Option<Unreachable> {
+        self.reachability.unreachable()
     }
 
     pub fn is_right_pane_open(&self) -> bool {
@@ -1896,6 +2102,13 @@ impl AppState {
             self.start_computer_poll(cx);
         } else {
             self.computer_poll = None;
+        }
+        if pane == RightPane::Settings {
+            // Looking at the Model field asks again. The catalogue is fetched once at startup
+            // and one failed fetch used to be the whole of it for the life of the process; the
+            // reconnect loop refills it unvisited now, and this is the other half — somebody
+            // who opens the pane to see why it is empty gets a fresh answer for opening it.
+            self.refresh_models(cx);
         }
     }
 
@@ -3174,7 +3387,13 @@ impl AppState {
                 {
                     settle_patch(existing, &patch, result.as_ref().ok(), before);
                 }
-                state.auth_error = error.clone();
+                match result.as_ref() {
+                    Ok(_) => {
+                        state.auth_error = None;
+                        state.note_server_answered(cx);
+                    }
+                    Err(error) => state.note_failure(error, cx),
+                }
                 cx.notify();
             });
             if let Some(done) = done {
@@ -3224,8 +3443,9 @@ impl AppState {
                     Ok(account) => {
                         state.account = Some(account);
                         state.auth_error = None;
+                        state.note_server_answered(cx);
                     }
-                    Err(error) => state.auth_error = Some(error.message),
+                    Err(error) => state.note_failure(&error, cx),
                 }
                 cx.notify();
             });
@@ -3248,8 +3468,11 @@ impl AppState {
             let result = client.change_password(&current, &new_password).await;
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(()) => state.auth_error = None,
-                    Err(error) => state.auth_error = Some(error.message),
+                    Ok(()) => {
+                        state.auth_error = None;
+                        state.note_server_answered(cx);
+                    }
+                    Err(error) => state.note_failure(&error, cx),
                 }
                 cx.notify();
             });
@@ -3372,6 +3595,10 @@ impl AppState {
                         state.coworkers.insert(0, hired);
                         state.select_coworker(id, cx);
                     }
+                    // "is OpenGrok running at …?" was this app's one attempt at saying the
+                    // server was out of reach, in a field that never cleared. It has a home of
+                    // its own now, and one that goes away when the server comes back.
+                    Err(error) if error.unreachable().is_some() => state.note_failure(&error, cx),
                     Err(error) => {
                         state.auth_error = Some(format!(
                             "Could not create agent: {} (is OpenGrok running at {}?)",
@@ -3702,7 +3929,7 @@ impl AppState {
                         }
                         state.select_coworker(new_id, cx);
                     }
-                    Err(error) => state.auth_error = Some(error.message),
+                    Err(error) => state.note_failure(&error, cx),
                 }
                 cx.notify();
             });
@@ -3735,7 +3962,7 @@ impl AppState {
             let result = client.delete_coworker(&id).await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(error) = result {
-                    state.auth_error = Some(error.message);
+                    state.note_failure(&error, cx);
                     state.refresh_coworkers(cx);
                 }
                 cx.notify();
@@ -4416,6 +4643,15 @@ impl AppState {
                                 message.content = tool_standin(&deeds)
                                     .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
                             }
+                            // A turn nothing answered is not a turn that went wrong. The red
+                            // line with the server's sentence in it is a verdict, and it stayed
+                            // in the transcript long after the wire came back, still naming a
+                            // URL that was working again. This row says only that the turn did
+                            // not happen, and offers it again; what is broken *now* is the
+                            // indicator's business, and the indicator can go away.
+                            Err(error) if error.unreachable().is_some() => {
+                                message.content = TURN_UNREACHED_NOTE.to_string()
+                            }
                             Err(error) => {
                                 message.content = format!("{RUN_ERROR_PREFIX}{}", error.message)
                             }
@@ -4477,16 +4713,73 @@ impl AppState {
                 } else {
                     state.finish_responding(turn_id.as_deref(), false);
                 }
-                // A failed run already ended the last assistant row with "OpenGrok: <why>";
-                // `auth_error` is the sign-in / settings error and the settings pane paints it,
-                // so a run's failure must not land there too.
-                if let Err(error) = result {
-                    eprintln!("NativeChat: the turn failed: {}", error.message);
+                // A failed run has already ended the last assistant row, with the server's
+                // sentence or with the note that the turn never left; `auth_error` is the
+                // sign-in / settings error and the settings pane paints it, so a run's failure
+                // must not land there too. Reachability is the exception, and only because it
+                // is not a verdict about the run at all: a turn is the one request that goes
+                // the whole way, so whether it arrived is the freshest word anything has about
+                // the wire, in either direction.
+                match &result {
+                    // Parked on a card counts: the model asked for the tool, so the answer came
+                    // through the gateway like any other.
+                    Ok(_) => state.note_gateway_answered(cx),
+                    Err(error) => {
+                        if error.unreachable().is_some() {
+                            state.note_failure(error, cx);
+                        }
+                        eprintln!("NativeChat: the turn failed: {}", error.message);
+                    }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The row of the open thread's last turn that did not go through, if its last turn is one.
+    ///
+    /// Only the last: an older one has messages after it, and re-running the thread from here
+    /// would answer the newest message rather than the one that went unanswered.
+    pub fn retryable_turn(&self) -> Option<String> {
+        if self.is_turn_in_flight() {
+            return None;
+        }
+        let conversation = self
+            .conversations
+            .iter()
+            .find(|c| Some(&c.id) == self.active_conversation_id.as_ref())?;
+        let last = conversation.messages.last()?;
+        (!last.is_me && last.content.trim() == TURN_UNREACHED_NOTE).then(|| last.id.clone())
+    }
+
+    /// Send the turn that did not go through, again.
+    ///
+    /// It is offered rather than done for the person, and that is deliberate. In the plain case
+    /// — the app never reached OpenGrok — the request did not leave and nothing ran, so sending
+    /// it again is free. But a turn can also fail at the gateway *after* it has been going for a
+    /// while, with tools already run against a real computer, and re-sending that one silently
+    /// would do those things a second time to somebody who never asked. So the app says the turn
+    /// did not go through and waits to be told.
+    ///
+    /// The person's message is still in the thread and is not sent again; the failed row goes,
+    /// and the turn is run from the thread as it stands, which is where `send_opengrok_turn`
+    /// reads its history from anyway.
+    pub fn retry_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(message_id) = self.retryable_turn() else {
+            return;
+        };
+        let Some(conversation_id) = self.active_conversation_id.clone() else {
+            return;
+        };
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+        {
+            conversation.messages.retain(|m| m.id != message_id);
+        }
+        self.send_opengrok_turn(conversation_id, String::new(), cx);
     }
 
     /// Stop the turn the open thread has in flight.
@@ -6039,11 +6332,14 @@ mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
         ActiveRecipe, AppState, ChatMessage, ChatPart, Conversation, DatabaseService,
-        EMPTY_TURN_NOTE, LiveTurn, Message, PickedKind, REPLY_QUOTE_CHARS, RecipeSummary,
-        RecoveredReply, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, ThreadRun, TurnAssembler,
-        agui_messages, apply_reload, graft_reply, is_status_line, is_tool_standin, missing_replies,
-        reply_from_replay, restored_parts, saved_parts, streaming_message_mut,
+        EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind, REPLY_QUOTE_CHARS,
+        RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE,
+        TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler, agui_messages, apply_catalogue,
+        apply_reload, graft_reply, is_status_line, is_tool_standin, missing_replies,
+        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
+        streaming_message_mut,
     };
+    use crate::opengrok::ModelEntry;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
@@ -6962,6 +7258,154 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.id == "m_live")
+        );
+    }
+
+    // ---- Reaching the gateway, and the list that depends on it ------------------------------
+
+    fn catalogue(ids: &[&str], note: Option<&str>) -> ModelCatalogue {
+        ModelCatalogue {
+            models: ids
+                .iter()
+                .map(|id| ModelEntry {
+                    id: (*id).to_string(),
+                })
+                .collect(),
+            note: note.map(str::to_string),
+        }
+    }
+
+    /// The whole of the reported bug, on the data: the gateway goes, the Model field keeps what
+    /// it had and says why it may be stale, and the answer that arrives once the gateway is back
+    /// refills it.
+    #[test]
+    fn a_gateway_outage_does_not_empty_the_model_list_and_coming_back_refills_it() {
+        let mut held = ModelCatalogue::default();
+
+        let note = apply_catalogue(&mut held, catalogue(&["xai/grok-4.6", "oag/auto"], None));
+        assert_eq!(note, None);
+        assert_eq!(held.models.len(), 2);
+
+        // `/models` never fails: a gateway it cannot reach answers 200, empty, with the reason.
+        let down = catalogue(
+            &[],
+            Some(
+                "the gateway could not be reached: error sending request for url \
+                 (http://127.0.0.1:29080/v1/models)",
+            ),
+        );
+        let note = apply_catalogue(&mut held, down);
+        assert_eq!(
+            held.models.len(),
+            2,
+            "the list the app already has is still a list it can offer"
+        );
+        assert!(reads_as_gateway_unreachable(
+            note.as_deref().expect("the server said why")
+        ));
+        assert!(
+            held.note.is_some(),
+            "and the field can say why it may be stale"
+        );
+
+        let note = apply_catalogue(
+            &mut held,
+            catalogue(&["xai/grok-4.6", "oag/auto", "new"], None),
+        );
+        assert_eq!(note, None, "nothing left to explain");
+        assert_eq!(held.models.len(), 3, "the newer list is taken");
+        assert_eq!(held.note, None);
+    }
+
+    /// An empty answer with nothing to explain it is a real answer — this key routes nowhere —
+    /// and holding a stale list against it would be the app inventing models.
+    #[test]
+    fn an_empty_answer_with_no_reason_is_taken_as_the_answer() {
+        let mut held = catalogue(&["xai/grok-4.6"], None);
+        let note = apply_catalogue(&mut held, catalogue(&[], None));
+        assert_eq!(note, None);
+        assert!(held.models.is_empty());
+    }
+
+    /// A gateway that answered and had nothing to offer is not a gateway out of reach: the note
+    /// belongs on the field, but nothing is worth retrying.
+    #[test]
+    fn a_gateway_that_answers_with_no_models_is_not_a_gateway_to_wait_for() {
+        let mut held = ModelCatalogue::default();
+        let note = apply_catalogue(
+            &mut held,
+            catalogue(
+                &[],
+                Some(
+                    "the gateway advertises no models on this key's route — a pin can still be \
+                     typed by hand",
+                ),
+            ),
+        );
+        assert!(!reads_as_gateway_unreachable(
+            note.as_deref().expect("a note")
+        ));
+        assert!(held.note.is_some(), "the field still says what happened");
+    }
+
+    /// The app's own account of a turn that never left is one of its status lines: painted, not
+    /// saved, and never handed to the model as something the coworker said.
+    #[test]
+    fn a_turn_that_never_left_is_a_status_line_and_not_the_coworkers_words() {
+        assert!(is_status_line(TURN_UNREACHED_NOTE));
+        let sent = agui_messages(&[
+            message("m1", true, "open youtube"),
+            message("m2", false, TURN_UNREACHED_NOTE),
+        ]);
+        assert_eq!(
+            sent.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["open youtube"]
+        );
+    }
+
+    /// Only the thread's last turn is offered again. An older one has messages after it, and
+    /// re-running the thread from there would answer the newest message instead.
+    #[test]
+    fn the_turn_offered_again_is_the_last_one_and_only_while_nothing_is_running() {
+        let mut state = AppState::new();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![
+                at(message("m_ask", true, "open youtube"), 10),
+                at(message("m_failed", false, TURN_UNREACHED_NOTE), 20),
+            ],
+        ));
+        state.active_conversation_id = Some("cw_1".to_string());
+        assert_eq!(state.retryable_turn().as_deref(), Some("m_failed"));
+
+        state.live_turns.insert("cw_1".to_string(), in_flight());
+        assert_eq!(
+            state.retryable_turn(),
+            None,
+            "a thread already running a turn has nothing to send again"
+        );
+        state.live_turns.remove("cw_1");
+
+        state.conversations[0]
+            .messages
+            .push(at(message("m_next", true, "never mind"), 30));
+        assert_eq!(
+            state.retryable_turn(),
+            None,
+            "the thread has moved on, and the turn to run is not the old one"
+        );
+    }
+
+    /// A run the server refused is a verdict, and it keeps the red line with the server's own
+    /// sentence in it. Only a turn that never left gets the quiet line that can be answered.
+    #[test]
+    fn a_refused_run_still_says_why_where_a_turn_that_never_left_does_not() {
+        let refused = format!("{RUN_ERROR_PREFIX}the model gateway refused: 402 spend cap");
+        assert!(is_status_line(&refused));
+        assert_ne!(refused, TURN_UNREACHED_NOTE);
+        assert!(
+            !TURN_UNREACHED_NOTE.starts_with(RUN_ERROR_PREFIX),
+            "which is what keeps it out of the colour of a failure"
         );
     }
 }
