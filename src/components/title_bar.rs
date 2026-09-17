@@ -121,6 +121,13 @@ impl Render for TitleBar {
             .px(px(HEADER_PX))
             .items_center()
             .gap_2()
+            // THE RULE UNDER THE BAR BELONGS TO THE CHAT COLUMN ALONE. It marks where the
+            // header ends and the transcript begins, and neither neighbour has that boundary:
+            // the sidebar runs unbroken from the window's top edge to the account row, and the
+            // right pane's header flows straight into its own fields. Drawn across the whole
+            // row it cut both of them in half for no reason a reader could name.
+            .border_b_1()
+            .border_color(theme.border)
             .map(|this| match (recipes_span, &coworker, signed_in) {
                 // The Recipes page's own title and back chevron, in place of a bot's name.
                 (Some(header), _, _) => this.child(header),
@@ -202,10 +209,15 @@ impl Render for TitleBar {
             .items_center()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .border_b_1()
-            .border_color(theme.border)
-            // The traffic lights' corner and the sidebar's span: nothing but a handle.
-            .child(window_drag(div().w(px(chat_x)).h_full().flex_shrink_0()))
+            // The traffic lights' corner and the sidebar's span: nothing but a handle, and the
+            // top of the sidebar's own edge. That edge stops at the bar everywhere else, which
+            // left the sidebar looking like it began below the window's chrome rather than at
+            // its top. Only while the sidebar is docked: over a floating pane, or with nothing
+            // but the traffic lights there, the same line would divide nothing from nothing.
+            .child(
+                window_drag(div().w(px(chat_x)).h_full().flex_shrink_0())
+                    .when(docked, |this| this.border_r_1().border_color(theme.border)),
+            )
             .child(chat_span)
             .when_some(right_header, |this, header| {
                 this.child(
