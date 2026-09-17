@@ -504,7 +504,7 @@ impl MessageInput {
             PanelMode::Plus,
             rows,
             "Search",
-            "⌘1–9 picks a row. Type @ for the bot's tools, / for its recipes and actions.",
+            "⌘1–9 picks a row. Type @ for the bot's tools, / for its recipes and workflows.",
             window,
             cx,
         );
@@ -533,7 +533,7 @@ impl MessageInput {
         self.show_panel(
             PanelMode::Slash,
             rows,
-            "Search recipes and actions",
+            "Search recipes, workflows and actions",
             "↑↓ to move, ⌘1–9 to take one straight away, ↵ to run it or put it in the message, esc to close.",
             window,
             cx,
@@ -608,7 +608,12 @@ impl MessageInput {
                     self.state
                         .update(cx, |state, cx| state.pick_tool(id, label, cx));
                 }
-                TokenKind::Recipe => {
+                // A workflow goes the same way a recipe does, and on purpose: both are what the
+                // turn runs, both declare their parameters on the same field of the same row,
+                // and a second path through here would be the first one copied with one word
+                // changed. What the two differ in is what they are called, which is on the chip
+                // and on the bar.
+                TokenKind::Recipe | TokenKind::Workflow => {
                     // A recipe picked from `/` is not only a word in the sentence: it is what
                     // the turn runs, so it goes on the draft as well as into the message. One
                     // recipe to a message, so picking another takes the first one's chip out
@@ -721,7 +726,7 @@ impl MessageInput {
         if let Some(index) = self
             .tokens
             .iter()
-            .position(|token| token.kind == TokenKind::Recipe && token.id == recipe.id)
+            .position(|token| token.kind.is_mode() && token.id == recipe.id)
         {
             let range = self.tokens.remove(index).range;
             self.remove_text(range, window, cx);
@@ -757,7 +762,7 @@ impl MessageInput {
         if self
             .tokens
             .iter()
-            .any(|token| token.kind == TokenKind::Recipe && token.id == id)
+            .any(|token| token.kind.is_mode() && token.id == id)
         {
             return;
         }
@@ -1121,7 +1126,7 @@ impl MessageInput {
                                 .gap_1()
                                 .child(
                                     Icon::default()
-                                        .path("icons/record.svg")
+                                        .path(recipe.kind.icon())
                                         .size(px(11.))
                                         .text_color(muted_foreground),
                                 )
@@ -1131,7 +1136,15 @@ impl MessageInput {
                                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                                         .text_color(muted_foreground)
                                         .truncate()
-                                        .child(format!("Recipe · {}", recipe.name)),
+                                        // The noun is the thing's own, never "Recipe" for both:
+                                        // the bar is the one place that says what the next
+                                        // message runs, and a tree and a tape are not the same
+                                        // promise.
+                                        .child(format!(
+                                            "{} · {}",
+                                            recipe.kind.label(),
+                                            recipe.name
+                                        )),
                                 )
                                 .child(div().text_xs().text_color(muted_foreground).child(
                                     if has_parameters {
@@ -1163,7 +1176,11 @@ impl MessageInput {
                         .justify_center()
                         .cursor_pointer()
                         .hover(move |style| style.bg(secondary))
-                        .tooltip(|window, cx| Tooltip::new("Drop the recipe").build(window, cx))
+                        .tooltip({
+                            let drop =
+                                SharedString::from(format!("Drop the {}", recipe.kind.word()));
+                            move |window, cx| Tooltip::new(drop.clone()).build(window, cx)
+                        })
                         .child(
                             Icon::new(IconName::Close)
                                 .size(px(12.))

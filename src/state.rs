@@ -9,11 +9,11 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, Failure, FormSpec, LocalExecMode,
     LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
-    QueuedApproval, RecipeDetail, RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep,
-    RecipeSummary, ReplyQuote, RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
-    TurnRecipe, Unreachable, activity_from_replay, command_from_args, command_from_replay_events,
-    deeds_from_replay, enrol_this_machine, local_exec_outcome, policy_answer,
-    reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
+    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, ThreadReplay, ThreadRun, ToolCallTracker,
+    TurnAssembler, TurnRecipe, Unreachable, activity_from_replay, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
+    policy_answer, reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -1449,15 +1449,21 @@ impl PickedKind {
     }
 }
 
-/// The recipe the next message runs, picked with `/` in the composer.
+/// The recipe or workflow the next message runs, picked with `/` in the composer.
 ///
 /// The parameters are the copy the recipe carried when it was picked rather than a look-up by
 /// id later: the recipe list is refetched and refiltered under the draft, and a draft that lost
 /// what it needs because a list was narrowed elsewhere would be a mystery to whoever typed it.
+///
+/// One type for both kinds, because everything about being on the draft is the same for the
+/// two: the same declaration, the same values, the same bar, the same `@`. What differs is the
+/// noun, and that is [`Self::kind`], carried so that no surface has to guess.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveRecipe {
     pub id: String,
     pub name: String,
+    /// A taped sequence or a decision tree, as the listing said.
+    pub kind: RecipeKind,
     pub parameters: Vec<RecipeParameter>,
     /// What each parameter was filled in with, by name, as the person typed it. A parameter
     /// with no entry here is unfilled.
@@ -1480,13 +1486,20 @@ impl ActiveRecipe {
         Self {
             id: recipe.id.clone(),
             name: if recipe.name.trim().is_empty() {
-                "Untitled recipe".to_string()
+                format!("Untitled {}", recipe.kind.word())
             } else {
                 recipe.name.trim().to_string()
             },
+            kind: recipe.kind,
             parameters: recipe.parameters.clone(),
             values,
         }
+    }
+
+    /// A decision tree rather than a tape, which is what the bar over the composer says and the
+    /// only thing the composer does differently with the two.
+    pub fn is_workflow(&self) -> bool {
+        self.kind == RecipeKind::Workflow
     }
 
     pub fn value(&self, name: &str) -> Option<&str> {
@@ -2630,6 +2643,13 @@ impl AppState {
 
     /// Load the list for the current filter. A late answer for an earlier request is dropped,
     /// so switching chips quickly never shows the wrong list.
+    ///
+    /// ONE FETCH FOR BOTH KINDS. The listing takes `?kind=recipe|workflow` and is never asked
+    /// for one: the server builds every row either way and the query only drops some of them
+    /// afterwards, so asking twice would be two round trips for one answer — and two answers in
+    /// flight at once, which is a `/` panel that fills in twice while somebody reads it. What a
+    /// row is rides on the row, and each surface reads it: `/` shows both kinds, and the Recipes
+    /// page keeps to recipes.
     pub fn refresh_recipes(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
@@ -3391,9 +3411,13 @@ impl AppState {
             .collect()
     }
 
-    /// Put a recipe on the next message, from the list the composer picked it out of. An id the
-    /// list does not hold leaves the draft as it was, and says so, so the composer knows whether
-    /// it has a recipe to show.
+    /// Put a recipe or a workflow on the next message, from the list the composer picked it out
+    /// of. An id the list does not hold leaves the draft as it was, and says so, so the composer
+    /// knows whether it has something to show.
+    ///
+    /// The two kinds go on the draft by the same route because the listing brings them back in
+    /// one array: what a row IS travels on the row itself, and [`ActiveRecipe::from_summary`]
+    /// carries it through to the bar.
     pub fn start_recipe(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
         let Some(recipe) = self.recipes.iter().find(|recipe| recipe.id == id) else {
             return false;
@@ -6409,6 +6433,49 @@ mod tests {
     /// The values a turn carries are typed as the declaration said they would be, because that
     /// is what the server validates them against — a number sent as the word "5" is a number
     /// the server has every right to refuse.
+    #[test]
+    /// Picking a workflow from `/` puts it on the draft the way a recipe goes, and the draft
+    /// keeps the one thing that differs: what it is called. Everything else — the declaration,
+    /// the defaults standing in their fields, what the turn carries — is the same machinery,
+    /// which is why there is one type for both and not two that drift.
+    #[test]
+    fn a_workflow_goes_on_the_draft_under_its_own_noun() {
+        let declaration = serde_json::json!([
+            { "name": "term", "required": true, "kind": "text" },
+            { "name": "tries", "required": false, "kind": "number", "default": 3 }
+        ]);
+        let tape: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_1", "name": "search", "kind": "recipe", "parameters": declaration
+        }))
+        .unwrap();
+        let tree: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_2", "name": "search", "kind": "workflow", "parameters": declaration
+        }))
+        .unwrap();
+
+        let on_draft = ActiveRecipe::from_summary(&tree);
+        assert!(on_draft.is_workflow());
+        assert_eq!(on_draft.kind.label(), "Workflow");
+        assert_eq!(
+            on_draft.parameters,
+            ActiveRecipe::from_summary(&tape).parameters,
+            "a tree declares what it needs told exactly as a tape does"
+        );
+        assert_eq!(
+            on_draft.value("tries"),
+            Some("3"),
+            "a declared default stands in its field on a tree too"
+        );
+        assert_eq!(on_draft.missing(), vec!["term"]);
+        assert_eq!(on_draft.turn().id, "rcp_2");
+
+        // A listing from a server that has never heard of workflows says nothing about kind,
+        // and every row it sends is a tape.
+        let old: RecipeSummary =
+            serde_json::from_value(serde_json::json!({ "id": "rcp_3", "name": "search" })).unwrap();
+        assert!(!ActiveRecipe::from_summary(&old).is_workflow());
+    }
+
     #[test]
     fn a_recipe_on_the_draft_sends_each_value_as_the_kind_it_was_declared() {
         let recipe: RecipeSummary = serde_json::from_value(serde_json::json!({
