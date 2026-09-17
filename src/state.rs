@@ -14,7 +14,6 @@ use crate::opengrok::{
     TurnRecipe, Unreachable, activity_from_replay, command_from_args, command_from_replay_events,
     deeds_from_replay, enrol_this_machine, local_exec_outcome, policy_answer,
     reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
-    visible_bot_status,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -225,6 +224,13 @@ pub const TURN_UNREACHED_NOTE: &str = "This turn did not go through.";
 /// left, so sending it after signing in does nothing twice.
 pub const TURN_SIGNED_OUT_NOTE: &str = "This turn was not sent: the app is signed out.";
 
+/// The working line of a turn that has stopped to ask for permission.
+///
+/// A constant because it is both written and read: a poll that outlives the card checks the
+/// thread's own line for it before deciding the turn is over, and a spelling that drifted
+/// between the two would end the turn out from under the person's answer.
+const WAITING_APPROVAL_STATUS: &str = "Waiting for approval";
+
 /// A turn that never reached the server, in either of the two ways that happens.
 ///
 /// Both rows mean the same thing about the transcript — nothing ran, nothing was decided, and
@@ -394,13 +400,25 @@ pub struct LiveTurn {
     /// The row the run is being painted into. Named, rather than "the last one": the last row
     /// stops being this one the moment anything else touches the list.
     pub message_id: String,
-    /// Whose turn it is, so a replay can put the status line back on the right bot.
-    pub coworker_id: Option<String>,
     /// The reply has been handed to the database. Set the moment the app decides what the turn
     /// came to, so a replay landing afterwards does not write the same reply down a second
     /// time; the turn itself is not let go until the write lands, because until then the
     /// database still does not have it.
     pub persisting: bool,
+}
+
+/// What one thread's turn is doing, as the app would say it out loud.
+///
+/// The two halves are separate because a turn between frames is still a turn: a run says
+/// "Thinking", clears the label when the thought is over, and goes on running. A label with
+/// nothing running is the other way round and just as real — a turn parked on a permission card
+/// is waiting for a person, not working.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ThreadActivity {
+    /// The working line this thread shows while it is the open one.
+    label: Option<String>,
+    /// A turn of this thread's is under way.
+    responding: bool,
 }
 
 /// The row a run is writing into, found by the id the turn gave it when it started.
@@ -1234,7 +1252,6 @@ pub struct AppState {
     pub auto_collapsed: bool,
     pub database_service: Option<DatabaseService>,
     pub config: Option<Config>,
-    pub is_ai_responding: bool,
     pub debug_markdown_disabled: bool,
     pub tts_service: Option<TtsService>,
     tts_initing: bool,
@@ -1272,9 +1289,16 @@ pub struct AppState {
     pub login_password: String,
     pub coworkers: Vec<Coworker>,
     pub active_coworker_id: Option<String>,
-    pub bot_status: Option<String>,
-    /// Coworker whose turn owns `bot_status` / `is_ai_responding`.
-    responding_coworker_id: Option<String>,
+    /// What each thread's turn is doing, by the thread it belongs to.
+    ///
+    /// Keyed the way `live_turns` is, and for the same reason. This was one label and one
+    /// owner's name for the whole app, which held while only one bot could be working: the
+    /// second turn to start took the field from the first, so the first bot's working line went
+    /// dark while its run was still going, and — worse — its own frames were then dropped for
+    /// not matching the owner the app thought was responding. A turn now survives switching away
+    /// from it, so leaving one bot running while starting another is the ordinary thing to do,
+    /// and a thread's line has to be the thread's own.
+    thread_activity: HashMap<String, ThreadActivity>,
     pub model_catalogue: ModelCatalogue,
     pub right_pane: RightPane,
     pub computer_view: ComputerView,
@@ -1571,7 +1595,6 @@ impl AppState {
             auto_collapsed: false,
             database_service: None,
             config: None,
-            is_ai_responding: false,
             debug_markdown_disabled: false,
             tts_service: None,
             tts_initing: false,
@@ -1590,8 +1613,7 @@ impl AppState {
             login_password: String::new(),
             coworkers: Vec::new(),
             active_coworker_id: None,
-            bot_status: None,
-            responding_coworker_id: None,
+            thread_activity: HashMap::new(),
             model_catalogue: ModelCatalogue::default(),
             right_pane: RightPane::Closed,
             computer_view: ComputerView::Overview,
@@ -1723,12 +1745,20 @@ impl AppState {
         self.auth_status == AuthStatus::SignedIn && self.account.is_some()
     }
 
+    /// The working line under the open thread, which is that thread's own or nothing.
+    ///
+    /// Nothing else can put a line here: the label is looked up by the thread it belongs to, so
+    /// a bot working next door has no way to reach this one's footer, and coming back to a
+    /// thread whose run never stopped finds the line exactly where it was left.
     pub fn visible_bot_status(&self) -> Option<String> {
-        visible_bot_status(
-            self.active_coworker_id.as_deref(),
-            self.responding_coworker_id.as_deref(),
-            self.bot_status.as_deref(),
-        )
+        self.thread_status(self.active_conversation_id.as_deref()?)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+    }
+
+    /// What one thread's turn is saying, whether or not that thread is the open one.
+    fn thread_status(&self, conversation_id: &str) -> Option<&str> {
+        self.thread_activity.get(conversation_id)?.label.as_deref()
     }
 
     /// The selected coworker's name, for copy that addresses it.
@@ -1741,25 +1771,61 @@ impl AppState {
     }
 
     pub fn is_active_bot_responding(&self) -> bool {
-        self.is_ai_responding
-            && self.active_coworker_id.is_some()
-            && self.active_coworker_id == self.responding_coworker_id
+        self.active_conversation_id
+            .as_deref()
+            .is_some_and(|id| self.is_thread_responding(id))
     }
 
-    fn begin_responding(&mut self, coworker_id: Option<&str>, status: &str) {
-        self.responding_coworker_id = coworker_id.map(str::to_string);
-        self.is_ai_responding = true;
-        self.bot_status = Some(status.to_string());
+    /// A turn of this thread's is under way, wherever the person happens to be looking.
+    fn is_thread_responding(&self, conversation_id: &str) -> bool {
+        self.thread_activity
+            .get(conversation_id)
+            .is_some_and(|activity| activity.responding)
     }
 
-    fn apply_turn_status(&mut self, coworker_id: Option<&str>, tick: ActivityTick) {
-        if coworker_id.is_some() && coworker_id != self.responding_coworker_id.as_deref() {
+    /// A turn has begun in this thread, and this is the first thing it has to say.
+    ///
+    /// Named by thread throughout — this one, `apply_turn_status` and `finish_responding` — so
+    /// that a run only ever writes into the line of the thread it belongs to. A run with no
+    /// thread to its name has nowhere to put a line and so says nothing: the only caller that
+    /// can hand one over is a card picked off the approvals queue for a thread the app never saw
+    /// start, and that run has no footer of its own to light up.
+    fn begin_responding(&mut self, conversation_id: Option<&str>, status: &str) {
+        let Some(conversation_id) = conversation_id else {
             return;
-        }
+        };
+        let activity = self
+            .thread_activity
+            .entry(conversation_id.to_string())
+            .or_default();
+        activity.responding = true;
+        activity.label = Some(status.to_string());
+    }
+
+    /// One frame's worth of news about a thread's turn.
+    ///
+    /// There is no owner to check any more. A frame belongs to the thread it names, and it is
+    /// written into that thread's line whatever any other thread is doing — which is the whole
+    /// of the fix: the check this used to make was against a single app-wide owner, so a second
+    /// bot starting a turn made every one of the first bot's frames look like somebody else's
+    /// and they were thrown away.
+    fn apply_turn_status(&mut self, conversation_id: Option<&str>, tick: ActivityTick) {
+        let Some(conversation_id) = conversation_id else {
+            return;
+        };
         match tick {
             ActivityTick::Keep => {}
-            ActivityTick::Clear => self.bot_status = None,
-            ActivityTick::Set(activity) => self.bot_status = Some(activity.label),
+            ActivityTick::Clear => {
+                if let Some(activity) = self.thread_activity.get_mut(conversation_id) {
+                    activity.label = None;
+                }
+            }
+            ActivityTick::Set(activity) => {
+                self.thread_activity
+                    .entry(conversation_id.to_string())
+                    .or_default()
+                    .label = Some(activity.label);
+            }
         }
     }
 
@@ -1830,19 +1896,25 @@ impl AppState {
             .map(|resolution| local_exec_outcome(bot, resolution, spec.place()))
     }
 
-    fn finish_responding(&mut self, coworker_id: Option<&str>, waiting_approval: bool) {
-        if coworker_id.is_some()
-            && self.responding_coworker_id.is_some()
-            && coworker_id != self.responding_coworker_id.as_deref()
-        {
+    /// This thread's turn is over, either for good or until somebody answers a card.
+    ///
+    /// Only this thread's. The guard that used to stand here — "is the ending's bot still the
+    /// one the app thinks is responding" — was an app-wide field's only defence against one
+    /// bot's ending clearing another's line, and it leaked both ways. Keyed by thread there is
+    /// nothing to guard: A's ending can no more reach B's line than B's frames can reach A's.
+    fn finish_responding(&mut self, conversation_id: Option<&str>, waiting_approval: bool) {
+        let Some(conversation_id) = conversation_id else {
             return;
-        }
-        self.is_ai_responding = false;
+        };
         if waiting_approval {
-            self.bot_status = Some("Waiting for approval".into());
+            let activity = self
+                .thread_activity
+                .entry(conversation_id.to_string())
+                .or_default();
+            activity.responding = false;
+            activity.label = Some(WAITING_APPROVAL_STATUS.to_string());
         } else {
-            self.bot_status = None;
-            self.responding_coworker_id = None;
+            self.thread_activity.remove(conversation_id);
         }
     }
 
@@ -1908,9 +1980,7 @@ impl AppState {
         self.coworkers.clear();
         self.last_active_at.clear();
         self.active_coworker_id = None;
-        self.bot_status = None;
-        self.responding_coworker_id = None;
-        self.is_ai_responding = false;
+        self.thread_activity.clear();
         self.is_app_settings_open = false;
         self.bot_finder_open = false;
         self.command_palette_open = false;
@@ -4253,12 +4323,6 @@ impl AppState {
         if missing.is_empty() {
             return;
         }
-        let coworker_id = self
-            .coworkers
-            .iter()
-            .find(|coworker| coworker.id == conversation_id)
-            .map(|coworker| coworker.id.clone())
-            .or_else(|| self.active_coworker_id.clone());
         for reply in missing {
             let Some(conversation) = self
                 .conversations
@@ -4277,17 +4341,11 @@ impl AppState {
                     LiveTurn {
                         run_id: reply.run_id.clone(),
                         message_id,
-                        coworker_id: coworker_id.clone(),
                         persisting: false,
                     },
                 );
-                self.begin_responding(coworker_id.as_deref(), "Working");
-                self.follow_run(
-                    reply.run_id.clone(),
-                    Some(conversation_id.to_string()),
-                    coworker_id.clone(),
-                    cx,
-                );
+                self.begin_responding(Some(conversation_id), "Working");
+                self.follow_run(reply.run_id.clone(), Some(conversation_id.to_string()), cx);
             } else {
                 self.persist_assistant_reply(
                     conversation_id,
@@ -4394,14 +4452,14 @@ impl AppState {
                 let activity = activity_from_replay(&replay.events).unwrap_or(BotActivity {
                     label: "Working".into(),
                 });
-                self.begin_responding(turn.coworker_id.as_deref(), &activity.label);
+                self.begin_responding(Some(conversation_id), &activity.label);
             }
             "awaiting-approval" => {
-                self.finish_responding(turn.coworker_id.as_deref(), true);
+                self.finish_responding(Some(conversation_id), true);
                 self.fill_open_approval_commands(cx);
             }
             "finished" => {
-                self.finish_responding(turn.coworker_id.as_deref(), false);
+                self.finish_responding(Some(conversation_id), false);
                 // Only when nobody has written this turn down yet. The live stream may have come
                 // back and settled it while the replay was in the air, and a turn saved twice is
                 // a thread that says everything twice.
@@ -4416,7 +4474,7 @@ impl AppState {
                 }
             }
             "failed" => {
-                self.finish_responding(turn.coworker_id.as_deref(), false);
+                self.finish_responding(Some(conversation_id), false);
                 self.release_live_turn(conversation_id, &turn.run_id);
             }
             _ => {}
@@ -4462,8 +4520,9 @@ impl AppState {
     /// Read off `live_turns`, which is the record of a turn being in flight and is kept per
     /// thread. That is what makes it worth trusting: it is still true of this thread after
     /// looking at another bot and coming back, and it is not disturbed by what some other bot is
-    /// doing meanwhile. `bot_status` cannot answer this — it is one label for the whole app, and
-    /// the second bot to start a turn takes it from the first.
+    /// doing meanwhile. The working line beside this button is now kept the same way — it was
+    /// once one label for the whole app, so the second bot to start a turn took it from the
+    /// first and the two indicators disagreed about the same fact.
     ///
     /// A turn whose outcome is decided and on its way to disk is not in flight. It stays
     /// registered until the write lands, because the thread is held out of reload for that long,
@@ -4620,14 +4679,13 @@ impl AppState {
             LiveTurn {
                 run_id: run_id.clone(),
                 message_id: reply_id.clone(),
-                coworker_id: coworker_id.clone(),
                 persisting: false,
             },
         );
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
-        self.begin_responding(coworker_id.as_deref(), "Thinking");
+        self.begin_responding(Some(&conversation_id), "Thinking");
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -4639,19 +4697,13 @@ impl AppState {
                         let _ = this.update(cx, |state, _| {
                             state.active_coworker_id = Some(id.clone());
                             state.coworkers = vec![hired];
-                            // The turn was registered before there was a coworker to register it
-                            // against, so the bot a replay puts the status line back on is named
-                            // now that one exists.
-                            if let Some(turn) = state.live_turns.get_mut(&conversation_id) {
-                                turn.coworker_id = Some(id.clone());
-                            }
                         });
                         Ok(id)
                     }
                     Err(error) => Err(error),
                 },
             };
-            let (result, waiting_approval, turn_id, deeds) = match coworker {
+            let (result, waiting_approval, deeds) = match coworker {
                 Ok(id) => {
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
@@ -4666,11 +4718,16 @@ impl AppState {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
                                     tick => {
-                                        let turn_id = id.clone();
                                         let _ = this.update(cx, |state, cx| {
-                                            let before = state.bot_status.clone();
-                                            state.apply_turn_status(Some(&turn_id), tick);
-                                            if state.bot_status != before {
+                                            // The frame is this thread's news, and it is written
+                                            // into this thread's line whoever else is working.
+                                            let before = state
+                                                .thread_status(&conversation_id)
+                                                .map(str::to_string);
+                                            state.apply_turn_status(Some(&conversation_id), tick);
+                                            if state.thread_status(&conversation_id)
+                                                != before.as_deref()
+                                            {
                                                 cx.notify();
                                             }
                                         });
@@ -4724,9 +4781,9 @@ impl AppState {
                         }
                         cx.notify();
                     });
-                    (result, waiting_approval, Some(id), deeds)
+                    (result, waiting_approval, deeds)
                 }
-                Err(error) => (Err(error), false, coworker_id.clone(), Vec::new()),
+                Err(error) => (Err(error), false, Vec::new()),
             };
             let _ = this.update(cx, |state, cx| {
                 // Something else has already decided what this turn came to: the person stopped
@@ -4825,14 +4882,14 @@ impl AppState {
                         .zip(open);
                     if let Some((resolution, spec)) = auto {
                         state.answer_approval(spec, resolution, cx);
-                        state.finish_responding(turn_id.as_deref(), false);
+                        state.finish_responding(Some(&conversation_id), false);
                     } else {
-                        state.finish_responding(turn_id.as_deref(), true);
+                        state.finish_responding(Some(&conversation_id), true);
                         state.fill_open_approval_commands(cx);
                         state.sync_pending_approvals(cx);
                     }
                 } else {
-                    state.finish_responding(turn_id.as_deref(), false);
+                    state.finish_responding(Some(&conversation_id), false);
                 }
                 // A failed run has already ended the last assistant row, with the server's
                 // sentence or with the note that the turn never left; `auth_error` is the
@@ -4980,7 +5037,7 @@ impl AppState {
         conversation_id: &str,
         turn: &LiveTurn,
     ) -> Option<(String, Vec<ChatPart>)> {
-        self.finish_responding(turn.coworker_id.as_deref(), false);
+        self.finish_responding(Some(conversation_id), false);
         let kept = self
             .conversations
             .iter_mut()
@@ -5118,12 +5175,15 @@ impl AppState {
                         state
                             .approval_decisions
                             .insert(spec.call_id.clone(), decision);
-                        let coworker_id = state.active_coworker_id.clone();
+                        // The thread the resumed run belongs to, which is not necessarily the
+                        // one being read: a card answered from the notification leaves the
+                        // person somewhere else entirely, and the working line belongs where the
+                        // work is.
                         if approved {
-                            state.begin_responding(coworker_id.as_deref(), "Running commands");
-                            state.follow_run(run_id.clone(), conversation_id, coworker_id, cx);
+                            state.begin_responding(conversation_id.as_deref(), "Running commands");
+                            state.follow_run(run_id.clone(), conversation_id, cx);
                         } else {
-                            state.finish_responding(coworker_id.as_deref(), false);
+                            state.finish_responding(conversation_id.as_deref(), false);
                         }
                     }
                     Err(error) => {
@@ -5153,7 +5213,6 @@ impl AppState {
         &mut self,
         run_id: String,
         conversation_id: Option<String>,
-        coworker_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -5249,16 +5308,16 @@ impl AppState {
                                 }
                                 match status.as_str() {
                                     "awaiting-approval" => {
-                                        state.finish_responding(coworker_id.as_deref(), true);
+                                        state.finish_responding(conversation_id.as_deref(), true);
                                     }
                                     "running" => {
                                         state.apply_turn_status(
-                                            coworker_id.as_deref(),
+                                            conversation_id.as_deref(),
                                             ActivityTick::Set(activity.clone()),
                                         );
                                     }
                                     "finished" => {
-                                        state.finish_responding(coworker_id.as_deref(), false);
+                                        state.finish_responding(conversation_id.as_deref(), false);
                                         if let Some(id) = conversation_id.as_ref() {
                                             state.persist_assistant_reply(
                                                 id,
@@ -5270,7 +5329,7 @@ impl AppState {
                                         }
                                     }
                                     "failed" => {
-                                        state.finish_responding(coworker_id.as_deref(), false);
+                                        state.finish_responding(conversation_id.as_deref(), false);
                                         if let Some(id) = conversation_id.as_ref() {
                                             state.release_live_turn(id, &run_id);
                                         }
@@ -5284,7 +5343,7 @@ impl AppState {
                             "finished" | "failed" => break,
                             "awaiting-approval" => {
                                 let _ = this.update(cx, |state, cx| {
-                                    state.finish_responding(coworker_id.as_deref(), true);
+                                    state.finish_responding(conversation_id.as_deref(), true);
                                     cx.notify();
                                 });
                                 break;
@@ -5297,8 +5356,15 @@ impl AppState {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
             let _ = this.update(cx, |state, cx| {
-                if !matches!(state.bot_status.as_deref(), Some("Waiting for approval")) {
-                    state.finish_responding(coworker_id.as_deref(), false);
+                // This thread's own line, not the app's: a poll that has run out of patience
+                // must not decide that some other bot's turn is over, and must not end this one
+                // while it is stopped at a card waiting for a person.
+                let waiting = conversation_id
+                    .as_deref()
+                    .and_then(|id| state.thread_status(id))
+                    == Some(WAITING_APPROVAL_STATUS);
+                if !waiting {
+                    state.finish_responding(conversation_id.as_deref(), false);
                 }
                 cx.notify();
             });
@@ -5382,7 +5448,10 @@ impl AppState {
     }
 
     fn sync_pending_approvals(&mut self, cx: &mut Context<Self>) {
-        if self.is_ai_responding {
+        // A card is only ever grafted onto the open thread, so it is the open thread's own turn
+        // that would paint one of its own — a bot working next door is no reason to leave this
+        // thread without the card it is waiting on.
+        if self.is_active_bot_responding() {
             return;
         }
         let Some(client) = self.opengrok.clone() else {
@@ -5406,12 +5475,14 @@ impl AppState {
                         None => needs_card.push(item),
                     }
                 }
-                if state.is_ai_responding {
-                    return;
-                }
                 let Some(thread_id) = thread_id.as_deref() else {
                     return;
                 };
+                // A turn may have started in this thread while the queue was in the air, and
+                // that turn will paint its own card.
+                if state.is_thread_responding(thread_id) {
+                    return;
+                }
                 let Some(item) = QueuedApproval::latest_for_thread(&needs_card, thread_id) else {
                     return;
                 };
@@ -5419,8 +5490,7 @@ impl AppState {
                     return;
                 }
                 state.attach_queued_approval(item.clone());
-                state.responding_coworker_id = Some(thread_id.to_string());
-                state.bot_status = Some("Waiting for approval".into());
+                state.finish_responding(Some(thread_id), true);
                 cx.notify();
             });
         })
@@ -5694,7 +5764,8 @@ impl AppState {
         }
 
         if self.has_open_approval(&conversation_id) {
-            self.bot_status = Some("Waiting for approval".into());
+            // The card is this thread's, and so is the line saying what it is waiting for.
+            self.finish_responding(Some(&conversation_id), true);
             cx.notify();
             return;
         }
@@ -6467,13 +6538,14 @@ mod tests {
 
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        ActiveRecipe, AppState, ChatMessage, ChatPart, Conversation, DatabaseService,
-        EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind, REPLY_QUOTE_CHARS,
-        RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE,
-        TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler, agui_messages,
-        apply_catalogue, apply_reload, graft_reply, is_status_line, is_tool_standin,
-        is_unsent_turn_note, missing_replies, reads_as_gateway_unreachable, reply_from_replay,
-        restored_parts, saved_parts, streaming_message_mut,
+        ActiveRecipe, ActivityTick, AppState, BotActivity, ChatMessage, ChatPart, Conversation,
+        DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
+        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE,
+        STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler,
+        WAITING_APPROVAL_STATUS, agui_messages, apply_catalogue, apply_reload, graft_reply,
+        is_status_line, is_tool_standin, is_unsent_turn_note, missing_replies,
+        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
+        streaming_message_mut,
     };
     use crate::opengrok::{Failure, ModelEntry, OpenGrokClient};
     use std::str::FromStr;
@@ -6917,7 +6989,6 @@ mod tests {
         LiveTurn {
             run_id: "run_1".to_string(),
             message_id: "m_live".to_string(),
-            coworker_id: Some("cw_1".to_string()),
             persisting: false,
         }
     }
@@ -7345,8 +7416,11 @@ mod tests {
             !state.is_turn_in_flight(),
             "the button is a send arrow again at once, not after the reply reaches the database"
         );
-        assert!(state.bot_status.is_none(), "and the working line is gone");
-        assert!(!state.is_ai_responding);
+        assert!(
+            state.visible_bot_status().is_none(),
+            "and the working line is gone"
+        );
+        assert!(!state.is_active_bot_responding());
     }
 
     /// A stop pressed before the coworker managed to say anything. There is nothing to write
@@ -7395,6 +7469,156 @@ mod tests {
                 .iter()
                 .any(|message| message.id == "m_live")
         );
+    }
+
+    // ---- A working line per thread ----------------------------------------------------------
+
+    /// Two threads, each with a turn in it, the way `send_opengrok_turn` leaves them: the run
+    /// registered against the thread and the thread's own working line lit.
+    fn two_bots_working() -> AppState {
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", Vec::new()));
+        state.conversations.push(thread("cw_2", Vec::new()));
+        state.active_conversation_id = Some("cw_1".to_string());
+        state.active_coworker_id = Some("cw_1".to_string());
+        state.live_turns.insert("cw_1".to_string(), in_flight());
+        state.begin_responding(Some("cw_1"), "Thinking");
+        // The second bot is started while the first is still going, which is the whole of the
+        // case: a turn now survives being switched away from, so leaving one running and asking
+        // another for something is the ordinary thing to do.
+        state.live_turns.insert("cw_2".to_string(), in_flight());
+        state.begin_responding(Some("cw_2"), "Running commands");
+        state
+    }
+
+    /// Reading another thread, as switching bots does.
+    fn open_thread(state: &mut AppState, id: &str) {
+        state.active_conversation_id = Some(id.to_string());
+        state.active_coworker_id = Some(id.to_string());
+    }
+
+    /// The label a person reads is the label of the thread they are reading. Starting a second
+    /// bot used to take the one field there was, so the first bot's line went dark while its run
+    /// was still going.
+    #[test]
+    fn two_turns_in_flight_each_keep_their_own_working_line() {
+        let mut state = two_bots_working();
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Thinking"),
+            "the open thread's line is still the open thread's own"
+        );
+        assert!(state.is_active_bot_responding());
+
+        open_thread(&mut state, "cw_2");
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Running commands"),
+            "and the other thread's line is the other thread's own"
+        );
+        assert!(state.is_active_bot_responding());
+    }
+
+    /// Coming back to a bot that never stopped working. Its line is where it was left, and the
+    /// bot next door is undisturbed by the visit.
+    ///
+    /// This is the sequence from the report: start a turn on one bot, start another on a second,
+    /// then go back. The line used to be gone on the way back, and putting it back — which is
+    /// what re-attaching to the run does — used to take it from the second bot.
+    #[test]
+    fn returning_to_a_running_thread_shows_that_threads_status_and_not_the_other_ones() {
+        let mut state = two_bots_working();
+        open_thread(&mut state, "cw_2");
+        open_thread(&mut state, "cw_1");
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Thinking"),
+            "the line is there the moment the thread is open again, not a round trip later"
+        );
+        assert!(
+            state.is_turn_in_flight(),
+            "and it agrees with the button beside it, which has always read the live turn"
+        );
+
+        // What re-attaching to the run does once the server says it is still going.
+        state.begin_responding(Some("cw_1"), "Working");
+        open_thread(&mut state, "cw_2");
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Running commands"),
+            "and the bot that was left running was never touched by the visit"
+        );
+    }
+
+    /// A frame belongs to the thread it came out of. It used to be checked against a single
+    /// app-wide owner, so every frame of the first bot's turn was thrown away from the moment a
+    /// second bot started one — the turn went on, and the app stopped hearing about it.
+    #[test]
+    fn a_frame_lands_on_its_own_thread_while_another_bot_is_working() {
+        let mut state = two_bots_working();
+        state.apply_turn_status(
+            Some("cw_1"),
+            ActivityTick::Set(BotActivity {
+                label: "Opening youtube.com".into(),
+            }),
+        );
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Opening youtube.com"),
+            "the frame was applied rather than discarded"
+        );
+
+        open_thread(&mut state, "cw_2");
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Running commands"),
+            "and it was not painted into the thread that happened to start a turn last"
+        );
+    }
+
+    /// One turn ending says nothing about the other. The clear used to be app-wide, so whichever
+    /// bot finished first put the light out on the one still working.
+    #[test]
+    fn ending_one_threads_turn_leaves_the_other_threads_line_alone() {
+        let mut state = two_bots_working();
+        state.finish_responding(Some("cw_1"), false);
+        assert_eq!(
+            state.visible_bot_status(),
+            None,
+            "the thread whose turn ended has no working line"
+        );
+        assert!(!state.is_active_bot_responding());
+
+        open_thread(&mut state, "cw_2");
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Running commands"),
+            "and the bot still working still says so"
+        );
+        assert!(state.is_active_bot_responding());
+    }
+
+    /// A turn that has stopped to ask for permission is waiting on a person rather than working,
+    /// and that is true of one thread at a time like everything else here.
+    #[test]
+    fn a_thread_waiting_for_an_answer_says_so_without_ending_the_other_turn() {
+        let mut state = two_bots_working();
+        state.finish_responding(Some("cw_1"), true);
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some(WAITING_APPROVAL_STATUS)
+        );
+        assert!(
+            !state.is_active_bot_responding(),
+            "nothing is running under it: the card is the person's to answer"
+        );
+
+        open_thread(&mut state, "cw_2");
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some("Running commands")
+        );
+        assert!(state.is_active_bot_responding());
     }
 
     // ---- Reaching the gateway, and the list that depends on it ------------------------------

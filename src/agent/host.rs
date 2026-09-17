@@ -513,10 +513,14 @@ pub struct NativeChatHost {
     login_email: String,
     login_password: String,
     last_assistant: String,
+    /// The open thread's working line, which is that thread's own: it is kept per thread, like
+    /// the live turn below, so a bot working next door cannot put a line here and cannot take
+    /// this one away.
     bot_status: Option<String>,
     /// The open thread has a turn in flight. It is what the composer's button is showing, and
-    /// it is a steadier answer to "is it still doing something" than `bot_status`: the live turn
-    /// is kept per thread, so it survives looking at another bot and coming back.
+    /// the two now answer the same question the same way — the button has always read the live
+    /// turn, which is kept per thread, and the line beside it was once one label for the whole
+    /// app.
     turn_in_flight: bool,
     agent_settings_open: bool,
     model_picker_open: bool,

@@ -15,22 +15,6 @@ pub enum ActivityTick {
     Clear,
 }
 
-/// The footer says "{name} is working" from `bot_status`. That label is
-/// per in-flight coworker — switching to another bot must not inherit it.
-pub fn visible_bot_status(
-    active_coworker_id: Option<&str>,
-    responding_coworker_id: Option<&str>,
-    bot_status: Option<&str>,
-) -> Option<String> {
-    if active_coworker_id.is_some() && active_coworker_id == responding_coworker_id {
-        bot_status
-            .filter(|label| !label.is_empty())
-            .map(str::to_string)
-    } else {
-        None
-    }
-}
-
 /// Per-call memory for the frames AG-UI splits: `TOOL_CALL_START` names the
 /// tool but has no arguments, `TOOL_CALL_ARGS` has arguments but no name.
 /// Fed every frame in order, each one labels correctly.
@@ -432,22 +416,6 @@ mod tests {
         let cut = short_command(&long);
         assert_eq!(cut.chars().count(), 49);
         assert!(cut.ends_with('…'));
-    }
-
-    #[test]
-    fn working_status_stays_on_the_bot_that_is_running() {
-        assert_eq!(
-            visible_bot_status(Some("cw_example"), Some("cw_example"), Some("Thinking")),
-            Some("Thinking".into())
-        );
-        assert_eq!(
-            visible_bot_status(Some("cw_new"), Some("cw_example"), Some("Thinking")),
-            None
-        );
-        assert_eq!(
-            visible_bot_status(Some("cw_new"), None, Some("Thinking")),
-            None
-        );
     }
 
     #[test]
