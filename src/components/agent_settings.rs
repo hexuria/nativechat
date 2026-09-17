@@ -187,10 +187,18 @@ impl AgentSettings {
         if self.saving {
             return;
         }
+        // The Model field is a field, so Save means it too. Picking from the list already
+        // patches the model on the spot; a route id typed by hand had nowhere to go, and a
+        // person who edits a box and presses the button beside it has said what they want just
+        // as plainly as one who picked from a list. Blank is the exception and is left out: an
+        // empty box is a field nobody filled, not an instruction to unpin the model, and a
+        // coworker with no route cannot answer at all.
+        let model = self.model_input.read(cx).value().trim().to_string();
         let patch = CoworkerPatch {
             name: Some(self.name_input.read(cx).value().to_string()),
             title: Some(self.label_input.read(cx).value().to_string()),
             role: Some(self.role_input.read(cx).value().to_string()),
+            model: (!model.is_empty()).then_some(model),
             ..Default::default()
         };
         self.saving = true;
