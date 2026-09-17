@@ -7,7 +7,10 @@ use crate::components::persona::PersonaMark;
 use crate::opengrok::{CoworkerPatch, ModelEntry};
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{
+    IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
+    TextareaState,
+};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Selectable, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -105,6 +108,16 @@ pub struct AgentSettings {
     label_input: Entity<InputState>,
     role_input: Entity<TextareaState>,
     model_input: Entity<InputState>,
+    /// The row Enter takes, counted over the routes the field's text leaves rather than over
+    /// the whole catalogue: what the arrows walk is what a person can see.
+    model_highlight: usize,
+    /// Whether the list was open at the last look. A highlight belongs to one opening of the
+    /// list, and an opening the pane did not ask for itself — the chevron's — is only ever
+    /// heard of here.
+    model_open: bool,
+    /// The list scrolls once there are more routes than fit, so a row walked onto has to be
+    /// brought into view; a highlight below the fold is a highlight nobody can see.
+    model_scroll: ScrollHandle,
     synced_id: Option<String>,
     /// The profile is with the server. The Save button is out of the person's hands until the
     /// answer comes back, whichever way it goes.
@@ -132,13 +145,50 @@ impl AgentSettings {
             state
         });
         let model_input = cx.new(|cx| InputState::new(window, cx).placeholder("xai/grok-4.6@sub"));
-        cx.observe(&state, |_this, _, cx| cx.notify()).detach();
+        cx.observe(&state, |this, state, cx| {
+            // The chevron opens the list through the app's state, so the pane learns of that
+            // opening here or not at all. Every opening starts on the first match: the row the
+            // arrows were left on last time belongs to a list that is no longer up.
+            let open = state.read(cx).model_picker_open;
+            if open && !this.model_open {
+                this.reset_model_highlight();
+            }
+            this.model_open = open;
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe_in(
+            &model_input,
+            window,
+            |this, _input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    // What is typed in the field is the filter, so typing opens the list too:
+                    // someone typing a route is choosing one, and the routes that answer to
+                    // what they have typed are no use behind a shut list. Only a person's own
+                    // edit arrives here — `set_value` says nothing — so taking a route does not
+                    // reopen the list that taking it just closed.
+                    this.reset_model_highlight();
+                    this.state.update(cx, |state, cx| {
+                        state.set_model_picker_open(true, cx);
+                    });
+                    cx.notify();
+                }
+                // Enter takes the row the highlight is on, which is the whole point of a list
+                // that is walked from the field above it.
+                InputEvent::PressEnter { .. } => this.take_highlighted_model(window, cx),
+                _ => {}
+            },
+        )
+        .detach();
         Self {
             state,
             name_input,
             label_input,
             role_input,
             model_input,
+            model_highlight: FIRST_MATCH,
+            model_open: false,
+            model_scroll: ScrollHandle::new(),
             synced_id: None,
             saving: false,
             usage_open: false,
@@ -177,6 +227,47 @@ impl AgentSettings {
         self.model_input.update(cx, |input, cx| {
             input.set_value(coworker.model.clone(), window, cx);
         });
+    }
+
+    /// The routes the field's text leaves, in the catalogue's order.
+    fn model_matches(&self, cx: &App) -> Vec<String> {
+        let query = self.model_input.read(cx).value().to_string();
+        matching_models(&self.state.read(cx).model_catalogue.models, &query)
+    }
+
+    fn reset_model_highlight(&mut self) {
+        self.model_highlight = FIRST_MATCH;
+        self.model_scroll.scroll_to_item(FIRST_MATCH);
+    }
+
+    /// Step the highlight, and claim the keystroke while the list is open: these keys belong to
+    /// the list for as long as it is up. Shut, the keystroke is left to whoever else wants it,
+    /// which is what keeps Tab moving the focus out of a field with no list under it.
+    fn step_model_highlight(&mut self, down: bool, cx: &mut Context<Self>) {
+        if !self.state.read(cx).model_picker_open {
+            return;
+        }
+        cx.stop_propagation();
+        let len = self.model_matches(cx).len();
+        self.model_highlight = stepped_highlight(self.model_highlight, len, down);
+        self.model_scroll.scroll_to_item(self.model_highlight);
+        cx.notify();
+    }
+
+    /// Take the highlighted route, by the same road a click on that row takes.
+    fn take_highlighted_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.read(cx).model_picker_open {
+            return;
+        }
+        let query = self.model_input.read(cx).value().to_string();
+        let catalogue = self.state.read(cx).model_catalogue.models.clone();
+        // Nothing matched what was typed, so there is nothing for Enter to take and the text
+        // stands as it is: it may well be a route this catalogue has not heard of, and Save
+        // sends what the field holds either way.
+        let Some(id) = highlighted_model(&catalogue, &query, self.model_highlight) else {
+            return;
+        };
+        take_model(&self.state, &self.model_input, id, window, cx);
     }
 
     fn commit_profile(&mut self, cx: &mut Context<Self>) {
@@ -344,6 +435,12 @@ impl Render for AgentSettings {
             )
         };
         let model_focus = self.model_input.read(cx).focus_handle(cx);
+        // The list is what the field's text leaves of the catalogue, and the row Enter takes is
+        // counted over that rather than over the catalogue behind it.
+        let model_query = self.model_input.read(cx).value().trim().to_string();
+        let model_matches = matching_models(&catalogue, &model_query);
+        let model_highlight = self.model_highlight;
+        let model_scroll = self.model_scroll.clone();
         let saving = self.saving;
         let usage_open = self.usage_open;
         let auto_review_open = self.auto_review_open;
@@ -488,31 +585,26 @@ impl Render for AgentSettings {
                                                                     div()
                                                                         .text_xs()
                                                                         .text_color(muted)
-                                                                        .child("Get notified when this agent finishes or needs input"),
+                                                                        .child("Get notified when this agent finishes or needs input. There is nowhere to keep this yet, so the switch does nothing."),
                                                                 ),
                                                         )
+                                                        // The switch shows what the roster says
+                                                        // and takes no orders. Nothing stores
+                                                        // this: the two handlers that mention it
+                                                        // answer a fixed yes, and the patch route
+                                                        // does not read the key at all, so a flip
+                                                        // was thrown away in silence — and once
+                                                        // that route refuses a patch with nothing
+                                                        // in it to change, the same flip would
+                                                        // come back as an error in the row below.
+                                                        // It stays on show, dimmed, because the
+                                                        // setting is a real one waiting on
+                                                        // somewhere to live, and the line beside
+                                                        // it says as much.
                                                         .child(
                                                             div()
                                                                 .id("agent-notify-switch")
-                                                                .cursor_pointer()
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    {
-                                                                        let app = app.clone();
-                                                                        move |_, _, cx| {
-                                                                            app.update(cx, |state, cx| {
-                                                                                let next = !notify;
-                                                                                state.patch_active_agent(
-                                                                                    CoworkerPatch {
-                                                                                        notify_on_updates: Some(next),
-                                                                                        ..Default::default()
-                                                                                    },
-                                                                                    cx,
-                                                                                );
-                                                                            });
-                                                                        }
-                                                                    },
-                                                                )
+                                                                .opacity(0.5)
                                                                 .child(notify_switch(notify)),
                                                         ),
                                                 ),
@@ -534,6 +626,37 @@ impl Render for AgentSettings {
                                                             state.set_model_picker_open(false, cx);
                                                         });
                                                     }
+                                                },
+                                            ))
+                                            // The field binds the arrows and Tab to actions of
+                                            // its own, and actions are dispatched before any key
+                                            // listener, so the capture phase — which runs from
+                                            // the outside in — is the only place this row can
+                                            // take them before the field does.
+                                            .capture_action(cx.listener(
+                                                |this, _: &MoveUp, _, cx| {
+                                                    this.step_model_highlight(false, cx);
+                                                },
+                                            ))
+                                            .capture_action(cx.listener(
+                                                |this, _: &MoveDown, _, cx| {
+                                                    this.step_model_highlight(true, cx);
+                                                },
+                                            ))
+                                            // Tab is Down and Shift-Tab is Up: someone tabbing
+                                            // with a list of choices in front of them means the
+                                            // choices. The field binds the two to indent and
+                                            // outdent, which a one-line field has no use for, so
+                                            // stopping there is what keeps Tab from moving the
+                                            // focus out of the field while the list is up.
+                                            .capture_action(cx.listener(
+                                                |this, _: &IndentInline, _, cx| {
+                                                    this.step_model_highlight(true, cx);
+                                                },
+                                            ))
+                                            .capture_action(cx.listener(
+                                                |this, _: &OutdentInline, _, cx| {
+                                                    this.step_model_highlight(false, cx);
                                                 },
                                             ))
                                             .child(
@@ -573,14 +696,20 @@ impl Render for AgentSettings {
                                                         let app = app.clone();
                                                         let theme = theme.clone();
                                                         let model = model.clone();
-                                                        let catalogue = catalogue.clone();
                                                         let field = self.model_input.clone();
+                                                        let matches = model_matches.clone();
+                                                        let query = model_query.clone();
                                                         move |_, _, _| {
                                                             model_picker_panel(
                                                                 app.clone(),
                                                                 field.clone(),
-                                                                catalogue.clone(),
-                                                                model.clone(),
+                                                                ModelPicker {
+                                                                    matches: matches.clone(),
+                                                                    query: query.clone(),
+                                                                    highlight: model_highlight,
+                                                                    current: model.clone(),
+                                                                },
+                                                                model_scroll.clone(),
                                                                 dark,
                                                                 theme.clone(),
                                                             )
@@ -895,20 +1024,110 @@ fn avatar_editor_panel(
         )
 }
 
+/// The row the highlight goes back to whenever the filter changes or the list opens: the first
+/// of the matches. The row the arrows were left on stands for something else once the list under
+/// it has changed, and the top of a list is where a person who has just typed is looking.
+const FIRST_MATCH: usize = 0;
+
+/// The routes a typed query leaves, in the order the catalogue gives them.
+///
+/// The match is a case-insensitive run of the route id anywhere in it rather than a prefix: a
+/// route id is read as who serves it and what it is — `oag/cheap` — and someone who remembers
+/// only the second half would be shown nothing at all by a prefix. An empty field is no filter,
+/// so it lists everything on offer.
+fn matching_models(catalogue: &[ModelEntry], query: &str) -> Vec<String> {
+    let needle = query.trim().to_lowercase();
+    catalogue
+        .iter()
+        .filter(|entry| needle.is_empty() || entry.id.to_lowercase().contains(&needle))
+        .map(|entry| entry.id.clone())
+        .collect()
+}
+
+/// The route Enter takes: the highlighted row of what the field's text leaves, and nothing at
+/// all when nothing matches.
+fn highlighted_model(catalogue: &[ModelEntry], query: &str, row: usize) -> Option<String> {
+    matching_models(catalogue, query).into_iter().nth(row)
+}
+
+/// Where the highlight lands when it is stepped one row.
+///
+/// It goes round the list rather than stopping at the ends. Tab walks a set of choices in a
+/// circle everywhere else it is used, and the ⌘K palette — this app's other list walked from a
+/// field — goes round too; Tab wrapping while the arrows stopped would be two rules for one
+/// list. Both keys step through here, so the two cannot drift apart.
+fn stepped_highlight(row: usize, len: usize, down: bool) -> usize {
+    if len == 0 {
+        return FIRST_MATCH;
+    }
+    if down {
+        (row + 1) % len
+    } else {
+        (row + len - 1) % len
+    }
+}
+
+/// Take a route: the id lands in the field as text, the list shuts and the coworker is patched.
+///
+/// The field is a field, so a pick has to land in it as text. Nothing else puts the roster's
+/// model back into the field while the same agent stays open. A click on a row and Enter on the
+/// highlighted one are the same act, so they come through here rather than doing the same three
+/// things twice.
+fn take_model(
+    app: &Entity<AppState>,
+    field: &Entity<InputState>,
+    id: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    field.update(cx, |input, cx| {
+        input.set_value(id.clone(), window, cx);
+    });
+    app.update(cx, |state, cx| {
+        state.set_model_picker_open(false, cx);
+        state.patch_active_agent(
+            CoworkerPatch {
+                model: Some(id),
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+}
+
+/// What the list needs to draw itself: the routes the field's text leaves, that text for when it
+/// leaves none, the row Enter would take, and the route the coworker is on now.
+struct ModelPicker {
+    matches: Vec<String>,
+    query: String,
+    highlight: usize,
+    current: String,
+}
+
 fn model_picker_panel(
     app: Entity<AppState>,
     field: Entity<InputState>,
-    catalogue: Vec<ModelEntry>,
-    current: String,
+    picker: ModelPicker,
+    scroll: ScrollHandle,
     dark: bool,
     theme: gpui_kit::component::Theme,
 ) -> impl IntoElement {
     let list_bg = if dark { rgb(0x1c1c1c) } else { rgb(0xffffff) };
+    let ModelPicker {
+        matches,
+        query,
+        highlight,
+        current,
+    } = picker;
+    let muted = theme.muted_foreground;
+    let tick = theme.primary;
+    let nothing_matches = matches.is_empty();
     v_flex()
         .id("agent-model-list")
         .w(px(PANE_INNER))
         .max_h(px(262.))
         .overflow_y_scroll()
+        .track_scroll(&scroll)
         .p(px(4.))
         .rounded(px(10.))
         .border_1()
@@ -920,43 +1139,55 @@ fn model_picker_panel(
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
-        .children(catalogue.into_iter().map(move |m| {
-            let mid = m.id;
+        .children(matches.into_iter().enumerate().map(move |(row, mid)| {
             let selected = mid == current;
             let app = app.clone();
             let field = field.clone();
             div()
                 .id(SharedString::from(format!("model-{mid}")))
+                .flex()
+                .items_center()
+                .gap(px(6.))
                 .px(px(8.))
                 .py(px(5.))
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(selected, |this| this.bg(rgb(0x777777).opacity(0.16)))
-                .hover(|s| s.bg(rgb(0x777777).opacity(0.16)))
+                // Two different things, told apart two different ways: the filled row is what
+                // Enter would take, the ticked one is what the coworker is already on. One fill
+                // for both left a person unable to read what they have off what they are about
+                // to get.
+                .when(row == highlight, |this| {
+                    this.bg(rgb(0x777777).opacity(0.22))
+                })
+                .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
                 .on_mouse_down(MouseButton::Left, {
                     let mid = mid.clone();
-                    let field = field.clone();
-                    move |_, window, cx| {
-                        // The field is a field, so a pick has to land in it as text. Nothing
-                        // else puts the roster's model back into the field while the same
-                        // agent stays open.
-                        field.update(cx, |input, cx| {
-                            input.set_value(mid.clone(), window, cx);
-                        });
-                        app.update(cx, |state, cx| {
-                            state.set_model_picker_open(false, cx);
-                            state.patch_active_agent(
-                                CoworkerPatch {
-                                    model: Some(mid.clone()),
-                                    ..Default::default()
-                                },
-                                cx,
-                            );
-                        });
-                    }
+                    move |_, window, cx| take_model(&app, &field, mid.clone(), window, cx)
                 })
-                .child(div().text_sm().child(mid))
+                .child(div().flex_1().min_w(px(0.)).text_sm().truncate().child(mid))
+                .when(selected, |this| {
+                    this.child(
+                        Icon::new(IconName::Check)
+                            .size(px(13.))
+                            .flex_shrink_0()
+                            .text_color(tick),
+                    )
+                })
         }))
+        // An empty box says nothing about why it is empty, and the answer is always the same
+        // one: what was typed. The row names it and cannot be picked — there is no route behind
+        // it to pick.
+        .when(nothing_matches, |this| {
+            this.child(
+                div()
+                    .id("agent-model-empty")
+                    .px(px(8.))
+                    .py(px(6.))
+                    .text_sm()
+                    .text_color(muted)
+                    .child(format!("No route matches {query}")),
+            )
+        })
 }
 
 impl AgentSettings {
@@ -1004,5 +1235,130 @@ impl AgentSettings {
                         }),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over the
+    // one the test harness wants.
+    use super::{FIRST_MATCH, highlighted_model, matching_models, stepped_highlight};
+    use crate::opengrok::ModelEntry;
+
+    fn catalogue() -> Vec<ModelEntry> {
+        [
+            "oag/cheap",
+            "xai/grok-4.6@sub",
+            "OAG/Fast",
+            "anthropic/opus",
+        ]
+        .into_iter()
+        .map(|id| ModelEntry { id: id.into() })
+        .collect()
+    }
+
+    #[test]
+    fn the_filter_reads_any_run_of_a_route_id_in_any_case() {
+        let catalogue = catalogue();
+        assert_eq!(
+            matching_models(&catalogue, "oag"),
+            vec!["oag/cheap", "OAG/Fast"]
+        );
+        assert_eq!(
+            matching_models(&catalogue, "OAG"),
+            vec!["oag/cheap", "OAG/Fast"],
+            "nobody types a route id in the case the catalogue keeps it in"
+        );
+        assert_eq!(
+            matching_models(&catalogue, "grok"),
+            vec!["xai/grok-4.6@sub"],
+            "a route is looked for by the part of it a person remembers, which is rarely its start"
+        );
+        assert_eq!(
+            matching_models(&catalogue, "4.6@sub"),
+            vec!["xai/grok-4.6@sub"]
+        );
+    }
+
+    #[test]
+    fn an_empty_field_is_no_filter_at_all() {
+        let catalogue = catalogue();
+        assert_eq!(
+            matching_models(&catalogue, ""),
+            vec![
+                "oag/cheap",
+                "xai/grok-4.6@sub",
+                "OAG/Fast",
+                "anthropic/opus"
+            ],
+            "everything on offer, in the order the catalogue gives it"
+        );
+        assert_eq!(
+            matching_models(&catalogue, "   "),
+            matching_models(&catalogue, ""),
+            "a space is not something a route id is looked for by"
+        );
+    }
+
+    #[test]
+    fn a_query_no_route_answers_to_leaves_nothing() {
+        let catalogue = catalogue();
+        assert!(matching_models(&catalogue, "not showing the options").is_empty());
+        assert_eq!(
+            highlighted_model(&catalogue, "not showing the options", FIRST_MATCH),
+            None,
+            "Enter has nothing to take, so what was typed stands"
+        );
+    }
+
+    #[test]
+    fn the_highlight_goes_round_the_list_rather_than_stopping_at_its_ends() {
+        // Four rows. Up from the first is the last and down from the last is the first, and it
+        // is the same rule whether the key was an arrow or Tab: both step through here.
+        assert_eq!(stepped_highlight(0, 4, false), 3);
+        assert_eq!(stepped_highlight(3, 4, true), 0);
+        assert_eq!(stepped_highlight(1, 4, true), 2);
+        assert_eq!(stepped_highlight(1, 4, false), 0);
+        // A step each way is where it started, from every row and from either end.
+        for row in 0..4 {
+            assert_eq!(
+                stepped_highlight(stepped_highlight(row, 4, true), 4, false),
+                row
+            );
+            assert_eq!(
+                stepped_highlight(stepped_highlight(row, 4, false), 4, true),
+                row
+            );
+        }
+        assert_eq!(
+            stepped_highlight(0, 0, true),
+            FIRST_MATCH,
+            "with no rows to walk there is nowhere to walk to"
+        );
+    }
+
+    #[test]
+    fn the_highlight_lands_on_the_first_match_whenever_the_filter_changes() {
+        let catalogue = catalogue();
+        // A row means something else once the list under it has changed: row 1 of everything is
+        // the grok route, and row 1 of what "oag" leaves is another route altogether.
+        assert_eq!(
+            highlighted_model(&catalogue, "", 1).unwrap(),
+            "xai/grok-4.6@sub"
+        );
+        assert_eq!(highlighted_model(&catalogue, "oag", 1).unwrap(), "OAG/Fast");
+        // Which is why every change to the filter puts the highlight back to the first match,
+        // and the first match is the first of the matches rather than of the catalogue.
+        for query in ["", "oag", "fast", "anthropic"] {
+            assert_eq!(
+                highlighted_model(&catalogue, query, FIRST_MATCH),
+                matching_models(&catalogue, query).first().cloned()
+            );
+        }
+        assert_eq!(
+            highlighted_model(&catalogue, "fast", FIRST_MATCH).unwrap(),
+            "OAG/Fast"
+        );
     }
 }
