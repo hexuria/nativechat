@@ -45,6 +45,10 @@ pub struct ComposerPanelRow {
     /// A row that says something rather than offering it. It is dimmed, the arrow keys step
     /// over it, and Enter never lands on it.
     pub selectable: bool,
+    /// A row the search never hides. It is for a panel whose field is the answer rather than a
+    /// search over answers — the line telling someone to type a value would vanish the moment
+    /// they started typing one, which is exactly when it is being read.
+    pub always: bool,
     /// The element id this row answers to, when the caller wants one of its own. Rows are
     /// `composer-panel-row-<id>` by default, which is what a list built from data wants; a row
     /// that is a fixed control of the composer, like Attach files, is named by the composer.
@@ -66,6 +70,7 @@ impl ComposerPanelRow {
             label: None,
             shortcut: None,
             selectable: true,
+            always: false,
             element_id: None,
         }
     }
@@ -91,8 +96,15 @@ impl ComposerPanelRow {
         self
     }
 
+    /// Keep this row through any search.
+    pub fn always(mut self) -> Self {
+        self.always = true;
+        self
+    }
+
     fn matches(&self, needle: &str) -> bool {
         needle.is_empty()
+            || self.always
             || self.title.to_lowercase().contains(needle)
             || self.description.to_lowercase().contains(needle)
     }
@@ -103,6 +115,10 @@ impl ComposerPanelRow {
 #[derive(Debug, Clone)]
 pub enum ComposerPanelEvent {
     Selected(SharedString),
+    /// Enter with no row to take, carrying what was typed. A panel that lists things ignores
+    /// this — there was simply nothing matching — and a panel whose field is the answer, such
+    /// as the one a recipe parameter's value is typed into, takes it as the answer.
+    Submitted(SharedString),
     /// Escape, or a click outside. `at` is where that click went down, which is `None` for
     /// Escape: a click outside shuts the panel in the capture phase, before the click a person
     /// meant by it is dispatched at all, so without knowing where it was the click on the "+"
@@ -192,6 +208,16 @@ impl ComposerPanel {
         let query = self.search.read(cx).value().to_string();
         self.apply_filter(&query);
         cx.notify();
+    }
+
+    /// Change the line under the list without disturbing what is typed above it, so a value the
+    /// panel would not take can be answered where it was typed rather than after a reopen.
+    pub fn set_hint(&mut self, hint: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let hint = hint.into();
+        if self.hint != hint {
+            self.hint = hint;
+            cx.notify();
+        }
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
@@ -288,6 +314,10 @@ impl ComposerPanel {
             .and_then(|position| self.row_at(position))
             .filter(|row| row.selectable)
         else {
+            let typed = self.search.read(cx).value().trim().to_string();
+            if !typed.is_empty() {
+                cx.emit(ComposerPanelEvent::Submitted(typed.into()));
+            }
             return;
         };
         let id = row.id.clone();

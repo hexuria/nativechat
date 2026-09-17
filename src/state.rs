@@ -9,10 +9,10 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, FormSpec, LocalExecMode, LocalExecResolution,
     ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, ToolCallTracker,
-    TurnAssembler, activity_from_replay, command_from_args, command_from_replay_events,
-    deeds_from_replay, enrol_this_machine, local_exec_outcome, policy_answer, serve_local_exec,
-    stored_machine_id, tool_standin, visible_bot_status,
+    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
+    ToolCallTracker, TurnAssembler, TurnRecipe, activity_from_replay, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
+    policy_answer, serve_local_exec, stored_machine_id, tool_standin, visible_bot_status,
 };
 use crate::services::database::{DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
@@ -825,6 +825,10 @@ pub struct AppState {
     /// The composer's "+" picker: what it can offer, what is picked, and what each entry is.
     /// Tools named for the next message. They show as chips beside the composer's "+".
     pub picked_tools: Vec<PickedTool>,
+    /// The recipe the next message runs, once one has been picked with `/`. While it is set the
+    /// composer is in recipe mode: `@` offers this recipe's parameters instead of the bot's
+    /// tools, because a turn that is already a recipe run has no use for a tool roster.
+    pub active_recipe: Option<ActiveRecipe>,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -1005,6 +1009,88 @@ impl PickedKind {
     }
 }
 
+/// The recipe the next message runs, picked with `/` in the composer.
+///
+/// The parameters are the copy the recipe carried when it was picked rather than a look-up by
+/// id later: the recipe list is refetched and refiltered under the draft, and a draft that lost
+/// what it needs because a list was narrowed elsewhere would be a mystery to whoever typed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveRecipe {
+    pub id: String,
+    pub name: String,
+    pub parameters: Vec<RecipeParameter>,
+    /// What each parameter was filled in with, by name, as the person typed it. A parameter
+    /// with no entry here is unfilled.
+    pub values: HashMap<String, String>,
+}
+
+impl ActiveRecipe {
+    /// A recipe put on the draft, with every declared default already standing in its field.
+    /// The run would use those defaults anyway, and a field showing what will be used is worth
+    /// more than an empty one that quietly means the same.
+    pub fn from_summary(recipe: &RecipeSummary) -> Self {
+        let values = recipe
+            .parameters
+            .iter()
+            .filter_map(|parameter| {
+                let default = parameter.default.clone()?;
+                (!default.is_empty()).then(|| (parameter.name.clone(), default))
+            })
+            .collect();
+        Self {
+            id: recipe.id.clone(),
+            name: if recipe.name.trim().is_empty() {
+                "Untitled recipe".to_string()
+            } else {
+                recipe.name.trim().to_string()
+            },
+            parameters: recipe.parameters.clone(),
+            values,
+        }
+    }
+
+    pub fn value(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+
+    /// Fill a parameter in, or take its value away. Blank is not a value, so it clears too.
+    pub fn set_value(&mut self, name: &str, value: Option<String>) {
+        match value.map(|value| value.trim().to_string()) {
+            Some(value) if !value.is_empty() => {
+                self.values.insert(name.to_string(), value);
+            }
+            _ => {
+                self.values.remove(name);
+            }
+        }
+    }
+
+    /// The required parameters nobody has filled in, in the order they were declared. Nothing
+    /// can be sent while this is not empty.
+    pub fn missing(&self) -> Vec<&str> {
+        self.parameters
+            .iter()
+            .filter(|parameter| parameter.required && self.value(&parameter.name).is_none())
+            .map(|parameter| parameter.name.as_str())
+            .collect()
+    }
+
+    /// What goes in the turn's `forwardedProps`: the recipe's id, and each filled-in value as
+    /// the kind its declaration named.
+    pub fn turn(&self) -> TurnRecipe {
+        let mut values = serde_json::Map::new();
+        for parameter in &self.parameters {
+            if let Some(text) = self.value(&parameter.name) {
+                values.insert(parameter.name.clone(), parameter.encode(text));
+            }
+        }
+        TurnRecipe {
+            id: self.id.clone(),
+            values,
+        }
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -1027,6 +1113,7 @@ impl AppState {
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
             picked_tools: Vec::new(),
+            active_recipe: None,
             is_app_settings_open: false,
             bot_finder_open: false,
             command_palette_open: false,
@@ -2566,6 +2653,34 @@ impl AppState {
             .collect()
     }
 
+    /// Put a recipe on the next message, from the list the composer picked it out of. An id
+    /// that is not a recipe — the example skill's — leaves the draft as it was, and says so, so
+    /// the composer knows whether it has a recipe to show.
+    pub fn start_recipe(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(recipe) = self.recipes.iter().find(|recipe| recipe.id == id) else {
+            return false;
+        };
+        self.active_recipe = Some(ActiveRecipe::from_summary(recipe));
+        cx.notify();
+        true
+    }
+
+    /// Take the recipe back off the draft.
+    pub fn clear_active_recipe(&mut self, cx: &mut Context<Self>) {
+        if self.active_recipe.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Fill one of the active recipe's parameters in, or take its value away.
+    pub fn set_recipe_value(&mut self, name: &str, value: Option<String>, cx: &mut Context<Self>) {
+        let Some(recipe) = self.active_recipe.as_mut() else {
+            return;
+        };
+        recipe.set_value(name, value);
+        cx.notify();
+    }
+
     pub fn close_emoji_picker(&mut self, cx: &mut Context<Self>) {
         if self.emoji_picker.take().is_some() {
             cx.notify();
@@ -3483,6 +3598,9 @@ impl AppState {
             return;
         };
         let coworker_id = self.active_coworker_id.clone();
+        // The recipe as it stands now, not when the turn reaches the wire: the composer clears
+        // the draft the moment it is sent, and the turn should carry what was on the message.
+        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
         let history: Vec<AguiMessage> = self
             .conversations
             .iter()
@@ -3533,7 +3651,7 @@ impl AppState {
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let result = client
-                        .run_turn(&id, &conversation_id, &history, |event| {
+                        .run_turn(&id, &conversation_id, &history, recipe.as_ref(), |event| {
                             match tracker.tick(event) {
                                 ActivityTick::Keep => {}
                                 tick => {
@@ -4743,10 +4861,58 @@ mod tests {
         assert_eq!(PickedKind::of("run_recipe"), PickedKind::Tool);
         assert_eq!(PickedKind::of("gmail.api.send"), PickedKind::App);
     }
+    /// The values a turn carries are typed as the declaration said they would be, because that
+    /// is what the server validates them against — a number sent as the word "5" is a number
+    /// the server has every right to refuse.
+    #[test]
+    fn a_recipe_on_the_draft_sends_each_value_as_the_kind_it_was_declared() {
+        let recipe: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_1",
+            "name": "youtube",
+            "parameters": [
+                { "name": "search_term", "required": true, "kind": "text" },
+                { "name": "count", "required": false, "kind": "number", "default": 5 },
+                { "name": "shorts", "required": false, "kind": "boolean" },
+                { "name": "lang", "required": false, "kind": "text", "values": ["en", "es"] }
+            ]
+        }))
+        .unwrap();
+        let mut active = ActiveRecipe::from_summary(&recipe);
+        assert_eq!(
+            active.value("count"),
+            Some("5"),
+            "a declared default is what the run would use, so the field shows it standing there"
+        );
+        assert_eq!(active.missing(), vec!["search_term"]);
+
+        active.set_value("search_term", Some("mundo".to_string()));
+        active.set_value("shorts", Some("yes".to_string()));
+        active.set_value("lang", Some("ES".to_string()));
+        assert!(active.missing().is_empty());
+
+        let turn = active.turn();
+        assert_eq!(turn.id, "rcp_1");
+        assert_eq!(
+            serde_json::Value::Object(turn.values),
+            serde_json::json!({
+                "search_term": "mundo",
+                "count": 5,
+                "shorts": true,
+                "lang": "es"
+            })
+        );
+
+        // Blank is not a value: it leaves the parameter unfilled, and out of the turn.
+        active.set_value("search_term", Some("   ".to_string()));
+        assert_eq!(active.missing(), vec!["search_term"]);
+        assert!(!active.turn().values.contains_key("search_term"));
+    }
+
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        ChatPart, DatabaseService, EMPTY_TURN_NOTE, Message, PickedKind, REPLY_QUOTE_CHARS,
-        agui_messages, is_status_line, is_tool_standin, restored_parts, saved_parts,
+        ActiveRecipe, ChatPart, DatabaseService, EMPTY_TURN_NOTE, Message, PickedKind,
+        REPLY_QUOTE_CHARS, RecipeSummary, agui_messages, is_status_line, is_tool_standin,
+        restored_parts, saved_parts,
     };
     use std::str::FromStr;
     use std::sync::Arc;

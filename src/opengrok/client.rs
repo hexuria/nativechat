@@ -402,22 +402,31 @@ impl OpenGrokClient {
 
     /// One turn. Desktop Grok Bot POSTs `/api/sendPrompt` then paints from `GET /events`.
     /// NativeChat is a new client: same coworker + transcript, `POST /ag-ui` SSE instead.
+    ///
+    /// A recipe the person put on this turn goes in `forwardedProps` beside the coworker, with
+    /// the values its parameters were given. The messages are untouched by it.
     pub async fn run_turn<F>(
         &self,
         coworker_id: &str,
         thread_id: &str,
         messages: &[AguiMessage],
+        recipe: Option<&TurnRecipe>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
         F: FnMut(&serde_json::Value),
     {
+        let mut forwarded = json!({ "coworkerId": coworker_id });
+        if let Some(recipe) = recipe {
+            forwarded["recipe"] = Value::String(recipe.id.clone());
+            forwarded["recipeValues"] = Value::Object(recipe.values.clone());
+        }
         let body = json!({
             "threadId": thread_id,
             "runId": uuid::Uuid::now_v7().to_string(),
             "messages": messages,
             "tools": super::gen_ui::agui_tools(),
-            "forwardedProps": { "coworkerId": coworker_id },
+            "forwardedProps": forwarded,
         });
         let url = self.url("/ag-ui")?;
         self.ensure_fresh_token("/ag-ui").await;
@@ -1221,6 +1230,11 @@ pub struct RecipeSummary {
     pub relation: RecipeRelation,
     #[serde(default)]
     pub share_state: Option<RecipeShareState>,
+    /// What the runnable version needs told before it runs. It rides on the summary so the
+    /// composer knows what a recipe wants the moment it is picked, with no second fetch: a
+    /// list that arrives one keystroke after the person needs it is a list they type past.
+    #[serde(default)]
+    pub parameters: Vec<RecipeParameter>,
 }
 
 impl RecipeSummary {
@@ -1233,6 +1247,167 @@ impl RecipeSummary {
         self.relation == RecipeRelation::Invited
             && matches!(self.share_state, Some(RecipeShareState::Pending) | None)
     }
+}
+
+/// What a parameter takes. The server names only these three, and a fourth this client has no
+/// word for is read as text: an unknown kind should leave a field a person can still type into
+/// rather than fail the whole listing and take every other recipe down with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipeParameterKind {
+    Number,
+    Boolean,
+    #[default]
+    #[serde(other)]
+    Text,
+}
+
+impl RecipeParameterKind {
+    /// What this kind is called where a person reads it.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Number => "number",
+            Self::Boolean => "yes or no",
+            Self::Text => "text",
+        }
+    }
+}
+
+/// One thing a recipe needs told before it runs, as its runnable version declares it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeParameter {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub name: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub kind: RecipeParameterKind,
+    /// What it stands at when nobody says otherwise. A number or a boolean default arrives as
+    /// itself in JSON and is kept as the words a person would type for it, because that is what
+    /// it is shown and compared as; [`RecipeParameter::encode`] turns it back on the way out.
+    #[serde(default, deserialize_with = "scalar_text")]
+    pub default: Option<String>,
+    /// The only values this parameter takes, when the declaration narrows it.
+    #[serde(default, deserialize_with = "scalar_text_list")]
+    pub values: Option<Vec<String>>,
+}
+
+impl RecipeParameter {
+    /// The values this parameter is narrowed to, if it is narrowed at all.
+    pub fn allowed(&self) -> Option<&[String]> {
+        self.values.as_deref().filter(|values| !values.is_empty())
+    }
+
+    /// The declared value this text names, in the declaration's own spelling. Case is not what
+    /// a person is choosing between, so "Mundo" takes the declared "mundo" rather than being
+    /// refused for a difference they cannot see the point of.
+    pub fn declared(&self, text: &str) -> Option<&str> {
+        self.allowed()?
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case(text))
+            .map(String::as_str)
+    }
+
+    /// Why this text is not a value this parameter takes, in words for the person, or `None`
+    /// when it is one. The text is what they typed, trimmed and not empty — an empty field is
+    /// no value at all rather than a bad one.
+    ///
+    /// The server checks again and is the authority; this only catches it while the composer is
+    /// still open and the answer can be fixed without losing the turn.
+    pub fn reject(&self, text: &str) -> Option<String> {
+        if let Some(allowed) = self.allowed() {
+            if self.declared(text).is_none() {
+                return Some(format!(
+                    "{} takes one of: {}.",
+                    self.name,
+                    allowed.join(", ")
+                ));
+            }
+            return None;
+        }
+        match self.kind {
+            RecipeParameterKind::Number => text
+                .parse::<f64>()
+                .is_err()
+                .then(|| format!("{} takes a number, and \"{text}\" is not one.", self.name)),
+            RecipeParameterKind::Boolean => boolean_text(text)
+                .is_none()
+                .then(|| format!("{} is a yes or a no, so pick one.", self.name)),
+            RecipeParameterKind::Text => None,
+        }
+    }
+
+    /// The value as it travels to the server: a declared `number` as a number and a `boolean`
+    /// as a boolean, so `recipeValues` carries what the declaration asked for rather than the
+    /// words that stood for it in the composer.
+    pub fn encode(&self, text: &str) -> Value {
+        let text = self.declared(text).unwrap_or(text);
+        match self.kind {
+            RecipeParameterKind::Number => text
+                .parse::<i64>()
+                .map(Value::from)
+                .or_else(|_| text.parse::<f64>().map(Value::from))
+                .unwrap_or_else(|_| Value::String(text.to_string())),
+            RecipeParameterKind::Boolean => match boolean_text(text) {
+                Some(flag) => Value::Bool(flag),
+                None => Value::String(text.to_string()),
+            },
+            RecipeParameterKind::Text => Value::String(text.to_string()),
+        }
+    }
+}
+
+/// The yes or the no a person may have written, whichever way they wrote it.
+fn boolean_text(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "y" | "1" => Some(true),
+        "false" | "no" | "n" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// A scalar the server may send as a string, a number, a boolean or `null`, read as the words a
+/// person would type for it.
+fn scalar_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| value_text(&value)))
+}
+
+/// The same, for the list of values a parameter may be narrowed to.
+fn scalar_text_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(values) = Option::<Vec<Value>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(Some(values.iter().filter_map(value_text).collect()))
+}
+
+/// One JSON scalar as text. An object or an array is not something a person types into a field,
+/// so it stands for no value at all.
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+/// The recipe a turn runs, and what its parameters were filled in with.
+///
+/// It travels in `forwardedProps` beside the coworker and never in the message: a parameter
+/// value is not prose, and pasting it into the sentence would change what the person said.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnRecipe {
+    pub id: String,
+    pub values: serde_json::Map<String, Value>,
 }
 
 /// One version of a recipe: the tape (v1), the steps the server filtered from it (v2), or
@@ -1250,6 +1425,10 @@ pub struct RecipeVersion {
     pub created_by: Option<String>,
     #[serde(default)]
     pub created_at_ms: i64,
+    /// What this version needs told before it runs. See [`RecipeVersion::declared`] for why it
+    /// is read from here and from the body both.
+    #[serde(default)]
+    pub parameters: Vec<RecipeParameter>,
     #[serde(default)]
     pub body: RecipeVersionBody,
 }
@@ -1258,6 +1437,17 @@ impl RecipeVersion {
     /// The tape is kept, not run; every other kind carries steps.
     pub fn is_runnable(&self) -> bool {
         self.kind != "raw"
+    }
+
+    /// What this version declares it needs told, which is the declaration a run of it binds
+    /// values to. It arrives beside the version's own fields or inside its body, and either
+    /// shape reads the same here, the way a tape does: the declaration belongs to the version
+    /// whichever half of the row the server writes it on.
+    pub fn declared(&self) -> &[RecipeParameter] {
+        if !self.parameters.is_empty() {
+            return &self.parameters;
+        }
+        &self.body.parameters
     }
 
     /// A version someone wrote by editing, which is the only kind the server will delete on
@@ -1302,6 +1492,10 @@ pub struct RecipeVersionBody {
     pub truncated: bool,
     #[serde(default)]
     pub steps: Vec<RecipeStep>,
+    /// The version's declaration, when the server writes it inside the body rather than beside
+    /// it. Read through [`RecipeVersion::declared`], which takes either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<RecipeParameter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_on_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1875,6 +2069,7 @@ mod tests {
                     tool_call_id: None,
                     reply_to: None,
                 }],
+                None,
                 {
                     let first_at = first_at.clone();
                     move |event| {
@@ -1898,6 +2093,84 @@ mod tests {
             until_first + Duration::from_millis(50) < total,
             "first text at {until_first:?}, stream ended at {total:?} — frames were buffered"
         );
+    }
+
+    /// The turn's body is a contract with the server, which reads `forwardedProps` for the
+    /// recipe and validates the values against the same declaration the composer read. Both
+    /// sides are written apart, so the shape is asserted here rather than agreed in passing.
+    #[tokio::test]
+    async fn a_turn_carries_the_active_recipe_and_its_values_in_forwarded_props() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let message = AguiMessage {
+            id: "u1".into(),
+            role: "user".into(),
+            content: "find me something".into(),
+            tool_call_id: None,
+            reply_to: None,
+        };
+        let recipe = TurnRecipe {
+            id: "rcp_1".to_string(),
+            values: serde_json::Map::from_iter([
+                ("search_term".to_string(), json!("mundo")),
+                ("count".to_string(), json!(5)),
+                ("shorts".to_string(), json!(true)),
+            ]),
+        };
+        client
+            .run_turn("cw_1", "thread_1", &[message], Some(&recipe), |_| {})
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.expect("the turn was sent");
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["forwardedProps"],
+            json!({
+                "coworkerId": "cw_1",
+                "recipe": "rcp_1",
+                "recipeValues": { "search_term": "mundo", "count": 5, "shorts": true }
+            })
+        );
+        assert_eq!(
+            body["messages"][0]["content"], "find me something",
+            "a parameter value is not prose: the message stays exactly what was written"
+        );
+
+        // No recipe on the turn leaves the props as they were, so an ordinary chat is unchanged.
+        client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                &[AguiMessage {
+                    id: "u2".into(),
+                    role: "user".into(),
+                    content: "hello".into(),
+                    tool_call_id: None,
+                    reply_to: None,
+                }],
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = server
+            .received_requests()
+            .await
+            .expect("both turns were sent");
+        let plain: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(plain["forwardedProps"], json!({ "coworkerId": "cw_1" }));
     }
 
     #[tokio::test]
@@ -2211,6 +2484,145 @@ mod tests {
             serde_json::from_value(json!({"id": "rcp_2", "relation": "custodian"})).unwrap();
         assert_eq!(odd.relation, RecipeRelation::None);
         assert_eq!(odd.screen, RecipeScreen::default());
+        assert!(
+            odd.parameters.is_empty(),
+            "a server that names no parameters asks for nothing, rather than failing to list"
+        );
+    }
+
+    /// The declaration exactly as `GET /recipes` sends it. A fixture written from memory is how
+    /// a shape drifts apart between two repos without either noticing, so this one is the
+    /// server's own keys and nothing else.
+    #[test]
+    fn a_summary_carries_the_parameters_the_server_declares() {
+        let summary: RecipeSummary = serde_json::from_value(json!({
+            "id": "rcp_1",
+            "name": "youtube",
+            "parameters": [
+                { "name": "search_term", "description": "What to search YouTube for",
+                  "required": true, "kind": "text", "default": null, "values": null }
+            ]
+        }))
+        .unwrap();
+        let [search_term] = &summary.parameters[..] else {
+            panic!("the one declared parameter is read");
+        };
+        assert_eq!(search_term.name, "search_term");
+        assert_eq!(search_term.description, "What to search YouTube for");
+        assert!(search_term.required);
+        assert_eq!(search_term.kind, RecipeParameterKind::Text);
+        assert_eq!(search_term.default, None);
+        assert_eq!(search_term.allowed(), None);
+
+        // Round-trip, so what this client would send back reads as what it was sent.
+        let json = serde_json::to_value(&summary.parameters).unwrap();
+        assert_eq!(json[0]["name"], "search_term");
+        assert_eq!(json[0]["kind"], "text");
+        assert_eq!(json[0]["required"], true);
+        assert!(json[0]["default"].is_null());
+        assert!(json[0]["values"].is_null());
+        let back: Vec<RecipeParameter> = serde_json::from_value(json).unwrap();
+        assert_eq!(back, summary.parameters);
+
+        // The other two kinds, a default sent as the thing itself, and a narrowed set.
+        let rest: Vec<RecipeParameter> = serde_json::from_value(json!([
+            { "name": "count", "description": "", "required": false, "kind": "number",
+              "default": 5, "values": null },
+            { "name": "shorts", "description": "", "required": false, "kind": "boolean",
+              "default": false, "values": null },
+            { "name": "lang", "description": "", "required": true, "kind": "text",
+              "default": null, "values": ["en", "es"] },
+            { "name": "mystery", "description": "", "required": false, "kind": "colour",
+              "default": null, "values": null }
+        ]))
+        .unwrap();
+        assert_eq!(rest[0].kind, RecipeParameterKind::Number);
+        assert_eq!(rest[0].default.as_deref(), Some("5"));
+        assert_eq!(rest[1].kind, RecipeParameterKind::Boolean);
+        assert_eq!(rest[1].default.as_deref(), Some("false"));
+        assert_eq!(
+            rest[2].allowed(),
+            Some(&["en".to_string(), "es".to_string()][..])
+        );
+        assert_eq!(
+            rest[3].kind,
+            RecipeParameterKind::Text,
+            "a kind this client has no word for leaves a field that can still be typed into"
+        );
+    }
+
+    #[test]
+    fn a_version_declares_what_it_needs_told_whichever_half_of_the_row_it_is_on() {
+        let beside: RecipeVersion = serde_json::from_value(json!({
+            "version": 2, "kind": "filtered", "createdAtMs": 2,
+            "parameters": [{"name": "search_term", "required": true, "kind": "text"}],
+            "body": {"steps": []}
+        }))
+        .unwrap();
+        assert_eq!(beside.declared().len(), 1);
+        assert_eq!(beside.declared()[0].name, "search_term");
+
+        let inside: RecipeVersion = serde_json::from_value(json!({
+            "version": 2, "kind": "filtered", "createdAtMs": 2,
+            "body": {"steps": [], "parameters": [
+                {"name": "search_term", "required": true, "kind": "text"}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(inside.declared(), beside.declared());
+
+        // A version taught before parameters existed declares nothing, and reads as it always
+        // did rather than failing.
+        let older: RecipeVersion =
+            serde_json::from_value(json!({"version": 1, "kind": "raw", "body": {"events": 3}}))
+                .unwrap();
+        assert!(older.declared().is_empty());
+        assert_eq!(older.event_count(), 3);
+    }
+
+    #[test]
+    fn a_value_is_checked_against_the_kind_and_sent_as_that_kind() {
+        let number: RecipeParameter =
+            serde_json::from_value(json!({"name": "count", "required": true, "kind": "number"}))
+                .unwrap();
+        assert_eq!(number.reject("12"), None);
+        assert_eq!(number.reject("-1.5"), None);
+        assert_eq!(
+            number.reject("ten").as_deref(),
+            Some("count takes a number, and \"ten\" is not one.")
+        );
+        assert_eq!(number.encode("12"), json!(12));
+        assert_eq!(number.encode("1.5"), json!(1.5));
+
+        let flag: RecipeParameter =
+            serde_json::from_value(json!({"name": "shorts", "kind": "boolean"})).unwrap();
+        assert_eq!(flag.reject("yes"), None);
+        assert_eq!(
+            flag.reject("maybe").as_deref(),
+            Some("shorts is a yes or a no, so pick one.")
+        );
+        assert_eq!(flag.encode("yes"), json!(true));
+        assert_eq!(flag.encode("false"), json!(false));
+
+        let lang: RecipeParameter =
+            serde_json::from_value(json!({"name": "lang", "kind": "text", "values": ["en", "es"]}))
+                .unwrap();
+        assert_eq!(lang.reject("es"), None);
+        assert_eq!(
+            lang.reject("fr").as_deref(),
+            Some("lang takes one of: en, es."),
+            "a refusal that does not say what is allowed leaves the person guessing"
+        );
+        assert_eq!(
+            lang.encode("ES"),
+            json!("es"),
+            "case is not what they are choosing between, so the declared spelling goes"
+        );
+
+        let free: RecipeParameter =
+            serde_json::from_value(json!({"name": "search_term", "kind": "text"})).unwrap();
+        assert_eq!(free.reject("anything at all"), None);
+        assert_eq!(free.encode("mundo"), json!("mundo"));
     }
 
     #[test]

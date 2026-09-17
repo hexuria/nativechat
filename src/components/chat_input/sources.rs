@@ -5,10 +5,13 @@
 //! server's built-in tools until the composer can ask for the real one, and `SkillSource`
 //! answers from the recipes the app has already loaded, one example skill that stands in until
 //! the server has a skills registry, and a fixed roster of the app's own commands.
+//!
+//! `ParameterSource` and `ValueSource` are the two the composer shows once a recipe is on the
+//! draft: what that recipe needs told, and what one of those things may be told.
 
 use crate::components::composer_panel::ComposerPanelRow;
-use crate::opengrok::RecipeSummary;
-use crate::state::AppSettingsTab;
+use crate::opengrok::{RecipeParameter, RecipeParameterKind, RecipeSummary};
+use crate::state::{ActiveRecipe, AppSettingsTab};
 
 /// What a picked row stands for. The panel only says which row it was; this says what to do
 /// about it, and it is the composer that does it.
@@ -32,6 +35,10 @@ pub enum ComposerPick {
     },
     /// One of the app's own commands, run now.
     Command(AppCommand),
+    /// One parameter of the active recipe, by its place in the declaration, to be given a value.
+    Parameter { index: usize },
+    /// What the parameter whose panel is open is worth. `None` takes its value away.
+    Value(Option<String>),
     /// A row that only says something.
     Nothing,
 }
@@ -171,6 +178,184 @@ impl SkillSource {
     }
 }
 
+/// What the recipe on the draft needs told. This is what `@` offers in place of the bot's
+/// tools while a recipe is active: a turn that is already a recipe run is not looking for a
+/// tool, it is looking for the things the recipe cannot run without.
+pub struct ParameterSource;
+
+impl ParameterSource {
+    pub fn rows(&self, recipe: &ActiveRecipe) -> Vec<(ComposerPanelRow, ComposerPick)> {
+        if recipe.parameters.is_empty() {
+            return vec![(
+                ComposerPanelRow::new(
+                    "param:none",
+                    "icons/record.svg",
+                    format!("{} needs nothing told", recipe.name),
+                    "Write the message and send it",
+                )
+                .element_id("composer-param-none")
+                .note(),
+                ComposerPick::Nothing,
+            )];
+        }
+        recipe
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| {
+                let filled = recipe.value(&parameter.name);
+                (
+                    ComposerPanelRow::new(
+                        format!("param:{}", parameter.name),
+                        parameter_icon(parameter, filled),
+                        parameter_title(parameter, filled),
+                        parameter_state(parameter, filled),
+                    )
+                    .element_id(format!("composer-param-{}", parameter.name))
+                    .label(parameter_label(parameter)),
+                    ComposerPick::Parameter { index },
+                )
+            })
+            .collect()
+    }
+}
+
+/// What one parameter may be told: the values its declaration allows, the yes and the no of a
+/// boolean, and a way to leave it unfilled again. A parameter the declaration does not narrow
+/// is typed into the panel's own field, and the row there only says so.
+pub struct ValueSource;
+
+impl ValueSource {
+    pub fn rows(
+        &self,
+        parameter: &RecipeParameter,
+        filled: Option<&str>,
+    ) -> Vec<(ComposerPanelRow, ComposerPick)> {
+        let mut rows: Vec<(ComposerPanelRow, ComposerPick)> = Vec::new();
+        match (parameter.allowed(), parameter.kind) {
+            (Some(allowed), _) => rows.extend(allowed.iter().enumerate().map(|(index, value)| {
+                (
+                    ComposerPanelRow::new(
+                        format!("value:{value}"),
+                        "icons/check.svg",
+                        value.clone(),
+                        format!("Use this for {}", parameter.name),
+                    )
+                    .element_id(format!("composer-value-choice-{index}")),
+                    ComposerPick::Value(Some(value.clone())),
+                )
+            })),
+            (None, RecipeParameterKind::Boolean) => {
+                rows.extend([("Yes", "true"), ("No", "false")].into_iter().map(
+                    |(title, value)| {
+                        (
+                            ComposerPanelRow::new(
+                                format!("value:{value}"),
+                                "icons/check.svg",
+                                title,
+                                format!("Set {} to {value}", parameter.name),
+                            )
+                            .element_id(format!("composer-value-choice-{value}")),
+                            ComposerPick::Value(Some(value.to_string())),
+                        )
+                    },
+                ));
+            }
+            (None, _) => rows.push((
+                ComposerPanelRow::new(
+                    "value:typed",
+                    "icons/pencil.svg",
+                    format!("Type the value for {}, then press ↵", parameter.name),
+                    typed_hint(parameter),
+                )
+                .element_id("composer-value-typed")
+                .always()
+                .note(),
+                ComposerPick::Nothing,
+            )),
+        }
+        if filled.is_some() {
+            rows.push((
+                ComposerPanelRow::new(
+                    "value:clear",
+                    "icons/trash.svg",
+                    format!("Clear {}", parameter.name),
+                    "Leave it unfilled",
+                )
+                .element_id("composer-value-clear"),
+                ComposerPick::Value(None),
+            ));
+        }
+        rows
+    }
+}
+
+/// A filled parameter shows what it was told; an unfilled one shows only its name, so the two
+/// are told apart at a glance rather than read for.
+fn parameter_title(parameter: &RecipeParameter, filled: Option<&str>) -> String {
+    match filled {
+        Some(value) => format!("{} = {}", parameter.name, shorten(value)),
+        None => parameter.name.clone(),
+    }
+}
+
+/// Where a parameter stands, said outright rather than left to be worked out from what is
+/// missing: a required one nobody has filled in is the thing stopping the message being sent.
+fn parameter_state(parameter: &RecipeParameter, filled: Option<&str>) -> String {
+    let said = parameter.description.trim();
+    let standing = match (filled.is_some(), parameter.required) {
+        (false, true) => "Not filled in yet",
+        (false, false) => "Optional",
+        (true, _) => {
+            return if said.is_empty() {
+                "Filled in".to_string()
+            } else {
+                said.to_string()
+            };
+        }
+    };
+    if said.is_empty() {
+        standing.to_string()
+    } else {
+        format!("{standing} — {said}")
+    }
+}
+
+fn parameter_label(parameter: &RecipeParameter) -> String {
+    if parameter.required {
+        format!("Required · {}", parameter.kind.label())
+    } else {
+        parameter.kind.label().to_string()
+    }
+}
+
+fn parameter_icon(parameter: &RecipeParameter, filled: Option<&str>) -> &'static str {
+    match (filled.is_some(), parameter.required) {
+        (true, _) => "icons/check.svg",
+        (false, true) => "icons/report.svg",
+        (false, false) => "icons/pencil.svg",
+    }
+}
+
+/// What the field under a free parameter will and will not take.
+fn typed_hint(parameter: &RecipeParameter) -> String {
+    match parameter.kind {
+        RecipeParameterKind::Number => "Digits only — letters are not a number".to_string(),
+        _ => "Anything you like".to_string(),
+    }
+}
+
+/// A value long enough to push the rest of the row off the end is cut, because the row is here
+/// to say which parameter is filled rather than to be read as the value.
+fn shorten(value: &str) -> String {
+    const MOST: usize = 28;
+    if value.chars().count() <= MOST {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(MOST - 1).collect();
+    format!("{kept}…")
+}
+
 /// PLACEHOLDER. One made-up skill, so the inline chip a skill leaves in the message can be seen
 /// while the server has no skills registry to list. It is named and described as an example on
 /// purpose: picking it puts its chip in the message the way a real skill would, and nothing else
@@ -286,8 +471,25 @@ const APP_COMMANDS: &[(&str, &str, &str, &str, AppCommand)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerPick, SkillSource, TokenKind, ToolSource};
-    use crate::opengrok::RecipeSummary;
+    use super::{ComposerPick, ParameterSource, SkillSource, TokenKind, ToolSource, ValueSource};
+    use crate::opengrok::{RecipeParameter, RecipeSummary};
+    use crate::state::ActiveRecipe;
+
+    /// The recipe the owner hit this on: one required text parameter and nothing else.
+    fn youtube() -> ActiveRecipe {
+        let recipe: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_1",
+            "name": "youtube",
+            "parameters": [
+                { "name": "search_term", "description": "What to search YouTube for",
+                  "required": true, "kind": "text", "default": null, "values": null },
+                { "name": "count", "description": "How many to bring back",
+                  "required": false, "kind": "number", "default": null, "values": null }
+            ]
+        }))
+        .expect("the declaration the server sends");
+        ActiveRecipe::from_summary(&recipe)
+    }
 
     #[test]
     fn a_tool_becomes_an_at_chip_and_the_notice_becomes_nothing() {
@@ -349,6 +551,93 @@ mod tests {
         assert!(
             commands.iter().all(|(row, _)| row.shortcut.is_none()),
             "the chord comes from the keymap the app registered, not from this table"
+        );
+    }
+
+    #[test]
+    fn a_parameter_row_says_what_it_is_and_whether_it_is_still_needed() {
+        let mut recipe = youtube();
+        let rows = ParameterSource.rows(&recipe);
+        let (search, pick) = &rows[0];
+        assert_eq!(search.title, "search_term");
+        assert!(
+            search.description.starts_with("Not filled in yet"),
+            "a required parameter nobody has filled in has to read as unfilled at a glance, \
+             and this one read {:?}",
+            search.description
+        );
+        assert!(search.description.contains("What to search YouTube for"));
+        assert_eq!(search.label.as_deref(), Some("Required · text"));
+        assert_eq!(*pick, ComposerPick::Parameter { index: 0 });
+        assert_eq!(
+            rows[1].0.label.as_deref(),
+            Some("number"),
+            "one that is not required says what it takes and nothing about being needed"
+        );
+        assert_eq!(rows[1].0.description, "Optional — How many to bring back");
+
+        // Once it is filled in, the row shows what it was told, against its name.
+        recipe.set_value("search_term", Some("mundo".to_string()));
+        let rows = ParameterSource.rows(&recipe);
+        assert_eq!(rows[0].0.title, "search_term = mundo");
+        assert_eq!(rows[0].0.description, "What to search YouTube for");
+    }
+
+    #[test]
+    fn a_recipe_that_needs_nothing_says_so_rather_than_showing_an_empty_list() {
+        let recipe: RecipeSummary =
+            serde_json::from_value(serde_json::json!({ "id": "rcp_2", "name": "Mail" })).unwrap();
+        let rows = ParameterSource.rows(&ActiveRecipe::from_summary(&recipe));
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].0.selectable, "there is nothing there to pick");
+        assert!(rows[0].0.title.contains("needs nothing"));
+    }
+
+    #[test]
+    fn a_value_is_picked_from_the_declared_set_and_typed_when_there_is_none() {
+        let narrowed: RecipeParameter = serde_json::from_value(serde_json::json!({
+            "name": "lang", "kind": "text", "values": ["en", "es"]
+        }))
+        .unwrap();
+        let rows = ValueSource.rows(&narrowed, None);
+        assert_eq!(
+            rows.iter()
+                .map(|(row, _)| row.title.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["en", "es"],
+            "a narrowed parameter is chosen from, so the allowed values are the rows"
+        );
+        assert_eq!(rows[1].1, ComposerPick::Value(Some("es".to_string())));
+
+        let flag: RecipeParameter =
+            serde_json::from_value(serde_json::json!({"name": "shorts", "kind": "boolean"}))
+                .unwrap();
+        let rows = ValueSource.rows(&flag, Some("true"));
+        assert_eq!(
+            rows.iter()
+                .map(|(row, _)| row.title.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["Yes", "No", "Clear shorts"],
+            "a yes or no is a choice rather than a field to type into"
+        );
+        assert_eq!(
+            rows[2].1,
+            ComposerPick::Value(None),
+            "a value that has been given can be taken away again"
+        );
+
+        let free: RecipeParameter =
+            serde_json::from_value(serde_json::json!({"name": "search_term", "kind": "text"}))
+                .unwrap();
+        let rows = ValueSource.rows(&free, None);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].0.selectable,
+            "the row is the instruction, not a value"
+        );
+        assert!(
+            rows[0].0.always,
+            "the line telling someone to type a value must not vanish as they type one"
         );
     }
 
