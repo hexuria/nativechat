@@ -9,8 +9,9 @@ use crate::audio::AudioInput;
 use crate::components::composer_panel::{ComposerPanel, ComposerPanelEvent, ComposerPanelRow};
 use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
-use crate::state::{AppState, ReplyTo, SubmitChord};
-use sources::{SkillSource, ToolSource};
+use crate::opengrok::{RecipeParameter, RecipeParameterKind};
+use crate::state::{ActiveRecipe, AppState, ReplyTo, SubmitChord};
+use sources::{ParameterSource, SkillSource, ToolSource, ValueSource};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -40,10 +41,14 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
 enum PanelMode {
     /// The "+" button: attach files, teach a task.
     Plus,
-    /// `@`: the bot's tools and apps.
+    /// `@` with no recipe on the draft: the bot's tools and apps.
     Tools,
     /// `/`: recipes and the app's own commands.
     Skills,
+    /// `@` with a recipe on the draft: what that recipe needs told.
+    Parameters,
+    /// One parameter of the active recipe, by its place in the declaration, being given a value.
+    Value { parameter: usize },
 }
 
 /// A chip in the message: what it stands for, and where its text sits.
@@ -89,6 +94,9 @@ pub struct MessageInput {
     caret: usize,
     /// The chips in the message, in the order they appear.
     tokens: Vec<ComposerToken>,
+    /// The recipe the message runs, cached off [`AppState`] for the sake of drawing. Every
+    /// decision reads the state itself, so a value filled in a moment ago is never missed.
+    active_recipe: Option<ActiveRecipe>,
     /// Images to send with the message, shown as thumbnails above the text.
     attachments: Vec<PathBuf>,
     /// A line above the field for something the person needs told: a file that was not an image,
@@ -114,6 +122,7 @@ impl MessageInput {
         let picked_tools = app_state.picked_tools.clone();
         let is_voice_mode_open = app_state.is_voice_mode_open;
         let is_app_settings_open = app_state.is_app_settings_open;
+        let active_recipe = app_state.active_recipe.clone();
         let submit_chord = app_state.submit_chord;
         let reply_to = app_state.reply_to.clone();
         let coworker_name = composer_bot_name(&app_state);
@@ -136,6 +145,7 @@ impl MessageInput {
             picks: Vec::new(),
             caret: 0,
             tokens: Vec::new(),
+            active_recipe,
             attachments: Vec::new(),
             notice: None,
             dismissed_at: None,
@@ -152,6 +162,7 @@ impl MessageInput {
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_app_settings_open, changed);
                 sync_field_clone!(this, state, reply_to, changed);
+                sync_field_clone!(this, state, active_recipe, changed);
                 if this.submit_chord != state.submit_chord {
                     this.submit_chord = state.submit_chord;
                     changed = true;
@@ -170,6 +181,21 @@ impl MessageInput {
                 this.remember_picks(&rows);
                 let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
                 this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
+            }
+
+            // The open list of parameters shows each value as it is filled in, and shuts if the
+            // recipe it is about is dropped out from under it.
+            if this.panel_mode == Some(PanelMode::Parameters) {
+                match state.read(cx).active_recipe.clone() {
+                    Some(recipe) => {
+                        let rows = ParameterSource.rows(&recipe);
+                        this.remember_picks(&rows);
+                        let rows: Vec<ComposerPanelRow> =
+                            rows.into_iter().map(|(row, _)| row).collect();
+                        this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
+                    }
+                    None => this.close_panel(false, window, cx),
+                }
             }
 
             if changed {
@@ -218,6 +244,9 @@ impl MessageInput {
             window,
             |this, _panel, event, window, cx| match event {
                 ComposerPanelEvent::Selected(id) => this.pick_row(id.clone(), window, cx),
+                ComposerPanelEvent::Submitted(typed) => {
+                    this.submit_typed_value(typed.to_string(), window, cx)
+                }
                 ComposerPanelEvent::Dismissed { at } => {
                     this.dismissed_at = *at;
                     // A click outside meant to land somewhere else; only Escape hands the caret back.
@@ -257,6 +286,20 @@ impl MessageInput {
         let text = self.input_state.read(cx).value();
         let trimmed = text.trim();
         if !trimmed.is_empty() {
+            // A recipe that has not been told what it needs cannot run, and the server would
+            // refuse the turn. Say which parameter here, before anything is sent and while the
+            // draft is still on screen to fix.
+            let missing = self
+                .state
+                .read(cx)
+                .active_recipe
+                .as_ref()
+                .and_then(missing_note);
+            if let Some(note) = missing {
+                self.notice = Some(note);
+                cx.notify();
+                return;
+            }
             println!("Submitting message: {}", trimmed);
             if let Some(handler) = &self.on_submit {
                 (handler)(trimmed.to_string(), cx);
@@ -265,6 +308,9 @@ impl MessageInput {
                 state.set_value("".to_string(), window, cx);
             });
             self.tokens.clear();
+            // The recipe belonged to the message that has just gone, not to the next one.
+            self.state
+                .update(cx, |state, cx| state.clear_active_recipe(cx));
             // The images are not on their way anywhere: nothing carries them yet, so saying so
             // is better than leaving them over an empty composer as if they had gone with it.
             if !self.attachments.is_empty() {
@@ -441,6 +487,48 @@ impl MessageInput {
         );
     }
 
+    /// What the recipe on the draft still needs told: what `@` offers in place of the tools.
+    fn open_parameters_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(recipe) = self.state.read(cx).active_recipe.clone() else {
+            return;
+        };
+        let rows = ParameterSource.rows(&recipe);
+        let placeholder = format!("Search what {} needs", recipe.name);
+        self.show_panel(
+            PanelMode::Parameters,
+            rows,
+            &placeholder,
+            &parameters_hint(&recipe),
+            window,
+            cx,
+        );
+    }
+
+    /// One parameter's value: the choices its declaration allows, or the panel's own field for
+    /// a parameter the declaration leaves open.
+    fn open_value_panel(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(recipe) = self.state.read(cx).active_recipe.clone() else {
+            return;
+        };
+        let Some(parameter) = recipe.parameters.get(index) else {
+            return;
+        };
+        let filled = recipe.value(&parameter.name);
+        let rows = ValueSource.rows(parameter, filled);
+        let placeholder = match filled {
+            Some(value) => format!("{} is {value}", parameter.name),
+            None => format!("Value for {}", parameter.name),
+        };
+        self.show_panel(
+            PanelMode::Value { parameter: index },
+            rows,
+            &placeholder,
+            &value_hint(parameter),
+            window,
+            cx,
+        );
+    }
+
     fn pick_row(&mut self, id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pick) = self
             .picks
@@ -450,6 +538,9 @@ impl MessageInput {
         else {
             return;
         };
+        // Which list this row came out of, before closing the panel forgets it: a value only
+        // means anything beside the parameter whose panel was open.
+        let mode = self.panel_mode;
         self.close_panel(true, window, cx);
         match pick {
             ComposerPick::AttachFiles => self.attach_files(cx),
@@ -463,11 +554,114 @@ impl MessageInput {
                     self.state
                         .update(cx, |state, cx| state.pick_tool(id, label, cx));
                 }
-                TokenKind::Skill => self.insert_token(kind, id, text, window, cx),
+                TokenKind::Skill => {
+                    // A recipe picked from `/` is not only a word in the sentence: it is what
+                    // the turn runs, so it goes on the draft as well as into the message. One
+                    // recipe to a message, so picking another takes the first one's chip out
+                    // rather than leaving a word standing for a recipe that is not running.
+                    let replacing = self
+                        .state
+                        .read(cx)
+                        .active_recipe
+                        .as_ref()
+                        .is_some_and(|active| active.id != id);
+                    if replacing {
+                        self.drop_recipe(window, cx);
+                    }
+                    self.state
+                        .update(cx, |state, cx| state.start_recipe(&id, cx));
+                    self.insert_token(kind, id, text, window, cx);
+                }
             },
             ComposerPick::Command(command) => self.run_command(command, window, cx),
+            ComposerPick::Parameter { index } => self.open_value_panel(index, window, cx),
+            ComposerPick::Value(value) => {
+                let Some(PanelMode::Value { parameter }) = mode else {
+                    return;
+                };
+                self.fill_parameter(parameter, value, window, cx);
+            }
             ComposerPick::Nothing => {}
         }
+    }
+
+    /// What was typed into the value panel's field, offered as the open parameter's value.
+    ///
+    /// A value the declaration would not take is refused under the field it was typed into,
+    /// with the panel still open and the words still there, so it can be corrected rather than
+    /// asked for again. The server checks it too and is the authority; this is only early.
+    fn submit_typed_value(&mut self, typed: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(PanelMode::Value { parameter }) = self.panel_mode else {
+            return;
+        };
+        let typed = typed.trim().to_string();
+        let refusal = self
+            .state
+            .read(cx)
+            .active_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.parameters.get(parameter))
+            .map(|declared| declared.reject(&typed));
+        match refusal {
+            Some(Some(refusal)) => {
+                self.panel
+                    .update(cx, |panel, cx| panel.set_hint(refusal, cx));
+            }
+            Some(None) => self.fill_parameter(parameter, Some(typed), window, cx),
+            None => {}
+        }
+    }
+
+    /// Give a parameter a value, or take its value away, and go back to the list so the next
+    /// one can be filled in without asking for it again.
+    fn fill_parameter(
+        &mut self,
+        index: usize,
+        value: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self
+            .state
+            .read(cx)
+            .active_recipe
+            .as_ref()
+            .and_then(|recipe| recipe.parameters.get(index))
+            .map(|parameter| parameter.name.clone())
+        else {
+            return;
+        };
+        self.set_parameter_value(&name, value, cx);
+        self.close_panel(false, window, cx);
+        self.open_parameters_panel(window, cx);
+    }
+
+    fn set_parameter_value(&mut self, name: &str, value: Option<String>, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.set_recipe_value(name, value, cx));
+    }
+
+    /// Take the recipe off the draft, and its chip out of the message with it: one pick put
+    /// both there, so undoing it undoes both.
+    ///
+    /// Editing the chip away does not do this. A mode the person set should not come off the
+    /// message because of a keystroke in the text, and the bar is where it can be dropped on
+    /// purpose.
+    fn drop_recipe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(recipe) = self.state.read(cx).active_recipe.clone() else {
+            return;
+        };
+        self.state
+            .update(cx, |state, cx| state.clear_active_recipe(cx));
+        if let Some(index) = self
+            .tokens
+            .iter()
+            .position(|token| token.kind == TokenKind::Skill && token.id == recipe.id)
+        {
+            let range = self.tokens.remove(index).range;
+            self.remove_text(range, window, cx);
+        }
+        cx.notify();
     }
 
     fn run_command(&mut self, command: AppCommand, window: &mut Window, cx: &mut Context<Self>) {
@@ -586,6 +780,21 @@ impl MessageInput {
         true
     }
 
+    /// Take a stretch of the message out, with the space that was inserted after it: a chip
+    /// goes in with one, and leaving it behind would leave a gap where the chip was.
+    fn remove_text(&mut self, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input_state.read(cx).value().to_string();
+        let end = match text.get(range.end..) {
+            Some(rest) if rest.starts_with(' ') => range.end + 1,
+            _ => range.end,
+        };
+        self.input_state.update(cx, |input, cx| {
+            input.set_selected_range(range.start..end, cx);
+            input.replace("", window, cx);
+        });
+        self.resync_tokens(cx);
+    }
+
     /// `@` and `/` open the panel instead of being typed.
     ///
     /// Returns whether the key was taken. A trigger only counts at the start of a token — at the
@@ -621,9 +830,16 @@ impl MessageInput {
             return false;
         }
         match mode {
+            // Once a recipe is on the draft, `@` is for what that recipe needs told. The turn
+            // is already a recipe run, and a roster of the bot's tools is not what is missing
+            // from it — which is exactly what someone who has just picked a recipe finds when
+            // the list they are shown is tools.
+            PanelMode::Tools if self.state.read(cx).active_recipe.is_some() => {
+                self.open_parameters_panel(window, cx)
+            }
             PanelMode::Tools => self.open_tools_panel(window, cx),
             PanelMode::Skills => self.open_skills_panel(window, cx),
-            PanelMode::Plus => {}
+            PanelMode::Plus | PanelMode::Parameters | PanelMode::Value { .. } => {}
         }
         true
     }
@@ -694,6 +910,164 @@ impl MessageInput {
             })
             .child(Textarea::new(&self.input_state).appearance(false).w_full())
             .into_any_element()
+    }
+
+    // --- The recipe on the draft -------------------------------------------------------------
+
+    /// The bar that says which recipe the message runs, what it still needs, and how to drop it.
+    ///
+    /// The chip in the message is not this, and cannot be. A chip is text: it can be typed over
+    /// or deleted like any other word, and the message has to stay exactly what the person
+    /// wrote, so nothing that must be true about the turn can be read off it. The bar is also
+    /// the only place a parameter's value can be shown — a value is not prose, and putting it in
+    /// the sentence would change what was said.
+    fn recipe_bar(
+        &self,
+        theme: &gpui_kit::component::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let recipe = self.active_recipe.clone()?;
+        let secondary = theme.secondary;
+        let muted_foreground = theme.muted_foreground;
+        let secondary_foreground = theme.secondary_foreground;
+        let border = theme.border;
+        let danger = theme.danger;
+        let has_parameters = !recipe.parameters.is_empty();
+        let chips: Vec<AnyElement> = recipe
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| {
+                let name = parameter.name.clone();
+                let filled = recipe.value(&name).map(str::to_string);
+                let needed = parameter.required && filled.is_none();
+                let label = match &filled {
+                    Some(value) => format!("{name}: {}", chip_value(value)),
+                    None if parameter.required => format!("{name} (needed)"),
+                    None => name.clone(),
+                };
+                let tip = SharedString::from(chip_tooltip(parameter));
+                let clear_name = name.clone();
+                h_flex()
+                    .id(SharedString::from(format!("composer-recipe-param-{name}")))
+                    .items_center()
+                    .gap_1()
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if needed { danger } else { border })
+                    .when(filled.is_some(), |this| this.bg(secondary))
+                    .text_size(px(11.))
+                    .text_color(if needed { danger } else { secondary_foreground })
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(secondary))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_value_panel(index, window, cx);
+                    }))
+                    .child(div().child(label))
+                    .when(filled.is_some(), |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "composer-recipe-param-clear-{clear_name}"
+                                )))
+                                .size(px(12.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .child(
+                                    Icon::new(NativeIcon::Close)
+                                        .size(px(8.))
+                                        .text_color(secondary_foreground),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.set_parameter_value(&clear_name, None, cx);
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            h_flex()
+                .id("composer-recipe-bar")
+                .w_full()
+                .items_start()
+                .justify_between()
+                .gap_2()
+                .px_1()
+                .pb_1()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .gap(px(3.))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Icon::default()
+                                        .path("icons/record.svg")
+                                        .size(px(11.))
+                                        .text_color(muted_foreground),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                        .text_color(muted_foreground)
+                                        .truncate()
+                                        .child(format!("Recipe · {}", recipe.name)),
+                                )
+                                .child(div().text_xs().text_color(muted_foreground).child(
+                                    if has_parameters {
+                                        "— @ fills these in"
+                                    } else {
+                                        "— it needs nothing told"
+                                    },
+                                )),
+                        )
+                        .when(has_parameters, |this| {
+                            this.child(
+                                h_flex()
+                                    .id("composer-recipe-parameters")
+                                    .w_full()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(chips),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .id("composer-recipe-drop")
+                        .size(px(22.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(secondary))
+                        .tooltip(|window, cx| Tooltip::new("Drop the recipe").build(window, cx))
+                        .child(
+                            Icon::new(IconName::Close)
+                                .size(px(12.))
+                                .text_color(secondary_foreground),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.drop_recipe(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     // --- Attachments -----------------------------------------------------------------------
@@ -848,6 +1222,80 @@ fn apply_shortcuts(rows: &mut [(ComposerPanelRow, ComposerPick)], window: &Windo
     }
 }
 
+/// What the recipe still needs before the message can be sent, named, or nothing when it can
+/// go. Naming them is the point: "fill in the required fields" leaves someone hunting.
+fn missing_note(recipe: &ActiveRecipe) -> Option<String> {
+    let missing = recipe.missing();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} needs {} before this can be sent.",
+        recipe.name,
+        join_names(&missing)
+    ))
+}
+
+/// The line under the list of parameters: what is still missing, or how the list is worked.
+fn parameters_hint(recipe: &ActiveRecipe) -> String {
+    match missing_note(recipe) {
+        Some(note) => format!("{note} ↵ fills one in, esc closes."),
+        None => "↑↓ to move, ↵ to fill one in, esc to close.".to_string(),
+    }
+}
+
+/// The line under one parameter's value: whether it is picked from a list or typed.
+fn value_hint(parameter: &RecipeParameter) -> String {
+    match (parameter.allowed(), parameter.kind) {
+        (Some(allowed), _) => format!("One of: {}. ↵ takes it, esc closes.", allowed.join(", ")),
+        (None, RecipeParameterKind::Boolean) => {
+            "Pick the yes or the no. ↵ takes it, esc closes.".to_string()
+        }
+        (None, RecipeParameterKind::Number) => "Type a number and press ↵. esc closes.".to_string(),
+        (None, RecipeParameterKind::Text) => "Type it and press ↵. esc closes.".to_string(),
+    }
+}
+
+/// What a parameter's chip says when the pointer rests on it, which is the room the chip itself
+/// does not have: what the parameter is for, and what it takes.
+fn chip_tooltip(parameter: &RecipeParameter) -> String {
+    let said = parameter.description.trim();
+    let takes = match parameter.allowed() {
+        Some(allowed) => format!("one of: {}", allowed.join(", ")),
+        None => parameter.kind.label().to_string(),
+    };
+    let standing = if parameter.required {
+        "required"
+    } else {
+        "optional"
+    };
+    if said.is_empty() {
+        format!("{} — {standing} {takes}", parameter.name)
+    } else {
+        format!("{said} — {standing} {takes}")
+    }
+}
+
+/// A value that would push the drop button off the end of the bar is cut: the chip is there to
+/// say the parameter is filled, and the whole of a long value can be read where it was typed.
+fn chip_value(value: &str) -> String {
+    const MOST: usize = 18;
+    if value.chars().count() <= MOST {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(MOST - 1).collect();
+    format!("{kept}…")
+}
+
+/// Several names as a person would say them: "a", "a and b", "a, b and c".
+fn join_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Whether a trigger character sits at the start of a token: the start of the message, or right
 /// after a space. `me@example.com` therefore types its `@` rather than opening the panel.
 fn starts_token(text: &str, caret: usize) -> bool {
@@ -898,6 +1346,7 @@ impl Render for MessageInput {
             && self.picked_tools.is_empty()
             && self.attachments.is_empty()
             && self.notice.is_none()
+            && self.active_recipe.is_none()
             && !draft.contains('\n');
         let panel_open = self.panel_mode.is_some();
         let thumbnails = (!self.attachments.is_empty()).then(|| self.thumbnails(&theme, cx));
@@ -1006,6 +1455,7 @@ impl Render for MessageInput {
                             ),
                     )
                 })
+                .children(self.recipe_bar(&theme, cx))
                 .when_some(self.notice.clone(), |this, notice| {
                     this.child(
                         h_flex()
@@ -1456,8 +1906,48 @@ fn composer_bot_name(state: &AppState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_image, starts_token};
+    use super::{is_image, join_names, missing_note, starts_token};
+    use crate::opengrok::RecipeSummary;
+    use crate::state::ActiveRecipe;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_message_is_refused_by_the_name_of_what_is_missing() {
+        let recipe: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_1",
+            "name": "youtube",
+            "parameters": [
+                { "name": "search_term", "required": true, "kind": "text" },
+                { "name": "channel", "required": true, "kind": "text" },
+                { "name": "count", "required": false, "kind": "number" }
+            ]
+        }))
+        .unwrap();
+        let mut recipe = ActiveRecipe::from_summary(&recipe);
+        assert_eq!(
+            missing_note(&recipe).as_deref(),
+            Some("youtube needs search_term and channel before this can be sent."),
+            "a refusal that does not name the parameter leaves someone hunting for it"
+        );
+        recipe.set_value("search_term", Some("mundo".to_string()));
+        assert_eq!(
+            missing_note(&recipe).as_deref(),
+            Some("youtube needs channel before this can be sent.")
+        );
+        recipe.set_value("channel", Some("anything".to_string()));
+        assert_eq!(
+            missing_note(&recipe),
+            None,
+            "nothing required is missing, so the message goes; count was never required"
+        );
+    }
+
+    #[test]
+    fn names_are_joined_the_way_they_are_said() {
+        assert_eq!(join_names(&["a"]), "a");
+        assert_eq!(join_names(&["a", "b"]), "a and b");
+        assert_eq!(join_names(&["a", "b", "c"]), "a, b and c");
+    }
 
     #[test]
     fn a_trigger_only_counts_at_the_start_of_a_token() {
