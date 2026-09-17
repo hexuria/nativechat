@@ -345,6 +345,11 @@ impl ChatPalette {
     }
 }
 
+/// The air between the last bubble and the composer floating over it. The list's own `py_2`
+/// used to be the whole gap after the last row; the padding that clears the composer replaces
+/// that bottom edge, so the breathing room has to be put back by hand.
+const COMPOSER_GAP: f32 = 8.0;
+
 struct ChatTranscript {
     app_state: Entity<AppState>,
     input: Entity<MessageInput>,
@@ -361,6 +366,10 @@ struct ChatTranscript {
     find_query: String,
     find_hits: Vec<FindHit>,
     find_current: Option<usize>,
+    /// How tall the composer floating over the transcript's bottom stands right now, as the
+    /// composer itself last measured it (see `ChatView::render`). Zero until that first
+    /// measurement lands, which is one frame.
+    composer_height: Pixels,
 }
 
 impl ChatTranscript {
@@ -427,11 +436,28 @@ impl ChatTranscript {
             find_query: String::new(),
             find_hits: Vec::new(),
             find_current: None,
+            composer_height: px(0.),
         };
         if this.feed_rev.native_speaking_id.is_some() {
             this.start_highlight_pump(cx);
         }
         this
+    }
+
+    /// The composer floats over the transcript's bottom, so the rows have to come to rest a
+    /// composer's height above the pane's floor: a last bubble that stopped at the floor
+    /// would be read through the pill, and no amount of scrolling could free it. The composer
+    /// measures itself and tells us, because how tall it stands is the draft's business — a
+    /// second line, a recipe bar or the working line each move it.
+    fn set_composer_height(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        // Every layout pass the composer takes reports again, and each notify buys another
+        // frame: only a height that has really moved is worth one. Half a pixel is under what
+        // a row can show and over what rounding can invent.
+        if (self.composer_height - height).abs() < px(0.5) {
+            return;
+        }
+        self.composer_height = height;
+        cx.notify();
     }
 
     fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -616,6 +642,7 @@ impl Render for ChatTranscript {
         let ts_peek = self.ts_peek;
         let find_hits = self.find_hits.clone();
         let find_current = self.find_current;
+        let composer_height = self.composer_height;
         let timestamps_ok = {
             let win = f32::from(_window.viewport_size().width);
             let app = self.app_state.read(cx);
@@ -823,6 +850,17 @@ impl Render for ChatTranscript {
                 )
                 // Straight under the title bar, which holds the chat's header.
                 .pt(px(20.0))
+                // The list's floor, not the viewport's: rows still scroll on under the
+                // composer, and it is only the run-out after the last one that is held back,
+                // which is what lets the final bubble be read clear of the pill. The list
+                // counts its own padding towards the scroll, so the end of the transcript —
+                // the chevron's destination, and where a new message lands — moves down with
+                // it.
+                .with_list_style(StyleRefinement::default().pb(composer_height + px(COMPOSER_GAP)))
+                // The chevron belongs over the chat, not behind the composer, so lift it off
+                // the scroller's floor by exactly what the composer covers; the rem the
+                // scroller already holds it by then reads from the composer's top edge.
+                .with_jump_button_style(StyleRefinement::default().mb(composer_height))
                 .with_jump_button_transition(Duration::ZERO),
             )
     }
@@ -1212,7 +1250,8 @@ impl Render for ChatView {
                 }
             })
             .child(
-                // Main Content Area (Header + Messages)
+                // The transcript is the whole column: the composer that follows is out of the
+                // flow, so nothing takes a strip off the bottom of this.
                 div()
                     .id("chat-transcript-slot")
                     .flex_1()
@@ -1234,12 +1273,51 @@ impl Render for ChatView {
                     }),
             )
             .child(
+                // The composer floats over the transcript instead of standing beside it. As a
+                // row of its own it took its height out of the transcript's, and the last
+                // bubble was sliced off at the row's top edge with nothing able to scroll past
+                // that line; and the band it held, opaque or not, read as a wall across the
+                // column. Nothing here paints: the chat runs on underneath, and only the pill
+                // and the working line are solid. The transcript holds its rows a composer's
+                // height clear of the floor, so the last one can still be read in full.
                 v_flex()
-                    .flex_shrink_0()
-                    .w_full()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
                     .items_center()
                     .px_4()
                     .pb_4()
+                    .child({
+                        // How far the transcript has to hold back is whatever the composer
+                        // grew to, and it grows with the draft, the recipe bar and the working
+                        // line, so it is taken from the laid-out box rather than guessed. The
+                        // canvas is absolute, so asking costs the composer no room, and it
+                        // spans the padding box, so the 16px below the pill is counted too.
+                        let transcript = self.transcript.clone();
+                        gpui::canvas(
+                            move |bounds, _, cx| {
+                                let height = bounds.size.height;
+                                if transcript.read(cx).composer_height == height {
+                                    return;
+                                }
+                                // A notify raised here would be swallowed: the window clears
+                                // its dirty flag when the frame begins, so nothing would ask
+                                // for the next one and the transcript would keep the old floor
+                                // until something else redrew it. Handing the height over once
+                                // the frame is off leaves the notify a frame to buy.
+                                let transcript = transcript.clone();
+                                cx.defer(move |cx| {
+                                    transcript.update(cx, |transcript, cx| {
+                                        transcript.set_composer_height(height, cx);
+                                    });
+                                });
+                            },
+                            |_, _, _, _| (),
+                        )
+                        .absolute()
+                        .inset_0()
+                    })
                     .child(
                         v_flex()
                             .w_full()
