@@ -182,18 +182,35 @@ pub const EMPTY_TURN_NOTE: &str = "(OpenGrok returned no assistant text.)";
 /// How a run's failure is spelled in the feed.
 pub const RUN_ERROR_PREFIX: &str = "OpenGrok: ";
 
+/// What the feed says for a turn the person stopped.
+///
+/// Addressed to the person and about what they did, because that is whose doing it was. It is
+/// not spelled with [`RUN_ERROR_PREFIX`] on purpose: a stop is not a run going wrong, it is a
+/// run doing exactly what it was told, and a line painted in the colour of a failure would
+/// leave someone looking for what broke.
+pub const STOPPED_TURN_NOTE: &str = "You stopped this turn.";
+
+/// What the feed says when the stop never reached the server.
+///
+/// The app cannot stop a run by ceasing to watch it — the run drives a box, and it goes on
+/// opening pages and typing into them — so when the one thing that would have stopped it did
+/// not land, saying nothing would leave the person believing a stop that never happened.
+pub const STOP_UNSENT_NOTE: &str =
+    "OpenGrok: the stop did not reach the server, so the turn may still be running.";
+
 /// How much of a quoted message the coworker is shown: a reply to a long answer names it, it
 /// does not replay it. The server's `reply_context` caps the same way.
 const REPLY_QUOTE_CHARS: usize = 600;
 
-/// The app talking about a turn — the empty-turn note, a run's failure — rather than anything the
-/// coworker said. These are painted as a status line, never saved and never sent back: a line the
-/// app wrote is not a turn the coworker took, and the model would answer to it as if it were.
+/// The app talking about a turn — the empty-turn note, a run's failure, a turn the person
+/// stopped — rather than anything the coworker said. These are painted as a status line, never
+/// saved and never sent back: a line the app wrote is not a turn the coworker took, and the
+/// model would answer to it as if it were.
 ///
 /// The test is the content itself so that rows an older build saved are read the same way.
 pub fn is_status_line(content: &str) -> bool {
     let text = content.trim();
-    text == EMPTY_TURN_NOTE || text.starts_with(RUN_ERROR_PREFIX)
+    text == EMPTY_TURN_NOTE || text == STOPPED_TURN_NOTE || text.starts_with(RUN_ERROR_PREFIX)
 }
 
 /// The stand-in a turn that acted but said nothing leaves behind, e.g.
@@ -386,6 +403,54 @@ fn apply_reload(
     }
     conversation.messages = rows.into_iter().map(restored_message).collect();
     true
+}
+
+/// A line of the app's own, as a row of the transcript.
+///
+/// A row of its own rather than words on the end of a reply. `persist_assistant_reply` refuses a
+/// reply that is a status line, and a line glued onto the coworker's words would slip past that
+/// refusal into the history every later turn is sent — after which the coworker reads the app's
+/// account of the turn as something it said itself. Kept apart, the reply is saved as the
+/// coworker's and the line is painted and forgotten, which is the decision that function
+/// documents.
+///
+/// It came out of no run and so carries no run id: a thread reconciled against the server must
+/// not take this row as evidence that it already has some run's reply.
+fn status_row(line: &str) -> Message {
+    Message {
+        id: uuid::Uuid::now_v7().to_string(),
+        sender: "AI".to_string(),
+        content: line.to_string(),
+        sent_at: SystemTime::now(),
+        is_me: false,
+        reply_preview: None,
+        reply_to_id: None,
+        reply_is_me: false,
+        parts: Vec::new(),
+        run_id: None,
+    }
+}
+
+/// The transcript a stop leaves behind, and the reply it leaves to be written down.
+///
+/// The row the run was filling in stays if there is anything in it at all, and is handed back so
+/// the caller can save it: a turn cut short is still a turn that happened, and throwing away what
+/// had arrived would make the stop a worse outcome than the loop it was pressed to end. A row
+/// with nothing in it goes — an empty bubble above the note reads as an answer still on its way.
+fn stopped_transcript(
+    messages: &mut Vec<Message>,
+    message_id: &str,
+) -> Option<(String, Vec<ChatPart>)> {
+    let kept = messages
+        .iter()
+        .find(|message| message.id == message_id)
+        .filter(|message| !message.content.trim().is_empty() || !message.parts.is_empty())
+        .map(|message| (message.content.clone(), message.parts.clone()));
+    if kept.is_none() {
+        messages.retain(|message| message.id != message_id);
+    }
+    messages.push(status_row(STOPPED_TURN_NOTE));
+    kept
 }
 
 /// A saved row as the feed paints it, with the pieces the turn was made of, so a thread reopened
@@ -4008,11 +4073,7 @@ impl AppState {
                 // Only when nobody has written this turn down yet. The live stream may have come
                 // back and settled it while the replay was in the air, and a turn saved twice is
                 // a thread that says everything twice.
-                let ours = self
-                    .live_turns
-                    .get(conversation_id)
-                    .is_some_and(|live| !live.persisting && live.run_id == turn.run_id);
-                if ours {
+                if self.turn_is_unsettled(conversation_id, &turn.run_id) {
                     self.persist_assistant_reply(
                         conversation_id,
                         plain,
@@ -4048,6 +4109,35 @@ impl AppState {
         {
             self.live_turns.remove(conversation_id);
         }
+    }
+
+    /// This thread's turn is still `run_id`'s, and nothing has decided yet what to write down
+    /// for it.
+    ///
+    /// Four things can arrive at the end of one turn — the stream it went out on, the replay a
+    /// thread re-attaches to, the poll that follows a resumed run, and the person pressing stop
+    /// — and whichever gets there first settles it. The others have to be able to tell that they
+    /// are late, because an ending painted twice is a turn saved twice, and an ending painted
+    /// over a stop is the stop undone.
+    fn turn_is_unsettled(&self, conversation_id: &str, run_id: &str) -> bool {
+        self.live_turns
+            .get(conversation_id)
+            .is_some_and(|turn| !turn.persisting && turn.run_id == run_id)
+    }
+
+    /// The open thread has a turn in flight: the coworker is still doing something.
+    ///
+    /// Read off `live_turns`, which is the record of a turn being in flight and is kept per
+    /// thread. That is what makes it worth trusting: it is still true of this thread after
+    /// looking at another bot and coming back, and it is not disturbed by what some other bot is
+    /// doing meanwhile. `bot_status` cannot answer this — it is one label for the whole app, and
+    /// the second bot to start a turn takes it from the first.
+    ///
+    /// A turn whose outcome is decided and on its way to disk is not in flight. It stays
+    /// registered until the write lands, because the thread is held out of reload for that long,
+    /// but nothing is running any more and the composer must not go on offering to stop it.
+    pub fn is_turn_in_flight(&self) -> bool {
+        self.turn_to_stop().is_some()
     }
 
     fn conversation_title(&self, id: &str) -> String {
@@ -4299,6 +4389,17 @@ impl AppState {
                 Err(error) => (Err(error), false, coworker_id.clone(), Vec::new()),
             };
             let _ = this.update(cx, |state, cx| {
+                // Something else has already decided what this turn came to: the person stopped
+                // it, a replay settled it while the stream was still open, or the thread has
+                // moved on to a later turn. Painting an ending now would write over the one
+                // that is there — and in the stopped case it would report the person's own
+                // stop as a run that failed, then save the turn a second time.
+                if !state.turn_is_unsettled(&conversation_id, &run_id) {
+                    if let Err(error) = &result {
+                        eprintln!("NativeChat: the turn failed: {}", error.message);
+                    }
+                    return;
+                }
                 if let Some(message) =
                     streaming_message_mut(&mut state.conversations, &conversation_id, &reply_id)
                 {
@@ -4386,6 +4487,115 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// Stop the turn the open thread has in flight.
+    ///
+    /// The server is told, and that is the whole of it: a run drives a box — it opens pages and
+    /// types into them — so the app closing its own stream would stop nothing but the watching.
+    /// The route is idempotent, so a turn that ended between the person deciding and the press
+    /// landing is a success and there is nothing to check about the run first.
+    ///
+    /// The ending is painted without waiting for the answer, because a button that takes a round
+    /// trip to respond gets pressed again. The answer is still read: a stop that did not land
+    /// says so in the feed rather than letting the app claim a quiet it has no evidence for. A
+    /// `404` is not that case — the run is unknown or is not ours, and either way nothing of
+    /// ours is running under it.
+    ///
+    /// Nothing happens when no turn is in flight. The button is not there to be pressed then,
+    /// but a keystroke or a driver can still ask, and "there is nothing to stop" is an answer
+    /// rather than a fault.
+    pub fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        let Some((conversation_id, turn)) = self.turn_to_stop() else {
+            return;
+        };
+        if let Some(client) = self.opengrok.clone() {
+            let run_id = turn.run_id.clone();
+            let thread = conversation_id.clone();
+            cx.spawn(async move |this, cx| {
+                if let Err(error) = client.stop_run(&run_id).await
+                    && error.status != Some(404)
+                {
+                    eprintln!("NativeChat: the stop did not reach the server: {error}");
+                    let _ = this.update(cx, |state, cx| {
+                        state.say_status_line(&thread, STOP_UNSENT_NOTE);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        if let Some((content, parts)) = self.end_stopped_turn(&conversation_id, &turn) {
+            self.persist_assistant_reply(&conversation_id, content, &parts, Some(&turn.run_id), cx);
+        }
+        cx.notify();
+    }
+
+    /// The turn a stop would be about, if there is one.
+    ///
+    /// A thread with nothing in flight has nothing to stop, and that is an answer rather than a
+    /// fault: the button is not a stop button then, but a keystroke or a driver can still ask.
+    /// Neither is a turn whose outcome is already decided and on its way to disk — it stays
+    /// registered until the write lands, but nothing is running under it.
+    fn turn_to_stop(&self) -> Option<(String, LiveTurn)> {
+        let conversation_id = self.active_conversation_id.clone()?;
+        let turn = self.live_turns.get(&conversation_id)?;
+        if turn.persisting {
+            return None;
+        }
+        Some((conversation_id, turn.clone()))
+    }
+
+    /// The turn is over here, whatever the server makes of the stop. Answers with the reply to
+    /// write down, when the run left one worth keeping.
+    ///
+    /// What arrived before the stop stays. The words are the coworker's and the pictures are of
+    /// things that really happened to the box, so a turn cut short is still a turn that
+    /// happened, and it goes to disk through `persist_assistant_reply` like any other ending —
+    /// which is also what lets the thread go. A row with nothing in it is not a turn that
+    /// happened, and an empty bubble above the note would read as an answer still on its way.
+    fn end_stopped_turn(
+        &mut self,
+        conversation_id: &str,
+        turn: &LiveTurn,
+    ) -> Option<(String, Vec<ChatPart>)> {
+        self.finish_responding(turn.coworker_id.as_deref(), false);
+        let kept = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+            .and_then(|conversation| {
+                stopped_transcript(&mut conversation.messages, &turn.message_id)
+            });
+        match kept {
+            // The outcome is decided the moment the stop lands, even though the thread stays
+            // registered until the reply reaches the database. Saying so here is what puts the
+            // send arrow back at once rather than after a disk write, and what tells the stream
+            // — should it come back with an ending of its own — that it is too late.
+            Some(_) => {
+                if let Some(live) = self
+                    .live_turns
+                    .get_mut(conversation_id)
+                    .filter(|live| live.run_id == turn.run_id)
+                {
+                    live.persisting = true;
+                }
+            }
+            // Nothing is going to the database, so nothing will let the thread go later.
+            None => self.release_live_turn(conversation_id, &turn.run_id),
+        }
+        kept
+    }
+
+    /// Put a line of the app's own into a thread.
+    fn say_status_line(&mut self, conversation_id: &str, line: &str) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+        {
+            conversation.messages.push(status_row(line));
+        }
     }
 
     pub fn answer_approval(
@@ -4528,10 +4738,33 @@ impl AppState {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
+        // Whether the thread is holding a row for this run. When it is, the run being let go
+        // means this poll has nothing of its own left to paint into and must stop — the row it
+        // would fall back to, "the last thing the coworker said", is by then somebody else's.
+        // When it never was, there is no such row to lose: that is a run picked up off the
+        // approvals queue after a restart, which is followed on behalf of a thread that was
+        // never watching it.
+        let registered = conversation_id
+            .as_deref()
+            .is_some_and(|id| self.turn_is_unsettled(id, &run_id));
         cx.spawn(async move |this, cx| {
             let mut last_len = 0usize;
             let mut last_status = String::new();
             for _ in 0..400 {
+                if registered {
+                    let settled = this
+                        .update(cx, |state, _| {
+                            conversation_id
+                                .as_deref()
+                                .is_some_and(|id| !state.turn_is_unsettled(id, &run_id))
+                        })
+                        .unwrap_or(true);
+                    // Whoever settled the turn has already ended the responding state and said
+                    // what the turn came to, so there is nothing to do on the way out either.
+                    if settled {
+                        return;
+                    }
+                }
                 match client.replay_run(&run_id).await {
                     Ok(replay) => {
                         // The status counts as news of its own: the frame that ends a run is
@@ -5805,10 +6038,11 @@ mod tests {
 
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        ActiveRecipe, ChatMessage, ChatPart, Conversation, DatabaseService, EMPTY_TURN_NOTE,
-        LiveTurn, Message, PickedKind, REPLY_QUOTE_CHARS, RecipeSummary, RecoveredReply, ThreadRun,
-        TurnAssembler, agui_messages, apply_reload, graft_reply, is_status_line, is_tool_standin,
-        missing_replies, reply_from_replay, restored_parts, saved_parts, streaming_message_mut,
+        ActiveRecipe, AppState, ChatMessage, ChatPart, Conversation, DatabaseService,
+        EMPTY_TURN_NOTE, LiveTurn, Message, PickedKind, REPLY_QUOTE_CHARS, RecipeSummary,
+        RecoveredReply, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, ThreadRun, TurnAssembler,
+        agui_messages, apply_reload, graft_reply, is_status_line, is_tool_standin, missing_replies,
+        reply_from_replay, restored_parts, saved_parts, streaming_message_mut,
     };
     use std::str::FromStr;
     use std::sync::Arc;
@@ -6051,10 +6285,13 @@ mod tests {
         assert!(saved_parts(&live).is_empty());
     }
 
-    /// Both are the app talking, whether painted now or read back from an older build's rows.
+    /// All of these are the app talking, whether painted now or read back from an older build's
+    /// rows.
     #[test]
     fn a_status_line_is_told_from_something_the_coworker_said() {
         assert!(is_status_line(EMPTY_TURN_NOTE));
+        assert!(is_status_line(STOPPED_TURN_NOTE));
+        assert!(is_status_line(STOP_UNSENT_NOTE));
         assert!(is_status_line("OpenGrok: the run failed"));
         assert!(!is_status_line("OpenGrok is a server."));
         assert!(!is_status_line("[took a screenshot of my screen]"));
@@ -6553,6 +6790,178 @@ mod tests {
             messages[1].run_id.as_deref(),
             Some("run_1"),
             "and it says which run it came out of, so the next reconcile leaves it alone"
+        );
+    }
+
+    // ---- Stopping a turn --------------------------------------------------------------------
+
+    /// A thread with a turn in flight in it, the way `send_opengrok_turn` leaves one: the row the
+    /// run is filling in, the run registered against the thread, and the bot marked as working.
+    fn mid_turn(reply: Message) -> AppState {
+        let mut state = AppState::new();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![at(message("m_ask", true, "open youtube"), 10), reply],
+        ));
+        state.active_conversation_id = Some("cw_1".to_string());
+        state.active_coworker_id = Some("cw_1".to_string());
+        state.live_turns.insert("cw_1".to_string(), in_flight());
+        state.begin_responding(Some("cw_1"), "Working");
+        state
+    }
+
+    /// The composer's button is a stop button for exactly as long as there is something to stop,
+    /// which is the whole of what it promises.
+    #[test]
+    fn the_button_is_a_stop_button_while_the_turn_runs_and_a_send_arrow_at_every_ending() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        assert!(
+            state.is_turn_in_flight(),
+            "the turn was sent and is registered against the thread"
+        );
+
+        // An ordinary ending: `persist_assistant_reply` marks the turn the moment it takes the
+        // reply, and the thread stays registered only until that write lands.
+        state.live_turns.get_mut("cw_1").unwrap().persisting = true;
+        assert!(
+            !state.is_turn_in_flight(),
+            "the outcome is decided, so there is nothing left running to stop"
+        );
+
+        // A run that failed leaves the app's own words behind, which are never written down, so
+        // the thread is let go on the spot instead.
+        state.live_turns.insert("cw_1".to_string(), in_flight());
+        state.release_live_turn("cw_1", "run_1");
+        assert!(!state.is_turn_in_flight());
+
+        // And a turn running in the thread next door is not this thread's to stop.
+        state.live_turns.insert("cw_2".to_string(), in_flight());
+        assert!(
+            !state.is_turn_in_flight(),
+            "the live turn is kept per thread, which is what makes it worth asking"
+        );
+        assert!(
+            state.turn_to_stop().is_none(),
+            "so a stop pressed here finds nothing, rather than stopping somebody else's turn"
+        );
+    }
+
+    /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".
+    /// The button is not a stop button then, but a keystroke or a driver can still ask.
+    #[test]
+    fn a_stop_with_no_turn_in_flight_finds_nothing_rather_than_failing() {
+        let mut state = AppState::new();
+        assert!(state.turn_to_stop().is_none(), "no thread is even open yet");
+
+        state.conversations.push(thread("cw_1", Vec::new()));
+        state.active_conversation_id = Some("cw_1".to_string());
+        assert!(
+            state.turn_to_stop().is_none(),
+            "an open thread that has never been asked anything"
+        );
+
+        let mut settled = in_flight();
+        settled.persisting = true;
+        state.live_turns.insert("cw_1".to_string(), settled);
+        assert!(
+            state.turn_to_stop().is_none(),
+            "a turn already on its way to disk is registered, but nothing is running under it"
+        );
+    }
+
+    /// The loop the person filmed, stopped: the bubble the run had been filling in keeps what it
+    /// had said, and the app says what happened to the rest of it.
+    #[test]
+    fn a_stop_keeps_what_the_turn_had_said_and_says_that_it_was_stopped() {
+        let mut live = at(message("m_live", false, "Opening YouTube on my box."), 20);
+        live.run_id = Some("run_1".to_string());
+        live.parts = vec![ChatPart::Text("Opening YouTube on my box.".to_string())];
+        let mut state = mid_turn(live);
+
+        let kept = state.end_stopped_turn("cw_1", &in_flight());
+        assert_eq!(
+            kept.as_ref().map(|(content, _)| content.as_str()),
+            Some("Opening YouTube on my box."),
+            "a turn cut short is still a turn that happened, and what it said goes to disk"
+        );
+
+        let messages = &state.conversations[0].messages;
+        assert_eq!(
+            ids(messages)[..2],
+            ["m_ask", "m_live"],
+            "the message that asked and the reply that had begun are both still there"
+        );
+        let note = messages.last().unwrap();
+        assert_eq!(note.content, STOPPED_TURN_NOTE);
+        assert!(
+            is_status_line(&note.content),
+            "which is how the feed knows to paint it as a line rather than as speech, and how \
+             `persist_assistant_reply` knows never to write it down"
+        );
+        assert!(
+            note.run_id.is_none(),
+            "it came out of no run, so a reconcile cannot mistake it for the run's own reply"
+        );
+        assert!(
+            agui_messages(messages)
+                .iter()
+                .all(|sent| sent.content != STOPPED_TURN_NOTE),
+            "and the coworker is never told the app's account of the turn as if it were its own"
+        );
+
+        assert!(
+            !state.is_turn_in_flight(),
+            "the button is a send arrow again at once, not after the reply reaches the database"
+        );
+        assert!(state.bot_status.is_none(), "and the working line is gone");
+        assert!(!state.is_ai_responding);
+    }
+
+    /// A stop pressed before the coworker managed to say anything. There is nothing to write
+    /// down, so the thread is let go here — and an empty bubble left standing over the note
+    /// would read as an answer still on its way.
+    #[test]
+    fn a_stop_before_the_turn_said_anything_leaves_no_empty_bubble_behind() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+
+        let kept = state.end_stopped_turn("cw_1", &in_flight());
+        assert!(kept.is_none());
+
+        let messages = &state.conversations[0].messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(ids(messages)[0], "m_ask");
+        assert_eq!(messages[1].content, STOPPED_TURN_NOTE);
+        assert!(
+            !state.live_turns.contains_key("cw_1"),
+            "nothing is going to the database, so nothing would let the thread go later"
+        );
+        assert!(!state.is_turn_in_flight());
+    }
+
+    /// A turn that only took pictures said nothing, but it did something, and the pictures are of
+    /// things that really happened to the box.
+    #[test]
+    fn a_stop_keeps_a_turn_that_had_only_taken_pictures() {
+        let mut live = at(message("m_live", false, ""), 20);
+        live.parts = vec![screenshot(
+            "c1",
+            "the box's screen",
+            b"png-one",
+            (1280, 800),
+        )];
+        let mut state = mid_turn(live);
+
+        let kept = state.end_stopped_turn("cw_1", &in_flight());
+        assert_eq!(
+            kept.map(|(_, parts)| parts.len()),
+            Some(1),
+            "the row is kept, pictures and all"
+        );
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .any(|message| message.id == "m_live")
         );
     }
 }

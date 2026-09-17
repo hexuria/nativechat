@@ -119,6 +119,10 @@ pub struct MessageInput {
     /// Where the mouse went down when a click outside shut the panel, so the click on the "+"
     /// that shut it is not also taken as a click to open it again.
     dismissed_at: Option<Point<Pixels>>,
+    /// The open thread has a turn in flight, which is what turns the send button into a stop
+    /// button. Cached off [`AppState`] like the rest, so the composer draws without reading the
+    /// state on every frame.
+    turn_in_flight: bool,
 }
 
 impl MessageInput {
@@ -140,6 +144,7 @@ impl MessageInput {
         let submit_chord = app_state.submit_chord;
         let reply_to = app_state.reply_to.clone();
         let coworker_name = composer_bot_name(&app_state);
+        let turn_in_flight = app_state.is_turn_in_flight();
 
         let this = Self {
             state: state.clone(),
@@ -163,6 +168,7 @@ impl MessageInput {
             attachments: Vec::new(),
             notice: None,
             dismissed_at: None,
+            turn_in_flight,
         };
 
         // Subscribe to state changes to update cached values and notify only when relevant
@@ -184,6 +190,13 @@ impl MessageInput {
                 let name = composer_bot_name(&state);
                 if this.coworker_name != name {
                     this.coworker_name = name;
+                    changed = true;
+                }
+                // Not a field, so not one of the macros: whether a turn is in flight is a
+                // question about the open thread's live turn, which only the state can answer.
+                let running = state.is_turn_in_flight();
+                if this.turn_in_flight != running {
+                    this.turn_in_flight = running;
                     changed = true;
                 }
             }
@@ -1929,7 +1942,46 @@ impl Render for MessageInput {
                                         mic_btn
                                     })
                                     .child(
-                                        if self.input_state.read(cx).text().len() == 0 {
+                                        if self.turn_in_flight {
+                                            // The same round button in the same place, so the
+                                            // composer does not move under the hand that is
+                                            // about to press it. The square is drawn rather than
+                                            // brought in as an icon: it is a square.
+                                            let mut stop_btn = div()
+                                                .id("stop-btn")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.state.update(cx, |state, cx| {
+                                                        state.stop_turn(cx);
+                                                    });
+                                                }))
+                                                .w(px(36.0))
+                                                .h(px(36.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded_full()
+                                                .bg(foreground)
+                                                .text_color(background)
+                                                .hover(move |style| {
+                                                    style.bg(foreground.opacity(0.8))
+                                                })
+                                                .tooltip(|w, cx| {
+                                                    Tooltip::new("Stop").build(w, cx)
+                                                })
+                                                .child(
+                                                    div()
+                                                        .w(px(11.0))
+                                                        .h(px(11.0))
+                                                        .rounded(px(2.0))
+                                                        .bg(background),
+                                                );
+
+                                            if !any_modal_open {
+                                                stop_btn = stop_btn.cursor_pointer();
+                                            }
+
+                                            stop_btn
+                                        } else if self.input_state.read(cx).text().len() == 0 {
                                             // Empty state: Sparkles icon - opens voice mode modal
                                             let mut sparkles_btn = div()
                                                 .id("voice-mode")
