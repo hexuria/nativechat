@@ -611,6 +611,73 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// Fill the box page from the in-chat card. Account bearer. Not
+    /// `/ag-ui/runs/{id}/answer` and not `submitSecret`. `entryId` is the
+    /// gateway card id — an empty id is not sent as `callId`.
+    pub async fn submit_user_form(
+        &self,
+        entry_id: &str,
+        agent_id: &str,
+        values: &super::user_form::UserFormValues,
+    ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
+        if entry_id.trim().is_empty() {
+            return Ok(super::user_form::UserFormActionReply::MissingEntryId);
+        }
+        let body = super::user_form::submit_request_body(entry_id, agent_id, values);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::user_form::USER_FORM_SUBMIT_PATH,
+                Some(&body),
+            )
+            .await?;
+        Self::user_form_action_response(response).await
+    }
+
+    /// Dismiss or escalate the card. `mode` is `dismissed` or `escalated`
+    /// (Open the screen). Same `entryId` rule as submit.
+    pub async fn dismiss_user_form(
+        &self,
+        entry_id: &str,
+        agent_id: &str,
+        mode: super::user_form::UserFormDismissMode,
+    ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
+        if entry_id.trim().is_empty() {
+            return Ok(super::user_form::UserFormActionReply::MissingEntryId);
+        }
+        let body = super::user_form::dismiss_request_body(entry_id, agent_id, mode);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::user_form::USER_FORM_DISMISS_PATH,
+                Some(&body),
+            )
+            .await?;
+        Self::user_form_action_response(response).await
+    }
+
+    async fn user_form_action_response(
+        response: reqwest::Response,
+    ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(super::user_form::UserFormActionReply::MissingRoute);
+        }
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        let value: Value = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::Null)
+        };
+        Ok(super::user_form::user_form_action_from_http(status, &value))
+    }
+
     /// Stop a run that is still going.
     ///
     /// The turn is not the app's to abandon. A run drives a box — it opens pages and types into
@@ -2761,6 +2828,155 @@ mod tests {
         let reply = client.answer_run("run-1", "call-9", true).await.unwrap();
         assert!(!reply.already_answered);
         assert!(reply.continuing);
+    }
+
+    #[tokio::test]
+    async fn submit_user_form_posts_gateway_entry_id_and_values() {
+        use super::super::user_form::{
+            FormResolution, UserFormActionReply, UserFormValues, user_form_action_from_http,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .and(body_json(json!({
+                "entryId": "e_form",
+                "agentId": "cw_1",
+                "values": { "email": "ada@example.com", "password": "s3cret-pass" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": {
+                        "title": "Google account",
+                        "fields": [
+                            {"id": "email", "label": "Email", "type": "email"},
+                            {"id": "password", "label": "Password", "type": "password"}
+                        ]
+                    }
+                },
+                "formResolution": "submitted",
+                "sharedValues": { "email": "ada@example.com" }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let mut values = UserFormValues::default();
+        values
+            .by_id
+            .insert("email".into(), "ada@example.com".into());
+        values.by_id.insert("password".into(), "s3cret-pass".into());
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &values)
+            .await
+            .unwrap();
+        match reply {
+            UserFormActionReply::Settled(spec) => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+            }
+            other => panic!("expected Settled, got {other:?}"),
+        }
+        let dump = format!("{values:?}");
+        assert!(!dump.contains("s3cret-pass"), "{dump}");
+        assert_eq!(
+            user_form_action_from_http(404, &Value::Null),
+            UserFormActionReply::MissingRoute
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_user_form_404_is_missing_route_not_submitted() {
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "error": "no such route" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::MissingRoute);
+        assert!(!matches!(reply, UserFormActionReply::Settled(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_user_form_200_null_is_not_a_fill() {
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Value::Null))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::Empty);
+    }
+
+    #[tokio::test]
+    async fn empty_entry_id_is_not_posted_as_call_id() {
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "formResolution": "submitted"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::MissingEntryId);
+    }
+
+    #[tokio::test]
+    async fn dismiss_user_form_posts_escalated_mode() {
+        use super::super::user_form::{UserFormActionReply, UserFormDismissMode};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/dismiss"))
+            .and(body_json(json!({
+                "entryId": "e_form",
+                "agentId": "cw_1",
+                "mode": "escalated"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "send-message",
+                "id": "e_form",
+                "message": { "type": "user-form", "formRequest": { "title": "Sign in", "fields": [] } },
+                "formResolution": "escalated",
+                "widgetDismissed": true
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .dismiss_user_form("e_form", "cw_1", UserFormDismissMode::Escalated)
+            .await
+            .unwrap();
+        match reply {
+            UserFormActionReply::Settled(spec) => {
+                assert_eq!(
+                    spec.effective_resolution(),
+                    Some(super::super::user_form::FormResolution::Escalated)
+                );
+            }
+            other => panic!("expected Settled, got {other:?}"),
+        }
     }
 
     /// The route is idempotent, so the status is what is true of the run now rather than an

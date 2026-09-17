@@ -215,7 +215,11 @@ pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTic
         }),
         "RUN_FINISHED" | "RUN_ERROR" => ActivityTick::Clear,
         "CUSTOM" => {
-            if event.get("name").and_then(Value::as_str) == Some("run-awaiting-approval") {
+            if super::user_form::is_user_form_awaiting(event) {
+                ActivityTick::Set(BotActivity {
+                    label: super::user_form::WAITING_FOR_YOU.into(),
+                })
+            } else if event.get("name").and_then(Value::as_str) == Some("run-awaiting-approval") {
                 ActivityTick::Set(BotActivity {
                     label: "Waiting for approval".into(),
                 })
@@ -491,6 +495,25 @@ mod tests {
     fn a_live_user_form_is_waiting_for_you_not_approval() {
         let ev = json!({
             "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "why": "Waiting for you",
+            "arguments": {
+                "title": "Google account email",
+                "fields": [{"id":"email","label":"Email","type":"email","required":true}]
+            }
+        });
+        assert_eq!(
+            activity_from_agui(&ev, None),
+            ActivityTick::Set(BotActivity {
+                label: "Waiting for you".into()
+            })
+        );
+        let fixture = json!({
+            "type": "CUSTOM",
             "name": "user-form",
             "value": {
                 "entryId": "e1",
@@ -501,7 +524,7 @@ mod tests {
             }
         });
         assert_eq!(
-            activity_from_agui(&ev, None),
+            activity_from_agui(&fixture, None),
             ActivityTick::Set(BotActivity {
                 label: "Waiting for you".into()
             })

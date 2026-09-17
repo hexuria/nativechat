@@ -20,9 +20,12 @@ pub use gen_ui::{
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use user_form::{
-    FormResolution, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_SERVER_FILL_AVAILABLE,
-    UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues, WAITING_FOR_YOU,
-    continue_enabled, is_user_form_custom_name, is_user_form_event, is_user_form_tool,
+    FormResolution, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
+    USER_FORM_SERVER_FILL_AVAILABLE, USER_FORM_SUBMIT_PATH, UserFormActionReply,
+    UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues,
+    WAITING_FOR_YOU, continue_enabled, dismiss_request_body, is_user_form_awaiting,
+    is_user_form_custom_name, is_user_form_event, is_user_form_tool, submit_request_body,
+    user_form_action_from_http,
 };
 
 pub use client::{

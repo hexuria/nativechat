@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::client::LocalExecMode;
-use super::user_form::{UserFormSpec, is_user_form_tool};
+use super::user_form::{UserFormSpec, is_user_form_awaiting, is_user_form_tool};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatPart {
@@ -221,6 +221,9 @@ pub struct TurnAssembler {
     waiting_approval: bool,
     completed_ui: Vec<CompletedUiTool>,
     shell_args: std::collections::HashMap<String, String>,
+    /// `request_user_form` args by call id, so an awaiting CUSTOM with empty
+    /// `arguments` can still paint the schema.
+    form_args: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -271,6 +274,9 @@ impl TurnAssembler {
                 }
                 if is_ui_tool(name) || is_user_form_tool(name) {
                     self.flush_text();
+                    if is_user_form_tool(name) && !id.is_empty() {
+                        self.form_args.entry(id.clone()).or_default();
+                    }
                     self.tool = Some(OpenTool {
                         id,
                         name: name.to_string(),
@@ -289,6 +295,9 @@ impl TurnAssembler {
                             .entry(id.to_string())
                             .or_default()
                             .push_str(delta);
+                        if let Some(buf) = self.form_args.get_mut(id) {
+                            buf.push_str(delta);
+                        }
                     }
                     if let Some(tool) = self.tool.as_mut() {
                         tool.args.push_str(delta);
@@ -303,7 +312,22 @@ impl TurnAssembler {
             }
             "CUSTOM" => {
                 let name = event.get("name").and_then(Value::as_str).unwrap_or("");
-                if name == "run-awaiting-approval" {
+                if is_user_form_awaiting(event) {
+                    self.flush_text();
+                    let call_id = event
+                        .get("callId")
+                        .or_else(|| event.get("toolCallId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let fallback = self
+                        .form_args
+                        .get(call_id)
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+                    if let Some(spec) = UserFormSpec::from_awaiting_event(event, fallback.as_ref())
+                    {
+                        self.push_user_form(spec);
+                    }
+                } else if name == "run-awaiting-approval" {
                     self.flush_text();
                     if let Some(mut spec) = approval_from_event(event) {
                         if spec.command.is_empty() {
@@ -413,6 +437,7 @@ impl TurnAssembler {
             return;
         };
         if is_user_form_tool(&tool.name) {
+            self.form_args.insert(tool.id.clone(), tool.args.clone());
             if let Some(spec) = UserFormSpec::from_tool_args(&value, &tool.id) {
                 self.push_user_form(spec);
             }
@@ -425,9 +450,26 @@ impl TurnAssembler {
 
     fn push_user_form(&mut self, spec: UserFormSpec) {
         if let Some(existing) = self.committed.iter_mut().find_map(|part| match part {
-            ChatPart::UserForm(existing) if existing.entry_id == spec.entry_id => Some(existing),
+            ChatPart::UserForm(existing) if existing.same_card(&spec) => Some(existing),
             _ => None,
         }) {
+            existing.merge(spec);
+            return;
+        }
+        // One HITL user-form per turn. Awaiting CUSTOM has callId; a later
+        // send-message envelope has the gateway id and no callId — fold them.
+        let only_unresolved = self
+            .committed
+            .iter()
+            .filter(|part| matches!(part, ChatPart::UserForm(existing) if existing.is_unresolved()))
+            .count()
+            == 1;
+        if only_unresolved
+            && let Some(existing) = self.committed.iter_mut().find_map(|part| match part {
+                ChatPart::UserForm(existing) if existing.is_unresolved() => Some(existing),
+                _ => None,
+            })
+        {
             existing.merge(spec);
             return;
         }
@@ -1614,6 +1656,139 @@ mod tests {
                 assert!(spec.is_unresolved());
             }
             other => panic!("expected UserForm from official envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_awaiting_user_form_is_not_an_approval_card() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "why": "Waiting for you",
+            "arguments": {
+                "title": "Google account email",
+                "fields": [
+                    {"id": "email", "label": "Email", "type": "email", "required": true},
+                    {"id": "password", "label": "Password", "type": "password", "required": true, "value": "s3cret-pass"}
+                ],
+                "liveHost": "accounts.google.com"
+            }
+        }));
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "", "field values must not become chat text");
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.title, "Google account email");
+                assert_eq!(spec.call_id, "call-9");
+                assert_eq!(spec.run_id, "run-1");
+                assert!(
+                    spec.entry_id.is_empty(),
+                    "AG-UI callId is not the gateway entryId: {}",
+                    spec.entry_id
+                );
+                assert!(!spec.has_gateway_entry_id());
+                assert!(spec.fields.iter().any(|f| f.masked()));
+                assert!(spec.is_unresolved());
+            }
+            other => panic!("expected UserForm from awaiting, got {other:?}"),
+        }
+        assert!(turn.waiting_user_form());
+        assert!(
+            !turn.waiting_approval(),
+            "user-form HITL is not a permission card"
+        );
+        let dump = format!("{parts:?}");
+        assert!(
+            !dump.contains("s3cret-pass"),
+            "password must not appear in the assembler snapshot: {dump}"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|part| !matches!(part, ChatPart::Approval(_))),
+            "must not mount as Approval: {parts:?}"
+        );
+        assert!(
+            parts.iter().all(|part| !matches!(part, ChatPart::Ui(_))),
+            "must not mount as UiSpec::Form: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn awaiting_with_entry_id_keeps_the_gateway_card_id() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Sign in",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.call_id, "call-9");
+                assert!(spec.has_gateway_entry_id());
+            }
+            other => panic!("expected UserForm with gateway id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_message_envelope_folds_onto_the_awaiting_card() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Sign in",
+                "fields": [
+                    {"id": "email", "label": "Email", "type": "email", "required": true},
+                    {"id": "password", "label": "Password", "type": "password", "required": true}
+                ]
+            }
+        }));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": {
+                        "title": "Sign in",
+                        "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                    }
+                },
+                "formResolution": null
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.call_id, "call-9");
+                assert!(spec.has_gateway_entry_id());
+                assert!(spec.fields.iter().any(|f| f.masked()));
+            }
+            other => panic!("expected one merged card, got {other:?}"),
         }
     }
 }

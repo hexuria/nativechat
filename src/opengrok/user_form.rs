@@ -6,60 +6,55 @@
 //! `I'm done` / `Skip`). Password and other secret fields typed here must never
 //! enter AG-UI `content` or sqlite.
 //!
-//! # PR1 vs PR2
+//! # Two channels ([opengrok-server#139](https://github.com/hexuria/opengrok-server/pull/139))
 //!
-//! PR1 paints idle and settled cards. Continue is gated: the server cannot yet
-//! fill the box page ([opengrok-server#138](https://github.com/hexuria/opengrok-server/issues/138)).
-//! NativeChat does not invent `submitUserForm` / `dismissUserForm` against a
-//! 404. PR2 wires Continue / Open the screen / Dismiss after those verbs exist.
+//! 1. **AG-UI SSE** (`POST /ag-ui`): CUSTOM `name: "run-awaiting-approval"`,
+//!    `reason: "user-form"`, `tool: "request_user_form"`, `arguments` = the
+//!    sanitized formRequest (title / fields / liveHost). There is **no**
+//!    `message.type: "user-form"` on this stream. Paint from `arguments`;
+//!    activity is **Waiting for you**. This is **not** an approval card and
+//!    must not go through `POST /ag-ui/runs/{id}/answer`.
+//! 2. **Gateway transcript**: `kind: send-message`, `id` = gateway card id
+//!    (`e_{uuid}`), `message.type: user-form`, `formRequest`; sibling
+//!    `formResolution` when settled. NativeChat is AG-UI-first and does not
+//!    consume gateway `send-message` as the live turn path. The envelope is
+//!    still parsed if it appears on a value we already accept.
 //!
-//! [`USER_FORM_SERVER_FILL_AVAILABLE`] is the gate. It is `false` in this
-//! build on purpose.
+//! [`USER_FORM_CUSTOM`] (`CUSTOM` `name: "user-form"`) is a **test/fixture
+//! alias only**. The server does not emit that name on AG-UI.
 //!
-//! # Mount (provisional CUSTOM name)
+//! # Fill verbs
 //!
-//! Official desktop uses Electron `send-message` `type: "user-form"`. NativeChat
-//! is AG-UI-first. Until the server emits a documented event, this client
-//! mounts from **`CUSTOM` `name: "user-form"`** (`USER_FORM_CUSTOM`).
+//! Continue / Open the screen / Dismiss POST with an **account bearer**:
 //!
-//! Idle fixture:
+//! - `POST /ag-ui/user-form/submit` `{entryId, agentId, values}`
+//! - `POST /ag-ui/user-form/dismiss` `{entryId, agentId, mode: dismissed|escalated}`
 //!
-//! ```json
-//! {
-//!   "type": "CUSTOM",
-//!   "name": "user-form",
-//!   "value": {
-//!     "entryId": "entry-1",
-//!     "formRequest": {
-//!       "title": "Google account email",
-//!       "instruction": "Enter the other Gmail address you want to sign in with.",
-//!       "fields": [
-//!         { "id": "email", "label": "Email or phone", "type": "email", "required": true }
-//!       ],
-//!       "domain": "accounts.google.com",
-//!       "liveHost": "accounts.google.com"
-//!     },
-//!     "formResolution": null
-//!   }
-//! }
-//! ```
+//! **`entryId` is the gateway card id, never `callId`.** Submit looks the
+//! entry up by that id. A 404 means the route is missing: verbs flip off,
+//! the card stays idle, **Submitted is not painted**. A 200 JSON `null`
+//! (entry not found / no permission) is also not a fill.
 //!
-//! The official send-message envelope is also accepted as `value` (`kind`,
-//! `id`, `message.type: "user-form"`, `formResolution` as a sibling of
-//! `message`). A later CUSTOM with the same `entryId` and a `formResolution`
-//! settles the card.
+//! # Gap until [opengrok-server#140](https://github.com/hexuria/opengrok-server/issues/140)
 //!
-//! Also recognised, still provisional: `form-request`, `form-resolution`,
-//! `request-user-form`, and a `TOOL_CALL_*` named `request_user_form` whose
-//! arguments are a `formRequest`.
+//! Today's AG-UI CUSTOM carries `callId` (the tool call), not the gateway
+//! `e_…` id. Pure AgUiSink does not call `emit_suspension`, so NativeChat
+//! has no gateway card to read. Until #140 stamps `entryId` on the CUSTOM
+//! (or emits the send-message card onto AG-UI), Continue / Dismiss stay
+//! gated — we do **not** POST `callId` as `entryId` and we do not fake a
+//! fill.
+//!
+//! [`USER_FORM_SERVER_FILL_AVAILABLE`] defaults true (this server has the
+//! verbs). AppState flips it off after a 404. Fill still needs
+//! [`UserFormSpec::has_gateway_entry_id`].
 //!
 //! `formFieldOutcomes` is hashed on the official client, not painted. We parse
 //! it only so it cannot be mistaken for field values.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-/// Provisional AG-UI CUSTOM `name` for a user-form card. Documented for PR2
-/// and for whoever emits the fixture while the server catch-up is in flight.
+/// Fixture CUSTOM `name` only. Live #139 HITL is `run-awaiting-approval`
+/// with `reason: "user-form"` — see [`is_user_form_awaiting`].
 pub const USER_FORM_CUSTOM: &str = "user-form";
 
 /// Tool name official 0.29 uses while the bot waits on the card. Activity:
@@ -69,9 +64,14 @@ pub const REQUEST_USER_FORM_TOOL: &str = "request_user_form";
 /// Working-line copy while an unresolved user-form is on screen.
 pub const WAITING_FOR_YOU: &str = "Waiting for you";
 
-/// Continue must not claim a fill until the server can do it. Flip this in PR2
-/// when `submitUserForm` (or the AG-UI REST twin) exists and fills the box.
-pub const USER_FORM_SERVER_FILL_AVAILABLE: bool = false;
+/// AG-UI REST twins from opengrok-server#139. Account bearer, not the
+/// Electron coordinator, and not `/ag-ui/runs/{id}/answer`.
+pub const USER_FORM_SUBMIT_PATH: &str = "/ag-ui/user-form/submit";
+pub const USER_FORM_DISMISS_PATH: &str = "/ag-ui/user-form/dismiss";
+
+/// Default: a server that can emit the card has the verbs. AppState sets this
+/// false after a 404 so we never paint Submitted against a missing route.
+pub const USER_FORM_SERVER_FILL_AVAILABLE: bool = true;
 
 /// Field types from NativeChat #17. Anything else is default text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,8 +182,7 @@ impl UserFormField {
 /// Settled `formResolution`, including local-only **Sending**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormResolution {
-    /// Optimistic local pill. Not durable server success. PR1 does not set this
-    /// from Continue, because Continue never fires a fill.
+    /// Optimistic local pill. Not durable server success.
     Sending,
     Submitted,
     FillFailed,
@@ -237,10 +236,53 @@ impl FormResolution {
     }
 }
 
+/// `dismissUserForm` mode. Open the screen → [`Escalated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserFormDismissMode {
+    Dismissed,
+    Escalated,
+}
+
+impl UserFormDismissMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dismissed => "dismissed",
+            Self::Escalated => "escalated",
+        }
+    }
+
+    pub fn resolution(self) -> FormResolution {
+        match self {
+            Self::Dismissed => FormResolution::Dismissed,
+            Self::Escalated => FormResolution::Escalated,
+        }
+    }
+}
+
+/// What `POST /ag-ui/user-form/submit|dismiss` meant. Never treat a miss as
+/// [`FormResolution::Submitted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserFormActionReply {
+    Settled(UserFormSpec),
+    AlreadyAnswered,
+    /// 200 JSON `null`, empty body, or an object with no `formResolution`.
+    Empty,
+    /// Route is not on this server.
+    MissingRoute,
+    /// No gateway card id — we must not POST `callId` as `entryId`.
+    MissingEntryId,
+}
+
 /// A user-form card in the transcript. Field values are not stored on this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserFormSpec {
+    /// Gateway transcript card id (`e_{uuid}`). Required to POST. Empty on
+    /// today's AG-UI CUSTOM until #140 stamps `entryId`.
     pub entry_id: String,
+    /// AG-UI tool call id. Used to merge events. **Never** sent as `entryId`.
+    pub call_id: String,
+    /// AG-UI run to follow after a real settle. Empty when the event had none.
+    pub run_id: String,
     pub title: String,
     pub instruction: Option<String>,
     pub fields: Vec<UserFormField>,
@@ -268,11 +310,43 @@ impl UserFormSpec {
         self.effective_resolution().map(FormResolution::body)
     }
 
-    /// Continue is enabled only when the server can fill **and** every required
-    /// field has a value. PR1 keeps the server gate off, so this is always false
-    /// in the app; tests pass `server_fill` to cover both halves.
+    /// Submit looks the gateway entry up by this id. `callId` is not a substitute.
+    pub fn has_gateway_entry_id(&self) -> bool {
+        !self.entry_id.is_empty()
+    }
+
+    /// Identity in the transcript view when the gateway id is missing (#140).
+    pub fn card_key(&self) -> &str {
+        if !self.entry_id.is_empty() {
+            &self.entry_id
+        } else if !self.call_id.is_empty() {
+            &self.call_id
+        } else {
+            "user-form"
+        }
+    }
+
+    pub fn same_card(&self, other: &Self) -> bool {
+        if self.has_gateway_entry_id()
+            && other.has_gateway_entry_id()
+            && self.entry_id == other.entry_id
+        {
+            return true;
+        }
+        if !self.call_id.is_empty() && self.call_id == other.call_id {
+            return true;
+        }
+        false
+    }
+
+    /// Continue / Dismiss POST only when the route is present **and** we have
+    /// a gateway `entryId`. Required fields are an extra Continue gate.
     pub fn continue_enabled(&self, values: &UserFormValues, server_fill: bool) -> bool {
-        server_fill && self.required_fields_filled(values)
+        self.can_post(server_fill) && self.required_fields_filled(values)
+    }
+
+    pub fn can_post(&self, server_fill: bool) -> bool {
+        server_fill && self.has_gateway_entry_id()
     }
 
     pub fn required_fields_filled(&self, values: &UserFormValues) -> bool {
@@ -282,9 +356,18 @@ impl UserFormSpec {
             .all(|field| values.filled(field))
     }
 
-    /// Fold a later event for the same entry onto this card (resolution, or a
+    /// Fold a later event for the same card onto this one (resolution, or a
     /// fuller request). Secret values are not carried.
     pub fn merge(&mut self, incoming: UserFormSpec) {
+        if incoming.has_gateway_entry_id() {
+            self.entry_id = incoming.entry_id;
+        }
+        if !incoming.call_id.is_empty() {
+            self.call_id = incoming.call_id;
+        }
+        if !incoming.run_id.is_empty() {
+            self.run_id = incoming.run_id;
+        }
         if !incoming.title.is_empty() {
             self.title = incoming.title;
         }
@@ -307,24 +390,49 @@ impl UserFormSpec {
     }
 
     pub fn from_custom_event(event: &Value) -> Option<Self> {
+        if is_user_form_awaiting(event)
+            && let Some(spec) = Self::from_awaiting_event(event, None)
+        {
+            return Some(spec);
+        }
         let name = event.get("name").and_then(Value::as_str).unwrap_or("");
         let value = event.get("value").unwrap_or(event);
         if !is_user_form_event(name, value) {
             return None;
         }
-        Self::parse(value, entry_id_hint(event, value))
+        let mut spec = Self::parse(value, gateway_entry_id(event, value))?;
+        fill_run_and_call(&mut spec, event);
+        Some(spec)
+    }
+
+    /// Live #139 HITL: CUSTOM `run-awaiting-approval` + `reason: user-form`.
+    /// Paint from `arguments` (sanitized schema). `callId` is recorded for
+    /// merge only — it is not `entryId`. If a send-message envelope is on
+    /// `value`, its gateway `id` is the fill target.
+    pub fn from_awaiting_event(event: &Value, args_fallback: Option<&Value>) -> Option<Self> {
+        let arguments = arguments_object(event, args_fallback);
+        let value = event.get("value").unwrap_or(&Value::Null);
+        let hint = gateway_entry_id(event, &arguments).or_else(|| gateway_entry_id(event, event));
+        let mut spec = Self::parse(&arguments, hint.clone())
+            .or_else(|| Self::parse(&json!({ "formRequest": arguments.clone() }), hint.clone()))
+            .or_else(|| {
+                looks_like_user_form_value(value)
+                    .then(|| Self::parse(value, hint.clone()))
+                    .flatten()
+            })?;
+        fill_run_and_call(&mut spec, event);
+        Some(spec)
     }
 
     pub fn from_tool_args(args: &Value, tool_call_id: &str) -> Option<Self> {
         if !looks_like_user_form_value(args) && args.get("fields").is_none() {
             return None;
         }
-        let hint = if tool_call_id.is_empty() {
-            None
-        } else {
-            Some(tool_call_id.to_string())
-        };
-        Self::parse(args, hint)
+        let mut spec = Self::parse(args, gateway_entry_id_in(args))?;
+        if spec.call_id.is_empty() && !tool_call_id.is_empty() {
+            spec.call_id = tool_call_id.to_string();
+        }
+        Some(spec)
     }
 
     pub fn parse(value: &Value, entry_id: Option<String>) -> Option<Self> {
@@ -340,14 +448,8 @@ impl UserFormSpec {
             .or_else(|| string_field(value, "title"))
             .unwrap_or_default();
         let entry_id = entry_id
-            .or_else(|| string_field(value, "entryId"))
-            .or_else(|| string_field(value, "id"))
-            .or_else(|| {
-                value
-                    .get("message")
-                    .and_then(|message| string_field(message, "id"))
-            })
-            .unwrap_or_else(|| "user-form".to_string());
+            .or_else(|| gateway_entry_id_in(value))
+            .unwrap_or_default();
         if fields.is_empty() && title.is_empty() && resolution.is_none() && !widget_dismissed {
             return None;
         }
@@ -358,6 +460,8 @@ impl UserFormSpec {
             .or_else(|| value.get("formFieldOutcomes"));
         Some(Self {
             entry_id,
+            call_id: String::new(),
+            run_id: String::new(),
             // Empty when the event is resolution-only, so merge does not
             // clobber a title the request already set.
             title,
@@ -420,8 +524,17 @@ impl UserFormValues {
         }
         parts.join(",")
     }
+
+    pub fn as_json_object(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        for (id, value) in &self.by_id {
+            map.insert(id.clone(), Value::String(value.clone()));
+        }
+        Value::Object(map)
+    }
 }
 
+/// Fixture / optional CUSTOM names. Not what #139 emits on AG-UI SSE.
 pub fn is_user_form_custom_name(name: &str) -> bool {
     matches!(
         normalize_name(name).as_str(),
@@ -438,6 +551,84 @@ pub fn is_user_form_tool(name: &str) -> bool {
 
 pub fn is_user_form_event(name: &str, value: &Value) -> bool {
     is_user_form_custom_name(name) || looks_like_user_form_value(value)
+}
+
+/// Live AG-UI HITL from #139: CUSTOM `run-awaiting-approval` whose reason
+/// (or tool) is the user-form, not exec-consent.
+pub fn is_user_form_awaiting(event: &Value) -> bool {
+    let name = event
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .get("value")
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    if name != "run-awaiting-approval" {
+        return false;
+    }
+    let reason = string_field(event, "reason")
+        .or_else(|| {
+            event
+                .get("value")
+                .and_then(|value| string_field(value, "reason"))
+        })
+        .unwrap_or_default();
+    if reason.eq_ignore_ascii_case("user-form") {
+        return true;
+    }
+    let tool = string_field(event, "tool")
+        .or_else(|| {
+            event
+                .get("value")
+                .and_then(|value| string_field(value, "tool"))
+        })
+        .unwrap_or_default();
+    is_user_form_tool(&tool)
+}
+
+pub fn submit_request_body(entry_id: &str, agent_id: &str, values: &UserFormValues) -> Value {
+    json!({
+        "entryId": entry_id,
+        "agentId": agent_id,
+        "values": values.as_json_object(),
+    })
+}
+
+pub fn dismiss_request_body(entry_id: &str, agent_id: &str, mode: UserFormDismissMode) -> Value {
+    json!({
+        "entryId": entry_id,
+        "agentId": agent_id,
+        "mode": mode.as_str(),
+    })
+}
+
+/// Classify a submit/dismiss HTTP response. 404 and 200-null are not fills.
+pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionReply {
+    if status == 404 {
+        return UserFormActionReply::MissingRoute;
+    }
+    if status != 200 {
+        return UserFormActionReply::Empty;
+    }
+    if body.is_null() {
+        return UserFormActionReply::Empty;
+    }
+    let already = body
+        .get("alreadyAnswered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(spec) = UserFormSpec::parse(body, gateway_entry_id_in(body)) {
+        if spec.effective_resolution().is_some() {
+            return UserFormActionReply::Settled(spec);
+        }
+    }
+    if already {
+        return UserFormActionReply::AlreadyAnswered;
+    }
+    UserFormActionReply::Empty
 }
 
 fn looks_like_user_form_value(value: &Value) -> bool {
@@ -477,22 +668,67 @@ fn form_request_object(value: &Value) -> Option<&Value> {
         })
 }
 
-fn entry_id_hint(event: &Value, value: &Value) -> Option<String> {
-    string_field(value, "entryId")
-        .or_else(|| string_field(value, "id"))
-        .or_else(|| string_field(event, "entryId"))
-        .or_else(|| string_field(event, "id"))
-        .or_else(|| {
-            value
-                .get("message")
-                .and_then(|message| string_field(message, "id"))
-        })
+/// Gateway card id only. `callId` / `toolCallId` / a generic AG-UI `id` are
+/// not this. A send-message envelope may live on `event.value`.
+fn gateway_entry_id(event: &Value, value: &Value) -> Option<String> {
+    string_field(event, "entryId")
+        .or_else(|| gateway_entry_id_in(value))
+        .or_else(|| event.get("value").and_then(gateway_entry_id_in))
+}
+
+fn gateway_entry_id_in(value: &Value) -> Option<String> {
+    string_field(value, "entryId").or_else(|| {
+        let send_message = value.get("kind").and_then(Value::as_str) == Some("send-message");
+        let user_form_card = looks_like_user_form_value(value);
+        if send_message || user_form_card {
+            string_field(value, "id")
+        } else {
+            None
+        }
+    })
+}
+
+fn fill_run_and_call(spec: &mut UserFormSpec, event: &Value) {
+    if spec.run_id.is_empty() {
+        spec.run_id = string_field(event, "runId")
+            .or_else(|| {
+                event
+                    .get("value")
+                    .and_then(|value| string_field(value, "runId"))
+            })
+            .unwrap_or_default();
+    }
+    if spec.call_id.is_empty() {
+        spec.call_id = string_field(event, "callId")
+            .or_else(|| string_field(event, "toolCallId"))
+            .or_else(|| {
+                event.get("value").and_then(|value| {
+                    string_field(value, "callId").or_else(|| string_field(value, "toolCallId"))
+                })
+            })
+            .unwrap_or_default();
+    }
+}
+
+fn arguments_object(event: &Value, fallback: Option<&Value>) -> Value {
+    let raw = event
+        .get("arguments")
+        .cloned()
         .or_else(|| {
             event
-                .get("toolCallId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+                .get("value")
+                .and_then(|value| value.get("arguments"))
+                .cloned()
         })
+        .or_else(|| fallback.cloned())
+        .unwrap_or(Value::Null);
+    if raw.is_null() {
+        return fallback.cloned().unwrap_or(Value::Null);
+    }
+    if let Some(s) = raw.as_str() {
+        return serde_json::from_str(s).unwrap_or(raw);
+    }
+    raw
 }
 
 fn parse_resolution(value: &Value) -> Option<FormResolution> {
@@ -608,7 +844,7 @@ fn normalize_name(name: &str) -> String {
         .replace(' ', "-")
 }
 
-/// Continue's two gates, for tests and for the renderer. Never "fill succeeded".
+/// Continue's gates, for tests and for the renderer. Never "fill succeeded".
 pub fn continue_enabled(spec: &UserFormSpec, values: &UserFormValues, server_fill: bool) -> bool {
     spec.continue_enabled(values, server_fill)
 }
@@ -635,6 +871,34 @@ mod tests {
         })
     }
 
+    fn live_awaiting(entry_id: Option<&str>) -> Value {
+        let mut event = json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": REQUEST_USER_FORM_TOOL,
+            "reason": "user-form",
+            "why": WAITING_FOR_YOU,
+            "arguments": {
+                "title": "Google account email",
+                "instruction": "Enter the other Gmail address you want to sign in with.",
+                "fields": [
+                    {"id": "email", "label": "Email or phone", "type": "email", "required": true},
+                    {"id": "password", "label": "Password", "type": "password", "required": true}
+                ],
+                "liveHost": "accounts.google.com"
+            }
+        });
+        if let Some(id) = entry_id {
+            event
+                .as_object_mut()
+                .unwrap()
+                .insert("entryId".into(), json!(id));
+        }
+        event
+    }
+
     #[test]
     fn official_send_message_envelope_parses_idle_card() {
         let event = json!({
@@ -642,7 +906,7 @@ mod tests {
             "name": USER_FORM_CUSTOM,
             "value": {
                 "kind": "send-message",
-                "id": "entry-email",
+                "id": "e_entry-email",
                 "message": {
                     "type": "user-form",
                     "formRequest": google_email_request()
@@ -651,7 +915,8 @@ mod tests {
             }
         });
         let spec = UserFormSpec::from_custom_event(&event).expect("idle card");
-        assert_eq!(spec.entry_id, "entry-email");
+        assert_eq!(spec.entry_id, "e_entry-email");
+        assert!(spec.has_gateway_entry_id());
         assert_eq!(spec.title, "Google account email");
         assert_eq!(
             spec.instruction.as_deref(),
@@ -664,6 +929,130 @@ mod tests {
         assert!(spec.is_unresolved());
         assert_eq!(spec.domain.as_deref(), Some("accounts.google.com"));
         assert_eq!(spec.live_host.as_deref(), Some("accounts.google.com"));
+    }
+
+    #[test]
+    fn live_awaiting_paints_from_arguments_and_does_not_use_call_id_as_entry() {
+        let spec = UserFormSpec::from_custom_event(&live_awaiting(None)).expect("card");
+        assert!(is_user_form_awaiting(&live_awaiting(None)));
+        assert_eq!(spec.call_id, "call-9");
+        assert_eq!(spec.run_id, "run-1");
+        assert!(
+            spec.entry_id.is_empty(),
+            "callId must not be sent as entryId: {}",
+            spec.entry_id
+        );
+        assert!(!spec.has_gateway_entry_id());
+        assert_eq!(spec.title, "Google account email");
+        assert_eq!(spec.fields.len(), 2);
+        assert!(spec.fields[1].masked());
+        assert!(spec.is_unresolved());
+        let mut filled = UserFormValues::default();
+        filled.by_id.insert("email".into(), "you@gmail.com".into());
+        filled.by_id.insert("password".into(), "s3cret-pass".into());
+        assert!(
+            !continue_enabled(&spec, &filled, true),
+            "without a gateway entryId Continue stays gated"
+        );
+        assert!(!spec.can_post(true));
+    }
+
+    #[test]
+    fn agui_event_id_is_not_the_gateway_card() {
+        let mut event = live_awaiting(None);
+        event
+            .as_object_mut()
+            .unwrap()
+            .insert("id".into(), json!("agui-event-1"));
+        let spec = UserFormSpec::from_custom_event(&event).expect("card");
+        assert!(
+            spec.entry_id.is_empty(),
+            "CUSTOM id is not a gateway entryId: {}",
+            spec.entry_id
+        );
+        assert_eq!(spec.call_id, "call-9");
+    }
+
+    #[test]
+    fn awaiting_paints_arguments_and_takes_entry_id_from_send_message_value() {
+        let mut event = live_awaiting(None);
+        event.as_object_mut().unwrap().insert(
+            "value".into(),
+            json!({
+                "kind": "send-message",
+                "id": "e_from_gateway",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": google_email_request()
+                },
+                "formResolution": null
+            }),
+        );
+        let spec = UserFormSpec::from_custom_event(&event).expect("card");
+        assert_eq!(spec.entry_id, "e_from_gateway");
+        assert_eq!(spec.call_id, "call-9");
+        assert!(spec.has_gateway_entry_id());
+        assert_eq!(spec.fields.len(), 2, "arguments win over value for paint");
+        assert!(spec.fields.iter().any(|f| f.masked()));
+        let mut filled = UserFormValues::default();
+        filled.by_id.insert("email".into(), "you@gmail.com".into());
+        filled.by_id.insert("password".into(), "s3cret-pass".into());
+        assert!(continue_enabled(&spec, &filled, true));
+    }
+
+    #[test]
+    fn awaiting_without_arguments_still_paints_a_send_message_value() {
+        let event = json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": REQUEST_USER_FORM_TOOL,
+            "reason": "user-form",
+            "value": {
+                "kind": "send-message",
+                "id": "e_entry-email",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": google_email_request()
+                },
+                "formResolution": null
+            }
+        });
+        let spec = UserFormSpec::from_custom_event(&event).expect("card");
+        assert_eq!(spec.entry_id, "e_entry-email");
+        assert_eq!(spec.call_id, "call-9");
+        assert_eq!(spec.title, "Google account email");
+        assert!(spec.is_unresolved());
+        assert!(spec.has_gateway_entry_id());
+    }
+
+    #[test]
+    fn awaiting_with_entry_id_can_post() {
+        let spec = UserFormSpec::from_custom_event(&live_awaiting(Some("e_form"))).expect("card");
+        assert_eq!(spec.entry_id, "e_form");
+        assert_eq!(spec.call_id, "call-9");
+        assert!(spec.has_gateway_entry_id());
+        let mut filled = UserFormValues::default();
+        filled.by_id.insert("email".into(), "you@gmail.com".into());
+        filled.by_id.insert("password".into(), "s3cret-pass".into());
+        assert!(continue_enabled(&spec, &filled, true));
+        assert!(USER_FORM_SERVER_FILL_AVAILABLE);
+    }
+
+    #[test]
+    fn exec_consent_awaiting_is_not_a_user_form() {
+        let event = json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "user_machine_shell",
+            "reason": "exec-consent",
+            "arguments": {"command": "ls"}
+        });
+        assert!(!is_user_form_awaiting(&event));
+        assert!(UserFormSpec::from_custom_event(&event).is_none());
     }
 
     #[test]
@@ -811,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_needs_server_fill_and_required_fields() {
+    fn continue_needs_server_fill_entry_id_and_required_fields() {
         let spec = UserFormSpec::parse(
             &json!({
                 "entryId": "e1",
@@ -820,16 +1209,18 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(spec.has_gateway_entry_id());
         let empty = UserFormValues::default();
         let mut filled = UserFormValues::default();
         filled.by_id.insert("email".into(), "you@gmail.com".into());
-        assert!(
-            !continue_enabled(&spec, &filled, USER_FORM_SERVER_FILL_AVAILABLE),
-            "PR1 must keep Continue gated"
-        );
         assert!(!continue_enabled(&spec, &empty, true));
-        assert!(continue_enabled(&spec, &filled, true));
-        assert!(!USER_FORM_SERVER_FILL_AVAILABLE);
+        assert!(continue_enabled(
+            &spec,
+            &filled,
+            USER_FORM_SERVER_FILL_AVAILABLE
+        ));
+        assert!(!continue_enabled(&spec, &filled, false));
+        assert!(USER_FORM_SERVER_FILL_AVAILABLE);
     }
 
     #[test]
@@ -909,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_args_parse_request_user_form() {
+    fn tool_args_keep_call_id_off_entry_id() {
         let spec = UserFormSpec::from_tool_args(
             &json!({
                 "formRequest": google_email_request()
@@ -917,7 +1308,63 @@ mod tests {
             "call-9",
         )
         .unwrap();
-        assert_eq!(spec.entry_id, "call-9");
+        assert_eq!(spec.call_id, "call-9");
+        assert!(
+            spec.entry_id.is_empty(),
+            "tool call id is not the gateway card: {}",
+            spec.entry_id
+        );
+        assert!(!spec.has_gateway_entry_id());
         assert!(spec.is_unresolved());
+    }
+
+    #[test]
+    fn http_404_and_200_null_are_not_submitted() {
+        assert_eq!(
+            user_form_action_from_http(404, &Value::Null),
+            UserFormActionReply::MissingRoute
+        );
+        assert_eq!(
+            user_form_action_from_http(200, &Value::Null),
+            UserFormActionReply::Empty
+        );
+        assert_eq!(
+            user_form_action_from_http(200, &json!({ "alreadyAnswered": true })),
+            UserFormActionReply::AlreadyAnswered
+        );
+        match user_form_action_from_http(
+            200,
+            &json!({
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": google_email_request()
+                },
+                "formResolution": "submitted"
+            }),
+        ) {
+            UserFormActionReply::Settled(spec) => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+            }
+            other => panic!("expected Settled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_body_carries_values_that_must_not_become_chat_text() {
+        let mut values = UserFormValues::default();
+        values
+            .by_id
+            .insert("email".into(), "ada@example.com".into());
+        values.by_id.insert("password".into(), "s3cret-pass".into());
+        let body = submit_request_body("e_form", "cw_1", &values);
+        assert_eq!(body["entryId"], "e_form");
+        assert_eq!(body["agentId"], "cw_1");
+        assert_eq!(body["values"]["password"], "s3cret-pass");
+        let dismiss = dismiss_request_body("e_form", "cw_1", UserFormDismissMode::Escalated);
+        assert_eq!(dismiss["mode"], "escalated");
+        assert!(dismiss.get("values").is_none());
     }
 }

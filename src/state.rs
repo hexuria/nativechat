@@ -7,14 +7,14 @@ use crate::chrome::{
 use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
-    Coworker, CoworkerComputer, CoworkerPatch, Failure, FormSpec, LocalExecMode,
+    Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, LocalExecMode,
     LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
     QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
     RecipeStep, RecipeSummary, ReplyQuote, RunReplay, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, Unreachable, WAITING_FOR_YOU, activity_from_replay,
-    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    local_exec_outcome, policy_answer, reads_as_gateway_unreachable, serve_local_exec,
-    stored_machine_id, tool_standin,
+    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
+    UserFormDismissMode, UserFormValues, WAITING_FOR_YOU, activity_from_replay, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
+    policy_answer, reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -1335,7 +1335,13 @@ pub struct AppState {
     pub form_picks: HashMap<String, HashMap<String, String>>,
     /// Checkbox / select picks on a user-form. Never passwords or other secrets —
     /// those stay in the transcript view's input state and are never written here.
+    /// Keyed by [`crate::opengrok::UserFormSpec::card_key`].
     pub user_form_picks: HashMap<String, HashMap<String, String>>,
+    /// Routes exist on this server. Flipped off after a 404; never fake Submitted.
+    pub user_form_verbs_available: bool,
+    /// Local/server settlements grafted onto AG-UI replay, which does not carry
+    /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
+    user_form_resolutions: HashMap<String, FormResolution>,
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
@@ -1429,6 +1435,11 @@ impl ApprovalDecision {
         };
         Some(local_exec_outcome(bot, resolution, place))
     }
+}
+
+enum UserFormDispatch {
+    Submit(UserFormValues),
+    Dismiss(UserFormDismissMode),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1665,6 +1676,8 @@ impl AppState {
             emoji_picker: None,
             form_picks: HashMap::new(),
             user_form_picks: HashMap::new(),
+            user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
+            user_form_resolutions: HashMap::new(),
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
@@ -4478,6 +4491,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
+        let parts = self.graft_user_forms(parts);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -4806,7 +4820,7 @@ impl AppState {
                                         &reply_id,
                                     ) {
                                         message.content = plain.clone();
-                                        message.parts = parts.clone();
+                                        message.parts = state.graft_user_forms(parts.clone());
                                         cx.notify();
                                     }
                                     if assembler.waiting_approval() {
@@ -4839,7 +4853,7 @@ impl AppState {
                             &reply_id,
                         ) {
                             message.content = plain;
-                            message.parts = parts;
+                            message.parts = state.graft_user_forms(parts);
                         }
                         cx.notify();
                     });
@@ -5349,6 +5363,7 @@ impl AppState {
                                     label: "Working".into(),
                                 });
                             let _ = this.update(cx, |state, cx| {
+                                let parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card.
@@ -5724,10 +5739,11 @@ impl AppState {
     }
 
     /// Non-secret user-form control (checkbox / select). Do not call this with a
-    /// password or otp; those never belong on `AppState`.
+    /// password or otp; those never belong on `AppState`. `card_key` is
+    /// [`crate::opengrok::UserFormSpec::card_key`], not `callId` as a fill id.
     pub fn pick_user_form_option(
         &mut self,
-        entry_id: String,
+        card_key: String,
         field_id: String,
         value: String,
         cx: &mut Context<Self>,
@@ -5735,7 +5751,7 @@ impl AppState {
         let masked = self.conversations.iter().any(|conversation| {
             conversation.messages.iter().any(|message| {
                 message.parts.iter().any(|part| match part {
-                    ChatPart::UserForm(spec) if spec.entry_id == entry_id => spec
+                    ChatPart::UserForm(spec) if spec.card_key() == card_key => spec
                         .fields
                         .iter()
                         .any(|field| field.id == field_id && field.masked()),
@@ -5747,10 +5763,189 @@ impl AppState {
             return;
         }
         self.user_form_picks
-            .entry(entry_id)
+            .entry(card_key)
             .or_default()
             .insert(field_id, value);
         cx.notify();
+    }
+
+    fn graft_user_forms(&self, mut parts: Vec<ChatPart>) -> Vec<ChatPart> {
+        for part in &mut parts {
+            if let ChatPart::UserForm(spec) = part
+                && spec.effective_resolution().is_none()
+            {
+                let key = spec.card_key().to_string();
+                if let Some(&res) = self
+                    .user_form_resolutions
+                    .get(&spec.entry_id)
+                    .or_else(|| self.user_form_resolutions.get(&key))
+                {
+                    spec.resolution = Some(res);
+                }
+            }
+        }
+        parts
+    }
+
+    fn user_form_mut(&mut self, card_key: &str) -> Option<&mut crate::opengrok::UserFormSpec> {
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                for part in &mut message.parts {
+                    if let ChatPart::UserForm(spec) = part
+                        && spec.card_key() == card_key
+                    {
+                        return Some(spec);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn user_form_context(&self, card_key: &str) -> Option<(String, String, String, String)> {
+        for conversation in &self.conversations {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    if let ChatPart::UserForm(spec) = part
+                        && spec.card_key() == card_key
+                    {
+                        let run_id = if spec.run_id.is_empty() {
+                            self.live_turns
+                                .get(&conversation.id)
+                                .map(|turn| turn.run_id.clone())
+                                .unwrap_or_default()
+                        } else {
+                            spec.run_id.clone()
+                        };
+                        return Some((
+                            spec.entry_id.clone(),
+                            run_id,
+                            conversation.id.clone(),
+                            conversation.id.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn remember_user_form_resolution(&mut self, spec: &crate::opengrok::UserFormSpec) {
+        if let Some(resolution) = spec.effective_resolution() {
+            if spec.has_gateway_entry_id() {
+                self.user_form_resolutions
+                    .insert(spec.entry_id.clone(), resolution);
+            }
+            self.user_form_resolutions
+                .insert(spec.card_key().to_string(), resolution);
+        }
+    }
+
+    fn clear_user_form_sending(&mut self, card_key: &str) {
+        if let Some(spec) = self.user_form_mut(card_key) {
+            if spec.resolution == Some(FormResolution::Sending) {
+                spec.resolution = None;
+            }
+        }
+        self.user_form_resolutions
+            .retain(|_, res| *res != FormResolution::Sending);
+    }
+
+    /// Continue: POST `/ag-ui/user-form/submit`. Secrets stay in `values` for
+    /// this request only — never `send_message`, AG-UI `content`, or sqlite.
+    pub fn submit_user_form(
+        &mut self,
+        card_key: String,
+        values: UserFormValues,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_user_form(card_key, UserFormDispatch::Submit(values), cx);
+    }
+
+    /// Open the screen (`escalated`) or Dismiss (`dismissed`).
+    pub fn dismiss_user_form(
+        &mut self,
+        card_key: String,
+        mode: UserFormDismissMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_user_form(card_key, UserFormDispatch::Dismiss(mode), cx);
+    }
+
+    fn dispatch_user_form(
+        &mut self,
+        card_key: String,
+        action: UserFormDispatch,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.user_form_verbs_available {
+            return;
+        }
+        let Some((entry_id, run_id, conversation_id, agent_id)) = self.user_form_context(&card_key)
+        else {
+            return;
+        };
+        if entry_id.is_empty() {
+            // #140: AG-UI CUSTOM has no gateway card id. Do not POST callId.
+            return;
+        }
+        if let Some(spec) = self.user_form_mut(&card_key) {
+            spec.resolution = Some(FormResolution::Sending);
+        }
+        self.user_form_resolutions
+            .insert(card_key.clone(), FormResolution::Sending);
+        cx.notify();
+        let Some(client) = self.opengrok.clone() else {
+            self.clear_user_form_sending(&card_key);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = match action {
+                UserFormDispatch::Submit(values) => {
+                    client.submit_user_form(&entry_id, &agent_id, &values).await
+                }
+                UserFormDispatch::Dismiss(mode) => {
+                    client.dismiss_user_form(&entry_id, &agent_id, mode).await
+                }
+            };
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(UserFormActionReply::Settled(incoming)) => {
+                        state.remember_user_form_resolution(&incoming);
+                        if let Some(spec) = state.user_form_mut(&card_key) {
+                            spec.merge(incoming);
+                        }
+                        state.user_form_picks.remove(&card_key);
+                        if !run_id.is_empty() {
+                            state.begin_responding(Some(&conversation_id), "Working");
+                            state.follow_run(run_id, Some(conversation_id), cx);
+                        }
+                    }
+                    Ok(UserFormActionReply::AlreadyAnswered) => {
+                        state.clear_user_form_sending(&card_key);
+                        if !run_id.is_empty() {
+                            state.begin_responding(Some(&conversation_id), "Working");
+                            state.follow_run(run_id, Some(conversation_id), cx);
+                        }
+                    }
+                    Ok(UserFormActionReply::MissingRoute) => {
+                        state.user_form_verbs_available = false;
+                        state.clear_user_form_sending(&card_key);
+                    }
+                    Ok(UserFormActionReply::Empty) | Ok(UserFormActionReply::MissingEntryId) => {
+                        state.clear_user_form_sending(&card_key);
+                    }
+                    Err(error) => {
+                        state.clear_user_form_sending(&card_key);
+                        if error.is_signed_out() {
+                            state.note_signed_out(cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn submit_form(&mut self, message_id: String, spec: FormSpec, cx: &mut Context<Self>) {
@@ -6832,11 +7027,7 @@ mod tests {
         let kept: Vec<&str> = sent.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             kept,
-            vec![
-                "hi",
-                "still there?",
-                "[took a screenshot of my screen]"
-            ]
+            vec!["hi", "still there?", "[took a screenshot of my screen]"]
         );
     }
 
@@ -6876,6 +7067,18 @@ mod tests {
         assert!(
             !dump.contains("s3cret-pass"),
             "password in Debug of messages: {dump}"
+        );
+        let mut values = crate::opengrok::UserFormValues::default();
+        values.by_id.insert("password".into(), "s3cret-pass".into());
+        let body = crate::opengrok::submit_request_body("e_form", "cw_1", &values);
+        assert_eq!(body["values"]["password"], "s3cret-pass");
+        assert!(
+            !sent[0].content.contains("s3cret-pass"),
+            "submit values must not leak into AguiMessage.content"
+        );
+        assert_eq!(
+            crate::opengrok::user_form_action_from_http(404, &serde_json::Value::Null),
+            crate::opengrok::UserFormActionReply::MissingRoute
         );
     }
 

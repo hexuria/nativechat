@@ -44,6 +44,7 @@ struct ChatFeedRev {
     form_picks: Vec<(String, String, String)>,
     user_form_picks: Vec<(String, String, String)>,
     user_forms: Vec<(String, String)>,
+    user_form_verbs: bool,
     is_ai_responding: bool,
     debug_mode: bool,
     can_read_aloud: bool,
@@ -110,10 +111,16 @@ impl ChatFeedRev {
                             .flat_map(|m| m.parts.iter())
                             .filter_map(|part| match part {
                                 ChatPart::UserForm(spec) => Some((
-                                    spec.entry_id.clone(),
+                                    spec.card_key().to_string(),
                                     spec.effective_resolution()
                                         .map(|r| r.as_str().to_string())
-                                        .unwrap_or_else(|| "idle".into()),
+                                        .unwrap_or_else(|| {
+                                            if spec.has_gateway_entry_id() {
+                                                "idle".into()
+                                            } else {
+                                                "idle-no-entry".into()
+                                            }
+                                        }),
                                 )),
                                 _ => None,
                             })
@@ -123,6 +130,7 @@ impl ChatFeedRev {
                 cards.sort();
                 cards
             },
+            user_form_verbs: state.user_form_verbs_available,
             is_ai_responding: state.is_active_bot_responding(),
             debug_mode: state.debug_markdown_disabled,
             can_read_aloud: true,
@@ -739,7 +747,7 @@ impl ChatTranscript {
                     | crate::opengrok::UserFormFieldKind::Select => {}
                     crate::opengrok::UserFormFieldKind::Textarea => {
                         needed.insert(
-                            field_key(&spec.entry_id, &field.id),
+                            field_key(spec.card_key(), &field.id),
                             (
                                 true,
                                 field.masked(),
@@ -750,7 +758,7 @@ impl ChatTranscript {
                     }
                     _ => {
                         needed.insert(
-                            field_key(&spec.entry_id, &field.id),
+                            field_key(spec.card_key(), &field.id),
                             (
                                 false,
                                 field.masked(),
@@ -993,7 +1001,7 @@ impl Render for ChatTranscript {
                                 let picks = app_state
                                     .read(cx)
                                     .user_form_picks
-                                    .get(&spec.entry_id)
+                                    .get(spec.card_key())
                                     .cloned()
                                     .unwrap_or_default();
                                 let mut values = UserFormValues { by_id: picks };
@@ -1001,7 +1009,7 @@ impl Render for ChatTranscript {
                                     if values.by_id.contains_key(&field.id) {
                                         continue;
                                     }
-                                    let key = field_key(&spec.entry_id, &field.id);
+                                    let key = field_key(spec.card_key(), &field.id);
                                     let raw = if let Some(state) = user_form_textareas.get(&key) {
                                         Some(state.read(cx).value().to_string())
                                     } else {

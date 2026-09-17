@@ -2,14 +2,16 @@
 //! (choice chips → `send_message`), and from future secret-request / Computer
 //! handoff cards.
 //!
-//! Continue is gated in PR1: it must not claim a fill, and it must not POST a
-//! verb the server does not have. Open the screen / Dismiss are painted and
-//! similarly not wired. Settled pills come from parsed `formResolution`.
+//! Continue / Open the screen / Dismiss POST `/ag-ui/user-form/submit|dismiss`
+//! when the server has the verbs **and** the card has a gateway `entryId`.
+//! Without `entryId` (today's AG-UI CUSTOM until opengrok-server#140) the
+//! buttons stay gated — we do not POST `callId`. Secrets collected here go
+//! only in the REST body, never `send_message` / AG-UI `content` / sqlite.
 
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    FormResolution, USER_FORM_SERVER_FILL_AVAILABLE, UserFormField, UserFormFieldKind,
-    UserFormSpec, UserFormValues, continue_enabled,
+    FormResolution, USER_FORM_SERVER_FILL_AVAILABLE, UserFormDismissMode, UserFormField,
+    UserFormFieldKind, UserFormSpec, UserFormValues, continue_enabled,
 };
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -23,8 +25,8 @@ use std::collections::HashMap;
 pub type UserFormInputMap = HashMap<String, Entity<InputState>>;
 pub type UserFormTextareaMap = HashMap<String, Entity<TextareaState>>;
 
-pub fn field_key(entry_id: &str, field_id: &str) -> String {
-    format!("{entry_id}\u{1f}{field_id}")
+pub fn field_key(card_key: &str, field_id: &str) -> String {
+    format!("{card_key}\u{1f}{field_id}")
 }
 
 pub fn render_user_form(
@@ -50,7 +52,12 @@ fn render_idle(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
-    let can_continue = continue_enabled(spec, values, USER_FORM_SERVER_FILL_AVAILABLE);
+    let server_fill = app
+        .as_ref()
+        .map(|entity| entity.read(cx).user_form_verbs_available)
+        .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
+    let can_post = spec.can_post(server_fill);
+    let can_continue = continue_enabled(spec, values, server_fill);
     let mut body = v_flex()
         .w_full()
         .gap(px(10.))
@@ -98,33 +105,119 @@ fn render_idle(
             cx,
         ));
     }
-    let entry = spec.entry_id.clone();
+    let key = spec.card_key().to_string();
     body.child(
         h_flex()
             .w_full()
             .justify_end()
             .gap(px(8.))
             .flex_wrap()
-            .child(gated_button(
-                format!("user-form-continue-{entry}"),
+            .child(action_button(
+                format!("user-form-continue-{key}"),
                 "Continue",
                 ButtonKind::Primary,
                 !can_continue,
+                !can_post,
+                {
+                    let spec = spec.clone();
+                    let inputs = inputs.clone();
+                    let textareas = textareas.clone();
+                    let picks = values.clone();
+                    let app = app.clone();
+                    let key = key.clone();
+                    can_continue.then_some(move |cx: &mut App| {
+                        let values = collect_submit_values(&spec, &inputs, &textareas, &picks, cx);
+                        if let Some(app) = &app {
+                            app.update(cx, |state, cx| {
+                                state.submit_user_form(key.clone(), values, cx);
+                            });
+                        }
+                    })
+                },
             ))
-            .child(gated_button(
-                format!("user-form-screen-{entry}"),
+            .child(action_button(
+                format!("user-form-screen-{key}"),
                 "Open the screen",
                 ButtonKind::Secondary,
-                true,
+                !can_post,
+                !can_post,
+                {
+                    let app = app.clone();
+                    let key = key.clone();
+                    can_post.then_some(move |cx: &mut App| {
+                        if let Some(app) = &app {
+                            app.update(cx, |state, cx| {
+                                state.dismiss_user_form(
+                                    key.clone(),
+                                    UserFormDismissMode::Escalated,
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                },
             ))
-            .child(gated_button(
-                format!("user-form-dismiss-{entry}"),
+            .child(action_button(
+                format!("user-form-dismiss-{key}"),
                 "Dismiss",
                 ButtonKind::Ghost,
-                true,
+                !can_post,
+                !can_post,
+                {
+                    let app = app.clone();
+                    can_post.then_some(move |cx: &mut App| {
+                        if let Some(app) = &app {
+                            app.update(cx, |state, cx| {
+                                state.dismiss_user_form(
+                                    key.clone(),
+                                    UserFormDismissMode::Dismissed,
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                },
             )),
     )
     .into_any_element()
+}
+
+fn collect_submit_values(
+    spec: &UserFormSpec,
+    inputs: &UserFormInputMap,
+    textareas: &UserFormTextareaMap,
+    picks: &UserFormValues,
+    cx: &App,
+) -> UserFormValues {
+    let mut out = UserFormValues::default();
+    for field in &spec.fields {
+        let key = field_key(spec.card_key(), &field.id);
+        let raw = match field.kind {
+            UserFormFieldKind::Checkbox | UserFormFieldKind::Select => {
+                picks.by_id.get(&field.id).cloned().unwrap_or_default()
+            }
+            UserFormFieldKind::Textarea => textareas
+                .get(&key)
+                .map(|state| state.read(cx).value().to_string())
+                .unwrap_or_default(),
+            _ => inputs
+                .get(&key)
+                .map(|state| state.read(cx).value().to_string())
+                .unwrap_or_default(),
+        };
+        if field.kind == UserFormFieldKind::Checkbox {
+            out.by_id.insert(
+                field.id.clone(),
+                UserFormField::checkbox_wire(raw == "true").to_string(),
+            );
+            continue;
+        }
+        if raw.trim().is_empty() {
+            continue;
+        }
+        out.by_id.insert(field.id.clone(), raw);
+    }
+    out
 }
 
 fn render_settled(spec: &UserFormSpec, resolution: FormResolution, cx: &App) -> AnyElement {
@@ -206,7 +299,7 @@ fn render_field(
     } else {
         field.label.clone()
     };
-    let key = field_key(&spec.entry_id, &field.id);
+    let key = field_key(spec.card_key(), &field.id);
     let control = match field.kind {
         UserFormFieldKind::Checkbox => render_checkbox(spec, field, values, app, cx),
         UserFormFieldKind::Select => render_select(spec, field, values, app, cx),
@@ -275,12 +368,12 @@ fn render_checkbox(
 ) -> AnyElement {
     let theme = cx.theme();
     let on = values.by_id.get(&field.id).map(String::as_str) == Some("true");
-    let entry_id = spec.entry_id.clone();
+    let card_key = spec.card_key().to_string();
     let field_id = field.id.clone();
     let next = if on { "false" } else { "true" };
     h_flex()
         .id(ElementId::Name(
-            format!("user-form-check-{}-{field_id}", spec.entry_id).into(),
+            format!("user-form-check-{}-{field_id}", spec.card_key()).into(),
         ))
         .items_center()
         .gap(px(8.))
@@ -317,7 +410,7 @@ fn render_checkbox(
             this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 app.update(cx, |state, cx| {
                     state.pick_user_form_option(
-                        entry_id.clone(),
+                        card_key.clone(),
                         field_id.clone(),
                         next.to_string(),
                         cx,
@@ -340,14 +433,14 @@ fn render_select(
     let mut chips = h_flex().gap(px(6.)).flex_wrap();
     for option in &field.options {
         let on = selected.as_deref() == Some(option.value.as_str());
-        let entry_id = spec.entry_id.clone();
+        let card_key = spec.card_key().to_string();
         let field_id = field.id.clone();
         let value = option.value.clone();
         let app = app.clone();
         chips = chips.child(
             div()
                 .id(ElementId::Name(
-                    format!("user-form-opt-{}-{field_id}-{value}", spec.entry_id).into(),
+                    format!("user-form-opt-{}-{field_id}-{value}", spec.card_key()).into(),
                 ))
                 .px(px(10.))
                 .py(px(4.))
@@ -367,7 +460,7 @@ fn render_select(
                     this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         app.update(cx, |state, cx| {
                             state.pick_user_form_option(
-                                entry_id.clone(),
+                                card_key.clone(),
                                 field_id.clone(),
                                 value.clone(),
                                 cx,
@@ -409,16 +502,30 @@ enum ButtonKind {
     Ghost,
 }
 
-fn gated_button(id: String, label: &'static str, kind: ButtonKind, disabled: bool) -> AnyElement {
-    let why = "Coming from the server";
+fn action_button(
+    id: String,
+    label: &'static str,
+    kind: ButtonKind,
+    disabled: bool,
+    coming_from_server: bool,
+    on_click: Option<impl Fn(&mut App) + 'static>,
+) -> AnyElement {
     let button = Button::new(id).label(label).disabled(disabled).small();
     let button = match kind {
         ButtonKind::Primary => button.primary(),
         ButtonKind::Secondary => button.outline(),
         ButtonKind::Ghost => button.ghost(),
     };
-    div()
-        .tooltip(move |window, cx| Tooltip::new(why).build(window, cx))
-        .child(button)
-        .into_any_element()
+    let button = match on_click {
+        Some(on_click) => button.on_click(move |_, _, cx| on_click(cx)),
+        None => button,
+    };
+    if coming_from_server {
+        div()
+            .tooltip(move |window, cx| Tooltip::new("Coming from the server").build(window, cx))
+            .child(button)
+            .into_any_element()
+    } else {
+        button.into_any_element()
+    }
 }
