@@ -3,11 +3,12 @@
 //! handoff cards.
 //!
 //! Continue / Open the screen / Dismiss POST `/ag-ui/user-form/submit|dismiss`
-//! when the server has the verbs **and** the card has a gateway `entryId`.
-//! Without `entryId` on AG-UI (CUSTOM still has `callId` only until #140
-//! stamps a field we can read) the buttons stay gated — we do not invent
-//! an id. Secrets collected here go only in the REST body, never
-//! `send_message` / AG-UI `content` / sqlite.
+//! when the server has the verbs **and** the card has a gateway `entryId`
+//! (top-level CUSTOM field from opengrok-server#139 @ d12fffc). Continue
+//! stays disabled while required fields are empty. Missing `entryId` or a
+//! 404 keeps the buttons gated — we do not invent an id or fake Submitted.
+//! Secrets collected here go only in the REST body, never `send_message` /
+//! AG-UI `content` / sqlite.
 
 use crate::components::fields::field_input;
 use crate::opengrok::{

@@ -1747,6 +1747,57 @@ mod tests {
     }
 
     #[test]
+    fn d12fffc_custom_entry_id_is_not_call_id() {
+        let schema = json!({
+            "title": "Google account",
+            "instruction": "Enter the address and password.",
+            "liveHost": "accounts.google.com",
+            "fields": [
+                {"id": "email", "label": "Email", "type": "email", "required": true, "secret": false},
+                {"id": "password", "label": "Password", "type": "password", "required": true, "secret": false, "value": "s3cret-pass"}
+            ]
+        });
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "threadId": "thr-1",
+            "runId": "run-1",
+            "callId": "mock-form-1",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "why": "Waiting for you",
+            "entryId": "e_form",
+            "arguments": schema.clone(),
+            "formRequest": schema
+        }));
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "", "field values must not become chat text");
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.call_id, "mock-form-1");
+                assert_ne!(spec.entry_id, spec.call_id);
+                assert!(spec.has_gateway_entry_id());
+                assert!(spec.can_post(true));
+                assert!(spec.fields.iter().any(|f| f.masked()));
+                assert!(spec.fields.iter().all(|f| f.prefill.is_none()));
+            }
+            other => panic!("expected UserForm from d12fffc CUSTOM, got {other:?}"),
+        }
+        assert!(turn.waiting_user_form());
+        assert!(!turn.waiting_approval());
+        let dump = format!("{parts:?}");
+        assert!(!dump.contains("s3cret-pass"), "{dump}");
+        assert!(
+            parts
+                .iter()
+                .all(|part| !matches!(part, ChatPart::Approval(_) | ChatPart::Ui(_))),
+            "must not mount as Approval or FormSpec: {parts:?}"
+        );
+    }
+
+    #[test]
     fn send_message_envelope_folds_onto_the_awaiting_card() {
         let mut turn = TurnAssembler::default();
         turn.push_event(&json!({

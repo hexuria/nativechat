@@ -7072,10 +7072,34 @@ mod tests {
         values.by_id.insert("password".into(), "s3cret-pass".into());
         let body = crate::opengrok::submit_request_body("e_form", "cw_1", &values);
         assert_eq!(body["values"]["password"], "s3cret-pass");
+        assert_eq!(body["entryId"], "e_form");
+        assert_ne!(body["entryId"], "mock-form-1");
         assert!(
             !sent[0].content.contains("s3cret-pass"),
             "submit values must not leak into AguiMessage.content"
         );
+        let official = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "mock-form-1",
+            "reason": "user-form",
+            "entryId": "e_form",
+            "arguments": {
+                "title": "Google password",
+                "fields": [{
+                    "id": "password",
+                    "label": "Password",
+                    "type": "password",
+                    "required": true
+                }]
+            }
+        }))
+        .expect("d12fffc card");
+        assert_eq!(official.entry_id, "e_form");
+        assert_eq!(official.call_id, "mock-form-1");
+        let rest = crate::opengrok::submit_request_body(&official.entry_id, "cw_1", &values);
+        assert_eq!(rest["entryId"], official.entry_id);
+        assert_ne!(rest["entryId"], official.call_id);
         assert_eq!(
             crate::opengrok::user_form_action_from_http(404, &serde_json::Value::Null),
             crate::opengrok::UserFormActionReply::MissingRoute
