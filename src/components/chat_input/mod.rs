@@ -13,7 +13,7 @@ use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
 use crate::opengrok::{RecipeParameter, RecipeParameterKind};
 use crate::state::{ActiveRecipe, AppState, ReplyTo, SubmitChord};
-use sources::{ParameterSource, SkillSource, ToolSource, ValueSource};
+use sources::{ParameterSource, SlashSource, ToolSource, ValueSource};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -57,8 +57,8 @@ pub enum PanelMode {
     Plus,
     /// `@` with no recipe on the draft: the bot's tools and apps.
     Tools,
-    /// `/`: recipes and the app's own commands.
-    Skills,
+    /// `/`: the recipes and workflows the bot can be pointed at, and the app's own actions.
+    Slash,
     /// `@` with a recipe on the draft: what that recipe needs told.
     Parameters,
     /// One parameter of the active recipe, by its place in the declaration, being given a value.
@@ -76,8 +76,8 @@ pub struct ComposerToken {
     pub kind: TokenKind,
     /// What the thing is called where it lives: a tool's name, a recipe's id.
     pub id: String,
-    /// What the chip reads as in the message: the skill's name, without the `/` that opened the
-    /// panel, because that was how it was asked for and not part of what is being said.
+    /// What the chip reads as in the message: the recipe's name, without the `/` that opened
+    /// the panel, because that was how it was asked for and not part of what is being said.
     pub text: String,
     /// Where that text sits, in bytes. Kept true across edits by `resync_tokens`.
     pub range: Range<usize>,
@@ -202,8 +202,8 @@ impl MessageInput {
             }
 
             // Recipes that were still being fetched when `/` opened the panel land here.
-            if this.panel_mode == Some(PanelMode::Skills) {
-                let mut rows = SkillSource.rows(&state.read(cx).recipes);
+            if this.panel_mode == Some(PanelMode::Slash) {
+                let mut rows = SlashSource.rows(&state.read(cx).recipes);
                 apply_shortcuts(&mut rows, window);
                 this.remember_picks(&rows);
                 let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
@@ -494,7 +494,9 @@ impl MessageInput {
                     "teach",
                     "icons/monitor.svg",
                     "Teach a task",
-                    "Show the bot on its screen, and keep what it saw as a recipe",
+                    // Not "as a recipe" any more: stopping the tape asks which of three things
+                    // to make of it, and only one of the three is a recipe.
+                    "Show the bot on its screen, and keep what it saw",
                 )
                 .element_id("composer-teach"),
                 ComposerPick::TeachTask,
@@ -504,7 +506,7 @@ impl MessageInput {
             PanelMode::Plus,
             rows,
             "Search",
-            "⌘1–9 picks a row. Type @ for the bot's tools, / for its skills.",
+            "⌘1–9 picks a row. Type @ for the bot's tools, / for its recipes and workflows.",
             window,
             cx,
         );
@@ -522,18 +524,18 @@ impl MessageInput {
         );
     }
 
-    fn open_skills_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_slash_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An empty list may only mean the recipes have never been fetched in this session; ask
         // for them, and the observer above fills the open panel when they land.
         if self.state.read(cx).recipes.is_empty() {
             self.state.update(cx, |state, cx| state.refresh_recipes(cx));
         }
-        let mut rows = SkillSource.rows(&self.state.read(cx).recipes);
+        let mut rows = SlashSource.rows(&self.state.read(cx).recipes);
         apply_shortcuts(&mut rows, window);
         self.show_panel(
-            PanelMode::Skills,
+            PanelMode::Slash,
             rows,
-            "Search skills and actions",
+            "Search recipes, workflows and actions",
             "↑↓ to move, ⌘1–9 to take one straight away, ↵ to run it or put it in the message, esc to close.",
             window,
             cx,
@@ -599,15 +601,21 @@ impl MessageInput {
             ComposerPick::AttachFiles => self.attach_files(cx),
             ComposerPick::TeachTask => self.teach_task(cx),
             // A tool is a chip beside the "+", not text in the message: naming a tool says
-            // something ABOUT the message, and the message should not have to carry it. A skill
-            // is the opposite — it reads as part of the sentence, so it goes in at the caret.
+            // something ABOUT the message, and the message should not have to carry it. A
+            // recipe is the opposite — it reads as part of the sentence, so it goes in at the
+            // caret.
             ComposerPick::Token { kind, id, text } => match kind {
                 TokenKind::Tool => {
                     let label = text.trim_start_matches('@').to_string();
                     self.state
                         .update(cx, |state, cx| state.pick_tool(id, label, cx));
                 }
-                TokenKind::Skill => {
+                // A workflow goes the same way a recipe does, and on purpose: both are what the
+                // turn runs, both declare their parameters on the same field of the same row,
+                // and a second path through here would be the first one copied with one word
+                // changed. What the two differ in is what they are called, which is on the chip
+                // and on the bar.
+                TokenKind::Recipe | TokenKind::Workflow => {
                     // A recipe picked from `/` is not only a word in the sentence: it is what
                     // the turn runs, so it goes on the draft as well as into the message. One
                     // recipe to a message, so picking another takes the first one's chip out
@@ -720,7 +728,7 @@ impl MessageInput {
         if let Some(index) = self
             .tokens
             .iter()
-            .position(|token| token.kind == TokenKind::Skill && token.id == recipe.id)
+            .position(|token| token.kind.is_mode() && token.id == recipe.id)
         {
             let range = self.tokens.remove(index).range;
             self.remove_text(range, window, cx);
@@ -756,7 +764,7 @@ impl MessageInput {
         if self
             .tokens
             .iter()
-            .any(|token| token.kind == TokenKind::Skill && token.id == id)
+            .any(|token| token.kind.is_mode() && token.id == id)
         {
             return;
         }
@@ -921,7 +929,7 @@ impl MessageInput {
         }
         let mode = match event.keystroke.key_char.as_deref() {
             Some("@") => PanelMode::Tools,
-            Some("/") => PanelMode::Skills,
+            Some("/") => PanelMode::Slash,
             _ => return false,
         };
         let (text, caret, selection) = {
@@ -945,7 +953,7 @@ impl MessageInput {
                 self.open_parameters_panel(window, cx)
             }
             PanelMode::Tools => self.open_tools_panel(window, cx),
-            PanelMode::Skills => self.open_skills_panel(window, cx),
+            PanelMode::Slash => self.open_slash_panel(window, cx),
             PanelMode::Plus | PanelMode::Parameters | PanelMode::Value { .. } => {}
         }
         true
@@ -1120,7 +1128,7 @@ impl MessageInput {
                                 .gap_1()
                                 .child(
                                     Icon::default()
-                                        .path("icons/record.svg")
+                                        .path(recipe.kind.icon())
                                         .size(px(11.))
                                         .text_color(muted_foreground),
                                 )
@@ -1130,7 +1138,15 @@ impl MessageInput {
                                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                                         .text_color(muted_foreground)
                                         .truncate()
-                                        .child(format!("Recipe · {}", recipe.name)),
+                                        // The noun is the thing's own, never "Recipe" for both:
+                                        // the bar is the one place that says what the next
+                                        // message runs, and a tree and a tape are not the same
+                                        // promise.
+                                        .child(format!(
+                                            "{} · {}",
+                                            recipe.kind.label(),
+                                            recipe.name
+                                        )),
                                 )
                                 .child(div().text_xs().text_color(muted_foreground).child(
                                     if has_parameters {
@@ -1162,7 +1178,11 @@ impl MessageInput {
                         .justify_center()
                         .cursor_pointer()
                         .hover(move |style| style.bg(secondary))
-                        .tooltip(|window, cx| Tooltip::new("Drop the recipe").build(window, cx))
+                        .tooltip({
+                            let drop =
+                                SharedString::from(format!("Drop the {}", recipe.kind.word()));
+                            move |window, cx| Tooltip::new(drop.clone()).build(window, cx)
+                        })
                         .child(
                             Icon::new(IconName::Close)
                                 .size(px(12.))

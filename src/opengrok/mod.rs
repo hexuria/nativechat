@@ -21,10 +21,11 @@ pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 
 pub use client::{
     ConnectedComputer, CoworkerComputer, ImageStatus, LocalExecMode, OpenGrokClient,
-    QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeParameter, RecipeParameterKind,
-    RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare, RecipeShareState,
-    RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent, RecipeVersion,
-    RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, thin_tape,
+    QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind, RecipeParameter,
+    RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare,
+    RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent,
+    RecipeVersion, RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus,
+    thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
 pub use types::{

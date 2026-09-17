@@ -2,9 +2,17 @@
 //!
 //! Every list sits behind one small type, so the rows can come from the server later without
 //! the panel or the composer changing: `ToolSource` answers from a hardcoded roster of the
-//! server's built-in tools until the composer can ask for the real one, and `SkillSource`
-//! answers from the recipes the app has already loaded, one example skill that stands in until
-//! the server has a skills registry, and a fixed roster of the app's own commands.
+//! server's built-in tools until the composer can ask for the real one, and `SlashSource`
+//! answers from the recipes and workflows the app has already loaded, a note standing in for the
+//! skills nothing lists yet, and a fixed roster of the app's own actions.
+//!
+//! FOUR WORDS, ONE THING EACH. A RECIPE is a taped sequence, replayed exactly by the box alone.
+//! A WORKFLOW is a decision tree that drives recipes, walked by the server, which asks Jev at
+//! each branch. A SKILL is a lesson — written notes on how a task is done, which the model reads.
+//! An ACTION is something the app itself does. The `/` list holds three of the four, and the
+//! label on each row is which one it is; they are priced differently enough that a person has to
+//! be able to tell them apart at a glance — a recipe is free and instant, a skill costs the model
+//! some reading, a workflow costs a model call per decision.
 //!
 //! `ParameterSource` and `ValueSource` are the two the composer shows once a recipe is on the
 //! draft: what that recipe needs told, and what one of those things may be told.
@@ -26,10 +34,10 @@ pub enum ComposerPick {
         kind: TokenKind,
         /// What the thing is called where it lives: a tool's name, a recipe's id.
         id: String,
-        /// The chip's own words: `Weekly report` for a skill, which is what goes into the
+        /// The chip's own words: `Weekly report` for a recipe, which is what goes into the
         /// message, and `@shell` for a tool, which is what the chip beside the "+" is named
         /// after. The `/` a person typed to open the panel is how they asked, not part of what
-        /// they are saying, so a skill's chip does not carry it; the kind rides along in
+        /// they are saying, so a recipe's chip does not carry it; the kind rides along in
         /// [`TokenKind`] instead.
         text: String,
     },
@@ -48,7 +56,23 @@ pub enum ComposerPick {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     Tool,
-    Skill,
+    /// A taped sequence the box replays exactly. It was called a skill here until the four
+    /// words were settled, which left the one noun standing for two very different prices.
+    Recipe,
+    /// A decision tree that drives recipes. It is its own kind rather than a recipe with a flag
+    /// because the chip in the message is read by a person, and a person who picked a tree must
+    /// not be shown the word for a tape.
+    Workflow,
+}
+
+impl TokenKind {
+    /// Whether this chip is what the message RUNS, rather than something said about it. Both a
+    /// recipe and a workflow become the message's mode — one pick puts the chip in the message
+    /// and the thing itself on the draft — so everything that keeps those two in step asks this
+    /// rather than naming one kind and quietly forgetting the other.
+    pub fn is_mode(self) -> bool {
+        matches!(self, Self::Recipe | Self::Workflow)
+    }
 }
 
 /// One of the app's own commands. The ones that have an action in [`crate::actions`] are
@@ -130,37 +154,52 @@ const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The skills a bot can be pointed at: the recipes the app has, and the app's own commands.
-pub struct SkillSource;
+/// What `/` lists: the recipes and workflows the app has, and the app's own commands.
+///
+/// Named after the key that opens it, the way [`crate::components::chat_input::PanelMode::Plus`]
+/// is named after the button, because what it lists is several kinds of thing and no one noun
+/// covers them.
+///
+/// ONE LIST, ONE FETCH. Recipes and workflows arrive on the same listing, told apart by the
+/// `kind` on each row, and they are shown in one panel with one search field over them. Two
+/// fetches would mean two flights in the air while somebody is reading the list, and a panel
+/// that shows recipes now and workflows a moment later reads as a workflow that has gone.
+pub struct SlashSource;
 
-impl SkillSource {
-    /// Recipes first, because they are what `/` is mostly for, then the commands.
+impl SlashSource {
+    /// Recipes first, because they are what `/` is mostly for, then workflows, then the skills
+    /// notice, then the app's own actions.
+    ///
+    /// Grouped by kind rather than left in the server's order, so a list someone is arrowing
+    /// through does not alternate between two things that cost wildly different amounts to run.
     pub fn rows(&self, recipes: &[RecipeSummary]) -> Vec<(ComposerPanelRow, ComposerPick)> {
         let mut rows: Vec<(ComposerPanelRow, ComposerPick)> = recipes
             .iter()
+            .filter(|recipe| !recipe.is_workflow())
+            .chain(recipes.iter().filter(|recipe| recipe.is_workflow()))
             .map(|recipe| {
                 let name = recipe_name(recipe);
                 (
                     ComposerPanelRow::new(
                         format!("recipe:{}", recipe.id),
-                        "icons/record.svg",
+                        recipe.kind.icon(),
                         name.clone(),
-                        if recipe.description.trim().is_empty() {
-                            "A task one of your bots was taught".to_string()
-                        } else {
-                            recipe.description.trim().to_string()
-                        },
+                        described(recipe),
                     )
-                    .label("Skill"),
+                    .label(recipe.kind.label()),
                     ComposerPick::Token {
-                        kind: TokenKind::Skill,
+                        kind: if recipe.is_workflow() {
+                            TokenKind::Workflow
+                        } else {
+                            TokenKind::Recipe
+                        },
                         id: recipe.id.clone(),
                         text: name,
                     },
                 )
             })
             .collect();
-        rows.push(example_skill());
+        rows.push(no_skills_yet());
         rows.extend(
             APP_COMMANDS
                 .iter()
@@ -343,24 +382,28 @@ fn typed_hint(parameter: &RecipeParameter) -> String {
     }
 }
 
-/// PLACEHOLDER. One made-up skill, so the inline chip a skill leaves in the message can be seen
-/// while the server has no skills registry to list. It is named and described as an example on
-/// purpose: picking it puts its chip in the message the way a real skill would, and nothing else
-/// happens. Delete this function and its call the day the server reports real skills.
-fn example_skill() -> (ComposerPanelRow, ComposerPick) {
+/// The one row standing in for skills, which nothing lists yet.
+///
+/// It was a made-up `example-skill` that could be picked, and picking it put a chip in the
+/// message that stood for nothing anywhere: no lesson was written, and nothing read one. A row
+/// that can be taken and does nothing is worse than a row that says it is not ready, so this is
+/// a notice — shown, dimmed, never picked — the same as the plugins line above the tools.
+///
+/// A skill is a lesson: written notes on how a task is done, which the model reads. There is
+/// nowhere to keep one yet (see the teach-a-task sheet, which says the same in its own words),
+/// so what this row promises is a word, not a feature. Delete it the day a lesson has a home.
+fn no_skills_yet() -> (ComposerPanelRow, ComposerPick) {
     (
         ComposerPanelRow::new(
-            "skill:example",
-            "icons/sparkles.svg",
-            "example-skill",
-            "Example only — a placeholder that does nothing yet, until your bots' skills are listed here",
+            "skill:none",
+            "icons/study.svg",
+            "Skills",
+            "A lesson your bot reads before it works — not written or kept anywhere yet",
         )
-        .label("Skill"),
-        ComposerPick::Token {
-            kind: TokenKind::Skill,
-            id: "example-skill".to_string(),
-            text: "example-skill".to_string(),
-        },
+        .element_id("composer-skills-none")
+        .label("Skill")
+        .note(),
+        ComposerPick::Nothing,
     )
 }
 
@@ -368,9 +411,23 @@ fn example_skill() -> (ComposerPanelRow, ComposerPick) {
 fn recipe_name(recipe: &RecipeSummary) -> String {
     let name = recipe.name.split_whitespace().collect::<Vec<_>>().join(" ");
     if name.is_empty() {
-        "Untitled recipe".to_string()
+        format!("Untitled {}", recipe.kind.word())
     } else {
         name
+    }
+}
+
+/// The line under a row's name: what its owner wrote, or — for one nobody described — what this
+/// kind of thing is, which is the more useful of the two things a stranger to the row needs.
+fn described(recipe: &RecipeSummary) -> String {
+    let said = recipe.description.trim();
+    if !said.is_empty() {
+        return said.to_string();
+    }
+    if recipe.is_workflow() {
+        "A decision tree that picks which recipe to play".to_string()
+    } else {
+        "A task one of your bots was taught".to_string()
     }
 }
 
@@ -458,7 +515,7 @@ const APP_COMMANDS: &[(&str, &str, &str, &str, AppCommand)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerPick, ParameterSource, SkillSource, TokenKind, ToolSource, ValueSource};
+    use super::{ComposerPick, ParameterSource, SlashSource, TokenKind, ToolSource, ValueSource};
     use crate::opengrok::{RecipeParameter, RecipeSummary};
     use crate::state::ActiveRecipe;
 
@@ -476,6 +533,124 @@ mod tests {
         }))
         .expect("the declaration the server sends");
         ActiveRecipe::from_summary(&recipe)
+    }
+
+    /// The two rows `/` now holds, declared the same way on purpose: the server writes a
+    /// workflow's parameters on the same field of the same row a recipe's ride on, so a test
+    /// that declared them differently would be testing a shape the server does not send.
+    fn one_of_each() -> Vec<RecipeSummary> {
+        serde_json::from_value(serde_json::json!([
+            {
+                "id": "rcp_tape", "name": "Weekly report", "kind": "recipe",
+                "description": "Open the dashboard and export it",
+                "parameters": [{ "name": "since", "required": true, "kind": "text" }]
+            },
+            {
+                "id": "rcp_tree", "name": "Search and retry", "kind": "workflow",
+                "description": "Look first, then search once",
+                "parameters": [{ "name": "since", "required": true, "kind": "text" }]
+            }
+        ]))
+        .expect("the listing the server sends now carries `kind` on every row")
+    }
+
+    /// The whole point of the four words: the one list says which of them each row is.
+    #[test]
+    fn the_slash_list_calls_a_tape_a_recipe_and_a_tree_a_workflow() {
+        let rows = SlashSource.rows(&one_of_each());
+        let (tape, tape_pick) = &rows[0];
+        let (tree, tree_pick) = &rows[1];
+        assert_eq!(tape.title, "Weekly report");
+        assert_eq!(tape.label.as_deref(), Some("Recipe"));
+        assert_eq!(tree.title, "Search and retry");
+        assert_eq!(
+            tree.label.as_deref(),
+            Some("Workflow"),
+            "a decision tree under the word for a tape is the thing this list is for fixing"
+        );
+        assert_ne!(
+            tape.icon, tree.icon,
+            "the two cost wildly different amounts to run, so they do not share a glyph either"
+        );
+        assert_eq!(
+            *tape_pick,
+            ComposerPick::Token {
+                kind: TokenKind::Recipe,
+                id: "rcp_tape".into(),
+                text: "Weekly report".into(),
+            }
+        );
+        assert_eq!(
+            *tree_pick,
+            ComposerPick::Token {
+                kind: TokenKind::Workflow,
+                id: "rcp_tree".into(),
+                text: "Search and retry".into(),
+            },
+            "picking a workflow leaves the same chip a recipe does, under its own kind"
+        );
+        // Both are what the message RUNS, which is what makes either one the message's mode.
+        for pick in [tape_pick, tree_pick] {
+            let ComposerPick::Token { kind, .. } = pick else {
+                panic!("both rows are chips: {pick:?}");
+            };
+            assert!(kind.is_mode(), "{kind:?} is what the next message runs");
+        }
+    }
+
+    /// Grouped rather than interleaved: the server's order mixes the two, and a list someone is
+    /// arrowing through should not alternate between free-and-instant and a model call a step.
+    #[test]
+    fn the_recipes_come_before_the_workflows_whatever_order_they_arrived_in() {
+        let mut listing = one_of_each();
+        listing.reverse();
+        let rows = SlashSource.rows(&listing);
+        assert_eq!(
+            rows.iter()
+                .take(2)
+                .map(|(row, _)| row.label.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["Recipe", "Workflow"]
+        );
+    }
+
+    /// A workflow declares what it needs told exactly as a recipe does, so the `@` panel it
+    /// drives is the same panel, row for row. This is the claim that let the parameter flow be
+    /// reused rather than copied: if it ever stops holding, the copy is what it will cost.
+    #[test]
+    fn a_workflows_parameters_drive_the_at_panel_the_way_a_recipes_do() {
+        let declaration = serde_json::json!([
+            { "name": "term", "description": "What to search for", "required": true,
+              "kind": "text" },
+            { "name": "tries", "description": "How many times", "required": false,
+              "kind": "number" }
+        ]);
+        let tape: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_1", "name": "search", "kind": "recipe", "parameters": declaration
+        }))
+        .unwrap();
+        let tree: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_2", "name": "search", "kind": "workflow", "parameters": declaration
+        }))
+        .unwrap();
+        assert!(tree.is_workflow() && !tape.is_workflow());
+
+        let from_tape = ParameterSource.rows(&ActiveRecipe::from_summary(&tape));
+        let from_tree = ParameterSource.rows(&ActiveRecipe::from_summary(&tree));
+        assert_eq!(
+            from_tape, from_tree,
+            "the same declaration asks for the same things in the same order, whichever kind \
+             of row it arrived on"
+        );
+
+        // And the value panel under it, for the one that narrows what it takes.
+        let mut active = ActiveRecipe::from_summary(&tree);
+        active.set_value("term", Some("mundo".to_string()));
+        assert_eq!(
+            ParameterSource.rows(&active)[0].0.title,
+            "tries",
+            "a filled-in parameter leaves the list on a tree the way it does on a tape"
+        );
     }
 
     #[test]
@@ -503,23 +678,28 @@ mod tests {
         let recipe: RecipeSummary =
             serde_json::from_value(serde_json::json!({ "id": "rec_1", "name": "Weekly  report" }))
                 .expect("a recipe needs nothing but an id and a name");
-        let rows = SkillSource.rows(&[recipe]);
+        let rows = SlashSource.rows(&[recipe]);
         assert_eq!(
             rows[0].1,
             ComposerPick::Token {
-                kind: TokenKind::Skill,
+                kind: TokenKind::Recipe,
                 id: "rec_1".into(),
                 // The run of spaces in the name is collapsed: a chip is one token. The `/` that
                 // opened the panel is how it was asked for, not part of the name.
                 text: "Weekly report".into(),
             }
         );
-        assert_eq!(rows[0].0.label.as_deref(), Some("Skill"));
+        assert_eq!(
+            rows[0].0.label.as_deref(),
+            Some("Recipe"),
+            "a taped sequence is a recipe; calling it a skill left one noun standing for two \
+             very different things to buy"
+        );
     }
 
     #[test]
     fn the_app_commands_come_after_the_recipes_and_say_so() {
-        let rows = SkillSource.rows(&[]);
+        let rows = SlashSource.rows(&[]);
         let commands: Vec<_> = rows
             .iter()
             .skip_while(|(row, _)| !row.id.starts_with("action:"))
@@ -687,26 +867,23 @@ mod tests {
         );
     }
 
+    /// A skill is a lesson the model reads, and nothing writes or keeps one yet. The row that
+    /// used to stand here could be picked and left a chip standing for nothing; a row that does
+    /// nothing has to say so rather than look like a row that works.
     #[test]
-    fn the_example_skill_is_a_chip_and_says_it_is_only_an_example() {
-        let rows = SkillSource.rows(&[]);
+    fn skills_are_a_notice_rather_than_a_row_that_can_be_taken() {
+        let rows = SlashSource.rows(&[]);
         let (row, pick) = rows
             .iter()
-            .find(|(row, _)| row.id == "skill:example")
-            .expect("one example skill stands in until the server lists real ones");
+            .find(|(row, _)| row.id == "skill:none")
+            .expect("the `/` list says what a skill is even while nothing lists one");
         assert_eq!(row.label.as_deref(), Some("Skill"));
+        assert!(!row.selectable, "there is nothing there to take");
+        assert_eq!(*pick, ComposerPick::Nothing);
         assert!(
-            row.description.to_lowercase().contains("example"),
-            "the row has to read as an example rather than as a skill someone can count on"
-        );
-        assert_eq!(
-            *pick,
-            ComposerPick::Token {
-                kind: TokenKind::Skill,
-                id: "example-skill".into(),
-                text: "example-skill".into(),
-            },
-            "picking it leaves the same inline chip a real skill would"
+            row.description.to_lowercase().contains("not"),
+            "the row has to read as something that is not ready, and it read {:?}",
+            row.description
         );
     }
 }

@@ -961,7 +961,18 @@ impl RecipesView {
             let state = self.state.read(cx);
             (
                 state.recipes_filter,
-                state.recipes.clone(),
+                // The listing carries recipes and workflows both, on one fetch, and this page is
+                // the recipes. Everything on it below this line is tape machinery — versions,
+                // the table of steps, adding a step, playing it back — and a decision tree has
+                // no use for any of it. The workflows are in the composer's `/` list, where
+                // picking one is all there is to do with it today; the page that manages a tree
+                // is not built.
+                state
+                    .recipes
+                    .iter()
+                    .filter(|recipe| !recipe.is_workflow())
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 state.recipes_loading,
                 state.recipes_error.clone(),
                 state.account.as_ref().map(|account| account.id.clone()),

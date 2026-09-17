@@ -3,11 +3,11 @@ use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::chat_input::PanelMode;
 use crate::components::chat_input::sources::{
-    ParameterSource, SkillSource, ToolSource, ValueSource,
+    ParameterSource, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::{
-    ChatPart, CoworkerPatch, LocalExecResolution, RecipeSummary, ScreenshotSpec,
+    ChatPart, CoworkerPatch, LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec,
 };
 use crate::state::{ActiveRecipe, AppState};
 
@@ -355,7 +355,7 @@ fn panel_rows(
             ];
         }
         PanelMode::Tools => ToolSource.rows(),
-        PanelMode::Skills => SkillSource.rows(recipes),
+        PanelMode::Slash => SlashSource.rows(recipes),
         PanelMode::Parameters => match active {
             Some(recipe) => ParameterSource.rows(recipe),
             None => Vec::new(),
@@ -371,6 +371,7 @@ fn panel_rows(
         .map(|(row, _)| PanelRow {
             id: row_id(&row),
             title: row.title.to_string(),
+            label: row.label.as_ref().map(ToString::to_string),
             note: !row.selectable,
         })
         .collect()
@@ -390,7 +391,7 @@ fn panel_name(mode: PanelMode, recipe: Option<&RecipeBarSnap>) -> String {
     match mode {
         PanelMode::Plus => "Attach or teach".to_string(),
         PanelMode::Tools => "Tools".to_string(),
-        PanelMode::Skills => "Skills and actions".to_string(),
+        PanelMode::Slash => "Recipes, workflows and actions".to_string(),
         PanelMode::Parameters => match recipe {
             Some(recipe) => format!("What {} needs told", recipe.name),
             None => "What the recipe needs told".to_string(),
@@ -416,6 +417,13 @@ struct SessionSnap {
 struct PanelRow {
     id: String,
     title: String,
+    /// Which kind of thing this row is — "Recipe", "Workflow", "Skill", "Action", "Tool" — the
+    /// word the panel prints down the right-hand side of it.
+    ///
+    /// It rides in the node's `value` because `value` is the one field a driver can assert on,
+    /// and telling a tape from a tree is the whole point of the list: two rows with the same
+    /// shape and the same id prefix are otherwise indistinguishable to anything but an eye.
+    label: Option<String>,
     /// A row that only says something: dimmed, stepped over by the arrows, never picked.
     note: bool,
 }
@@ -425,15 +433,19 @@ impl PanelRow {
         Self {
             id: id.to_string(),
             title: title.to_string(),
+            label: None,
             note: false,
         }
     }
 }
 
-/// The recipe on the draft, as the composer's bar shows it.
+/// The recipe or workflow on the draft, as the composer's bar shows it.
 #[derive(Clone)]
 struct RecipeBarSnap {
     name: String,
+    /// Which of the two it is. The driver has to be able to tell a tape from a tree without
+    /// looking at pixels, because the two rows in `/` are otherwise the same shape.
+    kind: RecipeKind,
     parameters: Vec<ParamSnap>,
 }
 
@@ -701,6 +713,9 @@ impl NativeChatHost {
             recipes: state
                 .recipes
                 .iter()
+                // The same rows the page draws, and the listing holds workflows too: a tree is
+                // not on that page, so a driver must not be told there is a row there to click.
+                .filter(|recipe| !recipe.is_workflow())
                 .map(|recipe| RecipeSnap {
                     id: recipe.id.clone(),
                     name: recipe.name.clone(),
@@ -715,6 +730,7 @@ impl NativeChatHost {
                 .unwrap_or_default(),
             recipe_bar: state.active_recipe.as_ref().map(|recipe| RecipeBarSnap {
                 name: recipe.name.clone(),
+                kind: recipe.kind,
                 parameters: recipe
                     .parameters
                     .iter()
@@ -1040,6 +1056,9 @@ impl NativeChatHost {
         );
         for row in &self.panel_rows {
             let mut item = UiNode::listitem(row.id.clone(), row.title.clone());
+            if let Some(label) = &row.label {
+                item = item.with_value(label.clone());
+            }
             if row.note {
                 item.states.push("note".into());
             }
@@ -1048,13 +1067,17 @@ impl NativeChatHost {
         Some(panel)
     }
 
-    /// The bar above the field: which recipe the next message runs, and what it has been told.
+    /// The bar above the field: what the next message runs, and what it has been told.
+    ///
+    /// The line is the bar's own, word for word, so a driver that has just picked a row from `/`
+    /// can assert which of the two it got — "Workflow · Search and retry" is the only place the
+    /// app says that out loud.
     fn recipe_bar_node(&self) -> Option<UiNode> {
         let bar = self.recipe_bar.as_ref()?;
         let mut node = UiNode::new(
             ids::COMPOSER_RECIPE_BAR,
             role::STATUS,
-            format!("Recipe · {}", bar.name),
+            format!("{} · {}", bar.kind.label(), bar.name),
         );
         for parameter in &bar.parameters {
             let mut chip = UiNode::note(ids::recipe_param(&parameter.name), parameter.name.clone());
@@ -1503,6 +1526,25 @@ mod tests {
     use super::*;
     use crate::opengrok::{RecipeParameter, RecipeParameterKind};
 
+    /// The same bar, for a decision tree. A driver that has just picked from `/` reads this
+    /// line to know which of the two it got, so the noun has to be the thing's own.
+    #[test]
+    fn the_bar_says_workflow_when_the_draft_is_a_tree() {
+        let mut host = host();
+        let mut active = recipe(&[]);
+        active.kind = RecipeKind::Workflow;
+        active.name = "Search and retry".into();
+        host.recipe_bar = Some(RecipeBarSnap {
+            name: active.name.clone(),
+            kind: active.kind,
+            parameters: Vec::new(),
+        });
+        assert_eq!(
+            host.snapshot().find(ids::COMPOSER_RECIPE_BAR).unwrap().name,
+            "Workflow · Search and retry"
+        );
+    }
+
     /// A host with a bot and a session, which is what the chat tree is drawn for.
     fn host() -> NativeChatHost {
         NativeChatHost {
@@ -1521,6 +1563,7 @@ mod tests {
         ActiveRecipe {
             id: "rcp_1".into(),
             name: "Weekly report".into(),
+            kind: RecipeKind::Recipe,
             parameters: vec![
                 RecipeParameter {
                     name: "city".into(),
@@ -1848,13 +1891,50 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_row_carries_the_id_the_panel_gives_it() {
+    fn a_recipe_row_carries_the_id_the_panel_gives_it() {
         let row = ComposerPanelRow::new("recipe:rcp_1", "icons/record.svg", "Weekly", "A task");
         assert_eq!(row_id(&row), "composer-panel-row-recipe:rcp_1");
         assert_eq!(
             row_id(&row.element_id("composer-param-city")),
             "composer-param-city"
         );
+    }
+
+    /// What a driver needs to work `/`: the rows are there while the panel is open, and each
+    /// one says which of the four kinds it is. Without the word, a workflow row and a recipe
+    /// row are the same node under the same id prefix, and "pick the workflow" is a guess.
+    #[test]
+    fn the_slash_list_tells_a_driver_which_rows_are_workflows() {
+        let mut host = host();
+        assert!(host.snapshot().find(ids::COMPOSER_PANEL).is_none());
+
+        let listing: Vec<RecipeSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "rcp_tape", "name": "Weekly report", "kind": "recipe" },
+            { "id": "rcp_tree", "name": "Search and retry", "kind": "workflow" }
+        ]))
+        .unwrap();
+        host.composer_panel = Some(PanelMode::Slash);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, None);
+
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::COMPOSER_PANEL).unwrap().name,
+            "Recipes, workflows and actions",
+            "the panel says what is in it, and it is no longer called skills"
+        );
+        let tape = tree.find("composer-panel-row-recipe:rcp_tape").unwrap();
+        assert_eq!(tape.name, "Weekly report");
+        assert_eq!(tape.value.as_deref(), Some("Recipe"));
+        let workflow = tree.find("composer-panel-row-recipe:rcp_tree").unwrap();
+        assert_eq!(workflow.name, "Search and retry");
+        assert_eq!(
+            workflow.value.as_deref(),
+            Some("Workflow"),
+            "the one assertable field a driver has is where the kind has to be"
+        );
+        // Nothing lists a skill yet, and the row that says so must not look pickable.
+        let skill = tree.find("composer-skills-none").unwrap();
+        assert!(skill.states.contains(&"note".to_string()));
     }
 
     #[test]
@@ -1865,6 +1945,7 @@ mod tests {
         let active = recipe(&[("city", "London")]);
         host.recipe_bar = Some(RecipeBarSnap {
             name: active.name.clone(),
+            kind: active.kind,
             parameters: active
                 .parameters
                 .iter()
@@ -1877,6 +1958,7 @@ mod tests {
         });
         let tree = host.snapshot();
         let bar = tree.find(ids::COMPOSER_RECIPE_BAR).unwrap();
+        assert!(bar.name.starts_with("Recipe · "), "{}", bar.name);
         assert!(bar.name.contains("Weekly report"));
         let city = tree.find(&ids::recipe_param("city")).unwrap();
         assert_eq!(city.value.as_deref(), Some("London"));

@@ -1393,6 +1393,54 @@ pub enum RecipeRelation {
     None,
 }
 
+/// Which of the two things a row on the listing is.
+///
+/// The server keeps both on one table: a workflow is a recipe version of kind `workflow`, so
+/// ownership, versions, sharing, grants and run history are one set of rules rather than two
+/// that drift. The listing therefore carries this word on every row — `GET /recipes` brings
+/// back both and `?kind=` only drops rows it has already built — which is why the app fetches
+/// once and reads the word instead of asking twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipeKind {
+    /// A decision tree that drives recipes, walked by the server, which asks Jev at each branch.
+    Workflow,
+    /// A taped sequence, replayed exactly by the box alone.
+    ///
+    /// Last because the catch-all has to be, and a word this client has no name for is read as
+    /// one — the way an unknown parameter kind is read as text: a third kind arriving one day
+    /// must not fail the listing and take every recipe down with it.
+    #[default]
+    #[serde(other)]
+    Recipe,
+}
+
+impl RecipeKind {
+    /// What this kind is called where a person reads it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recipe => "Recipe",
+            Self::Workflow => "Workflow",
+        }
+    }
+
+    /// The same word mid-sentence, for a line like "Drop the workflow".
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Recipe => "recipe",
+            Self::Workflow => "workflow",
+        }
+    }
+
+    /// The icon a row of this kind carries: a tape for a recipe, a fork in the road for a tree.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Recipe => "icons/record.svg",
+            Self::Workflow => "icons/branch.svg",
+        }
+    }
+}
+
 /// Where a share stands with the person it went to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1431,6 +1479,11 @@ pub struct RecipeSummary {
     pub relation: RecipeRelation,
     #[serde(default)]
     pub share_state: Option<RecipeShareState>,
+    /// A taped sequence or a decision tree. A server that has never heard of workflows leaves
+    /// the word off the row, or sends it empty; either way every row it sends is a recipe, which
+    /// is what the default says.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub kind: RecipeKind,
     /// What the runnable version needs told before it runs. It rides on the summary so the
     /// composer knows what a recipe wants the moment it is picked, with no second fetch: a
     /// list that arrives one keystroke after the person needs it is a list they type past.
@@ -1441,6 +1494,13 @@ pub struct RecipeSummary {
 impl RecipeSummary {
     pub fn is_mine(&self) -> bool {
         self.relation == RecipeRelation::Mine
+    }
+
+    /// A decision tree rather than a tape. What it changes is what the row is called and what
+    /// can be done with it, never how its parameters are read: a workflow declares them exactly
+    /// as a recipe does, on the same field of the same row.
+    pub fn is_workflow(&self) -> bool {
+        self.kind == RecipeKind::Workflow
     }
 
     /// A share the person has not answered: Accept or Decline comes before anything else.
@@ -2053,6 +2113,30 @@ mod tests {
     /// A URL nothing is listening on. These tests only ever read the jar, and a base that
     /// cannot be connected to is the guarantee that they never do anything else.
     const NOWHERE: &str = "http://127.0.0.1:1/";
+
+    /// The one word that tells the two apart on a listing that carries both. A kind this client
+    /// has never heard of has to land somewhere readable rather than fail the whole listing and
+    /// take every recipe on it down with a row nobody asked about.
+    #[test]
+    fn a_row_says_which_of_the_two_it_is_and_an_unknown_word_is_still_a_row() {
+        let listing: Vec<RecipeSummary> = serde_json::from_value(json!([
+            { "id": "rcp_1", "name": "tape", "kind": "recipe" },
+            { "id": "rcp_2", "name": "tree", "kind": "workflow" },
+            { "id": "rcp_3", "name": "older server", "kind": null },
+            { "id": "rcp_4", "name": "something new" },
+            { "id": "rcp_5", "name": "a word from the future", "kind": "lesson" }
+        ]))
+        .expect("an unknown kind must not fail the listing");
+        assert_eq!(
+            listing
+                .iter()
+                .map(|row| row.kind.label())
+                .collect::<Vec<_>>(),
+            vec!["Recipe", "Workflow", "Recipe", "Recipe", "Recipe"]
+        );
+        assert!(listing[1].is_workflow());
+        assert!(!listing[4].is_workflow());
+    }
 
     fn put_cookie(client: &OpenGrokClient, set_cookie: &str) {
         let header = HeaderValue::from_str(set_cookie).unwrap();
