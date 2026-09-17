@@ -185,31 +185,19 @@ pub struct ParameterSource;
 
 impl ParameterSource {
     pub fn rows(&self, recipe: &ActiveRecipe) -> Vec<(ComposerPanelRow, ComposerPick)> {
-        if recipe.parameters.is_empty() {
-            return vec![(
-                ComposerPanelRow::new(
-                    "param:none",
-                    "icons/record.svg",
-                    format!("{} needs nothing told", recipe.name),
-                    "Write the message and send it",
-                )
-                .element_id("composer-param-none")
-                .note(),
-                ComposerPick::Nothing,
-            )];
+        let unfilled = recipe.unfilled();
+        if unfilled.is_empty() {
+            return vec![nothing_left(recipe)];
         }
-        recipe
-            .parameters
-            .iter()
-            .enumerate()
+        unfilled
+            .into_iter()
             .map(|(index, parameter)| {
-                let filled = recipe.value(&parameter.name);
                 (
                     ComposerPanelRow::new(
                         format!("param:{}", parameter.name),
-                        parameter_icon(parameter, filled),
-                        parameter_title(parameter, filled),
-                        parameter_state(parameter, filled),
+                        parameter_icon(parameter),
+                        parameter.name.clone(),
+                        parameter_state(parameter),
                     )
                     .element_id(format!("composer-param-{}", parameter.name))
                     .label(parameter_label(parameter)),
@@ -218,6 +206,30 @@ impl ParameterSource {
             })
             .collect()
     }
+}
+
+/// The one row a recipe with nothing left to fill in shows. A panel with no rows at all reads
+/// as a list that failed to load, so the good news is said outright instead — and the two ways
+/// of having nothing to do are told apart, because "there was never anything to tell it" and
+/// "you have told it everything" are different things to have just learned.
+fn nothing_left(recipe: &ActiveRecipe) -> (ComposerPanelRow, ComposerPick) {
+    let (title, standing) = if recipe.parameters.is_empty() {
+        (
+            format!("{} needs nothing told", recipe.name),
+            "Write the message and send it",
+        )
+    } else {
+        (
+            format!("{} has everything it needs", recipe.name),
+            "Every value is in the bar below, where it can still be changed",
+        )
+    };
+    (
+        ComposerPanelRow::new("param:none", "icons/check.svg", title, standing)
+            .element_id("composer-param-none")
+            .note(),
+        ComposerPick::Nothing,
+    )
 }
 
 /// What one parameter may be told: the values its declaration allows, the yes and the no of a
@@ -290,29 +302,15 @@ impl ValueSource {
     }
 }
 
-/// A filled parameter shows what it was told; an unfilled one shows only its name, so the two
-/// are told apart at a glance rather than read for.
-fn parameter_title(parameter: &RecipeParameter, filled: Option<&str>) -> String {
-    match filled {
-        Some(value) => format!("{} = {}", parameter.name, shorten(value)),
-        None => parameter.name.clone(),
-    }
-}
-
 /// Where a parameter stands, said outright rather than left to be worked out from what is
 /// missing: a required one nobody has filled in is the thing stopping the message being sent.
-fn parameter_state(parameter: &RecipeParameter, filled: Option<&str>) -> String {
+/// Every row in this list is unfilled, so there is no third case to say.
+fn parameter_state(parameter: &RecipeParameter) -> String {
     let said = parameter.description.trim();
-    let standing = match (filled.is_some(), parameter.required) {
-        (false, true) => "Not filled in yet",
-        (false, false) => "Optional",
-        (true, _) => {
-            return if said.is_empty() {
-                "Filled in".to_string()
-            } else {
-                said.to_string()
-            };
-        }
+    let standing = if parameter.required {
+        "Not filled in yet"
+    } else {
+        "Optional"
     };
     if said.is_empty() {
         standing.to_string()
@@ -329,11 +327,11 @@ fn parameter_label(parameter: &RecipeParameter) -> String {
     }
 }
 
-fn parameter_icon(parameter: &RecipeParameter, filled: Option<&str>) -> &'static str {
-    match (filled.is_some(), parameter.required) {
-        (true, _) => "icons/check.svg",
-        (false, true) => "icons/report.svg",
-        (false, false) => "icons/pencil.svg",
+fn parameter_icon(parameter: &RecipeParameter) -> &'static str {
+    if parameter.required {
+        "icons/report.svg"
+    } else {
+        "icons/pencil.svg"
     }
 }
 
@@ -343,17 +341,6 @@ fn typed_hint(parameter: &RecipeParameter) -> String {
         RecipeParameterKind::Number => "Digits only — letters are not a number".to_string(),
         _ => "Anything you like".to_string(),
     }
-}
-
-/// A value long enough to push the rest of the row off the end is cut, because the row is here
-/// to say which parameter is filled rather than to be read as the value.
-fn shorten(value: &str) -> String {
-    const MOST: usize = 28;
-    if value.chars().count() <= MOST {
-        return value.to_string();
-    }
-    let kept: String = value.chars().take(MOST - 1).collect();
-    format!("{kept}…")
 }
 
 /// PLACEHOLDER. One made-up skill, so the inline chip a skill leaves in the message can be seen
@@ -556,7 +543,7 @@ mod tests {
 
     #[test]
     fn a_parameter_row_says_what_it_is_and_whether_it_is_still_needed() {
-        let mut recipe = youtube();
+        let recipe = youtube();
         let rows = ParameterSource.rows(&recipe);
         let (search, pick) = &rows[0];
         assert_eq!(search.title, "search_term");
@@ -575,12 +562,52 @@ mod tests {
             "one that is not required says what it takes and nothing about being needed"
         );
         assert_eq!(rows[1].0.description, "Optional — How many to bring back");
+    }
 
-        // Once it is filled in, the row shows what it was told, against its name.
+    /// The list is what is left to do. A value that has been given is shown in the bar over the
+    /// composer, and repeating it here only pads the list someone is reading to find their next
+    /// move; the pick that is left still points at the parameter's place in the declaration.
+    #[test]
+    fn a_filled_parameter_leaves_the_list_and_the_rest_keep_their_places() {
+        let mut recipe = youtube();
         recipe.set_value("search_term", Some("mundo".to_string()));
         let rows = ParameterSource.rows(&recipe);
-        assert_eq!(rows[0].0.title, "search_term = mundo");
-        assert_eq!(rows[0].0.description, "What to search YouTube for");
+        assert_eq!(
+            rows.iter()
+                .map(|(row, _)| row.title.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["count"],
+            "the one that was told something has nothing left to ask"
+        );
+        assert_eq!(
+            rows[0].1,
+            ComposerPick::Parameter { index: 1 },
+            "count is still the second parameter declared, wherever it sits in the list"
+        );
+    }
+
+    #[test]
+    fn what_is_required_is_asked_for_before_what_is_optional() {
+        let recipe: RecipeSummary = serde_json::from_value(serde_json::json!({
+            "id": "rcp_3",
+            "name": "report",
+            "parameters": [
+                { "name": "format", "required": false, "kind": "text" },
+                { "name": "since", "required": true, "kind": "text" },
+                { "name": "tone", "required": false, "kind": "text" },
+                { "name": "until", "required": true, "kind": "text" }
+            ]
+        }))
+        .unwrap();
+        let rows = ParameterSource.rows(&ActiveRecipe::from_summary(&recipe));
+        assert_eq!(
+            rows.iter()
+                .map(|(row, _)| row.title.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["since", "until", "format", "tone"],
+            "what stops the message being sent comes first, and the declaration's own order \
+             holds within each group so the list does not reshuffle as values come in"
+        );
     }
 
     #[test]
@@ -591,6 +618,25 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].0.selectable, "there is nothing there to pick");
         assert!(rows[0].0.title.contains("needs nothing"));
+    }
+
+    #[test]
+    fn a_recipe_told_everything_says_so_rather_than_showing_an_empty_list() {
+        let mut recipe = youtube();
+        recipe.set_value("search_term", Some("mundo".to_string()));
+        recipe.set_value("count", Some("5".to_string()));
+        let rows = ParameterSource.rows(&recipe);
+        assert_eq!(rows.len(), 1, "an empty panel reads as a list that broke");
+        assert!(!rows[0].0.selectable, "there is nothing there to pick");
+        assert!(
+            rows[0].0.title.contains("has everything it needs"),
+            "being done is different from never having been asked, and this one read {:?}",
+            rows[0].0.title
+        );
+        assert!(
+            rows[0].0.description.contains("bar below"),
+            "the values did not vanish, and the row says where they went"
+        );
     }
 
     #[test]

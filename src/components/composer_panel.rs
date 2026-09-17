@@ -155,8 +155,10 @@ impl ComposerPanel {
                     cx.notify();
                 }
                 // Enter takes the row the arrows are on, so the panel can be worked from the
-                // search field without reaching for the mouse.
-                InputEvent::PressEnter { .. } => this.confirm(cx),
+                // search field without reaching for the mouse. ⌘↵ is the composer's send
+                // chord and is left alone here: it has to reach the composer while the panel
+                // holds the focus, which it cannot do if the panel takes it as a pick first.
+                InputEvent::PressEnter { secondary, .. } if !*secondary => this.confirm(cx),
                 _ => {}
             });
         Self {
@@ -470,6 +472,10 @@ impl Render for ComposerPanel {
         let empty = rows.is_empty();
         v_flex()
             .id("composer-panel")
+            // The panel holds the focus while it is open, so a chord that has to work from
+            // inside it needs somewhere to be bound: the composer's own context is on the
+            // other branch of the tree and never reaches this far.
+            .key_context("ComposerPanel")
             .w_full()
             .occlude()
             .rounded(px(16.))

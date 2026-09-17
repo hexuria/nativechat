@@ -11,7 +11,7 @@ use nativechat::actions::{
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::chrome::TITLE_BAR_H;
-use nativechat::components::chat_input::SubmitMessage;
+use nativechat::components::chat_input::{SendDraft, SubmitMessage};
 use nativechat::config::Config;
 use nativechat::db::{create_pool, run_migrations};
 use nativechat::root::RootView;
@@ -58,6 +58,12 @@ fn main() {
                 KeyBinding::new("enter", SubmitMessage, Some("MessageInput")),
                 KeyBinding::new("cmd-enter", SubmitMessage, Some("Editor")),
                 KeyBinding::new("ctrl-enter", SubmitMessage, Some("Editor")),
+                // The send chord, bound in both halves of the composer. The panel is where it
+                // earns its keep: it holds the focus while it is open, and ↵ in there fills the
+                // highlighted parameter in, so a message that is ready to go needs a second way
+                // out. The composer's own context does not reach into the panel, hence two.
+                KeyBinding::new("cmd-enter", SendDraft, Some("MessageInput")),
+                KeyBinding::new("cmd-enter", SendDraft, Some("ComposerPanel")),
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-b", ToggleSidebar, Some("Editor")),
                 KeyBinding::new("cmd-b", ToggleSidebar, Some("AppSettings")),
