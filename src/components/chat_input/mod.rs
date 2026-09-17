@@ -28,7 +28,15 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-actions!(chat, [SubmitMessage]);
+actions!(
+    chat,
+    [
+        SubmitMessage,
+        /// Send the draft, from the field or from the panel standing over it. See
+        /// `MessageInput::send_draft` for why the send needs an action of its own.
+        SendDraft
+    ]
+);
 
 type SubmitCallback = Box<dyn Fn(String, &mut Context<MessageInput>)>;
 
@@ -232,6 +240,7 @@ impl MessageInput {
                 }
                 InputEvent::Change => {
                     this.resync_tokens(cx);
+                    this.drop_recipe_without_its_chip(window, cx);
                     cx.notify();
                 }
                 _ => {}
@@ -279,6 +288,24 @@ impl MessageInput {
     /// The images waiting on the draft. Nothing sends them yet — see `trigger_submit`.
     pub fn attachments(&self) -> &[PathBuf] {
         &self.attachments
+    }
+
+    /// The send chord, from wherever the caret is.
+    ///
+    /// ↵ and ⌘↵ already reach the field as [`InputEvent::PressEnter`], and which of them sends
+    /// is the person's own setting. Neither reaches the composer while the panel is open: the
+    /// panel holds the focus, and inside it ↵ fills the highlighted parameter in — which is
+    /// what it should do, and is why the send needs a chord of its own rather than a share of
+    /// that one. A key listener would be too late, because GPUI dispatches a keybinding's
+    /// action before any listener sees the key, so [`SendDraft`] is bound to ⌘↵ in `main.rs`
+    /// — in the composer's context and in the panel's — and answered here.
+    ///
+    /// The panel goes first. Sending is a decision about the message, not about the list, and
+    /// leaving a picker standing over a composer that has just emptied reads as if nothing
+    /// happened.
+    fn send_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_panel(true, window, cx);
+        self.trigger_submit(window, cx);
     }
 
     fn trigger_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -571,6 +598,19 @@ impl MessageInput {
                     self.state
                         .update(cx, |state, cx| state.start_recipe(&id, cx));
                     self.insert_token(kind, id, text, window, cx);
+                    // A recipe that cannot run until it is told something asks now, rather
+                    // than leaving it behind an `@` nobody has been told about: picking it is
+                    // the one moment the person is certainly thinking about this recipe, and
+                    // a bar reading "needed" beside a name is a puzzle, not an instruction.
+                    if self
+                        .state
+                        .read(cx)
+                        .active_recipe
+                        .as_ref()
+                        .is_some_and(opens_on_pick)
+                    {
+                        self.open_parameters_panel(window, cx);
+                    }
                 }
             },
             ComposerPick::Command(command) => self.run_command(command, window, cx),
@@ -642,11 +682,9 @@ impl MessageInput {
     }
 
     /// Take the recipe off the draft, and its chip out of the message with it: one pick put
-    /// both there, so undoing it undoes both.
+    /// both there, so undoing it undoes both. This is what the `×` on the bar does.
     ///
-    /// Editing the chip away does not do this. A mode the person set should not come off the
-    /// message because of a keystroke in the text, and the bar is where it can be dropped on
-    /// purpose.
+    /// [`Self::drop_recipe_without_its_chip`] is the same rule read the other way round.
     fn drop_recipe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(recipe) = self.state.read(cx).active_recipe.clone() else {
             return;
@@ -660,6 +698,49 @@ impl MessageInput {
         {
             let range = self.tokens.remove(index).range;
             self.remove_text(range, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Take the recipe off the draft once its chip is no longer in the message, whether it was
+    /// backspaced over or typed away a letter at a time.
+    ///
+    /// This reverses what the recipe mode was first built with. The rule then was that editing
+    /// the chip away left the recipe running, on the reasoning that a mode set on purpose
+    /// should not fall off because of a keystroke in the text. In use that turned out to be
+    /// the worse half of the bargain: deleting the chip left a bar still demanding
+    /// `search_term`, with nothing anywhere in the message to say where that demand came from
+    /// or how to be rid of it. The rule is symmetric now — one pick puts the recipe and its
+    /// chip there, and losing either takes both away — which is the reading a person arrives
+    /// at on their own, and the `×` on the bar still goes the other way round.
+    ///
+    /// Everything the recipe was told goes with it, because the values live inside the recipe
+    /// and nothing outside it remembers them; picking the same recipe again starts empty
+    /// rather than resuming a run that was abandoned.
+    fn drop_recipe_without_its_chip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .active_recipe
+            .as_ref()
+            .map(|recipe| recipe.id.clone())
+        else {
+            return;
+        };
+        if self
+            .tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::Skill && token.id == id)
+        {
+            return;
+        }
+        self.state
+            .update(cx, |state, cx| state.clear_active_recipe(cx));
+        // A list of what to tell a recipe that is no longer on the draft is a list about
+        // nothing. The parameter list closes itself when the recipe goes (see the observer in
+        // `new`); the value panel under it has to be told.
+        if matches!(self.panel_mode, Some(PanelMode::Value { .. })) {
+            self.close_panel(false, window, cx);
         }
         cx.notify();
     }
@@ -1222,6 +1303,15 @@ fn apply_shortcuts(rows: &mut [(ComposerPanelRow, ComposerPick)], window: &Windo
     }
 }
 
+/// Whether picking this recipe should open the list of what it needs there and then, instead of
+/// waiting for an `@` nobody has said is coming: it declares something required that nobody has
+/// filled in, so it cannot run as it stands. A recipe that declares nothing, and one whose
+/// required parameters all arrived with defaults, has nothing to ask about and opens nothing —
+/// a panel over a composer that was ready to send is a step backwards.
+fn opens_on_pick(recipe: &ActiveRecipe) -> bool {
+    !recipe.missing().is_empty()
+}
+
 /// What the recipe still needs before the message can be sent, named, or nothing when it can
 /// go. Naming them is the point: "fill in the required fields" leaves someone hunting.
 fn missing_note(recipe: &ActiveRecipe) -> Option<String> {
@@ -1236,11 +1326,26 @@ fn missing_note(recipe: &ActiveRecipe) -> Option<String> {
     ))
 }
 
-/// The line under the list of parameters: what is still missing, or how the list is worked.
+/// The chord that sends the draft, spelled as the keyboard shows it. It is written out here
+/// rather than read back from the keymap because it stands in a line of prose beside ↵ and esc,
+/// which are written the same way; the binding it names is [`SendDraft`], in `main.rs`.
+const SEND_CHORD: &str = "⌘↵";
+
+/// The line under the list of parameters: what is still stopping the message, or — once nothing
+/// is — that it can go, and on which keys.
+///
+/// The send is worth naming here and nowhere else in the panel. Someone who has just filled in
+/// the last thing a recipe needed is done, and the panel they are looking at has no row left
+/// that says so; being told the keys beats closing the panel to find out whether it worked.
 fn parameters_hint(recipe: &ActiveRecipe) -> String {
     match missing_note(recipe) {
         Some(note) => format!("{note} ↵ fills one in, esc closes."),
-        None => "↑↓ to move, ↵ to fill one in, esc to close.".to_string(),
+        None if recipe.unfilled().is_empty() => {
+            format!("{SEND_CHORD} sends the message, esc closes.")
+        }
+        None => format!(
+            "The rest is optional — {SEND_CHORD} sends the message. ↵ fills one in, esc closes."
+        ),
     }
 }
 
@@ -1370,6 +1475,12 @@ impl Render for MessageInput {
                     if this.backspace_over_token(window, cx) {
                         cx.stop_propagation();
                     }
+                }))
+                // ⌘↵ sends, from the field or from the panel. This listener sits outside both
+                // on purpose: the panel is a deferred child of this element, so an action
+                // dispatched while it holds the focus bubbles out through here.
+                .on_action(cx.listener(|this, _: &SendDraft, window, cx| {
+                    this.send_draft(window, cx);
                 }))
                 .when(panel_open, |this| {
                     this.child(deferred(
@@ -1906,10 +2017,74 @@ fn composer_bot_name(state: &AppState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_image, join_names, missing_note, starts_token};
+    use super::{is_image, join_names, missing_note, opens_on_pick, parameters_hint, starts_token};
     use crate::opengrok::RecipeSummary;
     use crate::state::ActiveRecipe;
     use std::path::PathBuf;
+
+    fn picked(declaration: serde_json::Value) -> ActiveRecipe {
+        let recipe: RecipeSummary = serde_json::from_value(declaration).unwrap();
+        ActiveRecipe::from_summary(&recipe)
+    }
+
+    #[test]
+    fn a_recipe_that_cannot_run_as_it_stands_opens_its_list_on_the_pick() {
+        assert!(
+            opens_on_pick(&picked(serde_json::json!({
+                "id": "rcp_1", "name": "youtube",
+                "parameters": [{ "name": "search_term", "required": true, "kind": "text" }]
+            }))),
+            "there is a required parameter with nothing in it, so the pick has left the \
+             message unsendable and the list is what to do about that"
+        );
+        assert!(
+            !opens_on_pick(&picked(serde_json::json!({
+                "id": "rcp_2", "name": "digest",
+                "parameters": [
+                    { "name": "since", "required": true, "kind": "text", "default": "monday" },
+                    { "name": "tone", "required": false, "kind": "text" }
+                ]
+            }))),
+            "every required parameter came with a default standing in its field, so the \
+             recipe would run as picked and a panel over it is a step backwards"
+        );
+        assert!(
+            !opens_on_pick(&picked(
+                serde_json::json!({ "id": "rcp_3", "name": "Mail" })
+            )),
+            "a recipe that declares nothing has nothing to ask about"
+        );
+    }
+
+    #[test]
+    fn the_hint_names_the_send_chord_once_nothing_is_stopping_the_message() {
+        let mut recipe = picked(serde_json::json!({
+            "id": "rcp_1", "name": "youtube",
+            "parameters": [
+                { "name": "search_term", "required": true, "kind": "text" },
+                { "name": "count", "required": false, "kind": "number" }
+            ]
+        }));
+        assert!(
+            !parameters_hint(&recipe).contains(super::SEND_CHORD),
+            "a chord that will only be refused is not worth offering while something \
+             required is still missing"
+        );
+
+        recipe.set_value("search_term", Some("mundo".to_string()));
+        assert!(
+            parameters_hint(&recipe).contains(super::SEND_CHORD),
+            "nothing stops the message now, and the optional one left does not"
+        );
+
+        recipe.set_value("count", Some("5".to_string()));
+        let hint = parameters_hint(&recipe);
+        assert!(
+            hint.contains(super::SEND_CHORD),
+            "the empty state's only row says there is nothing to do, so the line under it \
+             has to say what to do instead, and it read {hint:?}"
+        );
+    }
 
     #[test]
     fn a_message_is_refused_by_the_name_of_what_is_missing() {

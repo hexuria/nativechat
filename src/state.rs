@@ -1077,6 +1077,26 @@ impl ActiveRecipe {
             .collect()
     }
 
+    /// What the recipe has still to be told, required first and then optional, each with its
+    /// place in the declaration so a pick can name it back.
+    ///
+    /// A parameter that has a value is left out on purpose. It has not gone anywhere — it is a
+    /// chip in the bar above the composer, where its value is shown and can be changed — and
+    /// what someone came to this list for is what is still to do, not a roll-call of the done.
+    /// Required first because those are the ones stopping the message being sent; the
+    /// declaration's own order is kept within each group, so the list does not reshuffle
+    /// under the hand as values come in.
+    pub fn unfilled(&self) -> Vec<(usize, &RecipeParameter)> {
+        let mut unfilled: Vec<(usize, &RecipeParameter)> = self
+            .parameters
+            .iter()
+            .enumerate()
+            .filter(|(_, parameter)| self.value(&parameter.name).is_none())
+            .collect();
+        unfilled.sort_by_key(|(_, parameter)| !parameter.required);
+        unfilled
+    }
+
     /// What goes in the turn's `forwardedProps`: the recipe's id, and each filled-in value as
     /// the kind its declaration named.
     pub fn turn(&self) -> TurnRecipe {
@@ -5086,6 +5106,89 @@ mod tests {
         active.set_value("search_term", Some("   ".to_string()));
         assert_eq!(active.missing(), vec!["search_term"]);
         assert!(!active.turn().values.contains_key("search_term"));
+    }
+
+    /// The declaration the owner hit this on, with an optional parameter declared ahead of a
+    /// required one so the ordering is a claim about the list and not about the JSON.
+    fn youtube() -> RecipeSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": "rcp_1",
+            "name": "youtube",
+            "parameters": [
+                { "name": "count", "required": false, "kind": "number", "default": 5 },
+                { "name": "search_term", "required": true, "kind": "text" },
+                { "name": "channel", "required": true, "kind": "text" },
+                { "name": "lang", "required": false, "kind": "text" }
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn what_is_left_to_tell_a_recipe_puts_the_required_first_and_leaves_the_told_out() {
+        let mut active = ActiveRecipe::from_summary(&youtube());
+        let names = |recipe: &ActiveRecipe| -> Vec<String> {
+            recipe
+                .unfilled()
+                .into_iter()
+                .map(|(_, parameter)| parameter.name.clone())
+                .collect()
+        };
+        assert_eq!(
+            names(&active),
+            vec!["search_term", "channel", "lang"],
+            "what stops the message being sent is asked for first, and count came with a \
+             default standing in its field, so there is nothing left to ask about it"
+        );
+        assert_eq!(
+            active
+                .unfilled()
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "each one keeps its place in the declaration, which is how a pick names it back"
+        );
+
+        active.set_value("search_term", Some("mundo".to_string()));
+        assert_eq!(
+            names(&active),
+            vec!["channel", "lang"],
+            "a parameter that has been told something is done with, and drops out"
+        );
+
+        active.set_value("channel", Some("anything".to_string()));
+        active.set_value("lang", Some("es".to_string()));
+        assert!(
+            active.unfilled().is_empty(),
+            "nothing left to tell it, which is what the panel shows its empty state for"
+        );
+    }
+
+    /// Dropping the recipe is `Option::take`, and the values live inside the recipe: nothing
+    /// outside it remembers them, so picking the same one again starts from its declaration
+    /// rather than resuming a run somebody abandoned.
+    #[test]
+    fn a_recipe_picked_again_starts_empty_rather_than_where_the_last_one_stopped() {
+        let declared = youtube();
+        let mut on_draft = Some(ActiveRecipe::from_summary(&declared));
+        if let Some(active) = on_draft.as_mut() {
+            active.set_value("search_term", Some("mundo".to_string()));
+            active.set_value("count", Some("20".to_string()));
+        }
+        on_draft.take();
+
+        let again = ActiveRecipe::from_summary(&declared);
+        assert_eq!(
+            again.value("search_term"),
+            None,
+            "what was typed for the last run has no business in this one"
+        );
+        assert_eq!(
+            again.value("count"),
+            Some("5"),
+            "the declared default stands again, in place of the 20 that went with the recipe"
+        );
     }
 
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
