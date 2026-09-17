@@ -713,6 +713,9 @@ impl NativeChatHost {
             recipes: state
                 .recipes
                 .iter()
+                // The same rows the page draws, and the listing holds workflows too: a tree is
+                // not on that page, so a driver must not be told there is a row there to click.
+                .filter(|recipe| !recipe.is_workflow())
                 .map(|recipe| RecipeSnap {
                     id: recipe.id.clone(),
                     name: recipe.name.clone(),
