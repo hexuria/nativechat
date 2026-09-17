@@ -35,6 +35,9 @@ struct ShellRev {
     /// revision because the shell repaints only when this struct changes, and a pill that
     /// appears and disappears on its own has to be one of the things that counts as a change.
     reconnect: Option<(String, String)>,
+    /// The signed-out banner's two lines, while the server does not know who the app is. Here
+    /// for the same reason as the pill above: it appears without anybody touching the shell.
+    signed_out: Option<(String, String)>,
     right_pane: u8,
     computer_editor: bool,
     model_picker: bool,
@@ -60,6 +63,7 @@ impl ShellRev {
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
             reconnect: state.reachability_indicator(),
+            signed_out: state.session_banner(),
             right_pane: match state.right_pane {
                 RightPane::Closed => 0,
                 RightPane::Settings => 1,
@@ -279,6 +283,14 @@ impl Render for Layout {
         } else {
             state.computer_banner()
         };
+        // The signed-out banner waits for the wire, by the same rule: signing in cannot work
+        // while the server is not answering, so the pill that says so is the more useful
+        // sentence at that moment, and it goes away by itself. This one does not — it is still
+        // waiting, with its button, when the pill clears.
+        let signed_out = reconnect
+            .is_none()
+            .then(|| state.session_banner())
+            .flatten();
         let computer_confirm = state
             .computer_confirm
             .map(|action| (action, state.active_bot_name()));
@@ -455,6 +467,9 @@ impl Render for Layout {
             .when_some(reconnect, |this, (title, detail)| {
                 this.child(reconnect_banner(title, detail, &theme))
             })
+            .when_some(signed_out, |this, (title, detail)| {
+                this.child(signed_out_banner(self.state.clone(), title, detail, &theme))
+            })
             .when_some(computer_confirm, |this, (action, name)| {
                 this.child(computer_confirm_overlay(
                     self.state.clone(),
@@ -591,6 +606,61 @@ fn reconnect_banner(
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
     banner_pill("reconnect-banner", title, detail, theme)
+}
+
+/// The banner over the app when the server no longer knows who it is signed in as.
+///
+/// Not the pill the other two use, and the difference is the point. The pill means "something is
+/// going on and it will stop"; this one will not stop, ever, until somebody acts — so it carries
+/// the act. It also does not take the thread away: their work is on screen and still worth
+/// reading, and dropping them onto a login form the instant a 401 lands is most of what the
+/// relaunch did that this is meant to spare them.
+fn signed_out_banner(
+    app: Entity<AppState>,
+    title: String,
+    detail: String,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    div()
+        .id("signed-out-banner")
+        .absolute()
+        .top(px(12.))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(
+            h_flex()
+                .items_center()
+                .gap(px(12.))
+                .px(px(14.))
+                .py(px(8.))
+                .rounded(px(12.))
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.danger)
+                .shadow_md()
+                .child(
+                    v_flex()
+                        .gap(px(1.))
+                        .max_w(px(420.))
+                        .child(div().text_sm().child(title))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(detail),
+                        ),
+                )
+                .child(
+                    Button::new("signed-out-sign-in")
+                        .label("Sign in again")
+                        .primary()
+                        .on_click(move |_, _, cx| {
+                            app.update(cx, |state, cx| state.sign_in_again(cx));
+                        }),
+                ),
+        )
 }
 
 fn banner_pill(

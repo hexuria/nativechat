@@ -26,7 +26,7 @@ pub use client::{
     RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent, RecipeVersion,
     RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, thin_tape,
 };
-pub use error::{OpenGrokError, Unreachable, reads_as_gateway_unreachable};
+pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
 pub use types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
     ReplyQuote, assistant_text_from_sse,

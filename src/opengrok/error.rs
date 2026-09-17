@@ -24,22 +24,47 @@ impl Unreachable {
     }
 }
 
+/// What a failure *is*, as opposed to what it says.
+///
+/// Three kinds, and they are three because collapsing any two of them is how a missing
+/// credential once reached a person as a sentence about spend limits. Each has a different
+/// answer to "what makes this stop being true", and that is the only question a caller ever
+/// wants answered:
+///
+/// | kind | the wire | the server | clears by |
+/// |---|---|---|---|
+/// | [`Failure::OutOfReach`] | down | said nothing | itself, when the wire returns |
+/// | [`Failure::SignedOut`] | fine | answered `401` | the person signing in |
+/// | [`Failure::Verdict`] | fine | answered with a reason | nothing; it is a decision |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// Something answered the request and decided against it. It will decide the same way until
+    /// something changes, so there is nothing to retry and nothing to wait for: this is the one
+    /// kind that belongs in a transcript, because it is a fact about one request at one moment.
+    Verdict,
+    /// Nothing answered. The named machine is out of reach, nothing was decided about the
+    /// request at all, and it stops being true without anybody doing anything.
+    OutOfReach(Unreachable),
+    /// The server answered, and what it answered was that it does not know who is asking.
+    ///
+    /// Neither of the other two. The wire is fine — a `401` is proof of it — and the server
+    /// decided nothing about what was asked, because it never got as far as the question.
+    /// Waiting will not fix it and neither will asking again; a person has to sign in.
+    SignedOut,
+}
+
 /// HTTP failure against OpenGrok. Status is preserved so login 401 is distinguishable.
 ///
-/// A failure is one of two different kinds of thing, and this is where the two are told apart —
-/// once, here, rather than at every call site that has to decide what to do about one. A refusal
-/// is a **verdict**: the server heard the request and decided against it, and it will decide the
-/// same way until something changes. Not being able to reach the server, or the server not being
-/// able to reach the gateway, is a **state**: nothing was decided, and it stops being true on its
-/// own. Only the second kind is worth retrying and worth saying "reconnecting" about.
+/// A failure is one of three different kinds of thing, and this is where they are told apart —
+/// once, here, rather than at every call site that has to decide what to do about one. See
+/// [`Failure`] for what the three are and why none of them may be folded into another.
 #[derive(Debug)]
 pub struct OpenGrokError {
     pub status: Option<u16>,
     pub message: String,
-    /// Which machine was out of reach, when that is what this failure was. `None` is a verdict:
-    /// something answered, and this is what it said. Private so the invariant holds — a failure
-    /// is never both a state and a verdict.
-    unreachable: Option<Unreachable>,
+    /// What kind of failure this is. Private so the invariant holds — a failure is exactly one
+    /// of the three, never two of them at once.
+    failure: Failure,
 }
 
 impl OpenGrokError {
@@ -47,7 +72,7 @@ impl OpenGrokError {
         Self {
             status: None,
             message: message.into(),
-            unreachable: None,
+            failure: Failure::Verdict,
         }
     }
 
@@ -55,7 +80,21 @@ impl OpenGrokError {
         Self {
             status: Some(status),
             message: message.into(),
-            unreachable: None,
+            failure: Failure::Verdict,
+        }
+    }
+
+    /// The server does not know who is asking.
+    ///
+    /// Built where the route is known rather than read off the status, because `401` means two
+    /// unrelated things depending on what was asked: on `/auth/login` it is a wrong password,
+    /// which is a verdict about what the person typed, and on anything else it is the session
+    /// being gone. Only the client, which knows the path, can tell those apart.
+    pub fn signed_out(message: impl Into<String>) -> Self {
+        Self {
+            status: Some(401),
+            message: message.into(),
+            failure: Failure::SignedOut,
         }
     }
 
@@ -71,27 +110,31 @@ impl OpenGrokError {
         Self {
             status: None,
             message: error.to_string(),
-            unreachable: out_of_reach.then_some(Unreachable::Server),
+            failure: if out_of_reach {
+                Failure::OutOfReach(Unreachable::Server)
+            } else {
+                Failure::Verdict
+            },
         }
     }
 
     /// Something the server said, read for whether it is saying the gateway is out of reach.
     pub fn from_server(status: Option<u16>, message: impl Into<String>) -> Self {
         let message = message.into();
-        let unreachable = if reads_as_gateway_unreachable(&message) {
-            Some(Unreachable::Gateway)
+        let failure = if reads_as_gateway_unreachable(&message) {
+            Failure::OutOfReach(Unreachable::Gateway)
         } else if matches!(status, Some(502..=504)) {
             // Nothing this app talks to answers these itself: they come from whatever stands in
             // front of OpenGrok, saying it could not get to OpenGrok either. That is the server
             // being out of reach with an extra hop in the middle.
-            Some(Unreachable::Server)
+            Failure::OutOfReach(Unreachable::Server)
         } else {
-            None
+            Failure::Verdict
         };
         Self {
             status,
             message,
-            unreachable,
+            failure,
         }
     }
 
@@ -99,9 +142,26 @@ impl OpenGrokError {
         self.status == Some(401)
     }
 
+    /// What kind of failure this is, for the one place that sorts them.
+    pub fn failure(&self) -> Failure {
+        self.failure
+    }
+
     /// Which machine was out of reach, when that is what happened.
     pub fn unreachable(&self) -> Option<Unreachable> {
-        self.unreachable
+        match self.failure {
+            Failure::OutOfReach(what) => Some(what),
+            _ => None,
+        }
+    }
+
+    /// The server answered and did not know who was asking.
+    ///
+    /// Not the same question as [`Self::is_unauthorized`], which is only about the status line:
+    /// a wrong password is a `401` too, and it is a verdict about what somebody typed rather
+    /// than a session that has gone.
+    pub fn is_signed_out(&self) -> bool {
+        self.failure == Failure::SignedOut
     }
 }
 
@@ -143,9 +203,11 @@ mod tests {
         let refused = OpenGrokError::status(401, "invalid email or password");
         assert!(refused.is_unauthorized());
         assert_eq!(refused.unreachable(), None);
+        assert_eq!(refused.failure(), Failure::Verdict);
 
         let declined = OpenGrokError::from_server(Some(403), "this model is not on your plan");
         assert_eq!(declined.unreachable(), None);
+        assert_eq!(declined.failure(), Failure::Verdict);
     }
 
     #[test]
@@ -179,5 +241,50 @@ mod tests {
         assert!(!reads_as_gateway_unreachable(
             "the gateway answered 429 Too Many Requests when asked for its models"
         ));
+    }
+
+    /// The three kinds are three, and no two of them read alike.
+    ///
+    /// This is the bug the whole distinction exists for: a turn went out with no credential on
+    /// it, the server had nobody to bill and held it, and the sentence it sent back landed in
+    /// the transcript as a red line about spend limits. A session that is gone is not a verdict
+    /// about the turn, and it is not the wire being down.
+    #[test]
+    fn a_session_that_is_gone_is_neither_a_verdict_nor_a_state_that_clears_itself() {
+        let gone =
+            OpenGrokError::signed_out("this turn does not say whose spend it is — sign in again");
+        assert_eq!(gone.failure(), Failure::SignedOut);
+        assert!(gone.is_signed_out());
+        assert!(gone.is_unauthorized(), "it is still a 401 on the wire");
+        assert_eq!(
+            gone.unreachable(),
+            None,
+            "nothing is out of reach: the server answered"
+        );
+    }
+
+    #[test]
+    fn a_verdict_with_a_reason_stays_a_verdict() {
+        // The exact sentence that reached a person as a red line while the real trouble was a
+        // missing credential. Read on its own it *is* a verdict — a refusal with a reason — and
+        // it has to stay one, or the fix for today's bug would swallow every real refusal too.
+        let refused = OpenGrokError::from_server(
+            Some(402),
+            "the model gateway refused: 402 spend cap reached for this org",
+        );
+        assert_eq!(refused.failure(), Failure::Verdict);
+        assert!(!refused.is_signed_out());
+        assert_eq!(refused.unreachable(), None);
+    }
+
+    #[test]
+    fn a_wrong_password_is_not_a_session_that_has_gone() {
+        // Both are `401`. One is the person mistyping and belongs under the password field; the
+        // other is the app holding nothing the server recognises. Status alone cannot tell them
+        // apart, which is why the client builds the second one by route.
+        let typed_wrong = OpenGrokError::from_server(Some(401), "invalid email or password");
+        assert!(typed_wrong.is_unauthorized());
+        assert!(!typed_wrong.is_signed_out());
+        assert_eq!(typed_wrong.failure(), Failure::Verdict);
     }
 }
