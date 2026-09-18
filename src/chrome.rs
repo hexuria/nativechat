@@ -9,6 +9,22 @@ pub const SIDEBAR_MIN_EXPANDED: f32 = 240.0;
 pub const SIDEBAR_MAX_EXPANDED: f32 = 400.0;
 pub const SIDEBAR_HIDE_SNAP: f32 = 44.0;
 pub const INFO_PANE_WIDTH: f32 = 320.0;
+/// Coworker desktop, CSS pixels. The Computer pane `{Bot}'s screen` thumb and
+/// the in-chat Computer card well must share this size so the full desktop
+/// (taskbar included) is visible — no letterbox, no bottom clip.
+pub const BOX_SCREEN: (f32, f32) = (1280.0, 800.0);
+/// Width / height for GPUI `aspect_ratio` (1280/800 = 1.6).
+pub const BOX_SCREEN_ASPECT: f32 = BOX_SCREEN.0 / BOX_SCREEN.1;
+
+/// Height of a 1280×800 desktop scaled to `width`.
+pub fn box_screen_height_for_width(width: f32) -> f32 {
+    width * BOX_SCREEN.1 / BOX_SCREEN.0
+}
+
+/// Inner width of the Computer pane preview (pane minus the overview's 16px gutters).
+pub fn computer_pane_screen_width() -> f32 {
+    INFO_PANE_WIDTH - 32.0
+}
 pub const AVATAR_PX: f32 = 36.0;
 pub const AVATAR_TRIGGER_PX: f32 = 64.0;
 pub const MASCOT_BOX_PX: f32 = 46.0;
@@ -401,6 +417,28 @@ mod tests {
         s = remember_choice(s, false);
         let r = collapse_for_width(s, 1400.0, false);
         assert_eq!(r.apply, Some(true), "the wide-screen choice was the rail");
+    }
+
+    #[test]
+    fn box_screen_aspect_matches_the_desktop() {
+        assert!((BOX_SCREEN_ASPECT - 1280.0 / 800.0).abs() < f32::EPSILON);
+        let pane_w = computer_pane_screen_width();
+        assert!((box_screen_height_for_width(pane_w) - pane_w * 800.0 / 1280.0).abs() < 0.001);
+        // The old in-chat well used height = 512 × 800/1280 while the card was
+        // `w_full` (often ~720). That squat box overflow-clipped the taskbar.
+        let old_chat_h = 512.0 * 800.0 / 1280.0;
+        let chat_w = 720.0;
+        assert!(
+            box_screen_height_for_width(chat_w) > old_chat_h + 1.0,
+            "chat well must grow with width so 1280×800 is not clipped"
+        );
+        assert!(
+            (box_screen_height_for_width(chat_w) / chat_w
+                - box_screen_height_for_width(pane_w) / pane_w)
+                .abs()
+                < 0.0001,
+            "pane thumb and chat well share the same 1280×800 aspect"
+        );
     }
 
     #[test]

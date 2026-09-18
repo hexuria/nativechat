@@ -1,7 +1,11 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::chrome::{HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats};
+use crate::chrome::{
+    BOX_SCREEN_ASPECT, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, box_screen_height_for_width,
+    chrome_floats, computer_pane_screen_width,
+};
+use crate::components::alert_chrome::{attention_ctas, attention_glass, attention_shadow};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     BoxHandoffResolution, computer_attention_done_id, computer_attention_id,
@@ -11,7 +15,7 @@ use crate::state::{
     AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
     ScheduleUiMode, ScheduleUnit,
 };
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
@@ -843,6 +847,10 @@ fn recipes_entry(
 /// Grok **Needs your attention** while Open the screen is live.
 /// Skip this step = decline; I'm done, continue = hand back.
 /// Shared by the Computer pane and the launched noVNC window.
+///
+/// Glass: translucent peach/bronze over the sidebar (`theme.sidebar` shows
+/// through). GPUI has no element backdrop-filter; alpha + warm shadow is the
+/// frost. Orange is the title only — I'm done is a black (light) / white (dark) pill.
 pub(crate) fn computer_attention_banner(
     banner_id: impl Into<ElementId>,
     skip_id: impl Into<ElementId>,
@@ -857,45 +865,33 @@ pub(crate) fn computer_attention_banner(
     let done_app = app;
     let skip_key = key.clone();
     let done_key = key;
-    let colors = attention_colors(cx.theme().is_dark());
-    let skip_style = ButtonCustomVariant::new(cx)
-        .foreground(colors.body)
-        .hover(rgb(0xFFFFFF).opacity(0.14).into())
-        .active(rgb(0xFFFFFF).opacity(0.22).into());
-    let done_style = ButtonCustomVariant::new(cx)
-        .color(colors.done_bg)
-        .foreground(colors.done_fg)
-        .hover(rgb(0xFFF4DC).into())
-        .active(rgb(0xF0E0C0).into());
-    h_flex()
+    let dark = cx.theme().is_dark();
+    let glass = attention_glass(dark);
+    let ctas = attention_ctas(dark, cx);
+    v_flex()
         .id(banner_id)
         .w_full()
         .flex_shrink_0()
-        .gap(px(12.))
-        .px(px(14.))
-        .py(px(10.))
-        .items_start()
-        .flex_wrap()
-        .rounded(px(10.))
+        .gap(px(10.))
+        .px(px(18.))
+        .py(px(16.))
+        .rounded(px(14.))
         .border_1()
-        .border_color(colors.border)
-        .bg(colors.bg)
+        .border_color(glass.border)
+        .bg(glass.bg)
+        .shadow(attention_shadow(dark))
         .child(
-            v_flex()
-                .flex_1()
-                .min_w(px(160.))
-                .gap(px(4.))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.title)
-                        .child("Needs your attention"),
-                )
-                .child(div().text_xs().text_color(colors.body).child(instruction)),
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(glass.title)
+                .child("Needs your attention"),
         )
+        .child(div().text_sm().text_color(glass.body).child(instruction))
         .child(
             h_flex()
+                .w_full()
+                .justify_end()
                 .gap(px(8.))
                 .flex_shrink_0()
                 .items_center()
@@ -903,7 +899,7 @@ pub(crate) fn computer_attention_banner(
                 .child(
                     Button::new(skip_id)
                         .small()
-                        .custom(skip_style)
+                        .custom(ctas.tertiary)
                         .label("Skip this step")
                         .disabled(!can_resolve)
                         .on_click(move |_, _, cx| {
@@ -919,7 +915,7 @@ pub(crate) fn computer_attention_banner(
                 .child(
                     Button::new(done_id)
                         .small()
-                        .custom(done_style)
+                        .custom(ctas.primary)
                         .rounded(px(999.))
                         .label("I'm done, continue")
                         .disabled(!can_resolve)
@@ -936,39 +932,6 @@ pub(crate) fn computer_attention_banner(
         )
 }
 
-struct AttentionColors {
-    bg: Hsla,
-    border: Hsla,
-    title: Hsla,
-    body: Hsla,
-    done_bg: Hsla,
-    done_fg: Hsla,
-}
-
-/// Dark: Grok warm amber banner, gold title, cream body, white I'm done pill.
-/// Light: the same hue, saturated gold — not a beige wash.
-fn attention_colors(dark: bool) -> AttentionColors {
-    if dark {
-        AttentionColors {
-            bg: rgb(0x7A4A10).into(),
-            border: rgb(0xE0A020).into(),
-            title: rgb(0xF8C96A).into(),
-            body: rgb(0xF4E4C4).into(),
-            done_bg: rgb(0xFFFFFF).into(),
-            done_fg: rgb(0x1A140C).into(),
-        }
-    } else {
-        AttentionColors {
-            bg: rgb(0xFFC44D).into(),
-            border: rgb(0xD49212).into(),
-            title: rgb(0x8A3A00).into(),
-            body: rgb(0x3D2208).into(),
-            done_bg: rgb(0xFFFFFF).into(),
-            done_fg: rgb(0x1A140C).into(),
-        }
-    }
-}
-
 /// The coworker's screen. The Open pill is the control: it appears on hover
 /// only once the box has a screen URL, and only then does the tile take a
 /// click — a blank monitor must not provision a box behind the person's back.
@@ -979,16 +942,18 @@ fn screen_tile(
     app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    // The tile is the screen's own shape (the box is 1280x800), so the picture fills it edge to
-    // edge with nothing cropped and nothing letterboxed — the way the reference client draws it.
-    let width = INFO_PANE_WIDTH - 32.;
-    let height = width * 800. / 1280.;
+    // The tile is the screen's own 1280×800 shape — same AR as the in-chat
+    // Computer card well (`BOX_SCREEN_ASPECT`) so neither letterboxes nor
+    // clips the taskbar.
+    let width = computer_pane_screen_width();
+    let height = box_screen_height_for_width(width);
     div()
         .id("agent-screen")
         .group("agent-screen")
         .relative()
         .w(px(width))
         .h(px(height))
+        .aspect_ratio(BOX_SCREEN_ASPECT)
         .flex_shrink_0()
         .rounded(px(12.))
         .border_1()
