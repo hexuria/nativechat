@@ -72,6 +72,10 @@ pub struct OpenGrokClient {
     /// retry must await this instead of each POSTing: the first 200 rotates
     /// the refresh cookie, and a second POST with the old cookie is 401 and
     /// used to `clear_session` (SignedOut banner).
+    ///
+    /// OpenGrok today: one-time rotate. They are shipping a short grace so
+    /// presenting the just-rotated-away refresh returns the current pair
+    /// (idempotent). NativeChat single-flight is still required either way.
     refresh_flight: Arc<AsyncMutex<Option<RefreshShared>>>,
 }
 
@@ -399,8 +403,10 @@ impl OpenGrokClient {
     /// `send_json`, which would refresh before refreshing.
     ///
     /// Single-flight: concurrent callers await one POST. A second `/auth/refresh`
-    /// with the cookie the first just rotated is 401 and must not `clear_session`
-    /// if the jar already holds a new pair.
+    /// with the cookie the first just rotated is 401 today (OpenGrok one-time
+    /// rotate) and must not `clear_session` if the jar already holds a new pair.
+    /// OG short grace (idempotent current pair for the just-rotated-away
+    /// refresh) does not replace this join.
     pub async fn refresh(&self) -> Result<(), OpenGrokError> {
         let shared = {
             let mut flight = self.refresh_flight.lock().await;
@@ -3018,7 +3024,9 @@ mod tests {
     }
 
     /// Burst after access TTL: two refresh() callers must join one POST.
-    /// A second POST would 401 on the rotated cookie and used to clear_session.
+    /// OpenGrok `/auth/refresh` is one-time rotate today (grace for the
+    /// just-rotated-away cookie is shipping and idempotent). NativeChat
+    /// single-flight is still required: a second POST 401 used to clear_session.
     #[tokio::test]
     async fn concurrent_refresh_is_single_flight_and_session_survives() {
         let server = MockServer::start().await;
