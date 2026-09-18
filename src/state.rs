@@ -2447,8 +2447,25 @@ impl AppState {
         }
     }
 
+    /// Open user-form / approval / live handoff, or Waiting chrome. Cold
+    /// composer send has none of these and must not POST `/stop`.
+    fn has_hitl_to_interrupt(&self, conversation_id: &str) -> bool {
+        self.has_open_approval(conversation_id)
+            || self.has_open_user_form(conversation_id)
+            || matches!(
+                self.thread_status(conversation_id),
+                Some(WAITING_FOR_YOU_STATUS) | Some(WAITING_APPROVAL_STATUS)
+            )
+    }
+
     /// Run id of a parked HITL turn, if this thread still has one.
+    ///
+    /// Only a live or HITL-parked run. Never invent an id for a cold send —
+    /// stopping the run we are about to mint is 202 then "did not go through."
     fn parked_hitl_run_id(&self, conversation_id: &str) -> Option<String> {
+        if !self.has_hitl_to_interrupt(conversation_id) {
+            return None;
+        }
         if let Some(id) = self.parked_hitl_runs.get(conversation_id)
             && !id.is_empty()
         {
@@ -2488,10 +2505,11 @@ impl AppState {
             }
         }
         // Form painted mid-stream: live_turns still holds the run that
-        // `park_waiting_for_you` has not copied yet.
-        if (self.has_open_approval(conversation_id) || self.has_open_user_form(conversation_id))
-            && let Some(turn) = self.live_turns.get(conversation_id)
+        // `park_waiting_for_you` has not copied yet. Caller must snapshot
+        // this *before* minting the next turn's run id.
+        if let Some(turn) = self.live_turns.get(conversation_id)
             && !turn.run_id.is_empty()
+            && !turn.persisting
         {
             return Some(turn.run_id.clone());
         }
@@ -2502,6 +2520,16 @@ impl AppState {
         let id = self.parked_hitl_run_id(conversation_id)?;
         self.parked_hitl_runs.remove(conversation_id);
         Some(id)
+    }
+
+    /// Snapshot the HITL run to stop, if any. Stale map entries without
+    /// open HITL / Waiting are dropped so a later "hi" cannot `/stop`.
+    fn take_hitl_interrupt_target(&mut self, conversation_id: &str) -> Option<String> {
+        if !self.has_hitl_to_interrupt(conversation_id) {
+            self.parked_hitl_runs.remove(conversation_id);
+            return None;
+        }
+        self.take_parked_hitl_run(conversation_id)
     }
 
     /// Composer send POSTs a real OpenGrok turn. Open forms / approvals /
@@ -5372,17 +5400,11 @@ impl AppState {
             self.note_signed_out(cx);
             return;
         }
-        // Steer while HITL is parked: stop the AwaitingApproval run, then
-        // POST a new turn that includes this user message. Gate off if a
-        // server predates `POST /ag-ui/runs/{id}/stop` — send still POSTs.
-        // A 404 on stop is success (nothing of ours running).
-        let interrupt_run_id = if self.has_open_approval(&conversation_id)
-            || self.has_open_user_form(&conversation_id)
-        {
-            self.take_parked_hitl_run(&conversation_id)
-        } else {
-            None
-        };
+        // Snapshot the HITL run to interrupt *before* minting this turn's
+        // run id. A cold send has no open form / approval / live handoff /
+        // Waiting — do not POST `/stop` at all. Stopping the id we are
+        // about to send is 202 then "This turn did not go through."
+        let interrupt_run_id = self.take_hitl_interrupt_target(&conversation_id);
         let coworker_id = self.active_coworker_id.clone();
         // The recipe as it stands now, not when the turn reaches the wire: the composer clears
         // the draft the moment it is sent, and the turn should carry what was on the message.
@@ -5426,6 +5448,8 @@ impl AppState {
                 persisting: false,
             },
         );
+        // Never `/stop` the run this POST is about to start.
+        let interrupt_run_id = interrupt_run_id.filter(|id| id != &run_id);
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -5449,19 +5473,20 @@ impl AppState {
             };
             let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
-                    // OpenGrok A2: `POST /ag-ui/runs/{id}/stop` on
-                    // AwaitingApproval takes effect immediately (closes the
-                    // parked card). Box `interruptAgentRun` /
-                    // `POST /boxes/{boxId}/interrupt` is a different surface.
+                    // OpenGrok A2: `POST /ag-ui/runs/{id}/stop` on a parked
+                    // AwaitingApproval run, then POST `/ag-ui`. Cold send
+                    // has `interrupt_run_id == None` and skips stop.
                     // `HITL_INTERRUPT_AVAILABLE = false` skips stop only —
-                    // the new turn still POSTs. Never swallow send.
-                    if HITL_INTERRUPT_AVAILABLE && let Some(parked) = interrupt_run_id.as_deref() {
-                        if let Err(error) = client.stop_run(parked).await
-                            && error.status != Some(404)
-                        {
-                            eprintln!(
-                                "NativeChat: HITL interrupt of {parked} did not land: {error}"
-                            );
+                    // the new turn still POSTs. 404 on stop is success.
+                    if HITL_INTERRUPT_AVAILABLE {
+                        if let Some(parked) = interrupt_run_id.as_deref() {
+                            if let Err(error) = client.stop_run(parked).await
+                                && error.status != Some(404)
+                            {
+                                eprintln!(
+                                    "NativeChat: HITL interrupt of {parked} did not land: {error}"
+                                );
+                            }
                         }
                     }
                     let mut tracker = ToolCallTracker::default();
@@ -10178,12 +10203,84 @@ mod tests {
 
     #[test]
     fn composer_send_keeps_stop_on_a_working_turn_without_hitl() {
-        let state = mid_turn(at(message("m_live", false, ""), 20));
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
         assert!(state.is_active_bot_responding());
         assert!(state.is_turn_in_flight());
         assert!(
             !state.composer_send_posts_turn("cw_1"),
             "working turn with no form/approval/handoff still keeps Stop"
+        );
+        assert!(
+            state.take_hitl_interrupt_target("cw_1").is_none(),
+            "working turn with no HITL must not stop-then-send"
+        );
+    }
+
+    /// Cold "hi": no open HITL, no Waiting, no parked run. Composer POSTs
+    /// `/ag-ui` only — never `/ag-ui/runs/{id}/stop` of the run it just minted.
+    #[test]
+    fn cold_composer_send_does_not_stop_a_run() {
+        let mut state = AppState::new();
+        state
+            .conversations
+            .push(thread("cw_1", vec![at(message("m_hi", true, "hi"), 10)]));
+        state.active_conversation_id = Some("cw_1".to_string());
+        state.active_coworker_id = Some("cw_1".to_string());
+        assert!(!state.has_open_user_form("cw_1"));
+        assert!(!state.has_open_approval("cw_1"));
+        assert!(!state.has_hitl_to_interrupt("cw_1"));
+        assert!(state.parked_hitl_run_id("cw_1").is_none());
+        assert!(
+            state.take_hitl_interrupt_target("cw_1").is_none(),
+            "cold hi must not POST /stop"
+        );
+
+        let mut stale = AppState::new();
+        stale
+            .conversations
+            .push(thread("cw_1", vec![at(message("m_hi", true, "hi"), 10)]));
+        stale.active_conversation_id = Some("cw_1".to_string());
+        stale
+            .parked_hitl_runs
+            .insert("cw_1".into(), "01a0b381-stale".into());
+        assert!(
+            stale.take_hitl_interrupt_target("cw_1").is_none(),
+            "stale parked id without open HITL / Waiting must not stop"
+        );
+        assert!(
+            stale.parked_hitl_runs.get("cw_1").is_none(),
+            "stale map entry is dropped so the next hi cannot /stop"
+        );
+    }
+
+    #[test]
+    fn hitl_steer_stops_the_parked_run_not_the_new_mint() {
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run_1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert!(state.has_hitl_to_interrupt("cw_1"));
+        let parked = state.take_hitl_interrupt_target("cw_1");
+        assert_eq!(parked.as_deref(), Some("run_1"));
+        let new_run = "01a0b381-new-mint".to_string();
+        let interrupt = parked.filter(|id| id != &new_run);
+        assert_eq!(
+            interrupt.as_deref(),
+            Some("run_1"),
+            "steer stops the parked HITL run, never the run about to POST"
         );
     }
 
