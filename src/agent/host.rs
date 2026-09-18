@@ -717,8 +717,7 @@ impl NativeChatHost {
                 .into_iter()
                 .map(|spec| ApprovalSnap {
                     local: spec.runs_on_this_mac(),
-                    review: spec.is_review_an_action()
-                        && (state.egress_tunnel_available() || state.egress_tunnel_enabled),
+                    review: spec.is_review_an_action() && state.egress_tunnel_available(),
                     place: spec.place(),
                     call_id: spec.call_id,
                     tool: spec.tool,

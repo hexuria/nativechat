@@ -20,7 +20,7 @@ use crate::opengrok::{
     collapse_open_approvals,
 };
 use crate::state::{
-    AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, is_status_line, is_tool_standin,
+    AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, bot_status_line, is_status_line, is_tool_standin,
     is_unsent_turn_note,
 };
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
@@ -1685,7 +1685,7 @@ impl Render for ChatView {
                                             div()
                                                 .text_sm()
                                                 .text_color(theme.muted_foreground)
-                                                .child(format!("{name} is working")),
+                                                .child(bot_status_line(&name, &label)),
                                         ),
                                 )
                             })

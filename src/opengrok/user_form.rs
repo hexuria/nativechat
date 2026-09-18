@@ -477,6 +477,11 @@ impl UserFormSpec {
         false
     }
 
+    /// Call-only twin (`user-form-call-{callId}-*`) of a stamped entry card.
+    pub fn shares_call_id(&self, call_id: &str) -> bool {
+        !call_id.is_empty() && !self.call_id.is_empty() && self.call_id == call_id
+    }
+
     /// Fold an awaiting CUSTOM onto a later send-message envelope (one id
     /// missing). A second OTP form with a different `entryId` / `callId` is a
     /// new card — do not merge it onto a password form that already settled.
@@ -1071,6 +1076,19 @@ fn normalize_name(name: &str) -> String {
 /// Continue's gates, for tests and for the renderer. Never "fill succeeded".
 pub fn continue_enabled(spec: &UserFormSpec, values: &UserFormValues, server_fill: bool) -> bool {
     spec.continue_enabled(values, server_fill)
+}
+
+/// Settle every spec that shares `call_id` (stamped entry + call-only twin).
+/// A later OTP with a different call stays unresolved.
+pub fn bind_call_peers(specs: &mut [UserFormSpec], call_id: &str, resolution: FormResolution) {
+    if call_id.is_empty() {
+        return;
+    }
+    for spec in specs {
+        if spec.shares_call_id(call_id) {
+            spec.resolution = Some(resolution);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1889,6 +1907,45 @@ mod tests {
             }
             other => panic!("expected Settled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bind_call_peers_settles_the_call_twin_not_a_later_otp() {
+        let call_twin = UserFormSpec::from_tool_args(
+            &json!({ "formRequest": google_email_request() }),
+            "call-9",
+        )
+        .unwrap();
+        let entry = UserFormSpec::from_custom_event(&live_awaiting(Some("e_form"))).unwrap();
+        let otp = UserFormSpec::from_custom_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-otp",
+            "entryId": "e_otp",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Enter the code",
+                "fields": [{"id": "otp", "label": "Code", "type": "otp", "required": true}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(call_twin.card_key(), "call-9");
+        assert_eq!(entry.card_key(), "e_form");
+        assert!(entry.shares_call_id("call-9"));
+        assert!(!otp.shares_call_id("call-9"));
+        let mut specs = [call_twin, entry, otp];
+        bind_call_peers(&mut specs, "call-9", FormResolution::Submitted);
+        assert_eq!(
+            specs[0].effective_resolution(),
+            Some(FormResolution::Submitted)
+        );
+        assert!(!specs[0].is_unresolved(), "call twin must collapse");
+        assert_eq!(
+            specs[1].effective_resolution(),
+            Some(FormResolution::Submitted)
+        );
+        assert!(specs[2].is_unresolved(), "OTP is a different call");
+        assert_eq!(specs[2].entry_id, "e_otp");
     }
 
     #[test]

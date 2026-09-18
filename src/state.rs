@@ -245,11 +245,20 @@ const WAITING_APPROVAL_STATUS: &str = "Waiting for approval";
 /// the bot must not see.
 const WAITING_FOR_YOU_STATUS: &str = WAITING_FOR_YOU;
 
-fn is_waiting_on_person(status: Option<&str>) -> bool {
+pub fn is_waiting_on_person(status: Option<&str>) -> bool {
     matches!(
         status,
         Some(WAITING_APPROVAL_STATUS) | Some(WAITING_FOR_YOU_STATUS)
     )
+}
+
+/// Footer chrome: the server waiting label as-is, else `{name} is working`.
+pub fn bot_status_line(name: &str, label: &str) -> String {
+    if is_waiting_on_person(Some(label)) {
+        label.to_string()
+    } else {
+        format!("{name} is working")
+    }
 }
 
 /// A turn that never reached the server, in either of the two ways that happens.
@@ -2034,15 +2043,15 @@ impl AppState {
         self.submit_user_form(card_key, values, cx);
     }
 
-    /// Host command, process env, or box `isEgressTunnelAvailable` /
-    /// `egress_tunnel.ready`. Any one is enough. No tunnel is invented.
+    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** box
+    /// `egress_tunnel.ready`. No tunnel is invented.
     pub fn egress_tunnel_available(&self) -> bool {
-        self.host_egress_tunnel_available
-            || env_egress_tunnel_enabled()
-            || self
-                .coworker_computer
-                .as_ref()
-                .is_some_and(|computer| computer.egress_tunnel_ready())
+        let host = self.host_egress_tunnel_available || env_egress_tunnel_enabled();
+        let box_ready = self
+            .coworker_computer
+            .as_ref()
+            .is_some_and(|computer| computer.egress_tunnel_ready());
+        host && box_ready
     }
 
     /// Grok shows the row when the tunnel is provisioned or already on.
@@ -2154,6 +2163,17 @@ impl AppState {
             activity.label = Some(label.to_string());
         } else {
             self.thread_activity.remove(conversation_id);
+        }
+    }
+
+    /// Server run is finished; the person holds a form. Mirror that: chrome
+    /// **Waiting for you**, drop the local live-turn (Stop only while a run
+    /// is actually in flight). The open form lives on OpenGrok and comes
+    /// back from replay after quit/relaunch.
+    fn park_waiting_for_you(&mut self, conversation_id: &str, run_id: &str) {
+        self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+        if !run_id.is_empty() {
+            self.release_live_turn(conversation_id, run_id);
         }
     }
 
@@ -4727,7 +4747,7 @@ impl AppState {
                     .iter()
                     .any(|part| matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved()));
                 if waiting_form {
-                    self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+                    self.park_waiting_for_you(conversation_id, &turn.run_id);
                 } else {
                     self.finish_responding(Some(conversation_id), false);
                 }
@@ -5153,7 +5173,7 @@ impl AppState {
                     state.release_live_turn(&conversation_id, &run_id);
                 }
                 if waiting_user_form {
-                    state.end_turn_waiting(Some(&conversation_id), Some(WAITING_FOR_YOU_STATUS));
+                    state.park_waiting_for_you(&conversation_id, &run_id);
                 } else if waiting_approval {
                     let open = state
                         .conversations
@@ -5305,10 +5325,16 @@ impl AppState {
     /// fault: the button is not a stop button then, but a keystroke or a driver can still ask.
     /// Neither is a turn whose outcome is already decided and on its way to disk — it stays
     /// registered until the write lands, but nothing is running under it.
+    ///
+    /// A finished run that left a user-form card is not in flight on the
+    /// server. Do not keep Stop over **Waiting for you**.
     fn turn_to_stop(&self) -> Option<(String, LiveTurn)> {
         let conversation_id = self.active_conversation_id.clone()?;
         let turn = self.live_turns.get(&conversation_id)?;
         if turn.persisting {
+            return None;
+        }
+        if self.thread_status(&conversation_id) == Some(WAITING_FOR_YOU_STATUS) {
             return None;
         }
         Some((conversation_id, turn.clone()))
@@ -5626,10 +5652,9 @@ impl AppState {
                                             matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved())
                                         });
                                         if waiting_form {
-                                            state.end_turn_waiting(
-                                                conversation_id.as_deref(),
-                                                Some(WAITING_FOR_YOU_STATUS),
-                                            );
+                                            if let Some(id) = conversation_id.as_deref() {
+                                                state.park_waiting_for_you(id, &run_id);
+                                            }
                                         } else {
                                             state.finish_responding(
                                                 conversation_id.as_deref(),
@@ -5986,11 +6011,15 @@ impl AppState {
             if let ChatPart::UserForm(spec) = part {
                 if spec.effective_resolution().is_none() {
                     let key = spec.card_key().to_string();
-                    if let Some(&res) = self
+                    let mut res = self
                         .user_form_resolutions
                         .get(&spec.entry_id)
                         .or_else(|| self.user_form_resolutions.get(&key))
-                    {
+                        .copied();
+                    if res.is_none() && !spec.call_id.is_empty() {
+                        res = self.user_form_resolutions.get(&spec.call_id).copied();
+                    }
+                    if let Some(res) = res {
                         spec.resolution = Some(res);
                     }
                 }
@@ -6071,6 +6100,10 @@ impl AppState {
             }
             self.user_form_resolutions
                 .insert(spec.card_key().to_string(), resolution);
+            if !spec.call_id.is_empty() {
+                self.user_form_resolutions
+                    .insert(spec.call_id.clone(), resolution);
+            }
             self.user_form_restore.remove(spec.card_key());
         }
         if let Some(id) = spec.handoff_entry_id.as_deref().filter(|id| !id.is_empty()) {
@@ -6084,20 +6117,49 @@ impl AppState {
     }
 
     fn paint_user_form_resolution(&mut self, card_key: &str, resolution: FormResolution) {
-        let prior = self.user_form_mut(card_key).and_then(|spec| {
-            (spec.resolution != Some(FormResolution::Sending))
-                .then_some(spec.effective_resolution())
-                .flatten()
-        });
+        let (prior, call_id) = match self.user_form_mut(card_key) {
+            Some(spec) => {
+                let prior = (spec.resolution != Some(FormResolution::Sending))
+                    .then_some(spec.effective_resolution())
+                    .flatten();
+                (prior, spec.call_id.clone())
+            }
+            None => (None, String::new()),
+        };
         if let Some(prior) = prior {
             self.user_form_restore.insert(card_key.to_string(), prior);
         }
         if let Some(spec) = self.user_form_mut(card_key) {
             spec.resolution = Some(resolution);
         }
+        self.paint_user_form_call_peers(&call_id, resolution);
         if resolution != FormResolution::Sending {
             self.user_form_resolutions
                 .insert(card_key.to_string(), resolution);
+        }
+    }
+
+    /// Collapse every `ChatPart::UserForm` that shares this AG-UI `callId`
+    /// (`user-form-call-{callId}-*`). Clone `call_id` before this walk — do
+    /// not hold `user_form_mut` across the iteration (Mac E0499).
+    fn paint_user_form_call_peers(&mut self, call_id: &str, resolution: FormResolution) {
+        if call_id.is_empty() {
+            return;
+        }
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                for part in &mut message.parts {
+                    if let ChatPart::UserForm(spec) = part
+                        && spec.shares_call_id(call_id)
+                    {
+                        spec.resolution = Some(resolution);
+                    }
+                }
+            }
+        }
+        if resolution != FormResolution::Sending {
+            self.user_form_resolutions
+                .insert(call_id.to_string(), resolution);
         }
     }
 
@@ -6260,9 +6322,22 @@ impl AppState {
                         match crate::opengrok::settle_user_form_http(verb, &reply) {
                             UserFormHttpSettle::Merge(incoming) => {
                                 let resolution = incoming.effective_resolution();
+                                let incoming_call = incoming.call_id.clone();
+                                let origin_call = state
+                                    .user_form_mut(&card_key)
+                                    .map(|spec| spec.call_id.clone())
+                                    .unwrap_or_default();
                                 state.remember_user_form_resolution(&incoming);
                                 if let Some(spec) = state.user_form_mut(&card_key) {
                                     spec.merge(incoming);
+                                }
+                                if let Some(res) = resolution {
+                                    let call_id = if !incoming_call.is_empty() {
+                                        incoming_call
+                                    } else {
+                                        origin_call
+                                    };
+                                    state.paint_user_form_call_peers(&call_id, res);
                                 }
                                 if resolution != Some(FormResolution::FillFailed) {
                                     state.user_form_picks.remove(&card_key);
@@ -6468,7 +6543,12 @@ impl AppState {
         if self.has_open_approval(&conversation_id) || self.has_open_user_form(&conversation_id) {
             // The card is this thread's, and so is the line saying what it is waiting for.
             if self.has_open_user_form(&conversation_id) {
-                self.end_turn_waiting(Some(&conversation_id), Some(WAITING_FOR_YOU_STATUS));
+                let run_id = self
+                    .live_turns
+                    .get(&conversation_id)
+                    .map(|turn| turn.run_id.clone())
+                    .unwrap_or_default();
+                self.park_waiting_for_you(&conversation_id, &run_id);
             } else {
                 self.finish_responding(Some(&conversation_id), true);
             }
@@ -7315,12 +7395,12 @@ mod tests {
         DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
         REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE,
         STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler,
-        WAITING_APPROVAL_STATUS, agui_messages, apply_catalogue, apply_reload, graft_reply,
-        is_status_line, is_tool_standin, is_unsent_turn_note, missing_replies,
-        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
-        stream_paint_due, stream_part_sig, streaming_message_mut,
+        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
+        apply_reload, bot_status_line, graft_reply, is_status_line, is_tool_standin,
+        is_unsent_turn_note, missing_replies, reads_as_gateway_unreachable, reply_from_replay,
+        restored_parts, saved_parts, stream_paint_due, stream_part_sig, streaming_message_mut,
     };
-    use crate::opengrok::{Failure, ModelEntry, OpenGrokClient};
+    use crate::opengrok::{Failure, FormResolution, ModelEntry, OpenGrokClient};
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -7531,6 +7611,90 @@ mod tests {
             crate::opengrok::user_form_action_from_http(404, &serde_json::Value::Null),
             crate::opengrok::UserFormActionReply::MissingRoute
         );
+    }
+
+    #[test]
+    fn paint_settle_collapses_the_same_call_id_twin() {
+        let call_twin = crate::opengrok::UserFormSpec::from_tool_args(
+            &serde_json::json!({
+                "formRequest": {
+                    "title": "Google account",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true},
+                        {"id": "password", "label": "Password", "type": "password", "required": true}
+                    ]
+                }
+            }),
+            "call-9",
+        )
+        .unwrap();
+        let entry = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [
+                    {"id": "email", "label": "Email", "type": "email", "required": true},
+                    {"id": "password", "label": "Password", "type": "password", "required": true}
+                ]
+            }
+        }))
+        .unwrap();
+        let otp = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-otp",
+            "entryId": "e_otp",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Enter the code",
+                "fields": [{"id": "otp", "label": "Code", "type": "otp", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m1", false, "");
+        bot.parts = vec![
+            ChatPart::UserForm(call_twin),
+            ChatPart::UserForm(entry),
+            ChatPart::UserForm(otp),
+        ];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+
+        state.paint_user_form_resolution("e_form", FormResolution::Submitted);
+
+        let open = state.open_user_forms();
+        assert!(
+            open.iter().all(|spec| spec.call_id != "call-9"),
+            "call twin must not stay unresolved: {open:?}"
+        );
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].entry_id, "e_otp");
+
+        let fresh = crate::opengrok::UserFormSpec::from_tool_args(
+            &serde_json::json!({
+                "formRequest": {
+                    "title": "Google account",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true}
+                    ]
+                }
+            }),
+            "call-9",
+        )
+        .unwrap();
+        let grafted = state.graft_user_forms(vec![ChatPart::UserForm(fresh)]);
+        match grafted.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+                assert!(!spec.is_unresolved());
+            }
+            other => panic!("expected grafted settle, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8313,6 +8477,89 @@ mod tests {
         // And an ending is what lets the button go back to a send arrow.
         state.release_live_turn("cw_1", "run_1");
         assert!(!state.is_turn_in_flight());
+    }
+
+    #[test]
+    fn finished_user_form_wait_drops_stop_and_keeps_waiting_chrome() {
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        assert!(state.is_turn_in_flight());
+
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some(WAITING_FOR_YOU_STATUS)
+        );
+        assert_eq!(
+            bot_status_line("Grok", WAITING_FOR_YOU_STATUS),
+            "Waiting for you"
+        );
+        assert_eq!(bot_status_line("Grok", "Working"), "Grok is working");
+        assert!(
+            !state.is_turn_in_flight(),
+            "server run is finished; composer is Send, not Stop"
+        );
+        assert!(state.turn_to_stop().is_none());
+        assert!(
+            state.live_turns.get("cw_1").is_none(),
+            "do not keep a local live-turn past the run"
+        );
+        assert_eq!(state.open_user_forms().len(), 1);
+    }
+
+    #[test]
+    fn egress_tunnel_is_host_and_box_ready() {
+        let mut state = AppState::new();
+        state.host_egress_tunnel_available = true;
+        assert!(
+            !state.egress_tunnel_available(),
+            "host without a ready box is not a tunnel"
+        );
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "ready": true }
+            }))
+            .unwrap(),
+        );
+        assert!(state.egress_tunnel_available());
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "ready": false }
+            }))
+            .unwrap(),
+        );
+        assert!(!state.egress_tunnel_available());
+        state.host_egress_tunnel_available = false;
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "ready": true }
+            }))
+            .unwrap(),
+        );
+        assert!(
+            !state.egress_tunnel_available(),
+            "a ready box without host/env is not a tunnel"
+        );
     }
 
     /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".

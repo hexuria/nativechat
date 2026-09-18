@@ -186,7 +186,7 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 decision,
                 state.active_bot_name(),
                 state.local_exec_machine_id.clone().unwrap_or_default(),
-                state.egress_tunnel_available() || state.egress_tunnel_enabled,
+                state.egress_tunnel_available(),
             )
         })
         .unwrap_or((
