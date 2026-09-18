@@ -6827,6 +6827,14 @@ impl AppState {
     }
 
     fn restore_user_form(&mut self, card_key: &str) {
+        let local_call_settle = self
+            .user_form_mut(card_key)
+            .is_some_and(|spec| spec.entry_id.is_empty() && !spec.call_id.is_empty());
+        if local_call_settle {
+            // call-* cards settle locally; HTTP never had a gateway target.
+            self.user_form_restore.remove(card_key);
+            return;
+        }
         if let Some(prior) = self.user_form_restore.remove(card_key) {
             if let Some(spec) = self.user_form_mut(card_key) {
                 spec.resolution = Some(prior);
@@ -7148,8 +7156,9 @@ impl AppState {
             UserFormDispatch::ResolveHandoff(_) => self.box_handoff_post_id(&card_key, &entry_id),
             _ => None,
         };
-        if !matches!(action, UserFormDispatch::ResolveHandoff(_)) && entry_id.is_empty() {
-            // #140: AG-UI CUSTOM has no gateway card id. Do not POST callId.
+        if matches!(action, UserFormDispatch::Submit(_)) && entry_id.is_empty() {
+            // #140: never POST callId as submit. Dismiss / Open the screen
+            // still paint locally on call-* cards.
             return;
         }
         match &action {
@@ -7231,6 +7240,11 @@ impl AppState {
                     },
                 );
             }
+            return;
+        }
+        if entry_id.is_empty() {
+            // Local Dismiss / Open the screen on call-* (#140). Never POST
+            // callId as entryId, never restore the optimistic settle.
             return;
         }
         let Some(client) = self.opengrok.clone() else {
@@ -10002,7 +10016,12 @@ mod tests {
         for spec in state.open_user_forms() {
             assert!(
                 spec.can_post(state.user_form_verbs_available),
-                "{} must stay Dismiss/Continue-able",
+                "{} must stay Continue-able",
+                spec.entry_id
+            );
+            assert!(
+                spec.can_dismiss(),
+                "{} must stay Dismiss-able",
                 spec.entry_id
             );
         }
@@ -10028,6 +10047,160 @@ mod tests {
             "Waiting clears only after the last open form settles"
         );
         assert!(state.open_user_forms().is_empty());
+    }
+
+    fn call_keyed_login(call: &str) -> crate::opengrok::UserFormSpec {
+        crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": call,
+            "reason": "user-form",
+            "arguments": {
+                "title": "Website login",
+                "fields": [
+                    {"id": "email", "label": "Email", "type": "email", "required": true}
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// `user-form-dismiss-call-*` must settle the card locally. HTTP has no
+    /// gateway `entryId`; restore must not snap the form back to live.
+    #[test]
+    fn call_keyed_dismiss_settles_locally_and_survives_restore() {
+        let spec = call_keyed_login("call-9");
+        assert_eq!(spec.card_key(), "call-9");
+        assert!(spec.entry_id.is_empty());
+        assert!(spec.can_dismiss());
+        assert!(!spec.can_post(true), "Continue stays gated without entryId");
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.open_user_forms().len(), 1);
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_user_form_resolution("call-9", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert!(
+            state.open_user_forms().is_empty(),
+            "call-* Dismiss must settle that card"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+
+        state.restore_user_form("call-9");
+        assert!(
+            state.open_user_forms().is_empty(),
+            "no-gateway restore must not revive call-*"
+        );
+        match &state.conversations[0].messages[1].parts[0] {
+            ChatPart::UserForm(spec) => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Dismissed));
+            }
+            other => panic!("expected user-form, got {other:?}"),
+        }
+    }
+
+    /// Open the screen on a call-keyed card mints `computer-handoff-call-*`
+    /// even without a gateway `entryId`.
+    #[test]
+    fn call_keyed_open_screen_mints_computer_handoff() {
+        let spec = call_keyed_login("call-9");
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.set_computer_handoff(
+            "call-9",
+            crate::opengrok::ComputerHandoffStatus::ActionNeeded,
+        );
+        let handoffs = state.visible_computer_handoffs();
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].card_key(), "call-9");
+        assert_eq!(
+            crate::opengrok::computer_handoff_card_id(handoffs[0].card_key()),
+            "computer-handoff-call-9"
+        );
+        assert!(handoffs[0].live_computer_handoff());
+        state
+            .user_form_handoff_restore
+            .insert("call-9".into(), None);
+        state.restore_user_form("call-9");
+        assert!(
+            state
+                .visible_computer_handoffs()
+                .iter()
+                .any(|spec| spec.card_key() == "call-9" && spec.live_computer_handoff()),
+            "call-* Open the screen must keep computer-handoff-call-*"
+        );
+    }
+
+    /// Stacked call-* Dismiss one; others stay enabled. After those settle,
+    /// Skip both e_* siblings with nothing else pending clears Waiting.
+    #[test]
+    fn call_keyed_dismiss_one_then_skip_siblings_clears_waiting() {
+        fn gateway_login(entry: &str, call: &str) -> crate::opengrok::UserFormSpec {
+            crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+                "type": "CUSTOM",
+                "name": "run-awaiting-approval",
+                "callId": call,
+                "entryId": entry,
+                "reason": "user-form",
+                "arguments": {
+                    "title": "Website login",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true}
+                    ]
+                }
+            }))
+            .unwrap()
+        }
+        let e_a = gateway_login("e_a", "call-a");
+        let e_b = gateway_login("e_b", "call-b");
+        let extra_x = call_keyed_login("call-x");
+        let extra_y = call_keyed_login("call-y");
+        assert!(extra_x.can_dismiss() && extra_y.can_dismiss());
+        assert!(!extra_x.can_post(true) && !extra_y.can_post(true));
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![
+            ChatPart::UserForm(e_a),
+            ChatPart::UserForm(e_b),
+            ChatPart::UserForm(extra_x),
+            ChatPart::UserForm(extra_y),
+        ];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.open_user_forms().len(), 4);
+
+        state.paint_user_form_resolution("call-x", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        let open = state.open_user_forms();
+        assert_eq!(open.len(), 3, "dismiss one call-* leaves the rest live");
+        assert!(open.iter().all(|spec| spec.card_key() != "call-x"));
+        assert!(open.iter().any(|spec| spec.card_key() == "call-y"));
+        assert!(open.iter().any(|spec| spec.entry_id == "e_a"));
+        assert!(open.iter().any(|spec| spec.entry_id == "e_b"));
+        assert!(open.iter().all(|spec| spec.can_dismiss()));
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_user_form_resolution("call-y", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(state.open_user_forms().len(), 2);
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        for key in ["e_a", "e_b"] {
+            state.paint_user_form_resolution(key, FormResolution::Skipped);
+            state.set_computer_handoff(key, crate::opengrok::ComputerHandoffStatus::Skipped);
+            state.user_form_handoff_done.insert(key.into());
+        }
+        state.sync_waiting_chrome("cw_1");
+        assert!(state.open_user_forms().is_empty());
+        assert!(state.open_computer_handoffs().is_empty());
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Skip both e_* siblings with no other pending forms must clear Waiting"
+        );
     }
 
     #[test]

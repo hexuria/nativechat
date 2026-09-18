@@ -85,6 +85,7 @@ fn render_idle(
         .map(|entity| entity.read(cx).user_form_verbs_available)
         .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
     let can_post = spec.can_post(server_fill);
+    let can_dismiss = spec.can_dismiss();
     let mut picks = values.clone();
     if let Some(app) = &app {
         if let Some(typed) = app.read(cx).user_form_typed.get(spec.card_key()) {
@@ -181,12 +182,12 @@ fn render_idle(
                 user_form_screen_id(&key),
                 "Open the screen",
                 ButtonKind::Secondary,
-                !can_post,
-                !can_post,
+                !can_dismiss,
+                !can_dismiss,
                 {
                     let app = app.clone();
                     let key = key.clone();
-                    can_post.then_some(move |cx: &mut App| {
+                    can_dismiss.then_some(move |cx: &mut App| {
                         if let Some(app) = &app {
                             app.update(cx, |state, cx| {
                                 state.dismiss_user_form(
@@ -203,11 +204,11 @@ fn render_idle(
                 user_form_dismiss_id(&key),
                 "Dismiss",
                 ButtonKind::Ghost,
-                !can_post,
-                !can_post,
+                !can_dismiss,
+                !can_dismiss,
                 {
                     let app = app.clone();
-                    can_post.then_some(move |cx: &mut App| {
+                    can_dismiss.then_some(move |cx: &mut App| {
                         if let Some(app) = &app {
                             app.update(cx, |state, cx| {
                                 state.dismiss_user_form(
@@ -645,6 +646,7 @@ fn fill_failed_actions(
         .map(|entity| entity.read(cx).user_form_verbs_available)
         .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
     let can_post = spec.can_post(server_fill);
+    let can_dismiss = spec.can_dismiss();
     let key = spec.card_key().to_string();
     h_flex()
         .w_full()
@@ -678,12 +680,12 @@ fn fill_failed_actions(
             format!("user-form-failed-screen-{key}"),
             "I'll do it on the computer",
             ButtonKind::Secondary,
-            !can_post,
-            !can_post,
+            !can_dismiss,
+            !can_dismiss,
             {
                 let app = app.clone();
                 let key = key.clone();
-                can_post.then_some(move |cx: &mut App| {
+                can_dismiss.then_some(move |cx: &mut App| {
                     if let Some(app) = &app {
                         app.update(cx, |state, cx| {
                             state.dismiss_user_form(
@@ -700,11 +702,11 @@ fn fill_failed_actions(
             format!("user-form-failed-stop-{key}"),
             "Stop for now",
             ButtonKind::Ghost,
-            !can_post,
-            !can_post,
+            !can_dismiss,
+            !can_dismiss,
             {
                 let app = app.clone();
-                can_post.then_some(move |cx: &mut App| {
+                can_dismiss.then_some(move |cx: &mut App| {
                     if let Some(app) = &app {
                         app.update(cx, |state, cx| {
                             state.dismiss_user_form(

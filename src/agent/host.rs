@@ -2758,6 +2758,39 @@ mod tests {
     }
 
     #[test]
+    fn call_keyed_user_form_dismiss_is_in_the_tree() {
+        let mut host = host();
+        host.user_forms = vec![UserFormSnap {
+            card_key: "call-9".into(),
+            title: "Website login".into(),
+            fields: vec![UserFormFieldSnap {
+                id: "email".into(),
+                label: "Email".into(),
+                kind: UserFormFieldKind::Email,
+                masked: false,
+                value: String::new(),
+            }],
+            pill: None,
+        }];
+        let tree = host.snapshot();
+        assert!(tree.find("user-form-call-9").is_some());
+        assert!(tree.find("user-form-dismiss-call-9").is_some());
+        assert!(tree.find("user-form-screen-call-9").is_some());
+        host.dispatch(&Op::click("user-form-dismiss-call-9"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormDismiss { card_key }) => assert_eq!(card_key, "call-9"),
+            other => panic!("expected dismiss call-9, got {other:?}"),
+        }
+        host.dispatch(&Op::click("user-form-screen-call-9"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormOpenScreen { card_key }) => assert_eq!(card_key, "call-9"),
+            other => panic!("expected open screen call-9, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn computer_handoff_chrome_is_in_the_tree() {
         let mut host = host();
         host.computer_handoffs = vec![ComputerHandoffSnap {

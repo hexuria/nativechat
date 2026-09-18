@@ -72,11 +72,13 @@
 //! That id is what Continue / Dismiss POST. We never invent one: `callId`,
 //! `toolCallId`, and a generic AG-UI event `id` are not `entryId`.
 //!
-//! When `entryId` is present, Open the screen / Dismiss are live; Continue
-//! also needs required fields filled. Missing `entryId` keeps the card idle
-//! — **Submitted is not painted**. A 404 after a send that reached the
+//! When `entryId` is present, Continue / Open the screen / Dismiss POST.
+//! Missing `entryId` (`user-form-*-call-*`, #140) keeps Continue gated —
+//! **Submitted is not painted** — but Dismiss / Open the screen still
+//! settle **locally** on the call-keyed card (and mint `computer-handoff-{call-*}`).
+//! Never POST `callId` as `entryId`. A 404 after a send that reached the
 //! server is Not filled, not idle fields. A missing-route 404 on one verb
-//! must not leave other open-looking cards with every control disabled.
+//! must not leave other open-looking cards with all controls disabled.
 //!
 //! [`USER_FORM_SERVER_FILL_AVAILABLE`] defaults true (#139 @ d12fffc+ has
 //! the routes). A missing-route 404 on one card must **not** freeze every
@@ -735,16 +737,22 @@ impl UserFormSpec {
         true
     }
 
-    /// Continue / Dismiss POST when we have a gateway `entryId`. Required
-    /// fields are an extra Continue gate. `server_fill` is leftover from a
-    /// global missing-route lock that froze every stacked open card — it
-    /// does not disable an unresolved form.
+    /// Continue POST when we have a gateway `entryId`. Required fields are
+    /// an extra Continue gate. `server_fill` is leftover from a global
+    /// missing-route lock that froze every stacked open card — it does not
+    /// disable an unresolved form.
     pub fn continue_enabled(&self, values: &UserFormValues, server_fill: bool) -> bool {
         self.can_post(server_fill) && self.required_fields_filled(values)
     }
 
     pub fn can_post(&self, _server_fill: bool) -> bool {
         self.has_gateway_entry_id()
+    }
+
+    /// Dismiss / Open the screen. Call-keyed cards (`call-*`, no gateway
+    /// `entryId`) still settle locally. Continue stays on [`Self::can_post`].
+    pub fn can_dismiss(&self) -> bool {
+        self.has_gateway_entry_id() || !self.call_id.is_empty()
     }
 
     pub fn required_fields_filled(&self, values: &UserFormValues) -> bool {
@@ -1609,6 +1617,23 @@ mod tests {
             "without a gateway entryId Continue stays gated"
         );
         assert!(!spec.can_post(true));
+        assert!(
+            spec.can_dismiss(),
+            "call-* Dismiss / Open the screen stay live without entryId"
+        );
+        assert_eq!(spec.card_key(), "call-9");
+        assert_eq!(
+            user_form_dismiss_id(spec.card_key()),
+            "user-form-dismiss-call-9"
+        );
+        assert_eq!(
+            user_form_screen_id(spec.card_key()),
+            "user-form-screen-call-9"
+        );
+        assert_eq!(
+            computer_handoff_card_id(spec.card_key()),
+            "computer-handoff-call-9"
+        );
     }
 
     #[test]
@@ -1706,7 +1731,8 @@ mod tests {
         assert_eq!(spec.title, "Google account");
         assert_eq!(spec.fields.len(), 2);
         assert!(spec.fields[1].masked(), "password is secret by type");
-        assert!(spec.can_post(true), "Open the screen / Dismiss go live");
+        assert!(spec.can_post(true), "Continue POSTs with a gateway entryId");
+        assert!(spec.can_dismiss(), "Open the screen / Dismiss go live");
         let empty = UserFormValues::default();
         assert!(
             !continue_enabled(&spec, &empty, true),
