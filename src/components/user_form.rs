@@ -59,7 +59,10 @@ fn render_idle(
         .map(|entity| entity.read(cx).user_form_verbs_available)
         .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
     let can_post = spec.can_post(server_fill);
-    let can_continue = continue_enabled(spec, values, server_fill);
+    // Live InputState / TextareaState / picks — not the display map, which
+    // stores only a presence stub for masked fields.
+    let live = collect_submit_values(spec, inputs, textareas, values, cx);
+    let can_continue = continue_enabled(spec, &live, server_fill);
     let mut body = v_flex()
         .w_full()
         .gap(px(10.))

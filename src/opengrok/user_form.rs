@@ -86,6 +86,10 @@ pub const BOX_HANDOFF_RESOLVE_PATH: &str = "/ag-ui/box-handoff/resolve";
 /// route. Per-card fill still requires a real gateway `entryId`.
 pub const USER_FORM_SERVER_FILL_AVAILABLE: bool = true;
 
+/// Transcript display-map presence for a typed secret. Not a password: the
+/// typed value stays in `InputState`. Continue must not treat this as filled.
+pub const MASKED_PRESENCE_STUB: &str = "1";
+
 /// Field types from NativeChat #17. Anything else is default text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserFormFieldKind {
@@ -552,9 +556,10 @@ impl UserFormSpec {
     }
 }
 
-/// Values typed on the idle card. The transcript view stores only presence
-/// (`"1"`) for masked fields. Tests may put a secret here to prove Debug and
-/// `agui_messages` never echo it. Never copy this map onto a
+/// Values typed on the idle card. The transcript display map may store only
+/// [`MASKED_PRESENCE_STUB`] for masked fields; Continue must read live
+/// InputState instead of that stub. Tests may put a secret here to prove
+/// Debug and `agui_messages` never echo it. Never copy this map onto a
 /// [`crate::opengrok::gen_ui::ChatPart`], into `Message.content`, or into sqlite.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct UserFormValues {
@@ -574,6 +579,10 @@ impl UserFormValues {
         let raw = self.by_id.get(&field.id).map(String::as_str).unwrap_or("");
         match field.kind {
             UserFormFieldKind::Checkbox => raw == "true",
+            _ if field.masked() => {
+                let trimmed = raw.trim();
+                !trimmed.is_empty() && trimmed != MASKED_PRESENCE_STUB
+            }
             _ => !raw.trim().is_empty(),
         }
     }
@@ -1460,6 +1469,42 @@ mod tests {
             .by_id
             .insert("ok".into(), UserFormField::checkbox_wire(true).into());
         assert!(spec.required_fields_filled(&values));
+    }
+
+    #[test]
+    fn masked_presence_stub_does_not_enable_continue_without_input_state() {
+        let spec = UserFormSpec::from_custom_event(&official_d12fffc_frame()).expect("card");
+        assert!(
+            spec.fields
+                .iter()
+                .any(|field| field.masked() && field.required)
+        );
+
+        let mut display = UserFormValues::default();
+        display
+            .by_id
+            .insert("email".into(), "ada@example.com".into());
+        display
+            .by_id
+            .insert("password".into(), MASKED_PRESENCE_STUB.into());
+        let empty_input_state = UserFormValues::default();
+        assert!(
+            !continue_enabled(&spec, &display, true),
+            "display stub \"1\" is not a typed password"
+        );
+        assert!(
+            !continue_enabled(&spec, &empty_input_state, true),
+            "empty InputState keeps Continue gated"
+        );
+
+        let mut live = UserFormValues::default();
+        live.by_id.insert("email".into(), "ada@example.com".into());
+        live.by_id
+            .insert("password".into(), "typed-in-input-state".into());
+        assert!(
+            continue_enabled(&spec, &live, true),
+            "a real InputState value enables Continue"
+        );
     }
 
     #[test]

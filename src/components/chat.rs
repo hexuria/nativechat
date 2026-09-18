@@ -1048,17 +1048,16 @@ impl Render for ChatTranscript {
                                     let Some(raw) = raw else {
                                         continue;
                                     };
-                                    // Presence only for secrets: the typed value stays in
-                                    // InputState, never in this map, never on AppState.
-                                    let stored = if field.masked() {
-                                        if raw.trim().is_empty() {
-                                            continue;
-                                        }
-                                        "1".to_string()
-                                    } else {
-                                        raw
-                                    };
-                                    values.by_id.insert(field.id.clone(), stored);
+                                    // Secrets stay in InputState. Do not put a presence stub
+                                    // in this map: Continue reads live InputState, and a
+                                    // non-empty stub would look like a filled password.
+                                    if field.masked() {
+                                        continue;
+                                    }
+                                    if raw.trim().is_empty() {
+                                        continue;
+                                    }
+                                    values.by_id.insert(field.id.clone(), raw);
                                 }
                                 return div()
                                     .id(ElementId::Name(row.id.clone().into()))

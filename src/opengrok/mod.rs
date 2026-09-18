@@ -21,7 +21,7 @@ pub use gen_ui::{
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use user_form::{
     BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, FormResolution,
-    REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
+    MASKED_PRESENCE_STUB, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
     USER_FORM_SERVER_FILL_AVAILABLE, USER_FORM_SUBMIT_PATH, UserFormActionReply,
     UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues,
     WAITING_FOR_YOU, box_handoff_action_from_http, continue_enabled, dismiss_request_body,
