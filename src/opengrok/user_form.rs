@@ -39,9 +39,12 @@
 //! response. Hand back / decline POST that handoff id — **not** the form card
 //! id, **not** `handBackForeverBox`, **not** Take over / I'm done / Skip.
 //!
-//! A 404 means the route is missing: verbs flip off, the card stays idle,
-//! **Submitted is not painted**. A 200 JSON `null` (entry not found / no
-//! permission) is also not a fill.
+//! After Continue paints **Sending**, HTTP 200 must not restore idle fields.
+//! A body with `formResolution` is merged (Submitted / fill_failed / …).
+//! **200 JSON `null` is painted Submitted optimistically** — interim until
+//! the server returns `formResolution: submitted` (OpenGrok parallel). Do
+//! not invent fill_failed on a 200. A 404 after Continue paints Not filled
+//! and flips verbs off. Missing `entryId` (no POST) does not paint Submitted.
 //!
 //! # [opengrok-server#140](https://github.com/hexuria/opengrok-server/issues/140) on #139 @ d12fffc
 //!
@@ -52,7 +55,8 @@
 //!
 //! When `entryId` is present and the verbs are up, Open the screen / Dismiss
 //! are live; Continue also needs required fields filled. Missing `entryId`
-//! or a 404 keeps the card idle — **Submitted is not painted**.
+//! keeps the card idle — **Submitted is not painted**. A 404 after a send
+//! that reached the server is Not filled, not idle fields.
 //!
 //! [`USER_FORM_SERVER_FILL_AVAILABLE`] defaults true (#139 @ d12fffc+ has
 //! the routes). AppState flips it off after a 404. Fill still needs
@@ -307,8 +311,10 @@ impl UserFormDismissMode {
     }
 }
 
-/// What `POST /ag-ui/user-form/submit|dismiss` meant. Never treat a miss as
-/// [`FormResolution::Submitted`].
+/// What `POST /ag-ui/user-form/submit|dismiss` meant. The HTTP classifier still
+/// reports 200-null as [`Empty`]; [`settle_user_form_http`] maps that after
+/// Continue to collapsed [`FormResolution::Submitted`] so idle fields do not
+/// come back. A miss (404 / no POST) is never Submitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserFormActionReply {
     Settled(UserFormSpec),
@@ -319,6 +325,80 @@ pub enum UserFormActionReply {
     MissingRoute,
     /// No gateway card id — we must not POST `callId` as `entryId`.
     MissingEntryId,
+}
+
+/// Continue vs Dismiss. Hand-back is a different route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserFormVerb {
+    Submit,
+    Dismiss,
+}
+
+/// What the idle card becomes after the fill HTTP returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserFormHttpSettle {
+    /// Body carried `formResolution` (or a parseable card).
+    Merge(UserFormSpec),
+    /// Keep collapsed: 200-null after Continue → Submitted; 404 after
+    /// Continue → Not filled. Server should return `formResolution`.
+    Paint(FormResolution),
+    /// Dismiss already painted dismissed/escalated; 200-null keeps it.
+    Keep,
+    /// No POST, or dismiss 404. Undo the optimistic paint.
+    Restore,
+}
+
+/// After Continue has painted **Sending**, HTTP 200 must not restore idle
+/// fields. Prefer a body `formResolution` (Merge). 200-null / Empty is
+/// Submitted **interim** until the server returns `formResolution:
+/// submitted` — fill ran; do not invent fill_failed. 404 after Continue
+/// is Not filled. Never idle+disabled fields after a send that reached
+/// the server.
+pub fn settle_user_form_http(
+    verb: UserFormVerb,
+    reply: &UserFormActionReply,
+) -> UserFormHttpSettle {
+    match (verb, reply) {
+        (_, UserFormActionReply::Settled(spec)) => UserFormHttpSettle::Merge(spec.clone()),
+        (UserFormVerb::Submit, UserFormActionReply::Empty)
+        | (UserFormVerb::Submit, UserFormActionReply::AlreadyAnswered) => {
+            // Interim: 200-null has no formResolution. Paint Submitted so
+            // the card stays collapsed. Drop this arm when the server
+            // always returns formResolution: submitted|fill_failed.
+            UserFormHttpSettle::Paint(FormResolution::Submitted)
+        }
+        (UserFormVerb::Submit, UserFormActionReply::MissingRoute)
+        | (UserFormVerb::Submit, UserFormActionReply::MissingEntryId) => {
+            UserFormHttpSettle::Paint(FormResolution::FillFailed)
+        }
+        (UserFormVerb::Dismiss, UserFormActionReply::Empty)
+        | (UserFormVerb::Dismiss, UserFormActionReply::AlreadyAnswered) => UserFormHttpSettle::Keep,
+        (UserFormVerb::Dismiss, UserFormActionReply::MissingRoute)
+        | (UserFormVerb::Dismiss, UserFormActionReply::MissingEntryId) => {
+            UserFormHttpSettle::Restore
+        }
+    }
+}
+
+/// Stable gpui-agent / GPUI ids. Master Tester looks for `user-form-*`.
+pub fn user_form_card_id(card_key: &str) -> String {
+    format!("user-form-{card_key}")
+}
+
+pub fn user_form_continue_id(card_key: &str) -> String {
+    format!("user-form-continue-{card_key}")
+}
+
+pub fn user_form_dismiss_id(card_key: &str) -> String {
+    format!("user-form-dismiss-{card_key}")
+}
+
+pub fn user_form_screen_id(card_key: &str) -> String {
+    format!("user-form-screen-{card_key}")
+}
+
+pub fn user_form_field_id(card_key: &str, field_id: &str) -> String {
+    format!("user-form-field-{card_key}-{field_id}")
 }
 
 /// A user-form card in the transcript. Field values are not stored on this type.
@@ -696,7 +776,9 @@ pub fn resolve_handoff_request_body(
     })
 }
 
-/// Classify a submit/dismiss HTTP response. 404 and 200-null are not fills.
+/// Classify a submit/dismiss HTTP response. 404 is [`MissingRoute`]. 200-null
+/// is [`Empty`] — after Continue, [`settle_user_form_http`] paints Submitted
+/// rather than restoring idle fields. Prefer a body with `formResolution`.
 pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionReply {
     if status == 404 {
         return UserFormActionReply::MissingRoute;
@@ -1504,6 +1586,87 @@ mod tests {
         assert!(
             continue_enabled(&spec, &live, true),
             "a real InputState value enables Continue"
+        );
+    }
+
+    #[test]
+    fn submit_200_null_after_sending_paints_submitted_not_idle() {
+        assert_eq!(
+            user_form_action_from_http(200, &Value::Null),
+            UserFormActionReply::Empty,
+            "classifier still reports 200-null as Empty"
+        );
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Submit, &UserFormActionReply::Empty),
+            UserFormHttpSettle::Paint(FormResolution::Submitted)
+        );
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Submit, &UserFormActionReply::AlreadyAnswered),
+            UserFormHttpSettle::Paint(FormResolution::Submitted)
+        );
+        let settled = user_form_action_from_http(
+            200,
+            &json!({
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": google_email_request()
+                },
+                "formResolution": "submitted"
+            }),
+        );
+        match settle_user_form_http(UserFormVerb::Submit, &settled) {
+            UserFormHttpSettle::Merge(spec) => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+                assert!(!spec.is_unresolved(), "collapsed: no idle fields");
+            }
+            other => panic!("expected Merge submitted, got {other:?}"),
+        }
+        for reply in [
+            UserFormActionReply::Empty,
+            UserFormActionReply::AlreadyAnswered,
+            UserFormActionReply::MissingRoute,
+            UserFormActionReply::MissingEntryId,
+            settled,
+        ] {
+            assert!(
+                !matches!(
+                    settle_user_form_http(UserFormVerb::Submit, &reply),
+                    UserFormHttpSettle::Restore
+                ),
+                "after Sending, never restore idle fields: {reply:?}"
+            );
+        }
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Submit, &UserFormActionReply::MissingEntryId),
+            UserFormHttpSettle::Paint(FormResolution::FillFailed)
+        );
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Submit, &UserFormActionReply::MissingRoute),
+            UserFormHttpSettle::Paint(FormResolution::FillFailed),
+            "404 after Continue is Not filled, not idle fields"
+        );
+        let mut sending = UserFormSpec::parse(
+            &json!({
+                "entryId": "e_form",
+                "formRequest": google_email_request()
+            }),
+            None,
+        )
+        .unwrap();
+        sending.resolution = Some(FormResolution::Sending);
+        assert!(
+            !sending.is_unresolved(),
+            "Sending is collapsed: no idle email/password fields"
+        );
+        sending.resolution = Some(FormResolution::Submitted);
+        assert!(!sending.is_unresolved());
+        assert_eq!(FormResolution::Submitted.pill(), "Submitted");
+        assert!(
+            FormResolution::Submitted
+                .body()
+                .contains("Filled into the page")
         );
     }
 

@@ -13,9 +13,10 @@ use crate::opengrok::{
     RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
     RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply, UserFormDismissMode,
-    UserFormValues, WAITING_FOR_YOU, activity_from_replay, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
-    policy_answer, reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
+    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    local_exec_outcome, policy_answer, reads_as_gateway_unreachable, serve_local_exec,
+    stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -1364,7 +1365,11 @@ pub struct AppState {
     /// those stay in the transcript view's input state and are never written here.
     /// Keyed by [`crate::opengrok::UserFormSpec::card_key`].
     pub user_form_picks: HashMap<String, HashMap<String, String>>,
-    /// Routes exist on this server. Flipped off after a 404; never fake Submitted.
+    /// Agent/E2E typed values (including secrets). In-memory only — never
+    /// sqlite / AG-UI content. Continue prefers live InputState, then this.
+    pub user_form_typed: HashMap<String, HashMap<String, String>>,
+    /// Routes exist on this server. Flipped off after a 404. Continue after
+    /// a 404 paints Not filled rather than restoring idle fields.
     pub user_form_verbs_available: bool,
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
@@ -1710,6 +1715,7 @@ impl AppState {
             emoji_picker: None,
             form_picks: HashMap::new(),
             user_form_picks: HashMap::new(),
+            user_form_typed: HashMap::new(),
             user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
             user_form_resolutions: HashMap::new(),
             user_form_restore: HashMap::new(),
@@ -1968,6 +1974,56 @@ impl AppState {
         };
         self.answer_approval(spec, resolution, cx);
         true
+    }
+
+    /// Idle user-form cards in the open thread (fields still on screen).
+    pub fn open_user_forms(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::UserForm(spec) if spec.is_unresolved() => Some(spec.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Agent/E2E typed a field. Secrets stay in-memory; never sqlite.
+    pub fn set_user_form_typed_field(
+        &mut self,
+        card_key: String,
+        field_id: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.user_form_typed
+            .entry(card_key)
+            .or_default()
+            .insert(field_id, value);
+        cx.notify();
+    }
+
+    /// Agent Continue: picks, then typed overlay. Secrets stay in-memory.
+    pub fn user_form_submit_values(&self, card_key: &str) -> UserFormValues {
+        let mut values = UserFormValues::default();
+        if let Some(picks) = self.user_form_picks.get(card_key) {
+            for (id, value) in picks {
+                values.by_id.insert(id.clone(), value.clone());
+            }
+        }
+        if let Some(typed) = self.user_form_typed.get(card_key) {
+            for (id, value) in typed {
+                values.by_id.insert(id.clone(), value.clone());
+            }
+        }
+        values
+    }
+
+    pub fn submit_open_user_form(&mut self, card_key: String, cx: &mut Context<Self>) {
+        let values = self.user_form_submit_values(&card_key);
+        self.submit_user_form(card_key, values, cx);
     }
 
     pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
@@ -6083,6 +6139,15 @@ impl AppState {
             return;
         }
         cx.spawn(async move |this, cx| {
+            let verb = match &action {
+                UserFormDispatch::Submit(_) => UserFormVerb::Submit,
+                UserFormDispatch::Dismiss(_) => UserFormVerb::Dismiss,
+                UserFormDispatch::ResolveHandoff(_) => unreachable!("resolved above"),
+            };
+            let dismissed = matches!(
+                action,
+                UserFormDispatch::Dismiss(UserFormDismissMode::Dismissed)
+            );
             let result = match action {
                 UserFormDispatch::Submit(values) => {
                     client.submit_user_form(&entry_id, &agent_id, &values).await
@@ -6094,51 +6159,73 @@ impl AppState {
             };
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(UserFormActionReply::Settled(incoming)) => {
-                        let resolution = incoming.effective_resolution();
-                        state.remember_user_form_resolution(&incoming);
-                        if let Some(spec) = state.user_form_mut(&card_key) {
-                            spec.merge(incoming);
+                    Ok(reply) => {
+                        if matches!(reply, UserFormActionReply::MissingRoute) {
+                            state.user_form_verbs_available = false;
                         }
-                        if resolution != Some(FormResolution::FillFailed) {
-                            state.user_form_picks.remove(&card_key);
-                        }
-                        let follow = match resolution {
-                            Some(FormResolution::Escalated) => {
-                                state.end_turn_waiting(
-                                    Some(&conversation_id),
-                                    Some(WAITING_FOR_YOU_STATUS),
-                                );
-                                false
+                        match crate::opengrok::settle_user_form_http(verb, &reply) {
+                            UserFormHttpSettle::Merge(incoming) => {
+                                let resolution = incoming.effective_resolution();
+                                state.remember_user_form_resolution(&incoming);
+                                if let Some(spec) = state.user_form_mut(&card_key) {
+                                    spec.merge(incoming);
+                                }
+                                if resolution != Some(FormResolution::FillFailed) {
+                                    state.user_form_picks.remove(&card_key);
+                                    state.user_form_typed.remove(&card_key);
+                                }
+                                let follow = match resolution {
+                                    Some(FormResolution::Escalated) => {
+                                        state.end_turn_waiting(
+                                            Some(&conversation_id),
+                                            Some(WAITING_FOR_YOU_STATUS),
+                                        );
+                                        false
+                                    }
+                                    Some(FormResolution::FillFailed) => false,
+                                    _ => true,
+                                };
+                                if follow && !run_id.is_empty() {
+                                    state.begin_responding(Some(&conversation_id), "Working");
+                                    state.follow_run(run_id, Some(conversation_id), cx);
+                                }
                             }
-                            _ => true,
-                        };
-                        if follow && !run_id.is_empty() {
-                            state.begin_responding(Some(&conversation_id), "Working");
-                            state.follow_run(run_id, Some(conversation_id), cx);
-                        }
-                    }
-                    Ok(UserFormActionReply::AlreadyAnswered) => {
-                        if !matches!(
-                            state.user_form_resolutions.get(&card_key),
-                            Some(FormResolution::Escalated)
-                        ) {
-                            state.restore_user_form(&card_key);
-                            if !run_id.is_empty() {
-                                state.begin_responding(Some(&conversation_id), "Working");
-                                state.follow_run(run_id, Some(conversation_id), cx);
+                            UserFormHttpSettle::Paint(resolution) => {
+                                // Interim: 200-null after Continue → Submitted so idle
+                                // fields stay gone. Prefer a body formResolution.
+                                state.paint_user_form_resolution(&card_key, resolution);
+                                state.user_form_restore.remove(&card_key);
+                                if resolution != FormResolution::FillFailed {
+                                    state.user_form_picks.remove(&card_key);
+                                    state.user_form_typed.remove(&card_key);
+                                }
+                                if resolution == FormResolution::Submitted && !run_id.is_empty() {
+                                    state.begin_responding(Some(&conversation_id), "Working");
+                                    state.follow_run(run_id, Some(conversation_id), cx);
+                                }
+                            }
+                            UserFormHttpSettle::Keep => {
+                                if dismissed && !run_id.is_empty() {
+                                    state.begin_responding(Some(&conversation_id), "Working");
+                                    state.follow_run(run_id, Some(conversation_id), cx);
+                                }
+                            }
+                            UserFormHttpSettle::Restore => {
+                                state.restore_user_form(&card_key);
                             }
                         }
-                    }
-                    Ok(UserFormActionReply::MissingRoute) => {
-                        state.user_form_verbs_available = false;
-                        state.restore_user_form(&card_key);
-                    }
-                    Ok(UserFormActionReply::Empty) | Ok(UserFormActionReply::MissingEntryId) => {
-                        state.restore_user_form(&card_key);
                     }
                     Err(error) => {
-                        state.restore_user_form(&card_key);
+                        match verb {
+                            UserFormVerb::Submit => {
+                                state.paint_user_form_resolution(
+                                    &card_key,
+                                    FormResolution::FillFailed,
+                                );
+                                state.user_form_restore.remove(&card_key);
+                            }
+                            UserFormVerb::Dismiss => state.restore_user_form(&card_key),
+                        }
                         if error.is_signed_out() {
                             state.note_signed_out(cx);
                         }

@@ -8,6 +8,8 @@ use crate::components::chat_input::sources::{
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::{
     ChatPart, CoworkerPatch, LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec,
+    UserFormDismissMode, UserFormFieldKind, user_form_card_id, user_form_continue_id,
+    user_form_dismiss_id, user_form_field_id, user_form_screen_id,
 };
 use crate::state::{ActiveRecipe, AppState};
 
@@ -127,6 +129,21 @@ pub enum Command {
     /// The signed-out banner's button: go to the sign-in page, which is the only way out of
     /// that state and the reason the banner is a banner rather than a line in the transcript.
     SignInAgain,
+    /// Idle user-form Continue. Values come from typed/picks on AppState.
+    UserFormContinue {
+        card_key: String,
+    },
+    UserFormDismiss {
+        card_key: String,
+    },
+    UserFormOpenScreen {
+        card_key: String,
+    },
+    UserFormSetField {
+        card_key: String,
+        field_id: String,
+        value: String,
+    },
     Shutdown,
 }
 
@@ -192,6 +209,18 @@ impl Command {
             }
             Self::Logout => state.logout(cx),
             Self::SignInAgain => state.sign_in_again(cx),
+            Self::UserFormContinue { card_key } => state.submit_open_user_form(card_key, cx),
+            Self::UserFormDismiss { card_key } => {
+                state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
+            }
+            Self::UserFormOpenScreen { card_key } => {
+                state.dismiss_user_form(card_key, UserFormDismissMode::Escalated, cx)
+            }
+            Self::UserFormSetField {
+                card_key,
+                field_id,
+                value,
+            } => state.set_user_form_typed_field(card_key, field_id, value, cx),
             Self::Shutdown => {}
         }
     }
@@ -279,7 +308,7 @@ fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> 
 fn not_editable(target: &str) -> String {
     format!(
         "`{target}` is not editable (composer, login-email, login-password, \
-         or \"\" for whatever holds the caret)"
+         user-form-field-*, or \"\" for whatever holds the caret)"
     )
 }
 
@@ -483,6 +512,46 @@ struct ApprovalSnap {
     local: bool,
 }
 
+/// Idle user-form card: fields still on screen. Settled / Sending cards
+/// are absent so E2E sees zero email/password fields after Continue.
+#[derive(Clone)]
+struct UserFormSnap {
+    card_key: String,
+    title: String,
+    fields: Vec<UserFormFieldSnap>,
+}
+
+#[derive(Clone)]
+struct UserFormFieldSnap {
+    id: String,
+    label: String,
+    kind: UserFormFieldKind,
+    masked: bool,
+    /// Typed value, including secrets. The tree omits masked values.
+    value: String,
+}
+
+fn user_form_node(form: &UserFormSnap) -> UiNode {
+    let key = &form.card_key;
+    let mut card = UiNode::dialog(user_form_card_id(key), form.title.clone());
+    for field in &form.fields {
+        let id = user_form_field_id(key, &field.id);
+        let node = if field.kind == UserFormFieldKind::Checkbox {
+            UiNode::checkbox(id, field.label.clone()).with_checked(field.value == "true")
+        } else {
+            let mut box_ = UiNode::textbox(id, field.label.clone());
+            if !field.masked && !field.value.is_empty() {
+                box_ = box_.with_value(field.value.clone());
+            }
+            box_
+        };
+        card = card.with_child(node);
+    }
+    card.with_child(UiNode::button(user_form_continue_id(key), "Continue"))
+        .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
+        .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
+}
+
 /// `approval-<call_id>-<verb>` → the answer it stands for.
 /// A recipe row's id, and only a row's. Every control on the recipe page is named
 /// `recipe-<something>` too, so a bare prefix match turned a click on a version tab into a
@@ -578,6 +647,8 @@ pub struct NativeChatHost {
     thumbs: Vec<String>,
     /// The picture overlay, while it is open.
     lightbox: Option<LightboxSnap>,
+    /// Idle user-form cards in the open thread.
+    user_forms: Vec<UserFormSnap>,
     pending: Option<Command>,
     /// Keys the last op asked the window for. The host has no window; the root view presses
     /// them (see [`Self::take_compose`]).
@@ -753,6 +824,45 @@ impl NativeChatHost {
                     .map(|shot| shot.caption.clone())
                     .unwrap_or_default(),
             }),
+            user_forms: state
+                .open_user_forms()
+                .into_iter()
+                .map(|spec| {
+                    let key = spec.card_key().to_string();
+                    let typed = state.user_form_typed.get(&key);
+                    let picks = state.user_form_picks.get(&key);
+                    UserFormSnap {
+                        title: if spec.title.is_empty() {
+                            "Form".into()
+                        } else {
+                            spec.title.clone()
+                        },
+                        fields: spec
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                let raw = typed
+                                    .and_then(|map| map.get(&field.id))
+                                    .or_else(|| picks.and_then(|map| map.get(&field.id)))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                UserFormFieldSnap {
+                                    id: field.id.clone(),
+                                    label: if field.label.is_empty() {
+                                        field.id.clone()
+                                    } else {
+                                        field.label.clone()
+                                    },
+                                    kind: field.kind,
+                                    masked: field.masked(),
+                                    value: raw,
+                                }
+                            })
+                            .collect(),
+                        card_key: key,
+                    }
+                })
+                .collect(),
             pending: None,
             compose: None,
         }
@@ -894,6 +1004,9 @@ impl NativeChatHost {
                     .with_child(UiNode::button(format!("{id}-never"), "Never"));
             }
             page = page.with_child(card);
+        }
+        for form in &self.user_forms {
+            page = page.with_child(user_form_node(form));
         }
         page = page.with_child(
             UiNode::new("computer-pane", "dialog", "Computer")
@@ -1142,6 +1255,67 @@ impl NativeChatHost {
         page
     }
 
+    fn user_form_command(&self, target: &str) -> Option<Command> {
+        for form in &self.user_forms {
+            let key = &form.card_key;
+            if target == user_form_continue_id(key) {
+                return Some(Command::UserFormContinue {
+                    card_key: key.clone(),
+                });
+            }
+            if target == user_form_dismiss_id(key) {
+                return Some(Command::UserFormDismiss {
+                    card_key: key.clone(),
+                });
+            }
+            if target == user_form_screen_id(key) {
+                return Some(Command::UserFormOpenScreen {
+                    card_key: key.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn user_form_field(&self, target: &str) -> Option<(String, String, UserFormFieldKind, String)> {
+        for form in &self.user_forms {
+            for field in &form.fields {
+                if target == user_form_field_id(&form.card_key, &field.id) {
+                    return Some((
+                        form.card_key.clone(),
+                        field.id.clone(),
+                        field.kind,
+                        field.value.clone(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    fn set_user_form_field(
+        &mut self,
+        card_key: String,
+        field_id: String,
+        value: String,
+    ) -> Result<DispatchResult, String> {
+        if let Some(form) = self
+            .user_forms
+            .iter_mut()
+            .find(|form| form.card_key == card_key)
+        {
+            if let Some(field) = form.fields.iter_mut().find(|field| field.id == field_id) {
+                field.value = value.clone();
+            }
+        }
+        self.pending = Some(Command::UserFormSetField {
+            card_key,
+            field_id,
+            value,
+        });
+        Ok(DispatchResult::empty())
+    }
+
     /// `recipe-accept` / `recipe-decline` (the one pending share) or the same with `-<id>`.
     fn recipe_answer_target(&self, target: &str) -> Option<(String, bool)> {
         let (rest, accept) = if let Some(rest) = target.strip_prefix("recipe-accept") {
@@ -1261,6 +1435,16 @@ impl NativeChatHost {
                  (`type composer /`, then `type \"\" <words>` to filter and `key \"\" Enter` \
                  to take the row)"
             ));
+        } else if let Some(cmd) = self.user_form_command(target) {
+            cmd
+        } else if let Some((card_key, field_id, kind, value)) = self.user_form_field(target) {
+            if kind == UserFormFieldKind::Checkbox {
+                let next = if value == "true" { "false" } else { "true" };
+                return self.set_user_form_field(card_key, field_id, next.to_string());
+            }
+            return Err(format!(
+                "`{target}` is a user-form field: use set_value, not click"
+            ));
         } else {
             return Err(format!("unknown click target `{target}`"));
         };
@@ -1276,6 +1460,9 @@ impl NativeChatHost {
     fn set_value(&mut self, target: &str, value: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
             return self.set_login(field, value.to_string());
+        }
+        if let Some((card_key, field_id, _, _)) = self.user_form_field(target) {
+            return self.set_user_form_field(card_key, field_id, value.to_string());
         }
         // The target is read before the text, here and in the two below: a wrong address is
         // worth saying before anything about what was going to be typed into it.
@@ -1294,6 +1481,9 @@ impl NativeChatHost {
             };
             return self.set_login(field, value);
         }
+        if let Some((card_key, field_id, _, current)) = self.user_form_field(target) {
+            return self.set_user_form_field(card_key, field_id, format!("{current}{text}"));
+        }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
             keys: text_tokens(text)?,
@@ -1305,6 +1495,24 @@ impl NativeChatHost {
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
             return self.login_key(field, target, key);
+        }
+        if let Some((card_key, field_id, _, current)) = self.user_form_field(target) {
+            match key_token(key)?.as_str() {
+                "enter" => {
+                    self.pending = Some(Command::UserFormContinue { card_key });
+                    return Ok(DispatchResult::empty());
+                }
+                "backspace" => {
+                    let mut value = current;
+                    value.pop();
+                    return self.set_user_form_field(card_key, field_id, value);
+                }
+                other => {
+                    return Err(format!(
+                        "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                    ));
+                }
+            }
         }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
@@ -2051,5 +2259,110 @@ mod tests {
             assert_eq!(recipe_row_target(control), None, "{control}");
         }
         assert_eq!(recipe_row_target("recipes-filter-mine"), None);
+    }
+
+    fn google_login_form() -> UserFormSnap {
+        UserFormSnap {
+            card_key: "e_form".into(),
+            title: "Google account".into(),
+            fields: vec![
+                UserFormFieldSnap {
+                    id: "email".into(),
+                    label: "Email".into(),
+                    kind: UserFormFieldKind::Email,
+                    masked: false,
+                    value: String::new(),
+                },
+                UserFormFieldSnap {
+                    id: "password".into(),
+                    label: "Password".into(),
+                    kind: UserFormFieldKind::Password,
+                    masked: true,
+                    value: String::new(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn idle_user_form_fields_and_buttons_are_in_the_tree() {
+        let mut host = host();
+        assert!(host.snapshot().find("user-form-e_form").is_none());
+        host.user_forms = vec![google_login_form()];
+        let tree = host.snapshot();
+        assert!(tree.find("user-form-e_form").is_some());
+        assert_eq!(
+            tree.find("user-form-field-e_form-email").unwrap().name,
+            "Email"
+        );
+        assert_eq!(
+            tree.find("user-form-field-e_form-password").unwrap().name,
+            "Password"
+        );
+        assert!(tree.find("user-form-continue-e_form").is_some());
+        assert!(tree.find("user-form-dismiss-e_form").is_some());
+        assert_eq!(
+            tree.find("user-form-screen-e_form").unwrap().name,
+            "Open the screen"
+        );
+        host.dispatch(&Op::SetValue {
+            target: "user-form-field-e_form-email".into(),
+            value: "ada@example.com".into(),
+        })
+        .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormSetField {
+                card_key,
+                field_id,
+                value,
+            }) => {
+                assert_eq!(card_key, "e_form");
+                assert_eq!(field_id, "email");
+                assert_eq!(value, "ada@example.com");
+            }
+            other => panic!("expected set field, got {other:?}"),
+        }
+        host.dispatch(&Op::SetValue {
+            target: "user-form-field-e_form-password".into(),
+            value: "s3cret".into(),
+        })
+        .unwrap();
+        assert!(
+            host.snapshot()
+                .find("user-form-field-e_form-password")
+                .unwrap()
+                .value
+                .is_none(),
+            "secrets stay off the tree"
+        );
+        host.dispatch(&Op::click("user-form-continue-e_form"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormContinue { card_key }) => assert_eq!(card_key, "e_form"),
+            other => panic!("expected continue, got {other:?}"),
+        }
+        host.dispatch(&Op::click("user-form-dismiss-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormDismiss { .. })
+        ));
+        host.dispatch(&Op::click("user-form-screen-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormOpenScreen { .. })
+        ));
+    }
+
+    #[test]
+    fn settled_user_form_has_no_field_nodes() {
+        let host = host();
+        let tree = host.snapshot();
+        assert!(
+            tree.find("user-form-field-e_form-email").is_none(),
+            "after Continue the snapshot must not list idle fields"
+        );
+        assert!(tree.find("user-form-continue-e_form").is_none());
     }
 }

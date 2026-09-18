@@ -2955,6 +2955,8 @@ mod tests {
 
     #[tokio::test]
     async fn submit_user_form_200_null_is_not_a_fill() {
+        // Classifier still reports Empty. After Continue, settle_user_form_http
+        // paints Submitted so idle fields do not come back.
         use super::super::user_form::UserFormActionReply;
         let server = MockServer::start().await;
         Mock::given(method("POST"))

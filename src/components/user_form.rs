@@ -11,6 +11,8 @@ use crate::components::fields::field_input;
 use crate::opengrok::{
     BoxHandoffResolution, FormResolution, USER_FORM_SERVER_FILL_AVAILABLE, UserFormDismissMode,
     UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues, continue_enabled,
+    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
+    user_form_screen_id,
 };
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -59,11 +61,22 @@ fn render_idle(
         .map(|entity| entity.read(cx).user_form_verbs_available)
         .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
     let can_post = spec.can_post(server_fill);
-    // Live InputState / TextareaState / picks — not the display map, which
-    // stores only a presence stub for masked fields.
-    let live = collect_submit_values(spec, inputs, textareas, values, cx);
+    let mut picks = values.clone();
+    if let Some(app) = &app {
+        if let Some(typed) = app.read(cx).user_form_typed.get(spec.card_key()) {
+            for (id, value) in typed {
+                picks
+                    .by_id
+                    .entry(id.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+    // Live InputState / TextareaState / picks / agent-typed — not a masked stub.
+    let live = collect_submit_values(spec, inputs, textareas, &picks, cx);
     let can_continue = continue_enabled(spec, &live, server_fill);
     let mut body = v_flex()
+        .id(ElementId::Name(user_form_card_id(spec.card_key()).into()))
         .w_full()
         .gap(px(10.))
         .p(px(14.))
@@ -118,7 +131,7 @@ fn render_idle(
             .gap(px(8.))
             .flex_wrap()
             .child(action_button(
-                format!("user-form-continue-{key}"),
+                user_form_continue_id(&key),
                 "Continue",
                 ButtonKind::Primary,
                 !can_continue,
@@ -127,7 +140,7 @@ fn render_idle(
                     let spec = spec.clone();
                     let inputs = inputs.clone();
                     let textareas = textareas.clone();
-                    let picks = values.clone();
+                    let picks = picks.clone();
                     let app = app.clone();
                     let key = key.clone();
                     can_continue.then_some(move |cx: &mut App| {
@@ -141,7 +154,7 @@ fn render_idle(
                 },
             ))
             .child(action_button(
-                format!("user-form-screen-{key}"),
+                user_form_screen_id(&key),
                 "Open the screen",
                 ButtonKind::Secondary,
                 !can_post,
@@ -163,7 +176,7 @@ fn render_idle(
                 },
             ))
             .child(action_button(
-                format!("user-form-dismiss-{key}"),
+                user_form_dismiss_id(&key),
                 "Dismiss",
                 ButtonKind::Ghost,
                 !can_post,
@@ -201,14 +214,28 @@ fn collect_submit_values(
             UserFormFieldKind::Checkbox | UserFormFieldKind::Select => {
                 picks.by_id.get(&field.id).cloned().unwrap_or_default()
             }
-            UserFormFieldKind::Textarea => textareas
-                .get(&key)
-                .map(|state| state.read(cx).value().to_string())
-                .unwrap_or_default(),
-            _ => inputs
-                .get(&key)
-                .map(|state| state.read(cx).value().to_string())
-                .unwrap_or_default(),
+            UserFormFieldKind::Textarea => {
+                let live = textareas
+                    .get(&key)
+                    .map(|state| state.read(cx).value().to_string())
+                    .unwrap_or_default();
+                if live.trim().is_empty() {
+                    picks.by_id.get(&field.id).cloned().unwrap_or_default()
+                } else {
+                    live
+                }
+            }
+            _ => {
+                let live = inputs
+                    .get(&key)
+                    .map(|state| state.read(cx).value().to_string())
+                    .unwrap_or_default();
+                if live.trim().is_empty() {
+                    picks.by_id.get(&field.id).cloned().unwrap_or_default()
+                } else {
+                    live
+                }
+            }
         };
         if field.kind == UserFormFieldKind::Checkbox {
             out.by_id.insert(
@@ -282,6 +309,7 @@ fn collapsed_card(
     theme: &Theme,
 ) -> AnyElement {
     v_flex()
+        .id(ElementId::Name(user_form_card_id(spec.card_key()).into()))
         .w_full()
         .gap(px(8.))
         .p(px(14.))
@@ -554,6 +582,11 @@ fn render_field(
             }
         }
     };
+    let field_el = user_form_field_id(spec.card_key(), &field.id);
+    let control = div()
+        .id(ElementId::Name(field_el.into()))
+        .w_full()
+        .child(control);
     let show_label = field.kind != UserFormFieldKind::Checkbox;
     v_flex()
         .gap(px(6.))
@@ -583,7 +616,7 @@ fn render_checkbox(
     let next = if on { "false" } else { "true" };
     h_flex()
         .id(ElementId::Name(
-            format!("user-form-check-{}-{field_id}", spec.card_key()).into(),
+            user_form_field_id(spec.card_key(), &field.id).into(),
         ))
         .items_center()
         .gap(px(8.))
