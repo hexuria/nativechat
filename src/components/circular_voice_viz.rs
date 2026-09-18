@@ -63,8 +63,9 @@ impl CircularVoiceViz {
                         .await;
 
                     let result = view.update(cx, |this, cx| {
-                        this.update_animation(cx);
-                        cx.notify();
+                        if this.tick() {
+                            cx.notify();
+                        }
                     });
 
                     if result.is_err() {
@@ -86,7 +87,24 @@ impl CircularVoiceViz {
         })
     }
 
-    fn update_animation(&mut self, cx: &mut Context<Self>) {
+    fn tick(&mut self) -> bool {
+        let before = (
+            self.smoothed_amplitude.to_bits(),
+            self.smoothed_ai_amplitude.to_bits(),
+            self.rotation.to_bits(),
+            self.velocity.to_bits(),
+        );
+        self.update_animation();
+        let after = (
+            self.smoothed_amplitude.to_bits(),
+            self.smoothed_ai_amplitude.to_bits(),
+            self.rotation.to_bits(),
+            self.velocity.to_bits(),
+        );
+        before != after
+    }
+
+    fn update_animation(&mut self) {
         // 1. Read Amplitude
         let raw_amplitude = f32::from_bits(self.amplitude.load(Ordering::Relaxed));
         let raw_ai_amplitude = f32::from_bits(self.ai_amplitude.load(Ordering::Relaxed));
@@ -134,15 +152,18 @@ impl CircularVoiceViz {
         if is_talking {
             // Accelerate
             self.velocity = (self.velocity + 0.0005).min(MAX_VELOCITY);
+            self.rotation += self.velocity;
         } else {
-            // Friction
-            self.velocity = (self.velocity * 0.98).max(MIN_VELOCITY);
+            // Friction. Once we sit at the floor, freeze so idle ticks
+            // do not notify.
+            let next = (self.velocity * 0.98).max(MIN_VELOCITY);
+            if next > MIN_VELOCITY + f32::EPSILON {
+                self.velocity = next;
+                self.rotation += self.velocity;
+            } else {
+                self.velocity = MIN_VELOCITY;
+            }
         }
-
-        // Apply velocity to rotation
-        self.rotation += self.velocity;
-
-        cx.notify();
     }
 }
 

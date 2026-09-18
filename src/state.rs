@@ -26,7 +26,7 @@ use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -573,6 +573,32 @@ fn restored_message(row: ChatMessage) -> Message {
         parts,
         run_id: row.run_id,
     }
+}
+
+/// Paint the streaming bubble at most ~60Hz. Non-text parts (form, screenshot,
+/// approval, generative UI) flush immediately so a card is not delayed a frame.
+const STREAM_PAINT_MIN: Duration = Duration::from_millis(16);
+
+fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
+    let flags = parts.iter().fold(0u8, |acc, part| {
+        acc | match part {
+            ChatPart::Text(_) => 0,
+            ChatPart::Ui(_) => 1,
+            ChatPart::Approval(_) => 2,
+            ChatPart::Screenshot(_) => 4,
+            ChatPart::UserForm(_) => 8,
+        }
+    });
+    (parts.len(), flags)
+}
+
+fn stream_paint_due(
+    last: Option<Instant>,
+    now: Instant,
+    prev_sig: (usize, u8),
+    sig: (usize, u8),
+) -> bool {
+    sig != prev_sig || last.is_none_or(|at| now.saturating_duration_since(at) >= STREAM_PAINT_MIN)
 }
 
 /// A run rebuilt from the frames the server kept, as the live stream would have painted it.
@@ -2504,9 +2530,18 @@ impl AppState {
                 }
                 match result {
                     Ok(frame) => {
-                        state.coworker_screen =
+                        let next =
                             crate::opengrok::ScreenshotSpec::from_frame("screen", "", &frame)
                                 .map(|spec| spec.image);
+                        let unchanged = match (state.coworker_screen.as_ref(), next.as_ref()) {
+                            (Some(old), Some(new)) => old.bytes == new.bytes,
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if unchanged {
+                            return;
+                        }
+                        state.coworker_screen = next;
                         cx.notify();
                     }
                     Err(_) => {
@@ -4793,6 +4828,8 @@ impl AppState {
                 Ok(id) => {
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
+                    let mut last_stream_paint: Option<Instant> = None;
+                    let mut last_stream_sig = (0usize, 0u8);
                     let result = client
                         .run_turn(
                             &id,
@@ -4821,6 +4858,10 @@ impl AppState {
                                 }
                                 assembler.push_event(&event);
                                 let (plain, parts) = assembler.snapshot();
+                                let sig = stream_part_sig(&parts);
+                                let now = Instant::now();
+                                let paint =
+                                    stream_paint_due(last_stream_paint, now, last_stream_sig, sig);
                                 let _ = this.update(cx, |state, cx| {
                                     // Into the thread the run belongs to, and into the row the run
                                     // was given — not the thread that happens to be open, and not
@@ -4833,7 +4874,11 @@ impl AppState {
                                     ) {
                                         message.content = plain.clone();
                                         message.parts = grafted;
-                                        cx.notify();
+                                        // Tokens update the row every frame; notify at ~60Hz
+                                        // or when a card/picture lands, not on every SSE event.
+                                        if paint {
+                                            cx.notify();
+                                        }
                                     }
                                     if assembler.waiting_approval() {
                                         let open = parts.iter().rev().find_map(|part| match part {
@@ -4849,6 +4894,10 @@ impl AppState {
                                         }
                                     }
                                 });
+                                if paint {
+                                    last_stream_paint = Some(now);
+                                    last_stream_sig = sig;
+                                }
                             },
                         )
                         .await;
@@ -7086,12 +7135,12 @@ mod tests {
         WAITING_APPROVAL_STATUS, agui_messages, apply_catalogue, apply_reload, graft_reply,
         is_status_line, is_tool_standin, is_unsent_turn_note, missing_replies,
         reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
-        streaming_message_mut,
+        stream_paint_due, stream_part_sig, streaming_message_mut,
     };
     use crate::opengrok::{Failure, ModelEntry, OpenGrokClient};
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn message(id: &str, is_me: bool, content: &str) -> Message {
         Message {
@@ -7131,6 +7180,43 @@ mod tests {
         assert_eq!(quote.message_id, "m1");
         assert_eq!(quote.preview, "The build is green.");
         assert!(!quote.is_me);
+    }
+
+    #[test]
+    fn stream_paint_coalesces_text_and_flushes_on_a_card() {
+        let t0 = Instant::now();
+        let text = vec![ChatPart::Text("hi".into())];
+        let sig = stream_part_sig(&text);
+        assert!(
+            stream_paint_due(None, t0, (0, 0), sig),
+            "the first token paints"
+        );
+        assert!(
+            !stream_paint_due(Some(t0), t0, sig, sig),
+            "another token in the same 16ms does not notify"
+        );
+        assert!(
+            stream_paint_due(Some(t0), t0 + Duration::from_millis(16), sig, sig),
+            "text flushes at ~60Hz"
+        );
+        let card = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e1",
+                "formRequest": {
+                    "title": "Login",
+                    "fields": [{"id": "p", "label": "Password", "type": "password", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let with_form = vec![ChatPart::Text("hi".into()), ChatPart::UserForm(card)];
+        let form_sig = stream_part_sig(&with_form);
+        assert_ne!(sig, form_sig);
+        assert!(
+            stream_paint_due(Some(t0), t0, sig, form_sig),
+            "a user-form card paints immediately"
+        );
     }
 
     #[test]
