@@ -2245,10 +2245,9 @@ impl AppState {
             .is_some_and(|computer| computer.egress_tunnel_ready())
     }
 
-    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** box
-    /// `egress_tunnel.ready`. No tunnel is invented. The Settings row can
-    /// still *show* when only one side is known; this AND-gate is what may
-    /// actually turn the tunnel on.
+    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** this bot's box
+    /// tunnel. No tunnel is invented. The Computer pane row can still *show*
+    /// when only one side is known; this AND-gate is what may turn it on.
     pub fn egress_tunnel_available(&self) -> bool {
         self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
     }
@@ -2755,6 +2754,7 @@ impl AppState {
         self.computer_action_error = None;
         if computer {
             self.refresh_coworker_computer(cx);
+            self.refresh_host_egress(cx);
             self.start_computer_poll(cx);
         } else {
             self.computer_poll = None;
@@ -10299,6 +10299,19 @@ mod tests {
         assert!(
             state.show_egress_tunnel_settings(),
             "box ready still paints the Network row if the host poll missed"
+        );
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "url": "ws://127.0.0.1:8790" }
+            }))
+            .unwrap(),
+        );
+        state.host_egress_tunnel_available = true;
+        assert!(
+            state.egress_tunnel_available(),
+            "box tunnel URL is ready for Route traffic"
         );
         state.coworker_computer = None;
         state.host_egress_tunnel_available = true;

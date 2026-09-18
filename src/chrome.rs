@@ -18,7 +18,8 @@ pub const AUTO_COLLAPSE_WIDTH: f32 = 900.0;
 /// columns. 52px centres the 28px controls and, with the light position in main.rs, the
 /// traffic lights.
 pub const TITLE_BAR_H: f32 = 52.0;
-/// Past the traffic lights; nothing sits under them.
+/// Past the traffic lights; nothing sits under them. Settings ← Back to app
+/// uses this inset so it does not overlap the red/yellow/green lights.
 pub const TITLE_BAR_LEFT_PAD: f32 = 80.0;
 /// The headers' horizontal padding, in the title bar and in a floating pane.
 pub const HEADER_PX: f32 = 16.0;
