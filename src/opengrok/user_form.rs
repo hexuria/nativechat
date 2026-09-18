@@ -47,12 +47,14 @@
 //! **Form `entryId` is the gateway card id, never `callId`.** Open the screen
 //! keeps that id on the form card and stores **`handoffEntryId`** from the
 //! dismiss response when the server mints a sibling. **I'm done** / **Skip**
-//! POST that sibling id when we have it (`handed_back` / `declined`). If
-//! dismiss Keep / `sand://box` omit a sibling, POST the **form** gateway
-//! `entryId` — an open Action needed handoff must resolve without Take over
-//! first, and without inventing a `callId`. Never `handBackForeverBox`.
-//! **Take over** opens/focuses the Computer (pane + screen). Server
-//! `formResolution: escalated` is a live Computer sibling, not form chrome.
+//! POST that sibling id (`handed_back` / `declined`) — never the form
+//! gateway `entryId`. `is_live_handoff` rejects a form id (400 / a 404 that
+//! is not a missing route). If escalate dismiss has not returned
+//! `handoffEntryId` yet, queue the resolve and POST when the sibling id
+//! lands. Local Skip / I'm done chrome still settles so the buttons stay
+//! live. Never invent a `callId`. Never `handBackForeverBox`. **Take over**
+//! opens/focuses the Computer (pane + screen). Server `formResolution:
+//! escalated` is a live Computer sibling, not form chrome.
 //!
 //! After Continue paints **Sending**, HTTP must not restore idle fields.
 //! A body with `formResolution` (`submitted` / `fill_failed` / …) is merged.
@@ -60,8 +62,8 @@
 //! fail / unknown coworker) on [opengrok-server#139](https://github.com/hexuria/opengrok-server/pull/139)
 //! @ `c09bc6c`. Paint **Not filled**. A 404 `{error: "form entry missing"}`
 //! is a missing stamped card (Not filled), not a missing route. A 404 that
-//! is not that sentence flips verbs off. Missing `entryId` (no POST) does
-//! not paint Submitted.
+//! is not that sentence restores that card — it must not gray every other
+//! open form. Missing `entryId` (no POST) does not paint Submitted.
 //!
 //! # [opengrok-server#140](https://github.com/hexuria/opengrok-server/issues/140) on #139 @ d12fffc
 //!
@@ -70,15 +72,16 @@
 //! That id is what Continue / Dismiss POST. We never invent one: `callId`,
 //! `toolCallId`, and a generic AG-UI event `id` are not `entryId`.
 //!
-//! When `entryId` is present and the verbs are up, Open the screen / Dismiss
-//! are live; Continue also needs required fields filled. Missing `entryId`
-//! keeps the card idle — **Submitted is not painted**. A 404 after a send
-//! that reached the server is Not filled, not idle fields.
+//! When `entryId` is present, Open the screen / Dismiss are live; Continue
+//! also needs required fields filled. Missing `entryId` keeps the card idle
+//! — **Submitted is not painted**. A 404 after a send that reached the
+//! server is Not filled, not idle fields. A missing-route 404 on one verb
+//! must not leave other open-looking cards with every control disabled.
 //!
 //! [`USER_FORM_SERVER_FILL_AVAILABLE`] defaults true (#139 @ d12fffc+ has
-//! the routes). AppState flips it off after a **missing-route** 404, not
-//! after `{error: "form entry missing"}`. Fill still needs
-//! [`UserFormSpec::has_gateway_entry_id`].
+//! the routes). A missing-route 404 on one card must **not** freeze every
+//! open user-form: unresolved cards stay editable until that card settles.
+//! Fill still needs [`UserFormSpec::has_gateway_entry_id`].
 //!
 //! `formFieldOutcomes` is hashed on the official client, not painted. We parse
 //! it only so it cannot be mistaken for field values.
@@ -103,11 +106,9 @@ pub const USER_FORM_DISMISS_PATH: &str = "/ag-ui/user-form/dismiss";
 /// Hand back / decline / timeout. `entryId` is the handoff card, not the form.
 pub const BOX_HANDOFF_RESOLVE_PATH: &str = "/ag-ui/box-handoff/resolve";
 
-/// Default true: opengrok-server#139 @ d12fffc+ has submit/dismiss. AppState
-/// sets this false after a **missing-route** 404 so we never POST against a
-/// server that has no verbs. A 404 `{error: "form entry missing"}` is not
-/// that: the routes exist, the stamped card does not. Per-card fill still
-/// requires a real gateway `entryId`.
+/// Default true: opengrok-server#139 @ d12fffc+ has submit/dismiss. A
+/// missing-route 404 on one POST must not flip every stacked open card
+/// read-only. Per-card fill still requires a real gateway `entryId`.
 pub const USER_FORM_SERVER_FILL_AVAILABLE: bool = true;
 
 /// OpenGrok #139 @ c09bc6c: stamped `entryId` that is gone from the
@@ -531,6 +532,8 @@ pub fn computer_window_attention_done_id(card_key: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerHandoffSpec {
     pub form_entry_id: String,
+    /// Sibling card id for `/ag-ui/box-handoff/resolve`. Never the form id.
+    pub handoff_entry_id: Option<String>,
     pub box_request_id: Option<String>,
     pub instruction: String,
 }
@@ -548,10 +551,26 @@ impl ComputerHandoffSpec {
             .or_else(|| string_field(event, "instruction"))
             .unwrap_or_default();
         let form_entry_id = string_field(&value, "formEntryId")
-            .or_else(|| string_field(&value, "entryId"))
             .or_else(|| string_field(event, "formEntryId"))
+            .or_else(|| string_field(&value, "entryId"))
             .or_else(|| string_field(event, "entryId"))
             .unwrap_or_default();
+        let handoff_entry_id = parse_handoff_entry_id(&value)
+            .or_else(|| parse_handoff_entry_id(event))
+            .or_else(|| {
+                let id = string_field(&value, "id").or_else(|| string_field(event, "id"))?;
+                if id.is_empty() || id == form_entry_id {
+                    None
+                } else {
+                    Some(id)
+                }
+            })
+            .or_else(|| {
+                let form = string_field(&value, "formEntryId")?;
+                let entry = string_field(&value, "entryId")?;
+                (entry != form).then_some(entry)
+            })
+            .filter(|id| !id.is_empty() && *id != form_entry_id);
         let box_request_id =
             string_field(&value, "boxRequestId").or_else(|| string_field(event, "boxRequestId"));
         if form_entry_id.is_empty() && box_request_id.is_none() && instruction.is_empty() {
@@ -559,6 +578,7 @@ impl ComputerHandoffSpec {
         }
         Some(Self {
             form_entry_id,
+            handoff_entry_id,
             box_request_id,
             instruction,
         })
@@ -586,7 +606,7 @@ impl ComputerHandoffSpec {
             live_host: None,
             resolution: None,
             widget_dismissed: false,
-            handoff_entry_id: None,
+            handoff_entry_id: self.handoff_entry_id.clone(),
             box_request_id: self.box_request_id.clone(),
             box_instruction: (!self.instruction.is_empty()).then(|| self.instruction.clone()),
             computer_handoff: Some(ComputerHandoffStatus::ActionNeeded),
@@ -715,14 +735,16 @@ impl UserFormSpec {
         true
     }
 
-    /// Continue / Dismiss POST only when the route is present **and** we have
-    /// a gateway `entryId`. Required fields are an extra Continue gate.
+    /// Continue / Dismiss POST when we have a gateway `entryId`. Required
+    /// fields are an extra Continue gate. `server_fill` is leftover from a
+    /// global missing-route lock that froze every stacked open card — it
+    /// does not disable an unresolved form.
     pub fn continue_enabled(&self, values: &UserFormValues, server_fill: bool) -> bool {
         self.can_post(server_fill) && self.required_fields_filled(values)
     }
 
-    pub fn can_post(&self, server_fill: bool) -> bool {
-        server_fill && self.has_gateway_entry_id()
+    pub fn can_post(&self, _server_fill: bool) -> bool {
+        self.has_gateway_entry_id()
     }
 
     pub fn required_fields_filled(&self, values: &UserFormValues) -> bool {
@@ -1070,22 +1092,21 @@ pub fn dismiss_request_body(entry_id: &str, agent_id: &str, mode: UserFormDismis
     })
 }
 
-/// Id POSTed to `/ag-ui/box-handoff/resolve`. Prefer dismiss `handoffEntryId`.
-/// When the server omitted a sibling card (Open the screen Keep / `sand://box`),
-/// the form gateway `entryId` is the live handoff. Never empty. Never invent a
-/// `callId` — callers pass [`UserFormSpec::entry_id`], not [`UserFormSpec::card_key`].
+/// Id POSTed to `/ag-ui/box-handoff/resolve`. Only dismiss `handoffEntryId`
+/// or a sibling Computer card id. Never the form gateway `entryId` — that
+/// hits `is_live_handoff` and is not a live handoff. Never invent a `callId`.
 pub fn box_handoff_resolve_entry_id(
     handoff_entry_id: Option<&str>,
     form_entry_id: &str,
 ) -> Option<String> {
-    if let Some(id) = handoff_entry_id.map(str::trim).filter(|id| !id.is_empty()) {
-        return Some(id.to_string());
-    }
+    let id = handoff_entry_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
     let form = form_entry_id.trim();
-    if form.is_empty() {
+    if !form.is_empty() && id == form {
         return None;
     }
-    Some(form.to_string())
+    Some(id.to_string())
 }
 
 /// Local Skip / I'm done chrome can settle on these replies. 200-null Keep
@@ -1698,8 +1719,8 @@ mod tests {
         filled.by_id.insert("password".into(), "s3cret-pass".into());
         assert!(continue_enabled(&spec, &filled, true));
         assert!(
-            !spec.can_post(false),
-            "404 feature-detect keeps Open/Dismiss gated"
+            spec.can_post(false),
+            "a missing-route 404 on another card must not freeze this one"
         );
         let submit = submit_request_body(&spec.entry_id, "cw_1", &filled);
         assert_eq!(submit["entryId"], "e_form");
@@ -1919,7 +1940,10 @@ mod tests {
             &filled,
             USER_FORM_SERVER_FILL_AVAILABLE
         ));
-        assert!(!continue_enabled(&spec, &filled, false));
+        assert!(
+            continue_enabled(&spec, &filled, false),
+            "stacked open forms stay Continue-able if a sibling 404 flipped the old global lock"
+        );
         assert!(USER_FORM_SERVER_FILL_AVAILABLE);
     }
 
@@ -2344,20 +2368,22 @@ mod tests {
     }
 
     #[test]
-    fn open_handoff_resolves_with_form_entry_id_when_sibling_is_missing() {
+    fn open_handoff_does_not_post_form_entry_id() {
         assert_eq!(
             box_handoff_resolve_entry_id(Some("e_hand"), "e_form").as_deref(),
             Some("e_hand"),
             "dismiss sibling wins when the server minted one"
         );
         assert_eq!(
-            box_handoff_resolve_entry_id(None, "e_form").as_deref(),
-            Some("e_form"),
-            "Open the screen Keep / sand://box POST the form gateway id"
+            box_handoff_resolve_entry_id(None, "e_form"),
+            None,
+            "never POST the form gateway id into is_live_handoff"
         );
+        assert_eq!(box_handoff_resolve_entry_id(Some("   "), "e_form"), None);
         assert_eq!(
-            box_handoff_resolve_entry_id(Some("   "), "e_form").as_deref(),
-            Some("e_form")
+            box_handoff_resolve_entry_id(Some("e_form"), "e_form"),
+            None,
+            "a stored form id is not a sibling"
         );
         assert_eq!(
             box_handoff_resolve_entry_id(None, ""),
@@ -2423,6 +2449,7 @@ mod tests {
         .expect("handoff");
         assert_eq!(spec.form_entry_id, "e_form");
         assert_eq!(spec.box_request_id.as_deref(), Some("box-9"));
+        assert_eq!(spec.handoff_entry_id, None);
         let form = spec.as_escalated_form();
         assert!(form.shows_computer_handoff());
         assert!(!form.shows_form_chrome());
@@ -2448,6 +2475,28 @@ mod tests {
         assert_eq!(
             sand.as_escalated_form().handoff_prompt(),
             "Finish this step."
+        );
+        let sibling = ComputerHandoffSpec::from_event(&json!({
+            "type": "CUSTOM",
+            "name": "computer-handoff-card",
+            "value": {
+                "formEntryId": "e_form",
+                "entryId": "e_hand",
+                "handoffEntryId": "e_hand",
+                "boxRequestId": "box-9",
+                "boxInstruction": "Sign in on the computer."
+            }
+        }))
+        .expect("sibling");
+        assert_eq!(sibling.form_entry_id, "e_form");
+        assert_eq!(sibling.handoff_entry_id.as_deref(), Some("e_hand"));
+        assert_eq!(
+            sibling.as_escalated_form().handoff_entry_id.as_deref(),
+            Some("e_hand")
+        );
+        assert_ne!(
+            sibling.as_escalated_form().handoff_entry_id.as_deref(),
+            Some("e_form")
         );
     }
 

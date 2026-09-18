@@ -657,7 +657,7 @@ impl OpenGrokClient {
     }
 
     /// Hand back / decline / timeout. `entry_id` is dismiss `handoffEntryId`
-    /// when present, else the form gateway id for an open handoff.
+    /// (sibling Computer card). Never the form gateway id.
     pub async fn resolve_box_handoff(
         &self,
         handoff_entry_id: &str,

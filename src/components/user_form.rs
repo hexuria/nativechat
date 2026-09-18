@@ -244,11 +244,10 @@ fn render_live_computer_handoff(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
-    let server_fill = app
-        .as_ref()
-        .map(|entity| entity.read(cx).user_form_verbs_available)
-        .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
-    let can_resolve = server_fill;
+    // Live Action needed: Skip / I'm done stay clickable even if a sibling
+    // 404 flipped the old global verbs lock. Do not POST until we have a
+    // sibling `handoffEntryId`.
+    let can_resolve = true;
     let screen = app.as_ref().and_then(|entity| {
         let state = entity.read(cx);
         state

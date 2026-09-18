@@ -13,14 +13,14 @@ use crate::opengrok::{
     OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
     RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
     RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
-    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
-    activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
-    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    env_egress_tunnel_enabled, host_egress_tunnel_enabled, keep_local_save_offer,
-    local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
-    reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
-    stored_machine_id, tool_standin,
+    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
+    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
+    host_egress_tunnel_enabled, keep_local_save_offer, local_exec_outcome,
+    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
+    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
+    tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -1462,8 +1462,9 @@ pub struct AppState {
     /// Agent/E2E typed values (including secrets). In-memory only — never
     /// sqlite / AG-UI content. Continue prefers live InputState, then this.
     pub user_form_typed: HashMap<String, HashMap<String, String>>,
-    /// Routes exist on this server. Flipped off after a missing-route 404.
-    /// A 404 `{error: "form entry missing"}` does not flip this.
+    /// Routes exist on this server. Diagnostic only — a missing-route 404
+    /// must not freeze every stacked open user-form. Unresolved cards stay
+    /// clickable until that card settles.
     pub user_form_verbs_available: bool,
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
@@ -1472,6 +1473,9 @@ pub struct AppState {
     user_form_restore: HashMap<String, FormResolution>,
     /// Form card key → handoff card id from dismiss `handoffEntryId`.
     user_form_handoffs: HashMap<String, String>,
+    /// Skip / I'm done before dismiss returned `handoffEntryId`. Local chrome
+    /// already settled; POST once the sibling id lands. Never the form entryId.
+    user_form_pending_resolves: HashMap<String, PendingBoxHandoff>,
     /// Form card keys whose box-handoff already resolved (I'm done / Skip).
     user_form_handoff_done: HashSet<String>,
     /// Computer sibling chrome grafted across hide→reshow / SSE replay.
@@ -1590,6 +1594,14 @@ enum UserFormDispatch {
     Submit(UserFormValues),
     Dismiss(UserFormDismissMode),
     ResolveHandoff(BoxHandoffResolution),
+}
+
+#[derive(Clone, Debug)]
+struct PendingBoxHandoff {
+    resolution: BoxHandoffResolution,
+    run_id: String,
+    conversation_id: String,
+    agent_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1831,6 +1843,7 @@ impl AppState {
             user_form_resolutions: HashMap::new(),
             user_form_restore: HashMap::new(),
             user_form_handoffs: HashMap::new(),
+            user_form_pending_resolves: HashMap::new(),
             user_form_handoff_done: HashSet::new(),
             user_form_computer_handoffs: HashMap::new(),
             user_form_handoff_restore: HashMap::new(),
@@ -2030,7 +2043,13 @@ impl AppState {
         match tick {
             ActivityTick::Keep => {}
             ActivityTick::Clear => {
-                if let Some(activity) = self.thread_activity.get_mut(conversation_id) {
+                if self.has_open_user_form(conversation_id) {
+                    // Settled CUSTOM / RUN_FINISHED must not blank Waiting
+                    // while another unresolved form or live handoff remains.
+                    self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+                } else if self.has_open_approval(conversation_id) {
+                    self.end_turn_waiting(Some(conversation_id), Some(WAITING_APPROVAL_STATUS));
+                } else if let Some(activity) = self.thread_activity.get_mut(conversation_id) {
                     activity.label = None;
                 }
             }
@@ -2358,6 +2377,30 @@ impl AppState {
         self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
         if !run_id.is_empty() {
             self.release_live_turn(conversation_id, run_id);
+        }
+    }
+
+    /// After Skip / Dismiss / Done (and after SSE graft): Waiting only while
+    /// an unresolved form or live Computer sibling remains. Do not leave
+    /// green Waiting over settled pills, and do not blank it while another
+    /// stacked card is still open.
+    fn sync_waiting_chrome(&mut self, conversation_id: &str) {
+        if self.is_thread_responding(conversation_id) {
+            return;
+        }
+        if self.has_open_user_form(conversation_id) {
+            self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+            return;
+        }
+        if self.has_open_approval(conversation_id) {
+            self.end_turn_waiting(Some(conversation_id), Some(WAITING_APPROVAL_STATUS));
+            return;
+        }
+        if matches!(
+            self.thread_status(conversation_id),
+            Some(WAITING_FOR_YOU_STATUS) | Some(WAITING_APPROVAL_STATUS)
+        ) {
+            self.end_turn_waiting(Some(conversation_id), None);
         }
     }
 
@@ -5006,10 +5049,7 @@ impl AppState {
                 self.fill_open_approval_commands(cx);
             }
             "finished" => {
-                let waiting_form = parts
-                    .iter()
-                    .any(|part| matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved()));
-                if waiting_form {
+                if self.has_open_user_form(conversation_id) {
                     self.park_waiting_for_you(conversation_id, &turn.run_id);
                 } else {
                     self.finish_responding(Some(conversation_id), false);
@@ -5017,7 +5057,10 @@ impl AppState {
                 // Only when nobody has written this turn down yet. The live stream may have come
                 // back and settled it while the replay was in the air, and a turn saved twice is
                 // a thread that says everything twice.
-                if !waiting_form && self.turn_is_unsettled(conversation_id, &turn.run_id) {
+                if !self.has_open_user_form(conversation_id)
+                    && !self.has_open_approval(conversation_id)
+                    && self.turn_is_unsettled(conversation_id, &turn.run_id)
+                {
                     self.persist_assistant_reply(
                         conversation_id,
                         plain,
@@ -5033,6 +5076,7 @@ impl AppState {
             }
             _ => {}
         }
+        self.collect_handoff_ids_and_flush(conversation_id, cx);
     }
 
     /// This thread is no longer answerable for a turn.
@@ -5317,6 +5361,7 @@ impl AppState {
                                             cx.notify();
                                         }
                                     }
+                                    state.collect_handoff_ids_and_flush(&conversation_id, cx);
                                     if assembler.waiting_approval() {
                                         let open = parts.iter().rev().find_map(|part| match part {
                                             ChatPart::Approval(spec) => Some(spec.clone()),
@@ -5358,9 +5403,13 @@ impl AppState {
                             message.content = plain;
                             message.parts = grafted;
                         }
+                        state.collect_handoff_ids_and_flush(&conversation_id, cx);
                         cx.notify();
                     });
-                    (result, waiting_approval, waiting_user_form, deeds)
+                    let waiting_form = this
+                        .update(cx, |state, _| state.has_open_user_form(&conversation_id))
+                        .unwrap_or(waiting_user_form);
+                    (result, waiting_approval, waiting_form, deeds)
                 }
                 Err(error) => (Err(error), false, false, Vec::new()),
             };
@@ -5897,10 +5946,12 @@ impl AppState {
                                 {
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
-                                    if let Some(shot) = parts.iter().rev().find_map(|part| match part {
-                                        ChatPart::Screenshot(spec) => Some(spec.clone()),
-                                        _ => None,
-                                    }) {
+                                    if let Some(shot) =
+                                        parts.iter().rev().find_map(|part| match part {
+                                            ChatPart::Screenshot(spec) => Some(spec.clone()),
+                                            _ => None,
+                                        })
+                                    {
                                         state.last_box_shot = Some(shot);
                                     }
                                     for part in &parts {
@@ -5925,26 +5976,23 @@ impl AppState {
                                         );
                                     }
                                     "finished" => {
-                                        let waiting_form = parts.iter().any(|part| {
-                                            matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved())
-                                        });
-                                        if waiting_form {
-                                            if let Some(id) = conversation_id.as_deref() {
+                                        if let Some(id) = conversation_id.as_deref() {
+                                            if state.has_open_user_form(id) {
                                                 state.park_waiting_for_you(id, &run_id);
-                                            }
-                                        } else {
-                                            state.finish_responding(
-                                                conversation_id.as_deref(),
-                                                false,
-                                            );
-                                            if let Some(id) = conversation_id.as_ref() {
-                                                state.persist_assistant_reply(
-                                                    id,
-                                                    plain.clone(),
-                                                    &parts,
-                                                    Some(&run_id),
-                                                    cx,
+                                            } else {
+                                                state.finish_responding(
+                                                    conversation_id.as_deref(),
+                                                    false,
                                                 );
+                                                if !state.has_open_approval(id) {
+                                                    state.persist_assistant_reply(
+                                                        id,
+                                                        plain.clone(),
+                                                        &parts,
+                                                        Some(&run_id),
+                                                        cx,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -5955,6 +6003,9 @@ impl AppState {
                                         }
                                     }
                                     _ => {}
+                                }
+                                if let Some(id) = conversation_id.as_deref() {
+                                    state.collect_handoff_ids_and_flush(id, cx);
                                 }
                                 cx.notify();
                             });
@@ -6411,8 +6462,8 @@ impl AppState {
         self.user_form_handoffs.get(card_key).cloned()
     }
 
-    /// POST id for I'm done / Skip. Sibling `handoffEntryId` if the server
-    /// minted one; otherwise the form gateway `entryId` while Action needed.
+    /// POST id for I'm done / Skip. Sibling `handoffEntryId` only — never the
+    /// form gateway `entryId` (that hits `is_live_handoff`).
     fn box_handoff_post_id(&self, card_key: &str, form_entry_id: &str) -> Option<String> {
         let stored = self
             .user_form_handoffs
@@ -6426,7 +6477,9 @@ impl AppState {
         let spec_id = self.conversations.iter().find_map(|conversation| {
             conversation.messages.iter().find_map(|message| {
                 message.parts.iter().find_map(|part| match part {
-                    ChatPart::UserForm(spec) if spec.card_key() == card_key => {
+                    ChatPart::UserForm(spec)
+                        if spec.card_key() == card_key || spec.entry_id == form_entry_id =>
+                    {
                         spec.handoff_entry_id.as_deref()
                     }
                     _ => None,
@@ -6434,6 +6487,158 @@ impl AppState {
             })
         });
         box_handoff_resolve_entry_id(stored.or(spec_id), form_entry_id)
+    }
+
+    fn queue_pending_box_handoff(
+        &mut self,
+        card_key: &str,
+        form_entry_id: &str,
+        pending: PendingBoxHandoff,
+    ) {
+        if !form_entry_id.is_empty() && form_entry_id != card_key {
+            self.user_form_pending_resolves
+                .insert(form_entry_id.to_string(), pending.clone());
+        }
+        self.user_form_pending_resolves
+            .insert(card_key.to_string(), pending);
+    }
+
+    fn take_pending_box_handoff(
+        &mut self,
+        card_key: &str,
+        form_entry_id: &str,
+    ) -> Option<PendingBoxHandoff> {
+        self.user_form_pending_resolves
+            .remove(card_key)
+            .or_else(|| {
+                (!form_entry_id.is_empty())
+                    .then(|| self.user_form_pending_resolves.remove(form_entry_id))
+                    .flatten()
+            })
+    }
+
+    fn flush_pending_box_handoff(
+        &mut self,
+        card_key: &str,
+        form_entry_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handoff_id) = self.box_handoff_post_id(card_key, form_entry_id) else {
+            return;
+        };
+        let Some(pending) = self.take_pending_box_handoff(card_key, form_entry_id) else {
+            return;
+        };
+        self.post_box_handoff_resolve(
+            card_key.to_string(),
+            handoff_id,
+            pending.resolution,
+            pending.run_id,
+            pending.conversation_id,
+            pending.agent_id,
+            cx,
+        );
+    }
+
+    fn collect_handoff_ids_and_flush(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        let pending_keys: Vec<String> = self.user_form_pending_resolves.keys().cloned().collect();
+        let mut discovered: Vec<(String, String, String)> = Vec::new();
+        let mut flush: Vec<(String, String)> = Vec::new();
+        if let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    let ChatPart::UserForm(spec) = part else {
+                        continue;
+                    };
+                    let key = spec.card_key().to_string();
+                    if let Some(id) = spec
+                        .handoff_entry_id
+                        .as_deref()
+                        .filter(|id| !id.is_empty() && *id != spec.entry_id)
+                    {
+                        discovered.push((key.clone(), spec.entry_id.clone(), id.to_string()));
+                    }
+                    if pending_keys.iter().any(|pending| {
+                        pending == &key || (!spec.entry_id.is_empty() && pending == &spec.entry_id)
+                    }) {
+                        flush.push((key, spec.entry_id.clone()));
+                    }
+                }
+            }
+        }
+        for (key, entry_id, id) in discovered {
+            self.user_form_handoffs.insert(key, id.clone());
+            if !entry_id.is_empty() {
+                self.user_form_handoffs.insert(entry_id, id);
+            }
+        }
+        for (card_key, entry_id) in flush {
+            self.flush_pending_box_handoff(&card_key, &entry_id, cx);
+        }
+        self.sync_waiting_chrome(conversation_id);
+    }
+
+    fn post_box_handoff_resolve(
+        &mut self,
+        card_key: String,
+        handoff_entry_id: String,
+        resolution: BoxHandoffResolution,
+        run_id: String,
+        conversation_id: String,
+        agent_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .resolve_box_handoff(&handoff_entry_id, &agent_id, resolution)
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(
+                        BoxHandoffReply::Settled
+                        | BoxHandoffReply::AlreadyAnswered
+                        | BoxHandoffReply::Empty,
+                    ) => {
+                        state.user_form_handoff_done.insert(card_key.clone());
+                        #[cfg(target_os = "macos")]
+                        state.push_computer_window_attention(cx);
+                        if !run_id.is_empty() {
+                            state.begin_responding(Some(&conversation_id), "Working");
+                            state.follow_run(run_id, Some(conversation_id.clone()), cx);
+                        }
+                    }
+                    Ok(BoxHandoffReply::MissingRoute) => {
+                        // Wrong id or a resolve 404 is not "routes missing".
+                        // Do not freeze every stacked open user-form.
+                    }
+                    Ok(BoxHandoffReply::MissingEntryId) => {
+                        state.user_form_handoff_done.remove(&card_key);
+                        if let Some(spec) = state.user_form_mut(&card_key) {
+                            spec.resolution = None;
+                        }
+                        state.user_form_resolutions.remove(&card_key);
+                        state.set_computer_handoff(&card_key, ComputerHandoffStatus::ActionNeeded);
+                        #[cfg(target_os = "macos")]
+                        state.push_computer_window_attention(cx);
+                    }
+                    Err(error) => {
+                        if error.is_signed_out() {
+                            state.note_signed_out(cx);
+                        }
+                    }
+                }
+                state.sync_waiting_chrome(&conversation_id);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn user_form_handoff_resolved(&self, card_key: &str) -> bool {
@@ -6653,8 +6858,8 @@ impl AppState {
         self.dispatch_user_form(card_key, UserFormDispatch::Dismiss(mode), cx);
     }
 
-    /// Hand back / decline. POSTs dismiss `handoffEntryId` when present, else
-    /// the form gateway `entryId` for an open Action needed handoff.
+    /// Hand back / decline. POSTs dismiss `handoffEntryId` / sibling Computer
+    /// card id. Never the form gateway `entryId`. Queues until that id lands.
     pub fn resolve_user_form_handoff(
         &mut self,
         card_key: String,
@@ -6933,9 +7138,8 @@ impl AppState {
         action: UserFormDispatch,
         cx: &mut Context<Self>,
     ) {
-        if !self.user_form_verbs_available {
-            return;
-        }
+        // Do not early-return on `user_form_verbs_available`. That global lock
+        // left every stacked open card gray after one MissingRoute 404.
         let Some((entry_id, run_id, conversation_id, agent_id)) = self.user_form_context(&card_key)
         else {
             return;
@@ -6944,12 +7148,7 @@ impl AppState {
             UserFormDispatch::ResolveHandoff(_) => self.box_handoff_post_id(&card_key, &entry_id),
             _ => None,
         };
-        if matches!(action, UserFormDispatch::ResolveHandoff(_)) {
-            if handoff_entry_id.is_none() {
-                // No sibling id and no form gateway id — do not POST callId.
-                return;
-            }
-        } else if entry_id.is_empty() {
+        if !matches!(action, UserFormDispatch::ResolveHandoff(_)) && entry_id.is_empty() {
             // #140: AG-UI CUSTOM has no gateway card id. Do not POST callId.
             return;
         }
@@ -7006,64 +7205,39 @@ impl AppState {
                 self.push_computer_window_attention(cx);
             }
         }
+        self.sync_waiting_chrome(&conversation_id);
         cx.notify();
-        let Some(client) = self.opengrok.clone() else {
-            if !matches!(action, UserFormDispatch::ResolveHandoff(_)) {
-                self.restore_user_form(&card_key);
+        if let UserFormDispatch::ResolveHandoff(resolution) = action {
+            if let Some(handoff_entry_id) = handoff_entry_id {
+                self.post_box_handoff_resolve(
+                    card_key,
+                    handoff_entry_id,
+                    resolution,
+                    run_id,
+                    conversation_id,
+                    agent_id,
+                    cx,
+                );
+            } else {
+                // Sibling id not back yet. Keep Skip live (do not POST form id).
+                self.queue_pending_box_handoff(
+                    &card_key,
+                    &entry_id,
+                    PendingBoxHandoff {
+                        resolution,
+                        run_id,
+                        conversation_id,
+                        agent_id,
+                    },
+                );
             }
             return;
-        };
-        if let UserFormDispatch::ResolveHandoff(resolution) = action {
-            let Some(handoff_entry_id) = handoff_entry_id else {
-                return;
-            };
-            cx.spawn(async move |this, cx| {
-                let result = client
-                    .resolve_box_handoff(&handoff_entry_id, &agent_id, resolution)
-                    .await;
-                let _ = this.update(cx, |state, cx| {
-                    match result {
-                        Ok(
-                            BoxHandoffReply::Settled
-                            | BoxHandoffReply::AlreadyAnswered
-                            | BoxHandoffReply::Empty,
-                        ) => {
-                            state.user_form_handoff_done.insert(card_key.clone());
-                            #[cfg(target_os = "macos")]
-                            state.push_computer_window_attention(cx);
-                            if !run_id.is_empty() {
-                                state.begin_responding(Some(&conversation_id), "Working");
-                                state.follow_run(run_id, Some(conversation_id), cx);
-                            }
-                        }
-                        Ok(BoxHandoffReply::MissingRoute) => {
-                            state.user_form_verbs_available = false;
-                        }
-                        Ok(BoxHandoffReply::MissingEntryId) => {
-                            state.user_form_handoff_done.remove(&card_key);
-                            if let Some(spec) = state.user_form_mut(&card_key) {
-                                spec.resolution = None;
-                            }
-                            state.user_form_resolutions.remove(&card_key);
-                            state.set_computer_handoff(
-                                &card_key,
-                                ComputerHandoffStatus::ActionNeeded,
-                            );
-                            #[cfg(target_os = "macos")]
-                            state.push_computer_window_attention(cx);
-                        }
-                        Err(error) => {
-                            if error.is_signed_out() {
-                                state.note_signed_out(cx);
-                            }
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
-            return;
         }
+        let Some(client) = self.opengrok.clone() else {
+            self.restore_user_form(&card_key);
+            self.sync_waiting_chrome(&conversation_id);
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let verb = match &action {
                 UserFormDispatch::Submit(_) => UserFormVerb::Submit,
@@ -7086,9 +7260,6 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(reply) => {
-                        if matches!(reply, UserFormActionReply::MissingRoute) {
-                            state.user_form_verbs_available = false;
-                        }
                         match crate::opengrok::settle_user_form_http(verb, &reply) {
                             UserFormHttpSettle::Merge(incoming) => {
                                 let resolution = incoming.effective_resolution();
@@ -7116,10 +7287,17 @@ impl AppState {
                                 if resolution == Some(FormResolution::Submitted) {
                                     state.offer_save_login(&card_key);
                                 }
+                                let had_pending =
+                                    state.user_form_pending_resolves.contains_key(&card_key)
+                                        || state.user_form_pending_resolves.contains_key(&entry_id);
+                                state.flush_pending_box_handoff(&card_key, &entry_id, cx);
                                 let live_handoff = state
                                     .user_form_mut(&card_key)
                                     .is_some_and(|spec| spec.live_computer_handoff());
-                                let follow = if live_handoff
+                                let follow = if had_pending {
+                                    // Skip already queued a resolve; that POST resumes.
+                                    false
+                                } else if live_handoff
                                     || resolution == Some(FormResolution::Escalated)
                                 {
                                     state.end_turn_waiting(
@@ -7134,7 +7312,7 @@ impl AppState {
                                 };
                                 if follow && !run_id.is_empty() {
                                     state.begin_responding(Some(&conversation_id), "Working");
-                                    state.follow_run(run_id, Some(conversation_id), cx);
+                                    state.follow_run(run_id, Some(conversation_id.clone()), cx);
                                 }
                             }
                             UserFormHttpSettle::Paint(resolution) => {
@@ -7151,13 +7329,13 @@ impl AppState {
                                 }
                                 if resolution == FormResolution::Submitted && !run_id.is_empty() {
                                     state.begin_responding(Some(&conversation_id), "Working");
-                                    state.follow_run(run_id, Some(conversation_id), cx);
+                                    state.follow_run(run_id, Some(conversation_id.clone()), cx);
                                 }
                             }
                             UserFormHttpSettle::Keep => {
                                 if dismissed && !run_id.is_empty() {
                                     state.begin_responding(Some(&conversation_id), "Working");
-                                    state.follow_run(run_id, Some(conversation_id), cx);
+                                    state.follow_run(run_id, Some(conversation_id.clone()), cx);
                                 }
                             }
                             UserFormHttpSettle::Restore => {
@@ -7181,6 +7359,7 @@ impl AppState {
                         }
                     }
                 }
+                state.sync_waiting_chrome(&conversation_id);
                 cx.notify();
             });
         })
@@ -8867,7 +9046,7 @@ mod tests {
     }
 
     #[test]
-    fn open_handoff_posts_form_entry_id_when_sibling_id_is_missing() {
+    fn open_handoff_does_not_post_form_entry_id_when_sibling_id_is_missing() {
         let mut spec = crate::opengrok::UserFormSpec::parse(
             &serde_json::json!({
                 "entryId": "e_form",
@@ -8889,15 +9068,23 @@ mod tests {
         let mut state = AppState::new();
         state.conversations.push(thread("cw_1", vec![bot]));
         assert_eq!(
-            state.box_handoff_post_id("e_form", "e_form").as_deref(),
-            Some("e_form"),
-            "Skip / I'm done must POST the form gateway id while Action needed"
+            state.box_handoff_post_id("e_form", "e_form"),
+            None,
+            "Skip / I'm done must wait for handoffEntryId — never POST the form id"
         );
         spec.handoff_entry_id = Some("e_hand".into());
         state.conversations[0].messages[0].parts = vec![ChatPart::UserForm(spec)];
         assert_eq!(
             state.box_handoff_post_id("e_form", "e_form").as_deref(),
             Some("e_hand")
+        );
+        state
+            .user_form_handoffs
+            .insert("e_form".into(), "e_form".into());
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form"),
+            None,
+            "a stored form id is not a sibling"
         );
     }
 
@@ -9738,6 +9925,163 @@ mod tests {
             "do not keep a local live-turn past the run"
         );
         assert_eq!(state.open_user_forms().len(), 1);
+    }
+
+    #[test]
+    fn skip_clears_waiting_when_no_open_form_or_handoff_remains() {
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Website login",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_user_form_resolution("e_form", FormResolution::Skipped);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Skipped);
+        state.user_form_handoff_done.insert("e_form".into());
+        state.sync_waiting_chrome("cw_1");
+
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Waiting for you must drop once Skip settles the last open card"
+        );
+        assert!(state.open_user_forms().is_empty());
+        assert!(state.open_computer_handoffs().is_empty());
+    }
+
+    #[test]
+    fn stacked_open_forms_stay_enabled_and_waiting_until_each_settles() {
+        fn login(entry: &str, call: &str) -> crate::opengrok::UserFormSpec {
+            crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+                "type": "CUSTOM",
+                "name": "run-awaiting-approval",
+                "callId": call,
+                "entryId": entry,
+                "reason": "user-form",
+                "arguments": {
+                    "title": "Website login",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true},
+                        {"id": "password", "label": "Password", "type": "password", "required": true}
+                    ]
+                }
+            }))
+            .unwrap()
+        }
+        let a = login("e_a", "call-a");
+        let b = login("e_b", "call-b");
+        let c = login("e_c", "call-c");
+        assert!(a.can_post(true));
+        assert!(
+            b.can_post(false),
+            "global verbs-off must not gray this card"
+        );
+        assert!(c.can_post(false));
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![
+            ChatPart::UserForm(a),
+            ChatPart::UserForm(b),
+            ChatPart::UserForm(c),
+        ];
+        let mut state = mid_turn(at(bot, 20));
+        state.user_form_verbs_available = false;
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.open_user_forms().len(), 3);
+        for spec in state.open_user_forms() {
+            assert!(
+                spec.can_post(state.user_form_verbs_available),
+                "{} must stay Dismiss/Continue-able",
+                spec.entry_id
+            );
+        }
+
+        state.paint_user_form_resolution("e_a", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(
+            state.thread_status("cw_1"),
+            Some(WAITING_FOR_YOU_STATUS),
+            "Dismiss one of three must not blank Waiting"
+        );
+        let open = state.open_user_forms();
+        assert_eq!(open.len(), 2);
+        assert!(open.iter().all(|spec| spec.can_post(false)));
+        assert!(open.iter().all(|spec| spec.entry_id != "e_a"));
+
+        state.paint_user_form_resolution("e_b", FormResolution::Dismissed);
+        state.paint_user_form_resolution("e_c", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Waiting clears only after the last open form settles"
+        );
+        assert!(state.open_user_forms().is_empty());
+    }
+
+    #[test]
+    fn skip_without_sibling_id_queues_instead_of_posting_form_id() {
+        let mut spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Website login",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded);
+        let mut bot = message("m1", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        state.paint_user_form_resolution("e_form", FormResolution::Skipped);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Skipped);
+        state.user_form_handoff_done.insert("e_form".into());
+        state.queue_pending_box_handoff(
+            "e_form",
+            "e_form",
+            PendingBoxHandoff {
+                resolution: crate::opengrok::BoxHandoffResolution::Declined,
+                run_id: "run_1".into(),
+                conversation_id: "cw_1".into(),
+                agent_id: "cw_1".into(),
+            },
+        );
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(state.box_handoff_post_id("e_form", "e_form"), None);
+        assert!(state.user_form_pending_resolves.contains_key("e_form"));
+        assert_eq!(state.thread_status("cw_1"), None);
+
+        if let ChatPart::UserForm(spec) = &mut state.conversations[0].messages[0].parts[0] {
+            spec.handoff_entry_id = Some("e_hand".into());
+        }
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form").as_deref(),
+            Some("e_hand")
+        );
+        let pending = state.take_pending_box_handoff("e_form", "e_form").unwrap();
+        assert_eq!(
+            pending.resolution,
+            crate::opengrok::BoxHandoffResolution::Declined
+        );
+        assert_ne!(pending.resolution.as_str(), "e_form");
     }
 
     #[test]

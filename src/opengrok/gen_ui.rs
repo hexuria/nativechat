@@ -479,10 +479,14 @@ impl TurnAssembler {
         self.waiting_approval
     }
 
-    /// An unresolved user-form card is on the turn. Distinct from a permission card.
+    /// An unresolved user-form card or live Computer sibling is on the turn.
+    /// Distinct from a permission card. Local Skip/Dismiss that already
+    /// settled the grafted card is the AppState map's job, not this flag.
     pub fn waiting_user_form(&self) -> bool {
         self.committed.iter().any(|part| match part {
-            ChatPart::UserForm(spec) if spec.is_unresolved() => true,
+            ChatPart::UserForm(spec) if spec.is_unresolved() || spec.live_computer_handoff() => {
+                true
+            }
             ChatPart::CredentialRequest(_) => true,
             _ => false,
         })
