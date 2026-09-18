@@ -12,7 +12,9 @@
 //! AG-UI `content` / sqlite.
 
 use crate::chrome::BOX_SCREEN_ASPECT;
-use crate::components::alert_chrome::{attention_ctas, attention_glass, attention_shadow};
+use crate::components::alert_chrome::{
+    attention_cta, attention_ctas, attention_glass, attention_shadow,
+};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     BoxHandoffResolution, ComputerHandoffStatus, FormResolution, USER_FORM_SERVER_FILL_AVAILABLE,
@@ -22,7 +24,7 @@ use crate::opengrok::{
     user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_screen_id,
 };
 use crate::state::AppState;
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputContentType, InputState, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -248,7 +250,7 @@ fn render_live_computer_handoff(
 ) -> AnyElement {
     let dark = cx.theme().is_dark();
     let glass = attention_glass(dark);
-    let ctas = attention_ctas(dark, cx);
+    let ctas = attention_ctas(dark);
     // Live Action needed: Skip / I'm done stay clickable even if a sibling
     // 404 flipped the old global verbs lock. Do not POST until we have a
     // sibling `handoffEntryId`.
@@ -355,7 +357,7 @@ fn render_live_computer_handoff(
                 .justify_end()
                 .gap(px(8.))
                 .flex_wrap()
-                .child(handoff_cta(
+                .child(attention_cta(
                     computer_handoff_takeover_id(&key),
                     "Take over",
                     ctas.primary,
@@ -372,7 +374,7 @@ fn render_live_computer_handoff(
                         })
                     },
                 ))
-                .child(handoff_cta(
+                .child(attention_cta(
                     computer_handoff_done_id(&key),
                     "I'm done",
                     ctas.secondary,
@@ -394,7 +396,7 @@ fn render_live_computer_handoff(
                         })
                     },
                 ))
-                .child(handoff_cta(
+                .child(attention_cta(
                     computer_handoff_skip_id(&key),
                     "Skip",
                     ctas.tertiary,
@@ -950,31 +952,6 @@ enum ButtonKind {
     Primary,
     Secondary,
     Ghost,
-}
-
-fn handoff_cta(
-    id: String,
-    label: impl Into<SharedString>,
-    style: ButtonCustomVariant,
-    pill: bool,
-    disabled: bool,
-    on_click: Option<impl Fn(&mut App) + 'static>,
-) -> AnyElement {
-    let button = Button::new(id)
-        .small()
-        .custom(style)
-        .label(label)
-        .disabled(disabled);
-    let button = if pill {
-        button.rounded(px(999.))
-    } else {
-        button
-    };
-    let button = match on_click {
-        Some(on_click) => button.on_click(move |_, _, cx| on_click(cx)),
-        None => button,
-    };
-    button.into_any_element()
 }
 
 fn action_button(

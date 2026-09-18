@@ -54,9 +54,19 @@ impl RootView {
         let focus_handle = cx.focus_handle();
         // This is the window the pages are drawn in; a coworker's screen window hands its
         // "Recipes" over to it rather than drawing a page of its own.
-        state.update(cx, |state, _| {
+        state.update(cx, |state, cx| {
             state.set_main_window(window.window_handle());
+            state.restore_saved_theme(cx);
         });
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if this.state.read(cx).theme_mode == "system" {
+                crate::theme::apply_mode("system", cx);
+                this.state.update(cx, |_, cx| cx.notify());
+            } else {
+                window.refresh();
+            }
+        })
+        .detach();
 
         Self {
             layout,
