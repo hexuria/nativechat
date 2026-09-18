@@ -7,15 +7,15 @@ use crate::components::chat_input::sources::{
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::{
-    BoxHandoffResolution, ChatPart, CoworkerPatch, LocalExecResolution, RecipeKind, RecipeSummary,
-    ScreenshotSpec, UserFormDismissMode, UserFormFieldKind, computer_attention_done_id,
-    computer_attention_id, computer_attention_skip_id, computer_handoff_card_id,
-    computer_handoff_done_id, computer_handoff_skip_id, computer_handoff_takeover_id,
-    computer_window_attention_done_id, computer_window_attention_id,
+    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
+    RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode, UserFormFieldKind,
+    computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
+    computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
+    computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
     computer_window_attention_skip_id, credential_request_allow_id, credential_request_card_id,
     credential_request_deny_id, save_login_card_id, save_login_save_id, save_login_skip_id,
     user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
-    user_form_screen_id,
+    user_form_pill_id, user_form_screen_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -556,13 +556,16 @@ struct ApprovalSnap {
     review: bool,
 }
 
-/// Idle user-form card: fields still on screen. Settled / Sending cards
-/// are absent so E2E sees zero email/password fields after Continue.
+/// User-form card in the open thread. Idle cards expose fields + Continue /
+/// Open the screen / Dismiss. Settled cards expose a pill so Open the screen
+/// cannot drop `user-form-*` from the tree.
 #[derive(Clone)]
 struct UserFormSnap {
     card_key: String,
     title: String,
     fields: Vec<UserFormFieldSnap>,
+    /// None = idle (fields still on screen).
+    pill: Option<String>,
 }
 
 #[derive(Clone)]
@@ -575,10 +578,21 @@ struct UserFormFieldSnap {
     value: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ComputerHandoffSnap {
     card_key: String,
     instruction: String,
+    status: ComputerHandoffStatus,
+}
+
+impl Default for ComputerHandoffSnap {
+    fn default() -> Self {
+        Self {
+            card_key: String::new(),
+            instruction: String::new(),
+            status: ComputerHandoffStatus::ActionNeeded,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -605,6 +619,9 @@ struct SiteLoginSnap {
 fn user_form_node(form: &UserFormSnap) -> UiNode {
     let key = &form.card_key;
     let mut card = UiNode::dialog(user_form_card_id(key), form.title.clone());
+    if let Some(pill) = &form.pill {
+        return card.with_child(UiNode::status(user_form_pill_id(key), pill.clone()));
+    }
     for field in &form.fields {
         let id = user_form_field_id(key, &field.id);
         let node = if field.kind == UserFormFieldKind::Checkbox {
@@ -625,11 +642,15 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
 
 fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
     let key = &handoff.card_key;
-    UiNode::dialog(computer_handoff_card_id(key), "Computer")
-        .with_child(UiNode::status(
+    let mut card =
+        UiNode::dialog(computer_handoff_card_id(key), "Computer").with_child(UiNode::status(
             format!("computer-handoff-badge-{key}"),
-            "Action needed",
-        ))
+            handoff.status.pill(),
+        ));
+    if !handoff.status.is_live() {
+        return card;
+    }
+    card = card
         .with_child(UiNode::status(
             format!("computer-handoff-instruction-{key}"),
             handoff.instruction.clone(),
@@ -639,7 +660,8 @@ fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
             "Take over",
         ))
         .with_child(UiNode::button(computer_handoff_done_id(key), "I'm done"))
-        .with_child(UiNode::button(computer_handoff_skip_id(key), "Skip"))
+        .with_child(UiNode::button(computer_handoff_skip_id(key), "Skip"));
+    card
 }
 
 fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
@@ -968,20 +990,25 @@ impl NativeChatHost {
                     .unwrap_or_default(),
             }),
             user_forms: state
-                .open_user_forms()
+                .visible_user_forms()
                 .into_iter()
                 .map(|spec| {
                     let key = spec.card_key().to_string();
-                    let typed = state.user_form_typed.get(&key);
-                    let picks = state.user_form_picks.get(&key);
-                    UserFormSnap {
-                        title: if spec.title.is_empty() {
-                            "Form".into()
+                    let pill = spec.effective_resolution().map(|resolution| {
+                        if resolution == crate::opengrok::FormResolution::Escalated {
+                            crate::opengrok::FormResolution::Dismissed
+                                .pill()
+                                .to_string()
                         } else {
-                            spec.title.clone()
-                        },
-                        fields: spec
-                            .fields
+                            resolution.pill().to_string()
+                        }
+                    });
+                    let fields = if pill.is_some() {
+                        Vec::new()
+                    } else {
+                        let typed = state.user_form_typed.get(&key);
+                        let picks = state.user_form_picks.get(&key);
+                        spec.fields
                             .iter()
                             .map(|field| {
                                 let raw = typed
@@ -1001,17 +1028,29 @@ impl NativeChatHost {
                                     value: raw,
                                 }
                             })
-                            .collect(),
+                            .collect()
+                    };
+                    UserFormSnap {
+                        title: if spec.title.is_empty() {
+                            "Form".into()
+                        } else {
+                            spec.title.clone()
+                        },
+                        fields,
                         card_key: key,
+                        pill,
                     }
                 })
                 .collect(),
             computer_handoffs: state
-                .open_computer_handoffs()
+                .visible_computer_handoffs()
                 .into_iter()
                 .map(|spec| ComputerHandoffSnap {
                     instruction: spec.handoff_prompt(),
                     card_key: spec.card_key().to_string(),
+                    status: spec
+                        .computer_handoff
+                        .unwrap_or(ComputerHandoffStatus::ActionNeeded),
                 })
                 .collect(),
             save_logins: state
@@ -1247,7 +1286,12 @@ impl NativeChatHost {
                 "computer-reset",
                 self.computer_reset_label.clone(),
             ));
-        if let Some(handoff) = self.computer_handoffs.last() {
+        if let Some(handoff) = self
+            .computer_handoffs
+            .iter()
+            .rev()
+            .find(|handoff| handoff.status.is_live())
+        {
             computer = computer.with_child(
                 UiNode::new(computer_attention_id(), "dialog", "Needs your attention")
                     .with_child(UiNode::button(
@@ -2638,6 +2682,7 @@ mod tests {
                     value: String::new(),
                 },
             ],
+            pill: None,
         }
     }
 
@@ -2718,6 +2763,7 @@ mod tests {
         host.computer_handoffs = vec![ComputerHandoffSnap {
             card_key: "e_form".into(),
             instruction: "Sign in on the computer.".into(),
+            status: ComputerHandoffStatus::ActionNeeded,
         }];
         host.computer_open = true;
         let tree = host.snapshot();
@@ -2786,6 +2832,63 @@ mod tests {
             host.take_command(),
             Some(Command::ComputerHandoffDone { .. })
         ));
+    }
+
+    #[test]
+    fn form_and_computer_stay_in_the_tree_across_handoff() {
+        let mut host = host();
+        host.user_forms = vec![google_login_form()];
+        host.computer_handoffs = vec![ComputerHandoffSnap {
+            card_key: "e_form".into(),
+            instruction: "Sign in on the computer.".into(),
+            status: ComputerHandoffStatus::ActionNeeded,
+        }];
+        let open = host.snapshot();
+        assert!(
+            open.find("user-form-e_form").is_some(),
+            "Open the screen must not rip user-form-* out"
+        );
+        assert!(open.find("user-form-screen-e_form").is_some());
+        assert!(open.find("computer-handoff-e_form").is_some());
+        assert_eq!(
+            open.find("computer-handoff-badge-e_form").unwrap().name,
+            "Action needed"
+        );
+
+        host.user_forms = vec![UserFormSnap {
+            card_key: "e_form".into(),
+            title: "Google account".into(),
+            fields: Vec::new(),
+            pill: Some("Dismissed".into()),
+        }];
+        host.computer_handoffs[0].status = ComputerHandoffStatus::Done;
+        let done = host.snapshot();
+        assert!(done.find("user-form-e_form").is_some());
+        assert_eq!(
+            done.find("user-form-pill-e_form").unwrap().name,
+            "Dismissed"
+        );
+        assert!(done.find("user-form-screen-e_form").is_none());
+        assert!(done.find("computer-handoff-e_form").is_some());
+        assert_eq!(
+            done.find("computer-handoff-badge-e_form").unwrap().name,
+            "Done"
+        );
+        assert!(done.find("computer-handoff-takeover-e_form").is_none());
+        assert!(done.find("computer-attention").is_none());
+
+        host.user_forms[0].pill = Some("Skipped".into());
+        host.computer_handoffs[0].status = ComputerHandoffStatus::Skipped;
+        let skipped = host.snapshot();
+        assert_eq!(
+            skipped.find("user-form-pill-e_form").unwrap().name,
+            "Skipped"
+        );
+        assert_eq!(
+            skipped.find("computer-handoff-badge-e_form").unwrap().name,
+            "Skipped"
+        );
+        assert!(skipped.find("computer-handoff-e_form").is_some());
     }
 
     #[test]

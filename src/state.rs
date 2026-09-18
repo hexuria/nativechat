@@ -7,13 +7,13 @@ use crate::chrome::{
 use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
-    BoxHandoffResolution, ChatPart, ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch,
-    CredentialRequestSpec, CredentialResultStatus, Failure, FormResolution, FormSpec,
-    ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
-    OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
-    SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
-    TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
+    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, ConnectedComputer, Coworker,
+    CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus, Failure,
+    FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue,
+    OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
+    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
+    RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
+    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
     UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
     activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
@@ -1472,8 +1472,12 @@ pub struct AppState {
     user_form_restore: HashMap<String, FormResolution>,
     /// Form card key → handoff card id from dismiss `handoffEntryId`.
     user_form_handoffs: HashMap<String, String>,
-    /// Form card keys whose box-handoff already resolved.
+    /// Form card keys whose box-handoff already resolved (I'm done / Skip).
     user_form_handoff_done: HashSet<String>,
+    /// Computer sibling chrome grafted across hide→reshow / SSE replay.
+    user_form_computer_handoffs: HashMap<String, ComputerHandoffStatus>,
+    /// Prior Computer sibling to restore if Open the screen POST fails.
+    user_form_handoff_restore: HashMap<String, Option<ComputerHandoffStatus>>,
     /// Site-login metadata for Settings → Logins. Never passwords.
     pub site_logins: Vec<SiteLoginRecord>,
     site_login_vault: Option<SiteLoginVault>,
@@ -1828,6 +1832,8 @@ impl AppState {
             user_form_restore: HashMap::new(),
             user_form_handoffs: HashMap::new(),
             user_form_handoff_done: HashSet::new(),
+            user_form_computer_handoffs: HashMap::new(),
+            user_form_handoff_restore: HashMap::new(),
             site_logins: Vec::new(),
             site_login_vault: None,
             pending_save: HashMap::new(),
@@ -2115,11 +2121,41 @@ impl AppState {
             .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
             .filter_map(|part| match part {
                 ChatPart::UserForm(spec)
-                    if spec.shows_computer_handoff()
+                    if spec.live_computer_handoff()
                         && !self.user_form_handoff_done.contains(spec.card_key()) =>
                 {
                     Some(spec.clone())
                 }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Form cards that paint in the transcript (idle or settled). Computer-only
+    /// stubs are omitted so E2E does not see a fake form named Computer.
+    pub fn visible_user_forms(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_thread_user_forms()
+            .into_iter()
+            .filter(|spec| spec.shows_form_chrome())
+            .collect()
+    }
+
+    /// Computer siblings that paint in the transcript, including Done / Skipped.
+    pub fn visible_computer_handoffs(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_thread_user_forms()
+            .into_iter()
+            .filter(|spec| spec.shows_computer_handoff())
+            .collect()
+    }
+
+    fn active_thread_user_forms(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::UserForm(spec) => Some(spec.clone()),
                 _ => None,
             })
             .collect()
@@ -6250,22 +6286,30 @@ impl AppState {
     fn graft_user_forms(&self, mut parts: Vec<ChatPart>) -> Vec<ChatPart> {
         for part in &mut parts {
             if let ChatPart::UserForm(spec) = part {
-                if spec.effective_resolution().is_none() {
-                    let key = spec.card_key().to_string();
-                    let mut res = self
-                        .user_form_resolutions
-                        .get(&spec.entry_id)
-                        .or_else(|| self.user_form_resolutions.get(&key))
-                        .copied();
-                    if res.is_none() && !spec.call_id.is_empty() {
-                        res = self.user_form_resolutions.get(&spec.call_id).copied();
-                    }
-                    if let Some(res) = res {
-                        spec.resolution = Some(res);
-                    }
+                let key = spec.card_key().to_string();
+                let local_res = self
+                    .user_form_resolutions
+                    .get(&spec.entry_id)
+                    .or_else(|| self.user_form_resolutions.get(&key))
+                    .copied()
+                    .or_else(|| {
+                        (!spec.call_id.is_empty())
+                            .then(|| self.user_form_resolutions.get(&spec.call_id).copied())
+                            .flatten()
+                    });
+                if spec.effective_resolution() != Some(FormResolution::Sending)
+                    && let Some(res) = local_res
+                {
+                    spec.resolution = Some(res);
                 }
+                let local_handoff = self
+                    .user_form_computer_handoffs
+                    .get(&spec.entry_id)
+                    .or_else(|| self.user_form_computer_handoffs.get(&key))
+                    .copied();
+                spec.computer_handoff =
+                    ComputerHandoffStatus::fold(spec.computer_handoff, local_handoff);
                 if spec.handoff_entry_id.is_none() {
-                    let key = spec.card_key().to_string();
                     if let Some(id) = self
                         .user_form_handoffs
                         .get(&spec.entry_id)
@@ -6421,6 +6465,85 @@ impl AppState {
                     .insert(spec.entry_id.clone(), id.to_string());
             }
         }
+        if let Some(status) = spec.computer_handoff {
+            self.remember_computer_handoff(spec.card_key(), spec, status);
+        }
+    }
+
+    fn remember_computer_handoff(
+        &mut self,
+        card_key: &str,
+        spec: &crate::opengrok::UserFormSpec,
+        status: ComputerHandoffStatus,
+    ) {
+        let folded = ComputerHandoffStatus::fold(
+            self.user_form_computer_handoffs.get(card_key).copied(),
+            Some(status),
+        )
+        .unwrap_or(status);
+        self.user_form_computer_handoffs
+            .insert(card_key.to_string(), folded);
+        if spec.has_gateway_entry_id() {
+            self.user_form_computer_handoffs
+                .insert(spec.entry_id.clone(), folded);
+        }
+    }
+
+    fn set_computer_handoff(&mut self, card_key: &str, status: ComputerHandoffStatus) {
+        let call_id = self
+            .user_form_mut(card_key)
+            .map(|spec| spec.call_id.clone())
+            .unwrap_or_default();
+        let painted = if let Some(spec) = self.user_form_mut(card_key) {
+            spec.computer_handoff = Some(status);
+            Some((
+                spec.card_key().to_string(),
+                spec.entry_id.clone(),
+                spec.has_gateway_entry_id(),
+            ))
+        } else {
+            None
+        };
+        if let Some((key, entry_id, has_entry)) = painted {
+            self.user_form_computer_handoffs.insert(key, status);
+            if has_entry {
+                self.user_form_computer_handoffs.insert(entry_id, status);
+            }
+        } else {
+            self.user_form_computer_handoffs
+                .insert(card_key.to_string(), status);
+        }
+        if !call_id.is_empty() {
+            for conversation in &mut self.conversations {
+                for message in &mut conversation.messages {
+                    for part in &mut message.parts {
+                        if let ChatPart::UserForm(spec) = part
+                            && spec.shares_call_id(&call_id)
+                        {
+                            spec.computer_handoff = Some(status);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_computer_handoff(&mut self, card_key: &str) {
+        let Some(prior) = self.user_form_handoff_restore.remove(card_key) else {
+            return;
+        };
+        if let Some(spec) = self.user_form_mut(card_key) {
+            spec.computer_handoff = prior;
+        }
+        match prior {
+            Some(status) => {
+                self.user_form_computer_handoffs
+                    .insert(card_key.to_string(), status);
+            }
+            None => {
+                self.user_form_computer_handoffs.remove(card_key);
+            }
+        }
     }
 
     fn paint_user_form_resolution(&mut self, card_key: &str, resolution: FormResolution) {
@@ -6499,16 +6622,14 @@ impl AppState {
     }
 
     fn restore_user_form(&mut self, card_key: &str) {
-        let prior = self.user_form_restore.remove(card_key);
-        if let Some(spec) = self.user_form_mut(card_key) {
-            spec.resolution = prior;
-        }
-        if let Some(prior) = prior {
+        if let Some(prior) = self.user_form_restore.remove(card_key) {
+            if let Some(spec) = self.user_form_mut(card_key) {
+                spec.resolution = Some(prior);
+            }
             self.user_form_resolutions
                 .insert(card_key.to_string(), prior);
-        } else {
-            self.user_form_resolutions.remove(card_key);
         }
+        self.restore_computer_handoff(card_key);
     }
 
     /// Continue: POST `/ag-ui/user-form/submit`. Secrets stay in `values` for
@@ -6836,17 +6957,50 @@ impl AppState {
             UserFormDispatch::Submit(values) => {
                 self.stash_save_candidate(&card_key, values);
                 self.paint_user_form_resolution(&card_key, FormResolution::Sending);
+                if self
+                    .user_form_mut(&card_key)
+                    .is_some_and(|spec| spec.live_computer_handoff())
+                {
+                    self.set_computer_handoff(&card_key, ComputerHandoffStatus::Done);
+                    self.user_form_handoff_done.insert(card_key.clone());
+                }
             }
-            UserFormDispatch::Dismiss(mode) => {
-                self.paint_user_form_resolution(&card_key, mode.resolution());
-                if matches!(mode, UserFormDismissMode::Escalated) {
+            UserFormDispatch::Dismiss(mode) => match mode {
+                UserFormDismissMode::Dismissed => {
+                    self.paint_user_form_resolution(&card_key, FormResolution::Dismissed);
+                    if self
+                        .user_form_mut(&card_key)
+                        .is_some_and(|spec| spec.shows_computer_handoff())
+                    {
+                        self.set_computer_handoff(&card_key, ComputerHandoffStatus::Skipped);
+                        self.user_form_handoff_done.insert(card_key.clone());
+                    }
+                }
+                UserFormDismissMode::Escalated => {
+                    let prior = self
+                        .user_form_mut(&card_key)
+                        .and_then(|spec| spec.computer_handoff);
+                    self.user_form_handoff_restore
+                        .insert(card_key.clone(), prior);
+                    self.set_computer_handoff(&card_key, ComputerHandoffStatus::ActionNeeded);
                     self.pin_open_screen_shot(&conversation_id);
                     self.show_computer_pane(cx);
                     #[cfg(target_os = "macos")]
                     self.push_computer_window_attention(cx);
                 }
-            }
-            UserFormDispatch::ResolveHandoff(_) => {
+            },
+            UserFormDispatch::ResolveHandoff(resolution) => {
+                self.paint_user_form_resolution(
+                    &card_key,
+                    crate::opengrok::UserFormSpec::settle_form_from_box(*resolution),
+                );
+                let computer = match resolution {
+                    BoxHandoffResolution::Declined => ComputerHandoffStatus::Skipped,
+                    BoxHandoffResolution::HandedBack | BoxHandoffResolution::TimedOut => {
+                        ComputerHandoffStatus::Done
+                    }
+                };
+                self.set_computer_handoff(&card_key, computer);
                 self.user_form_handoff_done.insert(card_key.clone());
                 #[cfg(target_os = "macos")]
                 self.push_computer_window_attention(cx);
@@ -6887,6 +7041,14 @@ impl AppState {
                         }
                         Ok(BoxHandoffReply::MissingEntryId) => {
                             state.user_form_handoff_done.remove(&card_key);
+                            if let Some(spec) = state.user_form_mut(&card_key) {
+                                spec.resolution = None;
+                            }
+                            state.user_form_resolutions.remove(&card_key);
+                            state.set_computer_handoff(
+                                &card_key,
+                                ComputerHandoffStatus::ActionNeeded,
+                            );
                             #[cfg(target_os = "macos")]
                             state.push_computer_window_attention(cx);
                         }
@@ -6954,16 +7116,21 @@ impl AppState {
                                 if resolution == Some(FormResolution::Submitted) {
                                     state.offer_save_login(&card_key);
                                 }
-                                let follow = match resolution {
-                                    Some(FormResolution::Escalated) => {
-                                        state.end_turn_waiting(
-                                            Some(&conversation_id),
-                                            Some(WAITING_FOR_YOU_STATUS),
-                                        );
-                                        false
-                                    }
-                                    Some(FormResolution::FillFailed) => false,
-                                    _ => true,
+                                let live_handoff = state
+                                    .user_form_mut(&card_key)
+                                    .is_some_and(|spec| spec.live_computer_handoff());
+                                let follow = if live_handoff
+                                    || resolution == Some(FormResolution::Escalated)
+                                {
+                                    state.end_turn_waiting(
+                                        Some(&conversation_id),
+                                        Some(WAITING_FOR_YOU_STATUS),
+                                    );
+                                    false
+                                } else if resolution == Some(FormResolution::FillFailed) {
+                                    false
+                                } else {
+                                    true
                                 };
                                 if follow && !run_id.is_empty() {
                                     state.begin_responding(Some(&conversation_id), "Working");
@@ -7211,8 +7378,7 @@ impl AppState {
                     ChatPart::UserForm(spec) => {
                         spec.is_unresolved()
                             || spec.effective_resolution() == Some(FormResolution::Sending)
-                            || (spec.effective_resolution() == Some(FormResolution::Escalated)
-                                && !self.user_form_handoff_done.contains(spec.card_key()))
+                            || spec.live_computer_handoff()
                     }
                     ChatPart::CredentialRequest(_) => true,
                     _ => false,
@@ -8530,11 +8696,14 @@ mod tests {
                 ChatPart::Ui(_) => "ui".to_string(),
                 ChatPart::Approval(_) => "approval".to_string(),
                 ChatPart::UserForm(spec) => format!(
-                    "user-form {} {}",
+                    "user-form {} {} {}",
                     spec.entry_id,
                     spec.effective_resolution()
                         .map(|r| r.as_str())
-                        .unwrap_or("idle")
+                        .unwrap_or("idle"),
+                    spec.computer_handoff
+                        .map(|s| s.as_str())
+                        .unwrap_or("no-computer")
                 ),
                 ChatPart::SaveLogin(spec) => {
                     format!("save-login {} {}", spec.origin, spec.username)
@@ -8702,15 +8871,17 @@ mod tests {
         let mut spec = crate::opengrok::UserFormSpec::parse(
             &serde_json::json!({
                 "entryId": "e_form",
-                "formResolution": "escalated",
                 "formRequest": {
-                    "title": "Computer",
-                    "instruction": "Sign in on the computer."
+                    "title": "Form Label",
+                    "instruction": "Sign in on the computer.",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
                 }
             }),
             None,
         )
         .unwrap();
+        spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded);
+        assert!(spec.shows_form_chrome());
         assert!(spec.shows_computer_handoff());
         assert!(spec.handoff_entry_id.is_none());
         let mut bot = message("m1", false, "Open the screen");
@@ -8732,18 +8903,19 @@ mod tests {
 
     #[test]
     fn computer_window_attention_is_a_copy_of_the_open_handoff() {
-        let spec = crate::opengrok::UserFormSpec::parse(
+        let mut spec = crate::opengrok::UserFormSpec::parse(
             &serde_json::json!({
                 "entryId": "e_form",
-                "formResolution": "escalated",
                 "formRequest": {
-                    "title": "Computer",
-                    "instruction": "Sign in on the computer."
+                    "title": "Form Label",
+                    "instruction": "Sign in on the computer.",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
                 }
             }),
             None,
         )
         .unwrap();
+        spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded);
         let mut bot = message("m1", false, "Open the screen");
         bot.parts = vec![ChatPart::UserForm(spec)];
         let mut state = AppState::new();
@@ -8755,11 +8927,137 @@ mod tests {
             "Take over copies this into ComputerScreen so first draw never reads AppState"
         );
         state.user_form_handoff_done.insert("e_form".into());
+        if let ChatPart::UserForm(spec) = &mut state.conversations[0].messages[0].parts[0] {
+            spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::Done);
+        }
         assert_eq!(
             state.computer_window_attention(),
             None,
             "Done / Skipped drops the strip"
         );
+        assert!(
+            state.visible_computer_handoffs().iter().any(|spec| {
+                spec.computer_handoff == Some(crate::opengrok::ComputerHandoffStatus::Done)
+            }),
+            "Computer card remains as Done history"
+        );
+    }
+
+    #[test]
+    fn form_computer_lifecycle_keeps_both_cards_and_document_order() {
+        let idle = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Form Label",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let mut bot = message("m1", false, "I'll raise a single in-chat form…");
+        bot.parts = vec![
+            ChatPart::Text("I'll raise a single in-chat form…".into()),
+            ChatPart::UserForm(idle.clone()),
+            screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+        ];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+        let before = shape(&state.conversations[0].messages[0].parts);
+
+        state.set_computer_handoff(
+            "e_form",
+            crate::opengrok::ComputerHandoffStatus::ActionNeeded,
+        );
+        {
+            let spec = match &state.conversations[0].messages[0].parts[1] {
+                ChatPart::UserForm(spec) => spec,
+                other => panic!("form must stay in slot 1, got {other:?}"),
+            };
+            assert!(spec.is_unresolved());
+            assert!(spec.shows_form_chrome());
+            assert_eq!(
+                spec.computer_handoff,
+                Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded)
+            );
+            assert_ne!(spec.pill(), Some("On the computer"));
+        }
+        let after_open = shape(&state.conversations[0].messages[0].parts);
+        assert_eq!(
+            before
+                .iter()
+                .map(|s| s.split_whitespace().next())
+                .collect::<Vec<_>>(),
+            after_open
+                .iter()
+                .map(|s| s.split_whitespace().next())
+                .collect::<Vec<_>>(),
+            "Open the screen must not reorder parts: {before:?} vs {after_open:?}"
+        );
+
+        state.paint_user_form_resolution("e_form", FormResolution::Dismissed);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Done);
+        {
+            let spec = match &state.conversations[0].messages[0].parts[1] {
+                ChatPart::UserForm(spec) => spec,
+                other => panic!("I'm done must not drop the form, got {other:?}"),
+            };
+            assert_eq!(spec.effective_resolution(), Some(FormResolution::Dismissed));
+            assert_eq!(spec.pill(), Some("Dismissed"));
+            assert_eq!(
+                spec.computer_handoff,
+                Some(crate::opengrok::ComputerHandoffStatus::Done)
+            );
+        }
+
+        state.paint_user_form_resolution("e_form", FormResolution::Skipped);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Skipped);
+        {
+            let spec = match &state.conversations[0].messages[0].parts[1] {
+                ChatPart::UserForm(spec) => spec,
+                other => panic!("Skip must not drop the form, got {other:?}"),
+            };
+            assert_eq!(spec.effective_resolution(), Some(FormResolution::Skipped));
+            assert_eq!(
+                spec.computer_handoff,
+                Some(crate::opengrok::ComputerHandoffStatus::Skipped)
+            );
+        }
+
+        let remounted = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formResolution": "escalated",
+                "formRequest": {
+                    "title": "Form Label",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let grafted = state.graft_user_forms(vec![
+            ChatPart::Text("I'll raise a single in-chat form…".into()),
+            ChatPart::UserForm(remounted),
+            screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+        ]);
+        match grafted.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+            ] => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Skipped));
+                assert_eq!(
+                    spec.computer_handoff,
+                    Some(crate::opengrok::ComputerHandoffStatus::Skipped)
+                );
+                assert_ne!(spec.pill(), Some("On the computer"));
+            }
+            other => panic!("hide→reshow must keep form+computer in order, got {other:?}"),
+        }
     }
 
     /// A row written before pieces were kept has none of them — which is also every row the

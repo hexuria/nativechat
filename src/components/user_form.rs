@@ -2,20 +2,22 @@
 //! (choice chips → `send_message`).
 //!
 //! Continue → Submitting (fields hidden, spinner) → Submitted collapsed.
-//! Dismiss → Dismissed. Open the screen → Grok Computer handoff: Action needed,
-//! instruction, embedded screen, Take over / I'm done / Skip. After I'm done /
-//! Skip the card collapses to On the computer. fill_failed recovery stays on
+//! Dismiss → Dismissed. Open the screen → form stays in document order and a
+//! Computer sibling paints Action needed / Take over / I'm done / Skip.
+//! I'm done → form Dismissed + Computer Done. Skip → form Skipped + Computer
+//! Skipped. Never morph the form into Computer, then resurrect **On the
+//! computer** with the Computer card gone. fill_failed recovery stays on
 //! the collapsed card: Try again / I'll do it on the computer / Stop for now.
 //! Secrets collected here go only in the REST body, never `send_message` /
 //! AG-UI `content` / sqlite.
 
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    BoxHandoffResolution, FormResolution, USER_FORM_SERVER_FILL_AVAILABLE, UserFormDismissMode,
-    UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues, computer_handoff_card_id,
-    computer_handoff_done_id, computer_handoff_skip_id, computer_handoff_takeover_id,
-    continue_enabled, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_screen_id,
+    BoxHandoffResolution, ComputerHandoffStatus, FormResolution, USER_FORM_SERVER_FILL_AVAILABLE,
+    UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues,
+    computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
+    computer_handoff_takeover_id, continue_enabled, user_form_card_id, user_form_continue_id,
+    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_screen_id,
 };
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -43,17 +45,30 @@ pub fn render_user_form(
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
-    let handed_back = app
-        .as_ref()
-        .is_some_and(|entity| entity.read(cx).user_form_handoff_resolved(spec.card_key()));
-    if spec.shows_computer_handoff() && !handed_back {
-        return render_computer_handoff(spec, app, cx);
-    }
-    match spec.effective_resolution() {
+    let form = match spec.effective_resolution() {
         Some(FormResolution::Sending) => render_submitting(spec, cx),
-        Some(resolution) => render_settled(spec, resolution, inputs, textareas, values, app, cx),
-        None => render_idle(spec, inputs, textareas, values, app, cx),
+        Some(FormResolution::Escalated) => render_settled(
+            spec,
+            FormResolution::Dismissed,
+            inputs,
+            textareas,
+            values,
+            app.clone(),
+            cx,
+        ),
+        Some(resolution) => {
+            render_settled(spec, resolution, inputs, textareas, values, app.clone(), cx)
+        }
+        None => render_idle(spec, inputs, textareas, values, app.clone(), cx),
+    };
+    let mut stack = v_flex().w_full().gap(px(10.));
+    if spec.shows_form_chrome() {
+        stack = stack.child(form);
     }
+    if let Some(status) = spec.computer_handoff {
+        stack = stack.child(render_computer_handoff(spec, status, app, cx));
+    }
+    stack.into_any_element()
 }
 
 fn render_idle(
@@ -210,6 +225,20 @@ fn render_idle(
 }
 
 fn render_computer_handoff(
+    spec: &UserFormSpec,
+    status: ComputerHandoffStatus,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    match status {
+        ComputerHandoffStatus::ActionNeeded => render_live_computer_handoff(spec, app, cx),
+        ComputerHandoffStatus::Done | ComputerHandoffStatus::Skipped => {
+            render_settled_computer_handoff(spec, status, cx)
+        }
+    }
+}
+
+fn render_live_computer_handoff(
     spec: &UserFormSpec,
     app: Option<Entity<AppState>>,
     cx: &App,
@@ -383,6 +412,59 @@ fn render_computer_handoff(
         .into_any_element()
 }
 
+fn render_settled_computer_handoff(
+    spec: &UserFormSpec,
+    status: ComputerHandoffStatus,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let key = spec.card_key().to_string();
+    v_flex()
+        .id(ElementId::Name(computer_handoff_card_id(&key).into()))
+        .w_full()
+        .gap(px(8.))
+        .p(px(14.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Computer"),
+                )
+                .child(
+                    h_flex()
+                        .id(ElementId::Name(
+                            format!("computer-handoff-badge-{key}").into(),
+                        ))
+                        .items_center()
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(999.))
+                        .bg(theme.secondary)
+                        .text_color(theme.muted_foreground)
+                        .text_xs()
+                        .child(status.pill()),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status.body()),
+        )
+        .into_any_element()
+}
+
 fn collect_submit_values(
     spec: &UserFormSpec,
     inputs: &UserFormInputMap,
@@ -461,9 +543,10 @@ fn render_settled(
     let pill_fill = match resolution {
         FormResolution::Submitted => theme.green.opacity(0.18),
         FormResolution::FillFailed => theme.danger.opacity(0.16),
-        FormResolution::Escalated | FormResolution::Sending | FormResolution::Dismissed => {
-            theme.secondary
-        }
+        FormResolution::Escalated
+        | FormResolution::Sending
+        | FormResolution::Dismissed
+        | FormResolution::Skipped => theme.secondary,
     };
     let pill_text = match resolution {
         FormResolution::Submitted => theme.green,
@@ -474,7 +557,6 @@ fn render_settled(
         FormResolution::FillFailed => Some(fill_failed_actions(
             spec, inputs, textareas, values, app, cx,
         )),
-        FormResolution::Escalated => Some(escalated_actions(spec, app, cx)),
         _ => None,
     };
     collapsed_card(
@@ -519,6 +601,7 @@ fn collapsed_card(
                 )
                 .child(
                     h_flex()
+                        .id(ElementId::Name(user_form_pill_id(spec.card_key()).into()))
                         .items_center()
                         .gap(px(4.))
                         .px(px(8.))
@@ -635,69 +718,6 @@ fn fill_failed_actions(
                 })
             },
         ))
-        .into_any_element()
-}
-
-fn escalated_actions(spec: &UserFormSpec, app: Option<Entity<AppState>>, cx: &App) -> AnyElement {
-    let server_fill = app
-        .as_ref()
-        .map(|entity| entity.read(cx).user_form_verbs_available)
-        .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
-    let handed_back = app
-        .as_ref()
-        .is_some_and(|entity| entity.read(cx).user_form_handoff_resolved(spec.card_key()));
-    let can_resolve = server_fill && !handed_back;
-    let key = spec.card_key().to_string();
-    h_flex()
-        .w_full()
-        .justify_end()
-        .gap(px(8.))
-        .flex_wrap()
-        .when(!handed_back, |this| {
-            this.child(action_button(
-                format!("user-form-handback-{key}"),
-                "Hand back control",
-                ButtonKind::Primary,
-                !can_resolve,
-                !server_fill,
-                {
-                    let app = app.clone();
-                    let key = key.clone();
-                    can_resolve.then_some(move |cx: &mut App| {
-                        if let Some(app) = &app {
-                            app.update(cx, |state, cx| {
-                                state.resolve_user_form_handoff(
-                                    key.clone(),
-                                    BoxHandoffResolution::HandedBack,
-                                    cx,
-                                );
-                            });
-                        }
-                    })
-                },
-            ))
-            .child(action_button(
-                format!("user-form-handoff-stop-{key}"),
-                "Stop for now",
-                ButtonKind::Ghost,
-                !can_resolve,
-                !server_fill,
-                {
-                    let app = app.clone();
-                    can_resolve.then_some(move |cx: &mut App| {
-                        if let Some(app) = &app {
-                            app.update(cx, |state, cx| {
-                                state.resolve_user_form_handoff(
-                                    key.clone(),
-                                    BoxHandoffResolution::Declined,
-                                    cx,
-                                );
-                            });
-                        }
-                    })
-                },
-            ))
-        })
         .into_any_element()
 }
 

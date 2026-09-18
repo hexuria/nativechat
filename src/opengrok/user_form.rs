@@ -4,9 +4,14 @@
 //! dump values into `send_message`). It is **not** secret-request (a connector
 //! vault with **Save securely**). Continue fills the page and is not Take over.
 //! **Open the screen** (and OpenGrok `sand://box` / `computer_handoff_card`)
-//! paints Grok Computer handoff chrome: **Take over** / **I'm done** / **Skip**,
-//! plus **Needs your attention** on the Computer pane. Password and other
-//! secret fields typed here must never enter AG-UI `content` or sqlite.
+//! adds Grok Computer handoff chrome **beside** the form: **Take over** /
+//! **I'm done** / **Skip**, plus **Needs your attention** on the Computer pane.
+//! The form card stays in document order — it is not swapped for Computer, then
+//! resurrected. After I'm done / Skip the form settles **Dismissed** /
+//! **Skipped** and the Computer card remains as **Done** / **Skipped** history.
+//! Never paint the collapsed **On the computer** pill with no Computer card.
+//! Password and other secret fields typed here must never enter AG-UI
+//! `content` or sqlite.
 //!
 //! # Two channels ([opengrok-server#139](https://github.com/hexuria/opengrok-server/pull/139))
 //!
@@ -40,14 +45,14 @@
 //! - `POST /ag-ui/box-handoff/resolve` `{entryId, agentId, resolution}`
 //!
 //! **Form `entryId` is the gateway card id, never `callId`.** Open the screen
-//! keeps that id for the pill and stores **`handoffEntryId`** from the dismiss
-//! response when the server mints a sibling card. **I'm done** / **Skip** POST
-//! that sibling id when we have it (`handed_back` / `declined`). If dismiss
-//! Keep / `sand://box` omit a sibling, POST the **form** gateway `entryId` —
-//! an open Action needed handoff must resolve without Take over first, and
-//! without inventing a `callId`. Never `handBackForeverBox`.
-//! **Take over** opens/focuses the Computer (pane + screen). The live card is
-//! Grok Computer chrome, not the collapsed **On the computer** form.
+//! keeps that id on the form card and stores **`handoffEntryId`** from the
+//! dismiss response when the server mints a sibling. **I'm done** / **Skip**
+//! POST that sibling id when we have it (`handed_back` / `declined`). If
+//! dismiss Keep / `sand://box` omit a sibling, POST the **form** gateway
+//! `entryId` — an open Action needed handoff must resolve without Take over
+//! first, and without inventing a `callId`. Never `handBackForeverBox`.
+//! **Take over** opens/focuses the Computer (pane + screen). Server
+//! `formResolution: escalated` is a live Computer sibling, not form chrome.
 //!
 //! After Continue paints **Sending**, HTTP must not restore idle fields.
 //! A body with `formResolution` (`submitted` / `fill_failed` / …) is merged.
@@ -226,8 +231,12 @@ pub enum FormResolution {
     Sending,
     Submitted,
     FillFailed,
+    /// Wire value for dismiss `mode: escalated`. Never painted — Open the
+    /// screen is a Computer sibling ([`ComputerHandoffStatus`]), and I'm done
+    /// / Skip settle the form as [`Dismissed`] / [`Skipped`].
     Escalated,
     Dismissed,
+    Skipped,
 }
 
 impl FormResolution {
@@ -239,6 +248,7 @@ impl FormResolution {
             "escalated" | "on_screen" | "on-screen" | "on_the_computer" | "on-the-computer" => {
                 Self::Escalated
             }
+            "skipped" | "skip" => Self::Skipped,
             _ => Self::Dismissed,
         }
     }
@@ -250,18 +260,21 @@ impl FormResolution {
             Self::FillFailed => "fill_failed",
             Self::Escalated => "escalated",
             Self::Dismissed => "dismissed",
+            Self::Skipped => "skipped",
         }
     }
 
-    /// Pill copy on the *settled* form. Live Open-the-screen is Grok Computer
-    /// chrome (`Action needed`); after I'm done / Skip this pill remains.
+    /// Pill copy on the *settled* form. Live Open-the-screen keeps the form
+    /// in place and paints Computer `Action needed` beside it. I'm done →
+    /// Dismissed; Skip → Skipped. [`Escalated`] is not a visible settle.
     pub fn pill(self) -> &'static str {
         match self {
             Self::Sending => "Submitting",
             Self::Submitted => "Submitted",
             Self::FillFailed => "Not filled",
-            Self::Escalated => "On the computer",
+            Self::Escalated => "Dismissed",
             Self::Dismissed => "Dismissed",
+            Self::Skipped => "Skipped",
         }
     }
 
@@ -273,8 +286,64 @@ impl FormResolution {
             Self::FillFailed => {
                 "Could not fill into the page — it may have moved or changed. Secret values were never shown to your Bot."
             }
-            Self::Escalated => "You chose to do this step on the computer.",
+            Self::Escalated => "Dismissed without filling anything.",
             Self::Dismissed => "Dismissed without filling anything.",
+            Self::Skipped => "Skipped without filling anything.",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Submitted | Self::FillFailed | Self::Dismissed | Self::Skipped
+        )
+    }
+}
+
+/// In-chat Computer card that sits **beside** a user-form, not in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComputerHandoffStatus {
+    #[default]
+    ActionNeeded,
+    Done,
+    Skipped,
+}
+
+impl ComputerHandoffStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ActionNeeded => "action_needed",
+            Self::Done => "done",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn pill(self) -> &'static str {
+        match self {
+            Self::ActionNeeded => "Action needed",
+            Self::Done => "Done",
+            Self::Skipped => "Skipped",
+        }
+    }
+
+    pub fn body(self) -> &'static str {
+        match self {
+            Self::ActionNeeded => "Complete this step on the computer.",
+            Self::Done => "Finished on the computer.",
+            Self::Skipped => "Skipped this computer step.",
+        }
+    }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::ActionNeeded)
+    }
+
+    /// Local Done / Skipped wins over a later server Action needed.
+    pub fn fold(current: Option<Self>, incoming: Option<Self>) -> Option<Self> {
+        match (current, incoming) {
+            (Some(Self::Done), _) | (Some(Self::Skipped), _) => current,
+            (_, Some(next)) => Some(next),
+            (cur, None) => cur,
         }
     }
 }
@@ -325,6 +394,7 @@ impl UserFormDismissMode {
     pub fn resolution(self) -> FormResolution {
         match self {
             Self::Dismissed => FormResolution::Dismissed,
+            // Wire mode only. Open the screen does not paint this on the form.
             Self::Escalated => FormResolution::Escalated,
         }
     }
@@ -399,6 +469,10 @@ pub fn settle_user_form_http(
 /// Stable gpui-agent / GPUI ids. Master Tester looks for `user-form-*`.
 pub fn user_form_card_id(card_key: &str) -> String {
     format!("user-form-{card_key}")
+}
+
+pub fn user_form_pill_id(card_key: &str) -> String {
+    format!("user-form-pill-{card_key}")
 }
 
 pub fn user_form_continue_id(card_key: &str) -> String {
@@ -498,22 +572,24 @@ impl ComputerHandoffSpec {
         }
     }
 
-    /// Standalone attachment when no user-form card exists to fold onto.
+    /// Standalone Computer sibling when no user-form card exists to fold onto.
+    /// Title stays empty so this does not paint a fake form named Computer.
     pub fn as_escalated_form(&self) -> UserFormSpec {
         UserFormSpec {
             entry_id: self.card_key().to_string(),
             call_id: String::new(),
             run_id: String::new(),
-            title: "Computer".into(),
+            title: String::new(),
             instruction: (!self.instruction.is_empty()).then(|| self.instruction.clone()),
             fields: Vec::new(),
             domain: None,
             live_host: None,
-            resolution: Some(FormResolution::Escalated),
+            resolution: None,
             widget_dismissed: false,
             handoff_entry_id: None,
             box_request_id: self.box_request_id.clone(),
             box_instruction: (!self.instruction.is_empty()).then(|| self.instruction.clone()),
+            computer_handoff: Some(ComputerHandoffStatus::ActionNeeded),
         }
     }
 }
@@ -566,6 +642,9 @@ pub struct UserFormSpec {
     pub box_request_id: Option<String>,
     /// Instruction on the Computer handoff card when OpenGrok sent `boxInstruction`.
     pub box_instruction: Option<String>,
+    /// Computer sibling chrome. Independent of [`FormResolution`] so Open the
+    /// screen cannot rip the form out of document order.
+    pub computer_handoff: Option<ComputerHandoffStatus>,
 }
 
 impl UserFormSpec {
@@ -656,6 +735,8 @@ impl UserFormSpec {
     /// Fold a later event for the same card onto this one (resolution, or a
     /// fuller request). Secret values are not carried.
     pub fn merge(&mut self, incoming: UserFormSpec) {
+        let incoming_form = incoming.shows_form_chrome();
+        let self_form = self.shows_form_chrome();
         if incoming.has_gateway_entry_id() {
             self.entry_id = incoming.entry_id;
         }
@@ -664,9 +745,6 @@ impl UserFormSpec {
         }
         if !incoming.run_id.is_empty() {
             self.run_id = incoming.run_id;
-        }
-        if !incoming.title.is_empty() {
-            self.title = incoming.title;
         }
         if incoming.instruction.is_some() {
             self.instruction = incoming.instruction;
@@ -680,8 +758,8 @@ impl UserFormSpec {
         if incoming.live_host.is_some() {
             self.live_host = incoming.live_host;
         }
-        if incoming.resolution.is_some() {
-            self.resolution = incoming.resolution;
+        if !incoming.title.is_empty() && (incoming_form || !self_form) {
+            self.title = incoming.title;
         }
         self.widget_dismissed = self.widget_dismissed || incoming.widget_dismissed;
         if incoming.handoff_entry_id.is_some() {
@@ -692,6 +770,21 @@ impl UserFormSpec {
         }
         if incoming.box_instruction.is_some() {
             self.box_instruction = incoming.box_instruction;
+        }
+        self.computer_handoff =
+            ComputerHandoffStatus::fold(self.computer_handoff, incoming.computer_handoff);
+        if incoming.resolution == Some(FormResolution::Skipped)
+            || incoming.resolution == Some(FormResolution::Submitted)
+            || incoming.resolution == Some(FormResolution::FillFailed)
+        {
+            self.resolution = incoming.resolution;
+        } else if incoming.resolution.is_some() {
+            match self.resolution {
+                Some(FormResolution::Skipped)
+                | Some(FormResolution::Submitted)
+                | Some(FormResolution::FillFailed) => {}
+                _ => self.resolution = incoming.resolution,
+            }
         }
     }
 
@@ -744,8 +837,10 @@ impl UserFormSpec {
 
     pub fn parse(value: &Value, entry_id: Option<String>) -> Option<Self> {
         let request = form_request_object(value);
-        let resolution = parse_resolution(value);
+        let wire_resolution = parse_resolution(value);
         let widget_dismissed = bool_at(value, "widgetDismissed").unwrap_or(false);
+        let (resolution, widget_dismissed, computer_handoff) =
+            absorb_escalated_wire(wire_resolution, widget_dismissed);
         let fields = request
             .map(parse_fields)
             .or_else(|| value.get("fields").map(parse_fields_value))
@@ -757,7 +852,12 @@ impl UserFormSpec {
         let entry_id = entry_id
             .or_else(|| gateway_entry_id_in(value))
             .unwrap_or_default();
-        if fields.is_empty() && title.is_empty() && resolution.is_none() && !widget_dismissed {
+        if fields.is_empty()
+            && title.is_empty()
+            && resolution.is_none()
+            && !widget_dismissed
+            && computer_handoff.is_none()
+        {
             return None;
         }
         // Outcomes are hashed, not painted — read so a payload that only has
@@ -794,12 +894,41 @@ impl UserFormSpec {
             box_instruction: request
                 .and_then(|req| string_field(req, "boxInstruction"))
                 .or_else(|| string_field(value, "boxInstruction")),
+            computer_handoff,
         })
     }
 
-    /// Open the screen / `sand://box`: live Grok Computer chrome until I'm done / Skip.
+    /// Form chrome stays in document order. Computer-only stubs (no fields,
+    /// no title, no form settle) paint just the Computer card.
+    pub fn shows_form_chrome(&self) -> bool {
+        if self.computer_handoff.is_some()
+            && self.fields.is_empty()
+            && self.title.is_empty()
+            && self.effective_resolution().is_none()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Open the screen / `sand://box`: Computer sibling, live or settled history.
     pub fn shows_computer_handoff(&self) -> bool {
-        self.effective_resolution() == Some(FormResolution::Escalated)
+        self.computer_handoff.is_some()
+    }
+
+    pub fn live_computer_handoff(&self) -> bool {
+        self.computer_handoff
+            .is_some_and(ComputerHandoffStatus::is_live)
+    }
+
+    /// I'm done → Dismissed; Skip → Skipped.
+    pub fn settle_form_from_box(resolution: BoxHandoffResolution) -> FormResolution {
+        match resolution {
+            BoxHandoffResolution::Declined => FormResolution::Skipped,
+            BoxHandoffResolution::HandedBack | BoxHandoffResolution::TimedOut => {
+                FormResolution::Dismissed
+            }
+        }
     }
 
     pub fn handoff_prompt(&self) -> String {
@@ -1153,6 +1282,20 @@ fn arguments_object(event: &Value, fallback: Option<&Value>) -> Value {
         return serde_json::from_str(s).unwrap_or(raw);
     }
     raw
+}
+
+fn absorb_escalated_wire(
+    resolution: Option<FormResolution>,
+    widget_dismissed: bool,
+) -> (Option<FormResolution>, bool, Option<ComputerHandoffStatus>) {
+    if resolution == Some(FormResolution::Escalated) {
+        // Keep the form in place (idle or already settled). Escalated is a
+        // Computer sibling, and widgetDismissed on that envelope must not
+        // collapse the form into "On the computer".
+        (None, false, Some(ComputerHandoffStatus::ActionNeeded))
+    } else {
+        (resolution, widget_dismissed, None)
+    }
 }
 
 fn parse_resolution(value: &Value) -> Option<FormResolution> {
@@ -1652,13 +1795,18 @@ mod tests {
             ),
             (
                 FormResolution::Escalated,
-                "On the computer",
-                "You chose to do this step on the computer.",
+                "Dismissed",
+                "Dismissed without filling anything.",
             ),
             (
                 FormResolution::Dismissed,
                 "Dismissed",
                 "Dismissed without filling anything.",
+            ),
+            (
+                FormResolution::Skipped,
+                "Skipped",
+                "Skipped without filling anything.",
             ),
         ];
         for (resolution, pill, body) in cases {
@@ -2102,8 +2250,18 @@ mod tests {
             UserFormActionReply::Settled(spec) => {
                 assert_eq!(spec.entry_id, "e_form");
                 assert_eq!(spec.handoff_entry_id.as_deref(), Some("e_hand"));
-                assert_eq!(spec.effective_resolution(), Some(FormResolution::Escalated));
-                assert_eq!(spec.pill(), Some("On the computer"));
+                assert!(
+                    spec.is_unresolved(),
+                    "escalated must not settle the form: {:?}",
+                    spec.effective_resolution()
+                );
+                assert_eq!(
+                    spec.computer_handoff,
+                    Some(ComputerHandoffStatus::ActionNeeded)
+                );
+                assert_ne!(spec.pill(), Some("On the computer"));
+                assert!(spec.shows_form_chrome());
+                assert!(spec.shows_computer_handoff());
                 let resolve = resolve_handoff_request_body(
                     spec.handoff_entry_id.as_deref().unwrap(),
                     "cw_1",
@@ -2267,10 +2425,15 @@ mod tests {
         assert_eq!(spec.box_request_id.as_deref(), Some("box-9"));
         let form = spec.as_escalated_form();
         assert!(form.shows_computer_handoff());
+        assert!(!form.shows_form_chrome());
         assert_eq!(form.entry_id, "e_form");
         assert_eq!(form.box_request_id.as_deref(), Some("box-9"));
         assert_eq!(form.handoff_prompt(), "Sign in on the computer.");
-        assert_eq!(form.effective_resolution(), Some(FormResolution::Escalated));
+        assert!(form.is_unresolved());
+        assert_eq!(
+            form.computer_handoff,
+            Some(ComputerHandoffStatus::ActionNeeded)
+        );
         let sand = ComputerHandoffSpec::from_event(&json!({
             "type": "CUSTOM",
             "name": "ui",
@@ -2285,6 +2448,81 @@ mod tests {
         assert_eq!(
             sand.as_escalated_form().handoff_prompt(),
             "Finish this step."
+        );
+    }
+
+    #[test]
+    fn open_the_screen_keeps_form_and_adds_computer_sibling() {
+        let mut form = UserFormSpec::from_custom_event(&live_awaiting(Some("e_form"))).unwrap();
+        assert!(form.is_unresolved());
+        assert!(form.shows_form_chrome());
+        assert!(!form.shows_computer_handoff());
+        form.merge(
+            UserFormSpec::from_custom_event(&json!({
+                "type": "CUSTOM",
+                "name": "user-form",
+                "value": {
+                    "id": "e_form",
+                    "formResolution": "escalated",
+                    "widgetDismissed": true,
+                    "handoffEntryId": "e_hand",
+                    "formRequest": google_email_request()
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(
+            form.is_unresolved(),
+            "form stays in place: {:?}",
+            form.pill()
+        );
+        assert_eq!(form.title, "Google account email");
+        assert!(!form.fields.is_empty());
+        assert_eq!(
+            form.computer_handoff,
+            Some(ComputerHandoffStatus::ActionNeeded)
+        );
+        assert_ne!(form.pill(), Some("On the computer"));
+        form.resolution = Some(FormResolution::Dismissed);
+        form.computer_handoff = Some(ComputerHandoffStatus::Done);
+        assert_eq!(form.pill(), Some("Dismissed"));
+        assert_eq!(form.computer_handoff.map(|s| s.pill()), Some("Done"));
+        assert!(form.shows_form_chrome());
+        assert!(form.shows_computer_handoff());
+        form.merge(
+            UserFormSpec::from_custom_event(&json!({
+                "type": "CUSTOM",
+                "name": "user-form",
+                "value": {
+                    "id": "e_form",
+                    "formResolution": "escalated",
+                    "formRequest": google_email_request()
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            form.effective_resolution(),
+            Some(FormResolution::Dismissed),
+            "server escalated must not resurrect On the computer"
+        );
+        assert_eq!(
+            form.computer_handoff,
+            Some(ComputerHandoffStatus::Done),
+            "Computer card stays Done"
+        );
+        let mut skipped = UserFormSpec::from_custom_event(&live_awaiting(Some("e_skip"))).unwrap();
+        skipped.resolution = Some(FormResolution::Skipped);
+        skipped.computer_handoff = Some(ComputerHandoffStatus::Skipped);
+        assert_eq!(skipped.pill(), Some("Skipped"));
+        assert_eq!(skipped.computer_handoff.map(|s| s.pill()), Some("Skipped"));
+        assert_eq!(
+            UserFormSpec::settle_form_from_box(BoxHandoffResolution::HandedBack),
+            FormResolution::Dismissed
+        );
+        assert_eq!(
+            UserFormSpec::settle_form_from_box(BoxHandoffResolution::Declined),
+            FormResolution::Skipped
         );
     }
 }

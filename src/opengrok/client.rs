@@ -3292,7 +3292,13 @@ mod tests {
             UserFormActionReply::Settled(spec) => {
                 assert_eq!(
                     spec.effective_resolution(),
-                    Some(super::super::user_form::FormResolution::Escalated)
+                    None,
+                    "escalated is a Computer sibling, not form settle: {:?}",
+                    spec.effective_resolution()
+                );
+                assert_eq!(
+                    spec.computer_handoff,
+                    Some(super::super::user_form::ComputerHandoffStatus::ActionNeeded)
                 );
                 assert_eq!(spec.entry_id, "e_form");
                 assert_eq!(spec.handoff_entry_id.as_deref(), Some("e_hand"));

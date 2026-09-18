@@ -44,7 +44,7 @@ struct ChatFeedRev {
     last_ui: usize,
     form_picks: Vec<(String, String, String)>,
     user_form_picks: Vec<(String, String, String)>,
-    user_forms: Vec<(String, String)>,
+    user_forms: Vec<(String, String, String)>,
     user_form_verbs: bool,
     user_form_handoffs: Vec<(String, String, bool)>,
     save_logins: Vec<(String, String)>,
@@ -109,7 +109,7 @@ impl ChatFeedRev {
                 picks
             },
             user_forms: {
-                let mut cards: Vec<(String, String)> = conv
+                let mut cards: Vec<(String, String, String)> = conv
                     .map(|c| {
                         c.messages
                             .iter()
@@ -126,6 +126,9 @@ impl ChatFeedRev {
                                                 "idle-no-entry".into()
                                             }
                                         }),
+                                    spec.computer_handoff
+                                        .map(|status| status.as_str().to_string())
+                                        .unwrap_or_else(|| "none".into()),
                                 )),
                                 _ => None,
                             })
