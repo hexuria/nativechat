@@ -1,4 +1,5 @@
 pub mod agent_settings;
+pub mod alert_chrome;
 pub mod app_settings;
 pub mod bot_finder;
 pub mod chat;
