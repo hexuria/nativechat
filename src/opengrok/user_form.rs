@@ -28,15 +28,20 @@
 //!
 //! # Fill verbs
 //!
-//! Continue / Open the screen / Dismiss POST with an **account bearer**:
+//! Continue / Open the screen / Dismiss / Hand back POST with an **account bearer**:
 //!
 //! - `POST /ag-ui/user-form/submit` `{entryId, agentId, values}`
 //! - `POST /ag-ui/user-form/dismiss` `{entryId, agentId, mode: dismissed|escalated}`
+//! - `POST /ag-ui/box-handoff/resolve` `{entryId: handoffEntryId, agentId, resolution}`
 //!
-//! **`entryId` is the gateway card id, never `callId`.** Submit looks the
-//! entry up by that id. A 404 means the route is missing: verbs flip off,
-//! the card stays idle, **Submitted is not painted**. A 200 JSON `null`
-//! (entry not found / no permission) is also not a fill.
+//! **Form `entryId` is the gateway card id, never `callId`.** Open the screen
+//! keeps that id for the pill and stores **`handoffEntryId`** from the dismiss
+//! response. Hand back / decline POST that handoff id — **not** the form card
+//! id, **not** `handBackForeverBox`, **not** Take over / I'm done / Skip.
+//!
+//! A 404 means the route is missing: verbs flip off, the card stays idle,
+//! **Submitted is not painted**. A 200 JSON `null` (entry not found / no
+//! permission) is also not a fill.
 //!
 //! # [opengrok-server#140](https://github.com/hexuria/opengrok-server/issues/140) on #139 @ d12fffc
 //!
@@ -73,6 +78,8 @@ pub const WAITING_FOR_YOU: &str = "Waiting for you";
 /// Electron coordinator, and not `/ag-ui/runs/{id}/answer`.
 pub const USER_FORM_SUBMIT_PATH: &str = "/ag-ui/user-form/submit";
 pub const USER_FORM_DISMISS_PATH: &str = "/ag-ui/user-form/dismiss";
+/// Hand back / decline / timeout. `entryId` is the handoff card, not the form.
+pub const BOX_HANDOFF_RESOLVE_PATH: &str = "/ag-ui/box-handoff/resolve";
 
 /// Default true: opengrok-server#139 @ d12fffc+ has submit/dismiss. AppState
 /// sets this false after a 404 so we never paint Submitted against a missing
@@ -199,10 +206,12 @@ pub enum FormResolution {
 impl FormResolution {
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "sending" => Self::Sending,
+            "sending" | "submitting" => Self::Sending,
             "submitted" => Self::Submitted,
             "fill_failed" | "fill-failed" | "not_filled" | "not-filled" => Self::FillFailed,
-            "escalated" | "on_screen" | "on-screen" => Self::Escalated,
+            "escalated" | "on_screen" | "on-screen" | "on_the_computer" | "on-the-computer" => {
+                Self::Escalated
+            }
             _ => Self::Dismissed,
         }
     }
@@ -217,29 +226,58 @@ impl FormResolution {
         }
     }
 
-    /// Pill copy from NativeChat #17.
+    /// Pill copy. Continue paints **Submitting** (local) then **Submitted**.
+    /// Open the screen paints **On the computer**, not OpenGrok Take over.
     pub fn pill(self) -> &'static str {
         match self {
-            Self::Sending => "Sending",
+            Self::Sending => "Submitting",
             Self::Submitted => "Submitted",
             Self::FillFailed => "Not filled",
-            Self::Escalated => "On screen",
+            Self::Escalated => "On the computer",
             Self::Dismissed => "Dismissed",
         }
     }
 
-    /// Body copy from NativeChat #17.
+    /// Body copy under the collapsed card.
     pub fn body(self) -> &'static str {
         match self {
-            Self::Sending => "Sending…",
+            Self::Sending => "Submitting…",
             Self::Submitted => "Filled into the page. Secret values were never shown to your Bot.",
             Self::FillFailed => {
                 "Could not fill into the page — it may have moved or changed. Secret values were never shown to your Bot."
             }
-            Self::Escalated => "You chose to do this step on the screen instead.",
+            Self::Escalated => "You chose to do this step on the computer.",
             Self::Dismissed => "Dismissed without filling anything.",
         }
     }
+}
+
+/// `POST /ag-ui/box-handoff/resolve` `resolution`. Not `handBackForeverBox`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxHandoffResolution {
+    HandedBack,
+    Declined,
+    TimedOut,
+}
+
+impl BoxHandoffResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HandedBack => "handed_back",
+            Self::Declined => "declined",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// What `POST /ag-ui/box-handoff/resolve` meant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxHandoffReply {
+    Settled,
+    AlreadyAnswered,
+    Empty,
+    MissingRoute,
+    MissingEntryId,
 }
 
 /// `dismissUserForm` mode. Open the screen → [`Escalated`].
@@ -297,6 +335,9 @@ pub struct UserFormSpec {
     pub live_host: Option<String>,
     pub resolution: Option<FormResolution>,
     pub widget_dismissed: bool,
+    /// HTTP convenience from dismiss `mode: escalated`. Not the form card id.
+    /// Never sent as submit/dismiss `entryId`. Never a `boxRequestId` on this card.
+    pub handoff_entry_id: Option<String>,
 }
 
 impl UserFormSpec {
@@ -344,6 +385,22 @@ impl UserFormSpec {
             return true;
         }
         false
+    }
+
+    /// Fold an awaiting CUSTOM onto a later send-message envelope (one id
+    /// missing). A second OTP form with a different `entryId` / `callId` is a
+    /// new card — do not merge it onto a password form that already settled.
+    pub fn completes_with(&self, other: &Self) -> bool {
+        if self.has_gateway_entry_id()
+            && other.has_gateway_entry_id()
+            && self.entry_id != other.entry_id
+        {
+            return false;
+        }
+        if !self.call_id.is_empty() && !other.call_id.is_empty() && self.call_id != other.call_id {
+            return false;
+        }
+        true
     }
 
     /// Continue / Dismiss POST only when the route is present **and** we have
@@ -394,6 +451,9 @@ impl UserFormSpec {
             self.resolution = incoming.resolution;
         }
         self.widget_dismissed = self.widget_dismissed || incoming.widget_dismissed;
+        if incoming.handoff_entry_id.is_some() {
+            self.handoff_entry_id = incoming.handoff_entry_id;
+        }
     }
 
     pub fn from_custom_event(event: &Value) -> Option<Self> {
@@ -487,6 +547,7 @@ impl UserFormSpec {
                 .or_else(|| string_field(value, "liveHost")),
             resolution,
             widget_dismissed,
+            handoff_entry_id: string_field(value, "handoffEntryId"),
         })
     }
 }
@@ -613,6 +674,19 @@ pub fn dismiss_request_body(entry_id: &str, agent_id: &str, mode: UserFormDismis
     })
 }
 
+/// Hand back / decline / timeout. `entry_id` is [`UserFormSpec::handoff_entry_id`].
+pub fn resolve_handoff_request_body(
+    handoff_entry_id: &str,
+    agent_id: &str,
+    resolution: BoxHandoffResolution,
+) -> Value {
+    json!({
+        "entryId": handoff_entry_id,
+        "agentId": agent_id,
+        "resolution": resolution.as_str(),
+    })
+}
+
 /// Classify a submit/dismiss HTTP response. 404 and 200-null are not fills.
 pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionReply {
     if status == 404 {
@@ -637,6 +711,34 @@ pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionRe
         return UserFormActionReply::AlreadyAnswered;
     }
     UserFormActionReply::Empty
+}
+
+/// Classify `POST /ag-ui/box-handoff/resolve`. Never treat a miss as handed back.
+pub fn box_handoff_action_from_http(status: u16, body: &Value) -> BoxHandoffReply {
+    if status == 404 {
+        return BoxHandoffReply::MissingRoute;
+    }
+    if status != 200 {
+        return BoxHandoffReply::Empty;
+    }
+    if body.is_null() {
+        return BoxHandoffReply::Empty;
+    }
+    if body
+        .get("alreadyAnswered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return BoxHandoffReply::AlreadyAnswered;
+    }
+    if body
+        .get("boxResolution")
+        .and_then(Value::as_str)
+        .is_some_and(|word| !word.is_empty())
+    {
+        return BoxHandoffReply::Settled;
+    }
+    BoxHandoffReply::Settled
 }
 
 fn looks_like_user_form_value(value: &Value) -> bool {
@@ -1197,9 +1299,9 @@ mod tests {
     }
 
     #[test]
-    fn resolution_table_matches_issue_17() {
+    fn resolution_table_matches_grok_bot_chrome() {
         let cases = [
-            (FormResolution::Sending, "Sending", "Sending…"),
+            (FormResolution::Sending, "Submitting", "Submitting…"),
             (
                 FormResolution::Submitted,
                 "Submitted",
@@ -1212,8 +1314,8 @@ mod tests {
             ),
             (
                 FormResolution::Escalated,
-                "On screen",
-                "You chose to do this step on the screen instead.",
+                "On the computer",
+                "You chose to do this step on the computer.",
             ),
             (
                 FormResolution::Dismissed,
@@ -1478,5 +1580,68 @@ mod tests {
         let dismiss = dismiss_request_body("e_form", "cw_1", UserFormDismissMode::Escalated);
         assert_eq!(dismiss["mode"], "escalated");
         assert!(dismiss.get("values").is_none());
+    }
+
+    #[test]
+    fn dismiss_escalated_stores_handoff_entry_id_not_as_form_id() {
+        match user_form_action_from_http(
+            200,
+            &json!({
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": google_email_request()
+                },
+                "formResolution": "escalated",
+                "widgetDismissed": true,
+                "handoffEntryId": "e_hand"
+            }),
+        ) {
+            UserFormActionReply::Settled(spec) => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.handoff_entry_id.as_deref(), Some("e_hand"));
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Escalated));
+                assert_eq!(spec.pill(), Some("On the computer"));
+                let resolve = resolve_handoff_request_body(
+                    spec.handoff_entry_id.as_deref().unwrap(),
+                    "cw_1",
+                    BoxHandoffResolution::HandedBack,
+                );
+                assert_eq!(resolve["entryId"], "e_hand");
+                assert_ne!(resolve["entryId"], spec.entry_id);
+                assert_eq!(resolve["resolution"], "handed_back");
+                assert!(resolve.get("values").is_none());
+            }
+            other => panic!("expected Settled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_handoff_never_posts_the_form_card_id() {
+        let body = resolve_handoff_request_body("e_hand", "cw_1", BoxHandoffResolution::Declined);
+        assert_eq!(body["entryId"], "e_hand");
+        assert_eq!(body["agentId"], "cw_1");
+        assert_eq!(body["resolution"], "declined");
+        assert_ne!(body["entryId"], "e_form");
+        assert_eq!(
+            box_handoff_action_from_http(404, &Value::Null),
+            BoxHandoffReply::MissingRoute
+        );
+        assert_eq!(
+            box_handoff_action_from_http(200, &Value::Null),
+            BoxHandoffReply::Empty
+        );
+        assert_eq!(
+            box_handoff_action_from_http(200, &json!({ "alreadyAnswered": true })),
+            BoxHandoffReply::AlreadyAnswered
+        );
+        assert_eq!(
+            box_handoff_action_from_http(
+                200,
+                &json!({ "id": "e_hand", "boxResolution": "handed_back" })
+            ),
+            BoxHandoffReply::Settled
+        );
     }
 }

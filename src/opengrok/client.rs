@@ -656,6 +656,29 @@ impl OpenGrokClient {
         Self::user_form_action_response(response).await
     }
 
+    /// Hand back / decline / timeout. `entry_id` is the handoff card from
+    /// dismiss `handoffEntryId`, never the user-form id.
+    pub async fn resolve_box_handoff(
+        &self,
+        handoff_entry_id: &str,
+        agent_id: &str,
+        resolution: super::user_form::BoxHandoffResolution,
+    ) -> Result<super::user_form::BoxHandoffReply, OpenGrokError> {
+        if handoff_entry_id.trim().is_empty() {
+            return Ok(super::user_form::BoxHandoffReply::MissingEntryId);
+        }
+        let body =
+            super::user_form::resolve_handoff_request_body(handoff_entry_id, agent_id, resolution);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::user_form::BOX_HANDOFF_RESOLVE_PATH,
+                Some(&body),
+            )
+            .await?;
+        Self::box_handoff_action_response(response).await
+    }
+
     async fn user_form_action_response(
         response: reqwest::Response,
     ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
@@ -676,6 +699,30 @@ impl OpenGrokClient {
             serde_json::from_str(&text).unwrap_or(Value::Null)
         };
         Ok(super::user_form::user_form_action_from_http(status, &value))
+    }
+
+    async fn box_handoff_action_response(
+        response: reqwest::Response,
+    ) -> Result<super::user_form::BoxHandoffReply, OpenGrokError> {
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(super::user_form::BoxHandoffReply::MissingRoute);
+        }
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        let value: Value = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::Null)
+        };
+        Ok(super::user_form::box_handoff_action_from_http(
+            status, &value,
+        ))
     }
 
     /// Stop a run that is still going.
@@ -2959,7 +3006,8 @@ mod tests {
                 "id": "e_form",
                 "message": { "type": "user-form", "formRequest": { "title": "Sign in", "fields": [] } },
                 "formResolution": "escalated",
-                "widgetDismissed": true
+                "widgetDismissed": true,
+                "handoffEntryId": "e_hand"
             })))
             .mount(&server)
             .await;
@@ -2974,9 +3022,51 @@ mod tests {
                     spec.effective_resolution(),
                     Some(super::super::user_form::FormResolution::Escalated)
                 );
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.handoff_entry_id.as_deref(), Some("e_hand"));
             }
             other => panic!("expected Settled, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_box_handoff_posts_handoff_id_not_form_id() {
+        use super::super::user_form::{BoxHandoffReply, BoxHandoffResolution};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/box-handoff/resolve"))
+            .and(body_json(json!({
+                "entryId": "e_hand",
+                "agentId": "cw_1",
+                "resolution": "handed_back"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "e_hand",
+                "boxResolution": "handed_back"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/box-handoff/resolve"))
+            .and(body_json(json!({
+                "entryId": "e_form",
+                "agentId": "cw_1",
+                "resolution": "handed_back"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .resolve_box_handoff("e_hand", "cw_1", BoxHandoffResolution::HandedBack)
+            .await
+            .unwrap();
+        assert_eq!(reply, BoxHandoffReply::Settled);
+        let skipped = client
+            .resolve_box_handoff("", "cw_1", BoxHandoffResolution::HandedBack)
+            .await
+            .unwrap();
+        assert_eq!(skipped, BoxHandoffReply::MissingEntryId);
     }
 
     /// The route is idempotent, so the status is what is true of the run now rather than an

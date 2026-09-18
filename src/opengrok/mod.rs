@@ -20,12 +20,13 @@ pub use gen_ui::{
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use user_form::{
-    FormResolution, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
+    BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, FormResolution,
+    REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
     USER_FORM_SERVER_FILL_AVAILABLE, USER_FORM_SUBMIT_PATH, UserFormActionReply,
     UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues,
-    WAITING_FOR_YOU, continue_enabled, dismiss_request_body, is_user_form_awaiting,
-    is_user_form_custom_name, is_user_form_event, is_user_form_tool, submit_request_body,
-    user_form_action_from_http,
+    WAITING_FOR_YOU, box_handoff_action_from_http, continue_enabled, dismiss_request_body,
+    is_user_form_awaiting, is_user_form_custom_name, is_user_form_event, is_user_form_tool,
+    resolve_handoff_request_body, submit_request_body, user_form_action_from_http,
 };
 
 pub use client::{

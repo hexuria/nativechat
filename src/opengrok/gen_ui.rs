@@ -456,19 +456,23 @@ impl TurnAssembler {
             existing.merge(spec);
             return;
         }
-        // One HITL user-form per turn. Awaiting CUSTOM has callId; a later
-        // send-message envelope has the gateway id and no callId — fold them.
-        let only_unresolved = self
-            .committed
-            .iter()
-            .filter(|part| matches!(part, ChatPart::UserForm(existing) if existing.is_unresolved()))
-            .count()
-            == 1;
-        if only_unresolved
-            && let Some(existing) = self.committed.iter_mut().find_map(|part| match part {
-                ChatPart::UserForm(existing) if existing.is_unresolved() => Some(existing),
-                _ => None,
-            })
+        // Awaiting CUSTOM has callId; a later send-message envelope has the
+        // gateway id and no callId — fold those. A second OTP form after a
+        // password Submitted is a different entry / call: push a new card.
+        let mut unresolved_ix = None;
+        let mut unresolved_count = 0usize;
+        for (i, part) in self.committed.iter().enumerate() {
+            if let ChatPart::UserForm(existing) = part
+                && existing.is_unresolved()
+            {
+                unresolved_count += 1;
+                unresolved_ix = Some(i);
+            }
+        }
+        if unresolved_count == 1
+            && let Some(i) = unresolved_ix
+            && let ChatPart::UserForm(existing) = &mut self.committed[i]
+            && existing.completes_with(&spec)
         {
             existing.merge(spec);
             return;
@@ -1840,6 +1844,98 @@ mod tests {
                 assert!(spec.fields.iter().any(|f| f.masked()));
             }
             other => panic!("expected one merged card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_otp_form_mounts_after_password_submitted() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-pw",
+            "entryId": "e_pw",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google password",
+                "fields": [{"id": "password", "label": "Password", "type": "password", "required": true}]
+            }
+        }));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": { "entryId": "e_pw", "formResolution": "submitted" }
+        }));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-otp",
+            "entryId": "e_otp",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Enter the code",
+                "fields": [{"id": "otp", "label": "Code", "type": "otp", "required": true}]
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::UserForm(password), ChatPart::UserForm(otp)] => {
+                assert_eq!(password.entry_id, "e_pw");
+                assert_eq!(
+                    password.effective_resolution(),
+                    Some(crate::opengrok::FormResolution::Submitted)
+                );
+                assert_eq!(otp.entry_id, "e_otp");
+                assert!(otp.is_unresolved());
+                assert_eq!(otp.fields[0].kind, crate::opengrok::UserFormFieldKind::Otp);
+            }
+            other => panic!("expected password Submitted then OTP idle, got {other:?}"),
+        }
+        assert!(turn.waiting_user_form());
+    }
+
+    #[test]
+    fn a_second_otp_form_is_not_folded_onto_an_open_password_card() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-pw",
+            "entryId": "e_pw",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google password",
+                "fields": [{"id": "password", "label": "Password", "type": "password", "required": true}]
+            }
+        }));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-otp",
+            "entryId": "e_otp",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Enter the code",
+                "fields": [{"id": "otp", "label": "Code", "type": "otp", "required": true}]
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::UserForm(password), ChatPart::UserForm(otp)] => {
+                assert_eq!(password.entry_id, "e_pw");
+                assert!(password.is_unresolved());
+                assert_eq!(otp.entry_id, "e_otp");
+                assert!(otp.is_unresolved());
+            }
+            other => panic!("expected two cards, got {other:?}"),
         }
     }
 }
