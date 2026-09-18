@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
+use futures::future::{FutureExt, Shared};
 use reqwest::cookie::{CookieStore, Jar};
 use reqwest::header::{ACCEPT, CACHE_CONTROL, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::error::OpenGrokError;
 use super::types::{
@@ -47,12 +49,30 @@ fn needs_refresh(seconds_left: Option<i64>) -> bool {
     }
 }
 
+/// Cloneable result of one `/auth/refresh` so concurrent callers can join
+/// the same in-flight POST.
+#[derive(Clone)]
+enum RefreshOutcome {
+    Ok,
+    Failed {
+        status: Option<u16>,
+        message: String,
+    },
+}
+
+type RefreshShared = Shared<futures::future::BoxFuture<'static, RefreshOutcome>>;
+
 #[derive(Clone)]
 pub struct OpenGrokClient {
     base: Url,
     http: Client,
     jar: Arc<Jar>,
     session_path: Option<PathBuf>,
+    /// Single-flight `/auth/refresh`. Concurrent `ensure_fresh_token` / 401
+    /// retry must await this instead of each POSTing: the first 200 rotates
+    /// the refresh cookie, and a second POST with the old cookie is 401 and
+    /// used to `clear_session` (SignedOut banner).
+    refresh_flight: Arc<AsyncMutex<Option<RefreshShared>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,6 +96,7 @@ impl OpenGrokClient {
             http,
             jar,
             session_path: None,
+            refresh_flight: Arc::new(AsyncMutex::new(None)),
         })
     }
 
@@ -251,6 +272,12 @@ impl OpenGrokClient {
         }
     }
 
+    /// Access cookie is present and not inside [`REFRESH_SLACK`]. After a
+    /// joined refresh, waiters see this and must not POST again or clear.
+    fn has_fresh_access(&self) -> bool {
+        self.access_token().is_some() && !needs_refresh(self.token_seconds_left())
+    }
+
     fn url(&self, path: &str) -> Result<Url, OpenGrokError> {
         self.base
             .join(path)
@@ -370,25 +397,79 @@ impl OpenGrokClient {
 
     /// Trade the refresh cookie for a new access token. Sent directly rather than through
     /// `send_json`, which would refresh before refreshing.
+    ///
+    /// Single-flight: concurrent callers await one POST. A second `/auth/refresh`
+    /// with the cookie the first just rotated is 401 and must not `clear_session`
+    /// if the jar already holds a new pair.
     pub async fn refresh(&self) -> Result<(), OpenGrokError> {
-        let url = self.url("/auth/refresh")?;
+        let shared = {
+            let mut flight = self.refresh_flight.lock().await;
+            if let Some(shared) = flight.as_ref() {
+                shared.clone()
+            } else if self.has_fresh_access() {
+                return Ok(());
+            } else {
+                let this = self.clone();
+                let shared = async move { this.refresh_once().await }.boxed().shared();
+                *flight = Some(shared.clone());
+                shared
+            }
+        };
+        let outcome = shared.await;
+        {
+            let mut flight = self.refresh_flight.lock().await;
+            *flight = None;
+        }
+        match outcome {
+            RefreshOutcome::Ok => Ok(()),
+            RefreshOutcome::Failed { status, message } => {
+                Err(OpenGrokError::from_server(status, message))
+            }
+        }
+    }
+
+    async fn refresh_once(&self) -> RefreshOutcome {
+        let url = match self.url("/auth/refresh") {
+            Ok(url) => url,
+            Err(error) => {
+                return RefreshOutcome::Failed {
+                    status: error.status,
+                    message: error.message,
+                };
+            }
+        };
         let mut req = self.http.post(url);
         if let Some(token) = self.access_token() {
             req = req.bearer_auth(token);
         }
-        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = OpenGrokError::transport(&error);
+                return RefreshOutcome::Failed {
+                    status: mapped.status,
+                    message: mapped.message,
+                };
+            }
+        };
         if response.status().is_success() {
             self.save_session();
-            Ok(())
-        } else {
-            let error = Self::read_error(response).await;
+            return RefreshOutcome::Ok;
+        }
+        let error = Self::read_error(response).await;
+        if error.is_unauthorized() {
+            // Concurrent refresh already wrote a new pair. Do not throw it away.
+            if self.has_fresh_access() {
+                return RefreshOutcome::Ok;
+            }
             // "session expired": the refresh token is gone, so the saved session is worthless
             // and every later request would try this again. Forget it; the next request fails
             // plainly with 401 and the person signs in.
-            if error.is_unauthorized() {
-                self.clear_session();
-            }
-            Err(error)
+            self.clear_session();
+        }
+        RefreshOutcome::Failed {
+            status: error.status,
+            message: error.message,
         }
     }
 
@@ -2934,6 +3015,115 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let err = client.refresh().await.unwrap_err();
         assert!(err.is_unauthorized());
+    }
+
+    /// Burst after access TTL: two refresh() callers must join one POST.
+    /// A second POST would 401 on the rotated cookie and used to clear_session.
+    #[tokio::test]
+    async fn concurrent_refresh_is_single_flight_and_session_survives() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(200))
+                    .append_header("set-cookie", live_session().as_str())
+                    .append_header("set-cookie", "og_refresh=tok-r2; Path=/; Max-Age=3600"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("nativechat-refresh-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opengrok-session.json");
+        let client = OpenGrokClient::new(&server.uri())
+            .unwrap()
+            .with_session_file(path.clone());
+        put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
+        assert!(client.access_token().is_none());
+        assert!(client.has_session());
+
+        let a = client.clone();
+        let b = client.clone();
+        let (ra, rb) = tokio::join!(a.refresh(), b.refresh());
+        ra.expect("first refresh");
+        rb.expect("joined refresh");
+
+        let refresh_posts = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/auth/refresh")
+            .count();
+        assert_eq!(
+            refresh_posts, 1,
+            "concurrent refresh must join one POST /auth/refresh, got {refresh_posts}"
+        );
+        assert!(client.has_session(), "session must survive the join");
+        assert!(
+            client.access_token().is_some(),
+            "jar holds the new access cookie"
+        );
+        assert!(
+            path.exists(),
+            "save_session kept the file; did not clear_session"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `ensure_fresh_token` on a burst of requests (idle past access TTL) is
+    /// the live path that painted SignedOut. Both `/account` calls join one refresh.
+    #[tokio::test]
+    async fn concurrent_ensure_fresh_token_joins_one_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(200))
+                    .append_header("set-cookie", live_session().as_str())
+                    .append_header("set-cookie", "og_refresh=tok-r2; Path=/; Max-Age=3600"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acc_1",
+                "email": "a@b.c",
+                "firstName": "Ada",
+                "lastName": "Lovelace",
+                "avatarUrl": null,
+                "orgId": "org_1",
+                "verified": true,
+                "enabled": true,
+                "isAdmin": false
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
+        let a = client.clone();
+        let b = client.clone();
+        let (ma, mb) = tokio::join!(a.me(), b.me());
+        ma.expect("first me");
+        mb.expect("second me");
+
+        let refresh_posts = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/auth/refresh")
+            .count();
+        assert_eq!(
+            refresh_posts, 1,
+            "ensure_fresh_token burst must join one POST /auth/refresh, got {refresh_posts}"
+        );
+        assert!(client.has_session());
+        assert!(client.access_token().is_some());
     }
 
     #[tokio::test]
