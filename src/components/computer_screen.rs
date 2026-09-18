@@ -3,8 +3,9 @@
 //!
 //! The window has a strip of its own above the screen — the WebView is a
 //! native child view, so nothing GPUI draws can sit on top of it — with the
-//! "Teach a task" control, and it answers the window keys itself: ⌘W and ⌘Q
-//! close this window only, ⌘M minimizes it, ⌘H hides the app.
+//! "Teach a task" control, Open the screen **Needs your attention** (Skip /
+//! I'm done) when a handoff is live, and it answers the window keys itself:
+//! ⌘W and ⌘Q close this window only, ⌘M minimizes it, ⌘H hides the app.
 //!
 //! A stopped tape is written to disk and offered on a sheet under the title bar: named, and told
 //! which of three things to become, it goes up as a recipe (`POST /recipes`) and the Recipes page
@@ -26,8 +27,12 @@ use wry::{
 };
 
 use crate::actions::{CloseWindow, Hide, Minimize, Quit};
+use crate::components::computer::computer_attention_banner;
 use crate::components::fields::field_input;
-use crate::opengrok::thin_tape;
+use crate::opengrok::{
+    computer_window_attention_done_id, computer_window_attention_id,
+    computer_window_attention_skip_id, thin_tape,
+};
 use crate::state::AppState;
 
 /// The title bar the window paints for itself: tall enough for the traffic lights and a
@@ -753,6 +758,11 @@ impl Render for ComputerScreen {
             .pending
             .as_ref()
             .map(|pending| self.save_sheet(pending, &theme, cx));
+        let attention = self
+            .app
+            .read(cx)
+            .active_computer_handoff()
+            .map(|spec| (spec.card_key().to_string(), spec.handoff_prompt()));
         let body = match &self.webview {
             Ok(webview) => {
                 let webview = webview.clone();
@@ -809,6 +819,18 @@ impl Render for ComputerScreen {
                 cx.hide();
             }))
             .child(header)
+            .when_some(attention, |this, (key, instruction)| {
+                this.child(computer_attention_banner(
+                    computer_window_attention_id(),
+                    computer_window_attention_skip_id(&key),
+                    computer_window_attention_done_id(&key),
+                    key,
+                    instruction,
+                    true,
+                    self.app.clone(),
+                    cx,
+                ))
+            })
             .when_some(sheet, |this, sheet| this.child(sheet))
             .child(body)
     }

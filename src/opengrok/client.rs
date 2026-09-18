@@ -656,8 +656,8 @@ impl OpenGrokClient {
         Self::user_form_action_response(response).await
     }
 
-    /// Hand back / decline / timeout. `entry_id` is the handoff card from
-    /// dismiss `handoffEntryId`, never the user-form id.
+    /// Hand back / decline / timeout. `entry_id` is dismiss `handoffEntryId`
+    /// when present, else the form gateway id for an open handoff.
     pub async fn resolve_box_handoff(
         &self,
         handoff_entry_id: &str,

@@ -37,12 +37,15 @@
 //!
 //! - `POST /ag-ui/user-form/submit` `{entryId, agentId, values}`
 //! - `POST /ag-ui/user-form/dismiss` `{entryId, agentId, mode: dismissed|escalated}`
-//! - `POST /ag-ui/box-handoff/resolve` `{entryId: handoffEntryId, agentId, resolution}`
+//! - `POST /ag-ui/box-handoff/resolve` `{entryId, agentId, resolution}`
 //!
 //! **Form `entryId` is the gateway card id, never `callId`.** Open the screen
 //! keeps that id for the pill and stores **`handoffEntryId`** from the dismiss
-//! response. **I'm done** / **Skip** POST that handoff id (`handed_back` /
-//! `declined`) — **not** the form card id, **not** `handBackForeverBox`.
+//! response when the server mints a sibling card. **I'm done** / **Skip** POST
+//! that sibling id when we have it (`handed_back` / `declined`). If dismiss
+//! Keep / `sand://box` omit a sibling, POST the **form** gateway `entryId` —
+//! an open Action needed handoff must resolve without Take over first, and
+//! without inventing a `callId`. Never `handBackForeverBox`.
 //! **Take over** opens/focuses the Computer (pane + screen). The live card is
 //! Grok Computer chrome, not the collapsed **On the computer** form.
 //!
@@ -438,6 +441,18 @@ pub fn computer_attention_done_id(card_key: &str) -> String {
     format!("computer-attention-done-{card_key}")
 }
 
+pub fn computer_window_attention_id() -> &'static str {
+    "computer-window-attention"
+}
+
+pub fn computer_window_attention_skip_id(card_key: &str) -> String {
+    format!("computer-window-attention-skip-{card_key}")
+}
+
+pub fn computer_window_attention_done_id(card_key: &str) -> String {
+    format!("computer-window-attention-done-{card_key}")
+}
+
 /// OpenGrok Computer handoff attachment (`sand://box` / `computer_handoff_card`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputerHandoffSpec {
@@ -771,7 +786,8 @@ impl UserFormSpec {
                 .or_else(|| string_field(value, "liveHost")),
             resolution,
             widget_dismissed,
-            handoff_entry_id: string_field(value, "handoffEntryId"),
+            handoff_entry_id: parse_handoff_entry_id(value)
+                .or_else(|| request.and_then(parse_handoff_entry_id)),
             box_request_id: request
                 .and_then(|req| string_field(req, "boxRequestId"))
                 .or_else(|| string_field(value, "boxRequestId")),
@@ -925,7 +941,35 @@ pub fn dismiss_request_body(entry_id: &str, agent_id: &str, mode: UserFormDismis
     })
 }
 
-/// Hand back / decline / timeout. `entry_id` is [`UserFormSpec::handoff_entry_id`].
+/// Id POSTed to `/ag-ui/box-handoff/resolve`. Prefer dismiss `handoffEntryId`.
+/// When the server omitted a sibling card (Open the screen Keep / `sand://box`),
+/// the form gateway `entryId` is the live handoff. Never empty. Never invent a
+/// `callId` — callers pass [`UserFormSpec::entry_id`], not [`UserFormSpec::card_key`].
+pub fn box_handoff_resolve_entry_id(
+    handoff_entry_id: Option<&str>,
+    form_entry_id: &str,
+) -> Option<String> {
+    if let Some(id) = handoff_entry_id.map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(id.to_string());
+    }
+    let form = form_entry_id.trim();
+    if form.is_empty() {
+        return None;
+    }
+    Some(form.to_string())
+}
+
+/// Local Skip / I'm done chrome can settle on these replies. 200-null Keep
+/// (`Empty`) still ends the open handoff; a missing route does not.
+pub fn box_handoff_settles_locally(reply: &BoxHandoffReply) -> bool {
+    matches!(
+        reply,
+        BoxHandoffReply::Settled | BoxHandoffReply::AlreadyAnswered | BoxHandoffReply::Empty
+    )
+}
+
+/// Hand back / decline / timeout. `entry_id` is
+/// [`box_handoff_resolve_entry_id`].
 pub fn resolve_handoff_request_body(
     handoff_entry_id: &str,
     agent_id: &str,
@@ -1197,6 +1241,20 @@ fn parse_options(row: &Value) -> Vec<UserFormSelectOption> {
             Some(UserFormSelectOption { value, label })
         })
         .collect()
+}
+
+fn first_handoff_entry_id(value: &Value) -> Option<String> {
+    string_field(value, "handoffEntryId")
+        .or_else(|| string_field(value, "handoff_entry_id"))
+        .or_else(|| string_field(value, "boxHandoffEntryId"))
+        .or_else(|| string_field(value, "handoffId"))
+}
+
+fn parse_handoff_entry_id(value: &Value) -> Option<String> {
+    first_handoff_entry_id(value)
+        .or_else(|| value.get("message").and_then(first_handoff_entry_id))
+        .or_else(|| value.get("formRequest").and_then(first_handoff_entry_id))
+        .or_else(|| value.get("value").and_then(first_handoff_entry_id))
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -2125,6 +2183,72 @@ mod tests {
             ),
             BoxHandoffReply::Settled
         );
+    }
+
+    #[test]
+    fn open_handoff_resolves_with_form_entry_id_when_sibling_is_missing() {
+        assert_eq!(
+            box_handoff_resolve_entry_id(Some("e_hand"), "e_form").as_deref(),
+            Some("e_hand"),
+            "dismiss sibling wins when the server minted one"
+        );
+        assert_eq!(
+            box_handoff_resolve_entry_id(None, "e_form").as_deref(),
+            Some("e_form"),
+            "Open the screen Keep / sand://box POST the form gateway id"
+        );
+        assert_eq!(
+            box_handoff_resolve_entry_id(Some("   "), "e_form").as_deref(),
+            Some("e_form")
+        );
+        assert_eq!(
+            box_handoff_resolve_entry_id(None, ""),
+            None,
+            "never invent a callId"
+        );
+        assert_eq!(
+            box_handoff_resolve_entry_id(Some("e_hand"), "").as_deref(),
+            Some("e_hand")
+        );
+        assert!(box_handoff_settles_locally(&BoxHandoffReply::Empty));
+        assert!(box_handoff_settles_locally(&BoxHandoffReply::Settled));
+        assert!(box_handoff_settles_locally(
+            &BoxHandoffReply::AlreadyAnswered
+        ));
+        assert!(!box_handoff_settles_locally(&BoxHandoffReply::MissingRoute));
+        assert!(!box_handoff_settles_locally(
+            &BoxHandoffReply::MissingEntryId
+        ));
+    }
+
+    #[test]
+    fn handoff_entry_id_parses_aliases_and_nested_envelopes() {
+        let snake = UserFormSpec::parse(
+            &json!({
+                "entryId": "e_form",
+                "formResolution": "escalated",
+                "handoff_entry_id": "e_hand_snake",
+                "formRequest": {"title": "Computer"}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(snake.handoff_entry_id.as_deref(), Some("e_hand_snake"));
+        let nested = UserFormSpec::parse(
+            &json!({
+                "id": "e_form",
+                "kind": "send-message",
+                "formResolution": "escalated",
+                "message": {
+                    "type": "user-form",
+                    "handoffEntryId": "e_nested",
+                    "formRequest": {"title": "Computer"}
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(nested.handoff_entry_id.as_deref(), Some("e_nested"));
     }
 
     #[test]

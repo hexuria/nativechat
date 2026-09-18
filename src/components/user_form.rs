@@ -219,11 +219,7 @@ fn render_computer_handoff(
         .as_ref()
         .map(|entity| entity.read(cx).user_form_verbs_available)
         .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
-    let handoff_id = spec.handoff_entry_id.clone().or_else(|| {
-        app.as_ref()
-            .and_then(|entity| entity.read(cx).user_form_handoff_id(spec.card_key()))
-    });
-    let can_resolve = server_fill && handoff_id.is_some();
+    let can_resolve = server_fill;
     let screen = app.as_ref().and_then(|entity| {
         let state = entity.read(cx);
         state
@@ -345,7 +341,7 @@ fn render_computer_handoff(
                     "I'm done",
                     ButtonKind::Secondary,
                     !can_resolve,
-                    handoff_id.is_none(),
+                    !server_fill,
                     {
                         let app = app.clone();
                         let key = key.clone();
@@ -367,7 +363,7 @@ fn render_computer_handoff(
                     "Skip",
                     ButtonKind::Ghost,
                     !can_resolve,
-                    handoff_id.is_none(),
+                    !server_fill,
                     {
                         let app = app.clone();
                         can_resolve.then_some(move |cx: &mut App| {
@@ -650,11 +646,7 @@ fn escalated_actions(spec: &UserFormSpec, app: Option<Entity<AppState>>, cx: &Ap
     let handed_back = app
         .as_ref()
         .is_some_and(|entity| entity.read(cx).user_form_handoff_resolved(spec.card_key()));
-    let handoff_id = spec.handoff_entry_id.clone().or_else(|| {
-        app.as_ref()
-            .and_then(|entity| entity.read(cx).user_form_handoff_id(spec.card_key()))
-    });
-    let can_resolve = server_fill && handoff_id.is_some() && !handed_back;
+    let can_resolve = server_fill && !handed_back;
     let key = spec.card_key().to_string();
     h_flex()
         .w_full()
@@ -667,7 +659,7 @@ fn escalated_actions(spec: &UserFormSpec, app: Option<Entity<AppState>>, cx: &Ap
                 "Hand back control",
                 ButtonKind::Primary,
                 !can_resolve,
-                handoff_id.is_none(),
+                !server_fill,
                 {
                     let app = app.clone();
                     let key = key.clone();
@@ -689,7 +681,7 @@ fn escalated_actions(spec: &UserFormSpec, app: Option<Entity<AppState>>, cx: &Ap
                 "Stop for now",
                 ButtonKind::Ghost,
                 !can_resolve,
-                handoff_id.is_none(),
+                !server_fill,
                 {
                     let app = app.clone();
                     can_resolve.then_some(move |cx: &mut App| {

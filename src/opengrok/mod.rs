@@ -35,13 +35,15 @@ pub use user_form::{
     USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH, USER_FORM_SERVER_FILL_AVAILABLE,
     USER_FORM_SUBMIT_PATH, UserFormActionReply, UserFormDismissMode, UserFormField,
     UserFormFieldKind, UserFormHttpSettle, UserFormSpec, UserFormValues, UserFormVerb,
-    WAITING_FOR_YOU, bind_call_peers, box_handoff_action_from_http, computer_attention_done_id,
-    computer_attention_id, computer_attention_skip_id, computer_handoff_card_id,
-    computer_handoff_done_id, computer_handoff_skip_id, computer_handoff_takeover_id,
-    continue_enabled, dismiss_request_body, is_form_entry_missing, is_user_form_awaiting,
-    is_user_form_custom_name, is_user_form_event, is_user_form_tool, resolve_handoff_request_body,
-    settle_user_form_http, submit_request_body, user_form_action_from_http, user_form_card_id,
-    user_form_continue_id, user_form_dismiss_id, user_form_field_id, user_form_screen_id,
+    WAITING_FOR_YOU, bind_call_peers, box_handoff_action_from_http, box_handoff_resolve_entry_id,
+    box_handoff_settles_locally, computer_attention_done_id, computer_attention_id,
+    computer_attention_skip_id, computer_handoff_card_id, computer_handoff_done_id,
+    computer_handoff_skip_id, computer_handoff_takeover_id, computer_window_attention_done_id,
+    computer_window_attention_id, computer_window_attention_skip_id, continue_enabled,
+    dismiss_request_body, is_form_entry_missing, is_user_form_awaiting, is_user_form_custom_name,
+    is_user_form_event, is_user_form_tool, resolve_handoff_request_body, settle_user_form_http,
+    submit_request_body, user_form_action_from_http, user_form_card_id, user_form_continue_id,
+    user_form_dismiss_id, user_form_field_id, user_form_screen_id,
 };
 pub use visibility::ImageVisibility;
 

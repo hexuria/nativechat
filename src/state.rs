@@ -15,9 +15,10 @@ use crate::opengrok::{
     SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
     TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
     UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
-    activity_from_replay, collapse_computer_roster, command_from_args, command_from_replay_events,
-    deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_enabled,
-    keep_local_save_offer, local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
+    activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, host_egress_tunnel_enabled, keep_local_save_offer,
+    local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
     reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
     stored_machine_id, tool_standin,
 };
@@ -6343,6 +6344,31 @@ impl AppState {
         self.user_form_handoffs.get(card_key).cloned()
     }
 
+    /// POST id for I'm done / Skip. Sibling `handoffEntryId` if the server
+    /// minted one; otherwise the form gateway `entryId` while Action needed.
+    fn box_handoff_post_id(&self, card_key: &str, form_entry_id: &str) -> Option<String> {
+        let stored = self
+            .user_form_handoffs
+            .get(card_key)
+            .or_else(|| {
+                (!form_entry_id.is_empty())
+                    .then(|| self.user_form_handoffs.get(form_entry_id))
+                    .flatten()
+            })
+            .map(String::as_str);
+        let spec_id = self.conversations.iter().find_map(|conversation| {
+            conversation.messages.iter().find_map(|message| {
+                message.parts.iter().find_map(|part| match part {
+                    ChatPart::UserForm(spec) if spec.card_key() == card_key => {
+                        spec.handoff_entry_id.as_deref()
+                    }
+                    _ => None,
+                })
+            })
+        });
+        box_handoff_resolve_entry_id(stored.or(spec_id), form_entry_id)
+    }
+
     pub fn user_form_handoff_resolved(&self, card_key: &str) -> bool {
         self.user_form_handoff_done.contains(card_key)
     }
@@ -6483,7 +6509,8 @@ impl AppState {
         self.dispatch_user_form(card_key, UserFormDispatch::Dismiss(mode), cx);
     }
 
-    /// Hand back / decline. POSTs the stored `handoffEntryId`, never the form id.
+    /// Hand back / decline. POSTs dismiss `handoffEntryId` when present, else
+    /// the form gateway `entryId` for an open Action needed handoff.
     pub fn resolve_user_form_handoff(
         &mut self,
         card_key: String,
@@ -6769,31 +6796,19 @@ impl AppState {
         else {
             return;
         };
-        if entry_id.is_empty() {
+        let handoff_entry_id = match &action {
+            UserFormDispatch::ResolveHandoff(_) => self.box_handoff_post_id(&card_key, &entry_id),
+            _ => None,
+        };
+        if matches!(action, UserFormDispatch::ResolveHandoff(_)) {
+            if handoff_entry_id.is_none() {
+                // No sibling id and no form gateway id — do not POST callId.
+                return;
+            }
+        } else if entry_id.is_empty() {
             // #140: AG-UI CUSTOM has no gateway card id. Do not POST callId.
             return;
         }
-        let handoff_entry_id = match &action {
-            UserFormDispatch::ResolveHandoff(_) => {
-                let mut id = self
-                    .user_form_handoffs
-                    .get(&card_key)
-                    .cloned()
-                    .unwrap_or_default();
-                if id.is_empty() {
-                    id = self
-                        .user_form_mut(&card_key)
-                        .and_then(|spec| spec.handoff_entry_id.clone())
-                        .unwrap_or_default();
-                }
-                if id.is_empty() || id == entry_id {
-                    // Never resolve the form card. Never invent an id.
-                    return;
-                }
-                Some(id)
-            }
-            _ => None,
-        };
         match &action {
             UserFormDispatch::Submit(values) => {
                 self.stash_save_candidate(&card_key, values);
@@ -6806,7 +6821,9 @@ impl AppState {
                     self.show_computer_pane(cx);
                 }
             }
-            UserFormDispatch::ResolveHandoff(_) => {}
+            UserFormDispatch::ResolveHandoff(_) => {
+                self.user_form_handoff_done.insert(card_key.clone());
+            }
         }
         cx.notify();
         let Some(client) = self.opengrok.clone() else {
@@ -6825,7 +6842,11 @@ impl AppState {
                     .await;
                 let _ = this.update(cx, |state, cx| {
                     match result {
-                        Ok(BoxHandoffReply::Settled) | Ok(BoxHandoffReply::AlreadyAnswered) => {
+                        Ok(
+                            BoxHandoffReply::Settled
+                            | BoxHandoffReply::AlreadyAnswered
+                            | BoxHandoffReply::Empty,
+                        ) => {
                             state.user_form_handoff_done.insert(card_key.clone());
                             if !run_id.is_empty() {
                                 state.begin_responding(Some(&conversation_id), "Working");
@@ -6835,7 +6856,9 @@ impl AppState {
                         Ok(BoxHandoffReply::MissingRoute) => {
                             state.user_form_verbs_available = false;
                         }
-                        Ok(BoxHandoffReply::Empty) | Ok(BoxHandoffReply::MissingEntryId) => {}
+                        Ok(BoxHandoffReply::MissingEntryId) => {
+                            state.user_form_handoff_done.remove(&card_key);
+                        }
                         Err(error) => {
                             if error.is_signed_out() {
                                 state.note_signed_out(cx);
@@ -8641,6 +8664,39 @@ mod tests {
             }
             other => panic!("Dismissed must stay in the same slot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_handoff_posts_form_entry_id_when_sibling_id_is_missing() {
+        let mut spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formResolution": "escalated",
+                "formRequest": {
+                    "title": "Computer",
+                    "instruction": "Sign in on the computer."
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(spec.shows_computer_handoff());
+        assert!(spec.handoff_entry_id.is_none());
+        let mut bot = message("m1", false, "Open the screen");
+        bot.parts = vec![ChatPart::UserForm(spec.clone())];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form").as_deref(),
+            Some("e_form"),
+            "Skip / I'm done must POST the form gateway id while Action needed"
+        );
+        spec.handoff_entry_id = Some("e_hand".into());
+        state.conversations[0].messages[0].parts = vec![ChatPart::UserForm(spec)];
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form").as_deref(),
+            Some("e_hand")
+        );
     }
 
     /// A row written before pieces were kept has none of them — which is also every row the

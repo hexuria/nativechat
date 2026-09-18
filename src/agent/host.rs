@@ -11,9 +11,11 @@ use crate::opengrok::{
     ScreenshotSpec, UserFormDismissMode, UserFormFieldKind, computer_attention_done_id,
     computer_attention_id, computer_attention_skip_id, computer_handoff_card_id,
     computer_handoff_done_id, computer_handoff_skip_id, computer_handoff_takeover_id,
-    credential_request_allow_id, credential_request_card_id, credential_request_deny_id,
-    save_login_card_id, save_login_save_id, save_login_skip_id, user_form_card_id,
-    user_form_continue_id, user_form_dismiss_id, user_form_field_id, user_form_screen_id,
+    computer_window_attention_done_id, computer_window_attention_id,
+    computer_window_attention_skip_id, credential_request_allow_id, credential_request_card_id,
+    credential_request_deny_id, save_login_card_id, save_login_save_id, save_login_skip_id,
+    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
+    user_form_screen_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -1257,6 +1259,21 @@ impl NativeChatHost {
                         "I'm done, continue",
                     )),
             );
+            page = page.with_child(
+                UiNode::new(
+                    computer_window_attention_id(),
+                    "dialog",
+                    "Needs your attention",
+                )
+                .with_child(UiNode::button(
+                    computer_window_attention_skip_id(&handoff.card_key),
+                    "Skip this step",
+                ))
+                .with_child(UiNode::button(
+                    computer_window_attention_done_id(&handoff.card_key),
+                    "I'm done, continue",
+                )),
+            );
         }
         page = page.with_child(computer);
         if let Some(ready) = self.egress_tunnel_ready {
@@ -1545,13 +1562,17 @@ impl NativeChatHost {
                     card_key: key.clone(),
                 });
             }
-            if target == computer_handoff_done_id(key) || target == computer_attention_done_id(key)
+            if target == computer_handoff_done_id(key)
+                || target == computer_attention_done_id(key)
+                || target == computer_window_attention_done_id(key)
             {
                 return Some(Command::ComputerHandoffDone {
                     card_key: key.clone(),
                 });
             }
-            if target == computer_handoff_skip_id(key) || target == computer_attention_skip_id(key)
+            if target == computer_handoff_skip_id(key)
+                || target == computer_attention_skip_id(key)
+                || target == computer_window_attention_skip_id(key)
             {
                 return Some(Command::ComputerHandoffSkip {
                     card_key: key.clone(),
@@ -2725,6 +2746,22 @@ mod tests {
             tree.find("computer-attention-done-e_form").unwrap().name,
             "I'm done, continue"
         );
+        assert_eq!(
+            tree.find("computer-window-attention").unwrap().name,
+            "Needs your attention"
+        );
+        assert_eq!(
+            tree.find("computer-window-attention-skip-e_form")
+                .unwrap()
+                .name,
+            "Skip this step"
+        );
+        assert_eq!(
+            tree.find("computer-window-attention-done-e_form")
+                .unwrap()
+                .name,
+            "I'm done, continue"
+        );
         host.dispatch(&Op::click("computer-handoff-takeover-e_form"))
             .unwrap();
         assert!(matches!(
@@ -2742,6 +2779,12 @@ mod tests {
         assert!(matches!(
             host.take_command(),
             Some(Command::ComputerHandoffSkip { .. })
+        ));
+        host.dispatch(&Op::click("computer-window-attention-done-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffDone { .. })
         ));
     }
 
