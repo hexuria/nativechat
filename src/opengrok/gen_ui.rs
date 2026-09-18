@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::client::LocalExecMode;
 use super::credential::{CredentialRequestSpec, SaveLoginSpec};
 use super::user_form::{UserFormSpec, is_user_form_awaiting, is_user_form_tool};
+use super::visibility::{ImageVisibility, pin_shot_at_turn_end, pin_shot_now};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatPart {
@@ -19,8 +20,9 @@ pub enum ChatPart {
     Ui(UiSpec),
     /// A tool the person must allow or refuse before the run continues.
     Approval(ApprovalSpec),
-    /// The bot's screen when it belongs in the feed (failure, turn end,
-    /// Open-the-screen). Intermediate computer-step PNGs stay off this list.
+    /// The bot's screen when it belongs in the feed (`image.visibility` =
+    /// `transcript` | `failure` | `end`, or an untagged turn-end/failure pin).
+    /// `agent` shots stay off this list and paint in the Computer pane.
     Screenshot(ScreenshotSpec),
     /// In-chat credentials that fill the box page. Not [`UiSpec::Form`], not a vault.
     UserForm(UserFormSpec),
@@ -39,6 +41,8 @@ pub struct ScreenshotSpec {
     pub image: std::sync::Arc<gpui_kit::Image>,
     pub width: u32,
     pub height: u32,
+    /// `None` on frames that predate `image.visibility`.
+    pub visibility: Option<ImageVisibility>,
 }
 
 impl PartialEq for ScreenshotSpec {
@@ -52,8 +56,9 @@ impl PartialEq for ScreenshotSpec {
 }
 
 impl ScreenshotSpec {
-    /// From a `TOOL_CALL_RESULT` frame's `image` (`{mime, base64, width, height}`), or `None`
-    /// when it is not a PNG we can paint.
+    /// From a `TOOL_CALL_RESULT` frame's `image`
+    /// (`{mime, base64, width, height, visibility?}`), or `None` when it is
+    /// not a PNG we can paint. Journalled `agent` frames drop `base64`.
     pub fn from_frame(call_id: &str, caption: &str, image: &Value) -> Option<Self> {
         use base64::Engine as _;
         let mime = image
@@ -69,6 +74,10 @@ impl ScreenshotSpec {
             .ok()?;
         let width = image.get("width").and_then(Value::as_u64)? as u32;
         let height = image.get("height").and_then(Value::as_u64)? as u32;
+        let visibility = image
+            .get("visibility")
+            .and_then(Value::as_str)
+            .and_then(ImageVisibility::parse);
         Some(Self {
             call_id: call_id.to_string(),
             caption: caption.to_string(),
@@ -78,7 +87,20 @@ impl ScreenshotSpec {
             )),
             width,
             height,
+            visibility,
         })
+    }
+
+    /// Pin into chat now. Tagged `transcript`/`failure`/`end` yes; `agent` no.
+    /// Untagged: only a failed tool (`ok == false`), matching the pre-tag heuristic.
+    pub fn pin_now(&self, ok: Option<bool>) -> bool {
+        pin_shot_now(self.visibility, ok)
+    }
+
+    /// Turn-end pin. Tagged `agent` stays off the feed; everything else may
+    /// already be pinned (`pin_now`) and this is idempotent by `call_id`.
+    pub fn pin_at_turn_end(&self) -> bool {
+        pin_shot_at_turn_end(self.visibility)
     }
 }
 
@@ -440,14 +462,16 @@ impl TurnAssembler {
             spec.output = Some(content.clone());
             spec.ok = ok;
         }
-        // Keep every PNG for the Computer pane / last-screen thumb. Row it
-        // into chat only on failure; success shots wait for turn-end pin.
+        // Keep every PNG with bytes for the Computer pane / last-screen thumb.
+        // Chat row follows `image.visibility` (opengrok-server#139). Untagged
+        // frames keep the old heuristic: failure now, last shot at turn-end.
         if let Some(shot) = event
             .get("image")
             .and_then(|image| ScreenshotSpec::from_frame(&call_id, &content, image))
         {
+            let pin_now = shot.pin_now(ok);
             self.latest_shot = Some(shot.clone());
-            if ok == Some(false) {
+            if pin_now {
                 self.pin_shot(shot);
             } else {
                 self.break_feed_paragraph();
@@ -466,6 +490,9 @@ impl TurnAssembler {
         let Some(shot) = self.latest_shot.clone() else {
             return;
         };
+        if !shot.pin_at_turn_end() {
+            return;
+        }
         if self.committed.iter().any(|part| {
             matches!(part, ChatPart::Screenshot(existing) if existing.call_id == shot.call_id)
         }) {
@@ -487,7 +514,8 @@ impl TurnAssembler {
     }
 
     /// Stream ended. Mount a UI tool if its args already parse; otherwise release held text.
-    /// Pins the last computer PNG as a turn-end milestone (not every step).
+    /// Pins the last computer PNG when `image.visibility` is not `agent` (turn-end
+    /// `end` / untagged heuristic). Tagged `agent` stays Computer-pane only.
     pub fn finish(&mut self) {
         self.flush_text();
         if let Some(tool) = self.tool.take() {
@@ -1618,6 +1646,116 @@ mod tests {
         );
     }
 
+    fn png_image(visibility: Option<&str>) -> Value {
+        let mut image = json!({
+            "mime": "image/png",
+            "base64": TINY_PNG,
+            "width": 1280,
+            "height": 800
+        });
+        if let Some(visibility) = visibility {
+            image["visibility"] = json!(visibility);
+        }
+        image
+    }
+
+    #[test]
+    fn agent_visibility_stays_off_the_feed_and_on_the_computer_pane() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({"type":"TEXT_MESSAGE_CONTENT","delta":"Working."}));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "step-1",
+            "content": "click 1",
+            "ok": true,
+            "image": png_image(Some("agent"))
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "step-2",
+            "content": "click 2",
+            "ok": true,
+            "image": png_image(Some("agent"))
+        }));
+        let (_, mid) = turn.snapshot();
+        assert!(
+            !mid.iter()
+                .any(|part| matches!(part, ChatPart::Screenshot(_))),
+            "agent shots are Computer-pane only: {mid:?}"
+        );
+        assert_eq!(
+            turn.latest_screenshot().map(|s| s.call_id.as_str()),
+            Some("step-2")
+        );
+        assert_eq!(
+            turn.latest_screenshot().and_then(|s| s.visibility),
+            Some(ImageVisibility::Agent)
+        );
+        turn.finish();
+        let (_, parts) = turn.snapshot();
+        assert!(
+            !parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Screenshot(_))),
+            "finish must not pin agent: {parts:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_failure_end_visibility_pin_immediately() {
+        for (visibility, call_id) in [
+            ("transcript", "observe"),
+            ("failure", "stuck"),
+            ("end", "turn-end"),
+        ] {
+            let mut turn = TurnAssembler::default();
+            turn.push_event(&json!({
+                "type": "TOOL_CALL_RESULT",
+                "toolCallId": call_id,
+                "content": visibility,
+                "ok": true,
+                "image": png_image(Some(visibility))
+            }));
+            let (_, parts) = turn.snapshot();
+            match parts.as_slice() {
+                [ChatPart::Screenshot(spec)] => {
+                    assert_eq!(spec.call_id, call_id);
+                    assert_eq!(
+                        spec.visibility,
+                        ImageVisibility::parse(visibility),
+                        "{visibility}"
+                    );
+                }
+                other => panic!("{visibility} should pin before finish, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn journalled_agent_frame_without_bytes_is_not_a_chat_row() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "step-1",
+            "content": "click",
+            "ok": true,
+            "image": {
+                "mime": "image/png",
+                "width": 1280,
+                "height": 800,
+                "visibility": "agent"
+            }
+        }));
+        turn.finish();
+        let (_, parts) = turn.snapshot();
+        assert!(
+            !parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Screenshot(_)))
+        );
+        assert!(turn.latest_screenshot().is_none());
+    }
+
     fn user_form_custom(entry: &str, request: Value, resolution: Value) -> Value {
         json!({
             "type": "CUSTOM",
@@ -2139,5 +2277,57 @@ mod tests {
         let dump = format!("{parts:?}");
         assert!(!dump.contains("s3cret-pass"));
         assert!(!dump.contains("nope"));
+    }
+
+    #[test]
+    fn settled_send_message_form_resolution_folds_onto_awaiting() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Sign in",
+                "fields": [
+                    {"id": "email", "label": "Email", "type": "email", "required": true},
+                    {"id": "password", "label": "Password", "type": "password", "required": true, "value": "s3cret-pass"}
+                ]
+            }
+        }));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": {
+                        "title": "Sign in",
+                        "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                    }
+                },
+                "formResolution": "submitted"
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.call_id, "call-9");
+                assert_eq!(
+                    spec.effective_resolution(),
+                    Some(crate::opengrok::FormResolution::Submitted)
+                );
+                assert!(!spec.is_unresolved());
+            }
+            other => panic!("expected one settled card, got {other:?}"),
+        }
+        let dump = format!("{parts:?}");
+        assert!(!dump.contains("s3cret-pass"));
     }
 }

@@ -919,8 +919,9 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
-    /// The coworker's screen right now: `{mime, base64, width, height}`, the same shape as the
-    /// `image` on a `TOOL_CALL_RESULT`, so `ScreenshotSpec::from_frame` decodes both.
+    /// The coworker's screen right now: `{mime, base64, width, height, visibility?}`,
+    /// the same shape as `TOOL_CALL_RESULT.image`. `GET /coworkers/{id}/screen`
+    /// is the `transcript` observe pin; `ScreenshotSpec::from_frame` decodes both.
     pub async fn coworker_screen(&self, coworker_id: &str) -> Result<Value, OpenGrokError> {
         let path = format!("/coworkers/{coworker_id}/screen");
         let response = self

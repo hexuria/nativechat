@@ -23,8 +23,11 @@
 //!    turn path. The envelope is still parsed if it appears on a value we
 //!    already accept.
 //!
-//! [`USER_FORM_CUSTOM`] (`CUSTOM` `name: "user-form"`) is a **test/fixture
-//! alias only**. The server does not emit that name on AG-UI.
+//! [`USER_FORM_CUSTOM`] (`CUSTOM` `name: "user-form"`) is **settled/replay
+//! only**. Live HITL stays `run-awaiting-approval`. On settle, OpenGrok
+//! journals a `user-form` CUSTOM whose `value` is the gateway envelope
+//! (`formRequest` + sibling `formResolution`). NativeChat folds that onto
+//! the awaiting card.
 //!
 //! # Fill verbs
 //!
@@ -70,7 +73,7 @@
 
 use serde_json::{Value, json};
 
-/// Fixture CUSTOM `name` only. Live #139 HITL is `run-awaiting-approval`
+/// Settled/replay CUSTOM `name`. Live #139 HITL is `run-awaiting-approval`
 /// with `reason: "user-form"` — see [`is_user_form_awaiting`].
 pub const USER_FORM_CUSTOM: &str = "user-form";
 
@@ -703,7 +706,8 @@ impl UserFormValues {
     }
 }
 
-/// Fixture / optional CUSTOM names. Not what #139 emits on AG-UI SSE.
+/// Fixture / settled-replay CUSTOM names. Live HITL on AG-UI SSE is
+/// `run-awaiting-approval`, not these.
 pub fn is_user_form_custom_name(name: &str) -> bool {
     matches!(
         normalize_name(name).as_str(),

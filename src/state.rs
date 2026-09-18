@@ -9,15 +9,16 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, ChatPart, ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch,
     CredentialRequestSpec, CredentialResultStatus, Failure, FormResolution, FormSpec,
-    LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError,
-    ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult,
-    RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec,
-    ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
-    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply, UserFormDismissMode,
-    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    env_egress_tunnel_enabled, host_egress_tunnel_enabled, local_exec_outcome, policy_answer,
-    reads_as_gateway_unreachable, result_without_broker, serve_local_exec, stored_machine_id,
+    ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
+    OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
+    SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
+    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
+    activity_from_replay, command_from_args, command_from_replay_events, deeds_from_replay,
+    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_enabled,
+    keep_local_save_offer, local_exec_outcome, policy_answer, reads_as_gateway_unreachable,
+    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
     tool_standin,
 };
 use crate::reachability::Reachability;
@@ -99,19 +100,35 @@ impl Message {
 ///
 /// A turn that was only words keeps nothing here — `content` already holds them, and a second
 /// copy would double every thread on disk. Cards are left out on purpose; see `MessagePart`.
-/// Screenshots stay off sqlite until OpenGrok tags feed visibility — every computer-step PNG
-/// used to land here and flood both the transcript and the database. Because a card or picture
-/// is dropped, the words on either side of one are kept apart by a blank line, the same break
-/// `content` gets, rather than running together into one sentence. A chart, which is cut out
-/// of the middle of a sentence, leaves that sentence whole.
+/// Pinned screenshots (`image.visibility` = `transcript` | `failure` | `end`, plus untagged
+/// failure/turn-end pins) stay on disk so a bot switch still has the picture without waiting
+/// on OpenGrok. `agent` shots never become [`ChatPart::Screenshot`]. User-form cards still
+/// rehydrate from `formRequest` + sibling `formResolution`. Because a card is dropped, the
+/// words on either side of one are kept apart by a blank line, the same break `content` gets,
+/// rather than running together into one sentence. A chart, which is cut out of the middle of
+/// a sentence, leaves that sentence whole.
 fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
     let mut saved: Vec<MessagePart> = Vec::new();
     let mut words = String::new();
     for part in parts {
         match part {
             ChatPart::Text(text) => words.push_str(text),
-            ChatPart::Screenshot(_)
-            | ChatPart::Approval(_)
+            ChatPart::Screenshot(spec)
+                if matches!(spec.visibility, Some(ImageVisibility::Agent)) =>
+            {
+                break_paragraph(&mut words);
+            }
+            ChatPart::Screenshot(spec) => {
+                close_text_run(&mut words, &mut saved);
+                saved.push(MessagePart::Screenshot {
+                    call_id: spec.call_id.clone(),
+                    caption: spec.caption.clone(),
+                    image: spec.image.bytes.clone(),
+                    width: spec.width,
+                    height: spec.height,
+                });
+            }
+            ChatPart::Approval(_)
             | ChatPart::UserForm(_)
             | ChatPart::SaveLogin(_)
             | ChatPart::CredentialRequest(_) => break_paragraph(&mut words),
@@ -177,6 +194,7 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 )),
                 width,
                 height,
+                visibility: Some(ImageVisibility::Transcript),
             }),
         })
         .collect()
@@ -184,9 +202,10 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
 
 /// Fold OpenGrok-owned cards onto a sqlite row that dropped them.
 ///
-/// User-form (idle + settled, never secrets) and pinned screenshots live on
-/// the server. Local `saved_parts` does not keep them, so a bot switch would
-/// otherwise lose Submitted.
+/// User-form (idle + settled, never secrets) lives on the server as
+/// `formRequest` + sibling `formResolution`. Pinned screenshots may already
+/// be in sqlite; overlay still fills gaps. Save-login is origin+username
+/// only — the password stays in host `pending_save`, never on the wire.
 fn overlay_server_cards(message: &mut Message, replayed: &[ChatPart]) {
     for part in replayed {
         match part {
@@ -223,6 +242,17 @@ fn overlay_server_cards(message: &mut Message, replayed: &[ChatPart]) {
                     message
                         .parts
                         .push(ChatPart::CredentialRequest(incoming.clone()));
+                }
+            }
+            ChatPart::SaveLogin(incoming) => {
+                let already = message.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        ChatPart::SaveLogin(spec) if spec.form_entry_id == incoming.form_entry_id
+                    )
+                });
+                if !already {
+                    message.parts.push(ChatPart::SaveLogin(incoming.clone()));
                 }
             }
             _ => {}
@@ -4628,9 +4658,9 @@ impl AppState {
     /// been watching, and every turn since has gone to disk through the same door.
     /// Bring a thread up to what the server says was said in it.
     ///
-    /// SQLite is a cache of words. User-form cards and tool PNGs live on OpenGrok
-    /// and are folded on every visit (bot switch / thread load), not only the
-    /// first reconcile of the session.
+    /// SQLite is a cache of words and pinned feed shots. User-form cards live
+    /// on OpenGrok (`formRequest` + `formResolution`) and are folded on every
+    /// visit (bot switch / thread load), not only the first reconcile.
     fn reconcile_thread(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
         if self.active_conversation_id.as_deref() != Some(conversation_id) {
             return;
@@ -4661,9 +4691,9 @@ impl AppState {
     /// The runs the server has that this thread has not, put back into it.
     ///
     /// A run that ended goes onto the thread and into the database, through the same
-    /// `persist_assistant_reply` a turn watched to the end goes through. Tool PNGs stay
-    /// off sqlite until OpenGrok tags visibility; `overlay_replay_cards` puts pinned
-    /// shots and user-form cards back from the server. A run still going is a turn that
+    /// `persist_assistant_reply` a turn watched to the end goes through. Pinned
+    /// feed shots (`transcript`/`failure`/`end`) go to sqlite; `overlay_replay_cards`
+    /// still folds user-form cards and any pins the cache dropped. A run still going is a turn that
     /// outlived whatever stopped watching it — a bot switch, or the app closing — and is
     /// re-attached to: the bubble comes back, the status line comes back, and the rest of
     /// the turn arrives in it.
@@ -4716,8 +4746,9 @@ impl AppState {
         cx.notify();
     }
 
-    /// Idle + settled user-form cards (never secrets) and pinned screenshots
-    /// from OpenGrok onto rows sqlite already has.
+    /// Idle + settled user-form cards (never secrets) from
+    /// `formRequest` + sibling `formResolution`, local save prompts, and
+    /// pinned screenshots from OpenGrok onto rows sqlite already has.
     fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
         let grafted: Vec<(String, Vec<ChatPart>)> = runs
             .iter()
@@ -6178,13 +6209,46 @@ impl AppState {
             }
         }
         parts.retain(|part| match part {
-            ChatPart::SaveLogin(spec) => {
-                self.pending_save.contains_key(&spec.form_entry_id)
-                    && !self.already_saved_login(&spec.origin, &spec.username)
-            }
+            ChatPart::SaveLogin(spec) => keep_local_save_offer(
+                self.pending_save.contains_key(&spec.form_entry_id),
+                self.already_saved_login(&spec.origin, &spec.username),
+            ),
             _ => true,
         });
+        self.inject_local_save_logins(&mut parts);
         parts
+    }
+
+    /// After Continue, `follow_run` / SSE overwrite `message.parts` from the
+    /// assembler. Re-attach the save prompt from local form values so we do
+    /// not wait for `credential.offer_save` (and never for a password).
+    fn inject_local_save_logins(&self, parts: &mut Vec<ChatPart>) {
+        for pending in self.pending_save.values() {
+            let already_has_card = parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ChatPart::SaveLogin(spec) if spec.form_entry_id == pending.form_entry_id
+                )
+            });
+            let form_submitted = parts.iter().any(|part| match part {
+                ChatPart::UserForm(spec) => {
+                    let same = spec.entry_id == pending.form_entry_id
+                        || spec.card_key() == pending.form_entry_id;
+                    same && spec.effective_resolution() == Some(FormResolution::Submitted)
+                }
+                _ => false,
+            });
+            if let Some(spec) = save_login_from_local(
+                &pending.form_entry_id,
+                &pending.origin,
+                &pending.username,
+                self.already_saved_login(&pending.origin, &pending.username),
+                form_submitted,
+                already_has_card,
+            ) {
+                parts.push(ChatPart::SaveLogin(spec));
+            }
+        }
     }
 
     fn user_form_mut(&mut self, card_key: &str) -> Option<&mut crate::opengrok::UserFormSpec> {
@@ -6313,10 +6377,12 @@ impl AppState {
     }
 
     /// Open-the-screen milestone: pin the last box PNG into chat once, not every step.
+    /// Treat it as `transcript` (explicit observe), even if the live frame was `agent`.
     fn pin_open_screen_shot(&mut self, conversation_id: &str) {
-        let Some(shot) = self.last_box_shot.clone() else {
+        let Some(mut shot) = self.last_box_shot.clone() else {
             return;
         };
+        shot.visibility = Some(ImageVisibility::Transcript);
         let Some(conversation) = self
             .conversations
             .iter_mut()
@@ -8198,6 +8264,116 @@ mod tests {
         assert!(saved_parts(&live).is_empty());
     }
 
+    #[test]
+    fn graft_injects_save_login_from_local_form_not_from_server() {
+        let mut submitted = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Google account",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true},
+                        {"id": "password", "label": "Password", "type": "password", "required": true}
+                    ]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        submitted.resolution = Some(FormResolution::Submitted);
+        let mut state = AppState::new();
+        state.pending_save.insert(
+            "e_form".into(),
+            PendingSave {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+                password: "s3cret-pass".into(),
+            },
+        );
+        let grafted = state.graft_user_forms(vec![ChatPart::UserForm(submitted)]);
+        match grafted.as_slice() {
+            [ChatPart::UserForm(_), ChatPart::SaveLogin(spec)] => {
+                assert_eq!(spec.origin, "google.com");
+                assert_eq!(spec.username, "ada@example.com");
+                assert_eq!(spec.form_entry_id, "e_form");
+            }
+            other => panic!("expected submitted form + local save prompt, got {other:?}"),
+        }
+        let dump = format!("{grafted:?}");
+        assert!(!dump.contains("s3cret-pass"));
+        assert!(saved_parts(&grafted).is_empty());
+    }
+
+    #[test]
+    fn graft_drops_server_offer_save_without_local_secret() {
+        let state = AppState::new();
+        let grafted =
+            state.graft_user_forms(vec![ChatPart::SaveLogin(crate::opengrok::SaveLoginSpec {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+            })]);
+        assert!(
+            grafted.is_empty(),
+            "never wait for the server to echo a password: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_puts_local_save_login_back_on_a_sqlite_row() {
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.parts = vec![ChatPart::Text("I'll sign you in.".into())];
+        overlay_server_cards(
+            &mut bot,
+            &[ChatPart::SaveLogin(crate::opengrok::SaveLoginSpec {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+            })],
+        );
+        match bot.parts.as_slice() {
+            [ChatPart::Text(_), ChatPart::SaveLogin(spec)] => {
+                assert_eq!(spec.origin, "google.com");
+                assert_eq!(spec.username, "ada@example.com");
+            }
+            other => panic!("expected save prompt overlaid, got {other:?}"),
+        }
+        assert!(!format!("{:?}", bot.parts).contains("password"));
+    }
+
+    #[test]
+    fn overlay_settles_user_form_from_send_message_envelope() {
+        let settled = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": {
+                        "title": "Sign in",
+                        "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                    }
+                },
+                "formResolution": "submitted"
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.parts = vec![ChatPart::Text("I'll sign you in.".into())];
+        overlay_server_cards(&mut bot, &[ChatPart::UserForm(settled)]);
+        match bot.parts.as_slice() {
+            [ChatPart::Text(_), ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+                assert!(spec.fields.iter().all(|f| f.prefill.is_none()));
+            }
+            other => panic!("expected settled send-message card, got {other:?}"),
+        }
+    }
+
     /// The app's own schema on a database that lives for the length of the test. One connection:
     /// a second connection to `:memory:` would open a second, empty database.
     async fn test_db() -> DatabaseService {
@@ -8229,6 +8405,7 @@ mod tests {
             )),
             width: size.0,
             height: size.1,
+            visibility: None,
         })
     }
 
@@ -8288,10 +8465,12 @@ mod tests {
         ];
         let content = "I'll open YouTube on my box using the taught recipe.\n\nYouTube is open on my box (not your Mac).";
 
-        // Pictures stay off sqlite until OpenGrok tags feed visibility. Words remain.
+        // Pinned feed shots persist. `agent` computer-step PNGs never become ChatPart.
         assert!(
-            saved_parts(&live).is_empty(),
-            "computer-step PNGs must not flood sqlite: {:?}",
+            saved_parts(&live).iter().any(
+                |part| matches!(part, MessagePart::Screenshot { call_id, .. } if call_id == "c1")
+            ),
+            "pinned shots belong in sqlite: {:?}",
             saved_parts(&live)
         );
         db.save_message(
@@ -8311,9 +8490,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let restored = restored_parts(&rows[0].content, rows[0].parts.clone());
         assert_eq!(
-            restored,
-            vec![ChatPart::Text(content.to_string())],
-            "sqlite keeps the words; pictures rehydrate from OpenGrok"
+            shape(&restored),
+            shape(&live),
+            "sqlite keeps the words and the pinned pictures"
         );
         assert_eq!(
             rows[0].run_id.as_deref(),
@@ -8761,14 +8940,12 @@ mod tests {
                 .any(|part| part.starts_with("shot c1 1280x800")),
             "the picture is in the turn, or this proves nothing about pictures"
         );
-        // SQLite does not keep every PNG; OpenGrok replay puts the pinned shot back.
         assert_eq!(saved_parts(&replayed_parts), saved_parts(&live_parts));
         assert!(
-            saved_parts(&replayed_parts).iter().all(|part| !matches!(
-                part,
-                crate::services::database::MessagePart::Screenshot { .. }
-            )),
-            "untagged PNGs stay off sqlite: {:?}",
+            saved_parts(&replayed_parts)
+                .iter()
+                .any(|part| matches!(part, crate::services::database::MessagePart::Screenshot { call_id, .. } if call_id == "c1")),
+            "the turn-end pin is kept: {:?}",
             saved_parts(&replayed_parts)
         );
     }

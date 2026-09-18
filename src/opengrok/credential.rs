@@ -217,6 +217,39 @@ pub fn result_without_broker(
     CredentialResultStatus::Error
 }
 
+/// Build the save prompt from values the host already has. Never takes a
+/// password — the secret stays in `PendingSave` until Keychain write.
+///
+/// `follow_run` / SSE overwrite chat parts from the assembler. Call this so
+/// the prompt does not wait for `credential.offer_save` (and never for a
+/// server-echoed password, which must not exist).
+pub fn save_login_from_local(
+    form_entry_id: &str,
+    origin: &str,
+    username: &str,
+    already_saved: bool,
+    form_submitted: bool,
+    already_has_card: bool,
+) -> Option<SaveLoginSpec> {
+    if already_saved || !form_submitted || already_has_card {
+        return None;
+    }
+    if form_entry_id.is_empty() || origin.is_empty() || username.is_empty() {
+        return None;
+    }
+    Some(SaveLoginSpec {
+        form_entry_id: form_entry_id.to_string(),
+        origin: origin.to_string(),
+        username: username.to_string(),
+    })
+}
+
+/// Keep a journalled `credential.offer_save` only when the host still has
+/// the local secret. No pending secret → drop the card.
+pub fn keep_local_save_offer(have_pending: bool, already_saved: bool) -> bool {
+    have_pending && !already_saved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +357,29 @@ mod tests {
         assert_eq!(CREDENTIAL_OFFER_SAVE, "credential.offer_save");
         assert_eq!(CREDENTIAL_REQUEST, "credential.request");
         assert_eq!(CREDENTIAL_RESULT, "credential.result");
+    }
+
+    #[test]
+    fn save_prompt_comes_from_local_values_not_a_server_password() {
+        let spec = save_login_from_local(
+            "e_form",
+            "google.com",
+            "ada@example.com",
+            false,
+            true,
+            false,
+        )
+        .expect("offer");
+        assert_eq!(spec.origin, "google.com");
+        assert_eq!(spec.username, "ada@example.com");
+        assert_eq!(spec.form_entry_id, "e_form");
+        assert!(save_login_from_local("e_form", "google.com", "ada", true, true, false).is_none());
+        assert!(
+            save_login_from_local("e_form", "google.com", "ada", false, false, false).is_none()
+        );
+        assert!(save_login_from_local("e_form", "google.com", "ada", false, true, true).is_none());
+        assert!(!keep_local_save_offer(false, false));
+        assert!(keep_local_save_offer(true, false));
+        assert!(!keep_local_save_offer(true, true));
     }
 }

@@ -1849,6 +1849,7 @@ mod tests {
             )),
             width: 1280,
             height: 800,
+            visibility: None,
         }
     }
 
