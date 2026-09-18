@@ -477,6 +477,13 @@ const APP_COMMANDS: &[(&str, &str, &str, &str, AppCommand)] = &[
         AppCommand::SettingsTab(AppSettingsTab::Computer),
     ),
     (
+        "settings-logins",
+        "icons/account_settings.svg",
+        "Settings: Logins",
+        "Saved site logins",
+        AppCommand::SettingsTab(AppSettingsTab::Logins),
+    ),
+    (
         "new-chat",
         "icons/apps.svg",
         "New chat",

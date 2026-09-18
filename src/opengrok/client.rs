@@ -611,6 +611,216 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// Fill the box page from the in-chat card. Account bearer. Not
+    /// `/ag-ui/runs/{id}/answer` and not `submitSecret`. `entryId` is the
+    /// gateway card id — an empty id is not sent as `callId`.
+    pub async fn submit_user_form(
+        &self,
+        entry_id: &str,
+        agent_id: &str,
+        values: &super::user_form::UserFormValues,
+    ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
+        if entry_id.trim().is_empty() {
+            return Ok(super::user_form::UserFormActionReply::MissingEntryId);
+        }
+        let body = super::user_form::submit_request_body(entry_id, agent_id, values);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::user_form::USER_FORM_SUBMIT_PATH,
+                Some(&body),
+            )
+            .await?;
+        Self::user_form_action_response(response).await
+    }
+
+    /// Dismiss or escalate the card. `mode` is `dismissed` or `escalated`
+    /// (Open the screen). Same `entryId` rule as submit.
+    pub async fn dismiss_user_form(
+        &self,
+        entry_id: &str,
+        agent_id: &str,
+        mode: super::user_form::UserFormDismissMode,
+    ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
+        if entry_id.trim().is_empty() {
+            return Ok(super::user_form::UserFormActionReply::MissingEntryId);
+        }
+        let body = super::user_form::dismiss_request_body(entry_id, agent_id, mode);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::user_form::USER_FORM_DISMISS_PATH,
+                Some(&body),
+            )
+            .await?;
+        Self::user_form_action_response(response).await
+    }
+
+    /// Hand back / decline / timeout. `entry_id` is dismiss `handoffEntryId`
+    /// (sibling Computer card). Never the form gateway id.
+    pub async fn resolve_box_handoff(
+        &self,
+        handoff_entry_id: &str,
+        agent_id: &str,
+        resolution: super::user_form::BoxHandoffResolution,
+    ) -> Result<super::user_form::BoxHandoffReply, OpenGrokError> {
+        if handoff_entry_id.trim().is_empty() {
+            return Ok(super::user_form::BoxHandoffReply::MissingEntryId);
+        }
+        let body =
+            super::user_form::resolve_handoff_request_body(handoff_entry_id, agent_id, resolution);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::user_form::BOX_HANDOFF_RESOLVE_PATH,
+                Some(&body),
+            )
+            .await?;
+        Self::box_handoff_action_response(response).await
+    }
+
+    /// A.0: tell the run what happened for `credential.request`. Never a password.
+    /// `filled` is not posted here — there is no session broker yet.
+    pub async fn post_credential_result(
+        &self,
+        status: super::credential::CredentialResultStatus,
+        request_id: &str,
+        credential_id: Option<&str>,
+        agent_id: &str,
+    ) -> Result<(), OpenGrokError> {
+        if request_id.trim().is_empty() {
+            return Ok(());
+        }
+        let body =
+            super::credential::credential_result_body(status, request_id, credential_id, agent_id);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::credential::CREDENTIAL_RESULT_PATH,
+                Some(&body),
+            )
+            .await?;
+        let status_code = response.status().as_u16();
+        if status_code == 404 || (200..300).contains(&status_code) {
+            return Ok(());
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        Err(OpenGrokError::from_server(
+            Some(status_code),
+            error_message_from_body(&text),
+        ))
+    }
+
+    async fn user_form_action_response(
+        response: reqwest::Response,
+    ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
+        let status = response.status().as_u16();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        let value: Value = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::Null)
+        };
+        if status == 404 {
+            return Ok(super::user_form::user_form_action_from_http(status, &value));
+        }
+        if !(200..300).contains(&status) {
+            return Err(OpenGrokError::from_server(
+                Some(status),
+                error_message_from_body(&text),
+            ));
+        }
+        Ok(super::user_form::user_form_action_from_http(status, &value))
+    }
+
+    async fn box_handoff_action_response(
+        response: reqwest::Response,
+    ) -> Result<super::user_form::BoxHandoffReply, OpenGrokError> {
+        let status = response.status().as_u16();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        let value: Value = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::Null)
+        };
+        if status == 404 {
+            return Ok(super::user_form::box_handoff_action_from_http(
+                status, &value,
+            ));
+        }
+        if !(200..300).contains(&status) {
+            return Err(OpenGrokError::from_server(
+                Some(status),
+                error_message_from_body(&text),
+            ));
+        }
+        Ok(super::user_form::box_handoff_action_from_http(
+            status, &value,
+        ))
+    }
+
+    /// Seam A `POST /api/{method}`. Account JWT as Bearer **and**
+    /// `x-opengrok-account`. A 401 here is usually the host bearer, not a
+    /// signed-out AG-UI session — callers must not treat it as sign-out.
+    async fn gateway_command(
+        &self,
+        method: &str,
+        args: Option<&Value>,
+    ) -> Result<Value, OpenGrokError> {
+        let path = format!("/api/{method}");
+        let url = self.url(&path)?;
+        self.ensure_fresh_token("/account").await;
+        let token = self.access_token();
+        let mut req = self.http.post(url);
+        if let Some(token) = token.as_ref() {
+            req = req
+                .bearer_auth(token)
+                .header("x-opengrok-account", token.as_str());
+        }
+        req = req.json(args.unwrap_or(&json!({})));
+        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
+        let status = response.status().as_u16();
+        if matches!(status, 401 | 403 | 404) {
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenGrokError::from_server(
+                Some(status),
+                error_message_from_body(&body),
+            ));
+        }
+        Self::json_or_error(response).await
+    }
+
+    /// Host `isEgressTunnelAvailable`: env `OG_EGRESS_TUNNEL_ENABLED=1` /
+    /// `SAND_EGRESS_TUNNEL_ENABLED=1` or setting `egressTunnelEnabled`.
+    pub async fn is_egress_tunnel_available(&self) -> Result<bool, OpenGrokError> {
+        let value = self
+            .gateway_command("isEgressTunnelAvailable", None)
+            .await?;
+        Ok(value.as_bool().unwrap_or_else(|| {
+            value
+                .get("isEgressTunnelAvailable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        }))
+    }
+
+    pub async fn get_host_settings(&self) -> Result<Value, OpenGrokError> {
+        self.gateway_command("getHostSettings", None).await
+    }
+
+    pub async fn set_host_settings(&self, patch: &Value) -> Result<Value, OpenGrokError> {
+        self.gateway_command("setHostSettings", Some(patch)).await
+    }
+
     /// Stop a run that is still going.
     ///
     /// The turn is not the app's to abandon. A run drives a box — it opens pages and types into
@@ -687,7 +897,7 @@ impl OpenGrokClient {
                 online: machine.connected,
             });
         }
-        Ok(computers)
+        Ok(collapse_computers_by_machine_id(computers))
     }
 
     pub async fn list_daemons(&self) -> Result<Vec<DaemonMachine>, OpenGrokError> {
@@ -709,8 +919,9 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
-    /// The coworker's screen right now: `{mime, base64, width, height}`, the same shape as the
-    /// `image` on a `TOOL_CALL_RESULT`, so `ScreenshotSpec::from_frame` decodes both.
+    /// The coworker's screen right now: `{mime, base64, width, height, visibility?}`,
+    /// the same shape as `TOOL_CALL_RESULT.image`. `GET /coworkers/{id}/screen`
+    /// is the `transcript` observe pin; `ScreenshotSpec::from_frame` decodes both.
     pub async fn coworker_screen(&self, coworker_id: &str) -> Result<Value, OpenGrokError> {
         let path = format!("/coworkers/{coworker_id}/screen");
         let response = self
@@ -1243,6 +1454,21 @@ pub struct CoworkerComputer {
     /// An update in flight, or the failure the last one ended in.
     #[serde(default)]
     pub update: Option<UpdateStatus>,
+    /// OpenGrok #139: env `OG_*` / `SAND_*_EGRESS_TUNNEL_ENABLED=1` or host
+    /// setting `egressTunnelEnabled`. When true, Settings can offer **Route
+    /// traffic through this computer**. No tunnel is invented here.
+    #[serde(rename = "isEgressTunnelAvailable", default)]
+    pub is_egress_tunnel_available: bool,
+    /// Box-owned tunnel endpoint, when the computer JSON exposes it.
+    #[serde(rename = "egress_tunnel", alias = "egressTunnel", default)]
+    pub egress_tunnel: Option<EgressTunnel>,
+}
+
+/// `{ ready: bool }` on coworker computer JSON when the box owns the tunnel.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct EgressTunnel {
+    #[serde(default)]
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1297,6 +1523,38 @@ impl CoworkerComputer {
     pub fn image_stale(&self) -> bool {
         self.image.as_ref().is_some_and(|image| image.stale)
     }
+
+    /// Host flag or nested `egress_tunnel.ready`. Either is enough to gate
+    /// Route traffic / Review an action. No tunnel is invented here.
+    pub fn egress_tunnel_ready(&self) -> bool {
+        self.is_egress_tunnel_available || self.egress_tunnel.as_ref().is_some_and(|t| t.ready)
+    }
+
+    /// `Some` when the box JSON exposed a tunnel field. `None` means omit the node.
+    pub fn box_egress_ready(&self) -> Option<bool> {
+        match &self.egress_tunnel {
+            Some(tunnel) => Some(tunnel.ready),
+            None if self.is_egress_tunnel_available => Some(true),
+            None => None,
+        }
+    }
+}
+
+/// Grok host: `SAND_EGRESS_TUNNEL_ENABLED === "1"`. OpenGrok also honors
+/// `OG_EGRESS_TUNNEL_ENABLED`. Strict `"1"`, not `"true"`.
+pub fn env_egress_tunnel_enabled() -> bool {
+    matches!(
+        std::env::var("OG_EGRESS_TUNNEL_ENABLED").as_deref(),
+        Ok("1")
+    ) || matches!(
+        std::env::var("SAND_EGRESS_TUNNEL_ENABLED").as_deref(),
+        Ok("1")
+    )
+}
+
+/// `getHostSettings.egressTunnelEnabled`.
+pub fn host_egress_tunnel_enabled(settings: &Value) -> bool {
+    settings.get("egressTunnelEnabled").and_then(Value::as_bool) == Some(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1306,6 +1564,64 @@ pub struct ConnectedComputer {
     pub mode: LocalExecMode,
     pub this_machine: bool,
     pub online: bool,
+}
+
+impl ConnectedComputer {
+    fn preferred_over(&self, other: &Self) -> bool {
+        match (self.this_machine, other.this_machine) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => self.online && !other.online,
+        }
+    }
+}
+
+fn computer_label_key(computer: &ConnectedComputer) -> Option<String> {
+    let label = computer.label.trim().to_ascii_lowercase();
+    if label.is_empty() || label == "computer" {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+fn fold_computers(
+    computers: Vec<ConnectedComputer>,
+    key: impl Fn(&ConnectedComputer) -> Option<String>,
+) -> Vec<ConnectedComputer> {
+    let mut out = Vec::new();
+    for computer in computers {
+        let Some(k) = key(&computer) else {
+            out.push(computer);
+            continue;
+        };
+        match out
+            .iter()
+            .position(|existing| key(existing).as_deref() == Some(k.as_str()))
+        {
+            Some(i) if computer.preferred_over(&out[i]) => out[i] = computer,
+            Some(_) => {}
+            None => out.push(computer),
+        }
+    }
+    out
+}
+
+/// Same `machineId` listed twice (daemon roster glitch) becomes one row.
+pub fn collapse_computers_by_machine_id(
+    computers: Vec<ConnectedComputer>,
+) -> Vec<ConnectedComputer> {
+    fold_computers(computers, |computer| Some(computer.machine_id.clone()))
+}
+
+/// Settings Computers tab: one row per machine, and a stale enrol with the
+/// same label as this Mac (Online/Never + Offline/Always) collapses to the
+/// live one. Prefer `this_machine`, then online.
+pub fn collapse_computer_roster(computers: Vec<ConnectedComputer>) -> Vec<ConnectedComputer> {
+    fold_computers(
+        collapse_computers_by_machine_id(computers),
+        computer_label_key,
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2763,6 +3079,274 @@ mod tests {
         assert!(reply.continuing);
     }
 
+    #[tokio::test]
+    async fn submit_user_form_posts_gateway_entry_id_and_values() {
+        use super::super::user_form::{
+            FormResolution, UserFormActionReply, UserFormValues, user_form_action_from_http,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .and(body_json(json!({
+                "entryId": "e_form",
+                "agentId": "cw_1",
+                "values": { "email": "ada@example.com", "password": "s3cret-pass" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": {
+                        "title": "Google account",
+                        "fields": [
+                            {"id": "email", "label": "Email", "type": "email"},
+                            {"id": "password", "label": "Password", "type": "password"}
+                        ]
+                    }
+                },
+                "formResolution": "submitted",
+                "sharedValues": { "email": "ada@example.com" }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let mut values = UserFormValues::default();
+        values
+            .by_id
+            .insert("email".into(), "ada@example.com".into());
+        values.by_id.insert("password".into(), "s3cret-pass".into());
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &values)
+            .await
+            .unwrap();
+        match reply {
+            UserFormActionReply::Settled(spec) => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+            }
+            other => panic!("expected Settled, got {other:?}"),
+        }
+        let dump = format!("{values:?}");
+        assert!(!dump.contains("s3cret-pass"), "{dump}");
+        assert_eq!(
+            user_form_action_from_http(404, &Value::Null),
+            UserFormActionReply::MissingRoute
+        );
+        assert_eq!(
+            user_form_action_from_http(404, &json!({ "error": "form entry missing" })),
+            UserFormActionReply::MissingEntry
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_user_form_404_form_entry_missing_is_not_missing_route() {
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "error": "form entry missing" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::MissingEntry);
+        assert!(!matches!(reply, UserFormActionReply::MissingRoute));
+        assert!(!matches!(reply, UserFormActionReply::Settled(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_user_form_404_is_missing_route_not_submitted() {
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "error": "no such route" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::MissingRoute);
+        assert!(!matches!(reply, UserFormActionReply::Settled(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_user_form_200_null_is_not_a_fill() {
+        // Classifier reports Empty. After Continue, settle_user_form_http
+        // paints Not filled — 200-null is disclosure, not Submitted.
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Value::Null))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::Empty);
+    }
+
+    #[tokio::test]
+    async fn empty_entry_id_is_not_posted_as_call_id() {
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "formResolution": "submitted"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::MissingEntryId);
+    }
+
+    #[tokio::test]
+    async fn credential_result_posts_status_without_a_password() {
+        use super::super::credential::CredentialResultStatus;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/credential/result"))
+            .and(body_json(json!({
+                "status": "error",
+                "requestId": "req-9",
+                "agentId": "cw_1",
+                "credentialId": "cred-1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client
+            .post_credential_result(
+                CredentialResultStatus::Error,
+                "req-9",
+                Some("cred-1"),
+                "cw_1",
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_result_404_is_not_a_failure() {
+        use super::super::credential::CredentialResultStatus;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/credential/result"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client
+            .post_credential_result(CredentialResultStatus::Missing, "req-9", None, "cw_1")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dismiss_user_form_posts_escalated_mode() {
+        use super::super::user_form::{UserFormActionReply, UserFormDismissMode};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/dismiss"))
+            .and(body_json(json!({
+                "entryId": "e_form",
+                "agentId": "cw_1",
+                "mode": "escalated"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "send-message",
+                "id": "e_form",
+                "message": { "type": "user-form", "formRequest": { "title": "Sign in", "fields": [] } },
+                "formResolution": "escalated",
+                "widgetDismissed": true,
+                "handoffEntryId": "e_hand"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .dismiss_user_form("e_form", "cw_1", UserFormDismissMode::Escalated)
+            .await
+            .unwrap();
+        match reply {
+            UserFormActionReply::Settled(spec) => {
+                assert_eq!(
+                    spec.effective_resolution(),
+                    None,
+                    "escalated is a Computer sibling, not form settle: {:?}",
+                    spec.effective_resolution()
+                );
+                assert_eq!(
+                    spec.computer_handoff,
+                    Some(super::super::user_form::ComputerHandoffStatus::ActionNeeded)
+                );
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.handoff_entry_id.as_deref(), Some("e_hand"));
+            }
+            other => panic!("expected Settled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_box_handoff_posts_handoff_id_not_form_id() {
+        use super::super::user_form::{BoxHandoffReply, BoxHandoffResolution};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/box-handoff/resolve"))
+            .and(body_json(json!({
+                "entryId": "e_hand",
+                "agentId": "cw_1",
+                "resolution": "handed_back"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "e_hand",
+                "boxResolution": "handed_back"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/box-handoff/resolve"))
+            .and(body_json(json!({
+                "entryId": "e_form",
+                "agentId": "cw_1",
+                "resolution": "handed_back"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .resolve_box_handoff("e_hand", "cw_1", BoxHandoffResolution::HandedBack)
+            .await
+            .unwrap();
+        assert_eq!(reply, BoxHandoffReply::Settled);
+        let skipped = client
+            .resolve_box_handoff("", "cw_1", BoxHandoffResolution::HandedBack)
+            .await
+            .unwrap();
+        assert_eq!(skipped, BoxHandoffReply::MissingEntryId);
+    }
+
     /// The route is idempotent, so the status is what is true of the run now rather than an
     /// account of what this call did: a turn that ended a moment before the press answers the
     /// same way one that was still going does.
@@ -2841,6 +3425,91 @@ mod tests {
         let status = client.coworker_computer("cw_1").await.unwrap();
         assert_eq!(status.state, "running");
         assert_eq!(status.vnc_url(), Some("http://127.0.0.1:6080/vnc.html"));
+        assert!(
+            !status.is_egress_tunnel_available,
+            "omitted isEgressTunnelAvailable defaults false"
+        );
+        assert!(status.box_egress_ready().is_none());
+    }
+
+    #[test]
+    fn coworker_computer_reads_egress_tunnel_flag() {
+        let off: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running"
+        }))
+        .unwrap();
+        assert!(!off.is_egress_tunnel_available);
+        assert!(!off.egress_tunnel_ready());
+        assert!(off.box_egress_ready().is_none());
+        let on: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "isEgressTunnelAvailable": true
+        }))
+        .unwrap();
+        assert!(on.is_egress_tunnel_available);
+        assert!(on.egress_tunnel_ready());
+        assert_eq!(on.box_egress_ready(), Some(true));
+        let nested: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egress_tunnel": { "ready": true }
+        }))
+        .unwrap();
+        assert!(!nested.is_egress_tunnel_available);
+        assert!(nested.egress_tunnel_ready());
+        assert_eq!(nested.box_egress_ready(), Some(true));
+        let nested_off: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egressTunnel": { "ready": false }
+        }))
+        .unwrap();
+        assert_eq!(nested_off.box_egress_ready(), Some(false));
+        assert!(!nested_off.egress_tunnel_ready());
+        assert!(host_egress_tunnel_enabled(
+            &json!({ "egressTunnelEnabled": true })
+        ));
+        assert!(!host_egress_tunnel_enabled(
+            &json!({ "egressTunnelEnabled": false })
+        ));
+        assert!(!host_egress_tunnel_enabled(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn gateway_is_egress_tunnel_available_reads_boolean() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/isEgressTunnelAvailable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(true))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/getHostSettings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "egressTunnelEnabled": true
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert!(client.is_egress_tunnel_available().await.unwrap());
+        let settings = client.get_host_settings().await.unwrap();
+        assert!(host_egress_tunnel_enabled(&settings));
+    }
+
+    #[tokio::test]
+    async fn gateway_is_egress_tunnel_available_401_is_not_signed_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/isEgressTunnelAvailable"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({ "error": "bad token" })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.is_egress_tunnel_available().await.unwrap_err();
+        assert_eq!(error.status, Some(401));
+        assert!(!error.is_signed_out());
     }
 
     #[tokio::test]
@@ -2959,6 +3628,92 @@ mod tests {
         assert_eq!(computers[0].machine_id, "mac_live");
         assert_eq!(computers[0].mode, LocalExecMode::Always);
         assert!(computers[0].online);
+    }
+
+    fn computer(
+        machine_id: &str,
+        label: &str,
+        this_machine: bool,
+        online: bool,
+        mode: LocalExecMode,
+    ) -> ConnectedComputer {
+        ConnectedComputer {
+            machine_id: machine_id.into(),
+            label: label.into(),
+            mode,
+            this_machine,
+            online,
+        }
+    }
+
+    #[test]
+    fn collapse_roster_keeps_one_row_for_duplicate_machine_id() {
+        let collapsed = collapse_computer_roster(vec![
+            computer(
+                "mac_1",
+                "NativeChat on this Mac",
+                false,
+                false,
+                LocalExecMode::Always,
+            ),
+            computer(
+                "mac_1",
+                "NativeChat on this Mac",
+                true,
+                true,
+                LocalExecMode::Never,
+            ),
+        ]);
+        assert_eq!(collapsed.len(), 1);
+        assert!(collapsed[0].this_machine);
+        assert!(collapsed[0].online);
+        assert_eq!(collapsed[0].mode, LocalExecMode::Never);
+    }
+
+    #[test]
+    fn collapse_roster_drops_stale_enrol_with_the_same_label() {
+        let label = "NativeChat on uriahs-MacBook-Pro.local";
+        let collapsed = collapse_computer_roster(vec![
+            computer("mac_stale", label, false, false, LocalExecMode::Always),
+            computer("mac_live", label, true, true, LocalExecMode::Never),
+        ]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].machine_id, "mac_live");
+        assert!(collapsed[0].this_machine);
+        assert_eq!(collapsed[0].mode, LocalExecMode::Never);
+    }
+
+    #[test]
+    fn collapse_roster_prefers_online_when_neither_is_this_machine() {
+        let label = "NativeChat on uriahs-MacBook-Pro.local";
+        let collapsed = collapse_computer_roster(vec![
+            computer("mac_off", label, false, false, LocalExecMode::Always),
+            computer("mac_on", label, false, true, LocalExecMode::Never),
+        ]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].machine_id, "mac_on");
+        assert!(collapsed[0].online);
+    }
+
+    #[test]
+    fn collapse_roster_keeps_distinct_labels() {
+        let collapsed = collapse_computer_roster(vec![
+            computer(
+                "mac_a",
+                "NativeChat on office.local",
+                false,
+                true,
+                LocalExecMode::Ask,
+            ),
+            computer(
+                "mac_b",
+                "NativeChat on home.local",
+                false,
+                true,
+                LocalExecMode::Ask,
+            ),
+        ]);
+        assert_eq!(collapsed.len(), 2);
     }
 
     #[test]

@@ -7,9 +7,17 @@ use crate::components::chat_input::sources::{
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::{
-    ChatPart, CoworkerPatch, LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec,
+    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
+    RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode, UserFormFieldKind,
+    computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
+    computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
+    computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
+    computer_window_attention_skip_id, credential_request_allow_id, credential_request_card_id,
+    credential_request_deny_id, save_login_card_id, save_login_save_id, save_login_skip_id,
+    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
+    user_form_pill_id, user_form_screen_id,
 };
-use crate::state::{ActiveRecipe, AppState};
+use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
 pub mod ids {
     pub const WINDOW: &str = "app-window";
@@ -127,6 +135,44 @@ pub enum Command {
     /// The signed-out banner's button: go to the sign-in page, which is the only way out of
     /// that state and the reason the banner is a banner rather than a line in the transcript.
     SignInAgain,
+    /// Idle user-form Continue. Values come from typed/picks on AppState.
+    UserFormContinue {
+        card_key: String,
+    },
+    UserFormDismiss {
+        card_key: String,
+    },
+    UserFormOpenScreen {
+        card_key: String,
+    },
+    UserFormSetField {
+        card_key: String,
+        field_id: String,
+        value: String,
+    },
+    ComputerHandoffTakeOver {
+        card_key: String,
+    },
+    ComputerHandoffDone {
+        card_key: String,
+    },
+    ComputerHandoffSkip {
+        card_key: String,
+    },
+    SaveLogin {
+        form_entry_id: String,
+    },
+    SkipSaveLogin {
+        form_entry_id: String,
+    },
+    DeleteSiteLogin {
+        id: String,
+    },
+    AnswerCredentialRequest {
+        request_id: String,
+        allow: bool,
+    },
+    SetAppSettingsTab(crate::state::AppSettingsTab),
     Shutdown,
 }
 
@@ -192,6 +238,32 @@ impl Command {
             }
             Self::Logout => state.logout(cx),
             Self::SignInAgain => state.sign_in_again(cx),
+            Self::UserFormContinue { card_key } => state.submit_open_user_form(card_key, cx),
+            Self::UserFormDismiss { card_key } => {
+                state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
+            }
+            Self::UserFormOpenScreen { card_key } => {
+                state.dismiss_user_form(card_key, UserFormDismissMode::Escalated, cx)
+            }
+            Self::UserFormSetField {
+                card_key,
+                field_id,
+                value,
+            } => state.set_user_form_typed_field(card_key, field_id, value, cx),
+            Self::ComputerHandoffTakeOver { .. } => state.take_over_computer(cx),
+            Self::ComputerHandoffDone { card_key } => {
+                state.resolve_user_form_handoff(card_key, BoxHandoffResolution::HandedBack, cx)
+            }
+            Self::ComputerHandoffSkip { card_key } => {
+                state.resolve_user_form_handoff(card_key, BoxHandoffResolution::Declined, cx)
+            }
+            Self::SaveLogin { form_entry_id } => state.save_offered_login(form_entry_id, cx),
+            Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
+            Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
+            Self::AnswerCredentialRequest { request_id, allow } => {
+                state.answer_credential_request(request_id, allow, cx)
+            }
+            Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
             Self::Shutdown => {}
         }
     }
@@ -279,7 +351,7 @@ fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> 
 fn not_editable(target: &str) -> String {
     format!(
         "`{target}` is not editable (composer, login-email, login-password, \
-         or \"\" for whatever holds the caret)"
+         user-form-field-*, or \"\" for whatever holds the caret)"
     )
 }
 
@@ -332,7 +404,7 @@ fn last_screenshot_set(state: &AppState) -> Vec<ScreenshotSpec> {
             return set;
         }
     }
-    Vec::new()
+    state.last_box_shot.clone().into_iter().collect()
 }
 
 /// The rows of the composer's open panel, taken from the sources the panel itself draws from.
@@ -481,6 +553,157 @@ struct ApprovalSnap {
     tool: String,
     place: &'static str,
     local: bool,
+    review: bool,
+}
+
+/// User-form card in the open thread. Idle cards expose fields + Continue /
+/// Open the screen / Dismiss. Settled cards expose a pill so Open the screen
+/// cannot drop `user-form-*` from the tree.
+#[derive(Clone)]
+struct UserFormSnap {
+    card_key: String,
+    title: String,
+    fields: Vec<UserFormFieldSnap>,
+    /// None = idle (fields still on screen).
+    pill: Option<String>,
+}
+
+#[derive(Clone)]
+struct UserFormFieldSnap {
+    id: String,
+    label: String,
+    kind: UserFormFieldKind,
+    masked: bool,
+    /// Typed value, including secrets. The tree omits masked values.
+    value: String,
+}
+
+#[derive(Clone)]
+struct ComputerHandoffSnap {
+    card_key: String,
+    instruction: String,
+    status: ComputerHandoffStatus,
+}
+
+impl Default for ComputerHandoffSnap {
+    fn default() -> Self {
+        Self {
+            card_key: String::new(),
+            instruction: String::new(),
+            status: ComputerHandoffStatus::ActionNeeded,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SaveLoginSnap {
+    form_entry_id: String,
+    origin: String,
+    username: String,
+}
+
+#[derive(Clone, Default)]
+struct CredentialRequestSnap {
+    request_id: String,
+    origin: String,
+    username: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct SiteLoginSnap {
+    id: String,
+    origin: String,
+    username: String,
+}
+
+fn user_form_node(form: &UserFormSnap) -> UiNode {
+    let key = &form.card_key;
+    let mut card = UiNode::dialog(user_form_card_id(key), form.title.clone());
+    if let Some(pill) = &form.pill {
+        return card.with_child(UiNode::status(user_form_pill_id(key), pill.clone()));
+    }
+    for field in &form.fields {
+        let id = user_form_field_id(key, &field.id);
+        let node = if field.kind == UserFormFieldKind::Checkbox {
+            UiNode::checkbox(id, field.label.clone()).with_checked(field.value == "true")
+        } else {
+            let mut box_ = UiNode::textbox(id, field.label.clone());
+            if !field.masked && !field.value.is_empty() {
+                box_ = box_.with_value(field.value.clone());
+            }
+            box_
+        };
+        card = card.with_child(node);
+    }
+    card.with_child(UiNode::button(user_form_continue_id(key), "Continue"))
+        .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
+        .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
+}
+
+fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
+    let key = &handoff.card_key;
+    let mut card =
+        UiNode::dialog(computer_handoff_card_id(key), "Computer").with_child(UiNode::status(
+            format!("computer-handoff-badge-{key}"),
+            handoff.status.pill(),
+        ));
+    if !handoff.status.is_live() {
+        return card;
+    }
+    card = card
+        .with_child(UiNode::status(
+            format!("computer-handoff-instruction-{key}"),
+            handoff.instruction.clone(),
+        ))
+        .with_child(UiNode::button(
+            computer_handoff_takeover_id(key),
+            "Take over",
+        ))
+        .with_child(UiNode::button(computer_handoff_done_id(key), "I'm done"))
+        .with_child(UiNode::button(computer_handoff_skip_id(key), "Skip"));
+    card
+}
+
+fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
+    UiNode::dialog(
+        save_login_card_id(&offer.form_entry_id),
+        format!("Save login for {} as {}?", offer.origin, offer.username),
+    )
+    .with_child(UiNode::button(
+        save_login_save_id(&offer.form_entry_id),
+        "Save",
+    ))
+    .with_child(UiNode::button(
+        save_login_skip_id(&offer.form_entry_id),
+        "Not now",
+    ))
+}
+
+fn credential_request_node(request: &CredentialRequestSnap) -> UiNode {
+    let title = match &request.username {
+        Some(username) => format!("Use saved login for {} as {}?", request.origin, username),
+        None => format!("Use a saved login for {}?", request.origin),
+    };
+    UiNode::dialog(credential_request_card_id(&request.request_id), title)
+        .with_child(UiNode::button(
+            credential_request_allow_id(&request.request_id),
+            "Use saved login",
+        ))
+        .with_child(UiNode::button(
+            credential_request_deny_id(&request.request_id),
+            "Not now",
+        ))
+}
+
+fn site_login_node(login: &SiteLoginSnap) -> UiNode {
+    UiNode::listitem(
+        format!("settings-login-row-{}", login.id),
+        format!("{} · {}", login.username, login.origin),
+    )
+    .with_child(UiNode::button(
+        format!("settings-login-delete-{}", login.id),
+        "Delete",
+    ))
 }
 
 /// `approval-<call_id>-<verb>` → the answer it stands for.
@@ -578,6 +801,18 @@ pub struct NativeChatHost {
     thumbs: Vec<String>,
     /// The picture overlay, while it is open.
     lightbox: Option<LightboxSnap>,
+    /// Idle user-form cards in the open thread.
+    user_forms: Vec<UserFormSnap>,
+    /// Open the screen → Grok Computer chrome (Take over / I'm done / Skip).
+    computer_handoffs: Vec<ComputerHandoffSnap>,
+    save_logins: Vec<SaveLoginSnap>,
+    credential_requests: Vec<CredentialRequestSnap>,
+    site_logins: Vec<SiteLoginSnap>,
+    logins_tab: bool,
+    /// Settings → Computers: Route traffic row, when host/env/box says to show it.
+    route_traffic_visible: bool,
+    /// Box `egress_tunnel.ready` when the computer JSON exposed it.
+    egress_tunnel_ready: Option<bool>,
     pending: Option<Command>,
     /// Keys the last op asked the window for. The host has no window; the root view presses
     /// them (see [`Self::take_compose`]).
@@ -641,6 +876,7 @@ impl NativeChatHost {
                 .into_iter()
                 .map(|spec| ApprovalSnap {
                     local: spec.runs_on_this_mac(),
+                    review: spec.is_review_an_action() && state.egress_tunnel_available(),
                     place: spec.place(),
                     call_id: spec.call_id,
                     tool: spec.tool,
@@ -753,6 +989,129 @@ impl NativeChatHost {
                     .map(|shot| shot.caption.clone())
                     .unwrap_or_default(),
             }),
+            user_forms: state
+                .visible_user_forms()
+                .into_iter()
+                .map(|spec| {
+                    let key = spec.card_key().to_string();
+                    let pill = spec.effective_resolution().map(|resolution| {
+                        if resolution == crate::opengrok::FormResolution::Escalated {
+                            crate::opengrok::FormResolution::Dismissed
+                                .pill()
+                                .to_string()
+                        } else {
+                            resolution.pill().to_string()
+                        }
+                    });
+                    let fields = if pill.is_some() {
+                        Vec::new()
+                    } else {
+                        let typed = state.user_form_typed.get(&key);
+                        let picks = state.user_form_picks.get(&key);
+                        spec.fields
+                            .iter()
+                            .map(|field| {
+                                let raw = typed
+                                    .and_then(|map| map.get(&field.id))
+                                    .or_else(|| picks.and_then(|map| map.get(&field.id)))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                UserFormFieldSnap {
+                                    id: field.id.clone(),
+                                    label: if field.label.is_empty() {
+                                        field.id.clone()
+                                    } else {
+                                        field.label.clone()
+                                    },
+                                    kind: field.kind,
+                                    masked: field.masked(),
+                                    value: raw,
+                                }
+                            })
+                            .collect()
+                    };
+                    UserFormSnap {
+                        title: if spec.title.is_empty() {
+                            "Form".into()
+                        } else {
+                            spec.title.clone()
+                        },
+                        fields,
+                        card_key: key,
+                        pill,
+                    }
+                })
+                .collect(),
+            computer_handoffs: state
+                .visible_computer_handoffs()
+                .into_iter()
+                .map(|spec| ComputerHandoffSnap {
+                    instruction: spec.handoff_prompt(),
+                    card_key: spec.card_key().to_string(),
+                    status: spec
+                        .computer_handoff
+                        .unwrap_or(ComputerHandoffStatus::ActionNeeded),
+                })
+                .collect(),
+            save_logins: state
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    Some(&conversation.id) == state.active_conversation_id.as_ref()
+                })
+                .map(|conversation| {
+                    conversation
+                        .messages
+                        .iter()
+                        .flat_map(|message| message.parts.iter())
+                        .filter_map(|part| match part {
+                            ChatPart::SaveLogin(spec) => Some(SaveLoginSnap {
+                                form_entry_id: spec.form_entry_id.clone(),
+                                origin: spec.origin.clone(),
+                                username: spec.username.clone(),
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            credential_requests: state
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    Some(&conversation.id) == state.active_conversation_id.as_ref()
+                })
+                .map(|conversation| {
+                    conversation
+                        .messages
+                        .iter()
+                        .flat_map(|message| message.parts.iter())
+                        .filter_map(|part| match part {
+                            ChatPart::CredentialRequest(spec) => Some(CredentialRequestSnap {
+                                request_id: spec.request_id.clone(),
+                                origin: spec.origin.clone(),
+                                username: spec.username.clone(),
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            site_logins: state
+                .site_logins
+                .iter()
+                .map(|row| SiteLoginSnap {
+                    id: row.id.clone(),
+                    origin: row.origin.clone(),
+                    username: row.username.clone(),
+                })
+                .collect(),
+            logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
+            route_traffic_visible: state.show_egress_tunnel_settings(),
+            egress_tunnel_ready: state
+                .coworker_computer
+                .as_ref()
+                .and_then(|computer| computer.box_egress_ready()),
             pending: None,
             compose: None,
         }
@@ -881,37 +1240,92 @@ impl NativeChatHost {
         }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
-            let mut card = UiNode::new(
-                id.clone(),
-                "dialog",
-                format!("Allow {} on {}?", approval.tool, approval.place),
-            )
-            .with_child(UiNode::button(format!("{id}-allow-once"), "Allow once"))
-            .with_child(UiNode::button(format!("{id}-deny-once"), "Deny once"));
-            if approval.local {
-                card = card
-                    .with_child(UiNode::button(format!("{id}-always"), "Always allow"))
-                    .with_child(UiNode::button(format!("{id}-never"), "Never"));
+            let title = if approval.review {
+                "Review an action".to_string()
+            } else {
+                format!("Allow {} on {}?", approval.tool, approval.place)
+            };
+            let mut card = UiNode::new(id.clone(), "dialog", title)
+                .with_child(UiNode::button(format!("{id}-allow-once"), "Allow once"))
+                .with_child(UiNode::button(
+                    format!("{id}-deny-once"),
+                    if approval.review { "Deny" } else { "Deny once" },
+                ));
+            if approval.local || approval.review {
+                card = card.with_child(UiNode::button(format!("{id}-always"), "Always allow"));
+            }
+            if approval.local && !approval.review {
+                card = card.with_child(UiNode::button(format!("{id}-never"), "Never"));
             }
             page = page.with_child(card);
         }
-        page = page.with_child(
-            UiNode::new("computer-pane", "dialog", "Computer")
-                .with_visible(self.computer_open)
-                .with_child(UiNode::new(
-                    "computer-status",
-                    "status",
-                    self.computer_status.clone(),
+        for form in &self.user_forms {
+            page = page.with_child(user_form_node(form));
+        }
+        for handoff in &self.computer_handoffs {
+            page = page.with_child(computer_handoff_node(handoff));
+        }
+        for offer in &self.save_logins {
+            page = page.with_child(save_login_node(offer));
+        }
+        for request in &self.credential_requests {
+            page = page.with_child(credential_request_node(request));
+        }
+        let mut computer = UiNode::new("computer-pane", "dialog", "Computer")
+            .with_visible(self.computer_open)
+            .with_child(UiNode::new(
+                "computer-status",
+                "status",
+                self.computer_status.clone(),
+            ))
+            .with_child(UiNode::button(
+                "computer-update",
+                self.computer_update_label.clone(),
+            ))
+            .with_child(UiNode::button(
+                "computer-reset",
+                self.computer_reset_label.clone(),
+            ));
+        if let Some(handoff) = self
+            .computer_handoffs
+            .iter()
+            .rev()
+            .find(|handoff| handoff.status.is_live())
+        {
+            computer = computer.with_child(
+                UiNode::new(computer_attention_id(), "dialog", "Needs your attention")
+                    .with_child(UiNode::button(
+                        computer_attention_skip_id(&handoff.card_key),
+                        "Skip this step",
+                    ))
+                    .with_child(UiNode::button(
+                        computer_attention_done_id(&handoff.card_key),
+                        "I'm done, continue",
+                    )),
+            );
+            page = page.with_child(
+                UiNode::new(
+                    computer_window_attention_id(),
+                    "dialog",
+                    "Needs your attention",
+                )
+                .with_child(UiNode::button(
+                    computer_window_attention_skip_id(&handoff.card_key),
+                    "Skip this step",
                 ))
                 .with_child(UiNode::button(
-                    "computer-update",
-                    self.computer_update_label.clone(),
-                ))
-                .with_child(UiNode::button(
-                    "computer-reset",
-                    self.computer_reset_label.clone(),
+                    computer_window_attention_done_id(&handoff.card_key),
+                    "I'm done, continue",
                 )),
-        );
+            );
+        }
+        page = page.with_child(computer);
+        if let Some(ready) = self.egress_tunnel_ready {
+            page = page.with_child(UiNode::status(
+                "egress_tunnel.ready",
+                if ready { "ready" } else { "not-ready" },
+            ));
+        }
         if let Some(banner) = &self.update_banner {
             page = page.with_child(UiNode::new("update-banner", "status", banner.clone()));
         }
@@ -964,10 +1378,30 @@ impl NativeChatHost {
                     .with_child(sidebar)
                     .with_child(page)
                     .with_child(self.recipes_node())
-                    .with_child(
-                        UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
-                            .with_visible(self.account_open),
-                    )
+                    .with_child({
+                        let mut settings = UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
+                            .with_visible(self.account_open)
+                            .with_child(UiNode::button("settings-tab-logins", "Logins"));
+                        if self.route_traffic_visible {
+                            settings = settings.with_child(UiNode::new(
+                                "route-traffic-this-computer",
+                                "switch",
+                                "Route traffic through this computer",
+                            ));
+                        }
+                        if self.logins_tab {
+                            if self.site_logins.is_empty() {
+                                settings = settings.with_child(UiNode::status(
+                                    "settings-logins-empty",
+                                    "No saved logins yet.",
+                                ));
+                            }
+                            for login in &self.site_logins {
+                                settings = settings.with_child(site_login_node(login));
+                            }
+                        }
+                        settings
+                    })
                     .with_child(
                         UiNode::dialog(ids::DIALOG_VOICE, "Voice Mode")
                             .with_visible(self.voice_open),
@@ -1142,6 +1576,137 @@ impl NativeChatHost {
         page
     }
 
+    fn user_form_command(&self, target: &str) -> Option<Command> {
+        for form in &self.user_forms {
+            let key = &form.card_key;
+            if target == user_form_continue_id(key) {
+                return Some(Command::UserFormContinue {
+                    card_key: key.clone(),
+                });
+            }
+            if target == user_form_dismiss_id(key) {
+                return Some(Command::UserFormDismiss {
+                    card_key: key.clone(),
+                });
+            }
+            if target == user_form_screen_id(key) {
+                return Some(Command::UserFormOpenScreen {
+                    card_key: key.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn computer_handoff_command(&self, target: &str) -> Option<Command> {
+        for handoff in &self.computer_handoffs {
+            let key = &handoff.card_key;
+            if target == computer_handoff_takeover_id(key) {
+                return Some(Command::ComputerHandoffTakeOver {
+                    card_key: key.clone(),
+                });
+            }
+            if target == computer_handoff_done_id(key)
+                || target == computer_attention_done_id(key)
+                || target == computer_window_attention_done_id(key)
+            {
+                return Some(Command::ComputerHandoffDone {
+                    card_key: key.clone(),
+                });
+            }
+            if target == computer_handoff_skip_id(key)
+                || target == computer_attention_skip_id(key)
+                || target == computer_window_attention_skip_id(key)
+            {
+                return Some(Command::ComputerHandoffSkip {
+                    card_key: key.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn save_login_command(&self, target: &str) -> Option<Command> {
+        for offer in &self.save_logins {
+            if target == save_login_save_id(&offer.form_entry_id) {
+                return Some(Command::SaveLogin {
+                    form_entry_id: offer.form_entry_id.clone(),
+                });
+            }
+            if target == save_login_skip_id(&offer.form_entry_id) {
+                return Some(Command::SkipSaveLogin {
+                    form_entry_id: offer.form_entry_id.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn credential_request_command(&self, target: &str) -> Option<Command> {
+        for request in &self.credential_requests {
+            if target == credential_request_allow_id(&request.request_id) {
+                return Some(Command::AnswerCredentialRequest {
+                    request_id: request.request_id.clone(),
+                    allow: true,
+                });
+            }
+            if target == credential_request_deny_id(&request.request_id) {
+                return Some(Command::AnswerCredentialRequest {
+                    request_id: request.request_id.clone(),
+                    allow: false,
+                });
+            }
+        }
+        None
+    }
+
+    fn site_login_delete_target(&self, target: &str) -> Option<String> {
+        let id = target.strip_prefix("settings-login-delete-")?;
+        self.site_logins
+            .iter()
+            .find(|login| login.id == id)
+            .map(|login| login.id.clone())
+    }
+
+    fn user_form_field(&self, target: &str) -> Option<(String, String, UserFormFieldKind, String)> {
+        for form in &self.user_forms {
+            for field in &form.fields {
+                if target == user_form_field_id(&form.card_key, &field.id) {
+                    return Some((
+                        form.card_key.clone(),
+                        field.id.clone(),
+                        field.kind,
+                        field.value.clone(),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    fn set_user_form_field(
+        &mut self,
+        card_key: String,
+        field_id: String,
+        value: String,
+    ) -> Result<DispatchResult, String> {
+        if let Some(form) = self
+            .user_forms
+            .iter_mut()
+            .find(|form| form.card_key == card_key)
+        {
+            if let Some(field) = form.fields.iter_mut().find(|field| field.id == field_id) {
+                field.value = value.clone();
+            }
+        }
+        self.pending = Some(Command::UserFormSetField {
+            card_key,
+            field_id,
+            value,
+        });
+        Ok(DispatchResult::empty())
+    }
+
     /// `recipe-accept` / `recipe-decline` (the one pending share) or the same with `-<id>`.
     fn recipe_answer_target(&self, target: &str) -> Option<(String, bool)> {
         let (rest, accept) = if let Some(rest) = target.strip_prefix("recipe-accept") {
@@ -1261,6 +1826,26 @@ impl NativeChatHost {
                  (`type composer /`, then `type \"\" <words>` to filter and `key \"\" Enter` \
                  to take the row)"
             ));
+        } else if let Some(cmd) = self.user_form_command(target) {
+            cmd
+        } else if let Some(cmd) = self.computer_handoff_command(target) {
+            cmd
+        } else if let Some(cmd) = self.save_login_command(target) {
+            cmd
+        } else if let Some(cmd) = self.credential_request_command(target) {
+            cmd
+        } else if target == "settings-tab-logins" {
+            Command::SetAppSettingsTab(AppSettingsTab::Logins)
+        } else if let Some(id) = self.site_login_delete_target(target) {
+            Command::DeleteSiteLogin { id }
+        } else if let Some((card_key, field_id, kind, value)) = self.user_form_field(target) {
+            if kind == UserFormFieldKind::Checkbox {
+                let next = if value == "true" { "false" } else { "true" };
+                return self.set_user_form_field(card_key, field_id, next.to_string());
+            }
+            return Err(format!(
+                "`{target}` is a user-form field: use set_value, not click"
+            ));
         } else {
             return Err(format!("unknown click target `{target}`"));
         };
@@ -1276,6 +1861,9 @@ impl NativeChatHost {
     fn set_value(&mut self, target: &str, value: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
             return self.set_login(field, value.to_string());
+        }
+        if let Some((card_key, field_id, _, _)) = self.user_form_field(target) {
+            return self.set_user_form_field(card_key, field_id, value.to_string());
         }
         // The target is read before the text, here and in the two below: a wrong address is
         // worth saying before anything about what was going to be typed into it.
@@ -1294,6 +1882,9 @@ impl NativeChatHost {
             };
             return self.set_login(field, value);
         }
+        if let Some((card_key, field_id, _, current)) = self.user_form_field(target) {
+            return self.set_user_form_field(card_key, field_id, format!("{current}{text}"));
+        }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
             keys: text_tokens(text)?,
@@ -1305,6 +1896,24 @@ impl NativeChatHost {
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
             return self.login_key(field, target, key);
+        }
+        if let Some((card_key, field_id, _, current)) = self.user_form_field(target) {
+            match key_token(key)?.as_str() {
+                "enter" => {
+                    self.pending = Some(Command::UserFormContinue { card_key });
+                    return Ok(DispatchResult::empty());
+                }
+                "backspace" => {
+                    let mut value = current;
+                    value.pop();
+                    return self.set_user_form_field(card_key, field_id, value);
+                }
+                other => {
+                    return Err(format!(
+                        "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                    ));
+                }
+            }
         }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
@@ -2051,5 +2660,352 @@ mod tests {
             assert_eq!(recipe_row_target(control), None, "{control}");
         }
         assert_eq!(recipe_row_target("recipes-filter-mine"), None);
+    }
+
+    fn google_login_form() -> UserFormSnap {
+        UserFormSnap {
+            card_key: "e_form".into(),
+            title: "Google account".into(),
+            fields: vec![
+                UserFormFieldSnap {
+                    id: "email".into(),
+                    label: "Email".into(),
+                    kind: UserFormFieldKind::Email,
+                    masked: false,
+                    value: String::new(),
+                },
+                UserFormFieldSnap {
+                    id: "password".into(),
+                    label: "Password".into(),
+                    kind: UserFormFieldKind::Password,
+                    masked: true,
+                    value: String::new(),
+                },
+            ],
+            pill: None,
+        }
+    }
+
+    #[test]
+    fn idle_user_form_fields_and_buttons_are_in_the_tree() {
+        let mut host = host();
+        assert!(host.snapshot().find("user-form-e_form").is_none());
+        host.user_forms = vec![google_login_form()];
+        let tree = host.snapshot();
+        assert!(tree.find("user-form-e_form").is_some());
+        assert_eq!(
+            tree.find("user-form-field-e_form-email").unwrap().name,
+            "Email"
+        );
+        assert_eq!(
+            tree.find("user-form-field-e_form-password").unwrap().name,
+            "Password"
+        );
+        assert!(tree.find("user-form-continue-e_form").is_some());
+        assert!(tree.find("user-form-dismiss-e_form").is_some());
+        assert_eq!(
+            tree.find("user-form-screen-e_form").unwrap().name,
+            "Open the screen"
+        );
+        host.dispatch(&Op::SetValue {
+            target: "user-form-field-e_form-email".into(),
+            value: "ada@example.com".into(),
+        })
+        .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormSetField {
+                card_key,
+                field_id,
+                value,
+            }) => {
+                assert_eq!(card_key, "e_form");
+                assert_eq!(field_id, "email");
+                assert_eq!(value, "ada@example.com");
+            }
+            other => panic!("expected set field, got {other:?}"),
+        }
+        host.dispatch(&Op::SetValue {
+            target: "user-form-field-e_form-password".into(),
+            value: "s3cret".into(),
+        })
+        .unwrap();
+        assert!(
+            host.snapshot()
+                .find("user-form-field-e_form-password")
+                .unwrap()
+                .value
+                .is_none(),
+            "secrets stay off the tree"
+        );
+        host.dispatch(&Op::click("user-form-continue-e_form"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormContinue { card_key }) => assert_eq!(card_key, "e_form"),
+            other => panic!("expected continue, got {other:?}"),
+        }
+        host.dispatch(&Op::click("user-form-dismiss-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormDismiss { .. })
+        ));
+        host.dispatch(&Op::click("user-form-screen-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormOpenScreen { .. })
+        ));
+    }
+
+    #[test]
+    fn call_keyed_user_form_dismiss_is_in_the_tree() {
+        let mut host = host();
+        host.user_forms = vec![UserFormSnap {
+            card_key: "call-9".into(),
+            title: "Website login".into(),
+            fields: vec![UserFormFieldSnap {
+                id: "email".into(),
+                label: "Email".into(),
+                kind: UserFormFieldKind::Email,
+                masked: false,
+                value: String::new(),
+            }],
+            pill: None,
+        }];
+        let tree = host.snapshot();
+        assert!(tree.find("user-form-call-9").is_some());
+        assert!(tree.find("user-form-dismiss-call-9").is_some());
+        assert!(tree.find("user-form-screen-call-9").is_some());
+        host.dispatch(&Op::click("user-form-dismiss-call-9"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormDismiss { card_key }) => assert_eq!(card_key, "call-9"),
+            other => panic!("expected dismiss call-9, got {other:?}"),
+        }
+        host.dispatch(&Op::click("user-form-screen-call-9"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormOpenScreen { card_key }) => assert_eq!(card_key, "call-9"),
+            other => panic!("expected open screen call-9, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn computer_handoff_chrome_is_in_the_tree() {
+        let mut host = host();
+        host.computer_handoffs = vec![ComputerHandoffSnap {
+            card_key: "e_form".into(),
+            instruction: "Sign in on the computer.".into(),
+            status: ComputerHandoffStatus::ActionNeeded,
+        }];
+        host.computer_open = true;
+        let tree = host.snapshot();
+        assert!(tree.find("computer-handoff-e_form").is_some());
+        assert_eq!(
+            tree.find("computer-handoff-takeover-e_form").unwrap().name,
+            "Take over"
+        );
+        assert_eq!(
+            tree.find("computer-handoff-done-e_form").unwrap().name,
+            "I'm done"
+        );
+        assert_eq!(
+            tree.find("computer-handoff-skip-e_form").unwrap().name,
+            "Skip"
+        );
+        assert_eq!(
+            tree.find("computer-attention").unwrap().name,
+            "Needs your attention"
+        );
+        assert_eq!(
+            tree.find("computer-attention-skip-e_form").unwrap().name,
+            "Skip this step"
+        );
+        assert_eq!(
+            tree.find("computer-attention-done-e_form").unwrap().name,
+            "I'm done, continue"
+        );
+        assert_eq!(
+            tree.find("computer-window-attention").unwrap().name,
+            "Needs your attention"
+        );
+        assert_eq!(
+            tree.find("computer-window-attention-skip-e_form")
+                .unwrap()
+                .name,
+            "Skip this step"
+        );
+        assert_eq!(
+            tree.find("computer-window-attention-done-e_form")
+                .unwrap()
+                .name,
+            "I'm done, continue"
+        );
+        host.dispatch(&Op::click("computer-handoff-takeover-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffTakeOver { card_key }) if card_key == "e_form"
+        ));
+        host.dispatch(&Op::click("computer-handoff-done-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffDone { .. })
+        ));
+        host.dispatch(&Op::click("computer-attention-skip-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffSkip { .. })
+        ));
+        host.dispatch(&Op::click("computer-window-attention-done-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffDone { .. })
+        ));
+    }
+
+    #[test]
+    fn form_and_computer_stay_in_the_tree_across_handoff() {
+        let mut host = host();
+        host.user_forms = vec![google_login_form()];
+        host.computer_handoffs = vec![ComputerHandoffSnap {
+            card_key: "e_form".into(),
+            instruction: "Sign in on the computer.".into(),
+            status: ComputerHandoffStatus::ActionNeeded,
+        }];
+        let open = host.snapshot();
+        assert!(
+            open.find("user-form-e_form").is_some(),
+            "Open the screen must not rip user-form-* out"
+        );
+        assert!(open.find("user-form-screen-e_form").is_some());
+        assert!(open.find("computer-handoff-e_form").is_some());
+        assert_eq!(
+            open.find("computer-handoff-badge-e_form").unwrap().name,
+            "Action needed"
+        );
+
+        host.user_forms = vec![UserFormSnap {
+            card_key: "e_form".into(),
+            title: "Google account".into(),
+            fields: Vec::new(),
+            pill: Some("Dismissed".into()),
+        }];
+        host.computer_handoffs[0].status = ComputerHandoffStatus::Done;
+        let done = host.snapshot();
+        assert!(done.find("user-form-e_form").is_some());
+        assert_eq!(
+            done.find("user-form-pill-e_form").unwrap().name,
+            "Dismissed"
+        );
+        assert!(done.find("user-form-screen-e_form").is_none());
+        assert!(done.find("computer-handoff-e_form").is_some());
+        assert_eq!(
+            done.find("computer-handoff-badge-e_form").unwrap().name,
+            "Done"
+        );
+        assert!(done.find("computer-handoff-takeover-e_form").is_none());
+        assert!(done.find("computer-attention").is_none());
+
+        host.user_forms[0].pill = Some("Skipped".into());
+        host.computer_handoffs[0].status = ComputerHandoffStatus::Skipped;
+        let skipped = host.snapshot();
+        assert_eq!(
+            skipped.find("user-form-pill-e_form").unwrap().name,
+            "Skipped"
+        );
+        assert_eq!(
+            skipped.find("computer-handoff-badge-e_form").unwrap().name,
+            "Skipped"
+        );
+        assert!(skipped.find("computer-handoff-e_form").is_some());
+    }
+
+    #[test]
+    fn settled_user_form_has_no_field_nodes() {
+        let host = host();
+        let tree = host.snapshot();
+        assert!(
+            tree.find("user-form-field-e_form-email").is_none(),
+            "after Continue the snapshot must not list idle fields"
+        );
+        assert!(tree.find("user-form-continue-e_form").is_none());
+    }
+
+    #[test]
+    fn save_login_and_credential_request_are_in_the_tree_without_passwords() {
+        let mut host = host();
+        host.save_logins = vec![SaveLoginSnap {
+            form_entry_id: "e_form".into(),
+            origin: "google.com".into(),
+            username: "ada@example.com".into(),
+        }];
+        host.credential_requests = vec![CredentialRequestSnap {
+            request_id: "req-9".into(),
+            origin: "google.com".into(),
+            username: Some("ada@example.com".into()),
+        }];
+        let tree = host.snapshot();
+        assert!(tree.find("save-login-e_form").is_some());
+        assert!(tree.find("save-login-save-e_form").is_some());
+        assert!(tree.find("save-login-skip-e_form").is_some());
+        assert!(tree.find("credential-request-req-9").is_some());
+        let dump = format!("{tree:?}");
+        assert!(!dump.contains("s3cret"));
+        host.dispatch(&Op::click("save-login-save-e_form")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SaveLogin { .. })
+        ));
+        host.dispatch(&Op::click("credential-request-allow-req-9"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::AnswerCredentialRequest { allow: true, .. }) => {}
+            other => panic!("expected confirm, not a Box fill: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_logins_list_username_and_origin_only() {
+        let mut host = host();
+        host.account_open = true;
+        host.logins_tab = true;
+        host.site_logins = vec![SiteLoginSnap {
+            id: "cred-1".into(),
+            origin: "google.com".into(),
+            username: "ada@example.com".into(),
+        }];
+        let tree = host.snapshot();
+        let row = tree.find("settings-login-row-cred-1").unwrap();
+        assert!(row.name.contains("ada@example.com"));
+        assert!(row.name.contains("google.com"));
+        assert!(row.value.is_none());
+        host.dispatch(&Op::click("settings-login-delete-cred-1"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::DeleteSiteLogin { id }) if id == "cred-1"
+        ));
+    }
+
+    #[test]
+    fn settings_shows_route_traffic_row_when_visible() {
+        let mut host = host();
+        host.account_open = true;
+        host.route_traffic_visible = false;
+        assert!(
+            host.snapshot()
+                .find("route-traffic-this-computer")
+                .is_none()
+        );
+        host.route_traffic_visible = true;
+        assert!(
+            host.snapshot()
+                .find("route-traffic-this-computer")
+                .is_some()
+        );
     }
 }
