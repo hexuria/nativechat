@@ -18,7 +18,8 @@ pub enum ChatPart {
     Ui(UiSpec),
     /// A tool the person must allow or refuse before the run continues.
     Approval(ApprovalSpec),
-    /// The bot's screen after a `computer` action: a picture in the feed.
+    /// The bot's screen when it belongs in the feed (failure, turn end,
+    /// Open-the-screen). Intermediate computer-step PNGs stay off this list.
     Screenshot(ScreenshotSpec),
     /// In-chat credentials that fill the box page. Not [`UiSpec::Form`], not a vault.
     UserForm(UserFormSpec),
@@ -235,6 +236,8 @@ pub struct TurnAssembler {
     /// `request_user_form` args by call id, so an awaiting CUSTOM with empty
     /// `arguments` can still paint the schema.
     form_args: std::collections::HashMap<String, String>,
+    /// Newest tool PNG. Computer pane / last-screen thumb; chat only on pin.
+    latest_shot: Option<ScreenshotSpec>,
 }
 
 #[derive(Debug)]
@@ -424,23 +427,65 @@ impl TurnAssembler {
             spec.output = Some(content.clone());
             spec.ok = ok;
         }
-        // A result with a picture is the bot's screen; it gets its own row in the feed.
+        // Keep every PNG for the Computer pane / last-screen thumb. Row it
+        // into chat only on failure; success shots wait for turn-end pin.
         if let Some(shot) = event
             .get("image")
             .and_then(|image| ScreenshotSpec::from_frame(&call_id, &content, image))
         {
-            self.committed
-                .retain(|part| !matches!(part, ChatPart::Screenshot(existing) if existing.call_id == call_id));
-            self.committed.push(ChatPart::Screenshot(shot));
+            self.latest_shot = Some(shot.clone());
+            if ok == Some(false) {
+                self.pin_shot(shot);
+            } else {
+                self.break_feed_paragraph();
+            }
         }
     }
 
+    fn pin_shot(&mut self, shot: ScreenshotSpec) {
+        self.committed.retain(|part| {
+            !matches!(part, ChatPart::Screenshot(existing) if existing.call_id == shot.call_id)
+        });
+        self.committed.push(ChatPart::Screenshot(shot));
+    }
+
+    fn pin_latest_shot(&mut self) {
+        let Some(shot) = self.latest_shot.clone() else {
+            return;
+        };
+        if self.committed.iter().any(|part| {
+            matches!(part, ChatPart::Screenshot(existing) if existing.call_id == shot.call_id)
+        }) {
+            return;
+        }
+        self.committed.push(ChatPart::Screenshot(shot));
+    }
+
+    /// A tool PNG that stays off the feed still splits the words around it.
+    fn break_feed_paragraph(&mut self) {
+        let Some(ChatPart::Text(text)) = self.committed.last_mut() else {
+            return;
+        };
+        if text.trim().is_empty() || text.ends_with("\n\n") {
+            return;
+        }
+        text.truncate(text.trim_end().len());
+        text.push_str("\n\n");
+    }
+
     /// Stream ended. Mount a UI tool if its args already parse; otherwise release held text.
+    /// Pins the last computer PNG as a turn-end milestone (not every step).
     pub fn finish(&mut self) {
         self.flush_text();
         if let Some(tool) = self.tool.take() {
             self.close_tool(tool);
         }
+        self.pin_latest_shot();
+    }
+
+    /// Newest tool PNG, including steps that did not earn a chat row.
+    pub fn latest_screenshot(&self) -> Option<&ScreenshotSpec> {
+        self.latest_shot.as_ref()
     }
 
     fn close_tool(&mut self, tool: OpenTool) {
@@ -1415,6 +1460,67 @@ mod tests {
         assert!(!shot.image.bytes.is_empty());
         // Words before the picture stay words.
         assert!(matches!(parts.first(), Some(ChatPart::Text(text)) if text.contains("Looking.")));
+    }
+
+    #[test]
+    fn success_tool_images_wait_until_turn_end() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({"type":"TEXT_MESSAGE_CONTENT","delta":"Working."}));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "c1",
+            "content": "click 1",
+            "ok": true,
+            "image": {"mime": "image/png", "base64": TINY_PNG, "width": 1280, "height": 800}
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "c2",
+            "content": "click 2",
+            "ok": true,
+            "image": {"mime": "image/png", "base64": TINY_PNG, "width": 640, "height": 480}
+        }));
+        let (_, mid) = turn.snapshot();
+        assert!(
+            !mid.iter()
+                .any(|part| matches!(part, ChatPart::Screenshot(_))),
+            "intermediate success PNGs are Computer-pane only: {mid:?}"
+        );
+        assert_eq!(
+            turn.latest_screenshot().map(|s| s.call_id.as_str()),
+            Some("c2")
+        );
+        turn.finish();
+        let (_, parts) = turn.snapshot();
+        let shots: Vec<_> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ChatPart::Screenshot(spec) => Some(spec.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shots,
+            vec!["c2"],
+            "turn end pins the last screen, not every step"
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_image_is_a_screenshot_row() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "c-fail",
+            "content": "click missed",
+            "ok": false,
+            "image": {"mime": "image/png", "base64": TINY_PNG, "width": 10, "height": 10}
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::Screenshot(spec)] => assert_eq!(spec.call_id, "c-fail"),
+            other => panic!("failure pins immediately, got {other:?}"),
+        }
     }
 
     /// The giveaway of the bug the person reported: two things the coworker said either side of

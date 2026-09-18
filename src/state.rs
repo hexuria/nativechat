@@ -11,7 +11,7 @@ use crate::opengrok::{
     Failure, FormResolution, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue,
     OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
     RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    RunReplay, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply, UserFormDismissMode,
     UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
@@ -88,32 +88,25 @@ impl Message {
     }
 }
 
-/// What is worth keeping of a message the person watched arrive: its words and the pictures of
-/// the box's screen, in the order they appeared.
+/// What is worth keeping of a message the person watched arrive: its words.
 ///
 /// A turn that was only words keeps nothing here — `content` already holds them, and a second
 /// copy would double every thread on disk. Cards are left out on purpose; see `MessagePart`.
-/// Because a card is dropped, the words on either side of one are kept apart by a blank line,
-/// the same break `content` gets, rather than running together into one sentence. A chart, which
-/// is cut out of the middle of a sentence, leaves that sentence whole.
+/// Screenshots stay off sqlite until OpenGrok tags feed visibility — every computer-step PNG
+/// used to land here and flood both the transcript and the database. Because a card or picture
+/// is dropped, the words on either side of one are kept apart by a blank line, the same break
+/// `content` gets, rather than running together into one sentence. A chart, which is cut out
+/// of the middle of a sentence, leaves that sentence whole.
 fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
     let mut saved: Vec<MessagePart> = Vec::new();
     let mut words = String::new();
     for part in parts {
         match part {
             ChatPart::Text(text) => words.push_str(text),
-            ChatPart::Screenshot(spec) => {
-                close_text_run(&mut words, &mut saved);
-                saved.push(MessagePart::Screenshot {
-                    call_id: spec.call_id.clone(),
-                    caption: spec.caption.clone(),
-                    image: spec.image.bytes.clone(),
-                    width: spec.width,
-                    height: spec.height,
-                });
+            ChatPart::Screenshot(_) | ChatPart::Approval(_) | ChatPart::UserForm(_) => {
+                break_paragraph(&mut words)
             }
             ChatPart::Ui(_) => {}
-            ChatPart::Approval(_) | ChatPart::UserForm(_) => break_paragraph(&mut words),
         }
     }
     close_text_run(&mut words, &mut saved);
@@ -178,6 +171,41 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
             }),
         })
         .collect()
+}
+
+/// Fold OpenGrok-owned cards onto a sqlite row that dropped them.
+///
+/// User-form (idle + settled, never secrets) and pinned screenshots live on
+/// the server. Local `saved_parts` does not keep them, so a bot switch would
+/// otherwise lose Submitted.
+fn overlay_server_cards(message: &mut Message, replayed: &[ChatPart]) {
+    for part in replayed {
+        match part {
+            ChatPart::UserForm(incoming) => {
+                if let Some(existing) = message.parts.iter_mut().find_map(|part| match part {
+                    ChatPart::UserForm(spec)
+                        if spec.same_card(incoming) || spec.shares_call_id(&incoming.call_id) =>
+                    {
+                        Some(spec)
+                    }
+                    _ => None,
+                }) {
+                    existing.merge(incoming.clone());
+                } else {
+                    message.parts.push(ChatPart::UserForm(incoming.clone()));
+                }
+            }
+            ChatPart::Screenshot(incoming) => {
+                let already = message.parts.iter().any(|part| {
+                    matches!(part, ChatPart::Screenshot(spec) if spec.call_id == incoming.call_id)
+                });
+                if !already {
+                    message.parts.push(ChatPart::Screenshot(incoming.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1408,6 +1436,8 @@ pub struct AppState {
     /// The active coworker's screen as last fetched, painted in the Computer
     /// pane's tile. Polled with the status, only while the box has a screen.
     pub coworker_screen: Option<std::sync::Arc<gpui_kit::Image>>,
+    /// Newest tool PNG for thumbs / Open-the-screen pin. Not every chat row.
+    pub last_box_shot: Option<ScreenshotSpec>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
     /// One screen window per coworker: Open brings the existing one forward rather than
@@ -1744,6 +1774,7 @@ impl AppState {
             host_egress_tunnel_available: false,
             egress_tunnel_enabled: false,
             coworker_screen: None,
+            last_box_shot: None,
             computer_confirm: None,
             computer_action_error: None,
             computer_heal_requested: None,
@@ -4085,6 +4116,7 @@ impl AppState {
         // The previous bot's screen must not show under this bot's name.
         self.coworker_computer = None;
         self.coworker_screen = None;
+        self.last_box_shot = None;
         self.computer_confirm = None;
         self.computer_action_error = None;
         if !self.conversations.iter().any(|c| c.id == id) {
@@ -4557,11 +4589,13 @@ impl AppState {
     ///
     /// Once per thread per session, and only for the thread being read. After that the app has
     /// been watching, and every turn since has gone to disk through the same door.
+    /// Bring a thread up to what the server says was said in it.
+    ///
+    /// SQLite is a cache of words. User-form cards and tool PNGs live on OpenGrok
+    /// and are folded on every visit (bot switch / thread load), not only the
+    /// first reconcile of the session.
     fn reconcile_thread(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
         if self.active_conversation_id.as_deref() != Some(conversation_id) {
-            return;
-        }
-        if !self.reconciled_threads.insert(conversation_id.to_string()) {
             return;
         }
         let Some(client) = self.opengrok.clone() else {
@@ -4572,10 +4606,11 @@ impl AppState {
             let thread = client.replay_thread(&conversation_id, RECONCILE_RUNS).await;
             let _ = this.update(cx, |state, cx| {
                 match thread {
-                    Ok(thread) => state.apply_thread_replay(&conversation_id, &thread, cx),
-                    // A server that cannot answer leaves the thread exactly as the cache drew
-                    // it, and leaves it un-reconciled so the next visit tries again — an offline
-                    // app is still a usable one, it is just not up to date.
+                    Ok(thread) => {
+                        state.reconciled_threads.insert(conversation_id.clone());
+                        state.apply_thread_replay(&conversation_id, &thread, cx);
+                        state.overlay_replay_cards(&conversation_id, &thread.runs);
+                    }
                     Err(_) => {
                         state.reconciled_threads.remove(&conversation_id);
                     }
@@ -4589,10 +4624,12 @@ impl AppState {
     /// The runs the server has that this thread has not, put back into it.
     ///
     /// A run that ended goes onto the thread and into the database, through the same
-    /// `persist_assistant_reply` a turn watched to the end goes through, so its screenshots land
-    /// in `chat_message_parts` like any other turn's. A run still going is a turn that outlived
-    /// whatever stopped watching it — a bot switch, or the app closing — and is re-attached to:
-    /// the bubble comes back, the status line comes back, and the rest of the turn arrives in it.
+    /// `persist_assistant_reply` a turn watched to the end goes through. Tool PNGs stay
+    /// off sqlite until OpenGrok tags visibility; `overlay_replay_cards` puts pinned
+    /// shots and user-form cards back from the server. A run still going is a turn that
+    /// outlived whatever stopped watching it — a bot switch, or the app closing — and is
+    /// re-attached to: the bubble comes back, the status line comes back, and the rest of
+    /// the turn arrives in it.
     fn apply_thread_replay(
         &mut self,
         conversation_id: &str,
@@ -4640,6 +4677,54 @@ impl AppState {
             }
         }
         cx.notify();
+    }
+
+    /// Idle + settled user-form cards (never secrets) and pinned screenshots
+    /// from OpenGrok onto rows sqlite already has.
+    fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
+        let grafted: Vec<(String, Vec<ChatPart>)> = runs
+            .iter()
+            .filter(|run| !run.run_id.trim().is_empty())
+            .map(|run| {
+                let (_, parts) = reply_from_replay(&run.events, &run.status);
+                (run.run_id.clone(), self.graft_user_forms(parts))
+            })
+            .collect();
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return;
+        };
+        for (run_id, parts) in &grafted {
+            if let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.run_id.as_deref() == Some(run_id.as_str()))
+            {
+                overlay_server_cards(message, parts);
+            }
+        }
+        for (_, parts) in &grafted {
+            for part in parts {
+                if let ChatPart::UserForm(spec) = part {
+                    self.remember_user_form_resolution(spec);
+                }
+            }
+        }
+        if let Some(shot) = grafted
+            .iter()
+            .rev()
+            .flat_map(|(_, parts)| parts.iter())
+            .rev()
+            .find_map(|part| match part {
+                ChatPart::Screenshot(spec) => Some(spec.clone()),
+                _ => None,
+            })
+        {
+            self.last_box_shot = Some(shot);
+        }
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
@@ -4720,6 +4805,12 @@ impl AppState {
         {
             message.content = plain.clone();
             message.parts = parts.clone();
+        }
+        if let Some(shot) = parts.iter().rev().find_map(|part| match part {
+            ChatPart::Screenshot(spec) => Some(spec.clone()),
+            _ => None,
+        }) {
+            self.last_box_shot = Some(shot);
         }
         // A card whose command already ran is not a question any more, so the thread stops
         // asking it.
@@ -5028,6 +5119,7 @@ impl AppState {
                                 }
                                 assembler.push_event(&event);
                                 let (plain, parts) = assembler.snapshot();
+                                let box_shot = assembler.latest_screenshot().cloned();
                                 let sig = stream_part_sig(&parts);
                                 let now = Instant::now();
                                 let paint =
@@ -5036,6 +5128,9 @@ impl AppState {
                                     // Into the thread the run belongs to, and into the row the run
                                     // was given — not the thread that happens to be open, and not
                                     // whichever row happens to be last in it.
+                                    if let Some(shot) = box_shot {
+                                        state.last_box_shot = Some(shot);
+                                    }
                                     let grafted = state.graft_user_forms(parts.clone());
                                     if let Some(message) = streaming_message_mut(
                                         &mut state.conversations,
@@ -5077,7 +5172,11 @@ impl AppState {
                     // What the tools did, in case the turn ends without a word about it.
                     let deeds = tracker.deeds();
                     let (plain, parts) = assembler.snapshot();
+                    let box_shot = assembler.latest_screenshot().cloned();
                     let _ = this.update(cx, |state, cx| {
+                        if let Some(shot) = box_shot {
+                            state.last_box_shot = Some(shot);
+                        }
                         let grafted = state.graft_user_forms(parts);
                         if let Some(message) = streaming_message_mut(
                             &mut state.conversations,
@@ -5626,6 +5725,12 @@ impl AppState {
                                 {
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
+                                    if let Some(shot) = parts.iter().rev().find_map(|part| match part {
+                                        ChatPart::Screenshot(spec) => Some(spec.clone()),
+                                        _ => None,
+                                    }) {
+                                        state.last_box_shot = Some(shot);
+                                    }
                                     for part in &parts {
                                         if let ChatPart::Approval(spec) = part
                                             && spec.output.is_some()
@@ -6163,6 +6268,31 @@ impl AppState {
         }
     }
 
+    /// Open-the-screen milestone: pin the last box PNG into chat once, not every step.
+    fn pin_open_screen_shot(&mut self, conversation_id: &str) {
+        let Some(shot) = self.last_box_shot.clone() else {
+            return;
+        };
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return;
+        };
+        let Some(last) = conversation.messages.iter_mut().rev().find(|m| !m.is_me) else {
+            return;
+        };
+        if last
+            .parts
+            .iter()
+            .any(|part| matches!(part, ChatPart::Screenshot(spec) if spec.call_id == shot.call_id))
+        {
+            return;
+        }
+        last.parts.push(ChatPart::Screenshot(shot));
+    }
+
     fn restore_user_form(&mut self, card_key: &str) {
         let prior = self.user_form_restore.remove(card_key);
         if let Some(spec) = self.user_form_mut(card_key) {
@@ -6251,6 +6381,9 @@ impl AppState {
             }
             UserFormDispatch::Dismiss(mode) => {
                 self.paint_user_form_resolution(&card_key, mode.resolution());
+                if matches!(mode, UserFormDismissMode::Escalated) {
+                    self.pin_open_screen_shot(&conversation_id);
+                }
             }
             UserFormDispatch::ResolveHandoff(_) => {}
         }
@@ -7397,8 +7530,9 @@ mod tests {
         STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler,
         WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
         apply_reload, bot_status_line, graft_reply, is_status_line, is_tool_standin,
-        is_unsent_turn_note, missing_replies, reads_as_gateway_unreachable, reply_from_replay,
-        restored_parts, saved_parts, stream_paint_due, stream_part_sig, streaming_message_mut,
+        is_unsent_turn_note, missing_replies, overlay_server_cards, reads_as_gateway_unreachable,
+        reply_from_replay, restored_parts, saved_parts, stream_paint_due, stream_part_sig,
+        streaming_message_mut,
     };
     use crate::opengrok::{Failure, FormResolution, ModelEntry, OpenGrokClient};
     use std::str::FromStr;
@@ -7815,6 +7949,12 @@ mod tests {
         ];
         let content = "I'll open YouTube on my box using the taught recipe.\n\nYouTube is open on my box (not your Mac).";
 
+        // Pictures stay off sqlite until OpenGrok tags feed visibility. Words remain.
+        assert!(
+            saved_parts(&live).is_empty(),
+            "computer-step PNGs must not flood sqlite: {:?}",
+            saved_parts(&live)
+        );
         db.save_message(
             "s1",
             "assistant",
@@ -7831,13 +7971,54 @@ mod tests {
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         assert_eq!(rows.len(), 1);
         let restored = restored_parts(&rows[0].content, rows[0].parts.clone());
-        assert_eq!(shape(&restored), shape(&live));
+        assert_eq!(
+            restored,
+            vec![ChatPart::Text(content.to_string())],
+            "sqlite keeps the words; pictures rehydrate from OpenGrok"
+        );
         assert_eq!(
             rows[0].run_id.as_deref(),
             Some("run_1"),
             "the row says which run it came out of, which is how reconciling against the server \
              knows it already has this turn"
         );
+    }
+
+    #[test]
+    fn overlay_puts_submitted_user_form_back_on_a_sqlite_row() {
+        let submitted = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "formResolution": "submitted",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut submitted = submitted;
+        submitted.resolution = Some(FormResolution::Submitted);
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.run_id = Some("run_1".into());
+        bot.parts = vec![ChatPart::Text("I'll sign you in.".into())];
+        overlay_server_cards(
+            &mut bot,
+            &[
+                ChatPart::Text("I'll sign you in.".into()),
+                ChatPart::UserForm(submitted.clone()),
+            ],
+        );
+        match bot.parts.as_slice() {
+            [ChatPart::Text(_), ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+                assert!(spec.fields.iter().all(|f| f.prefill.is_none()));
+            }
+            other => panic!("expected text + Submitted card, got {other:?}"),
+        }
     }
 
     /// A row written before pieces were kept has none of them — which is also every row the
@@ -8241,14 +8422,15 @@ mod tests {
                 .any(|part| part.starts_with("shot c1 1280x800")),
             "the picture is in the turn, or this proves nothing about pictures"
         );
-        // And through the door both go to disk by, since that is where the pictures are kept.
+        // SQLite does not keep every PNG; OpenGrok replay puts the pinned shot back.
         assert_eq!(saved_parts(&replayed_parts), saved_parts(&live_parts));
         assert!(
-            saved_parts(&replayed_parts).iter().any(|part| matches!(
+            saved_parts(&replayed_parts).iter().all(|part| !matches!(
                 part,
                 crate::services::database::MessagePart::Screenshot { .. }
             )),
-            "a rebuilt turn saves its picture, or coming back to it loses the picture again"
+            "untagged PNGs stay off sqlite: {:?}",
+            saved_parts(&replayed_parts)
         );
     }
 

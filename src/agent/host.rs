@@ -361,7 +361,7 @@ fn last_screenshot_set(state: &AppState) -> Vec<ScreenshotSpec> {
             return set;
         }
     }
-    Vec::new()
+    state.last_box_shot.clone().into_iter().collect()
 }
 
 /// The rows of the composer's open panel, taken from the sources the panel itself draws from.
