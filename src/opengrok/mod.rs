@@ -20,24 +20,24 @@ pub use gen_ui::{
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use user_form::{
-    BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, FormResolution,
-    MASKED_PRESENCE_STUB, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
-    USER_FORM_SERVER_FILL_AVAILABLE, USER_FORM_SUBMIT_PATH, UserFormActionReply,
-    UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormHttpSettle, UserFormSpec,
-    UserFormValues, UserFormVerb, WAITING_FOR_YOU, box_handoff_action_from_http, continue_enabled,
-    dismiss_request_body, is_user_form_awaiting, is_user_form_custom_name, is_user_form_event,
-    is_user_form_tool, resolve_handoff_request_body, settle_user_form_http, submit_request_body,
-    user_form_action_from_http, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_screen_id,
+    BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, FORM_ENTRY_MISSING,
+    FormResolution, MASKED_PRESENCE_STUB, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM,
+    USER_FORM_DISMISS_PATH, USER_FORM_SERVER_FILL_AVAILABLE, USER_FORM_SUBMIT_PATH,
+    UserFormActionReply, UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormHttpSettle,
+    UserFormSpec, UserFormValues, UserFormVerb, WAITING_FOR_YOU, box_handoff_action_from_http,
+    continue_enabled, dismiss_request_body, is_form_entry_missing, is_user_form_awaiting,
+    is_user_form_custom_name, is_user_form_event, is_user_form_tool, resolve_handoff_request_body,
+    settle_user_form_http, submit_request_body, user_form_action_from_http, user_form_card_id,
+    user_form_continue_id, user_form_dismiss_id, user_form_field_id, user_form_screen_id,
 };
 
 pub use client::{
-    ConnectedComputer, CoworkerComputer, ImageStatus, LocalExecMode, OpenGrokClient,
+    ConnectedComputer, CoworkerComputer, EgressTunnel, ImageStatus, LocalExecMode, OpenGrokClient,
     QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind, RecipeParameter,
     RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare,
     RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent,
     RecipeVersion, RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus,
-    thin_tape,
+    env_egress_tunnel_enabled, host_egress_tunnel_enabled, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
 pub use types::{

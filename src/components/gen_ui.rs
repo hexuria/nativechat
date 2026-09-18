@@ -173,7 +173,7 @@ fn eye_scrim(radius: f32) -> impl IntoElement {
 
 pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let (decision, bot, machine) = app
+    let (decision, bot, machine, tunnel) = app
         .as_ref()
         .map(|entity| {
             let state = entity.read(cx);
@@ -186,12 +186,14 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 decision,
                 state.active_bot_name(),
                 state.local_exec_machine_id.clone().unwrap_or_default(),
+                state.egress_tunnel_available() || state.egress_tunnel_enabled,
             )
         })
         .unwrap_or((
             ApprovalDecision::Pending,
             "this agent".into(),
             String::new(),
+            false,
         ));
     if let Some(line) = decision.outcome_line(&bot, spec.place()) {
         return div()
@@ -244,7 +246,7 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                     .flex_1()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(if spec.is_review_an_action() {
+                    .child(if spec.is_review_an_action() && (tunnel || app.is_none()) {
                         "Review an action".to_string()
                     } else if spec.runs_on_this_mac() {
                         format!("Allow {bot} and all Bots to run commands on your local computer?")
@@ -299,8 +301,11 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
         // Always/Never set this Mac's policy, so only the local-shell tool
         // offers them. A box tool is answered one request at a time.
         // Review an action (egress / auto-review): Always allow / Allow once / Deny.
+        // Gated on host/env/box isEgressTunnelAvailable — OpenGrok only stamps
+        // the reason when the tunnel is on; we still require the flag here so
+        // exec-consent never grows Review chrome because a leftover reason.
         let local = spec.runs_on_this_mac();
-        let review = spec.is_review_an_action();
+        let review = spec.is_review_an_action() && (tunnel || app.is_none());
         let (primary, plain) = (
             (theme.primary, theme.primary_foreground, theme.primary),
             (theme.border, theme.foreground, theme.background),

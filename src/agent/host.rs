@@ -510,6 +510,7 @@ struct ApprovalSnap {
     tool: String,
     place: &'static str,
     local: bool,
+    review: bool,
 }
 
 /// Idle user-form card: fields still on screen. Settled / Sending cards
@@ -649,6 +650,10 @@ pub struct NativeChatHost {
     lightbox: Option<LightboxSnap>,
     /// Idle user-form cards in the open thread.
     user_forms: Vec<UserFormSnap>,
+    /// Settings → Computers: Route traffic row, when host/env/box says the tunnel exists.
+    route_traffic_visible: bool,
+    /// Box `egress_tunnel.ready` when the computer JSON exposed it.
+    egress_tunnel_ready: Option<bool>,
     pending: Option<Command>,
     /// Keys the last op asked the window for. The host has no window; the root view presses
     /// them (see [`Self::take_compose`]).
@@ -712,6 +717,8 @@ impl NativeChatHost {
                 .into_iter()
                 .map(|spec| ApprovalSnap {
                     local: spec.runs_on_this_mac(),
+                    review: spec.is_review_an_action()
+                        && (state.egress_tunnel_available() || state.egress_tunnel_enabled),
                     place: spec.place(),
                     call_id: spec.call_id,
                     tool: spec.tool,
@@ -863,6 +870,11 @@ impl NativeChatHost {
                     }
                 })
                 .collect(),
+            route_traffic_visible: state.show_egress_tunnel_settings(),
+            egress_tunnel_ready: state
+                .coworker_computer
+                .as_ref()
+                .and_then(|computer| computer.box_egress_ready()),
             pending: None,
             compose: None,
         }
@@ -991,17 +1003,22 @@ impl NativeChatHost {
         }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
-            let mut card = UiNode::new(
-                id.clone(),
-                "dialog",
-                format!("Allow {} on {}?", approval.tool, approval.place),
-            )
-            .with_child(UiNode::button(format!("{id}-allow-once"), "Allow once"))
-            .with_child(UiNode::button(format!("{id}-deny-once"), "Deny once"));
-            if approval.local {
-                card = card
-                    .with_child(UiNode::button(format!("{id}-always"), "Always allow"))
-                    .with_child(UiNode::button(format!("{id}-never"), "Never"));
+            let title = if approval.review {
+                "Review an action".to_string()
+            } else {
+                format!("Allow {} on {}?", approval.tool, approval.place)
+            };
+            let mut card = UiNode::new(id.clone(), "dialog", title)
+                .with_child(UiNode::button(format!("{id}-allow-once"), "Allow once"))
+                .with_child(UiNode::button(
+                    format!("{id}-deny-once"),
+                    if approval.review { "Deny" } else { "Deny once" },
+                ));
+            if approval.local || approval.review {
+                card = card.with_child(UiNode::button(format!("{id}-always"), "Always allow"));
+            }
+            if approval.local && !approval.review {
+                card = card.with_child(UiNode::button(format!("{id}-never"), "Never"));
             }
             page = page.with_child(card);
         }
@@ -1025,6 +1042,12 @@ impl NativeChatHost {
                     self.computer_reset_label.clone(),
                 )),
         );
+        if let Some(ready) = self.egress_tunnel_ready {
+            page = page.with_child(UiNode::status(
+                "egress_tunnel.ready",
+                if ready { "ready" } else { "not-ready" },
+            ));
+        }
         if let Some(banner) = &self.update_banner {
             page = page.with_child(UiNode::new("update-banner", "status", banner.clone()));
         }
@@ -1077,10 +1100,18 @@ impl NativeChatHost {
                     .with_child(sidebar)
                     .with_child(page)
                     .with_child(self.recipes_node())
-                    .with_child(
-                        UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
-                            .with_visible(self.account_open),
-                    )
+                    .with_child({
+                        let mut settings = UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
+                            .with_visible(self.account_open);
+                        if self.route_traffic_visible {
+                            settings = settings.with_child(UiNode::new(
+                                "route-traffic-this-computer",
+                                "switch",
+                                "Route traffic through this computer",
+                            ));
+                        }
+                        settings
+                    })
                     .with_child(
                         UiNode::dialog(ids::DIALOG_VOICE, "Voice Mode")
                             .with_visible(self.voice_open),

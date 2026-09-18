@@ -683,12 +683,6 @@ impl OpenGrokClient {
         response: reqwest::Response,
     ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
         let status = response.status().as_u16();
-        if status == 404 {
-            return Ok(super::user_form::UserFormActionReply::MissingRoute);
-        }
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
         let text = response
             .text()
             .await
@@ -698,6 +692,15 @@ impl OpenGrokClient {
         } else {
             serde_json::from_str(&text).unwrap_or(Value::Null)
         };
+        if status == 404 {
+            return Ok(super::user_form::user_form_action_from_http(status, &value));
+        }
+        if !(200..300).contains(&status) {
+            return Err(OpenGrokError::from_server(
+                Some(status),
+                error_message_from_body(&text),
+            ));
+        }
         Ok(super::user_form::user_form_action_from_http(status, &value))
     }
 
@@ -705,12 +708,6 @@ impl OpenGrokClient {
         response: reqwest::Response,
     ) -> Result<super::user_form::BoxHandoffReply, OpenGrokError> {
         let status = response.status().as_u16();
-        if status == 404 {
-            return Ok(super::user_form::BoxHandoffReply::MissingRoute);
-        }
-        if !response.status().is_success() {
-            return Err(Self::read_error(response).await);
-        }
         let text = response
             .text()
             .await
@@ -720,9 +717,73 @@ impl OpenGrokClient {
         } else {
             serde_json::from_str(&text).unwrap_or(Value::Null)
         };
+        if status == 404 {
+            return Ok(super::user_form::box_handoff_action_from_http(
+                status, &value,
+            ));
+        }
+        if !(200..300).contains(&status) {
+            return Err(OpenGrokError::from_server(
+                Some(status),
+                error_message_from_body(&text),
+            ));
+        }
         Ok(super::user_form::box_handoff_action_from_http(
             status, &value,
         ))
+    }
+
+    /// Seam A `POST /api/{method}`. Account JWT as Bearer **and**
+    /// `x-opengrok-account`. A 401 here is usually the host bearer, not a
+    /// signed-out AG-UI session — callers must not treat it as sign-out.
+    async fn gateway_command(
+        &self,
+        method: &str,
+        args: Option<&Value>,
+    ) -> Result<Value, OpenGrokError> {
+        let path = format!("/api/{method}");
+        let url = self.url(&path)?;
+        self.ensure_fresh_token("/account").await;
+        let token = self.access_token();
+        let mut req = self.http.post(url);
+        if let Some(token) = token.as_ref() {
+            req = req
+                .bearer_auth(token)
+                .header("x-opengrok-account", token.as_str());
+        }
+        req = req.json(args.unwrap_or(&json!({})));
+        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
+        let status = response.status().as_u16();
+        if matches!(status, 401 | 403 | 404) {
+            let body = response.text().await.unwrap_or_default();
+            return Err(OpenGrokError::from_server(
+                Some(status),
+                error_message_from_body(&body),
+            ));
+        }
+        Self::json_or_error(response).await
+    }
+
+    /// Host `isEgressTunnelAvailable`: env `OG_EGRESS_TUNNEL_ENABLED=1` /
+    /// `SAND_EGRESS_TUNNEL_ENABLED=1` or setting `egressTunnelEnabled`.
+    pub async fn is_egress_tunnel_available(&self) -> Result<bool, OpenGrokError> {
+        let value = self
+            .gateway_command("isEgressTunnelAvailable", None)
+            .await?;
+        Ok(value.as_bool().unwrap_or_else(|| {
+            value
+                .get("isEgressTunnelAvailable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        }))
+    }
+
+    pub async fn get_host_settings(&self) -> Result<Value, OpenGrokError> {
+        self.gateway_command("getHostSettings", None).await
+    }
+
+    pub async fn set_host_settings(&self, patch: &Value) -> Result<Value, OpenGrokError> {
+        self.gateway_command("setHostSettings", Some(patch)).await
     }
 
     /// Stop a run that is still going.
@@ -1357,10 +1418,21 @@ pub struct CoworkerComputer {
     /// An update in flight, or the failure the last one ended in.
     #[serde(default)]
     pub update: Option<UpdateStatus>,
-    /// OpenGrok currently hardcodes this false. When true, Settings can offer
-    /// **Route traffic through this computer**. No tunnel is invented here.
+    /// OpenGrok #139: env `OG_*` / `SAND_*_EGRESS_TUNNEL_ENABLED=1` or host
+    /// setting `egressTunnelEnabled`. When true, Settings can offer **Route
+    /// traffic through this computer**. No tunnel is invented here.
     #[serde(rename = "isEgressTunnelAvailable", default)]
     pub is_egress_tunnel_available: bool,
+    /// Box-owned tunnel endpoint, when the computer JSON exposes it.
+    #[serde(rename = "egress_tunnel", alias = "egressTunnel", default)]
+    pub egress_tunnel: Option<EgressTunnel>,
+}
+
+/// `{ ready: bool }` on coworker computer JSON when the box owns the tunnel.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct EgressTunnel {
+    #[serde(default)]
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1415,6 +1487,38 @@ impl CoworkerComputer {
     pub fn image_stale(&self) -> bool {
         self.image.as_ref().is_some_and(|image| image.stale)
     }
+
+    /// Host flag or nested `egress_tunnel.ready`. Either is enough to gate
+    /// Route traffic / Review an action. No tunnel is invented here.
+    pub fn egress_tunnel_ready(&self) -> bool {
+        self.is_egress_tunnel_available || self.egress_tunnel.as_ref().is_some_and(|t| t.ready)
+    }
+
+    /// `Some` when the box JSON exposed a tunnel field. `None` means omit the node.
+    pub fn box_egress_ready(&self) -> Option<bool> {
+        match &self.egress_tunnel {
+            Some(tunnel) => Some(tunnel.ready),
+            None if self.is_egress_tunnel_available => Some(true),
+            None => None,
+        }
+    }
+}
+
+/// Grok host: `SAND_EGRESS_TUNNEL_ENABLED === "1"`. OpenGrok also honors
+/// `OG_EGRESS_TUNNEL_ENABLED`. Strict `"1"`, not `"true"`.
+pub fn env_egress_tunnel_enabled() -> bool {
+    matches!(
+        std::env::var("OG_EGRESS_TUNNEL_ENABLED").as_deref(),
+        Ok("1")
+    ) || matches!(
+        std::env::var("SAND_EGRESS_TUNNEL_ENABLED").as_deref(),
+        Ok("1")
+    )
+}
+
+/// `getHostSettings.egressTunnelEnabled`.
+pub fn host_egress_tunnel_enabled(settings: &Value) -> bool {
+    settings.get("egressTunnelEnabled").and_then(Value::as_bool) == Some(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2935,6 +3039,31 @@ mod tests {
             user_form_action_from_http(404, &Value::Null),
             UserFormActionReply::MissingRoute
         );
+        assert_eq!(
+            user_form_action_from_http(404, &json!({ "error": "form entry missing" })),
+            UserFormActionReply::MissingEntry
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_user_form_404_form_entry_missing_is_not_missing_route() {
+        use super::super::user_form::UserFormActionReply;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/user-form/submit"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "error": "form entry missing" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let reply = client
+            .submit_user_form("e_form", "cw_1", &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(reply, UserFormActionReply::MissingEntry);
+        assert!(!matches!(reply, UserFormActionReply::MissingRoute));
+        assert!(!matches!(reply, UserFormActionReply::Settled(_)));
     }
 
     #[tokio::test]
@@ -2959,8 +3088,8 @@ mod tests {
 
     #[tokio::test]
     async fn submit_user_form_200_null_is_not_a_fill() {
-        // Classifier still reports Empty. After Continue, settle_user_form_http
-        // paints Submitted so idle fields do not come back.
+        // Classifier reports Empty. After Continue, settle_user_form_http
+        // paints Not filled — 200-null is disclosure, not Submitted.
         use super::super::user_form::UserFormActionReply;
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3155,8 +3284,9 @@ mod tests {
         assert_eq!(status.vnc_url(), Some("http://127.0.0.1:6080/vnc.html"));
         assert!(
             !status.is_egress_tunnel_available,
-            "OpenGrok hardcodes isEgressTunnelAvailable=false until provisioned"
+            "omitted isEgressTunnelAvailable defaults false"
         );
+        assert!(status.box_egress_ready().is_none());
     }
 
     #[test]
@@ -3167,6 +3297,8 @@ mod tests {
         }))
         .unwrap();
         assert!(!off.is_egress_tunnel_available);
+        assert!(!off.egress_tunnel_ready());
+        assert!(off.box_egress_ready().is_none());
         let on: CoworkerComputer = serde_json::from_value(json!({
             "agentId": "cw_1",
             "state": "running",
@@ -3174,6 +3306,67 @@ mod tests {
         }))
         .unwrap();
         assert!(on.is_egress_tunnel_available);
+        assert!(on.egress_tunnel_ready());
+        assert_eq!(on.box_egress_ready(), Some(true));
+        let nested: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egress_tunnel": { "ready": true }
+        }))
+        .unwrap();
+        assert!(!nested.is_egress_tunnel_available);
+        assert!(nested.egress_tunnel_ready());
+        assert_eq!(nested.box_egress_ready(), Some(true));
+        let nested_off: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egressTunnel": { "ready": false }
+        }))
+        .unwrap();
+        assert_eq!(nested_off.box_egress_ready(), Some(false));
+        assert!(!nested_off.egress_tunnel_ready());
+        assert!(host_egress_tunnel_enabled(
+            &json!({ "egressTunnelEnabled": true })
+        ));
+        assert!(!host_egress_tunnel_enabled(
+            &json!({ "egressTunnelEnabled": false })
+        ));
+        assert!(!host_egress_tunnel_enabled(&json!({})));
+    }
+
+    #[tokio::test]
+    async fn gateway_is_egress_tunnel_available_reads_boolean() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/isEgressTunnelAvailable"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(true))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/getHostSettings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "egressTunnelEnabled": true
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert!(client.is_egress_tunnel_available().await.unwrap());
+        let settings = client.get_host_settings().await.unwrap();
+        assert!(host_egress_tunnel_enabled(&settings));
+    }
+
+    #[tokio::test]
+    async fn gateway_is_egress_tunnel_available_401_is_not_signed_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/isEgressTunnelAvailable"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({ "error": "bad token" })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.is_egress_tunnel_available().await.unwrap_err();
+        assert_eq!(error.status, Some(401));
+        assert!(!error.is_signed_out());
     }
 
     #[tokio::test]

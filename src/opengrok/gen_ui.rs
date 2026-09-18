@@ -118,7 +118,9 @@ impl ApprovalSpec {
     }
 
     /// Grok Bot Steps 3–4: tunnel / auto-review HITL. Exec-consent stays
-    /// Allow/Deny once. OpenGrok must send this reason — we do not invent it.
+    /// Allow/Deny once. OpenGrok stamps this reason only when
+    /// `isEgressTunnelAvailable` (env `OG_*`/`SAND_*_EGRESS_TUNNEL_ENABLED=1`
+    /// or host `egressTunnelEnabled`). We do not invent it.
     pub fn is_review_an_action(&self) -> bool {
         matches!(
             self.reason.trim().to_ascii_lowercase().as_str(),

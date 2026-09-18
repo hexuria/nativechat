@@ -15,8 +15,8 @@ use crate::opengrok::{
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply, UserFormDismissMode,
     UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    local_exec_outcome, policy_answer, reads_as_gateway_unreachable, serve_local_exec,
-    stored_machine_id, tool_standin,
+    env_egress_tunnel_enabled, host_egress_tunnel_enabled, local_exec_outcome, policy_answer,
+    reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -1368,8 +1368,8 @@ pub struct AppState {
     /// Agent/E2E typed values (including secrets). In-memory only — never
     /// sqlite / AG-UI content. Continue prefers live InputState, then this.
     pub user_form_typed: HashMap<String, HashMap<String, String>>,
-    /// Routes exist on this server. Flipped off after a 404. Continue after
-    /// a 404 paints Not filled rather than restoring idle fields.
+    /// Routes exist on this server. Flipped off after a missing-route 404.
+    /// A 404 `{error: "form entry missing"}` does not flip this.
     pub user_form_verbs_available: bool,
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
@@ -1388,8 +1388,10 @@ pub struct AppState {
     /// The active coworker's computer, as last polled. Cleared on a switch so a
     /// bot never shows the previous one's screen.
     pub coworker_computer: Option<CoworkerComputer>,
-    /// Local opt-in for **Route traffic through this computer**. No tunnel
-    /// runs until OpenGrok sets `isEgressTunnelAvailable`.
+    /// From `POST /api/isEgressTunnelAvailable` (env OR host setting on the server).
+    pub host_egress_tunnel_available: bool,
+    /// Local/host opt-in for **Route traffic through this computer**. No tunnel
+    /// is invented here.
     pub egress_tunnel_enabled: bool,
     /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
     /// endpoint, so polling stops until the roster reloads.
@@ -1730,6 +1732,7 @@ impl AppState {
             expanded_shell_output: HashSet::new(),
             computers: Vec::new(),
             coworker_computer: None,
+            host_egress_tunnel_available: false,
             egress_tunnel_enabled: false,
             coworker_screen: None,
             computer_confirm: None,
@@ -1813,6 +1816,7 @@ impl AppState {
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.refresh_computers(cx);
+                        state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
                     }
                     Err(error) => {
@@ -2030,11 +2034,15 @@ impl AppState {
         self.submit_user_form(card_key, values, cx);
     }
 
-    /// OpenGrok must flip `isEgressTunnelAvailable` before this switch is live.
+    /// Host command, process env, or box `isEgressTunnelAvailable` /
+    /// `egress_tunnel.ready`. Any one is enough. No tunnel is invented.
     pub fn egress_tunnel_available(&self) -> bool {
-        self.coworker_computer
-            .as_ref()
-            .is_some_and(|computer| computer.is_egress_tunnel_available)
+        self.host_egress_tunnel_available
+            || env_egress_tunnel_enabled()
+            || self
+                .coworker_computer
+                .as_ref()
+                .is_some_and(|computer| computer.egress_tunnel_ready())
     }
 
     /// Grok shows the row when the tunnel is provisioned or already on.
@@ -2048,6 +2056,64 @@ impl AppState {
         }
         self.egress_tunnel_enabled = enabled;
         cx.notify();
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .set_host_settings(&serde_json::json!({ "egressTunnelEnabled": enabled }))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if let Ok(settings) = result {
+                    if let Some(flag) = settings
+                        .get("egressTunnelEnabled")
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        state.egress_tunnel_enabled = flag;
+                    }
+                    if enabled {
+                        state.host_egress_tunnel_available = true;
+                    } else {
+                        state.refresh_host_egress(cx);
+                        return;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Read `isEgressTunnelAvailable` + `getHostSettings` from the gateway.
+    /// A 401 is the host bearer, not a signed-out AG-UI session.
+    pub fn refresh_host_egress(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let available = client.is_egress_tunnel_available().await.ok();
+            let settings = client.get_host_settings().await.ok();
+            let _ = this.update(cx, |state, cx| {
+                let mut changed = false;
+                if let Some(available) = available
+                    && state.host_egress_tunnel_available != available
+                {
+                    state.host_egress_tunnel_available = available;
+                    changed = true;
+                }
+                if let Some(settings) = settings {
+                    let enabled = host_egress_tunnel_enabled(&settings);
+                    if state.egress_tunnel_enabled != enabled {
+                        state.egress_tunnel_enabled = enabled;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
@@ -2126,6 +2192,7 @@ impl AppState {
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.refresh_computers(cx);
+                        state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
                     }
                     Err(error) => {
@@ -2161,6 +2228,9 @@ impl AppState {
         self.stop_local_exec();
         self.approval_decisions.clear();
         self.computers.clear();
+        self.host_egress_tunnel_available = false;
+        self.egress_tunnel_enabled = false;
+        self.coworker_computer = None;
         cx.notify();
         if let Some(client) = client {
             cx.spawn(async move |_, _| {
@@ -6215,8 +6285,8 @@ impl AppState {
                                 }
                             }
                             UserFormHttpSettle::Paint(resolution) => {
-                                // Interim: 200-null after Continue → Submitted so idle
-                                // fields stay gone. Prefer a body formResolution.
+                                // After Sending: Not filled on 200-null / 404.
+                                // Submitted only from a body formResolution (Merge).
                                 state.paint_user_form_resolution(&card_key, resolution);
                                 state.user_form_restore.remove(&card_key);
                                 if resolution != FormResolution::FillFailed {
@@ -6557,6 +6627,7 @@ impl AppState {
         self.is_app_settings_open = !self.is_app_settings_open;
         if self.is_app_settings_open {
             self.dismiss_popovers(cx);
+            self.refresh_host_egress(cx);
         }
         self.record_nav();
         cx.notify();
@@ -6568,6 +6639,7 @@ impl AppState {
             self.record_nav();
             if tab == AppSettingsTab::Computer {
                 self.refresh_computers(cx);
+                self.refresh_host_egress(cx);
             }
             cx.notify();
         }
