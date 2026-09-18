@@ -17,9 +17,9 @@ use crate::opengrok::{
     UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
     activity_from_replay, collapse_computer_roster, command_from_args, command_from_replay_events,
     deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_enabled,
-    keep_local_save_offer, local_exec_outcome, policy_answer, reads_as_gateway_unreachable,
-    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
-    tool_standin,
+    keep_local_save_offer, local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
+    stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
@@ -258,6 +258,7 @@ fn overlay_server_cards(message: &mut Message, replayed: &[ChatPart]) {
             _ => {}
         }
     }
+    place_hitl_cards_in_document_order(&mut message.parts);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2104,6 +2105,35 @@ impl AppState {
             .collect()
     }
 
+    /// Escalated Open-the-screen cards waiting on Take over / I'm done / Skip.
+    pub fn open_computer_handoffs(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::UserForm(spec)
+                    if spec.shows_computer_handoff()
+                        && !self.user_form_handoff_done.contains(spec.card_key()) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn active_computer_handoff(&self) -> Option<crate::opengrok::UserFormSpec> {
+        self.open_computer_handoffs().into_iter().next_back()
+    }
+
+    /// Take over: open/focus the Computer pane and the coworker's screen.
+    pub fn take_over_computer(&mut self, cx: &mut Context<Self>) {
+        self.show_computer_pane(cx);
+        self.open_coworker_screen(cx);
+    }
+
     /// Agent/E2E typed a field. Secrets stay in-memory; never sqlite.
     pub fn set_user_form_typed_field(
         &mut self,
@@ -2675,6 +2705,7 @@ impl AppState {
         self.ensure_active_coworker(cx);
         self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
+        self.refresh_coworker_screen(cx);
         self.record_nav();
         cx.notify();
     }
@@ -6229,6 +6260,7 @@ impl AppState {
             _ => true,
         });
         self.inject_local_save_logins(&mut parts);
+        place_hitl_cards_in_document_order(&mut parts);
         parts
     }
 
@@ -6414,6 +6446,7 @@ impl AppState {
             return;
         }
         last.parts.push(ChatPart::Screenshot(shot));
+        place_hitl_cards_in_document_order(&mut last.parts);
     }
 
     fn restore_user_form(&mut self, card_key: &str) {
@@ -6770,6 +6803,7 @@ impl AppState {
                 self.paint_user_form_resolution(&card_key, mode.resolution());
                 if matches!(mode, UserFormDismissMode::Escalated) {
                     self.pin_open_screen_shot(&conversation_id);
+                    self.show_computer_pane(cx);
                 }
             }
             UserFormDispatch::ResolveHandoff(_) => {}
@@ -8554,6 +8588,58 @@ mod tests {
                 assert!(spec.fields.iter().all(|f| f.prefill.is_none()));
             }
             other => panic!("expected text + Submitted card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_mounts_the_open_form_above_screenshots_not_at_the_bottom() {
+        let open = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Form Label",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let mut bot = message("m1", false, "I'll raise a single in-chat form…");
+        bot.parts = vec![
+            ChatPart::Text("I'll raise a single in-chat form…".into()),
+            screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+        ];
+        overlay_server_cards(
+            &mut bot,
+            &[
+                ChatPart::Text("I'll raise a single in-chat form…".into()),
+                ChatPart::UserForm(open.clone()),
+                screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+            ],
+        );
+        match bot.parts.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+            ] => {
+                assert_eq!(spec.title, "Form Label");
+                assert!(spec.is_unresolved());
+            }
+            other => panic!("open form must not sit under the screenshot block: {other:?}"),
+        }
+        let mut dismissed = open;
+        dismissed.resolution = Some(FormResolution::Dismissed);
+        overlay_server_cards(&mut bot, &[ChatPart::UserForm(dismissed)]);
+        match bot.parts.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+            ] => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Dismissed));
+            }
+            other => panic!("Dismissed must stay in the same slot, got {other:?}"),
         }
     }
 

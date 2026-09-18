@@ -3,6 +3,10 @@ use std::sync::Arc;
 
 use crate::chrome::{HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats};
 use crate::components::fields::field_input;
+use crate::opengrok::{
+    BoxHandoffResolution, computer_attention_done_id, computer_attention_id,
+    computer_attention_skip_id,
+};
 use crate::state::{
     AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
     ScheduleUiMode, ScheduleUnit,
@@ -129,7 +133,17 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, box_id, routines, has_screen, screen, controls) = {
+        let (
+            view,
+            agent_name,
+            coworker_id,
+            box_id,
+            routines,
+            has_screen,
+            screen,
+            controls,
+            attention,
+        ) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -153,6 +167,16 @@ impl Render for ComputerPane {
                 .as_ref()
                 .and_then(|status| status.vnc_url())
                 .is_some();
+            let attention = state.active_computer_handoff().map(|spec| {
+                let key = spec.card_key().to_string();
+                let instruction = spec.handoff_prompt();
+                let handoff_id = spec
+                    .handoff_entry_id
+                    .clone()
+                    .or_else(|| state.user_form_handoff_id(&key));
+                let can_resolve = state.user_form_verbs_available && handoff_id.is_some();
+                (key, instruction, can_resolve)
+            });
             (
                 state.computer_view.clone(),
                 name,
@@ -162,6 +186,7 @@ impl Render for ComputerPane {
                 has_screen,
                 state.coworker_screen.clone(),
                 controls,
+                attention,
             )
         };
 
@@ -193,6 +218,7 @@ impl Render for ComputerPane {
                         has_screen,
                         screen,
                         &controls,
+                        attention,
                         muted,
                         app,
                         &theme,
@@ -294,6 +320,7 @@ impl ComputerPane {
         has_screen: bool,
         screen: Option<Arc<gpui_kit::Image>>,
         controls: &ComputerControls,
+        attention: Option<(String, String, bool)>,
         muted: Hsla,
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
@@ -306,6 +333,15 @@ impl ComputerPane {
                 .pt(px(8.))
                 .pb(px(16.))
                 .gap(px(12.))
+                .when_some(attention, |this, (key, instruction, can_resolve)| {
+                    this.child(attention_card(
+                        key,
+                        instruction,
+                        can_resolve,
+                        app.clone(),
+                        theme,
+                    ))
+                })
                 .child(screen_tile(
                     has_screen,
                     screen,
@@ -802,6 +838,79 @@ fn recipes_entry(
                         .text_xs()
                         .text_color(muted)
                         .child("Tasks taught on this screen"),
+                ),
+        )
+}
+
+/// Grok **Needs your attention** on the Computer surface while Open the screen
+/// is live. Skip this step = decline; I'm done, continue = hand back.
+fn attention_card(
+    key: String,
+    instruction: String,
+    can_resolve: bool,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let skip_app = app.clone();
+    let done_app = app;
+    let skip_key = key.clone();
+    let done_key = key.clone();
+    v_flex()
+        .id(computer_attention_id())
+        .w_full()
+        .gap(px(8.))
+        .p(px(12.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(rgb(0x8a5a2b))
+        .bg(rgb(0x6b4423).opacity(0.35))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Needs your attention"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(instruction),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .justify_end()
+                .gap(px(8.))
+                .flex_wrap()
+                .child(
+                    Button::new(computer_attention_skip_id(&key))
+                        .ghost()
+                        .label("Skip this step")
+                        .disabled(!can_resolve)
+                        .on_click(move |_, _, cx| {
+                            skip_app.update(cx, |state, cx| {
+                                state.resolve_user_form_handoff(
+                                    skip_key.clone(),
+                                    BoxHandoffResolution::Declined,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(computer_attention_done_id(&key))
+                        .primary()
+                        .label("I'm done, continue")
+                        .disabled(!can_resolve)
+                        .on_click(move |_, _, cx| {
+                            done_app.update(cx, |state, cx| {
+                                state.resolve_user_form_handoff(
+                                    done_key.clone(),
+                                    BoxHandoffResolution::HandedBack,
+                                    cx,
+                                );
+                            });
+                        }),
                 ),
         )
 }

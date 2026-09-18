@@ -1,18 +1,21 @@
 //! User-form transcript chrome. Separate from generative [`crate::opengrok::FormSpec`]
-//! (choice chips → `send_message`), and from OpenGrok Take over / I'm done / Skip.
+//! (choice chips → `send_message`).
 //!
 //! Continue → Submitting (fields hidden, spinner) → Submitted collapsed.
-//! Dismiss → Dismissed. Open the screen → On the computer + Hand back control.
-//! fill_failed recovery stays on the collapsed card: Try again / I'll do it
-//! on the computer / Stop for now. Secrets collected here go only in the REST
-//! body, never `send_message` / AG-UI `content` / sqlite.
+//! Dismiss → Dismissed. Open the screen → Grok Computer handoff: Action needed,
+//! instruction, embedded screen, Take over / I'm done / Skip. After I'm done /
+//! Skip the card collapses to On the computer. fill_failed recovery stays on
+//! the collapsed card: Try again / I'll do it on the computer / Stop for now.
+//! Secrets collected here go only in the REST body, never `send_message` /
+//! AG-UI `content` / sqlite.
 
 use crate::components::fields::field_input;
 use crate::opengrok::{
     BoxHandoffResolution, FormResolution, USER_FORM_SERVER_FILL_AVAILABLE, UserFormDismissMode,
-    UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues, continue_enabled,
-    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
-    user_form_screen_id,
+    UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues, computer_handoff_card_id,
+    computer_handoff_done_id, computer_handoff_skip_id, computer_handoff_takeover_id,
+    continue_enabled, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
+    user_form_field_id, user_form_screen_id,
 };
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -40,6 +43,12 @@ pub fn render_user_form(
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
+    let handed_back = app
+        .as_ref()
+        .is_some_and(|entity| entity.read(cx).user_form_handoff_resolved(spec.card_key()));
+    if spec.shows_computer_handoff() && !handed_back {
+        return render_computer_handoff(spec, app, cx);
+    }
     match spec.effective_resolution() {
         Some(FormResolution::Sending) => render_submitting(spec, cx),
         Some(resolution) => render_settled(spec, resolution, inputs, textareas, values, app, cx),
@@ -198,6 +207,184 @@ fn render_idle(
             )),
     )
     .into_any_element()
+}
+
+fn render_computer_handoff(
+    spec: &UserFormSpec,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let server_fill = app
+        .as_ref()
+        .map(|entity| entity.read(cx).user_form_verbs_available)
+        .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
+    let handoff_id = spec.handoff_entry_id.clone().or_else(|| {
+        app.as_ref()
+            .and_then(|entity| entity.read(cx).user_form_handoff_id(spec.card_key()))
+    });
+    let can_resolve = server_fill && handoff_id.is_some();
+    let screen = app.as_ref().and_then(|entity| {
+        let state = entity.read(cx);
+        state
+            .coworker_screen
+            .clone()
+            .or_else(|| state.last_box_shot.as_ref().map(|shot| shot.image.clone()))
+    });
+    let key = spec.card_key().to_string();
+    let prompt = spec.handoff_prompt();
+    let height = 512. * 800. / 1280.;
+    v_flex()
+        .id(ElementId::Name(computer_handoff_card_id(&key).into()))
+        .w_full()
+        .gap(px(10.))
+        .p(px(14.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .occlude()
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Computer"),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(999.))
+                        .bg(theme.yellow.opacity(0.22))
+                        .text_color(theme.yellow)
+                        .text_xs()
+                        .child("Action needed"),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(prompt),
+        )
+        .child(
+            div()
+                .id(ElementId::Name(
+                    format!("computer-handoff-screen-{key}").into(),
+                ))
+                .w_full()
+                .h(px(height))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(rgb(0x2a2a2a))
+                .overflow_hidden()
+                .cursor_pointer()
+                .when_some(app.clone(), |this, app| {
+                    this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        app.update(cx, |state, cx| {
+                            state.take_over_computer(cx);
+                        });
+                    })
+                })
+                .map(|this| match screen {
+                    Some(image) => this.child(
+                        img(image)
+                            .size_full()
+                            .rounded(px(10.))
+                            .object_fit(ObjectFit::Fill),
+                    ),
+                    None => this.child(
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::default()
+                                    .path("icons/monitor.svg")
+                                    .size(px(28.))
+                                    .text_color(rgb(0x888888)),
+                            ),
+                    ),
+                }),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .justify_end()
+                .gap(px(8.))
+                .flex_wrap()
+                .child(action_button(
+                    computer_handoff_takeover_id(&key),
+                    "Take over",
+                    ButtonKind::Primary,
+                    false,
+                    false,
+                    {
+                        let app = app.clone();
+                        Some(move |cx: &mut App| {
+                            if let Some(app) = &app {
+                                app.update(cx, |state, cx| {
+                                    state.take_over_computer(cx);
+                                });
+                            }
+                        })
+                    },
+                ))
+                .child(action_button(
+                    computer_handoff_done_id(&key),
+                    "I'm done",
+                    ButtonKind::Secondary,
+                    !can_resolve,
+                    handoff_id.is_none(),
+                    {
+                        let app = app.clone();
+                        let key = key.clone();
+                        can_resolve.then_some(move |cx: &mut App| {
+                            if let Some(app) = &app {
+                                app.update(cx, |state, cx| {
+                                    state.resolve_user_form_handoff(
+                                        key.clone(),
+                                        BoxHandoffResolution::HandedBack,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                    },
+                ))
+                .child(action_button(
+                    computer_handoff_skip_id(&key),
+                    "Skip",
+                    ButtonKind::Ghost,
+                    !can_resolve,
+                    handoff_id.is_none(),
+                    {
+                        let app = app.clone();
+                        can_resolve.then_some(move |cx: &mut App| {
+                            if let Some(app) = &app {
+                                app.update(cx, |state, cx| {
+                                    state.resolve_user_form_handoff(
+                                        key.clone(),
+                                        BoxHandoffResolution::Declined,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                    },
+                )),
+        )
+        .into_any_element()
 }
 
 fn collect_submit_values(

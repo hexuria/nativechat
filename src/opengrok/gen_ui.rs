@@ -11,7 +11,9 @@ use serde_json::Value;
 
 use super::client::LocalExecMode;
 use super::credential::{CredentialRequestSpec, SaveLoginSpec};
-use super::user_form::{UserFormSpec, is_user_form_awaiting, is_user_form_tool};
+use super::user_form::{
+    ComputerHandoffSpec, UserFormSpec, is_user_form_awaiting, is_user_form_tool,
+};
 use super::visibility::{ImageVisibility, pin_shot_at_turn_end, pin_shot_now};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +32,45 @@ pub enum ChatPart {
     SaveLogin(SaveLoginSpec),
     /// Confirm-to-reuse a saved login. A.0 answers without typing into Box.
     CredentialRequest(CredentialRequestSpec),
+}
+
+fn is_hitl_card(part: &ChatPart) -> bool {
+    matches!(
+        part,
+        ChatPart::UserForm(_) | ChatPart::SaveLogin(_) | ChatPart::CredentialRequest(_)
+    )
+}
+
+/// Paint HITL cards in the **settled** document slot from the first frame.
+///
+/// Live SSE used to append the awaiting form after tool screenshots, then
+/// replay/`overlay_server_cards` put it under the intro and above the shot
+/// block — the card jumped on Dismiss / Continue / Open the screen. Insert
+/// before the first [`ChatPart::Screenshot`] (or at the end when there is
+/// none) so the open Form Label already sits where Dismissed ends up.
+pub fn place_hitl_cards_in_document_order(parts: &mut Vec<ChatPart>) {
+    if parts.len() < 2 {
+        return;
+    }
+    let mut hitl = Vec::new();
+    let mut rest = Vec::new();
+    for part in parts.drain(..) {
+        if is_hitl_card(&part) {
+            hitl.push(part);
+        } else {
+            rest.push(part);
+        }
+    }
+    if hitl.is_empty() {
+        *parts = rest;
+        return;
+    }
+    let insert_at = rest
+        .iter()
+        .position(|part| matches!(part, ChatPart::Screenshot(_)))
+        .unwrap_or(rest.len());
+    rest.splice(insert_at..insert_at, hitl);
+    *parts = rest;
 }
 
 /// A screenshot the run produced, decoded once and shared by every row that paints it.
@@ -395,6 +436,9 @@ impl TurnAssembler {
                 } else if let Some(spec) = UserFormSpec::from_custom_event(event) {
                     self.flush_text();
                     self.push_user_form(spec);
+                } else if let Some(handoff) = ComputerHandoffSpec::from_event(event) {
+                    self.flush_text();
+                    self.push_user_form(handoff.as_escalated_form());
                 } else {
                     let value = event.get("value").cloned().unwrap_or(Value::Null);
                     if let Some(spec) = UiSpec::from_custom(name, &value) {
@@ -417,13 +461,16 @@ impl TurnAssembler {
 
     pub fn snapshot(&self) -> (String, Vec<ChatPart>) {
         if self.holding_ui() {
-            let plain = plain_text(&self.committed);
-            return (plain, self.committed.clone());
+            let mut parts = self.committed.clone();
+            place_hitl_cards_in_document_order(&mut parts);
+            let plain = plain_text(&parts);
+            return (plain, parts);
         }
         let mut parts = self.committed.clone();
         if !self.text.is_empty() {
             parts.push(ChatPart::Text(self.text.clone()));
         }
+        place_hitl_cards_in_document_order(&mut parts);
         let plain = plain_text(&parts);
         (plain, parts)
     }
@@ -551,6 +598,7 @@ impl TurnAssembler {
             _ => None,
         }) {
             existing.merge(spec);
+            place_hitl_cards_in_document_order(&mut self.committed);
             return;
         }
         // Awaiting CUSTOM has callId; a later send-message envelope has the
@@ -572,9 +620,11 @@ impl TurnAssembler {
             && existing.completes_with(&spec)
         {
             existing.merge(spec);
+            place_hitl_cards_in_document_order(&mut self.committed);
             return;
         }
         self.committed.push(ChatPart::UserForm(spec));
+        place_hitl_cards_in_document_order(&mut self.committed);
     }
 
     fn push_save_login(&mut self, spec: SaveLoginSpec) {
@@ -591,6 +641,7 @@ impl TurnAssembler {
             return;
         }
         self.committed.push(ChatPart::SaveLogin(spec));
+        place_hitl_cards_in_document_order(&mut self.committed);
     }
 
     fn push_credential_request(&mut self, spec: CredentialRequestSpec) {
@@ -604,6 +655,7 @@ impl TurnAssembler {
             return;
         }
         self.committed.push(ChatPart::CredentialRequest(spec));
+        place_hitl_cards_in_document_order(&mut self.committed);
     }
 
     pub fn take_completed_ui_tools(&mut self) -> Vec<CompletedUiTool> {
@@ -2329,5 +2381,174 @@ mod tests {
         }
         let dump = format!("{parts:?}");
         assert!(!dump.contains("s3cret-pass"));
+    }
+
+    fn form_label_card() -> ChatPart {
+        ChatPart::UserForm(
+            UserFormSpec::parse(
+                &json!({
+                    "entryId": "e_form",
+                    "formRequest": {
+                        "title": "Form Label",
+                        "instruction": "I'll raise a single in-chat form.",
+                        "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                    }
+                }),
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn dummy_shot(call_id: &str) -> ChatPart {
+        ChatPart::Screenshot(ScreenshotSpec {
+            call_id: call_id.into(),
+            caption: "screenshot".into(),
+            image: std::sync::Arc::new(gpui_kit::Image::from_bytes(
+                gpui_kit::ImageFormat::Png,
+                vec![0],
+            )),
+            width: 1280,
+            height: 800,
+            visibility: Some(ImageVisibility::Transcript),
+        })
+    }
+
+    #[test]
+    fn place_hitl_puts_the_open_form_where_dismissed_ends_up() {
+        let mut live = vec![
+            ChatPart::Text("I'll raise a single in-chat form…".into()),
+            dummy_shot("obs-1"),
+            ChatPart::Text("more.".into()),
+            form_label_card(),
+        ];
+        place_hitl_cards_in_document_order(&mut live);
+        match live.as_slice() {
+            [
+                ChatPart::Text(intro),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+                ChatPart::Text(after),
+            ] => {
+                assert!(intro.contains("in-chat form"));
+                assert_eq!(spec.title, "Form Label");
+                assert!(spec.is_unresolved());
+                assert_eq!(after, "more.");
+            }
+            other => panic!("open form must sit above the screenshot block, got {other:?}"),
+        }
+        let mut settled = live.clone();
+        if let ChatPart::UserForm(spec) = &mut settled[1] {
+            spec.resolution = Some(crate::opengrok::FormResolution::Dismissed);
+        }
+        place_hitl_cards_in_document_order(&mut settled);
+        assert_eq!(
+            live.iter()
+                .map(|p| std::mem::discriminant(p))
+                .collect::<Vec<_>>(),
+            settled
+                .iter()
+                .map(|p| std::mem::discriminant(p))
+                .collect::<Vec<_>>(),
+            "settle must not move the card"
+        );
+    }
+
+    #[test]
+    fn live_awaiting_form_is_not_appended_under_the_screenshot_block() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_CONTENT",
+            "delta": "I'll raise a single in-chat form…"
+        }));
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT",
+            "toolCallId": "obs-1",
+            "content": "observe",
+            "ok": true,
+            "image": png_image(Some("transcript"))
+        }));
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_CONTENT",
+            "delta": "Working on the page."
+        }));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run-1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "tool": "request_user_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Form Label",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }));
+        let (_, open) = turn.snapshot();
+        match open.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+                ChatPart::Text(_),
+            ] => {
+                assert_eq!(spec.title, "Form Label");
+                assert!(spec.is_unresolved());
+            }
+            other => {
+                panic!("PASS: open Form Label already sits where Dismissed ends up; got {other:?}")
+            }
+        }
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": { "title": "Form Label" }
+                },
+                "formResolution": "dismissed"
+            }
+        }));
+        let (_, settled) = turn.snapshot();
+        match settled.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+                ChatPart::Text(_),
+            ] => {
+                assert_eq!(
+                    spec.effective_resolution(),
+                    Some(crate::opengrok::FormResolution::Dismissed)
+                );
+            }
+            other => panic!("Dismissed must stay in the same slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn computer_handoff_custom_paints_an_escalated_form() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "computer-handoff-card",
+            "value": {
+                "entryId": "e_form",
+                "boxRequestId": "box-9",
+                "boxInstruction": "Sign in on the computer."
+            }
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert!(spec.shows_computer_handoff());
+                assert_eq!(spec.handoff_prompt(), "Sign in on the computer.");
+            }
+            other => panic!("expected Computer handoff card, got {other:?}"),
+        }
     }
 }

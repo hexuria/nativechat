@@ -2,9 +2,11 @@
 //!
 //! This is **not** generative UI [`super::gen_ui::FormSpec`] (choice chips that
 //! dump values into `send_message`). It is **not** secret-request (a connector
-//! vault with **Save securely**). It is **not** Computer handoff (`Take over` /
-//! `I'm done` / `Skip`). Password and other secret fields typed here must never
-//! enter AG-UI `content` or sqlite.
+//! vault with **Save securely**). Continue fills the page and is not Take over.
+//! **Open the screen** (and OpenGrok `sand://box` / `computer_handoff_card`)
+//! paints Grok Computer handoff chrome: **Take over** / **I'm done** / **Skip**,
+//! plus **Needs your attention** on the Computer pane. Password and other
+//! secret fields typed here must never enter AG-UI `content` or sqlite.
 //!
 //! # Two channels ([opengrok-server#139](https://github.com/hexuria/opengrok-server/pull/139))
 //!
@@ -39,8 +41,10 @@
 //!
 //! **Form `entryId` is the gateway card id, never `callId`.** Open the screen
 //! keeps that id for the pill and stores **`handoffEntryId`** from the dismiss
-//! response. Hand back / decline POST that handoff id — **not** the form card
-//! id, **not** `handBackForeverBox`, **not** Take over / I'm done / Skip.
+//! response. **I'm done** / **Skip** POST that handoff id (`handed_back` /
+//! `declined`) — **not** the form card id, **not** `handBackForeverBox`.
+//! **Take over** opens/focuses the Computer (pane + screen). The live card is
+//! Grok Computer chrome, not the collapsed **On the computer** form.
 //!
 //! After Continue paints **Sending**, HTTP must not restore idle fields.
 //! A body with `formResolution` (`submitted` / `fill_failed` / …) is merged.
@@ -246,8 +250,8 @@ impl FormResolution {
         }
     }
 
-    /// Pill copy. Continue paints **Submitting** (local) then **Submitted**.
-    /// Open the screen paints **On the computer**, not OpenGrok Take over.
+    /// Pill copy on the *settled* form. Live Open-the-screen is Grok Computer
+    /// chrome (`Action needed`); after I'm done / Skip this pill remains.
     pub fn pill(self) -> &'static str {
         match self {
             Self::Sending => "Submitting",
@@ -406,6 +410,118 @@ pub fn user_form_screen_id(card_key: &str) -> String {
     format!("user-form-screen-{card_key}")
 }
 
+pub fn computer_handoff_card_id(card_key: &str) -> String {
+    format!("computer-handoff-{card_key}")
+}
+
+pub fn computer_handoff_takeover_id(card_key: &str) -> String {
+    format!("computer-handoff-takeover-{card_key}")
+}
+
+pub fn computer_handoff_done_id(card_key: &str) -> String {
+    format!("computer-handoff-done-{card_key}")
+}
+
+pub fn computer_handoff_skip_id(card_key: &str) -> String {
+    format!("computer-handoff-skip-{card_key}")
+}
+
+pub fn computer_attention_id() -> &'static str {
+    "computer-attention"
+}
+
+pub fn computer_attention_skip_id(card_key: &str) -> String {
+    format!("computer-attention-skip-{card_key}")
+}
+
+pub fn computer_attention_done_id(card_key: &str) -> String {
+    format!("computer-attention-done-{card_key}")
+}
+
+/// OpenGrok Computer handoff attachment (`sand://box` / `computer_handoff_card`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerHandoffSpec {
+    pub form_entry_id: String,
+    pub box_request_id: Option<String>,
+    pub instruction: String,
+}
+
+impl ComputerHandoffSpec {
+    pub fn from_event(event: &Value) -> Option<Self> {
+        let name = event.get("name").and_then(Value::as_str).unwrap_or("");
+        let value = event.get("value").cloned().unwrap_or(Value::Null);
+        if !is_computer_handoff_name(name) && !is_computer_handoff_payload(&value) {
+            return None;
+        }
+        let instruction = string_field(&value, "boxInstruction")
+            .or_else(|| string_field(&value, "instruction"))
+            .or_else(|| string_field(event, "boxInstruction"))
+            .or_else(|| string_field(event, "instruction"))
+            .unwrap_or_default();
+        let form_entry_id = string_field(&value, "formEntryId")
+            .or_else(|| string_field(&value, "entryId"))
+            .or_else(|| string_field(event, "formEntryId"))
+            .or_else(|| string_field(event, "entryId"))
+            .unwrap_or_default();
+        let box_request_id =
+            string_field(&value, "boxRequestId").or_else(|| string_field(event, "boxRequestId"));
+        if form_entry_id.is_empty() && box_request_id.is_none() && instruction.is_empty() {
+            return None;
+        }
+        Some(Self {
+            form_entry_id,
+            box_request_id,
+            instruction,
+        })
+    }
+
+    pub fn card_key(&self) -> &str {
+        if !self.form_entry_id.is_empty() {
+            &self.form_entry_id
+        } else {
+            self.box_request_id.as_deref().unwrap_or("box")
+        }
+    }
+
+    /// Standalone attachment when no user-form card exists to fold onto.
+    pub fn as_escalated_form(&self) -> UserFormSpec {
+        UserFormSpec {
+            entry_id: self.card_key().to_string(),
+            call_id: String::new(),
+            run_id: String::new(),
+            title: "Computer".into(),
+            instruction: (!self.instruction.is_empty()).then(|| self.instruction.clone()),
+            fields: Vec::new(),
+            domain: None,
+            live_host: None,
+            resolution: Some(FormResolution::Escalated),
+            widget_dismissed: false,
+            handoff_entry_id: None,
+            box_request_id: self.box_request_id.clone(),
+            box_instruction: (!self.instruction.is_empty()).then(|| self.instruction.clone()),
+        }
+    }
+}
+
+pub fn is_computer_handoff_name(name: &str) -> bool {
+    let n = normalize_name(name);
+    matches!(
+        n.as_str(),
+        "computer-handoff-card"
+            | "computer-handoff"
+            | "sand://box"
+            | "sand:box"
+            | "box-handoff"
+            | "box-handoff-card"
+    )
+}
+
+fn is_computer_handoff_payload(value: &Value) -> bool {
+    string_field(value, "uri").as_deref() == Some("sand://box")
+        || value.get("boxRequestId").is_some()
+        || value.get("boxInstruction").is_some()
+}
+
 pub fn user_form_field_id(card_key: &str, field_id: &str) -> String {
     format!("user-form-field-{card_key}-{field_id}")
 }
@@ -431,6 +547,10 @@ pub struct UserFormSpec {
     /// HTTP convenience from dismiss `mode: escalated`. Not the form card id.
     /// Never sent as submit/dismiss `entryId`. Never a `boxRequestId` on this card.
     pub handoff_entry_id: Option<String>,
+    /// OpenGrok `sand://box` / `computer_handoff_card` request id. Not a POST id.
+    pub box_request_id: Option<String>,
+    /// Instruction on the Computer handoff card when OpenGrok sent `boxInstruction`.
+    pub box_instruction: Option<String>,
 }
 
 impl UserFormSpec {
@@ -552,6 +672,12 @@ impl UserFormSpec {
         if incoming.handoff_entry_id.is_some() {
             self.handoff_entry_id = incoming.handoff_entry_id;
         }
+        if incoming.box_request_id.is_some() {
+            self.box_request_id = incoming.box_request_id;
+        }
+        if incoming.box_instruction.is_some() {
+            self.box_instruction = incoming.box_instruction;
+        }
     }
 
     pub fn from_custom_event(event: &Value) -> Option<Self> {
@@ -646,7 +772,28 @@ impl UserFormSpec {
             resolution,
             widget_dismissed,
             handoff_entry_id: string_field(value, "handoffEntryId"),
+            box_request_id: request
+                .and_then(|req| string_field(req, "boxRequestId"))
+                .or_else(|| string_field(value, "boxRequestId")),
+            box_instruction: request
+                .and_then(|req| string_field(req, "boxInstruction"))
+                .or_else(|| string_field(value, "boxInstruction")),
         })
+    }
+
+    /// Open the screen / `sand://box`: live Grok Computer chrome until I'm done / Skip.
+    pub fn shows_computer_handoff(&self) -> bool {
+        self.effective_resolution() == Some(FormResolution::Escalated)
+    }
+
+    pub fn handoff_prompt(&self) -> String {
+        self.box_instruction
+            .as_deref()
+            .or(self.instruction.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Complete this step on the computer.")
+            .to_string()
     }
 }
 
@@ -1977,6 +2124,43 @@ mod tests {
                 &json!({ "id": "e_hand", "boxResolution": "handed_back" })
             ),
             BoxHandoffReply::Settled
+        );
+    }
+
+    #[test]
+    fn computer_handoff_attachment_becomes_an_escalated_form() {
+        let spec = ComputerHandoffSpec::from_event(&json!({
+            "type": "CUSTOM",
+            "name": "computer-handoff-card",
+            "value": {
+                "entryId": "e_form",
+                "boxRequestId": "box-9",
+                "boxInstruction": "Sign in on the computer."
+            }
+        }))
+        .expect("handoff");
+        assert_eq!(spec.form_entry_id, "e_form");
+        assert_eq!(spec.box_request_id.as_deref(), Some("box-9"));
+        let form = spec.as_escalated_form();
+        assert!(form.shows_computer_handoff());
+        assert_eq!(form.entry_id, "e_form");
+        assert_eq!(form.box_request_id.as_deref(), Some("box-9"));
+        assert_eq!(form.handoff_prompt(), "Sign in on the computer.");
+        assert_eq!(form.effective_resolution(), Some(FormResolution::Escalated));
+        let sand = ComputerHandoffSpec::from_event(&json!({
+            "type": "CUSTOM",
+            "name": "ui",
+            "value": {
+                "uri": "sand://box",
+                "boxRequestId": "box-2",
+                "instruction": "Finish this step."
+            }
+        }))
+        .expect("sand://box");
+        assert_eq!(sand.box_request_id.as_deref(), Some("box-2"));
+        assert_eq!(
+            sand.as_escalated_form().handoff_prompt(),
+            "Finish this step."
         );
     }
 }

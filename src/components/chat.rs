@@ -49,6 +49,7 @@ struct ChatFeedRev {
     user_form_handoffs: Vec<(String, String, bool)>,
     save_logins: Vec<(String, String)>,
     credential_requests: Vec<(String, String)>,
+    box_screen: bool,
     is_ai_responding: bool,
     debug_mode: bool,
     can_read_aloud: bool,
@@ -198,6 +199,7 @@ impl ChatFeedRev {
                 cards.sort();
                 cards
             },
+            box_screen: state.coworker_screen.is_some() || state.last_box_shot.is_some(),
             is_ai_responding: state.is_active_bot_responding(),
             debug_mode: state.debug_markdown_disabled,
             can_read_aloud: true,

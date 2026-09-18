@@ -7,11 +7,13 @@ use crate::components::chat_input::sources::{
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::{
-    ChatPart, CoworkerPatch, LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec,
-    UserFormDismissMode, UserFormFieldKind, credential_request_allow_id,
-    credential_request_card_id, credential_request_deny_id, save_login_card_id, save_login_save_id,
-    save_login_skip_id, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_screen_id,
+    BoxHandoffResolution, ChatPart, CoworkerPatch, LocalExecResolution, RecipeKind, RecipeSummary,
+    ScreenshotSpec, UserFormDismissMode, UserFormFieldKind, computer_attention_done_id,
+    computer_attention_id, computer_attention_skip_id, computer_handoff_card_id,
+    computer_handoff_done_id, computer_handoff_skip_id, computer_handoff_takeover_id,
+    credential_request_allow_id, credential_request_card_id, credential_request_deny_id,
+    save_login_card_id, save_login_save_id, save_login_skip_id, user_form_card_id,
+    user_form_continue_id, user_form_dismiss_id, user_form_field_id, user_form_screen_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -146,6 +148,15 @@ pub enum Command {
         field_id: String,
         value: String,
     },
+    ComputerHandoffTakeOver {
+        card_key: String,
+    },
+    ComputerHandoffDone {
+        card_key: String,
+    },
+    ComputerHandoffSkip {
+        card_key: String,
+    },
     SaveLogin {
         form_entry_id: String,
     },
@@ -237,6 +248,13 @@ impl Command {
                 field_id,
                 value,
             } => state.set_user_form_typed_field(card_key, field_id, value, cx),
+            Self::ComputerHandoffTakeOver { .. } => state.take_over_computer(cx),
+            Self::ComputerHandoffDone { card_key } => {
+                state.resolve_user_form_handoff(card_key, BoxHandoffResolution::HandedBack, cx)
+            }
+            Self::ComputerHandoffSkip { card_key } => {
+                state.resolve_user_form_handoff(card_key, BoxHandoffResolution::Declined, cx)
+            }
             Self::SaveLogin { form_entry_id } => state.save_offered_login(form_entry_id, cx),
             Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
             Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
@@ -556,6 +574,12 @@ struct UserFormFieldSnap {
 }
 
 #[derive(Clone, Default)]
+struct ComputerHandoffSnap {
+    card_key: String,
+    instruction: String,
+}
+
+#[derive(Clone, Default)]
 struct SaveLoginSnap {
     form_entry_id: String,
     origin: String,
@@ -595,6 +619,25 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
     card.with_child(UiNode::button(user_form_continue_id(key), "Continue"))
         .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
         .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
+}
+
+fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
+    let key = &handoff.card_key;
+    UiNode::dialog(computer_handoff_card_id(key), "Computer")
+        .with_child(UiNode::status(
+            format!("computer-handoff-badge-{key}"),
+            "Action needed",
+        ))
+        .with_child(UiNode::status(
+            format!("computer-handoff-instruction-{key}"),
+            handoff.instruction.clone(),
+        ))
+        .with_child(UiNode::button(
+            computer_handoff_takeover_id(key),
+            "Take over",
+        ))
+        .with_child(UiNode::button(computer_handoff_done_id(key), "I'm done"))
+        .with_child(UiNode::button(computer_handoff_skip_id(key), "Skip"))
 }
 
 fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
@@ -736,6 +779,8 @@ pub struct NativeChatHost {
     lightbox: Option<LightboxSnap>,
     /// Idle user-form cards in the open thread.
     user_forms: Vec<UserFormSnap>,
+    /// Open the screen → Grok Computer chrome (Take over / I'm done / Skip).
+    computer_handoffs: Vec<ComputerHandoffSnap>,
     save_logins: Vec<SaveLoginSnap>,
     credential_requests: Vec<CredentialRequestSnap>,
     site_logins: Vec<SiteLoginSnap>,
@@ -959,6 +1004,14 @@ impl NativeChatHost {
                     }
                 })
                 .collect(),
+            computer_handoffs: state
+                .open_computer_handoffs()
+                .into_iter()
+                .map(|spec| ComputerHandoffSnap {
+                    instruction: spec.handoff_prompt(),
+                    card_key: spec.card_key().to_string(),
+                })
+                .collect(),
             save_logins: state
                 .conversations
                 .iter()
@@ -1168,29 +1221,44 @@ impl NativeChatHost {
         for form in &self.user_forms {
             page = page.with_child(user_form_node(form));
         }
+        for handoff in &self.computer_handoffs {
+            page = page.with_child(computer_handoff_node(handoff));
+        }
         for offer in &self.save_logins {
             page = page.with_child(save_login_node(offer));
         }
         for request in &self.credential_requests {
             page = page.with_child(credential_request_node(request));
         }
-        page = page.with_child(
-            UiNode::new("computer-pane", "dialog", "Computer")
-                .with_visible(self.computer_open)
-                .with_child(UiNode::new(
-                    "computer-status",
-                    "status",
-                    self.computer_status.clone(),
-                ))
-                .with_child(UiNode::button(
-                    "computer-update",
-                    self.computer_update_label.clone(),
-                ))
-                .with_child(UiNode::button(
-                    "computer-reset",
-                    self.computer_reset_label.clone(),
-                )),
-        );
+        let mut computer = UiNode::new("computer-pane", "dialog", "Computer")
+            .with_visible(self.computer_open)
+            .with_child(UiNode::new(
+                "computer-status",
+                "status",
+                self.computer_status.clone(),
+            ))
+            .with_child(UiNode::button(
+                "computer-update",
+                self.computer_update_label.clone(),
+            ))
+            .with_child(UiNode::button(
+                "computer-reset",
+                self.computer_reset_label.clone(),
+            ));
+        if let Some(handoff) = self.computer_handoffs.last() {
+            computer = computer.with_child(
+                UiNode::new(computer_attention_id(), "dialog", "Needs your attention")
+                    .with_child(UiNode::button(
+                        computer_attention_skip_id(&handoff.card_key),
+                        "Skip this step",
+                    ))
+                    .with_child(UiNode::button(
+                        computer_attention_done_id(&handoff.card_key),
+                        "I'm done, continue",
+                    )),
+            );
+        }
+        page = page.with_child(computer);
         if let Some(ready) = self.egress_tunnel_ready {
             page = page.with_child(UiNode::status(
                 "egress_tunnel.ready",
@@ -1469,6 +1537,30 @@ impl NativeChatHost {
         None
     }
 
+    fn computer_handoff_command(&self, target: &str) -> Option<Command> {
+        for handoff in &self.computer_handoffs {
+            let key = &handoff.card_key;
+            if target == computer_handoff_takeover_id(key) {
+                return Some(Command::ComputerHandoffTakeOver {
+                    card_key: key.clone(),
+                });
+            }
+            if target == computer_handoff_done_id(key) || target == computer_attention_done_id(key)
+            {
+                return Some(Command::ComputerHandoffDone {
+                    card_key: key.clone(),
+                });
+            }
+            if target == computer_handoff_skip_id(key) || target == computer_attention_skip_id(key)
+            {
+                return Some(Command::ComputerHandoffSkip {
+                    card_key: key.clone(),
+                });
+            }
+        }
+        None
+    }
+
     fn save_login_command(&self, target: &str) -> Option<Command> {
         for offer in &self.save_logins {
             if target == save_login_save_id(&offer.form_entry_id) {
@@ -1670,6 +1762,8 @@ impl NativeChatHost {
                  to take the row)"
             ));
         } else if let Some(cmd) = self.user_form_command(target) {
+            cmd
+        } else if let Some(cmd) = self.computer_handoff_command(target) {
             cmd
         } else if let Some(cmd) = self.save_login_command(target) {
             cmd
@@ -2594,6 +2688,60 @@ mod tests {
         assert!(matches!(
             host.take_command(),
             Some(Command::UserFormOpenScreen { .. })
+        ));
+    }
+
+    #[test]
+    fn computer_handoff_chrome_is_in_the_tree() {
+        let mut host = host();
+        host.computer_handoffs = vec![ComputerHandoffSnap {
+            card_key: "e_form".into(),
+            instruction: "Sign in on the computer.".into(),
+        }];
+        host.computer_open = true;
+        let tree = host.snapshot();
+        assert!(tree.find("computer-handoff-e_form").is_some());
+        assert_eq!(
+            tree.find("computer-handoff-takeover-e_form").unwrap().name,
+            "Take over"
+        );
+        assert_eq!(
+            tree.find("computer-handoff-done-e_form").unwrap().name,
+            "I'm done"
+        );
+        assert_eq!(
+            tree.find("computer-handoff-skip-e_form").unwrap().name,
+            "Skip"
+        );
+        assert_eq!(
+            tree.find("computer-attention").unwrap().name,
+            "Needs your attention"
+        );
+        assert_eq!(
+            tree.find("computer-attention-skip-e_form").unwrap().name,
+            "Skip this step"
+        );
+        assert_eq!(
+            tree.find("computer-attention-done-e_form").unwrap().name,
+            "I'm done, continue"
+        );
+        host.dispatch(&Op::click("computer-handoff-takeover-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffTakeOver { card_key }) if card_key == "e_form"
+        ));
+        host.dispatch(&Op::click("computer-handoff-done-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffDone { .. })
+        ));
+        host.dispatch(&Op::click("computer-attention-skip-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ComputerHandoffSkip { .. })
         ));
     }
 
