@@ -7,17 +7,17 @@ use crate::chrome::{
 use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
-    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, ConnectedComputer, Coworker,
-    CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus, Failure,
-    FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue,
-    OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
-    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
+    BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
+    Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus,
+    Failure, FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecResolution,
+    ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
+    RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary,
+    ReplyQuote, RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
     TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
     UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_enabled, keep_local_save_offer, local_exec_outcome,
+    host_egress_tunnel_flag, keep_local_save_offer, local_exec_outcome,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
     result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
     tool_standin,
@@ -1269,6 +1269,14 @@ pub enum AppSettingsTab {
     Logins,
 }
 
+/// Where Route traffic chrome belongs for the active bot's box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteTrafficSurface {
+    Hidden,
+    BotPane,
+    UserSettings,
+}
+
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
 /// so ⌘[ / ⌘] can walk agents, the right pane, and Settings the way macOS apps do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1498,8 +1506,8 @@ pub struct AppState {
     pub coworker_computer: Option<CoworkerComputer>,
     /// From `POST /api/isEgressTunnelAvailable` (env OR host setting on the server).
     pub host_egress_tunnel_available: bool,
-    /// Local/host opt-in for **Route traffic through this computer**. No tunnel
-    /// is invented here.
+    /// Local/host opt-in for **Route traffic through this computer**. Defaults
+    /// ON; host `egressTunnelEnabled` overwrites only when the key is present.
     pub egress_tunnel_enabled: bool,
     /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
     /// endpoint, so polling stops until the roster reloads.
@@ -1858,7 +1866,7 @@ impl AppState {
             computers: Vec::new(),
             coworker_computer: None,
             host_egress_tunnel_available: false,
-            egress_tunnel_enabled: false,
+            egress_tunnel_enabled: true,
             coworker_screen: None,
             last_box_shot: None,
             computer_confirm: None,
@@ -2239,30 +2247,86 @@ impl AppState {
         self.host_egress_tunnel_available || env_egress_tunnel_enabled()
     }
 
-    fn box_egress_tunnel_ready(&self) -> bool {
-        self.coworker_computer
-            .as_ref()
-            .is_some_and(|computer| computer.egress_tunnel_ready())
+    fn nonempty_box_id(id: Option<&str>) -> Option<&str> {
+        id.map(str::trim).filter(|id| !id.is_empty())
     }
 
-    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** this bot's box
-    /// tunnel. No tunnel is invented. The Computer pane row can still *show*
-    /// when only one side is known; this AND-gate is what may turn it on.
+    fn active_box_id(&self) -> Option<&str> {
+        Self::nonempty_box_id(
+            self.coworker_computer
+                .as_ref()
+                .and_then(|computer| computer.box_id.as_deref()),
+        )
+        .or_else(|| {
+            let active = self.active_coworker_id.as_deref()?;
+            Self::nonempty_box_id(
+                self.coworkers
+                    .iter()
+                    .find(|coworker| coworker.id == active)?
+                    .box_id
+                    .as_deref(),
+            )
+        })
+    }
+
+    fn box_shared_among_coworkers(&self) -> bool {
+        let Some(box_id) = self.active_box_id() else {
+            return false;
+        };
+        self.coworkers
+            .iter()
+            .filter(|coworker| Self::nonempty_box_id(coworker.box_id.as_deref()) == Some(box_id))
+            .count()
+            > 1
+    }
+
+    /// Nested `egress_tunnel.ready` / URL on this bot's computer JSON.
+    pub fn box_egress_provisioned(&self) -> bool {
+        self.coworker_computer
+            .as_ref()
+            .is_some_and(CoworkerComputer::box_egress_provisioned)
+    }
+
+    fn box_egress_tunnel_ready(&self) -> bool {
+        self.box_egress_provisioned()
+    }
+
+    /// OpenGrok #139: host setting/env **and** this bot's box tunnel. No tunnel
+    /// is invented. Review-an-action uses this AND-gate; Route traffic chrome
+    /// uses [`Self::route_traffic_surface`] (provisioned + shareScope).
     pub fn egress_tunnel_available(&self) -> bool {
         self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
     }
 
-    /// Grok shows the Network row when the host intends a tunnel, the box
-    /// already exposed one, or the toggle is already on. Box status lag or a
-    /// 401 on the host poll must not hide the row.
-    pub fn show_egress_tunnel_settings(&self) -> bool {
-        self.host_intends_egress_tunnel()
-            || self.box_egress_tunnel_ready()
-            || self.egress_tunnel_enabled
+    /// Dedicated → bot Computer pane header icon. User (or unknown + shared
+    /// `boxId`) → Settings → Computer. Group/org → hide. Unprovisioned → hide.
+    pub fn route_traffic_surface(&self) -> RouteTrafficSurface {
+        if !self.box_egress_provisioned() {
+            return RouteTrafficSurface::Hidden;
+        }
+        match self
+            .coworker_computer
+            .as_ref()
+            .and_then(|computer| computer.share_scope)
+        {
+            Some(BoxShareScope::Dedicated) => RouteTrafficSurface::BotPane,
+            Some(BoxShareScope::User) => RouteTrafficSurface::UserSettings,
+            Some(BoxShareScope::Group) | Some(BoxShareScope::Org) => RouteTrafficSurface::Hidden,
+            None if self.box_shared_among_coworkers() => RouteTrafficSurface::UserSettings,
+            None => RouteTrafficSurface::BotPane,
+        }
+    }
+
+    pub fn show_route_traffic_on_bot_pane(&self) -> bool {
+        self.route_traffic_surface() == RouteTrafficSurface::BotPane
+    }
+
+    pub fn show_route_traffic_in_user_settings(&self) -> bool {
+        self.route_traffic_surface() == RouteTrafficSurface::UserSettings
     }
 
     pub fn set_egress_tunnel_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if enabled && !self.egress_tunnel_available() {
+        if enabled && !self.box_egress_provisioned() {
             return;
         }
         self.egress_tunnel_enabled = enabled;
@@ -2276,10 +2340,7 @@ impl AppState {
                 .await;
             let _ = this.update(cx, |state, cx| {
                 if let Ok(settings) = result {
-                    if let Some(flag) = settings
-                        .get("egressTunnelEnabled")
-                        .and_then(serde_json::Value::as_bool)
-                    {
+                    if let Some(flag) = host_egress_tunnel_flag(&settings) {
                         state.egress_tunnel_enabled = flag;
                     }
                     if enabled {
@@ -2313,8 +2374,9 @@ impl AppState {
                     changed = true;
                 }
                 if let Some(settings) = settings {
-                    let enabled = host_egress_tunnel_enabled(&settings);
-                    if state.egress_tunnel_enabled != enabled {
+                    if let Some(enabled) = host_egress_tunnel_flag(&settings)
+                        && state.egress_tunnel_enabled != enabled
+                    {
                         state.egress_tunnel_enabled = enabled;
                         changed = true;
                     }
@@ -2475,7 +2537,7 @@ impl AppState {
         self.approval_decisions.clear();
         self.computers.clear();
         self.host_egress_tunnel_available = false;
-        self.egress_tunnel_enabled = false;
+        self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
         cx.notify();
         if let Some(client) = client {
@@ -8372,13 +8434,13 @@ mod tests {
     use super::{
         ActiveRecipe, ActivityTick, AppState, BotActivity, ChatMessage, ChatPart, Conversation,
         DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
-        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE,
-        STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler,
-        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
-        apply_reload, bot_status_line, graft_reply, is_status_line, is_tool_standin,
-        is_unsent_turn_note, missing_replies, overlay_server_cards, reads_as_gateway_unreachable,
-        reply_from_replay, restored_parts, saved_parts, stream_paint_due, stream_part_sig,
-        streaming_message_mut,
+        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
+        STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
+        TurnAssembler, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
+        apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
+        is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
+        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
+        stream_paint_due, stream_part_sig, streaming_message_mut,
     };
     use crate::opengrok::{Failure, FormResolution, ModelEntry, OpenGrokClient};
     use std::str::FromStr;
@@ -10260,10 +10322,16 @@ mod tests {
     #[test]
     fn egress_tunnel_is_host_and_box_ready() {
         let mut state = AppState::new();
+        assert!(state.egress_tunnel_enabled, "Route traffic defaults ON");
         state.host_egress_tunnel_available = true;
         assert!(
             !state.egress_tunnel_available(),
             "host without a ready box is not a tunnel"
+        );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "unprovisioned hides Route traffic"
         );
         state.coworker_computer = Some(
             serde_json::from_value(serde_json::json!({
@@ -10283,6 +10351,7 @@ mod tests {
             .unwrap(),
         );
         assert!(!state.egress_tunnel_available());
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
         state.host_egress_tunnel_available = false;
         state.coworker_computer = Some(
             serde_json::from_value(serde_json::json!({
@@ -10294,11 +10363,12 @@ mod tests {
         );
         assert!(
             !state.egress_tunnel_available(),
-            "a ready box without host/env is not a tunnel"
+            "a ready box without host/env is not a Review-an-action tunnel"
         );
-        assert!(
-            state.show_egress_tunnel_settings(),
-            "box ready still paints the Network row if the host poll missed"
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::BotPane,
+            "provisioned unique box still shows dedicated chrome without host intent"
         );
         state.coworker_computer = Some(
             serde_json::from_value(serde_json::json!({
@@ -10316,13 +10386,93 @@ mod tests {
         state.coworker_computer = None;
         state.host_egress_tunnel_available = true;
         assert!(!state.egress_tunnel_available());
-        assert!(
-            state.show_egress_tunnel_settings(),
-            "host intent paints the row while box status lags"
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "host intent without a provisioned box does not paint Route traffic"
         );
         state.host_egress_tunnel_available = false;
         state.egress_tunnel_enabled = true;
-        assert!(state.show_egress_tunnel_settings());
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "isEgressTunnelAvailable": true
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "host isEgressTunnelAvailable is not box provisioned"
+        );
+    }
+
+    #[test]
+    fn route_traffic_surface_follows_share_scope() {
+        fn computer(extra: serde_json::Value) -> crate::opengrok::CoworkerComputer {
+            let mut body = serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "boxId": "box_1",
+                "egress_tunnel": { "ready": true }
+            });
+            if let serde_json::Value::Object(map) = extra {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.extend(map);
+                }
+            }
+            serde_json::from_value(body).unwrap()
+        }
+        fn coworker(id: &str, box_id: &str) -> Coworker {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "name": id,
+                "boxId": box_id
+            }))
+            .unwrap()
+        }
+
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        state.coworkers = vec![coworker("cw_1", "box_1")];
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "dedicated"
+        })));
+        assert!(state.show_route_traffic_on_bot_pane());
+        assert!(!state.show_route_traffic_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "user"
+        })));
+        assert!(!state.show_route_traffic_on_bot_pane());
+        assert!(state.show_route_traffic_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "group",
+            "groupId": "grp_1"
+        })));
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "org"
+        })));
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+
+        state.coworker_computer = Some(computer(serde_json::json!({})));
+        state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_1")];
+        assert!(
+            state.show_route_traffic_in_user_settings(),
+            "missing shareScope + shared boxId is user-level Settings, not both panes"
+        );
+        assert!(!state.show_route_traffic_on_bot_pane());
+
+        state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_2")];
+        assert!(
+            state.show_route_traffic_on_bot_pane(),
+            "missing shareScope + unique box is dedicated pane chrome"
+        );
     }
 
     /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".

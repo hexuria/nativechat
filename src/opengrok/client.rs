@@ -1436,6 +1436,29 @@ impl LocalExecMode {
     }
 }
 
+/// Who owns this bot's box. OpenGrok `shareScope` on GET `/coworkers/{id}/computer`.
+/// NativeChat chrome: dedicated → that bot's Computer pane; user → Settings → Computer;
+/// group / org → hide (no group sidebar; org is the admin console).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxShareScope {
+    Dedicated,
+    User,
+    Group,
+    Org,
+}
+
+impl BoxShareScope {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "dedicated" => Some(Self::Dedicated),
+            "user" => Some(Self::User),
+            "group" => Some(Self::Group),
+            "org" | "organization" | "organisation" => Some(Self::Org),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CoworkerComputer {
     #[serde(rename = "agentId", default)]
@@ -1454,9 +1477,8 @@ pub struct CoworkerComputer {
     /// An update in flight, or the failure the last one ended in.
     #[serde(default)]
     pub update: Option<UpdateStatus>,
-    /// OpenGrok #139: env `OG_*` / `SAND_*_EGRESS_TUNNEL_ENABLED=1` or host
-    /// setting `egressTunnelEnabled`. When true, Settings can offer **Route
-    /// traffic through this computer**. No tunnel is invented here.
+    /// Host env / `getHostSettings.egressTunnelEnabled`. Not box provisioned:
+    /// Route traffic chrome uses nested `egress_tunnel.ready` (or a tunnel URL).
     #[serde(rename = "isEgressTunnelAvailable", default)]
     pub is_egress_tunnel_available: bool,
     /// Box-owned tunnel endpoint, when the computer JSON exposes it.
@@ -1468,12 +1490,26 @@ pub struct CoworkerComputer {
         deserialize_with = "deserialize_optional_egress_tunnel"
     )]
     pub egress_tunnel: Option<EgressTunnel>,
+    /// OpenGrok: `dedicated` | `user` | `group` | `org`. Missing until the
+    /// computer JSON grows the field; NativeChat then infers from shared `boxId`.
+    #[serde(
+        rename = "shareScope",
+        alias = "share_scope",
+        default,
+        deserialize_with = "deserialize_optional_share_scope"
+    )]
+    pub share_scope: Option<BoxShareScope>,
+    /// Present when `shareScope` is `group`.
+    #[serde(rename = "groupId", alias = "group_id", default)]
+    pub group_id: Option<String>,
 }
 
-/// Box tunnel. OpenGrok may send `{ready}`, a `ws://` URL, or `{url, enabled}`.
+/// Box tunnel. OpenGrok sends `{enabled, ready}` and may send a `ws://` URL.
+/// `enabled` is the box's current opt-in; it is not provisioned-ness (`ready` / URL).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressTunnel {
     pub ready: bool,
+    pub enabled: Option<bool>,
     pub url: Option<String>,
 }
 
@@ -1499,20 +1535,39 @@ fn json_nonempty(value: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
+fn deserialize_optional_share_scope<'de, D>(
+    deserializer: D,
+) -> Result<Option<BoxShareScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => BoxShareScope::parse(&raw),
+        Some(other) => other.as_str().and_then(BoxShareScope::parse),
+    })
+}
+
 fn egress_tunnel_from_json(value: Value) -> Option<EgressTunnel> {
     match value {
         Value::Null => None,
-        Value::Bool(ready) => Some(EgressTunnel { ready, url: None }),
+        Value::Bool(ready) => Some(EgressTunnel {
+            ready,
+            enabled: None,
+            url: None,
+        }),
         Value::String(url) => {
             let url = url.trim().to_string();
             if url.is_empty() {
                 Some(EgressTunnel {
                     ready: false,
+                    enabled: None,
                     url: None,
                 })
             } else {
                 Some(EgressTunnel {
                     ready: true,
+                    enabled: None,
                     url: Some(url),
                 })
             }
@@ -1520,14 +1575,18 @@ fn egress_tunnel_from_json(value: Value) -> Option<EgressTunnel> {
         Value::Object(_) => {
             let url = json_nonempty(&value, &["url", "wsUrl", "ws_url", "endpoint", "uri"]);
             let ready_flag = value.get("ready").and_then(Value::as_bool);
-            let enabled = value
-                .get("enabled")
-                .or_else(|| value.get("available"))
-                .and_then(Value::as_bool);
+            // Older payloads used `available` for "the box has a tunnel". That is
+            // ready, not the person's opt-in (`enabled`).
+            let available = value.get("available").and_then(Value::as_bool);
+            let enabled = value.get("enabled").and_then(Value::as_bool);
             let ready = ready_flag.unwrap_or(false)
-                || enabled.unwrap_or(false)
+                || available.unwrap_or(false)
                 || url.as_ref().is_some_and(|u| !u.is_empty());
-            Some(EgressTunnel { ready, url })
+            Some(EgressTunnel {
+                ready,
+                enabled,
+                url,
+            })
         }
         _ => None,
     }
@@ -1591,19 +1650,30 @@ impl CoworkerComputer {
         })
     }
 
-    /// Host flag or nested `egress_tunnel.ready` / tunnel URL. Either is
-    /// enough to gate Route traffic / Review an action. No tunnel is invented.
+    /// Nested `egress_tunnel.ready` or a tunnel URL. Host `isEgressTunnelAvailable`
+    /// is not box provisioned — Route traffic chrome hides without this.
+    pub fn box_egress_provisioned(&self) -> bool {
+        self.egress_tunnel
+            .as_ref()
+            .is_some_and(|tunnel| tunnel.ready)
+    }
+
+    /// Same as [`Self::box_egress_provisioned`]. Review-an-action still AND-gates
+    /// this with host intent.
     pub fn egress_tunnel_ready(&self) -> bool {
-        self.is_egress_tunnel_available || self.egress_tunnel.as_ref().is_some_and(|t| t.ready)
+        self.box_egress_provisioned()
     }
 
     /// `Some` when the box JSON exposed a tunnel field. `None` means omit the node.
     pub fn box_egress_ready(&self) -> Option<bool> {
-        match &self.egress_tunnel {
-            Some(tunnel) => Some(tunnel.ready),
-            None if self.is_egress_tunnel_available => Some(true),
-            None => None,
-        }
+        self.egress_tunnel.as_ref().map(|tunnel| tunnel.ready)
+    }
+
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
     }
 }
 
@@ -1621,7 +1691,13 @@ pub fn env_egress_tunnel_enabled() -> bool {
 
 /// `getHostSettings.egressTunnelEnabled`.
 pub fn host_egress_tunnel_enabled(settings: &Value) -> bool {
-    settings.get("egressTunnelEnabled").and_then(Value::as_bool) == Some(true)
+    host_egress_tunnel_flag(settings) == Some(true)
+}
+
+/// `Some` only when the host actually sent the key. Missing must not overwrite
+/// NativeChat's default-on Route traffic toggle.
+pub fn host_egress_tunnel_flag(settings: &Value) -> Option<bool> {
+    settings.get("egressTunnelEnabled").and_then(Value::as_bool)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3508,6 +3584,7 @@ mod tests {
         .unwrap();
         assert!(!off.is_egress_tunnel_available);
         assert!(!off.egress_tunnel_ready());
+        assert!(!off.box_egress_provisioned());
         assert!(off.box_egress_ready().is_none());
         let on: CoworkerComputer = serde_json::from_value(json!({
             "agentId": "cw_1",
@@ -3516,8 +3593,11 @@ mod tests {
         }))
         .unwrap();
         assert!(on.is_egress_tunnel_available);
-        assert!(on.egress_tunnel_ready());
-        assert_eq!(on.box_egress_ready(), Some(true));
+        assert!(
+            !on.box_egress_provisioned(),
+            "host isEgressTunnelAvailable is not box provisioned"
+        );
+        assert!(on.box_egress_ready().is_none());
         let nested: CoworkerComputer = serde_json::from_value(json!({
             "agentId": "cw_1",
             "state": "running",
@@ -3535,6 +3615,43 @@ mod tests {
         .unwrap();
         assert_eq!(nested_off.box_egress_ready(), Some(false));
         assert!(!nested_off.egress_tunnel_ready());
+        let enabled_only: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egress_tunnel": { "enabled": true }
+        }))
+        .unwrap();
+        assert_eq!(
+            enabled_only.egress_tunnel.as_ref().and_then(|t| t.enabled),
+            Some(true)
+        );
+        assert!(
+            !enabled_only.box_egress_provisioned(),
+            "egress_tunnel.enabled is not ready"
+        );
+        let dedicated: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "shareScope": "dedicated",
+            "egress_tunnel": { "ready": true, "enabled": false }
+        }))
+        .unwrap();
+        assert_eq!(dedicated.share_scope, Some(BoxShareScope::Dedicated));
+        assert!(dedicated.box_egress_provisioned());
+        assert_eq!(
+            dedicated.egress_tunnel.as_ref().and_then(|t| t.enabled),
+            Some(false)
+        );
+        let grouped: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "shareScope": "group",
+            "groupId": "grp_1",
+            "egress_tunnel": { "ready": true }
+        }))
+        .unwrap();
+        assert_eq!(grouped.share_scope, Some(BoxShareScope::Group));
+        assert_eq!(grouped.group_id(), Some("grp_1"));
         let url_obj: CoworkerComputer = serde_json::from_value(json!({
             "agentId": "cw_1",
             "state": "running",
@@ -3566,6 +3683,11 @@ mod tests {
             &json!({ "egressTunnelEnabled": false })
         ));
         assert!(!host_egress_tunnel_enabled(&json!({})));
+        assert_eq!(host_egress_tunnel_flag(&json!({})), None);
+        assert_eq!(
+            host_egress_tunnel_flag(&json!({ "egressTunnelEnabled": false })),
+            Some(false)
+        );
     }
 
     #[tokio::test]

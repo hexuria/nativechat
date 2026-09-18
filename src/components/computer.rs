@@ -16,6 +16,7 @@ use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, Selectable, Sizable as _, h_flex, v_flex,
 };
@@ -339,7 +340,7 @@ impl ComputerPane {
                         cx,
                     ))
                 })
-                .child(box_chrome(controls, app.clone()))
+                .child(box_chrome(controls, app.clone(), theme, cx))
                 .child(screen_tile(
                     has_screen,
                     screen,
@@ -355,9 +356,6 @@ impl ComputerPane {
                         .text_color(muted)
                         .child(format!("{agent_name}'s screen")),
                 )
-                .when(app.read(cx).show_egress_tunnel_settings(), |this| {
-                    this.child(route_traffic_row(app.clone(), muted, cx))
-                })
                 .when(box_id.is_none(), |this| {
                     this.child(
                         div()
@@ -1089,29 +1087,39 @@ fn screen_tile(
         })
 }
 
-/// Update / Reset next to this bot's screen. Title-bar icons used to live
-/// only in the header (easy to miss, and Settings → Computer never showed
-/// them). `computer-update` / `computer-reset` stay the remasure ids.
-fn box_chrome(controls: &ComputerControls, app: Entity<AppState>) -> impl IntoElement {
+/// Update / Reset next to this bot's screen. Route traffic for a dedicated
+/// provisioned box is the header icon (`icons/route-traffic.svg`, analogue of
+/// SF Symbol arrow.triangle.swap). Status copy is a tooltip on download.
+/// `computer-update` / `computer-reset` stay the remasure ids.
+fn box_chrome(
+    controls: &ComputerControls,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> impl IntoElement {
     let can_update = !controls.update_disabled();
     let can_reset = controls.present && !controls.updating;
     let stale = controls.stale;
+    let update_tip = if stale {
+        "Update available"
+    } else if controls.current {
+        "Up to date"
+    } else if controls.present {
+        "Update this computer"
+    } else {
+        "No computer yet"
+    };
     let update_app = app.clone();
     let reset_app = app.clone();
+    let show_route = app.read(cx).show_route_traffic_on_bot_pane();
     h_flex()
         .id("computer-box-chrome")
         .w_full()
         .items_center()
         .justify_between()
         .gap(px(8.))
-        .child(div().text_xs().child(if stale {
-            "Update available"
-        } else if controls.current {
-            "Up to date"
-        } else if controls.present {
-            "Computer"
-        } else {
-            "No computer yet"
+        .child(h_flex().items_center().when(show_route, |this| {
+            this.child(route_traffic_icon(app.clone(), theme, cx))
         }))
         .child(
             h_flex()
@@ -1128,69 +1136,59 @@ fn box_chrome(controls: &ComputerControls, app: Entity<AppState>) -> impl IntoEl
                             });
                         },
                     )
-                    .when(stale, |this| this.text_color(gpui::blue())),
+                    .when(stale, |this| this.text_color(gpui::blue()))
+                    .tooltip(move |window, cx| Tooltip::new(update_tip).build(window, cx)),
                 )
-                .child(icon_btn_enabled(
-                    "computer-reset",
-                    "icons/reset.svg",
-                    can_reset,
-                    move |cx| {
+                .child(
+                    icon_btn_enabled("computer-reset", "icons/reset.svg", can_reset, move |cx| {
                         reset_app.update(cx, |state, cx| {
                             state.open_computer_confirm(crate::state::ComputerAction::Reset, cx)
                         });
-                    },
-                )),
+                    })
+                    .tooltip(|window, cx| Tooltip::new("Reset this computer").build(window, cx)),
+                ),
         )
 }
 
-fn route_traffic_row(app: Entity<AppState>, muted: Hsla, cx: &App) -> impl IntoElement {
-    let state = app.read(cx);
-    let available = state.egress_tunnel_available();
-    let enabled = state.egress_tunnel_enabled;
-    let description = if enabled {
-        "New connections from this Bot's computer go out through this desktop."
-    } else if available {
-        "Route web traffic from this Bot's computer out through this desktop instead of the cloud. Applies to new connections."
+fn route_traffic_icon(
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> impl IntoElement {
+    let enabled = app.read(cx).egress_tunnel_enabled;
+    let color = if enabled {
+        theme.primary
     } else {
-        "This Bot's computer wasn't provisioned with the egress tunnel — start a new one to use this."
+        theme.muted_foreground
     };
-    let can_toggle = available || enabled;
-    v_flex()
+    let tip = if enabled {
+        "Routing traffic through this computer. New connections go out through this desktop."
+    } else {
+        "Route traffic through this computer. Web traffic from this Bot's computer goes out through this desktop instead of the cloud."
+    };
+    div()
         .id("route-traffic-this-computer")
-        .w_full()
-        .px(px(10.))
-        .py(px(10.))
-        .gap(px(6.))
-        .rounded(px(12.))
-        .border_1()
-        .border_color(rgb(0x777777).opacity(0.24))
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .on_mouse_down(MouseButton::Left, {
+            let app = app.clone();
+            move |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    state.set_egress_tunnel_enabled(!state.egress_tunnel_enabled, cx);
+                });
+            }
+        })
         .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap(px(8.))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(2.))
-                        .child(div().text_sm().child("Route traffic through this computer"))
-                        .child(div().text_xs().text_color(muted).child(description)),
-                )
-                .child(
-                    Switch::new("egress-tunnel-enabled")
-                        .checked(enabled)
-                        .disabled(!can_toggle)
-                        .on_click({
-                            let app = app.clone();
-                            move |checked, _, cx| {
-                                app.update(cx, |state, cx| {
-                                    state.set_egress_tunnel_enabled(*checked, cx);
-                                });
-                            }
-                        }),
-                ),
+            Icon::default()
+                .path("icons/route-traffic.svg")
+                .size(px(16.))
+                .text_color(color),
         )
 }
 

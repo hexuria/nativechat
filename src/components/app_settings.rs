@@ -1,9 +1,10 @@
 use crate::actions::CloseSettings;
-use crate::chrome::{TITLE_BAR_H, TITLE_BAR_LEFT_PAD};
+use crate::chrome::TITLE_BAR_H;
 use crate::opengrok::LocalExecMode;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -99,7 +100,8 @@ impl Render for AppSettings {
                                     shortcuts_page(chord, muted, &theme).into_any_element()
                                 }
                                 AppSettingsTab::Computer => {
-                                    computer_page(computers, muted, app.clone()).into_any_element()
+                                    computer_page(computers, muted, app.clone(), cx)
+                                        .into_any_element()
                                 }
                                 AppSettingsTab::Updates => {
                                     updates_page(&bot_name, &controls, muted, app.clone(), &theme)
@@ -137,13 +139,14 @@ impl AppSettings {
             .px(px(12.))
             .pb(px(16.))
             .gap(px(4.))
+            .child(div().id("app-settings-titlebar-spacer").h(px(TITLE_BAR_H)))
             .child(
                 h_flex()
                     .id("app-settings-back")
-                    .h(px(TITLE_BAR_H))
                     .w_full()
-                    // Nav is already 12px in; sit to the right of the traffic lights.
-                    .pl(px(TITLE_BAR_LEFT_PAD - 12.))
+                    .px(px(10.))
+                    .py(px(12.))
+                    .rounded(px(8.))
                     .items_center()
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x777777).opacity(0.16)))
@@ -317,7 +320,8 @@ fn logins_page(
         })
 }
 
-/// The active bot's computer: Update (keeps files) and Reset (starts fresh), each two clicks.
+/// The active bot's computer: Update (keeps files). Reset lives on the
+/// Computer pane next to download — Settings no longer duplicates it.
 fn updates_page(
     bot_name: &str,
     controls: &crate::components::computer::ComputerControls,
@@ -330,7 +334,6 @@ fn updates_page(
         controls.updating,
         update_rest_label(controls.stale, controls.current),
     );
-    let reset_label = confirm_label(controls.updating, "Reset");
     let row = |title: String, detail: &'static str, button: Button| {
         h_flex()
             .w_full()
@@ -383,23 +386,6 @@ fn updates_page(
                             });
                         if controls.stale { button.primary() } else { button }
                     },
-                ))
-                .child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
-                .child(row(
-                    format!("Reset {bot_name}'s Computer"),
-                    "Start fresh if the computer gets stuck. Everything on it is lost.",
-                    Button::new("settings-computer-reset")
-                        .label(reset_label)
-                        .small()
-                        .disabled(!controls.present || controls.updating)
-                        .on_click({
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                app.update(cx, |state, cx| {
-                                    state.open_computer_confirm(crate::state::ComputerAction::Reset, cx)
-                                });
-                            }
-                        }),
                 )),
         )
         .when_some(controls.error.clone(), |this, error| {
@@ -638,16 +624,21 @@ fn computer_page(
     computers: Vec<crate::opengrok::ConnectedComputer>,
     muted: Hsla,
     app: Entity<AppState>,
+    cx: &App,
 ) -> impl IntoElement {
+    let show_route = app.read(cx).show_route_traffic_in_user_settings();
     let page = v_flex()
         .gap(px(12.))
+        .when(show_route, |this| {
+            this.child(settings_route_traffic_row(app.clone(), muted, cx))
+        })
         .child(div().text_xs().text_color(muted).child("This Mac"))
         .child(
             div()
                 .text_xs()
                 .text_color(muted)
                 .child(
-                    "Local-exec enrolment and policy. Each bot's box — screen, Route traffic, and image updates — is on that bot's Computer pane.",
+                    "Local-exec enrolment and policy. Each bot's screen and image updates are on that bot's Computer pane.",
                 ),
         );
     if computers.is_empty() {
@@ -671,6 +662,51 @@ fn computer_page(
         card = card.child(computer_row(computer, muted, app.clone()));
     }
     page.child(card)
+}
+
+fn settings_route_traffic_row(app: Entity<AppState>, muted: Hsla, cx: &App) -> impl IntoElement {
+    let enabled = app.read(cx).egress_tunnel_enabled;
+    let description = if enabled {
+        "New connections from Bots that share this computer go out through this desktop."
+    } else {
+        "Route web traffic from Bots that share this computer out through this desktop instead of the cloud. Applies to new connections."
+    };
+    v_flex()
+        .id("route-traffic-this-computer")
+        .w_full()
+        .px(px(16.))
+        .py(px(14.))
+        .gap(px(6.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0x777777).opacity(0.24))
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(div().text_sm().child("Route traffic through this computer"))
+                        .child(div().text_xs().text_color(muted).child(description)),
+                )
+                .child(
+                    Switch::new("egress-tunnel-enabled")
+                        .checked(enabled)
+                        .on_click({
+                            let app = app.clone();
+                            move |checked, _, cx| {
+                                app.update(cx, |state, cx| {
+                                    state.set_egress_tunnel_enabled(*checked, cx);
+                                });
+                            }
+                        }),
+                ),
+        )
 }
 
 fn computer_row(
