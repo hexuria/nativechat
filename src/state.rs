@@ -2129,6 +2129,13 @@ impl AppState {
         self.open_computer_handoffs().into_iter().next_back()
     }
 
+    /// Copy for the Computer window strip. The window must not `app.read` this
+    /// during Take over's first draw (`open_window` paints before the lease ends).
+    pub fn computer_window_attention(&self) -> Option<(String, String)> {
+        self.active_computer_handoff()
+            .map(|spec| (spec.card_key().to_string(), spec.handoff_prompt()))
+    }
+
     /// Take over: open/focus the Computer pane and the coworker's screen.
     pub fn take_over_computer(&mut self, cx: &mut Context<Self>) {
         self.show_computer_pane(cx);
@@ -3487,11 +3494,13 @@ impl AppState {
             .unwrap_or_else(|| "Computer".into());
         #[cfg(target_os = "macos")]
         {
+            let attention = self.computer_window_attention();
             // Already open: bring it forward. A handle whose window was closed fails to
             // update, and that is the cue to open a fresh one.
             if let Some(existing) = self.computer_windows.get(coworker_id)
                 && existing
                     .update(cx, |screen, window, cx| {
+                        screen.set_handoff_attention(attention.clone(), cx);
                         window.activate_window();
                         if teach {
                             screen.start_teaching(window, cx);
@@ -3523,7 +3532,7 @@ impl AppState {
             let opened = cx.open_window(options, move |window, cx| {
                 cx.new(|cx| {
                     crate::components::computer_screen::ComputerScreen::new(
-                        &url, &coworker, &title, app, window, cx,
+                        &url, &coworker, &title, app, attention, window, cx,
                     )
                 })
             });
@@ -3552,6 +3561,20 @@ impl AppState {
         {
             let _ = teach;
             eprintln!("NativeChat computer: {title} is at {url}; opening it in-app is macOS-only");
+        }
+    }
+
+    /// Push the live Open-the-screen strip onto any Computer window. Safe to
+    /// call while this AppState is leased: the window stores a copy and does
+    /// not read AppState from `render`.
+    #[cfg(target_os = "macos")]
+    fn push_computer_window_attention(&mut self, cx: &mut Context<Self>) {
+        let attention = self.computer_window_attention();
+        for handle in self.computer_windows.values() {
+            let attention = attention.clone();
+            let _ = handle.update(cx, |screen, _, cx| {
+                screen.set_handoff_attention(attention, cx);
+            });
         }
     }
 
@@ -6819,10 +6842,14 @@ impl AppState {
                 if matches!(mode, UserFormDismissMode::Escalated) {
                     self.pin_open_screen_shot(&conversation_id);
                     self.show_computer_pane(cx);
+                    #[cfg(target_os = "macos")]
+                    self.push_computer_window_attention(cx);
                 }
             }
             UserFormDispatch::ResolveHandoff(_) => {
                 self.user_form_handoff_done.insert(card_key.clone());
+                #[cfg(target_os = "macos")]
+                self.push_computer_window_attention(cx);
             }
         }
         cx.notify();
@@ -6848,6 +6875,8 @@ impl AppState {
                             | BoxHandoffReply::Empty,
                         ) => {
                             state.user_form_handoff_done.insert(card_key.clone());
+                            #[cfg(target_os = "macos")]
+                            state.push_computer_window_attention(cx);
                             if !run_id.is_empty() {
                                 state.begin_responding(Some(&conversation_id), "Working");
                                 state.follow_run(run_id, Some(conversation_id), cx);
@@ -6858,6 +6887,8 @@ impl AppState {
                         }
                         Ok(BoxHandoffReply::MissingEntryId) => {
                             state.user_form_handoff_done.remove(&card_key);
+                            #[cfg(target_os = "macos")]
+                            state.push_computer_window_attention(cx);
                         }
                         Err(error) => {
                             if error.is_signed_out() {
@@ -8696,6 +8727,38 @@ mod tests {
         assert_eq!(
             state.box_handoff_post_id("e_form", "e_form").as_deref(),
             Some("e_hand")
+        );
+    }
+
+    #[test]
+    fn computer_window_attention_is_a_copy_of_the_open_handoff() {
+        let spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formResolution": "escalated",
+                "formRequest": {
+                    "title": "Computer",
+                    "instruction": "Sign in on the computer."
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let mut bot = message("m1", false, "Open the screen");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+        assert_eq!(
+            state.computer_window_attention(),
+            Some(("e_form".into(), "Sign in on the computer.".into())),
+            "Take over copies this into ComputerScreen so first draw never reads AppState"
+        );
+        state.user_form_handoff_done.insert("e_form".into());
+        assert_eq!(
+            state.computer_window_attention(),
+            None,
+            "Done / Skipped drops the strip"
         );
     }
 
