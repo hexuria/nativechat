@@ -6,13 +6,14 @@ use crate::chrome::{
 };
 use crate::config::Config;
 use crate::opengrok::{
-    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
-    Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, LocalExecMode,
-    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
-    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
-    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
-    UserFormDismissMode, UserFormValues, WAITING_FOR_YOU, activity_from_replay, command_from_args,
+    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
+    BoxHandoffResolution, ChatPart, ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch,
+    Failure, FormResolution, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue,
+    OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
+    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
+    RunReplay, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply, UserFormDismissMode,
+    UserFormValues, WAITING_FOR_YOU, activity_from_replay, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
     policy_answer, reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
 };
@@ -1342,6 +1343,12 @@ pub struct AppState {
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
     user_form_resolutions: HashMap<String, FormResolution>,
+    /// Stable resolution to restore if a POST fails (never reopen a settled card).
+    user_form_restore: HashMap<String, FormResolution>,
+    /// Form card key → handoff card id from dismiss `handoffEntryId`.
+    user_form_handoffs: HashMap<String, String>,
+    /// Form card keys whose box-handoff already resolved.
+    user_form_handoff_done: HashSet<String>,
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
@@ -1440,6 +1447,7 @@ impl ApprovalDecision {
 enum UserFormDispatch {
     Submit(UserFormValues),
     Dismiss(UserFormDismissMode),
+    ResolveHandoff(BoxHandoffResolution),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1678,6 +1686,9 @@ impl AppState {
             user_form_picks: HashMap::new(),
             user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
             user_form_resolutions: HashMap::new(),
+            user_form_restore: HashMap::new(),
+            user_form_handoffs: HashMap::new(),
+            user_form_handoff_done: HashSet::new(),
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
@@ -5773,16 +5784,26 @@ impl AppState {
 
     fn graft_user_forms(&self, mut parts: Vec<ChatPart>) -> Vec<ChatPart> {
         for part in &mut parts {
-            if let ChatPart::UserForm(spec) = part
-                && spec.effective_resolution().is_none()
-            {
-                let key = spec.card_key().to_string();
-                if let Some(&res) = self
-                    .user_form_resolutions
-                    .get(&spec.entry_id)
-                    .or_else(|| self.user_form_resolutions.get(&key))
-                {
-                    spec.resolution = Some(res);
+            if let ChatPart::UserForm(spec) = part {
+                if spec.effective_resolution().is_none() {
+                    let key = spec.card_key().to_string();
+                    if let Some(&res) = self
+                        .user_form_resolutions
+                        .get(&spec.entry_id)
+                        .or_else(|| self.user_form_resolutions.get(&key))
+                    {
+                        spec.resolution = Some(res);
+                    }
+                }
+                if spec.handoff_entry_id.is_none() {
+                    let key = spec.card_key().to_string();
+                    if let Some(id) = self
+                        .user_form_handoffs
+                        .get(&spec.entry_id)
+                        .or_else(|| self.user_form_handoffs.get(&key))
+                    {
+                        spec.handoff_entry_id = Some(id.clone());
+                    }
                 }
             }
         }
@@ -5832,25 +5853,63 @@ impl AppState {
         None
     }
 
+    pub fn user_form_handoff_id(&self, card_key: &str) -> Option<String> {
+        self.user_form_handoffs.get(card_key).cloned()
+    }
+
+    pub fn user_form_handoff_resolved(&self, card_key: &str) -> bool {
+        self.user_form_handoff_done.contains(card_key)
+    }
+
     fn remember_user_form_resolution(&mut self, spec: &crate::opengrok::UserFormSpec) {
         if let Some(resolution) = spec.effective_resolution() {
+            if resolution == FormResolution::Sending {
+                return;
+            }
             if spec.has_gateway_entry_id() {
                 self.user_form_resolutions
                     .insert(spec.entry_id.clone(), resolution);
             }
             self.user_form_resolutions
                 .insert(spec.card_key().to_string(), resolution);
+            self.user_form_restore.remove(spec.card_key());
+        }
+        if let Some(id) = spec.handoff_entry_id.as_deref().filter(|id| !id.is_empty()) {
+            self.user_form_handoffs
+                .insert(spec.card_key().to_string(), id.to_string());
+            if spec.has_gateway_entry_id() {
+                self.user_form_handoffs
+                    .insert(spec.entry_id.clone(), id.to_string());
+            }
         }
     }
 
-    fn clear_user_form_sending(&mut self, card_key: &str) {
+    fn paint_user_form_resolution(&mut self, card_key: &str, resolution: FormResolution) {
         if let Some(spec) = self.user_form_mut(card_key) {
-            if spec.resolution == Some(FormResolution::Sending) {
-                spec.resolution = None;
+            if spec.resolution != Some(FormResolution::Sending)
+                && let Some(prior) = spec.effective_resolution()
+            {
+                self.user_form_restore.insert(card_key.to_string(), prior);
             }
+            spec.resolution = Some(resolution);
         }
-        self.user_form_resolutions
-            .retain(|_, res| *res != FormResolution::Sending);
+        if resolution != FormResolution::Sending {
+            self.user_form_resolutions
+                .insert(card_key.to_string(), resolution);
+        }
+    }
+
+    fn restore_user_form(&mut self, card_key: &str) {
+        let prior = self.user_form_restore.remove(card_key);
+        if let Some(spec) = self.user_form_mut(card_key) {
+            spec.resolution = prior;
+        }
+        if let Some(prior) = prior {
+            self.user_form_resolutions
+                .insert(card_key.to_string(), prior);
+        } else {
+            self.user_form_resolutions.remove(card_key);
+        }
     }
 
     /// Continue: POST `/ag-ui/user-form/submit`. Secrets stay in `values` for
@@ -5874,6 +5933,16 @@ impl AppState {
         self.dispatch_user_form(card_key, UserFormDispatch::Dismiss(mode), cx);
     }
 
+    /// Hand back / decline. POSTs the stored `handoffEntryId`, never the form id.
+    pub fn resolve_user_form_handoff(
+        &mut self,
+        card_key: String,
+        resolution: BoxHandoffResolution,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_user_form(card_key, UserFormDispatch::ResolveHandoff(resolution), cx);
+    }
+
     fn dispatch_user_form(
         &mut self,
         card_key: String,
@@ -5891,16 +5960,76 @@ impl AppState {
             // #140: AG-UI CUSTOM has no gateway card id. Do not POST callId.
             return;
         }
-        if let Some(spec) = self.user_form_mut(&card_key) {
-            spec.resolution = Some(FormResolution::Sending);
+        let handoff_entry_id = match &action {
+            UserFormDispatch::ResolveHandoff(_) => {
+                let mut id = self
+                    .user_form_handoffs
+                    .get(&card_key)
+                    .cloned()
+                    .unwrap_or_default();
+                if id.is_empty() {
+                    id = self
+                        .user_form_mut(&card_key)
+                        .and_then(|spec| spec.handoff_entry_id.clone())
+                        .unwrap_or_default();
+                }
+                if id.is_empty() || id == entry_id {
+                    // Never resolve the form card. Never invent an id.
+                    return;
+                }
+                Some(id)
+            }
+            _ => None,
+        };
+        match &action {
+            UserFormDispatch::Submit(_) => {
+                self.paint_user_form_resolution(&card_key, FormResolution::Sending);
+            }
+            UserFormDispatch::Dismiss(mode) => {
+                self.paint_user_form_resolution(&card_key, mode.resolution());
+            }
+            UserFormDispatch::ResolveHandoff(_) => {}
         }
-        self.user_form_resolutions
-            .insert(card_key.clone(), FormResolution::Sending);
         cx.notify();
         let Some(client) = self.opengrok.clone() else {
-            self.clear_user_form_sending(&card_key);
+            if !matches!(action, UserFormDispatch::ResolveHandoff(_)) {
+                self.restore_user_form(&card_key);
+            }
             return;
         };
+        if let UserFormDispatch::ResolveHandoff(resolution) = action {
+            let Some(handoff_entry_id) = handoff_entry_id else {
+                return;
+            };
+            cx.spawn(async move |this, cx| {
+                let result = client
+                    .resolve_box_handoff(&handoff_entry_id, &agent_id, resolution)
+                    .await;
+                let _ = this.update(cx, |state, cx| {
+                    match result {
+                        Ok(BoxHandoffReply::Settled) | Ok(BoxHandoffReply::AlreadyAnswered) => {
+                            state.user_form_handoff_done.insert(card_key.clone());
+                            if !run_id.is_empty() {
+                                state.begin_responding(Some(&conversation_id), "Working");
+                                state.follow_run(run_id, Some(conversation_id), cx);
+                            }
+                        }
+                        Ok(BoxHandoffReply::MissingRoute) => {
+                            state.user_form_verbs_available = false;
+                        }
+                        Ok(BoxHandoffReply::Empty) | Ok(BoxHandoffReply::MissingEntryId) => {}
+                        Err(error) => {
+                            if error.is_signed_out() {
+                                state.note_signed_out(cx);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = match action {
                 UserFormDispatch::Submit(values) => {
@@ -5909,36 +6038,55 @@ impl AppState {
                 UserFormDispatch::Dismiss(mode) => {
                     client.dismiss_user_form(&entry_id, &agent_id, mode).await
                 }
+                UserFormDispatch::ResolveHandoff(_) => unreachable!("resolved above"),
             };
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(UserFormActionReply::Settled(incoming)) => {
+                        let resolution = incoming.effective_resolution();
                         state.remember_user_form_resolution(&incoming);
                         if let Some(spec) = state.user_form_mut(&card_key) {
                             spec.merge(incoming);
                         }
-                        state.user_form_picks.remove(&card_key);
-                        if !run_id.is_empty() {
+                        if resolution != Some(FormResolution::FillFailed) {
+                            state.user_form_picks.remove(&card_key);
+                        }
+                        let follow = match resolution {
+                            Some(FormResolution::Escalated) => {
+                                state.end_turn_waiting(
+                                    Some(&conversation_id),
+                                    Some(WAITING_FOR_YOU_STATUS),
+                                );
+                                false
+                            }
+                            _ => true,
+                        };
+                        if follow && !run_id.is_empty() {
                             state.begin_responding(Some(&conversation_id), "Working");
                             state.follow_run(run_id, Some(conversation_id), cx);
                         }
                     }
                     Ok(UserFormActionReply::AlreadyAnswered) => {
-                        state.clear_user_form_sending(&card_key);
-                        if !run_id.is_empty() {
-                            state.begin_responding(Some(&conversation_id), "Working");
-                            state.follow_run(run_id, Some(conversation_id), cx);
+                        if !matches!(
+                            state.user_form_resolutions.get(&card_key),
+                            Some(FormResolution::Escalated)
+                        ) {
+                            state.restore_user_form(&card_key);
+                            if !run_id.is_empty() {
+                                state.begin_responding(Some(&conversation_id), "Working");
+                                state.follow_run(run_id, Some(conversation_id), cx);
+                            }
                         }
                     }
                     Ok(UserFormActionReply::MissingRoute) => {
                         state.user_form_verbs_available = false;
-                        state.clear_user_form_sending(&card_key);
+                        state.restore_user_form(&card_key);
                     }
                     Ok(UserFormActionReply::Empty) | Ok(UserFormActionReply::MissingEntryId) => {
-                        state.clear_user_form_sending(&card_key);
+                        state.restore_user_form(&card_key);
                     }
                     Err(error) => {
-                        state.clear_user_form_sending(&card_key);
+                        state.restore_user_form(&card_key);
                         if error.is_signed_out() {
                             state.note_signed_out(cx);
                         }
@@ -6132,10 +6280,15 @@ impl AppState {
         };
         conversation.messages.iter().rev().any(|message| {
             !message.is_me
-                && message
-                    .parts
-                    .iter()
-                    .any(|part| matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved()))
+                && message.parts.iter().any(|part| match part {
+                    ChatPart::UserForm(spec) => {
+                        spec.is_unresolved()
+                            || spec.effective_resolution() == Some(FormResolution::Sending)
+                            || (spec.effective_resolution() == Some(FormResolution::Escalated)
+                                && !self.user_form_handoff_done.contains(spec.card_key()))
+                    }
+                    _ => false,
+                })
         })
     }
 

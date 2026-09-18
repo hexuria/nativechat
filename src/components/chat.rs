@@ -45,6 +45,7 @@ struct ChatFeedRev {
     user_form_picks: Vec<(String, String, String)>,
     user_forms: Vec<(String, String)>,
     user_form_verbs: bool,
+    user_form_handoffs: Vec<(String, String, bool)>,
     is_ai_responding: bool,
     debug_mode: bool,
     can_read_aloud: bool,
@@ -131,6 +132,33 @@ impl ChatFeedRev {
                 cards
             },
             user_form_verbs: state.user_form_verbs_available,
+            user_form_handoffs: {
+                let mut rows: Vec<(String, String, bool)> = conv
+                    .map(|c| {
+                        c.messages
+                            .iter()
+                            .flat_map(|m| m.parts.iter())
+                            .filter_map(|part| match part {
+                                ChatPart::UserForm(spec) => {
+                                    let id = spec
+                                        .handoff_entry_id
+                                        .clone()
+                                        .or_else(|| state.user_form_handoff_id(spec.card_key()))
+                                        .unwrap_or_default();
+                                    Some((
+                                        spec.card_key().to_string(),
+                                        id,
+                                        state.user_form_handoff_resolved(spec.card_key()),
+                                    ))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                rows.sort();
+                rows
+            },
             is_ai_responding: state.is_active_bot_responding(),
             debug_mode: state.debug_markdown_disabled,
             can_read_aloud: true,

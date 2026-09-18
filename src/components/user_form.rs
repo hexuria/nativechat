@@ -1,27 +1,27 @@
 //! User-form transcript chrome. Separate from generative [`crate::opengrok::FormSpec`]
-//! (choice chips → `send_message`), and from future secret-request / Computer
-//! handoff cards.
+//! (choice chips → `send_message`), and from OpenGrok Take over / I'm done / Skip.
 //!
-//! Continue / Open the screen / Dismiss POST `/ag-ui/user-form/submit|dismiss`
-//! when the server has the verbs **and** the card has a gateway `entryId`
-//! (top-level CUSTOM field from opengrok-server#139 @ d12fffc). Continue
-//! stays disabled while required fields are empty. Missing `entryId` or a
-//! 404 keeps the buttons gated — we do not invent an id or fake Submitted.
-//! Secrets collected here go only in the REST body, never `send_message` /
-//! AG-UI `content` / sqlite.
+//! Continue → Submitting (fields hidden, spinner) → Submitted collapsed.
+//! Dismiss → Dismissed. Open the screen → On the computer + Hand back control.
+//! fill_failed recovery stays on the collapsed card: Try again / I'll do it
+//! on the computer / Stop for now. Secrets collected here go only in the REST
+//! body, never `send_message` / AG-UI `content` / sqlite.
 
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    FormResolution, USER_FORM_SERVER_FILL_AVAILABLE, UserFormDismissMode, UserFormField,
-    UserFormFieldKind, UserFormSpec, UserFormValues, continue_enabled,
+    BoxHandoffResolution, FormResolution, USER_FORM_SERVER_FILL_AVAILABLE, UserFormDismissMode,
+    UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues, continue_enabled,
 };
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputContentType, InputState, Textarea, TextareaState};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::collections::HashMap;
+
+type Theme = gpui_kit::component::Theme;
 
 pub type UserFormInputMap = HashMap<String, Entity<InputState>>;
 pub type UserFormTextareaMap = HashMap<String, Entity<TextareaState>>;
@@ -38,10 +38,11 @@ pub fn render_user_form(
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
-    if let Some(resolution) = spec.effective_resolution() {
-        return render_settled(spec, resolution, cx);
+    match spec.effective_resolution() {
+        Some(FormResolution::Sending) => render_submitting(spec, cx),
+        Some(resolution) => render_settled(spec, resolution, inputs, textareas, values, app, cx),
+        None => render_idle(spec, inputs, textareas, values, app, cx),
     }
-    render_idle(spec, inputs, textareas, values, app, cx)
 }
 
 fn render_idle(
@@ -221,7 +222,28 @@ fn collect_submit_values(
     out
 }
 
-fn render_settled(spec: &UserFormSpec, resolution: FormResolution, cx: &App) -> AnyElement {
+fn render_submitting(spec: &UserFormSpec, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    collapsed_card(
+        spec,
+        FormResolution::Sending,
+        theme.secondary,
+        theme.muted_foreground,
+        true,
+        None,
+        theme,
+    )
+}
+
+fn render_settled(
+    spec: &UserFormSpec,
+    resolution: FormResolution,
+    inputs: &UserFormInputMap,
+    textareas: &UserFormTextareaMap,
+    values: &UserFormValues,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let pill_fill = match resolution {
         FormResolution::Submitted => theme.green.opacity(0.18),
@@ -235,6 +257,27 @@ fn render_settled(spec: &UserFormSpec, resolution: FormResolution, cx: &App) -> 
         FormResolution::FillFailed => theme.danger,
         _ => theme.muted_foreground,
     };
+    let actions = match resolution {
+        FormResolution::FillFailed => Some(fill_failed_actions(
+            spec, inputs, textareas, values, app, cx,
+        )),
+        FormResolution::Escalated => Some(escalated_actions(spec, app, cx)),
+        _ => None,
+    };
+    collapsed_card(
+        spec, resolution, pill_fill, pill_text, false, actions, theme,
+    )
+}
+
+fn collapsed_card(
+    spec: &UserFormSpec,
+    resolution: FormResolution,
+    pill_fill: Hsla,
+    pill_text: Hsla,
+    spinner: bool,
+    actions: Option<AnyElement>,
+    theme: &Theme,
+) -> AnyElement {
     v_flex()
         .w_full()
         .gap(px(8.))
@@ -270,6 +313,13 @@ fn render_settled(spec: &UserFormSpec, resolution: FormResolution, cx: &App) -> 
                         .bg(pill_fill)
                         .text_color(pill_text)
                         .text_xs()
+                        .when(spinner, |this| {
+                            this.child(
+                                Spinner::new()
+                                    .with_size(px(12.))
+                                    .color(theme.muted_foreground),
+                            )
+                        })
                         .when(resolution == FormResolution::Submitted, |this| {
                             this.child(Icon::new(IconName::Check).size(px(12.)))
                         })
@@ -282,6 +332,162 @@ fn render_settled(spec: &UserFormSpec, resolution: FormResolution, cx: &App) -> 
                 .text_color(theme.muted_foreground)
                 .child(resolution.body()),
         )
+        .when_some(actions, |this, actions| this.child(actions))
+        .into_any_element()
+}
+
+fn fill_failed_actions(
+    spec: &UserFormSpec,
+    inputs: &UserFormInputMap,
+    textareas: &UserFormTextareaMap,
+    values: &UserFormValues,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    let server_fill = app
+        .as_ref()
+        .map(|entity| entity.read(cx).user_form_verbs_available)
+        .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
+    let can_post = spec.can_post(server_fill);
+    let key = spec.card_key().to_string();
+    h_flex()
+        .w_full()
+        .justify_end()
+        .gap(px(8.))
+        .flex_wrap()
+        .child(action_button(
+            format!("user-form-retry-{key}"),
+            "Try again",
+            ButtonKind::Primary,
+            !can_post,
+            !can_post,
+            {
+                let spec = spec.clone();
+                let inputs = inputs.clone();
+                let textareas = textareas.clone();
+                let picks = values.clone();
+                let app = app.clone();
+                let key = key.clone();
+                can_post.then_some(move |cx: &mut App| {
+                    let values = collect_submit_values(&spec, &inputs, &textareas, &picks, cx);
+                    if let Some(app) = &app {
+                        app.update(cx, |state, cx| {
+                            state.submit_user_form(key.clone(), values, cx);
+                        });
+                    }
+                })
+            },
+        ))
+        .child(action_button(
+            format!("user-form-failed-screen-{key}"),
+            "I'll do it on the computer",
+            ButtonKind::Secondary,
+            !can_post,
+            !can_post,
+            {
+                let app = app.clone();
+                let key = key.clone();
+                can_post.then_some(move |cx: &mut App| {
+                    if let Some(app) = &app {
+                        app.update(cx, |state, cx| {
+                            state.dismiss_user_form(
+                                key.clone(),
+                                UserFormDismissMode::Escalated,
+                                cx,
+                            );
+                        });
+                    }
+                })
+            },
+        ))
+        .child(action_button(
+            format!("user-form-failed-stop-{key}"),
+            "Stop for now",
+            ButtonKind::Ghost,
+            !can_post,
+            !can_post,
+            {
+                let app = app.clone();
+                can_post.then_some(move |cx: &mut App| {
+                    if let Some(app) = &app {
+                        app.update(cx, |state, cx| {
+                            state.dismiss_user_form(
+                                key.clone(),
+                                UserFormDismissMode::Dismissed,
+                                cx,
+                            );
+                        });
+                    }
+                })
+            },
+        ))
+        .into_any_element()
+}
+
+fn escalated_actions(spec: &UserFormSpec, app: Option<Entity<AppState>>, cx: &App) -> AnyElement {
+    let server_fill = app
+        .as_ref()
+        .map(|entity| entity.read(cx).user_form_verbs_available)
+        .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
+    let handed_back = app
+        .as_ref()
+        .is_some_and(|entity| entity.read(cx).user_form_handoff_resolved(spec.card_key()));
+    let handoff_id = spec.handoff_entry_id.clone().or_else(|| {
+        app.as_ref()
+            .and_then(|entity| entity.read(cx).user_form_handoff_id(spec.card_key()))
+    });
+    let can_resolve = server_fill && handoff_id.is_some() && !handed_back;
+    let key = spec.card_key().to_string();
+    h_flex()
+        .w_full()
+        .justify_end()
+        .gap(px(8.))
+        .flex_wrap()
+        .when(!handed_back, |this| {
+            this.child(action_button(
+                format!("user-form-handback-{key}"),
+                "Hand back control",
+                ButtonKind::Primary,
+                !can_resolve,
+                handoff_id.is_none(),
+                {
+                    let app = app.clone();
+                    let key = key.clone();
+                    can_resolve.then_some(move |cx: &mut App| {
+                        if let Some(app) = &app {
+                            app.update(cx, |state, cx| {
+                                state.resolve_user_form_handoff(
+                                    key.clone(),
+                                    BoxHandoffResolution::HandedBack,
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                },
+            ))
+            .child(action_button(
+                format!("user-form-handoff-stop-{key}"),
+                "Stop for now",
+                ButtonKind::Ghost,
+                !can_resolve,
+                handoff_id.is_none(),
+                {
+                    let app = app.clone();
+                    can_resolve.then_some(move |cx: &mut App| {
+                        if let Some(app) = &app {
+                            app.update(cx, |state, cx| {
+                                state.resolve_user_form_handoff(
+                                    key.clone(),
+                                    BoxHandoffResolution::Declined,
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                },
+            ))
+        })
         .into_any_element()
 }
 
@@ -505,7 +711,7 @@ enum ButtonKind {
 
 fn action_button(
     id: String,
-    label: &'static str,
+    label: impl Into<SharedString>,
     kind: ButtonKind,
     disabled: bool,
     coming_from_server: bool,
