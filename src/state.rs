@@ -5885,12 +5885,15 @@ impl AppState {
     }
 
     fn paint_user_form_resolution(&mut self, card_key: &str, resolution: FormResolution) {
+        let prior = self.user_form_mut(card_key).and_then(|spec| {
+            (spec.resolution != Some(FormResolution::Sending))
+                .then_some(spec.effective_resolution())
+                .flatten()
+        });
+        if let Some(prior) = prior {
+            self.user_form_restore.insert(card_key.to_string(), prior);
+        }
         if let Some(spec) = self.user_form_mut(card_key) {
-            if spec.resolution != Some(FormResolution::Sending)
-                && let Some(prior) = spec.effective_resolution()
-            {
-                self.user_form_restore.insert(card_key.to_string(), prior);
-            }
             spec.resolution = Some(resolution);
         }
         if resolution != FormResolution::Sending {
