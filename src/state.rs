@@ -7710,32 +7710,24 @@ impl AppState {
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let next = match self.theme_mode.as_str() {
-            "light" => "dark",
-            "dark" => "system",
-            _ => "light",
-        };
+        use gpui_kit::component::{ActiveTheme, Theme};
+
+        let visually_dark = cx.has_global::<Theme>() && cx.theme().is_dark();
+        let next = crate::theme::next_toggle_mode(&self.theme_mode, visually_dark);
         self.set_theme_mode(next, cx);
     }
 
-    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
-        use gpui_kit::component::{Theme, ThemeRegistry};
+    pub fn restore_saved_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_mode = crate::theme::load_saved_mode();
+        crate::theme::apply_mode(&self.theme_mode, cx);
+        cx.notify();
+    }
 
-        self.theme_mode = mode.to_string();
-        let theme_name = match self.theme_mode.as_str() {
-            "light" => "macOS Classic Light",
-            "dark" => "macOS Classic Dark",
-            "system" => "macOS Classic Dark",
-            _ => "macOS Classic Light",
-        };
-        if let Some(theme) = ThemeRegistry::global(cx)
-            .themes()
-            .get(&SharedString::from(theme_name))
-            .cloned()
-        {
-            Theme::global_mut(cx).apply_config(&theme);
-            Theme::sync_base(cx);
-        }
+    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.theme_mode = crate::theme::normalize_mode(mode).to_string();
+        #[cfg(not(test))]
+        crate::theme::save_mode(&self.theme_mode);
+        crate::theme::apply_mode(&self.theme_mode, cx);
         cx.notify();
     }
 

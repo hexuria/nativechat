@@ -5,7 +5,9 @@ use crate::chrome::{
     BOX_SCREEN_ASPECT, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, box_screen_height_for_width,
     chrome_floats, computer_pane_screen_width,
 };
-use crate::components::alert_chrome::{attention_ctas, attention_glass, attention_shadow};
+use crate::components::alert_chrome::{
+    attention_cta, attention_ctas, attention_glass, attention_shadow,
+};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     BoxHandoffResolution, computer_attention_done_id, computer_attention_id,
@@ -21,9 +23,7 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Icon, Selectable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -867,7 +867,7 @@ pub(crate) fn computer_attention_banner(
     let done_key = key;
     let dark = cx.theme().is_dark();
     let glass = attention_glass(dark);
-    let ctas = attention_ctas(dark, cx);
+    let ctas = attention_ctas(dark);
     v_flex()
         .id(banner_id)
         .w_full()
@@ -896,39 +896,38 @@ pub(crate) fn computer_attention_banner(
                 .flex_shrink_0()
                 .items_center()
                 .flex_wrap()
-                .child(
-                    Button::new(skip_id)
-                        .small()
-                        .custom(ctas.tertiary)
-                        .label("Skip this step")
-                        .disabled(!can_resolve)
-                        .on_click(move |_, _, cx| {
-                            skip_app.update(cx, |state, cx| {
-                                state.resolve_user_form_handoff(
-                                    skip_key.clone(),
-                                    BoxHandoffResolution::Declined,
-                                    cx,
-                                );
-                            });
-                        }),
-                )
-                .child(
-                    Button::new(done_id)
-                        .small()
-                        .custom(ctas.primary)
-                        .rounded(px(999.))
-                        .label("I'm done, continue")
-                        .disabled(!can_resolve)
-                        .on_click(move |_, _, cx| {
-                            done_app.update(cx, |state, cx| {
-                                state.resolve_user_form_handoff(
-                                    done_key.clone(),
-                                    BoxHandoffResolution::HandedBack,
-                                    cx,
-                                );
-                            });
-                        }),
-                ),
+                .child(attention_cta(
+                    skip_id,
+                    "Skip this step",
+                    ctas.tertiary,
+                    false,
+                    !can_resolve,
+                    can_resolve.then_some(move |cx: &mut App| {
+                        skip_app.update(cx, |state, cx| {
+                            state.resolve_user_form_handoff(
+                                skip_key.clone(),
+                                BoxHandoffResolution::Declined,
+                                cx,
+                            );
+                        });
+                    }),
+                ))
+                .child(attention_cta(
+                    done_id,
+                    "I'm done, continue",
+                    ctas.primary,
+                    true,
+                    !can_resolve,
+                    can_resolve.then_some(move |cx: &mut App| {
+                        done_app.update(cx, |state, cx| {
+                            state.resolve_user_form_handoff(
+                                done_key.clone(),
+                                BoxHandoffResolution::HandedBack,
+                                cx,
+                            );
+                        });
+                    }),
+                )),
         )
 }
 

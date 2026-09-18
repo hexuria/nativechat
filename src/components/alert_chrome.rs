@@ -4,8 +4,12 @@
 //! GPUI has no element `backdrop-filter`. Glass is a translucent fill over the
 //! pane/chat so `theme.sidebar` / the transcript shows through, plus a warm
 //! shadow that feathers the edge.
+//!
+//! Filled CTAs are local pills, not `ButtonVariant::Custom`. The kit mixes
+//! Custom rest fill with transparent at 0.2, so "I'm done, continue" would
+//! look washed until hover.
 
-use gpui_kit::component::button::ButtonCustomVariant;
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 fn wash(hex: u32, alpha: f32) -> Hsla {
@@ -30,10 +34,20 @@ pub struct AttentionGlass {
     pub preview_bg: Hsla,
 }
 
+/// Rest / hover / press fills. Primary is opaque black (light) or white (dark)
+/// at rest — hover only darkens or lightens slightly.
+#[derive(Clone, Copy)]
+pub struct CtaFill {
+    pub bg: Hsla,
+    pub fg: Hsla,
+    pub hover: Hsla,
+    pub active: Hsla,
+}
+
 pub struct AttentionCtas {
-    pub primary: ButtonCustomVariant,
-    pub secondary: ButtonCustomVariant,
-    pub tertiary: ButtonCustomVariant,
+    pub primary: CtaFill,
+    pub secondary: CtaFill,
+    pub tertiary: CtaFill,
 }
 
 /// Sidebar **Needs your attention** + in-chat Computer card.
@@ -80,42 +94,90 @@ pub fn attention_shadow(dark: bool) -> Vec<BoxShadow> {
     ]
 }
 
-pub fn attention_ctas(dark: bool, cx: &App) -> AttentionCtas {
+pub fn attention_ctas(dark: bool) -> AttentionCtas {
     if dark {
         AttentionCtas {
-            primary: ButtonCustomVariant::new(cx)
-                .color(solid(0xFFFFFF))
-                .foreground(solid(0x111111))
-                .hover(solid(0xF0F0F0))
-                .active(solid(0xE4E4E4)),
-            secondary: ButtonCustomVariant::new(cx)
-                .color(wash(0xFFFFFF, 0.10))
-                .foreground(solid(0xFFF5E6))
-                .hover(wash(0xFFFFFF, 0.16))
-                .active(wash(0xFFFFFF, 0.22)),
-            tertiary: ButtonCustomVariant::new(cx)
-                .foreground(wash(0xFFF5E6, 0.82))
-                .hover(wash(0xFFFFFF, 0.10))
-                .active(wash(0xFFFFFF, 0.16)),
+            primary: CtaFill {
+                bg: solid(0xFFFFFF),
+                fg: solid(0x111111),
+                hover: solid(0xF0F0F0),
+                active: solid(0xE4E4E4),
+            },
+            secondary: CtaFill {
+                bg: wash(0xFFFFFF, 0.10),
+                fg: solid(0xFFF5E6),
+                hover: wash(0xFFFFFF, 0.16),
+                active: wash(0xFFFFFF, 0.22),
+            },
+            tertiary: CtaFill {
+                bg: wash(0xFFFFFF, 0.0),
+                fg: wash(0xFFF5E6, 0.82),
+                hover: wash(0xFFFFFF, 0.10),
+                active: wash(0xFFFFFF, 0.16),
+            },
         }
     } else {
         AttentionCtas {
-            primary: ButtonCustomVariant::new(cx)
-                .color(solid(0x000000))
-                .foreground(solid(0xFFFFFF))
-                .hover(solid(0x1A1A1A))
-                .active(solid(0x111111)),
-            secondary: ButtonCustomVariant::new(cx)
-                .color(wash(0x000000, 0.06))
-                .foreground(solid(0x1C1917))
-                .hover(wash(0x000000, 0.10))
-                .active(wash(0x000000, 0.14)),
-            tertiary: ButtonCustomVariant::new(cx)
-                .foreground(solid(0x57534E))
-                .hover(wash(0x000000, 0.06))
-                .active(wash(0x000000, 0.10)),
+            primary: CtaFill {
+                bg: solid(0x000000),
+                fg: solid(0xFFFFFF),
+                hover: solid(0x1A1A1A),
+                active: solid(0x111111),
+            },
+            secondary: CtaFill {
+                bg: wash(0x000000, 0.06),
+                fg: solid(0x1C1917),
+                hover: wash(0x000000, 0.10),
+                active: wash(0x000000, 0.14),
+            },
+            tertiary: CtaFill {
+                bg: wash(0x000000, 0.0),
+                fg: solid(0x57534E),
+                hover: wash(0x000000, 0.06),
+                active: wash(0x000000, 0.10),
+            },
         }
     }
+}
+
+/// Full-fill pill at rest. Do not route this through `Button::custom`.
+pub fn attention_cta(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    fill: CtaFill,
+    pill: bool,
+    disabled: bool,
+    on_click: Option<impl Fn(&mut App) + 'static>,
+) -> AnyElement {
+    let radius = if pill { px(999.) } else { px(8.) };
+    let click = if disabled { None } else { on_click };
+    div()
+        .id(id)
+        .h(px(24.))
+        .px(px(8.))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded(radius)
+        .bg(fill.bg)
+        .text_color(fill.fg)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .when(disabled, |this| this.opacity(0.45))
+        .when(!disabled, |this| {
+            this.cursor_pointer()
+                .hover(|s| s.bg(fill.hover).text_color(fill.fg))
+                .active(|s| s.bg(fill.active).text_color(fill.fg))
+        })
+        .when_some(click, |this, on_click| {
+            this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                on_click(cx);
+            })
+        })
+        .child(label.into())
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -136,5 +198,42 @@ mod tests {
         );
         assert!(light.card_bg.a < 1.0);
         assert!(dark.card_bg.a < 1.0);
+    }
+
+    #[test]
+    fn attention_primary_is_full_strength_at_rest() {
+        let light = attention_ctas(false);
+        assert_eq!(
+            light.primary.bg.a, 1.0,
+            "light I'm done / Take over rest fill must be opaque, not kit Custom 0.2 mix"
+        );
+        assert!(
+            light.primary.bg.l < 0.08,
+            "light primary rest is a black pill, got l={}",
+            light.primary.bg.l
+        );
+        assert!(
+            light.primary.fg.l > 0.9,
+            "light primary label is white, got l={}",
+            light.primary.fg.l
+        );
+        assert!(
+            light.primary.hover.l > light.primary.bg.l,
+            "light hover may lighten slightly, not invent a muted rest"
+        );
+
+        let dark = attention_ctas(true);
+        assert_eq!(dark.primary.bg.a, 1.0);
+        assert!(
+            dark.primary.bg.l > 0.9,
+            "dark primary rest is a white pill, got l={}",
+            dark.primary.bg.l
+        );
+        assert!(
+            dark.primary.fg.l < 0.15,
+            "dark primary label is black, got l={}",
+            dark.primary.fg.l
+        );
+        assert!(dark.primary.hover.l < dark.primary.bg.l);
     }
 }
