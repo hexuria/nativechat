@@ -9,15 +9,15 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus,
-    Failure, FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecResolution,
-    ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail,
-    RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary,
-    ReplyQuote, RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
-    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_flag, keep_local_save_offer, local_exec_outcome,
+    Failure, FormResolution, FormSpec, HITL_INTERRUPT_AVAILABLE, ImageVisibility, LocalExecMode,
+    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
+    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay,
+    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE,
+    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
+    WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, host_egress_tunnel_flag, keep_local_save_offer, local_exec_outcome,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
     result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
     tool_standin,
@@ -1355,6 +1355,9 @@ pub struct AppState {
     /// refilled from the database, its run is written into by name rather than by position, and
     /// coming back to it asks the server what became of the run.
     live_turns: HashMap<String, LiveTurn>,
+    /// Server run parked on HITL (user-form / approval / live handoff) after
+    /// [`Self::live_turns`] is released. Composer steer POSTs stop then a new turn.
+    parked_hitl_runs: HashMap<String, String>,
     /// Threads already reconciled against the server this session. Once is enough: after it, the
     /// app has been watching, and every turn since has gone through the same door on its way to
     /// disk. Asking again on every visit would fetch a thread's frames — screenshots and all —
@@ -1782,6 +1785,7 @@ impl AppState {
         let mut state = Self {
             conversations: Vec::new(),
             live_turns: HashMap::new(),
+            parked_hitl_runs: HashMap::new(),
             reconciled_threads: HashSet::new(),
             last_active_at: HashMap::new(),
             active_conversation_id: None,
@@ -2437,8 +2441,77 @@ impl AppState {
     fn park_waiting_for_you(&mut self, conversation_id: &str, run_id: &str) {
         self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
         if !run_id.is_empty() {
+            self.parked_hitl_runs
+                .insert(conversation_id.to_string(), run_id.to_string());
             self.release_live_turn(conversation_id, run_id);
         }
+    }
+
+    /// Run id of a parked HITL turn, if this thread still has one.
+    fn parked_hitl_run_id(&self, conversation_id: &str) -> Option<String> {
+        if let Some(id) = self.parked_hitl_runs.get(conversation_id)
+            && !id.is_empty()
+        {
+            return Some(id.clone());
+        }
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return None;
+        };
+        for part in conversation
+            .messages
+            .iter()
+            .rev()
+            .flat_map(|message| message.parts.iter())
+        {
+            match part {
+                ChatPart::UserForm(spec)
+                    if (spec.is_unresolved() || spec.live_computer_handoff())
+                        && !spec.run_id.is_empty() =>
+                {
+                    return Some(spec.run_id.clone());
+                }
+                ChatPart::Approval(spec)
+                    if !spec.run_id.is_empty()
+                        && !self.approval_answered(&spec.call_id)
+                        && self.auto_resolve_local_exec(spec).is_none() =>
+                {
+                    return Some(spec.run_id.clone());
+                }
+                ChatPart::CredentialRequest(spec) if !spec.run_id.is_empty() => {
+                    return Some(spec.run_id.clone());
+                }
+                _ => {}
+            }
+        }
+        // Form painted mid-stream: live_turns still holds the run that
+        // `park_waiting_for_you` has not copied yet.
+        if (self.has_open_approval(conversation_id) || self.has_open_user_form(conversation_id))
+            && let Some(turn) = self.live_turns.get(conversation_id)
+            && !turn.run_id.is_empty()
+        {
+            return Some(turn.run_id.clone());
+        }
+        None
+    }
+
+    fn take_parked_hitl_run(&mut self, conversation_id: &str) -> Option<String> {
+        let id = self.parked_hitl_run_id(conversation_id)?;
+        self.parked_hitl_runs.remove(conversation_id);
+        Some(id)
+    }
+
+    /// Composer send POSTs a real OpenGrok turn. Open forms / approvals /
+    /// live handoff used to paint a local bubble and return — that is the
+    /// orphan-steer bug. A working turn with no HITL still keeps Stop.
+    fn composer_send_posts_turn(&self, conversation_id: &str) -> bool {
+        if self.has_open_approval(conversation_id) || self.has_open_user_form(conversation_id) {
+            return true;
+        }
+        !self.is_thread_responding(conversation_id)
     }
 
     /// After Skip / Dismiss / Done (and after SSE graft): Waiting only while
@@ -5299,6 +5372,17 @@ impl AppState {
             self.note_signed_out(cx);
             return;
         }
+        // Steer while HITL is parked: stop the AwaitingApproval run, then
+        // POST a new turn that includes this user message. Gate off if a
+        // server predates `POST /ag-ui/runs/{id}/stop` — send still POSTs.
+        // A 404 on stop is success (nothing of ours running).
+        let interrupt_run_id = if self.has_open_approval(&conversation_id)
+            || self.has_open_user_form(&conversation_id)
+        {
+            self.take_parked_hitl_run(&conversation_id)
+        } else {
+            None
+        };
         let coworker_id = self.active_coworker_id.clone();
         // The recipe as it stands now, not when the turn reaches the wire: the composer clears
         // the draft the moment it is sent, and the turn should carry what was on the message.
@@ -5365,6 +5449,21 @@ impl AppState {
             };
             let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
+                    // OpenGrok A2: `POST /ag-ui/runs/{id}/stop` on
+                    // AwaitingApproval takes effect immediately (closes the
+                    // parked card). Box `interruptAgentRun` /
+                    // `POST /boxes/{boxId}/interrupt` is a different surface.
+                    // `HITL_INTERRUPT_AVAILABLE = false` skips stop only —
+                    // the new turn still POSTs. Never swallow send.
+                    if HITL_INTERRUPT_AVAILABLE && let Some(parked) = interrupt_run_id.as_deref() {
+                        if let Err(error) = client.stop_run(parked).await
+                            && error.status != Some(404)
+                        {
+                            eprintln!(
+                                "NativeChat: HITL interrupt of {parked} did not land: {error}"
+                            );
+                        }
+                    }
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
@@ -7576,22 +7675,11 @@ impl AppState {
             .detach();
         }
 
-        if self.has_open_approval(&conversation_id) || self.has_open_user_form(&conversation_id) {
-            // The card is this thread's, and so is the line saying what it is waiting for.
-            if self.has_open_user_form(&conversation_id) {
-                let run_id = self
-                    .live_turns
-                    .get(&conversation_id)
-                    .map(|turn| turn.run_id.clone())
-                    .unwrap_or_default();
-                self.park_waiting_for_you(&conversation_id, &run_id);
-            } else {
-                self.finish_responding(Some(&conversation_id), true);
-            }
-            cx.notify();
-            return;
-        }
-        if self.is_active_bot_responding() {
+        // Open form / approval / live Computer handoff used to paint this
+        // bubble and return. That is the orphan-steer bug: the order never
+        // reached OpenGrok. Composer send POSTs a real turn. A working turn
+        // with no HITL still keeps Stop.
+        if !self.composer_send_posts_turn(&conversation_id) {
             cx.notify();
             return;
         }
@@ -9993,6 +10081,110 @@ mod tests {
             "do not keep a local live-turn past the run"
         );
         assert_eq!(state.open_user_forms().len(), 1);
+    }
+
+    /// Composer send while a form / approval / live handoff is open POSTs a
+    /// real OpenGrok turn. A working turn with no HITL still keeps Stop.
+    #[test]
+    fn composer_send_posts_turn_while_hitl_is_open() {
+        assert!(
+            crate::opengrok::HITL_INTERRUPT_AVAILABLE,
+            "wire stop_run; flip the gate only if OG predates /ag-ui/runs/{{id}}/stop"
+        );
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run_1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        assert!(state.has_open_user_form("cw_1"));
+        assert!(
+            state.composer_send_posts_turn("cw_1"),
+            "open form must POST a steer even while the stream is still registered"
+        );
+        assert_eq!(state.parked_hitl_run_id("cw_1").as_deref(), Some("run_1"));
+
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert!(!state.is_turn_in_flight());
+        assert!(!state.is_active_bot_responding());
+        assert!(state.composer_send_posts_turn("cw_1"));
+        assert_eq!(state.take_parked_hitl_run("cw_1").as_deref(), Some("run_1"));
+        assert_eq!(
+            state.parked_hitl_run_id("cw_1").as_deref(),
+            Some("run_1"),
+            "form run_id remains after the map is taken, so a second steer still stops"
+        );
+    }
+
+    #[test]
+    fn composer_send_posts_turn_while_approval_or_live_handoff_is_open() {
+        let approval = crate::opengrok::ApprovalSpec {
+            run_id: "run_1".into(),
+            call_id: "c1".into(),
+            tool: "Shell".into(),
+            command: "ls".into(),
+            why: String::new(),
+            reason: "exec-consent".into(),
+            output: None,
+            ok: None,
+        };
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::Approval(approval)];
+        let mut state = mid_turn(at(bot, 20));
+        state.finish_responding(Some("cw_1"), true);
+        assert!(state.has_open_approval("cw_1"));
+        assert!(
+            state.composer_send_posts_turn("cw_1"),
+            "open approval must POST a steer"
+        );
+
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Website login",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut form_bot = message("m_live", false, "");
+        form_bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut handoff = mid_turn(at(form_bot, 20));
+        handoff.park_waiting_for_you("cw_1", "run_1");
+        handoff.paint_user_form_resolution("e_form", FormResolution::Dismissed);
+        handoff.set_computer_handoff(
+            "e_form",
+            crate::opengrok::ComputerHandoffStatus::ActionNeeded,
+        );
+        assert!(
+            handoff.has_open_user_form("cw_1"),
+            "live Computer handoff is HITL"
+        );
+        assert!(handoff.composer_send_posts_turn("cw_1"));
+    }
+
+    #[test]
+    fn composer_send_keeps_stop_on_a_working_turn_without_hitl() {
+        let state = mid_turn(at(message("m_live", false, ""), 20));
+        assert!(state.is_active_bot_responding());
+        assert!(state.is_turn_in_flight());
+        assert!(
+            !state.composer_send_posts_turn("cw_1"),
+            "working turn with no form/approval/handoff still keeps Stop"
+        );
     }
 
     #[test]

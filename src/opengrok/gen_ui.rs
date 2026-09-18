@@ -2293,8 +2293,17 @@ mod tests {
             [ChatPart::UserForm(password), ChatPart::UserForm(otp)] => {
                 assert_eq!(password.entry_id, "e_pw");
                 assert!(password.is_unresolved());
+                assert!(
+                    password.can_post(false),
+                    "stamped sibling must stay Continue-able; merge must not steal its entryId"
+                );
                 assert_eq!(otp.entry_id, "e_otp");
                 assert!(otp.is_unresolved());
+                assert!(otp.can_post(true));
+                assert!(
+                    otp.can_post(false),
+                    "server_fill on another card must not gray this one"
+                );
             }
             other => panic!("expected two cards, got {other:?}"),
         }
