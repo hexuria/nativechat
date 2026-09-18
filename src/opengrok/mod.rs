@@ -2,6 +2,7 @@
 
 mod activity;
 mod client;
+mod credential;
 mod error;
 mod gen_ui;
 mod local_exec;
@@ -11,6 +12,13 @@ mod user_form;
 pub use activity::{
     ActivityTick, BotActivity, ToolCallTracker, activity_from_agui, activity_from_replay,
     deeds_from_replay, tool_standin,
+};
+pub use credential::{
+    CREDENTIAL_OFFER_SAVE, CREDENTIAL_REQUEST, CREDENTIAL_RESULT, CREDENTIAL_RESULT_PATH,
+    CredentialRequestSpec, CredentialResultStatus, SaveLoginSpec, credential_request_allow_id,
+    credential_request_card_id, credential_request_deny_id, credential_result_body,
+    is_credential_custom_name, result_without_broker, save_login_card_id, save_login_save_id,
+    save_login_skip_id,
 };
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, CompletedUiTool, FormField, FormSpec,

@@ -140,6 +140,13 @@ impl Render for AppSettings {
                                     updates_page(&bot_name, &controls, muted, app.clone(), &theme)
                                         .into_any_element()
                                 }
+                                AppSettingsTab::Logins => logins_page(
+                                    &app.read(cx).site_logins,
+                                    app.read(cx).site_login_error.clone(),
+                                    muted,
+                                    app.clone(),
+                                )
+                                .into_any_element(),
                             }),
                     ),
             )
@@ -239,6 +246,13 @@ impl AppSettings {
                 AppSettingsTab::Updates,
                 cx,
             ))
+            .child(nav_item(
+                "settings-tab-logins",
+                "Logins",
+                tab == AppSettingsTab::Logins,
+                AppSettingsTab::Logins,
+                cx,
+            ))
     }
 }
 
@@ -250,7 +264,91 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Shortcuts => "Keyboard shortcuts",
         AppSettingsTab::Computer => "Computer",
         AppSettingsTab::Updates => "Updates",
+        AppSettingsTab::Logins => "Logins",
     }
+}
+
+fn logins_page(
+    logins: &[crate::site_login::SiteLoginRecord],
+    error: Option<String>,
+    muted: Hsla,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    v_flex()
+        .id("settings-logins")
+        .gap(px(12.))
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("Saved site logins. Passwords stay in the OS keychain and are never shown."),
+        )
+        .when_some(error, |this, error| {
+            this.child(
+                div()
+                    .id("settings-logins-error")
+                    .text_xs()
+                    .text_color(rgb(0xcc4444))
+                    .child(error),
+            )
+        })
+        .child(if logins.is_empty() {
+            div()
+                .id("settings-logins-empty")
+                .text_sm()
+                .text_color(muted)
+                .child("No saved logins yet.")
+                .into_any_element()
+        } else {
+            let mut list = v_flex()
+                .w_full()
+                .rounded(px(12.))
+                .border_1()
+                .border_color(rgb(0x777777).opacity(0.24))
+                .overflow_hidden();
+            for (i, login) in logins.iter().enumerate() {
+                if i > 0 {
+                    list = list.child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)));
+                }
+                let id = login.id.clone();
+                list = list.child(
+                    h_flex()
+                        .id(format!("settings-login-row-{id}"))
+                        .w_full()
+                        .items_center()
+                        .gap(px(16.))
+                        .px(px(16.))
+                        .py(px(12.))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .gap(px(2.))
+                                .child(div().text_sm().child(login.username.clone()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(login.origin.clone()),
+                                ),
+                        )
+                        .child(
+                            Button::new(format!("settings-login-delete-{id}"))
+                                .label("Delete")
+                                .ghost()
+                                .on_click({
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| {
+                                            state.delete_site_login(id.clone(), cx);
+                                        });
+                                    }
+                                }),
+                        ),
+                );
+            }
+            list.into_any_element()
+        })
 }
 
 /// The active bot's computer: Update (keeps files) and Reset (starts fresh), each two clicks.

@@ -223,6 +223,12 @@ pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTic
                 ActivityTick::Set(BotActivity {
                     label: "Waiting for approval".into(),
                 })
+            } else if event.get("name").and_then(Value::as_str)
+                == Some(super::credential::CREDENTIAL_REQUEST)
+            {
+                ActivityTick::Set(BotActivity {
+                    label: super::user_form::WAITING_FOR_YOU.into(),
+                })
             } else if super::user_form::is_user_form_event(
                 event.get("name").and_then(Value::as_str).unwrap_or(""),
                 event.get("value").unwrap_or(event),

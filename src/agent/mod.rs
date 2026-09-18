@@ -8,7 +8,11 @@
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
 //! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
-//! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`.
+//! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
+//! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
+//! `credential-request-{id}`, `credential-request-allow-{id}`,
+//! `credential-request-deny-{id}`, `settings-tab-logins`,
+//! `settings-login-row-{id}`, `settings-login-delete-{id}`.
 //!
 //! Typing goes in as GPUI keystrokes. `type`, `key` and `set_value` on the composer are
 //! planned here ([`ComposePlan`]) and pressed by [`RootView`](crate::root::RootView), because

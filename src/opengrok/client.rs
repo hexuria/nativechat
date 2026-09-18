@@ -679,6 +679,41 @@ impl OpenGrokClient {
         Self::box_handoff_action_response(response).await
     }
 
+    /// A.0: tell the run what happened for `credential.request`. Never a password.
+    /// `filled` is not posted here — there is no session broker yet.
+    pub async fn post_credential_result(
+        &self,
+        status: super::credential::CredentialResultStatus,
+        request_id: &str,
+        credential_id: Option<&str>,
+        agent_id: &str,
+    ) -> Result<(), OpenGrokError> {
+        if request_id.trim().is_empty() {
+            return Ok(());
+        }
+        let body =
+            super::credential::credential_result_body(status, request_id, credential_id, agent_id);
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                super::credential::CREDENTIAL_RESULT_PATH,
+                Some(&body),
+            )
+            .await?;
+        let status_code = response.status().as_u16();
+        if status_code == 404 || (200..300).contains(&status_code) {
+            return Ok(());
+        }
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        Err(OpenGrokError::from_server(
+            Some(status_code),
+            error_message_from_body(&text),
+        ))
+    }
+
     async fn user_form_action_response(
         response: reqwest::Response,
     ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
@@ -3123,6 +3158,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingEntryId);
+    }
+
+    #[tokio::test]
+    async fn credential_result_posts_status_without_a_password() {
+        use super::super::credential::CredentialResultStatus;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/credential/result"))
+            .and(body_json(json!({
+                "status": "error",
+                "requestId": "req-9",
+                "agentId": "cw_1",
+                "credentialId": "cred-1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client
+            .post_credential_result(
+                CredentialResultStatus::Error,
+                "req-9",
+                Some("cred-1"),
+                "cw_1",
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_result_404_is_not_a_failure() {
+        use super::super::credential::CredentialResultStatus;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/credential/result"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client
+            .post_credential_result(CredentialResultStatus::Missing, "req-9", None, "cw_1")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

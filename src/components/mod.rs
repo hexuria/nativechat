@@ -23,6 +23,7 @@ pub mod message_actions;
 pub mod multi_select;
 pub mod persona;
 pub mod recipes;
+pub mod save_login;
 pub mod sidebar;
 pub mod sidebar_chat_item;
 pub mod title_bar;

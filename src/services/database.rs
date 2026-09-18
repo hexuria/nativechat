@@ -17,6 +17,10 @@ impl DatabaseService {
         Self { pool }
     }
 
+    pub fn pool(&self) -> DbPool {
+        self.pool.clone()
+    }
+
     pub async fn create_session(&self, title: &str) -> Result<String> {
         let id = uuid::Uuid::now_v7().to_string();
         sqlx::query("INSERT INTO chat_sessions (id, title) VALUES (?, ?)")

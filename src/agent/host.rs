@@ -8,10 +8,12 @@ use crate::components::chat_input::sources::{
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::opengrok::{
     ChatPart, CoworkerPatch, LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec,
-    UserFormDismissMode, UserFormFieldKind, user_form_card_id, user_form_continue_id,
-    user_form_dismiss_id, user_form_field_id, user_form_screen_id,
+    UserFormDismissMode, UserFormFieldKind, credential_request_allow_id,
+    credential_request_card_id, credential_request_deny_id, save_login_card_id, save_login_save_id,
+    save_login_skip_id, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
+    user_form_field_id, user_form_screen_id,
 };
-use crate::state::{ActiveRecipe, AppState};
+use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
 pub mod ids {
     pub const WINDOW: &str = "app-window";
@@ -144,6 +146,20 @@ pub enum Command {
         field_id: String,
         value: String,
     },
+    SaveLogin {
+        form_entry_id: String,
+    },
+    SkipSaveLogin {
+        form_entry_id: String,
+    },
+    DeleteSiteLogin {
+        id: String,
+    },
+    AnswerCredentialRequest {
+        request_id: String,
+        allow: bool,
+    },
+    SetAppSettingsTab(crate::state::AppSettingsTab),
     Shutdown,
 }
 
@@ -221,6 +237,13 @@ impl Command {
                 field_id,
                 value,
             } => state.set_user_form_typed_field(card_key, field_id, value, cx),
+            Self::SaveLogin { form_entry_id } => state.save_offered_login(form_entry_id, cx),
+            Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
+            Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
+            Self::AnswerCredentialRequest { request_id, allow } => {
+                state.answer_credential_request(request_id, allow, cx)
+            }
+            Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
             Self::Shutdown => {}
         }
     }
@@ -532,6 +555,27 @@ struct UserFormFieldSnap {
     value: String,
 }
 
+#[derive(Clone, Default)]
+struct SaveLoginSnap {
+    form_entry_id: String,
+    origin: String,
+    username: String,
+}
+
+#[derive(Clone, Default)]
+struct CredentialRequestSnap {
+    request_id: String,
+    origin: String,
+    username: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct SiteLoginSnap {
+    id: String,
+    origin: String,
+    username: String,
+}
+
 fn user_form_node(form: &UserFormSnap) -> UiNode {
     let key = &form.card_key;
     let mut card = UiNode::dialog(user_form_card_id(key), form.title.clone());
@@ -551,6 +595,48 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
     card.with_child(UiNode::button(user_form_continue_id(key), "Continue"))
         .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
         .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
+}
+
+fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
+    UiNode::dialog(
+        save_login_card_id(&offer.form_entry_id),
+        format!("Save login for {} as {}?", offer.origin, offer.username),
+    )
+    .with_child(UiNode::button(
+        save_login_save_id(&offer.form_entry_id),
+        "Save",
+    ))
+    .with_child(UiNode::button(
+        save_login_skip_id(&offer.form_entry_id),
+        "Not now",
+    ))
+}
+
+fn credential_request_node(request: &CredentialRequestSnap) -> UiNode {
+    let title = match &request.username {
+        Some(username) => format!("Use saved login for {} as {}?", request.origin, username),
+        None => format!("Use a saved login for {}?", request.origin),
+    };
+    UiNode::dialog(credential_request_card_id(&request.request_id), title)
+        .with_child(UiNode::button(
+            credential_request_allow_id(&request.request_id),
+            "Use saved login",
+        ))
+        .with_child(UiNode::button(
+            credential_request_deny_id(&request.request_id),
+            "Not now",
+        ))
+}
+
+fn site_login_node(login: &SiteLoginSnap) -> UiNode {
+    UiNode::listitem(
+        format!("settings-login-row-{}", login.id),
+        format!("{} · {}", login.username, login.origin),
+    )
+    .with_child(UiNode::button(
+        format!("settings-login-delete-{}", login.id),
+        "Delete",
+    ))
 }
 
 /// `approval-<call_id>-<verb>` → the answer it stands for.
@@ -650,6 +736,10 @@ pub struct NativeChatHost {
     lightbox: Option<LightboxSnap>,
     /// Idle user-form cards in the open thread.
     user_forms: Vec<UserFormSnap>,
+    save_logins: Vec<SaveLoginSnap>,
+    credential_requests: Vec<CredentialRequestSnap>,
+    site_logins: Vec<SiteLoginSnap>,
+    logins_tab: bool,
     /// Settings → Computers: Route traffic row, when host/env/box says the tunnel exists.
     route_traffic_visible: bool,
     /// Box `egress_tunnel.ready` when the computer JSON exposed it.
@@ -869,6 +959,60 @@ impl NativeChatHost {
                     }
                 })
                 .collect(),
+            save_logins: state
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    Some(&conversation.id) == state.active_conversation_id.as_ref()
+                })
+                .map(|conversation| {
+                    conversation
+                        .messages
+                        .iter()
+                        .flat_map(|message| message.parts.iter())
+                        .filter_map(|part| match part {
+                            ChatPart::SaveLogin(spec) => Some(SaveLoginSnap {
+                                form_entry_id: spec.form_entry_id.clone(),
+                                origin: spec.origin.clone(),
+                                username: spec.username.clone(),
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            credential_requests: state
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    Some(&conversation.id) == state.active_conversation_id.as_ref()
+                })
+                .map(|conversation| {
+                    conversation
+                        .messages
+                        .iter()
+                        .flat_map(|message| message.parts.iter())
+                        .filter_map(|part| match part {
+                            ChatPart::CredentialRequest(spec) => Some(CredentialRequestSnap {
+                                request_id: spec.request_id.clone(),
+                                origin: spec.origin.clone(),
+                                username: spec.username.clone(),
+                            }),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            site_logins: state
+                .site_logins
+                .iter()
+                .map(|row| SiteLoginSnap {
+                    id: row.id.clone(),
+                    origin: row.origin.clone(),
+                    username: row.username.clone(),
+                })
+                .collect(),
+            logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
             route_traffic_visible: state.show_egress_tunnel_settings(),
             egress_tunnel_ready: state
                 .coworker_computer
@@ -1024,6 +1168,12 @@ impl NativeChatHost {
         for form in &self.user_forms {
             page = page.with_child(user_form_node(form));
         }
+        for offer in &self.save_logins {
+            page = page.with_child(save_login_node(offer));
+        }
+        for request in &self.credential_requests {
+            page = page.with_child(credential_request_node(request));
+        }
         page = page.with_child(
             UiNode::new("computer-pane", "dialog", "Computer")
                 .with_visible(self.computer_open)
@@ -1101,13 +1251,25 @@ impl NativeChatHost {
                     .with_child(self.recipes_node())
                     .with_child({
                         let mut settings = UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
-                            .with_visible(self.account_open);
+                            .with_visible(self.account_open)
+                            .with_child(UiNode::button("settings-tab-logins", "Logins"));
                         if self.route_traffic_visible {
                             settings = settings.with_child(UiNode::new(
                                 "route-traffic-this-computer",
                                 "switch",
                                 "Route traffic through this computer",
                             ));
+                        }
+                        if self.logins_tab {
+                            if self.site_logins.is_empty() {
+                                settings = settings.with_child(UiNode::status(
+                                    "settings-logins-empty",
+                                    "No saved logins yet.",
+                                ));
+                            }
+                            for login in &self.site_logins {
+                                settings = settings.with_child(site_login_node(login));
+                            }
                         }
                         settings
                     })
@@ -1307,6 +1469,48 @@ impl NativeChatHost {
         None
     }
 
+    fn save_login_command(&self, target: &str) -> Option<Command> {
+        for offer in &self.save_logins {
+            if target == save_login_save_id(&offer.form_entry_id) {
+                return Some(Command::SaveLogin {
+                    form_entry_id: offer.form_entry_id.clone(),
+                });
+            }
+            if target == save_login_skip_id(&offer.form_entry_id) {
+                return Some(Command::SkipSaveLogin {
+                    form_entry_id: offer.form_entry_id.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn credential_request_command(&self, target: &str) -> Option<Command> {
+        for request in &self.credential_requests {
+            if target == credential_request_allow_id(&request.request_id) {
+                return Some(Command::AnswerCredentialRequest {
+                    request_id: request.request_id.clone(),
+                    allow: true,
+                });
+            }
+            if target == credential_request_deny_id(&request.request_id) {
+                return Some(Command::AnswerCredentialRequest {
+                    request_id: request.request_id.clone(),
+                    allow: false,
+                });
+            }
+        }
+        None
+    }
+
+    fn site_login_delete_target(&self, target: &str) -> Option<String> {
+        let id = target.strip_prefix("settings-login-delete-")?;
+        self.site_logins
+            .iter()
+            .find(|login| login.id == id)
+            .map(|login| login.id.clone())
+    }
+
     fn user_form_field(&self, target: &str) -> Option<(String, String, UserFormFieldKind, String)> {
         for form in &self.user_forms {
             for field in &form.fields {
@@ -1467,6 +1671,14 @@ impl NativeChatHost {
             ));
         } else if let Some(cmd) = self.user_form_command(target) {
             cmd
+        } else if let Some(cmd) = self.save_login_command(target) {
+            cmd
+        } else if let Some(cmd) = self.credential_request_command(target) {
+            cmd
+        } else if target == "settings-tab-logins" {
+            Command::SetAppSettingsTab(AppSettingsTab::Logins)
+        } else if let Some(id) = self.site_login_delete_target(target) {
+            Command::DeleteSiteLogin { id }
         } else if let Some((card_key, field_id, kind, value)) = self.user_form_field(target) {
             if kind == UserFormFieldKind::Checkbox {
                 let next = if value == "true" { "false" } else { "true" };
@@ -2394,5 +2606,61 @@ mod tests {
             "after Continue the snapshot must not list idle fields"
         );
         assert!(tree.find("user-form-continue-e_form").is_none());
+    }
+
+    #[test]
+    fn save_login_and_credential_request_are_in_the_tree_without_passwords() {
+        let mut host = host();
+        host.save_logins = vec![SaveLoginSnap {
+            form_entry_id: "e_form".into(),
+            origin: "google.com".into(),
+            username: "ada@example.com".into(),
+        }];
+        host.credential_requests = vec![CredentialRequestSnap {
+            request_id: "req-9".into(),
+            origin: "google.com".into(),
+            username: Some("ada@example.com".into()),
+        }];
+        let tree = host.snapshot();
+        assert!(tree.find("save-login-e_form").is_some());
+        assert!(tree.find("save-login-save-e_form").is_some());
+        assert!(tree.find("save-login-skip-e_form").is_some());
+        assert!(tree.find("credential-request-req-9").is_some());
+        let dump = format!("{tree:?}");
+        assert!(!dump.contains("s3cret"));
+        host.dispatch(&Op::click("save-login-save-e_form")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SaveLogin { .. })
+        ));
+        host.dispatch(&Op::click("credential-request-allow-req-9"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::AnswerCredentialRequest { allow: true, .. }) => {}
+            other => panic!("expected confirm, not a Box fill: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_logins_list_username_and_origin_only() {
+        let mut host = host();
+        host.account_open = true;
+        host.logins_tab = true;
+        host.site_logins = vec![SiteLoginSnap {
+            id: "cred-1".into(),
+            origin: "google.com".into(),
+            username: "ada@example.com".into(),
+        }];
+        let tree = host.snapshot();
+        let row = tree.find("settings-login-row-cred-1").unwrap();
+        assert!(row.name.contains("ada@example.com"));
+        assert!(row.name.contains("google.com"));
+        assert!(row.value.is_none());
+        host.dispatch(&Op::click("settings-login-delete-cred-1"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::DeleteSiteLogin { id }) if id == "cred-1"
+        ));
     }
 }

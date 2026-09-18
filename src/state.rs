@@ -8,20 +8,23 @@ use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, ChatPart, ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch,
-    Failure, FormResolution, FormSpec, LocalExecMode, LocalExecResolution, ModelCatalogue,
-    OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
-    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    RunReplay, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    CredentialRequestSpec, CredentialResultStatus, Failure, FormResolution, FormSpec,
+    LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError,
+    ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult,
+    RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec,
+    ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply, UserFormDismissMode,
     UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
     env_egress_tunnel_enabled, host_egress_tunnel_enabled, local_exec_outcome, policy_answer,
-    reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
+    reads_as_gateway_unreachable, result_without_broker, serve_local_exec, stored_machine_id,
+    tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
+use crate::site_login::{PendingSave, SiteLoginRecord, SiteLoginVault, save_candidate};
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -57,7 +60,9 @@ impl Message {
                 ChatPart::Ui(_)
                 | ChatPart::Approval(_)
                 | ChatPart::Screenshot(_)
-                | ChatPart::UserForm(_) => true,
+                | ChatPart::UserForm(_)
+                | ChatPart::SaveLogin(_)
+                | ChatPart::CredentialRequest(_) => true,
             })
     }
 
@@ -70,7 +75,9 @@ impl Message {
                 ChatPart::Ui(_)
                 | ChatPart::Approval(_)
                 | ChatPart::Screenshot(_)
-                | ChatPart::UserForm(_) => false,
+                | ChatPart::UserForm(_)
+                | ChatPart::SaveLogin(_)
+                | ChatPart::CredentialRequest(_) => false,
             })
     }
 
@@ -103,9 +110,11 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
     for part in parts {
         match part {
             ChatPart::Text(text) => words.push_str(text),
-            ChatPart::Screenshot(_) | ChatPart::Approval(_) | ChatPart::UserForm(_) => {
-                break_paragraph(&mut words)
-            }
+            ChatPart::Screenshot(_)
+            | ChatPart::Approval(_)
+            | ChatPart::UserForm(_)
+            | ChatPart::SaveLogin(_)
+            | ChatPart::CredentialRequest(_) => break_paragraph(&mut words),
             ChatPart::Ui(_) => {}
         }
     }
@@ -201,6 +210,19 @@ fn overlay_server_cards(message: &mut Message, replayed: &[ChatPart]) {
                 });
                 if !already {
                     message.parts.push(ChatPart::Screenshot(incoming.clone()));
+                }
+            }
+            ChatPart::CredentialRequest(incoming) => {
+                let already = message.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        ChatPart::CredentialRequest(spec) if spec.request_id == incoming.request_id
+                    )
+                });
+                if !already {
+                    message
+                        .parts
+                        .push(ChatPart::CredentialRequest(incoming.clone()));
                 }
             }
             _ => {}
@@ -625,6 +647,8 @@ fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
             ChatPart::Approval(_) => 2,
             ChatPart::Screenshot(_) => 4,
             ChatPart::UserForm(_) => 8,
+            ChatPart::SaveLogin(_) => 16,
+            ChatPart::CredentialRequest(_) => 32,
         }
     });
     (parts.len(), flags)
@@ -1210,6 +1234,7 @@ pub enum AppSettingsTab {
     Shortcuts,
     Computer,
     Updates,
+    Logins,
 }
 
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
@@ -1417,6 +1442,12 @@ pub struct AppState {
     user_form_handoffs: HashMap<String, String>,
     /// Form card keys whose box-handoff already resolved.
     user_form_handoff_done: HashSet<String>,
+    /// Site-login metadata for Settings → Logins. Never passwords.
+    pub site_logins: Vec<SiteLoginRecord>,
+    site_login_vault: Option<SiteLoginVault>,
+    /// Password held only until Save / Not now. Never sqlite / ChatPart / tree.
+    pending_save: HashMap<String, PendingSave>,
+    pub site_login_error: Option<String>,
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
@@ -1765,6 +1796,10 @@ impl AppState {
             user_form_restore: HashMap::new(),
             user_form_handoffs: HashMap::new(),
             user_form_handoff_done: HashSet::new(),
+            site_logins: Vec::new(),
+            site_login_vault: None,
+            pending_save: HashMap::new(),
+            site_login_error: None,
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
@@ -1817,6 +1852,7 @@ impl AppState {
             }
         }
         self.config = Some(config);
+        self.ensure_site_login_vault(cx);
         cx.notify();
     }
 
@@ -3962,6 +3998,7 @@ impl AppState {
 
     pub fn set_database_service(&mut self, service: DatabaseService, cx: &mut Context<Self>) {
         self.database_service = Some(service.clone());
+        self.ensure_site_login_vault(cx);
         cx.notify();
 
         // Load sessions when DB service is set
@@ -6140,6 +6177,13 @@ impl AppState {
                 }
             }
         }
+        parts.retain(|part| match part {
+            ChatPart::SaveLogin(spec) => {
+                self.pending_save.contains_key(&spec.form_entry_id)
+                    && !self.already_saved_login(&spec.origin, &spec.username)
+            }
+            _ => true,
+        });
         parts
     }
 
@@ -6337,6 +6381,269 @@ impl AppState {
         self.dispatch_user_form(card_key, UserFormDispatch::ResolveHandoff(resolution), cx);
     }
 
+    fn ensure_site_login_vault(&mut self, cx: &mut Context<Self>) {
+        if self.site_login_vault.is_some() {
+            return;
+        }
+        let Some(db) = self.database_service.as_ref() else {
+            return;
+        };
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        self.site_login_vault = Some(SiteLoginVault::open(db.pool(), &config.data_dir));
+        self.reload_site_logins(cx);
+    }
+
+    fn reload_site_logins(&mut self, cx: &mut Context<Self>) {
+        let Some(vault) = self.site_login_vault.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let list = vault.list().await;
+            let _ = this.update(cx, |state, cx| {
+                match list {
+                    Ok(rows) => {
+                        state.site_logins = rows;
+                        state.site_login_error = None;
+                    }
+                    Err(err) => state.site_login_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn already_saved_login(&self, origin: &str, username: &str) -> bool {
+        self.site_logins
+            .iter()
+            .any(|row| row.origin == origin && row.username == username)
+    }
+
+    fn stash_save_candidate(&mut self, card_key: &str, values: &UserFormValues) {
+        let pending = {
+            let Some(spec) = self.user_form_mut(card_key) else {
+                return;
+            };
+            save_candidate(spec, values)
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        self.pending_save
+            .insert(pending.form_entry_id.clone(), pending);
+    }
+
+    fn offer_save_login(&mut self, card_key: &str) {
+        let entry_id = self
+            .user_form_mut(card_key)
+            .map(|spec| {
+                if spec.has_gateway_entry_id() {
+                    spec.entry_id.clone()
+                } else {
+                    spec.card_key().to_string()
+                }
+            })
+            .unwrap_or_else(|| card_key.to_string());
+        let Some(pending) = self.pending_save.get(&entry_id) else {
+            return;
+        };
+        if self.already_saved_login(&pending.origin, &pending.username) {
+            self.pending_save.remove(&entry_id);
+            return;
+        }
+        let spec = SaveLoginSpec {
+            form_entry_id: pending.form_entry_id.clone(),
+            origin: pending.origin.clone(),
+            username: pending.username.clone(),
+        };
+        self.push_save_login_part(spec);
+    }
+
+    fn push_save_login_part(&mut self, spec: SaveLoginSpec) {
+        let entry = spec.form_entry_id.clone();
+        for conversation in &mut self.conversations {
+            for message in conversation.messages.iter_mut().rev() {
+                let has_form = message.parts.iter().any(|part| match part {
+                    ChatPart::UserForm(form) => form.card_key() == entry || form.entry_id == entry,
+                    _ => false,
+                });
+                if !has_form {
+                    continue;
+                }
+                if let Some(existing) = message.parts.iter_mut().find_map(|part| match part {
+                    ChatPart::SaveLogin(existing)
+                        if existing.form_entry_id == spec.form_entry_id =>
+                    {
+                        Some(existing)
+                    }
+                    _ => None,
+                }) {
+                    *existing = spec;
+                    return;
+                }
+                message.parts.push(ChatPart::SaveLogin(spec));
+                return;
+            }
+        }
+    }
+
+    fn remove_save_login_part(&mut self, form_entry_id: &str) {
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::SaveLogin(spec) => spec.form_entry_id != form_entry_id,
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn remove_credential_request_part(&mut self, request_id: &str) {
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::CredentialRequest(spec) => spec.request_id != request_id,
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn credential_request_spec(&self, request_id: &str) -> Option<CredentialRequestSpec> {
+        for conversation in &self.conversations {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    if let ChatPart::CredentialRequest(spec) = part
+                        && spec.request_id == request_id
+                    {
+                        return Some(spec.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Save the offered login: Keychain + sqlite metadata. Never a ChatPart password.
+    pub fn save_offered_login(&mut self, form_entry_id: String, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_save.remove(&form_entry_id) else {
+            return;
+        };
+        self.remove_save_login_part(&form_entry_id);
+        let Some(vault) = self.site_login_vault.clone() else {
+            self.site_login_error = Some("Login vault is not ready.".into());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = vault
+                .save(&pending.origin, &pending.username, &pending.password)
+                .await;
+            drop(pending);
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(_) => {
+                        state.site_login_error = None;
+                        state.reload_site_logins(cx);
+                    }
+                    Err(err) => state.site_login_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn skip_save_login(&mut self, form_entry_id: String, cx: &mut Context<Self>) {
+        self.pending_save.remove(&form_entry_id);
+        self.remove_save_login_part(&form_entry_id);
+        cx.notify();
+    }
+
+    pub fn delete_site_login(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(vault) = self.site_login_vault.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = vault.delete(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(()) => {
+                        state.site_logins.retain(|row| row.id != id);
+                        state.site_login_error = None;
+                        state.reload_site_logins(cx);
+                    }
+                    Err(err) => state.site_login_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Confirm or deny `credential.request`. A.0 never types into Box and never
+    /// posts `filled` — that status is the session broker (A.1).
+    pub fn answer_credential_request(
+        &mut self,
+        request_id: String,
+        allow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(spec) = self.credential_request_spec(&request_id) else {
+            return;
+        };
+        let vault = self.site_login_vault.clone();
+        let agent_id = self.active_coworker_id.clone().unwrap_or_default();
+        let client = self.opengrok.clone();
+        self.remove_credential_request_part(&request_id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (status, credential_id) = match vault {
+                None => (CredentialResultStatus::Error, None),
+                Some(vault) => {
+                    let row = vault
+                        .find(&spec.origin, spec.username.as_deref())
+                        .await
+                        .ok()
+                        .flatten();
+                    let have_meta = row.is_some();
+                    let have_secret = row
+                        .as_ref()
+                        .is_some_and(|row| vault.secret_present(&row.id));
+                    let status = result_without_broker(allow, have_meta, have_secret);
+                    debug_assert_ne!(
+                        status,
+                        CredentialResultStatus::Filled,
+                        "A.0 must not claim filled without the session broker"
+                    );
+                    (status, row.map(|row| row.id))
+                }
+            };
+            if let Some(client) = client {
+                let _ = client
+                    .post_credential_result(
+                        status,
+                        &request_id,
+                        credential_id.as_deref(),
+                        &agent_id,
+                    )
+                    .await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if !spec.run_id.is_empty() {
+                    let conversation_id = state.active_conversation_id.clone();
+                    state.begin_responding(conversation_id.as_deref(), "Working");
+                    state.follow_run(spec.run_id.clone(), conversation_id, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn dispatch_user_form(
         &mut self,
         card_key: String,
@@ -6376,7 +6683,8 @@ impl AppState {
             _ => None,
         };
         match &action {
-            UserFormDispatch::Submit(_) => {
+            UserFormDispatch::Submit(values) => {
+                self.stash_save_candidate(&card_key, values);
                 self.paint_user_form_resolution(&card_key, FormResolution::Sending);
             }
             UserFormDispatch::Dismiss(mode) => {
@@ -6476,6 +6784,9 @@ impl AppState {
                                     state.user_form_picks.remove(&card_key);
                                     state.user_form_typed.remove(&card_key);
                                 }
+                                if resolution == Some(FormResolution::Submitted) {
+                                    state.offer_save_login(&card_key);
+                                }
                                 let follow = match resolution {
                                     Some(FormResolution::Escalated) => {
                                         state.end_turn_waiting(
@@ -6500,6 +6811,9 @@ impl AppState {
                                 if resolution != FormResolution::FillFailed {
                                     state.user_form_picks.remove(&card_key);
                                     state.user_form_typed.remove(&card_key);
+                                }
+                                if resolution == FormResolution::Submitted {
+                                    state.offer_save_login(&card_key);
                                 }
                                 if resolution == FormResolution::Submitted && !run_id.is_empty() {
                                     state.begin_responding(Some(&conversation_id), "Working");
@@ -6733,6 +7047,7 @@ impl AppState {
                             || (spec.effective_resolution() == Some(FormResolution::Escalated)
                                 && !self.user_form_handoff_done.contains(spec.card_key()))
                     }
+                    ChatPart::CredentialRequest(_) => true,
                     _ => false,
                 })
         })
@@ -7865,6 +8180,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn saved_parts_drop_save_login_and_credential_request() {
+        let live = vec![
+            ChatPart::SaveLogin(crate::opengrok::SaveLoginSpec {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+            }),
+            ChatPart::CredentialRequest(crate::opengrok::CredentialRequestSpec {
+                request_id: "req-9".into(),
+                origin: "google.com".into(),
+                username: Some("ada@example.com".into()),
+                run_id: "run-1".into(),
+            }),
+        ];
+        assert!(saved_parts(&live).is_empty());
+    }
+
     /// The app's own schema on a database that lives for the length of the test. One connection:
     /// a second connection to `:memory:` would open a second, empty database.
     async fn test_db() -> DatabaseService {
@@ -7920,6 +8253,12 @@ mod tests {
                         .map(|r| r.as_str())
                         .unwrap_or("idle")
                 ),
+                ChatPart::SaveLogin(spec) => {
+                    format!("save-login {} {}", spec.origin, spec.username)
+                }
+                ChatPart::CredentialRequest(spec) => {
+                    format!("credential-request {} {}", spec.origin, spec.request_id)
+                }
             })
             .collect()
     }

@@ -11,13 +11,14 @@ use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_spec};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
+use crate::components::save_login::{render_credential_request, render_save_login};
 use crate::components::user_form::{
     UserFormInputMap, UserFormTextareaMap, field_key, render_user_form,
 };
 use crate::find_text::{FindHit, marks_for_row, project_hits};
 use crate::opengrok::{
-    ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, UserFormSpec, UserFormValues,
-    collapse_open_approvals,
+    ApprovalSpec, ChatPart, CredentialRequestSpec, SaveLoginSpec, ScreenshotSpec, UiSpec,
+    UserFormSpec, UserFormValues, collapse_open_approvals,
 };
 use crate::state::{
     AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, bot_status_line, is_status_line, is_tool_standin,
@@ -46,6 +47,8 @@ struct ChatFeedRev {
     user_forms: Vec<(String, String)>,
     user_form_verbs: bool,
     user_form_handoffs: Vec<(String, String, bool)>,
+    save_logins: Vec<(String, String)>,
+    credential_requests: Vec<(String, String)>,
     is_ai_responding: bool,
     debug_mode: bool,
     can_read_aloud: bool,
@@ -159,6 +162,42 @@ impl ChatFeedRev {
                 rows.sort();
                 rows
             },
+            save_logins: {
+                let mut cards: Vec<(String, String)> = conv
+                    .map(|c| {
+                        c.messages
+                            .iter()
+                            .flat_map(|m| m.parts.iter())
+                            .filter_map(|part| match part {
+                                ChatPart::SaveLogin(spec) => {
+                                    Some((spec.form_entry_id.clone(), spec.username.clone()))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                cards.sort();
+                cards
+            },
+            credential_requests: {
+                let mut cards: Vec<(String, String)> = conv
+                    .map(|c| {
+                        c.messages
+                            .iter()
+                            .flat_map(|m| m.parts.iter())
+                            .filter_map(|part| match part {
+                                ChatPart::CredentialRequest(spec) => {
+                                    Some((spec.request_id.clone(), spec.origin.clone()))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                cards.sort();
+                cards
+            },
             is_ai_responding: state.is_active_bot_responding(),
             debug_mode: state.debug_markdown_disabled,
             can_read_aloud: true,
@@ -241,6 +280,8 @@ struct ChatRow {
     /// lightbox pages through as one set.
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
+    save_login: Option<SaveLoginSpec>,
+    credential_request: Option<CredentialRequestSpec>,
 }
 
 impl ChatRow {
@@ -274,6 +315,8 @@ impl ChatRow {
             status_retry: false,
             screenshots: Vec::new(),
             user_form: None,
+            save_login: None,
+            credential_request: None,
         }
     }
 }
@@ -416,6 +459,25 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     rows.push(ChatRow {
                         user_form: Some(spec),
                         ..ChatRow::slot(format!("{}-user-form-{ui_n}", msg.id), msg.id.clone())
+                    });
+                    ui_n += 1;
+                }
+                ChatPart::SaveLogin(spec) => {
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    rows.push(ChatRow {
+                        save_login: Some(spec),
+                        ..ChatRow::slot(format!("{}-save-login-{ui_n}", msg.id), msg.id.clone())
+                    });
+                    ui_n += 1;
+                }
+                ChatPart::CredentialRequest(spec) => {
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    rows.push(ChatRow {
+                        credential_request: Some(spec),
+                        ..ChatRow::slot(
+                            format!("{}-credential-request-{ui_n}", msg.id),
+                            msg.id.clone(),
+                        )
                     });
                     ui_n += 1;
                 }
@@ -1073,6 +1135,32 @@ impl Render for ChatTranscript {
                                         Some(app_state.clone()),
                                         cx,
                                     )))
+                                    .into_any_element();
+                            }
+                            if let Some(spec) = &row.save_login {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(div().w_full().max_w(px(560.)).child(render_save_login(
+                                        spec,
+                                        app_state.clone(),
+                                        cx,
+                                    )))
+                                    .into_any_element();
+                            }
+                            if let Some(spec) = &row.credential_request {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(div().w_full().max_w(px(560.)).child(
+                                        render_credential_request(spec, app_state.clone(), cx),
+                                    ))
                                     .into_any_element();
                             }
                             let highlight_color = if row.highlight_range.is_some() {
