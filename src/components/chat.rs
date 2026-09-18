@@ -1665,6 +1665,7 @@ impl Render for ChatView {
                                 let name =
                                     self.coworker_name.clone().unwrap_or_else(|| "Agent".into());
                                 let id = self.coworker_id.clone().unwrap_or_default();
+                                let tooltip_label = label.clone();
                                 this.child(
                                     h_flex()
                                         .id("bot-working")
@@ -1672,7 +1673,7 @@ impl Render for ChatView {
                                         .items_center()
                                         .px_1()
                                         .tooltip(move |w, cx| {
-                                            Tooltip::new(label.clone()).build(w, cx)
+                                            Tooltip::new(tooltip_label.clone()).build(w, cx)
                                         })
                                         .child(
                                             PersonaMark::new(id)
