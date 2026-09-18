@@ -282,16 +282,13 @@ impl ComputerPane {
 
     /// The pane's header row. In the title bar over the pane while the pane is docked (then
     /// its title and empty run drag the window), in the pane itself while it floats.
-    /// Overview: Update and Reset, then the close chevron; Routine: back, which keeps the
-    /// fields, and the title, then the close chevron.
+    /// Overview: close chevron (Update / Reset sit next to the screen). Routine: back, title,
+    /// close.
     pub fn header(&self, cx: &App, drag: bool) -> AnyElement {
         let app = self.state.clone();
         let state = self.state.read(cx);
         match state.computer_view.clone() {
-            ComputerView::Overview => {
-                let controls = ComputerControls::from_state(state);
-                pane_header(None, "", Some(&controls), app, drag).into_any_element()
-            }
+            ComputerView::Overview => pane_header(None, "", None, app, drag).into_any_element(),
             ComputerView::Editor { id } => {
                 let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
                 let persist = self.persist_routine(app.clone(), coworker_id, id);
@@ -342,6 +339,7 @@ impl ComputerPane {
                         cx,
                     ))
                 })
+                .child(box_chrome(controls, app.clone()))
                 .child(screen_tile(
                     has_screen,
                     screen,
@@ -357,6 +355,9 @@ impl ComputerPane {
                         .text_color(muted)
                         .child(format!("{agent_name}'s screen")),
                 )
+                .when(app.read(cx).show_egress_tunnel_settings(), |this| {
+                    this.child(route_traffic_row(app.clone(), muted, cx))
+                })
                 .when(box_id.is_none(), |this| {
                     this.child(
                         div()
@@ -783,8 +784,7 @@ impl ComputerControls {
             current: state
                 .coworker_computer
                 .as_ref()
-                .and_then(|s| s.image.as_ref())
-                .is_some_and(|image| !image.stale),
+                .is_some_and(|s| s.image.as_ref().is_some() && !s.image_stale()),
             error: state.computer_action_error.clone().or_else(|| {
                 state
                     .coworker_computer
@@ -1089,6 +1089,111 @@ fn screen_tile(
         })
 }
 
+/// Update / Reset next to this bot's screen. Title-bar icons used to live
+/// only in the header (easy to miss, and Settings → Computer never showed
+/// them). `computer-update` / `computer-reset` stay the remasure ids.
+fn box_chrome(controls: &ComputerControls, app: Entity<AppState>) -> impl IntoElement {
+    let can_update = !controls.update_disabled();
+    let can_reset = controls.present && !controls.updating;
+    let stale = controls.stale;
+    let update_app = app.clone();
+    let reset_app = app.clone();
+    h_flex()
+        .id("computer-box-chrome")
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap(px(8.))
+        .child(div().text_xs().child(if stale {
+            "Update available"
+        } else if controls.current {
+            "Up to date"
+        } else if controls.present {
+            "Computer"
+        } else {
+            "No computer yet"
+        }))
+        .child(
+            h_flex()
+                .gap(px(4.))
+                .child(
+                    icon_btn_enabled(
+                        "computer-update",
+                        "icons/download.svg",
+                        can_update,
+                        move |cx| {
+                            update_app.update(cx, |state, cx| {
+                                state
+                                    .open_computer_confirm(crate::state::ComputerAction::Update, cx)
+                            });
+                        },
+                    )
+                    .when(stale, |this| this.text_color(gpui::blue())),
+                )
+                .child(icon_btn_enabled(
+                    "computer-reset",
+                    "icons/reset.svg",
+                    can_reset,
+                    move |cx| {
+                        reset_app.update(cx, |state, cx| {
+                            state.open_computer_confirm(crate::state::ComputerAction::Reset, cx)
+                        });
+                    },
+                )),
+        )
+}
+
+fn route_traffic_row(app: Entity<AppState>, muted: Hsla, cx: &App) -> impl IntoElement {
+    let state = app.read(cx);
+    let available = state.egress_tunnel_available();
+    let enabled = state.egress_tunnel_enabled;
+    let description = if enabled {
+        "New connections from this Bot's computer go out through this desktop."
+    } else if available {
+        "Route web traffic from this Bot's computer out through this desktop instead of the cloud. Applies to new connections."
+    } else {
+        "This Bot's computer wasn't provisioned with the egress tunnel — start a new one to use this."
+    };
+    let can_toggle = available || enabled;
+    v_flex()
+        .id("route-traffic-this-computer")
+        .w_full()
+        .px(px(10.))
+        .py(px(10.))
+        .gap(px(6.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0x777777).opacity(0.24))
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(div().text_sm().child("Route traffic through this computer"))
+                        .child(div().text_xs().text_color(muted).child(description)),
+                )
+                .child(
+                    Switch::new("egress-tunnel-enabled")
+                        .checked(enabled)
+                        .disabled(!can_toggle)
+                        .on_click({
+                            let app = app.clone();
+                            move |checked, _, cx| {
+                                app.update(cx, |state, cx| {
+                                    state.set_egress_tunnel_enabled(*checked, cx);
+                                });
+                            }
+                        }),
+                ),
+        )
+}
+
 fn pane_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: &'static str,
@@ -1096,8 +1201,9 @@ fn pane_header(
     app: Entity<AppState>,
     drag: bool,
 ) -> impl IntoElement {
-    // Update and Reset live up here as icons, apart from the close chevron, each behind a
-    // confirm dialog — the pane's body is for the screen, not for buttons.
+    // Close chevron (and Routine back). Update / Reset sit next to the screen
+    // in `box_chrome` so they are visible on the right sidebar, not only in
+    // an empty title-bar strip.
     let actions_app = app.clone();
     let actions = actions.map(|controls| {
         (

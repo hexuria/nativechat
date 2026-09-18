@@ -105,6 +105,7 @@ pub enum Command {
     OpenComputerConfirm(crate::state::ComputerAction),
     ConfirmComputerAction,
     CancelComputerConfirm,
+    SetEgressTunnelEnabled(bool),
     /// The Recipes page: open it, filter it, open one recipe, answer a share, go back.
     OpenRecipes,
     SetRecipesFilter(crate::state::RecipeFilter),
@@ -173,6 +174,7 @@ pub enum Command {
         allow: bool,
     },
     SetAppSettingsTab(crate::state::AppSettingsTab),
+    CloseAppSettings,
     Shutdown,
 }
 
@@ -212,6 +214,7 @@ impl Command {
             Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
             Self::ConfirmComputerAction => state.confirm_computer_action(cx),
             Self::CancelComputerConfirm => state.close_computer_confirm(cx),
+            Self::SetEgressTunnelEnabled(enabled) => state.set_egress_tunnel_enabled(enabled, cx),
             Self::OpenRecipes => state.open_recipes(cx),
             Self::SetRecipesFilter(filter) => state.set_recipes_filter(filter, cx),
             Self::OpenRecipe(id) => state.open_recipe(id, cx),
@@ -264,6 +267,11 @@ impl Command {
                 state.answer_credential_request(request_id, allow, cx)
             }
             Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
+            Self::CloseAppSettings => {
+                if state.is_app_settings_open {
+                    state.toggle_app_settings(cx);
+                }
+            }
             Self::Shutdown => {}
         }
     }
@@ -809,8 +817,9 @@ pub struct NativeChatHost {
     credential_requests: Vec<CredentialRequestSnap>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
-    /// Settings → Computers: Route traffic row, when host/env/box says to show it.
+    /// Computer pane: Route traffic row, when host/env/box says to show it.
     route_traffic_visible: bool,
+    egress_tunnel_enabled: bool,
     /// Box `egress_tunnel.ready` when the computer JSON exposed it.
     egress_tunnel_ready: Option<bool>,
     pending: Option<Command>,
@@ -1108,6 +1117,7 @@ impl NativeChatHost {
                 .collect(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
             route_traffic_visible: state.show_egress_tunnel_settings(),
+            egress_tunnel_enabled: state.egress_tunnel_enabled,
             egress_tunnel_ready: state
                 .coworker_computer
                 .as_ref()
@@ -1286,6 +1296,13 @@ impl NativeChatHost {
                 "computer-reset",
                 self.computer_reset_label.clone(),
             ));
+        if self.computer_open && self.route_traffic_visible {
+            computer = computer.with_child(UiNode::new(
+                "route-traffic-this-computer",
+                "switch",
+                "Route traffic through this computer",
+            ));
+        }
         if let Some(handoff) = self
             .computer_handoffs
             .iter()
@@ -1381,14 +1398,9 @@ impl NativeChatHost {
                     .with_child({
                         let mut settings = UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
                             .with_visible(self.account_open)
+                            .with_child(UiNode::button("app-settings-back", "← Back to app"))
+                            .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"));
-                        if self.route_traffic_visible {
-                            settings = settings.with_child(UiNode::new(
-                                "route-traffic-this-computer",
-                                "switch",
-                                "Route traffic through this computer",
-                            ));
-                        }
                         if self.logins_tab {
                             if self.site_logins.is_empty() {
                                 settings = settings.with_child(UiNode::status(
@@ -1836,6 +1848,16 @@ impl NativeChatHost {
             cmd
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
+        } else if target == "settings-tab-computer" {
+            Command::SetAppSettingsTab(AppSettingsTab::Computer)
+        } else if target == "app-settings-back" {
+            Command::CloseAppSettings
+        } else if target == "computer-update" || target == "settings-computer-update" {
+            Command::OpenComputerConfirm(crate::state::ComputerAction::Update)
+        } else if target == "computer-reset" || target == "settings-computer-reset" {
+            Command::OpenComputerConfirm(crate::state::ComputerAction::Reset)
+        } else if target == "route-traffic-this-computer" || target == "egress-tunnel-enabled" {
+            Command::SetEgressTunnelEnabled(!self.egress_tunnel_enabled)
         } else if let Some(id) = self.site_login_delete_target(target) {
             Command::DeleteSiteLogin { id }
         } else if let Some((card_key, field_id, kind, value)) = self.user_form_field(target) {
@@ -2992,20 +3014,27 @@ mod tests {
     }
 
     #[test]
-    fn settings_shows_route_traffic_row_when_visible() {
+    fn settings_shows_route_traffic_on_computer_pane() {
         let mut host = host();
         host.account_open = true;
-        host.route_traffic_visible = false;
+        host.route_traffic_visible = true;
         assert!(
             host.snapshot()
                 .find("route-traffic-this-computer")
-                .is_none()
+                .is_none(),
+            "Settings must not host the Mac-row Route traffic switch"
         );
-        host.route_traffic_visible = true;
+        host.computer_open = true;
         assert!(
             host.snapshot()
                 .find("route-traffic-this-computer")
                 .is_some()
         );
+        host.dispatch(&Op::click("route-traffic-this-computer"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetEgressTunnelEnabled(true))
+        ));
     }
 }

@@ -1460,15 +1460,77 @@ pub struct CoworkerComputer {
     #[serde(rename = "isEgressTunnelAvailable", default)]
     pub is_egress_tunnel_available: bool,
     /// Box-owned tunnel endpoint, when the computer JSON exposes it.
-    #[serde(rename = "egress_tunnel", alias = "egressTunnel", default)]
+    #[serde(
+        rename = "egress_tunnel",
+        alias = "egressTunnel",
+        alias = "boxEgressTunnel",
+        default,
+        deserialize_with = "deserialize_optional_egress_tunnel"
+    )]
     pub egress_tunnel: Option<EgressTunnel>,
 }
 
-/// `{ ready: bool }` on coworker computer JSON when the box owns the tunnel.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Box tunnel. OpenGrok may send `{ready}`, a `ws://` URL, or `{url, enabled}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressTunnel {
-    #[serde(default)]
     pub ready: bool,
+    pub url: Option<String>,
+}
+
+fn deserialize_optional_egress_tunnel<'de, D>(
+    deserializer: D,
+) -> Result<Option<EgressTunnel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(egress_tunnel_from_json(
+        Option::<Value>::deserialize(deserializer)?.unwrap_or(Value::Null),
+    ))
+}
+
+fn json_nonempty(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn egress_tunnel_from_json(value: Value) -> Option<EgressTunnel> {
+    match value {
+        Value::Null => None,
+        Value::Bool(ready) => Some(EgressTunnel { ready, url: None }),
+        Value::String(url) => {
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                Some(EgressTunnel {
+                    ready: false,
+                    url: None,
+                })
+            } else {
+                Some(EgressTunnel {
+                    ready: true,
+                    url: Some(url),
+                })
+            }
+        }
+        Value::Object(_) => {
+            let url = json_nonempty(&value, &["url", "wsUrl", "ws_url", "endpoint", "uri"]);
+            let ready_flag = value.get("ready").and_then(Value::as_bool);
+            let enabled = value
+                .get("enabled")
+                .or_else(|| value.get("available"))
+                .and_then(Value::as_bool);
+            let ready = ready_flag.unwrap_or(false)
+                || enabled.unwrap_or(false)
+                || url.as_ref().is_some_and(|u| !u.is_empty());
+            Some(EgressTunnel { ready, url })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1521,11 +1583,16 @@ impl CoworkerComputer {
     }
 
     pub fn image_stale(&self) -> bool {
-        self.image.as_ref().is_some_and(|image| image.stale)
+        self.image.as_ref().is_some_and(|image| {
+            image.stale
+                || (!image.running.is_empty()
+                    && !image.latest.is_empty()
+                    && image.running != image.latest)
+        })
     }
 
-    /// Host flag or nested `egress_tunnel.ready`. Either is enough to gate
-    /// Route traffic / Review an action. No tunnel is invented here.
+    /// Host flag or nested `egress_tunnel.ready` / tunnel URL. Either is
+    /// enough to gate Route traffic / Review an action. No tunnel is invented.
     pub fn egress_tunnel_ready(&self) -> bool {
         self.is_egress_tunnel_available || self.egress_tunnel.as_ref().is_some_and(|t| t.ready)
     }
@@ -3468,6 +3535,30 @@ mod tests {
         .unwrap();
         assert_eq!(nested_off.box_egress_ready(), Some(false));
         assert!(!nested_off.egress_tunnel_ready());
+        let url_obj: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egress_tunnel": { "url": "ws://127.0.0.1:8790" }
+        }))
+        .unwrap();
+        assert!(
+            url_obj.egress_tunnel_ready(),
+            "a box tunnel URL is ready even without ready:true"
+        );
+        let url_str: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egressTunnel": "ws://127.0.0.1:8790"
+        }))
+        .unwrap();
+        assert!(url_str.egress_tunnel_ready());
+        let stale_by_digest: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "image": { "running": "old", "latest": "new" }
+        }))
+        .unwrap();
+        assert!(stale_by_digest.image_stale());
         assert!(host_egress_tunnel_enabled(
             &json!({ "egressTunnelEnabled": true })
         ));
