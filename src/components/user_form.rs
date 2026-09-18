@@ -369,7 +369,7 @@ fn render_live_computer_handoff(
                     "I'm done",
                     ButtonKind::Secondary,
                     !can_resolve,
-                    !server_fill,
+                    false,
                     {
                         let app = app.clone();
                         let key = key.clone();
@@ -391,7 +391,7 @@ fn render_live_computer_handoff(
                     "Skip",
                     ButtonKind::Ghost,
                     !can_resolve,
-                    !server_fill,
+                    false,
                     {
                         let app = app.clone();
                         can_resolve.then_some(move |cx: &mut App| {
