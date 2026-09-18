@@ -740,7 +740,7 @@ pub struct NativeChatHost {
     credential_requests: Vec<CredentialRequestSnap>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
-    /// Settings → Computers: Route traffic row, when host/env/box says the tunnel exists.
+    /// Settings → Computers: Route traffic row, when host/env/box says to show it.
     route_traffic_visible: bool,
     /// Box `egress_tunnel.ready` when the computer JSON exposed it.
     egress_tunnel_ready: Option<bool>,
@@ -2662,5 +2662,23 @@ mod tests {
             host.take_command(),
             Some(Command::DeleteSiteLogin { id }) if id == "cred-1"
         ));
+    }
+
+    #[test]
+    fn settings_shows_route_traffic_row_when_visible() {
+        let mut host = host();
+        host.account_open = true;
+        host.route_traffic_visible = false;
+        assert!(
+            host.snapshot()
+                .find("route-traffic-this-computer")
+                .is_none()
+        );
+        host.route_traffic_visible = true;
+        assert!(
+            host.snapshot()
+                .find("route-traffic-this-computer")
+                .is_some()
+        );
     }
 }

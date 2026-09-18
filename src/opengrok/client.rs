@@ -897,7 +897,7 @@ impl OpenGrokClient {
                 online: machine.connected,
             });
         }
-        Ok(computers)
+        Ok(collapse_computers_by_machine_id(computers))
     }
 
     pub async fn list_daemons(&self) -> Result<Vec<DaemonMachine>, OpenGrokError> {
@@ -1564,6 +1564,64 @@ pub struct ConnectedComputer {
     pub mode: LocalExecMode,
     pub this_machine: bool,
     pub online: bool,
+}
+
+impl ConnectedComputer {
+    fn preferred_over(&self, other: &Self) -> bool {
+        match (self.this_machine, other.this_machine) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => self.online && !other.online,
+        }
+    }
+}
+
+fn computer_label_key(computer: &ConnectedComputer) -> Option<String> {
+    let label = computer.label.trim().to_ascii_lowercase();
+    if label.is_empty() || label == "computer" {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+fn fold_computers(
+    computers: Vec<ConnectedComputer>,
+    key: impl Fn(&ConnectedComputer) -> Option<String>,
+) -> Vec<ConnectedComputer> {
+    let mut out = Vec::new();
+    for computer in computers {
+        let Some(k) = key(&computer) else {
+            out.push(computer);
+            continue;
+        };
+        match out
+            .iter()
+            .position(|existing| key(existing).as_deref() == Some(k.as_str()))
+        {
+            Some(i) if computer.preferred_over(&out[i]) => out[i] = computer,
+            Some(_) => {}
+            None => out.push(computer),
+        }
+    }
+    out
+}
+
+/// Same `machineId` listed twice (daemon roster glitch) becomes one row.
+pub fn collapse_computers_by_machine_id(
+    computers: Vec<ConnectedComputer>,
+) -> Vec<ConnectedComputer> {
+    fold_computers(computers, |computer| Some(computer.machine_id.clone()))
+}
+
+/// Settings Computers tab: one row per machine, and a stale enrol with the
+/// same label as this Mac (Online/Never + Offline/Always) collapses to the
+/// live one. Prefer `this_machine`, then online.
+pub fn collapse_computer_roster(computers: Vec<ConnectedComputer>) -> Vec<ConnectedComputer> {
+    fold_computers(
+        collapse_computers_by_machine_id(computers),
+        computer_label_key,
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3564,6 +3622,92 @@ mod tests {
         assert_eq!(computers[0].machine_id, "mac_live");
         assert_eq!(computers[0].mode, LocalExecMode::Always);
         assert!(computers[0].online);
+    }
+
+    fn computer(
+        machine_id: &str,
+        label: &str,
+        this_machine: bool,
+        online: bool,
+        mode: LocalExecMode,
+    ) -> ConnectedComputer {
+        ConnectedComputer {
+            machine_id: machine_id.into(),
+            label: label.into(),
+            mode,
+            this_machine,
+            online,
+        }
+    }
+
+    #[test]
+    fn collapse_roster_keeps_one_row_for_duplicate_machine_id() {
+        let collapsed = collapse_computer_roster(vec![
+            computer(
+                "mac_1",
+                "NativeChat on this Mac",
+                false,
+                false,
+                LocalExecMode::Always,
+            ),
+            computer(
+                "mac_1",
+                "NativeChat on this Mac",
+                true,
+                true,
+                LocalExecMode::Never,
+            ),
+        ]);
+        assert_eq!(collapsed.len(), 1);
+        assert!(collapsed[0].this_machine);
+        assert!(collapsed[0].online);
+        assert_eq!(collapsed[0].mode, LocalExecMode::Never);
+    }
+
+    #[test]
+    fn collapse_roster_drops_stale_enrol_with_the_same_label() {
+        let label = "NativeChat on uriahs-MacBook-Pro.local";
+        let collapsed = collapse_computer_roster(vec![
+            computer("mac_stale", label, false, false, LocalExecMode::Always),
+            computer("mac_live", label, true, true, LocalExecMode::Never),
+        ]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].machine_id, "mac_live");
+        assert!(collapsed[0].this_machine);
+        assert_eq!(collapsed[0].mode, LocalExecMode::Never);
+    }
+
+    #[test]
+    fn collapse_roster_prefers_online_when_neither_is_this_machine() {
+        let label = "NativeChat on uriahs-MacBook-Pro.local";
+        let collapsed = collapse_computer_roster(vec![
+            computer("mac_off", label, false, false, LocalExecMode::Always),
+            computer("mac_on", label, false, true, LocalExecMode::Never),
+        ]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].machine_id, "mac_on");
+        assert!(collapsed[0].online);
+    }
+
+    #[test]
+    fn collapse_roster_keeps_distinct_labels() {
+        let collapsed = collapse_computer_roster(vec![
+            computer(
+                "mac_a",
+                "NativeChat on office.local",
+                false,
+                true,
+                LocalExecMode::Ask,
+            ),
+            computer(
+                "mac_b",
+                "NativeChat on home.local",
+                false,
+                true,
+                LocalExecMode::Ask,
+            ),
+        ]);
+        assert_eq!(collapsed.len(), 2);
     }
 
     #[test]

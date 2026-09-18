@@ -15,8 +15,8 @@ use crate::opengrok::{
     SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
     TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormActionReply,
     UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
-    activity_from_replay, command_from_args, command_from_replay_events, deeds_from_replay,
-    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_enabled,
+    activity_from_replay, collapse_computer_roster, command_from_args, command_from_replay_events,
+    deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_enabled,
     keep_local_save_offer, local_exec_outcome, policy_answer, reads_as_gateway_unreachable,
     result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
     tool_standin,
@@ -2140,20 +2140,33 @@ impl AppState {
         self.submit_user_form(card_key, values, cx);
     }
 
-    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** box
-    /// `egress_tunnel.ready`. No tunnel is invented.
-    pub fn egress_tunnel_available(&self) -> bool {
-        let host = self.host_egress_tunnel_available || env_egress_tunnel_enabled();
-        let box_ready = self
-            .coworker_computer
-            .as_ref()
-            .is_some_and(|computer| computer.egress_tunnel_ready());
-        host && box_ready
+    /// Host env (`OG_*` / `SAND_*_EGRESS_TUNNEL_ENABLED=1`) or gateway
+    /// `isEgressTunnelAvailable`. Independent of box `egress_tunnel.ready`.
+    pub fn host_intends_egress_tunnel(&self) -> bool {
+        self.host_egress_tunnel_available || env_egress_tunnel_enabled()
     }
 
-    /// Grok shows the row when the tunnel is provisioned or already on.
+    fn box_egress_tunnel_ready(&self) -> bool {
+        self.coworker_computer
+            .as_ref()
+            .is_some_and(|computer| computer.egress_tunnel_ready())
+    }
+
+    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** box
+    /// `egress_tunnel.ready`. No tunnel is invented. The Settings row can
+    /// still *show* when only one side is known; this AND-gate is what may
+    /// actually turn the tunnel on.
+    pub fn egress_tunnel_available(&self) -> bool {
+        self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
+    }
+
+    /// Grok shows the Network row when the host intends a tunnel, the box
+    /// already exposed one, or the toggle is already on. Box status lag or a
+    /// 401 on the host poll must not hide the row.
     pub fn show_egress_tunnel_settings(&self) -> bool {
-        self.egress_tunnel_available() || self.egress_tunnel_enabled
+        self.host_intends_egress_tunnel()
+            || self.box_egress_tunnel_ready()
+            || self.egress_tunnel_enabled
     }
 
     pub fn set_egress_tunnel_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -7222,6 +7235,9 @@ impl AppState {
         if self.is_app_settings_open {
             self.dismiss_popovers(cx);
             self.refresh_host_egress(cx);
+            if self.app_settings_tab == AppSettingsTab::Computer {
+                self.refresh_computers(cx);
+            }
         }
         self.record_nav();
         cx.notify();
@@ -7256,6 +7272,7 @@ impl AppState {
                     computer.online = true;
                 }
             }
+            computers = collapse_computer_roster(computers);
             computers.sort_by_key(|computer| !computer.this_machine);
             let _ = this.update(cx, |state, cx| {
                 state.computers = computers;
@@ -7336,6 +7353,7 @@ impl AppState {
             self.is_app_settings_open = true;
             self.dismiss_popovers(cx);
         }
+        self.refresh_host_egress(cx);
         if tab == AppSettingsTab::Computer {
             self.refresh_computers(cx);
         }
@@ -9258,6 +9276,20 @@ mod tests {
             !state.egress_tunnel_available(),
             "a ready box without host/env is not a tunnel"
         );
+        assert!(
+            state.show_egress_tunnel_settings(),
+            "box ready still paints the Network row if the host poll missed"
+        );
+        state.coworker_computer = None;
+        state.host_egress_tunnel_available = true;
+        assert!(!state.egress_tunnel_available());
+        assert!(
+            state.show_egress_tunnel_settings(),
+            "host intent paints the row while box status lags"
+        );
+        state.host_egress_tunnel_available = false;
+        state.egress_tunnel_enabled = true;
+        assert!(state.show_egress_tunnel_settings());
     }
 
     /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".
