@@ -244,7 +244,9 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                     .flex_1()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(if spec.runs_on_this_mac() {
+                    .child(if spec.is_review_an_action() {
+                        "Review an action".to_string()
+                    } else if spec.runs_on_this_mac() {
                         format!("Allow {bot} and all Bots to run commands on your local computer?")
                     } else {
                         format!("Allow {bot} to run {} on its computer?", spec.tool)
@@ -296,14 +298,16 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
     } else {
         // Always/Never set this Mac's policy, so only the local-shell tool
         // offers them. A box tool is answered one request at a time.
+        // Review an action (egress / auto-review): Always allow / Allow once / Deny.
         let local = spec.runs_on_this_mac();
+        let review = spec.is_review_an_action();
         let (primary, plain) = (
             (theme.primary, theme.primary_foreground, theme.primary),
             (theme.border, theme.foreground, theme.background),
         );
-        let allow_once = if local { plain } else { primary };
+        let allow_once = if local || review { plain } else { primary };
         let mut row = h_flex().w_full().justify_end().gap(px(8.)).flex_wrap();
-        if local {
+        if local || review {
             row = row.child(approval_button(
                 spec,
                 "Always allow",
@@ -326,14 +330,14 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
             ))
             .child(approval_button(
                 spec,
-                "Deny once",
+                if review { "Deny" } else { "Deny once" },
                 LocalExecResolution::DenyOnce,
                 app.clone(),
                 plain.0,
                 plain.1,
                 plain.2,
             ));
-        if local {
+        if local && !review {
             row = row.child(approval_button(
                 spec,
                 "Never",

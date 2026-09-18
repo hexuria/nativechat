@@ -116,6 +116,15 @@ impl ApprovalSpec {
             "its computer"
         }
     }
+
+    /// Grok Bot Steps 3–4: tunnel / auto-review HITL. Exec-consent stays
+    /// Allow/Deny once. OpenGrok must send this reason — we do not invent it.
+    pub fn is_review_an_action(&self) -> bool {
+        matches!(
+            self.reason.trim().to_ascii_lowercase().as_str(),
+            "auto-review" | "review-an-action" | "computer-action" | "egress"
+        )
+    }
 }
 
 /// What this Mac's Always/Never setting answers on its own. Only the
@@ -1351,6 +1360,10 @@ mod tests {
         assert!(!boxed.runs_on_this_mac());
         assert_eq!(local.place(), "your computer");
         assert_eq!(boxed.place(), "its computer");
+        let mut review = boxed.clone();
+        review.reason = "auto-review".into();
+        assert!(review.is_review_an_action());
+        assert!(!local.is_review_an_action());
     }
 
     #[test]

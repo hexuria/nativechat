@@ -1388,6 +1388,9 @@ pub struct AppState {
     /// The active coworker's computer, as last polled. Cleared on a switch so a
     /// bot never shows the previous one's screen.
     pub coworker_computer: Option<CoworkerComputer>,
+    /// Local opt-in for **Route traffic through this computer**. No tunnel
+    /// runs until OpenGrok sets `isEgressTunnelAvailable`.
+    pub egress_tunnel_enabled: bool,
     /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
     /// endpoint, so polling stops until the roster reloads.
     pub computer_endpoint_missing: bool,
@@ -1727,6 +1730,7 @@ impl AppState {
             expanded_shell_output: HashSet::new(),
             computers: Vec::new(),
             coworker_computer: None,
+            egress_tunnel_enabled: false,
             coworker_screen: None,
             computer_confirm: None,
             computer_action_error: None,
@@ -2024,6 +2028,26 @@ impl AppState {
     pub fn submit_open_user_form(&mut self, card_key: String, cx: &mut Context<Self>) {
         let values = self.user_form_submit_values(&card_key);
         self.submit_user_form(card_key, values, cx);
+    }
+
+    /// OpenGrok must flip `isEgressTunnelAvailable` before this switch is live.
+    pub fn egress_tunnel_available(&self) -> bool {
+        self.coworker_computer
+            .as_ref()
+            .is_some_and(|computer| computer.is_egress_tunnel_available)
+    }
+
+    /// Grok shows the row when the tunnel is provisioned or already on.
+    pub fn show_egress_tunnel_settings(&self) -> bool {
+        self.egress_tunnel_available() || self.egress_tunnel_enabled
+    }
+
+    pub fn set_egress_tunnel_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled && !self.egress_tunnel_available() {
+            return;
+        }
+        self.egress_tunnel_enabled = enabled;
+        cx.notify();
     }
 
     pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {

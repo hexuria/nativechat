@@ -1357,6 +1357,10 @@ pub struct CoworkerComputer {
     /// An update in flight, or the failure the last one ended in.
     #[serde(default)]
     pub update: Option<UpdateStatus>,
+    /// OpenGrok currently hardcodes this false. When true, Settings can offer
+    /// **Route traffic through this computer**. No tunnel is invented here.
+    #[serde(rename = "isEgressTunnelAvailable", default)]
+    pub is_egress_tunnel_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -3149,6 +3153,27 @@ mod tests {
         let status = client.coworker_computer("cw_1").await.unwrap();
         assert_eq!(status.state, "running");
         assert_eq!(status.vnc_url(), Some("http://127.0.0.1:6080/vnc.html"));
+        assert!(
+            !status.is_egress_tunnel_available,
+            "OpenGrok hardcodes isEgressTunnelAvailable=false until provisioned"
+        );
+    }
+
+    #[test]
+    fn coworker_computer_reads_egress_tunnel_flag() {
+        let off: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running"
+        }))
+        .unwrap();
+        assert!(!off.is_egress_tunnel_available);
+        let on: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "isEgressTunnelAvailable": true
+        }))
+        .unwrap();
+        assert!(on.is_egress_tunnel_available);
     }
 
     #[tokio::test]

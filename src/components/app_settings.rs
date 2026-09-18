@@ -3,6 +3,7 @@ use crate::opengrok::LocalExecMode;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -22,7 +23,17 @@ impl Render for AppSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let (tab, chord, theme_mode, account_name, account_email, computers, bot_name, controls) = {
+        let (
+            tab,
+            chord,
+            theme_mode,
+            account_name,
+            account_email,
+            computers,
+            bot_name,
+            controls,
+            egress,
+        ) = {
             let state = self.state.read(cx);
             let (name, email) = state
                 .account
@@ -57,6 +68,11 @@ impl Render for AppSettings {
                         .is_some_and(|image| !image.stale),
                     error: state.computer_action_error.clone(),
                 },
+                (
+                    state.show_egress_tunnel_settings(),
+                    state.egress_tunnel_available(),
+                    state.egress_tunnel_enabled,
+                ),
             )
         };
         let app = self.state.clone();
@@ -117,7 +133,8 @@ impl Render for AppSettings {
                                     shortcuts_page(chord, muted, &theme).into_any_element()
                                 }
                                 AppSettingsTab::Computer => {
-                                    computer_page(computers, muted, app.clone()).into_any_element()
+                                    computer_page(computers, egress, muted, app.clone())
+                                        .into_any_element()
                                 }
                                 AppSettingsTab::Updates => {
                                     updates_page(&bot_name, &controls, muted, app.clone(), &theme)
@@ -555,6 +572,7 @@ fn theme_chip(
 
 fn computer_page(
     computers: Vec<crate::opengrok::ConnectedComputer>,
+    egress: (bool, bool, bool),
     muted: Hsla,
     app: Entity<AppState>,
 ) -> impl IntoElement {
@@ -562,12 +580,16 @@ fn computer_page(
         .gap(px(12.))
         .child(div().text_xs().text_color(muted).child("Computers"));
     if computers.is_empty() {
-        return page.child(
-            div()
-                .text_sm()
-                .text_color(muted)
-                .child("No computers yet. Stay signed in here and NativeChat enrols this Mac."),
-        );
+        return page
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("No computers yet. Stay signed in here and NativeChat enrols this Mac."),
+            )
+            .when(egress.0, |this| {
+                this.child(egress_tunnel_row(egress.1, egress.2, muted, app.clone()))
+            });
     }
     let mut card = v_flex()
         .w_full()
@@ -581,7 +603,59 @@ fn computer_page(
         }
         card = card.child(computer_row(computer, muted, app.clone()));
     }
-    page.child(card)
+    page.child(card).when(egress.0, |this| {
+        this.child(egress_tunnel_row(egress.1, egress.2, muted, app))
+    })
+}
+
+fn egress_tunnel_row(
+    available: bool,
+    enabled: bool,
+    muted: Hsla,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    let description = if enabled {
+        "New connections from this Bot's computer go out through this desktop."
+    } else if available {
+        "Route web traffic from this Bot's computer out through this desktop instead of the cloud. Applies to new connections."
+    } else {
+        "This Bot's computer wasn't provisioned with the egress tunnel — start a new one to use this."
+    };
+    let can_toggle = available || enabled;
+    v_flex()
+        .id("route-traffic-this-computer")
+        .w_full()
+        .px(px(16.))
+        .py(px(14.))
+        .gap(px(8.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0x777777).opacity(0.24))
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(div().text_sm().child("Route traffic through this computer"))
+                        .child(div().text_xs().text_color(muted).child(description)),
+                )
+                .child(
+                    Switch::new("egress-tunnel-enabled")
+                        .checked(enabled)
+                        .disabled(!can_toggle)
+                        .on_click(move |checked, _, cx| {
+                            app.update(cx, |state, cx| {
+                                state.set_egress_tunnel_enabled(*checked, cx);
+                            });
+                        }),
+                ),
+        )
 }
 
 fn computer_row(
