@@ -837,7 +837,19 @@ impl ChatTranscript {
             let Some(spec) = &row.user_form else {
                 continue;
             };
-            if !spec.is_unresolved() {
+            // Keep the typed values through Sending and FillFailed. These inputs
+            // are what "Try again" re-posts, and clearing them the moment a
+            // submit went out meant the retry after a failed fill left with
+            // the password gone.
+            let live = spec.is_unresolved()
+                || matches!(
+                    spec.effective_resolution(),
+                    Some(
+                        crate::opengrok::FormResolution::Sending
+                            | crate::opengrok::FormResolution::FillFailed
+                    )
+                );
+            if !live {
                 continue;
             }
             for field in &spec.fields {

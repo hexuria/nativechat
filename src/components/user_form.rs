@@ -654,7 +654,22 @@ fn fill_failed_actions(
         .as_ref()
         .map(|entity| entity.read(cx).user_form_verbs_available)
         .unwrap_or(USER_FORM_SERVER_FILL_AVAILABLE);
-    let can_post = spec.can_post(server_fill);
+    // Same inputs as the idle card's Continue: the live InputState plus whatever
+    // the agent typed, and enabled only when the required fields are present.
+    // Gating on `can_post` alone let "Try again" go out with the password gone.
+    let mut picks = values.clone();
+    if let Some(app) = &app {
+        if let Some(typed) = app.read(cx).user_form_typed.get(spec.card_key()) {
+            for (id, value) in typed {
+                picks
+                    .by_id
+                    .entry(id.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+    }
+    let live = collect_submit_values(spec, inputs, textareas, &picks, cx);
+    let can_post = continue_enabled(spec, &live, server_fill);
     let can_dismiss = spec.can_dismiss();
     let key = spec.card_key().to_string();
     h_flex()
@@ -672,7 +687,7 @@ fn fill_failed_actions(
                 let spec = spec.clone();
                 let inputs = inputs.clone();
                 let textareas = textareas.clone();
-                let picks = values.clone();
+                let picks = picks.clone();
                 let app = app.clone();
                 let key = key.clone();
                 can_post.then_some(move |cx: &mut App| {
