@@ -14,8 +14,14 @@
 //! `computer-handoff-skip-{key}`,
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
 //! `credential-request-{id}`, `credential-request-allow-{id}`,
-//! `credential-request-deny-{id}`, `settings-tab-logins`,
+//! `credential-request-deny-{id}`, `credential-request-pill-{id}`,
+//! `settings-tab-logins`,
 //! `settings-login-row-{id}`, `settings-login-delete-{id}`.
+//!
+//! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
+//! `UserFormOpenScreen`, `AnswerCredentialRequest` (also kebab
+//! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /
+//! `credential.answer`). Click ids above still work.
 //!
 //! Typing goes in as GPUI keystrokes. `type`, `key` and `set_value` on the composer are
 //! planned here ([`ComposePlan`]) and pressed by [`RootView`](crate::root::RootView), because

@@ -487,7 +487,7 @@ impl TurnAssembler {
             ChatPart::UserForm(spec) if spec.is_unresolved() || spec.live_computer_handoff() => {
                 true
             }
-            ChatPart::CredentialRequest(_) => true,
+            ChatPart::CredentialRequest(spec) if spec.is_unresolved() => true,
             _ => false,
         })
     }
@@ -655,7 +655,14 @@ impl TurnAssembler {
             }
             _ => None,
         }) {
+            if existing.is_settled() {
+                return;
+            }
+            let resolution = existing.resolution;
             *existing = spec;
+            if existing.resolution.is_none() {
+                existing.resolution = resolution;
+            }
             return;
         }
         self.committed.push(ChatPart::CredentialRequest(spec));
@@ -2335,6 +2342,7 @@ mod tests {
                 assert_eq!(offer.origin, "google.com");
                 assert_eq!(offer.username, "ada@example.com");
                 assert_eq!(req.request_id, "req-9");
+                assert!(req.is_unresolved());
                 assert!(assembler.waiting_user_form());
             }
             other => panic!("expected save+request, got {other:?}"),
