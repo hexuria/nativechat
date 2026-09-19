@@ -7,26 +7,30 @@ use crate::chrome::{
 use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
-    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, ConnectedComputer, Coworker,
-    CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus, Failure,
-    FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue,
-    OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
-    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
+    BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
+    Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestResolution, CredentialRequestSpec,
+    CredentialResultStatus, Failure, FormResolution, FormSpec, HITL_INTERRUPT_AVAILABLE,
+    ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
+    OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
+    SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
     UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_enabled, keep_local_save_offer, local_exec_outcome,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
-    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
-    tool_standin,
+    fold_credential_answer, host_egress_tunnel_flag, keep_credential_request_offer,
+    keep_local_save_offer, local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
+    stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
-use crate::site_login::{PendingSave, SiteLoginRecord, SiteLoginVault, save_candidate};
+use crate::site_login::{
+    PendingSave, SiteLoginRecord, SiteLoginVault, login_matches_request, registrable_origin,
+    save_candidate,
+};
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -1269,6 +1273,14 @@ pub enum AppSettingsTab {
     Logins,
 }
 
+/// Where Route traffic chrome belongs for the active bot's box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteTrafficSurface {
+    Hidden,
+    BotPane,
+    UserSettings,
+}
+
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
 /// so ⌘[ / ⌘] can walk agents, the right pane, and Settings the way macOS apps do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1347,6 +1359,9 @@ pub struct AppState {
     /// refilled from the database, its run is written into by name rather than by position, and
     /// coming back to it asks the server what became of the run.
     live_turns: HashMap<String, LiveTurn>,
+    /// Server run parked on HITL (user-form / approval / live handoff) after
+    /// [`Self::live_turns`] is released. Composer steer POSTs stop then a new turn.
+    parked_hitl_runs: HashMap<String, String>,
     /// Threads already reconciled against the server this session. Once is enough: after it, the
     /// app has been watching, and every turn since has gone through the same door on its way to
     /// disk. Asking again on every visit would fetch a thread's frames — screenshots and all —
@@ -1469,6 +1484,18 @@ pub struct AppState {
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
     user_form_resolutions: HashMap<String, FormResolution>,
+    /// Local `credential.request` settle (Dismissed / Used saved login /
+    /// None saved). Grafted across SSE overwrite so the remnant does not reopen.
+    credential_request_resolutions: HashMap<String, CredentialRequestResolution>,
+    /// `credential.request` ids auto-answered `missing` because Settings→Logins
+    /// had no matching row. Do not re-offer or POST again.
+    credential_auto_missing: HashSet<String>,
+    /// Runs that posted empty-vault `missing` and still need follow_run rather
+    /// than persist-as-finished / Waiting.
+    empty_vault_continue_runs: HashSet<String>,
+    /// First sqlite `site_logins` list has landed. Until then, do not treat an
+    /// empty in-memory vec as "no logins" (startup race).
+    site_logins_ready: bool,
     /// Stable resolution to restore if a POST fails (never reopen a settled card).
     user_form_restore: HashMap<String, FormResolution>,
     /// Form card key → handoff card id from dismiss `handoffEntryId`.
@@ -1498,8 +1525,8 @@ pub struct AppState {
     pub coworker_computer: Option<CoworkerComputer>,
     /// From `POST /api/isEgressTunnelAvailable` (env OR host setting on the server).
     pub host_egress_tunnel_available: bool,
-    /// Local/host opt-in for **Route traffic through this computer**. No tunnel
-    /// is invented here.
+    /// Local/host opt-in for **Route traffic through this computer**. Defaults
+    /// ON; host `egressTunnelEnabled` overwrites only when the key is present.
     pub egress_tunnel_enabled: bool,
     /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
     /// endpoint, so polling stops until the roster reloads.
@@ -1774,6 +1801,7 @@ impl AppState {
         let mut state = Self {
             conversations: Vec::new(),
             live_turns: HashMap::new(),
+            parked_hitl_runs: HashMap::new(),
             reconciled_threads: HashSet::new(),
             last_active_at: HashMap::new(),
             active_conversation_id: None,
@@ -1841,6 +1869,10 @@ impl AppState {
             user_form_typed: HashMap::new(),
             user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
             user_form_resolutions: HashMap::new(),
+            credential_request_resolutions: HashMap::new(),
+            credential_auto_missing: HashSet::new(),
+            empty_vault_continue_runs: HashSet::new(),
+            site_logins_ready: false,
             user_form_restore: HashMap::new(),
             user_form_handoffs: HashMap::new(),
             user_form_pending_resolves: HashMap::new(),
@@ -1858,7 +1890,7 @@ impl AppState {
             computers: Vec::new(),
             coworker_computer: None,
             host_egress_tunnel_available: false,
-            egress_tunnel_enabled: false,
+            egress_tunnel_enabled: true,
             coworker_screen: None,
             last_box_shot: None,
             computer_confirm: None,
@@ -2239,31 +2271,86 @@ impl AppState {
         self.host_egress_tunnel_available || env_egress_tunnel_enabled()
     }
 
-    fn box_egress_tunnel_ready(&self) -> bool {
-        self.coworker_computer
-            .as_ref()
-            .is_some_and(|computer| computer.egress_tunnel_ready())
+    fn nonempty_box_id(id: Option<&str>) -> Option<&str> {
+        id.map(str::trim).filter(|id| !id.is_empty())
     }
 
-    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** box
-    /// `egress_tunnel.ready`. No tunnel is invented. The Settings row can
-    /// still *show* when only one side is known; this AND-gate is what may
-    /// actually turn the tunnel on.
+    fn active_box_id(&self) -> Option<&str> {
+        Self::nonempty_box_id(
+            self.coworker_computer
+                .as_ref()
+                .and_then(|computer| computer.box_id.as_deref()),
+        )
+        .or_else(|| {
+            let active = self.active_coworker_id.as_deref()?;
+            Self::nonempty_box_id(
+                self.coworkers
+                    .iter()
+                    .find(|coworker| coworker.id == active)?
+                    .box_id
+                    .as_deref(),
+            )
+        })
+    }
+
+    fn box_shared_among_coworkers(&self) -> bool {
+        let Some(box_id) = self.active_box_id() else {
+            return false;
+        };
+        self.coworkers
+            .iter()
+            .filter(|coworker| Self::nonempty_box_id(coworker.box_id.as_deref()) == Some(box_id))
+            .count()
+            > 1
+    }
+
+    /// Nested `egress_tunnel.ready` / URL on this bot's computer JSON.
+    pub fn box_egress_provisioned(&self) -> bool {
+        self.coworker_computer
+            .as_ref()
+            .is_some_and(CoworkerComputer::box_egress_provisioned)
+    }
+
+    fn box_egress_tunnel_ready(&self) -> bool {
+        self.box_egress_provisioned()
+    }
+
+    /// OpenGrok #139: host setting/env **and** this bot's box tunnel. No tunnel
+    /// is invented. Review-an-action uses this AND-gate; Route traffic chrome
+    /// uses [`Self::route_traffic_surface`] (provisioned + shareScope).
     pub fn egress_tunnel_available(&self) -> bool {
         self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
     }
 
-    /// Grok shows the Network row when the host intends a tunnel, the box
-    /// already exposed one, or the toggle is already on. Box status lag or a
-    /// 401 on the host poll must not hide the row.
-    pub fn show_egress_tunnel_settings(&self) -> bool {
-        self.host_intends_egress_tunnel()
-            || self.box_egress_tunnel_ready()
-            || self.egress_tunnel_enabled
+    /// Dedicated → bot Computer pane header icon. User (or unknown + shared
+    /// `boxId`) → Settings → Computer. Group/org → hide. Unprovisioned → hide.
+    pub fn route_traffic_surface(&self) -> RouteTrafficSurface {
+        if !self.box_egress_provisioned() {
+            return RouteTrafficSurface::Hidden;
+        }
+        match self
+            .coworker_computer
+            .as_ref()
+            .and_then(|computer| computer.share_scope)
+        {
+            Some(BoxShareScope::Dedicated) => RouteTrafficSurface::BotPane,
+            Some(BoxShareScope::User) => RouteTrafficSurface::UserSettings,
+            Some(BoxShareScope::Group) | Some(BoxShareScope::Org) => RouteTrafficSurface::Hidden,
+            None if self.box_shared_among_coworkers() => RouteTrafficSurface::UserSettings,
+            None => RouteTrafficSurface::BotPane,
+        }
+    }
+
+    pub fn show_route_traffic_on_bot_pane(&self) -> bool {
+        self.route_traffic_surface() == RouteTrafficSurface::BotPane
+    }
+
+    pub fn show_route_traffic_in_user_settings(&self) -> bool {
+        self.route_traffic_surface() == RouteTrafficSurface::UserSettings
     }
 
     pub fn set_egress_tunnel_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if enabled && !self.egress_tunnel_available() {
+        if enabled && !self.box_egress_provisioned() {
             return;
         }
         self.egress_tunnel_enabled = enabled;
@@ -2277,10 +2364,7 @@ impl AppState {
                 .await;
             let _ = this.update(cx, |state, cx| {
                 if let Ok(settings) = result {
-                    if let Some(flag) = settings
-                        .get("egressTunnelEnabled")
-                        .and_then(serde_json::Value::as_bool)
-                    {
+                    if let Some(flag) = host_egress_tunnel_flag(&settings) {
                         state.egress_tunnel_enabled = flag;
                     }
                     if enabled {
@@ -2314,8 +2398,9 @@ impl AppState {
                     changed = true;
                 }
                 if let Some(settings) = settings {
-                    let enabled = host_egress_tunnel_enabled(&settings);
-                    if state.egress_tunnel_enabled != enabled {
+                    if let Some(enabled) = host_egress_tunnel_flag(&settings)
+                        && state.egress_tunnel_enabled != enabled
+                    {
                         state.egress_tunnel_enabled = enabled;
                         changed = true;
                     }
@@ -2376,8 +2461,107 @@ impl AppState {
     fn park_waiting_for_you(&mut self, conversation_id: &str, run_id: &str) {
         self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
         if !run_id.is_empty() {
+            self.parked_hitl_runs
+                .insert(conversation_id.to_string(), run_id.to_string());
             self.release_live_turn(conversation_id, run_id);
         }
+    }
+
+    /// Open user-form / approval / live handoff, or Waiting chrome. Cold
+    /// composer send has none of these and must not POST `/stop`.
+    fn has_hitl_to_interrupt(&self, conversation_id: &str) -> bool {
+        self.has_open_approval(conversation_id)
+            || self.has_open_user_form(conversation_id)
+            || matches!(
+                self.thread_status(conversation_id),
+                Some(WAITING_FOR_YOU_STATUS) | Some(WAITING_APPROVAL_STATUS)
+            )
+    }
+
+    /// Run id of a parked HITL turn, if this thread still has one.
+    ///
+    /// Only a live or HITL-parked run. Never invent an id for a cold send —
+    /// stopping the run we are about to mint is 202 then "did not go through."
+    fn parked_hitl_run_id(&self, conversation_id: &str) -> Option<String> {
+        if !self.has_hitl_to_interrupt(conversation_id) {
+            return None;
+        }
+        if let Some(id) = self.parked_hitl_runs.get(conversation_id)
+            && !id.is_empty()
+        {
+            return Some(id.clone());
+        }
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return None;
+        };
+        for part in conversation
+            .messages
+            .iter()
+            .rev()
+            .flat_map(|message| message.parts.iter())
+        {
+            match part {
+                ChatPart::UserForm(spec)
+                    if (spec.is_unresolved() || spec.live_computer_handoff())
+                        && !spec.run_id.is_empty() =>
+                {
+                    return Some(spec.run_id.clone());
+                }
+                ChatPart::Approval(spec)
+                    if !spec.run_id.is_empty()
+                        && !self.approval_answered(&spec.call_id)
+                        && self.auto_resolve_local_exec(spec).is_none() =>
+                {
+                    return Some(spec.run_id.clone());
+                }
+                ChatPart::CredentialRequest(spec)
+                    if spec.is_unresolved() && !spec.run_id.is_empty() =>
+                {
+                    return Some(spec.run_id.clone());
+                }
+                _ => {}
+            }
+        }
+        // Form painted mid-stream: live_turns still holds the run that
+        // `park_waiting_for_you` has not copied yet. Caller must snapshot
+        // this *before* minting the next turn's run id.
+        if let Some(turn) = self.live_turns.get(conversation_id)
+            && !turn.run_id.is_empty()
+            && !turn.persisting
+        {
+            return Some(turn.run_id.clone());
+        }
+        None
+    }
+
+    fn take_parked_hitl_run(&mut self, conversation_id: &str) -> Option<String> {
+        let id = self.parked_hitl_run_id(conversation_id)?;
+        self.parked_hitl_runs.remove(conversation_id);
+        Some(id)
+    }
+
+    /// Snapshot the HITL run to stop, if any. Stale map entries without
+    /// open HITL / Waiting are dropped so a later "hi" cannot `/stop`.
+    fn take_hitl_interrupt_target(&mut self, conversation_id: &str) -> Option<String> {
+        if !self.has_hitl_to_interrupt(conversation_id) {
+            self.parked_hitl_runs.remove(conversation_id);
+            return None;
+        }
+        self.take_parked_hitl_run(conversation_id)
+    }
+
+    /// Composer send POSTs a real OpenGrok turn. Open forms / approvals /
+    /// live handoff used to paint a local bubble and return — that is the
+    /// orphan-steer bug. A working turn with no HITL still keeps Stop.
+    fn composer_send_posts_turn(&self, conversation_id: &str) -> bool {
+        if self.has_open_approval(conversation_id) || self.has_open_user_form(conversation_id) {
+            return true;
+        }
+        !self.is_thread_responding(conversation_id)
     }
 
     /// After Skip / Dismiss / Done (and after SSE graft): Waiting only while
@@ -2476,7 +2660,7 @@ impl AppState {
         self.approval_decisions.clear();
         self.computers.clear();
         self.host_egress_tunnel_available = false;
-        self.egress_tunnel_enabled = false;
+        self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
         cx.notify();
         if let Some(client) = client {
@@ -2755,6 +2939,7 @@ impl AppState {
         self.computer_action_error = None;
         if computer {
             self.refresh_coworker_computer(cx);
+            self.refresh_host_egress(cx);
             self.start_computer_poll(cx);
         } else {
             self.computer_poll = None;
@@ -5007,7 +5192,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
-        let parts = self.graft_user_forms(parts);
+        let parts = self.graft_turn_parts(parts, Some(conversation_id), cx);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -5051,6 +5236,9 @@ impl AppState {
             "finished" => {
                 if self.has_open_user_form(conversation_id) {
                     self.park_waiting_for_you(conversation_id, &turn.run_id);
+                } else if self.empty_vault_continue_runs.contains(&turn.run_id) {
+                    // Empty-vault auto-miss posted `missing`; follow_run owns the rest.
+                    self.begin_responding(Some(conversation_id), "Working");
                 } else {
                     self.finish_responding(Some(conversation_id), false);
                 }
@@ -5059,6 +5247,7 @@ impl AppState {
                 // a thread that says everything twice.
                 if !self.has_open_user_form(conversation_id)
                     && !self.has_open_approval(conversation_id)
+                    && !self.empty_vault_continue_runs.contains(&turn.run_id)
                     && self.turn_is_unsettled(conversation_id, &turn.run_id)
                 {
                     self.persist_assistant_reply(
@@ -5090,6 +5279,7 @@ impl AppState {
     /// Named by run, because the turn being let go has to be the turn that ended: a thread whose
     /// next turn has already begun must not be let go by the last one finishing late.
     fn release_live_turn(&mut self, conversation_id: &str, run_id: &str) {
+        self.empty_vault_continue_runs.remove(run_id);
         if self
             .live_turns
             .get(conversation_id)
@@ -5164,6 +5354,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let settles = run_id.is_some_and(|run_id| {
+            self.empty_vault_continue_runs.remove(run_id);
             self.live_turns
                 .get(conversation_id)
                 .is_some_and(|turn| turn.run_id == run_id)
@@ -5237,6 +5428,11 @@ impl AppState {
             self.note_signed_out(cx);
             return;
         }
+        // Snapshot the HITL run to interrupt *before* minting this turn's
+        // run id. A cold send has no open form / approval / live handoff /
+        // Waiting — do not POST `/stop` at all. Stopping the id we are
+        // about to send is 202 then "This turn did not go through."
+        let interrupt_run_id = self.take_hitl_interrupt_target(&conversation_id);
         let coworker_id = self.active_coworker_id.clone();
         // The recipe as it stands now, not when the turn reaches the wire: the composer clears
         // the draft the moment it is sent, and the turn should carry what was on the message.
@@ -5280,6 +5476,8 @@ impl AppState {
                 persisting: false,
             },
         );
+        // Never `/stop` the run this POST is about to start.
+        let interrupt_run_id = interrupt_run_id.filter(|id| id != &run_id);
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -5303,6 +5501,22 @@ impl AppState {
             };
             let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
+                    // OpenGrok A2: `POST /ag-ui/runs/{id}/stop` on a parked
+                    // AwaitingApproval run, then POST `/ag-ui`. Cold send
+                    // has `interrupt_run_id == None` and skips stop.
+                    // `HITL_INTERRUPT_AVAILABLE = false` skips stop only —
+                    // the new turn still POSTs. 404 on stop is success.
+                    if HITL_INTERRUPT_AVAILABLE {
+                        if let Some(parked) = interrupt_run_id.as_deref() {
+                            if let Err(error) = client.stop_run(parked).await
+                                && error.status != Some(404)
+                            {
+                                eprintln!(
+                                    "NativeChat: HITL interrupt of {parked} did not land: {error}"
+                                );
+                            }
+                        }
+                    }
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
@@ -5347,7 +5561,11 @@ impl AppState {
                                     if let Some(shot) = box_shot {
                                         state.last_box_shot = Some(shot);
                                     }
-                                    let grafted = state.graft_user_forms(parts.clone());
+                                    let grafted = state.graft_turn_parts(
+                                        parts.clone(),
+                                        Some(&conversation_id),
+                                        cx,
+                                    );
                                     if let Some(message) = streaming_message_mut(
                                         &mut state.conversations,
                                         &conversation_id,
@@ -5394,7 +5612,7 @@ impl AppState {
                         if let Some(shot) = box_shot {
                             state.last_box_shot = Some(shot);
                         }
-                        let grafted = state.graft_user_forms(parts);
+                        let grafted = state.graft_turn_parts(parts, Some(&conversation_id), cx);
                         if let Some(message) = streaming_message_mut(
                             &mut state.conversations,
                             &conversation_id,
@@ -5464,7 +5682,11 @@ impl AppState {
                         }
                     }
                 }
-                if !waiting_approval && !waiting_user_form && result.is_ok() {
+                if !waiting_approval
+                    && !waiting_user_form
+                    && result.is_ok()
+                    && !state.empty_vault_continue_runs.contains(&run_id)
+                {
                     // The run is final; a run parked on a card is saved when it finishes.
                     // A status line is painted, never saved: `persist_assistant_reply` refuses
                     // it, so it cannot become history the model is shown next turn. Settling the
@@ -5518,6 +5740,8 @@ impl AppState {
                         state.fill_open_approval_commands(cx);
                         state.sync_pending_approvals(cx);
                     }
+                } else if state.empty_vault_continue_runs.contains(&run_id) {
+                    state.begin_responding(Some(&conversation_id), "Working");
                 } else {
                     state.finish_responding(Some(&conversation_id), false);
                 }
@@ -5921,7 +6145,11 @@ impl AppState {
                                     label: "Working".into(),
                                 });
                             let _ = this.update(cx, |state, cx| {
-                                let parts = state.graft_user_forms(parts.clone());
+                                let parts = state.graft_turn_parts(
+                                    parts.clone(),
+                                    conversation_id.as_deref(),
+                                    cx,
+                                );
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card.
@@ -5980,6 +6208,7 @@ impl AppState {
                                             if state.has_open_user_form(id) {
                                                 state.park_waiting_for_you(id, &run_id);
                                             } else {
+                                                state.empty_vault_continue_runs.remove(&run_id);
                                                 state.finish_responding(
                                                     conversation_id.as_deref(),
                                                     false,
@@ -6370,17 +6599,191 @@ impl AppState {
                     }
                 }
             }
+            if let ChatPart::CredentialRequest(spec) = part
+                && let Some(resolution) = self.credential_request_resolutions.get(&spec.request_id)
+            {
+                spec.resolution = Some(*resolution);
+            }
         }
         parts.retain(|part| match part {
             ChatPart::SaveLogin(spec) => keep_local_save_offer(
                 self.pending_save.contains_key(&spec.form_entry_id),
                 self.already_saved_login(&spec.origin, &spec.username),
             ),
+            ChatPart::CredentialRequest(spec) => keep_credential_request_offer(
+                spec.is_settled(),
+                self.has_matching_saved_login(&spec.origin, spec.username.as_deref()),
+                self.credential_auto_missing.contains(&spec.request_id),
+                self.site_logins_ready,
+            ),
             _ => true,
         });
         self.inject_local_save_logins(&mut parts);
         place_hitl_cards_in_document_order(&mut parts);
         parts
+    }
+
+    fn has_matching_saved_login(&self, origin: &str, username: Option<&str>) -> bool {
+        self.site_logins
+            .iter()
+            .any(|row| login_matches_request(&row.origin, &row.username, origin, username))
+    }
+
+    /// Vault-aware graft for a live turn: drop Use-saved when Settings has
+    /// no matching row, and POST `missing` so the agent does not park forever.
+    fn graft_turn_parts(
+        &mut self,
+        parts: Vec<ChatPart>,
+        conversation_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Vec<ChatPart> {
+        if let Some(id) = conversation_id {
+            self.queue_empty_vault_credential_misses(&parts, id, cx);
+        }
+        let grafted = self.graft_user_forms(parts);
+        if let Some(id) = conversation_id {
+            self.sweep_empty_vault_credential_requests(id, cx);
+        }
+        grafted
+    }
+
+    fn queue_empty_vault_credential_misses(
+        &mut self,
+        parts: &[ChatPart],
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.site_logins_ready {
+            return;
+        }
+        let unmatched: Vec<CredentialRequestSpec> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ChatPart::CredentialRequest(spec)
+                    if self.should_auto_miss_credential_request(spec) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for spec in unmatched {
+            self.auto_miss_empty_vault_credential_request(spec, conversation_id, cx);
+        }
+    }
+
+    fn should_auto_miss_credential_request(&self, spec: &CredentialRequestSpec) -> bool {
+        spec.is_unresolved()
+            && self.site_logins_ready
+            && !self
+                .credential_request_resolutions
+                .contains_key(&spec.request_id)
+            && !self.credential_auto_missing.contains(&spec.request_id)
+            && !self.has_matching_saved_login(&spec.origin, spec.username.as_deref())
+    }
+
+    fn sweep_empty_vault_credential_requests(
+        &mut self,
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.site_logins_ready {
+            return;
+        }
+        let unmatched: Vec<CredentialRequestSpec> = self
+            .conversations
+            .iter()
+            .filter(|conversation| conversation.id == conversation_id)
+            .flat_map(|conversation| conversation.messages.iter())
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                ChatPart::CredentialRequest(spec)
+                    if self.should_auto_miss_credential_request(spec) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for spec in unmatched {
+            self.auto_miss_empty_vault_credential_request(spec, conversation_id, cx);
+        }
+        self.strip_auto_missed_credential_requests(conversation_id);
+    }
+
+    fn strip_auto_missed_credential_requests(&mut self, conversation_id: &str) {
+        let auto_missed = &self.credential_auto_missing;
+        let ready = self.site_logins_ready;
+        let logins = &self.site_logins;
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::CredentialRequest(spec) => keep_credential_request_offer(
+                        spec.is_settled(),
+                        logins.iter().any(|row| {
+                            login_matches_request(
+                                &row.origin,
+                                &row.username,
+                                &spec.origin,
+                                spec.username.as_deref(),
+                            )
+                        }),
+                        auto_missed.contains(&spec.request_id),
+                        ready,
+                    ),
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn auto_miss_empty_vault_credential_request(
+        &mut self,
+        spec: CredentialRequestSpec,
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.credential_auto_missing.insert(spec.request_id.clone()) {
+            return;
+        }
+        if !spec.run_id.is_empty() {
+            self.empty_vault_continue_runs.insert(spec.run_id.clone());
+            self.begin_responding(Some(conversation_id), "Working");
+        } else {
+            self.sync_waiting_chrome(conversation_id);
+        }
+        let request_id = spec.request_id.clone();
+        let run_id = spec.run_id.clone();
+        let conversation = conversation_id.to_string();
+        let agent_id = self.active_coworker_id.clone().unwrap_or_default();
+        let client = self.opengrok.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if let Some(client) = client {
+                let _ = client
+                    .post_credential_result(
+                        CredentialResultStatus::Missing,
+                        &request_id,
+                        None,
+                        &agent_id,
+                    )
+                    .await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if !run_id.is_empty() {
+                    state.begin_responding(Some(&conversation), "Working");
+                    state.follow_run(run_id, Some(conversation), cx);
+                } else {
+                    state.sync_waiting_chrome(&conversation);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// After Continue, `follow_run` / SSE overwrite `message.parts` from the
@@ -6905,6 +7308,15 @@ impl AppState {
                     }
                     Err(err) => state.site_login_error = Some(err.to_string()),
                 }
+                state.site_logins_ready = true;
+                let ids: Vec<String> = state
+                    .conversations
+                    .iter()
+                    .map(|conversation| conversation.id.clone())
+                    .collect();
+                for id in ids {
+                    state.sweep_empty_vault_credential_requests(&id, cx);
+                }
                 cx.notify();
             });
         })
@@ -6996,13 +7408,38 @@ impl AppState {
         }
     }
 
-    fn remove_credential_request_part(&mut self, request_id: &str) {
+    fn conversation_id_for_credential_request(&self, request_id: &str) -> Option<String> {
+        self.conversations.iter().find_map(|conversation| {
+            conversation
+                .messages
+                .iter()
+                .flat_map(|message| message.parts.iter())
+                .any(|part| {
+                    matches!(
+                        part,
+                        ChatPart::CredentialRequest(spec) if spec.request_id == request_id
+                    )
+                })
+                .then(|| conversation.id.clone())
+        })
+    }
+
+    fn paint_credential_request_resolution(
+        &mut self,
+        request_id: &str,
+        resolution: CredentialRequestResolution,
+    ) {
+        self.credential_request_resolutions
+            .insert(request_id.to_string(), resolution);
         for conversation in &mut self.conversations {
             for message in &mut conversation.messages {
-                message.parts.retain(|part| match part {
-                    ChatPart::CredentialRequest(spec) => spec.request_id != request_id,
-                    _ => true,
-                });
+                for part in &mut message.parts {
+                    if let ChatPart::CredentialRequest(spec) = part
+                        && spec.request_id == request_id
+                    {
+                        spec.resolution = Some(resolution);
+                    }
+                }
             }
         }
     }
@@ -7080,8 +7517,12 @@ impl AppState {
         .detach();
     }
 
-    /// Confirm or deny `credential.request`. A.0 never types into Box and never
-    /// posts `filled` — that status is the session broker (A.1).
+    /// Confirm or deny `credential.request`. Folds the card immediately
+    /// (Dismissed / Used saved login / None saved), the way user-form
+    /// Continue/Dismiss leave a remnant. A.0 never types into Box and never
+    /// posts `filled` — that status is the session broker (A.1). Use saved
+    /// with no Settings→Logins row folds None saved (REST `missing`), not
+    /// Used.
     pub fn answer_credential_request(
         &mut self,
         request_id: String,
@@ -7091,31 +7532,58 @@ impl AppState {
         let Some(spec) = self.credential_request_spec(&request_id) else {
             return;
         };
+        if spec.is_settled() {
+            return;
+        }
+        let conversation_id = self
+            .conversation_id_for_credential_request(&request_id)
+            .or_else(|| self.active_conversation_id.clone());
+        let matching = self.has_matching_saved_login(&spec.origin, spec.username.as_deref());
+        let resolution = fold_credential_answer(allow, matching);
+        debug_assert_ne!(
+            resolution,
+            CredentialRequestResolution::Filled,
+            "A.0 must not fold Filled without the session broker"
+        );
+        self.paint_credential_request_resolution(&request_id, resolution);
+        if allow && !spec.run_id.is_empty() {
+            // Folded Used/Missing must not keep Waiting chrome; follow_run
+            // takes Working after the vault/broker result posts.
+            self.begin_responding(conversation_id.as_deref(), "Working");
+        } else if let Some(id) = conversation_id.as_deref() {
+            self.sync_waiting_chrome(id);
+        }
+        cx.notify();
         let vault = self.site_login_vault.clone();
         let agent_id = self.active_coworker_id.clone().unwrap_or_default();
         let client = self.opengrok.clone();
-        self.remove_credential_request_part(&request_id);
-        cx.notify();
+        let origin = registrable_origin(&spec.origin).unwrap_or_else(|| spec.origin.clone());
+        let username = spec.username.clone();
+        let run_id = spec.run_id.clone();
         cx.spawn(async move |this, cx| {
-            let (status, credential_id) = match vault {
-                None => (CredentialResultStatus::Error, None),
-                Some(vault) => {
-                    let row = vault
-                        .find(&spec.origin, spec.username.as_deref())
-                        .await
-                        .ok()
-                        .flatten();
-                    let have_meta = row.is_some();
-                    let have_secret = row
-                        .as_ref()
-                        .is_some_and(|row| vault.secret_present(&row.id));
-                    let status = result_without_broker(allow, have_meta, have_secret);
-                    debug_assert_ne!(
-                        status,
-                        CredentialResultStatus::Filled,
-                        "A.0 must not claim filled without the session broker"
-                    );
-                    (status, row.map(|row| row.id))
+            let (status, credential_id) = if !allow {
+                (CredentialResultStatus::Denied, None)
+            } else {
+                match vault {
+                    None => (CredentialResultStatus::Error, None),
+                    Some(vault) => {
+                        let row = vault
+                            .find(&origin, username.as_deref())
+                            .await
+                            .ok()
+                            .flatten();
+                        let have_meta = row.is_some();
+                        let have_secret = row
+                            .as_ref()
+                            .is_some_and(|row| vault.secret_present(&row.id));
+                        let status = result_without_broker(true, have_meta, have_secret);
+                        debug_assert_ne!(
+                            status,
+                            CredentialResultStatus::Filled,
+                            "A.0 must not claim filled without the session broker"
+                        );
+                        (status, row.map(|row| row.id))
+                    }
                 }
             };
             if let Some(client) = client {
@@ -7129,10 +7597,18 @@ impl AppState {
                     .await;
             }
             let _ = this.update(cx, |state, cx| {
-                if !spec.run_id.is_empty() {
-                    let conversation_id = state.active_conversation_id.clone();
+                // Use saved with no vault hit must not keep a success remnant.
+                if allow && status == CredentialResultStatus::Missing {
+                    state.paint_credential_request_resolution(
+                        &request_id,
+                        CredentialRequestResolution::Missing,
+                    );
+                }
+                // Not now must not restart Working; Use saved follows the
+                // parked run after the vault/broker result posts.
+                if allow && !run_id.is_empty() {
                     state.begin_responding(conversation_id.as_deref(), "Working");
-                    state.follow_run(spec.run_id.clone(), conversation_id, cx);
+                    state.follow_run(run_id, conversation_id, cx);
                 }
                 cx.notify();
             });
@@ -7514,22 +7990,11 @@ impl AppState {
             .detach();
         }
 
-        if self.has_open_approval(&conversation_id) || self.has_open_user_form(&conversation_id) {
-            // The card is this thread's, and so is the line saying what it is waiting for.
-            if self.has_open_user_form(&conversation_id) {
-                let run_id = self
-                    .live_turns
-                    .get(&conversation_id)
-                    .map(|turn| turn.run_id.clone())
-                    .unwrap_or_default();
-                self.park_waiting_for_you(&conversation_id, &run_id);
-            } else {
-                self.finish_responding(Some(&conversation_id), true);
-            }
-            cx.notify();
-            return;
-        }
-        if self.is_active_bot_responding() {
+        // Open form / approval / live Computer handoff used to paint this
+        // bubble and return. That is the orphan-steer bug: the order never
+        // reached OpenGrok. Composer send POSTs a real turn. A working turn
+        // with no HITL still keeps Stop.
+        if !self.composer_send_posts_turn(&conversation_id) {
             cx.notify();
             return;
         }
@@ -7573,7 +8038,7 @@ impl AppState {
                             || spec.effective_resolution() == Some(FormResolution::Sending)
                             || spec.live_computer_handoff()
                     }
-                    ChatPart::CredentialRequest(_) => true,
+                    ChatPart::CredentialRequest(spec) => spec.is_unresolved(),
                     _ => false,
                 })
         })
@@ -7648,32 +8113,24 @@ impl AppState {
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let next = match self.theme_mode.as_str() {
-            "light" => "dark",
-            "dark" => "system",
-            _ => "light",
-        };
+        use gpui_kit::component::{ActiveTheme, Theme};
+
+        let visually_dark = cx.has_global::<Theme>() && cx.theme().is_dark();
+        let next = crate::theme::next_toggle_mode(&self.theme_mode, visually_dark);
         self.set_theme_mode(next, cx);
     }
 
-    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
-        use gpui_kit::component::{Theme, ThemeRegistry};
+    pub fn restore_saved_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_mode = crate::theme::load_saved_mode();
+        crate::theme::apply_mode(&self.theme_mode, cx);
+        cx.notify();
+    }
 
-        self.theme_mode = mode.to_string();
-        let theme_name = match self.theme_mode.as_str() {
-            "light" => "macOS Classic Light",
-            "dark" => "macOS Classic Dark",
-            "system" => "macOS Classic Dark",
-            _ => "macOS Classic Light",
-        };
-        if let Some(theme) = ThemeRegistry::global(cx)
-            .themes()
-            .get(&SharedString::from(theme_name))
-            .cloned()
-        {
-            Theme::global_mut(cx).apply_config(&theme);
-            Theme::sync_base(cx);
-        }
+    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.theme_mode = crate::theme::normalize_mode(mode).to_string();
+        #[cfg(not(test))]
+        crate::theme::save_mode(&self.theme_mode);
+        crate::theme::apply_mode(&self.theme_mode, cx);
         cx.notify();
     }
 
@@ -8372,15 +8829,17 @@ mod tests {
     use super::{
         ActiveRecipe, ActivityTick, AppState, BotActivity, ChatMessage, ChatPart, Conversation,
         DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
-        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE,
-        STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler,
-        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
-        apply_reload, bot_status_line, graft_reply, is_status_line, is_tool_standin,
-        is_unsent_turn_note, missing_replies, overlay_server_cards, reads_as_gateway_unreachable,
-        reply_from_replay, restored_parts, saved_parts, stream_paint_due, stream_part_sig,
-        streaming_message_mut,
+        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
+        STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
+        TurnAssembler, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
+        apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
+        is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
+        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
+        stream_paint_due, stream_part_sig, streaming_message_mut,
     };
-    use crate::opengrok::{Failure, FormResolution, ModelEntry, OpenGrokClient};
+    use crate::opengrok::{
+        CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
+    };
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -8724,6 +9183,7 @@ mod tests {
                 origin: "google.com".into(),
                 username: Some("ada@example.com".into()),
                 run_id: "run-1".into(),
+                resolution: None,
             }),
         ];
         assert!(saved_parts(&live).is_empty());
@@ -8902,7 +9362,14 @@ mod tests {
                     format!("save-login {} {}", spec.origin, spec.username)
                 }
                 ChatPart::CredentialRequest(spec) => {
-                    format!("credential-request {} {}", spec.origin, spec.request_id)
+                    format!(
+                        "credential-request {} {} {}",
+                        spec.origin,
+                        spec.request_id,
+                        spec.resolution
+                            .map(|resolution| resolution.as_str())
+                            .unwrap_or("idle")
+                    )
                 }
             })
             .collect()
@@ -9941,6 +10408,182 @@ mod tests {
         assert_eq!(state.open_user_forms().len(), 1);
     }
 
+    /// Composer send while a form / approval / live handoff is open POSTs a
+    /// real OpenGrok turn. A working turn with no HITL still keeps Stop.
+    #[test]
+    fn composer_send_posts_turn_while_hitl_is_open() {
+        assert!(
+            crate::opengrok::HITL_INTERRUPT_AVAILABLE,
+            "wire stop_run; flip the gate only if OG predates /ag-ui/runs/{{id}}/stop"
+        );
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run_1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        assert!(state.has_open_user_form("cw_1"));
+        assert!(
+            state.composer_send_posts_turn("cw_1"),
+            "open form must POST a steer even while the stream is still registered"
+        );
+        assert_eq!(state.parked_hitl_run_id("cw_1").as_deref(), Some("run_1"));
+
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert!(!state.is_turn_in_flight());
+        assert!(!state.is_active_bot_responding());
+        assert!(state.composer_send_posts_turn("cw_1"));
+        assert_eq!(state.take_parked_hitl_run("cw_1").as_deref(), Some("run_1"));
+        assert_eq!(
+            state.parked_hitl_run_id("cw_1").as_deref(),
+            Some("run_1"),
+            "form run_id remains after the map is taken, so a second steer still stops"
+        );
+    }
+
+    #[test]
+    fn composer_send_posts_turn_while_approval_or_live_handoff_is_open() {
+        let approval = crate::opengrok::ApprovalSpec {
+            run_id: "run_1".into(),
+            call_id: "c1".into(),
+            tool: "Shell".into(),
+            command: "ls".into(),
+            why: String::new(),
+            reason: "exec-consent".into(),
+            output: None,
+            ok: None,
+        };
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::Approval(approval)];
+        let mut state = mid_turn(at(bot, 20));
+        state.finish_responding(Some("cw_1"), true);
+        assert!(state.has_open_approval("cw_1"));
+        assert!(
+            state.composer_send_posts_turn("cw_1"),
+            "open approval must POST a steer"
+        );
+
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Website login",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut form_bot = message("m_live", false, "");
+        form_bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut handoff = mid_turn(at(form_bot, 20));
+        handoff.park_waiting_for_you("cw_1", "run_1");
+        handoff.paint_user_form_resolution("e_form", FormResolution::Dismissed);
+        handoff.set_computer_handoff(
+            "e_form",
+            crate::opengrok::ComputerHandoffStatus::ActionNeeded,
+        );
+        assert!(
+            handoff.has_open_user_form("cw_1"),
+            "live Computer handoff is HITL"
+        );
+        assert!(handoff.composer_send_posts_turn("cw_1"));
+    }
+
+    #[test]
+    fn composer_send_keeps_stop_on_a_working_turn_without_hitl() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        assert!(state.is_active_bot_responding());
+        assert!(state.is_turn_in_flight());
+        assert!(
+            !state.composer_send_posts_turn("cw_1"),
+            "working turn with no form/approval/handoff still keeps Stop"
+        );
+        assert!(
+            state.take_hitl_interrupt_target("cw_1").is_none(),
+            "working turn with no HITL must not stop-then-send"
+        );
+    }
+
+    /// Cold "hi": no open HITL, no Waiting, no parked run. Composer POSTs
+    /// `/ag-ui` only — never `/ag-ui/runs/{id}/stop` of the run it just minted.
+    #[test]
+    fn cold_composer_send_does_not_stop_a_run() {
+        let mut state = AppState::new();
+        state
+            .conversations
+            .push(thread("cw_1", vec![at(message("m_hi", true, "hi"), 10)]));
+        state.active_conversation_id = Some("cw_1".to_string());
+        state.active_coworker_id = Some("cw_1".to_string());
+        assert!(!state.has_open_user_form("cw_1"));
+        assert!(!state.has_open_approval("cw_1"));
+        assert!(!state.has_hitl_to_interrupt("cw_1"));
+        assert!(state.parked_hitl_run_id("cw_1").is_none());
+        assert!(
+            state.take_hitl_interrupt_target("cw_1").is_none(),
+            "cold hi must not POST /stop"
+        );
+
+        let mut stale = AppState::new();
+        stale
+            .conversations
+            .push(thread("cw_1", vec![at(message("m_hi", true, "hi"), 10)]));
+        stale.active_conversation_id = Some("cw_1".to_string());
+        stale
+            .parked_hitl_runs
+            .insert("cw_1".into(), "01a0b381-stale".into());
+        assert!(
+            stale.take_hitl_interrupt_target("cw_1").is_none(),
+            "stale parked id without open HITL / Waiting must not stop"
+        );
+        assert!(
+            stale.parked_hitl_runs.get("cw_1").is_none(),
+            "stale map entry is dropped so the next hi cannot /stop"
+        );
+    }
+
+    #[test]
+    fn hitl_steer_stops_the_parked_run_not_the_new_mint() {
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run_1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert!(state.has_hitl_to_interrupt("cw_1"));
+        let parked = state.take_hitl_interrupt_target("cw_1");
+        assert_eq!(parked.as_deref(), Some("run_1"));
+        let new_run = "01a0b381-new-mint".to_string();
+        let interrupt = parked.filter(|id| id != &new_run);
+        assert_eq!(
+            interrupt.as_deref(),
+            Some("run_1"),
+            "steer stops the parked HITL run, never the run about to POST"
+        );
+    }
+
     #[test]
     fn skip_clears_waiting_when_no_open_form_or_handoff_remains() {
         let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
@@ -10257,13 +10900,235 @@ mod tests {
         assert_ne!(pending.resolution.as_str(), "e_form");
     }
 
+    fn facebook_credential_request() -> crate::opengrok::CredentialRequestSpec {
+        crate::opengrok::CredentialRequestSpec {
+            request_id: "req-fb".into(),
+            origin: "facebook.com".into(),
+            username: None,
+            run_id: "run_1".into(),
+            resolution: None,
+        }
+    }
+
+    fn demo_credential_request() -> crate::opengrok::CredentialRequestSpec {
+        crate::opengrok::CredentialRequestSpec {
+            request_id: "req-demo".into(),
+            origin: "http://127.0.0.1:8765/".into(),
+            username: Some("ada".into()),
+            run_id: "run_1".into(),
+            resolution: None,
+        }
+    }
+
+    fn saved_login_row(origin: &str, username: &str) -> crate::site_login::SiteLoginRecord {
+        crate::site_login::SiteLoginRecord {
+            id: format!("cred-{origin}-{username}"),
+            origin: origin.to_string(),
+            username: username.to_string(),
+            label: format!("{username} on {origin}"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        }
+    }
+
+    #[test]
+    fn not_now_folds_credential_request_and_clears_waiting() {
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert!(state.has_open_user_form("cw_1"));
+        assert!(state.has_hitl_to_interrupt("cw_1"));
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_credential_request_resolution("req-fb", CredentialRequestResolution::Denied);
+        state.sync_waiting_chrome("cw_1");
+
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "folded Dismissed is not open HITL"
+        );
+        assert!(
+            !state.has_hitl_to_interrupt("cw_1"),
+            "cold send must not /stop after Not now"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Denied));
+        assert_eq!(spec.pill(), Some("Dismissed"));
+        assert!(
+            state.conversations[0].messages.iter().any(|message| {
+                message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, ChatPart::CredentialRequest(_)))
+            }),
+            "Not now must leave a transcript remnant, not vanish"
+        );
+    }
+
+    #[test]
+    fn use_saved_folds_used_login_not_filled_without_broker() {
+        assert!(!crate::site_login::SESSION_BROKER_AVAILABLE);
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        state.paint_credential_request_resolution("req-fb", CredentialRequestResolution::Used);
+        state.sync_waiting_chrome("cw_1");
+
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Used));
+        assert_eq!(spec.pill(), Some("Used saved login"));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Filled));
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "Used remnant must not keep Waiting"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+    }
+
+    #[test]
+    fn graft_keeps_folded_credential_request_across_sse() {
+        let mut state = AppState::new();
+        state
+            .credential_request_resolutions
+            .insert("req-fb".into(), CredentialRequestResolution::Denied);
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert_eq!(spec.resolution, Some(CredentialRequestResolution::Denied));
+                assert_eq!(spec.pill(), Some("Dismissed"));
+                assert!(!spec.is_unresolved());
+            }
+            other => panic!("expected folded remnant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_drops_idle_credential_request_when_vault_has_no_row() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        assert!(
+            grafted.is_empty(),
+            "empty Settings→Logins must not offer Use saved: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn graft_keeps_idle_credential_request_when_origin_matches_a_login() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state
+            .site_logins
+            .push(saved_login_row("facebook.com", "ada"));
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert!(spec.is_unresolved());
+                assert_eq!(spec.origin, "facebook.com");
+            }
+            other => panic!("expected Use-saved card for a real vault row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_matches_demo_origin_url_to_saved_etld() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.site_logins.push(saved_login_row("127.0.0.1", "ada"));
+        let grafted =
+            state.graft_user_forms(vec![ChatPart::CredentialRequest(demo_credential_request())]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert!(spec.is_unresolved());
+                assert_eq!(spec.username.as_deref(), Some("ada"));
+            }
+            other => panic!("expected Use-saved for 127.0.0.1 demo row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_drops_named_username_that_does_not_match_the_row() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.site_logins.push(saved_login_row("127.0.0.1", "ada"));
+        let mut spec = demo_credential_request();
+        spec.username = Some("other".into());
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(spec)]);
+        assert!(
+            grafted.is_empty(),
+            "wrong username is not a vault hit: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn use_saved_with_no_row_folds_none_saved_not_used() {
+        assert!(!crate::site_login::SESSION_BROKER_AVAILABLE);
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.site_logins_ready = true;
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        let matching = state.has_matching_saved_login("facebook.com", None);
+        assert!(!matching);
+        state.paint_credential_request_resolution(
+            "req-fb",
+            crate::opengrok::fold_credential_answer(true, matching),
+        );
+        state.sync_waiting_chrome("cw_1");
+
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Missing));
+        assert_eq!(spec.pill(), Some("None saved"));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Used));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Filled));
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "None saved remnant must not keep Waiting"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+    }
+
+    #[test]
+    fn graft_does_not_reoffer_auto_missed_request_after_a_login_is_saved() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.credential_auto_missing.insert("req-fb".into());
+        state
+            .site_logins
+            .push(saved_login_row("facebook.com", "ada"));
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        assert!(
+            grafted.is_empty(),
+            "already-answered missing must not reopen: {grafted:?}"
+        );
+    }
+
     #[test]
     fn egress_tunnel_is_host_and_box_ready() {
         let mut state = AppState::new();
+        assert!(state.egress_tunnel_enabled, "Route traffic defaults ON");
         state.host_egress_tunnel_available = true;
         assert!(
             !state.egress_tunnel_available(),
             "host without a ready box is not a tunnel"
+        );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "unprovisioned hides Route traffic"
         );
         state.coworker_computer = Some(
             serde_json::from_value(serde_json::json!({
@@ -10283,6 +11148,7 @@ mod tests {
             .unwrap(),
         );
         assert!(!state.egress_tunnel_available());
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
         state.host_egress_tunnel_available = false;
         state.coworker_computer = Some(
             serde_json::from_value(serde_json::json!({
@@ -10294,22 +11160,116 @@ mod tests {
         );
         assert!(
             !state.egress_tunnel_available(),
-            "a ready box without host/env is not a tunnel"
+            "a ready box without host/env is not a Review-an-action tunnel"
         );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::BotPane,
+            "provisioned unique box still shows dedicated chrome without host intent"
+        );
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "url": "ws://127.0.0.1:8790" }
+            }))
+            .unwrap(),
+        );
+        state.host_egress_tunnel_available = true;
         assert!(
-            state.show_egress_tunnel_settings(),
-            "box ready still paints the Network row if the host poll missed"
+            state.egress_tunnel_available(),
+            "box tunnel URL is ready for Route traffic"
         );
         state.coworker_computer = None;
         state.host_egress_tunnel_available = true;
         assert!(!state.egress_tunnel_available());
-        assert!(
-            state.show_egress_tunnel_settings(),
-            "host intent paints the row while box status lags"
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "host intent without a provisioned box does not paint Route traffic"
         );
         state.host_egress_tunnel_available = false;
         state.egress_tunnel_enabled = true;
-        assert!(state.show_egress_tunnel_settings());
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "isEgressTunnelAvailable": true
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "host isEgressTunnelAvailable is not box provisioned"
+        );
+    }
+
+    #[test]
+    fn route_traffic_surface_follows_share_scope() {
+        fn computer(extra: serde_json::Value) -> crate::opengrok::CoworkerComputer {
+            let mut body = serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "boxId": "box_1",
+                "egress_tunnel": { "ready": true }
+            });
+            if let serde_json::Value::Object(map) = extra {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.extend(map);
+                }
+            }
+            serde_json::from_value(body).unwrap()
+        }
+        fn coworker(id: &str, box_id: &str) -> Coworker {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "name": id,
+                "boxId": box_id
+            }))
+            .unwrap()
+        }
+
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        state.coworkers = vec![coworker("cw_1", "box_1")];
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "dedicated"
+        })));
+        assert!(state.show_route_traffic_on_bot_pane());
+        assert!(!state.show_route_traffic_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "user"
+        })));
+        assert!(!state.show_route_traffic_on_bot_pane());
+        assert!(state.show_route_traffic_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "group",
+            "groupId": "grp_1"
+        })));
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "org"
+        })));
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+
+        state.coworker_computer = Some(computer(serde_json::json!({})));
+        state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_1")];
+        assert!(
+            state.show_route_traffic_in_user_settings(),
+            "missing shareScope + shared boxId is user-level Settings, not both panes"
+        );
+        assert!(!state.show_route_traffic_on_bot_pane());
+
+        state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_2")];
+        assert!(
+            state.show_route_traffic_on_bot_pane(),
+            "missing shareScope + unique box is dedicated pane chrome"
+        );
     }
 
     /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".

@@ -1,4 +1,5 @@
 use crate::actions::CloseSettings;
+use crate::chrome::TITLE_BAR_H;
 use crate::opengrok::LocalExecMode;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -23,17 +24,7 @@ impl Render for AppSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let (
-            tab,
-            chord,
-            theme_mode,
-            account_name,
-            account_email,
-            computers,
-            bot_name,
-            controls,
-            egress,
-        ) = {
+        let (tab, chord, theme_mode, account_name, account_email, computers, bot_name, controls) = {
             let state = self.state.read(cx);
             let (name, email) = state
                 .account
@@ -48,31 +39,7 @@ impl Render for AppSettings {
                 email,
                 state.computers.clone(),
                 state.active_bot_name(),
-                crate::components::computer::ComputerControls {
-                    present: state
-                        .coworker_computer
-                        .as_ref()
-                        .is_some_and(|s| s.state != "absent"),
-                    updating: state
-                        .coworker_computer
-                        .as_ref()
-                        .is_some_and(|s| s.updating()),
-                    stale: state
-                        .coworker_computer
-                        .as_ref()
-                        .is_some_and(|s| s.image_stale()),
-                    current: state
-                        .coworker_computer
-                        .as_ref()
-                        .and_then(|s| s.image.as_ref())
-                        .is_some_and(|image| !image.stale),
-                    error: state.computer_action_error.clone(),
-                },
-                (
-                    state.show_egress_tunnel_settings(),
-                    state.egress_tunnel_available(),
-                    state.egress_tunnel_enabled,
-                ),
+                crate::components::computer::ComputerControls::from_state(state),
             )
         };
         let app = self.state.clone();
@@ -133,7 +100,7 @@ impl Render for AppSettings {
                                     shortcuts_page(chord, muted, &theme).into_any_element()
                                 }
                                 AppSettingsTab::Computer => {
-                                    computer_page(computers, egress, muted, app.clone())
+                                    computer_page(computers, muted, app.clone(), cx)
                                         .into_any_element()
                                 }
                                 AppSettingsTab::Updates => {
@@ -170,15 +137,17 @@ impl AppSettings {
             .border_color(theme.border)
             .bg(theme.sidebar)
             .px(px(12.))
-            .py(px(16.))
+            .pb(px(16.))
             .gap(px(4.))
+            .child(div().id("app-settings-titlebar-spacer").h(px(TITLE_BAR_H)))
             .child(
-                div()
+                h_flex()
                     .id("app-settings-back")
+                    .w_full()
                     .px(px(10.))
-                    .py(px(8.))
-                    .mb(px(8.))
+                    .py(px(12.))
                     .rounded(px(8.))
+                    .items_center()
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(0x777777).opacity(0.16)))
                     .on_mouse_down(MouseButton::Left, {
@@ -281,7 +250,7 @@ fn logins_page(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child("Saved site logins. Passwords stay in the OS keychain and are never shown."),
+                .child("Saved site logins on this Mac. Passwords stay in the OS keychain (not OpenGrok). Use saved login is offered only when a row here matches the site."),
         )
         .when_some(error, |this, error| {
             this.child(
@@ -351,7 +320,8 @@ fn logins_page(
         })
 }
 
-/// The active bot's computer: Update (keeps files) and Reset (starts fresh), each two clicks.
+/// The active bot's computer: Update (keeps files). Reset lives on the
+/// Computer pane next to download — Settings no longer duplicates it.
 fn updates_page(
     bot_name: &str,
     controls: &crate::components::computer::ComputerControls,
@@ -364,7 +334,6 @@ fn updates_page(
         controls.updating,
         update_rest_label(controls.stale, controls.current),
     );
-    let reset_label = confirm_label(controls.updating, "Reset");
     let row = |title: String, detail: &'static str, button: Button| {
         h_flex()
             .w_full()
@@ -417,23 +386,6 @@ fn updates_page(
                             });
                         if controls.stale { button.primary() } else { button }
                     },
-                ))
-                .child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
-                .child(row(
-                    format!("Reset {bot_name}'s Computer"),
-                    "Start fresh if the computer gets stuck. Everything on it is lost.",
-                    Button::new("settings-computer-reset")
-                        .label(reset_label)
-                        .small()
-                        .disabled(!controls.present || controls.updating)
-                        .on_click({
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                app.update(cx, |state, cx| {
-                                    state.open_computer_confirm(crate::state::ComputerAction::Reset, cx)
-                                });
-                            }
-                        }),
                 )),
         )
         .when_some(controls.error.clone(), |this, error| {
@@ -670,24 +622,32 @@ fn theme_chip(
 
 fn computer_page(
     computers: Vec<crate::opengrok::ConnectedComputer>,
-    egress: (bool, bool, bool),
     muted: Hsla,
     app: Entity<AppState>,
+    cx: &App,
 ) -> impl IntoElement {
+    let show_route = app.read(cx).show_route_traffic_in_user_settings();
     let page = v_flex()
         .gap(px(12.))
-        .child(div().text_xs().text_color(muted).child("Computers"));
+        .when(show_route, |this| {
+            this.child(settings_route_traffic_row(app.clone(), muted, cx))
+        })
+        .child(div().text_xs().text_color(muted).child("This Mac"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(
+                    "Local-exec enrolment and policy. Each bot's screen and image updates are on that bot's Computer pane.",
+                ),
+        );
     if computers.is_empty() {
-        return page
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child("No computers yet. Stay signed in here and NativeChat enrols this Mac."),
-            )
-            .when(egress.0, |this| {
-                this.child(egress_tunnel_row(egress.1, egress.2, muted, app.clone()))
-            });
+        return page.child(
+            div()
+                .text_sm()
+                .text_color(muted)
+                .child("No computers yet. Stay signed in here and NativeChat enrols this Mac."),
+        );
     }
     let mut card = v_flex()
         .w_full()
@@ -701,31 +661,22 @@ fn computer_page(
         }
         card = card.child(computer_row(computer, muted, app.clone()));
     }
-    page.child(card).when(egress.0, |this| {
-        this.child(egress_tunnel_row(egress.1, egress.2, muted, app))
-    })
+    page.child(card)
 }
 
-fn egress_tunnel_row(
-    available: bool,
-    enabled: bool,
-    muted: Hsla,
-    app: Entity<AppState>,
-) -> impl IntoElement {
+fn settings_route_traffic_row(app: Entity<AppState>, muted: Hsla, cx: &App) -> impl IntoElement {
+    let enabled = app.read(cx).egress_tunnel_enabled;
     let description = if enabled {
-        "New connections from this Bot's computer go out through this desktop."
-    } else if available {
-        "Route web traffic from this Bot's computer out through this desktop instead of the cloud. Applies to new connections."
+        "New connections from Bots that share this computer go out through this desktop."
     } else {
-        "This Bot's computer wasn't provisioned with the egress tunnel — start a new one to use this."
+        "Route web traffic from Bots that share this computer out through this desktop instead of the cloud. Applies to new connections."
     };
-    let can_toggle = available || enabled;
     v_flex()
         .id("route-traffic-this-computer")
         .w_full()
         .px(px(16.))
         .py(px(14.))
-        .gap(px(8.))
+        .gap(px(6.))
         .rounded(px(12.))
         .border_1()
         .border_color(rgb(0x777777).opacity(0.24))
@@ -746,11 +697,13 @@ fn egress_tunnel_row(
                 .child(
                     Switch::new("egress-tunnel-enabled")
                         .checked(enabled)
-                        .disabled(!can_toggle)
-                        .on_click(move |checked, _, cx| {
-                            app.update(cx, |state, cx| {
-                                state.set_egress_tunnel_enabled(*checked, cx);
-                            });
+                        .on_click({
+                            let app = app.clone();
+                            move |checked, _, cx| {
+                                app.update(cx, |state, cx| {
+                                    state.set_egress_tunnel_enabled(*checked, cx);
+                                });
+                            }
                         }),
                 ),
         )

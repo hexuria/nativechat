@@ -13,9 +13,9 @@ use crate::opengrok::{
     computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
     computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
     computer_window_attention_skip_id, credential_request_allow_id, credential_request_card_id,
-    credential_request_deny_id, save_login_card_id, save_login_save_id, save_login_skip_id,
-    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
-    user_form_pill_id, user_form_screen_id,
+    credential_request_deny_id, credential_request_pill_id, save_login_card_id, save_login_save_id,
+    save_login_skip_id, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
+    user_form_field_id, user_form_pill_id, user_form_screen_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -105,6 +105,7 @@ pub enum Command {
     OpenComputerConfirm(crate::state::ComputerAction),
     ConfirmComputerAction,
     CancelComputerConfirm,
+    SetEgressTunnelEnabled(bool),
     /// The Recipes page: open it, filter it, open one recipe, answer a share, go back.
     OpenRecipes,
     SetRecipesFilter(crate::state::RecipeFilter),
@@ -173,6 +174,7 @@ pub enum Command {
         allow: bool,
     },
     SetAppSettingsTab(crate::state::AppSettingsTab),
+    CloseAppSettings,
     Shutdown,
 }
 
@@ -212,6 +214,7 @@ impl Command {
             Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
             Self::ConfirmComputerAction => state.confirm_computer_action(cx),
             Self::CancelComputerConfirm => state.close_computer_confirm(cx),
+            Self::SetEgressTunnelEnabled(enabled) => state.set_egress_tunnel_enabled(enabled, cx),
             Self::OpenRecipes => state.open_recipes(cx),
             Self::SetRecipesFilter(filter) => state.set_recipes_filter(filter, cx),
             Self::OpenRecipe(id) => state.open_recipe(id, cx),
@@ -264,6 +267,11 @@ impl Command {
                 state.answer_credential_request(request_id, allow, cx)
             }
             Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
+            Self::CloseAppSettings => {
+                if state.is_app_settings_open {
+                    state.toggle_app_settings(cx);
+                }
+            }
             Self::Shutdown => {}
         }
     }
@@ -607,6 +615,8 @@ struct CredentialRequestSnap {
     request_id: String,
     origin: String,
     username: Option<String>,
+    /// None = idle (Use saved / Not now). Some = folded pill copy.
+    pill: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -684,15 +694,21 @@ fn credential_request_node(request: &CredentialRequestSnap) -> UiNode {
         Some(username) => format!("Use saved login for {} as {}?", request.origin, username),
         None => format!("Use a saved login for {}?", request.origin),
     };
-    UiNode::dialog(credential_request_card_id(&request.request_id), title)
-        .with_child(UiNode::button(
-            credential_request_allow_id(&request.request_id),
-            "Use saved login",
-        ))
-        .with_child(UiNode::button(
-            credential_request_deny_id(&request.request_id),
-            "Not now",
-        ))
+    let card = UiNode::dialog(credential_request_card_id(&request.request_id), title);
+    if let Some(pill) = &request.pill {
+        return card.with_child(UiNode::status(
+            credential_request_pill_id(&request.request_id),
+            pill.clone(),
+        ));
+    }
+    card.with_child(UiNode::button(
+        credential_request_allow_id(&request.request_id),
+        "Use saved login",
+    ))
+    .with_child(UiNode::button(
+        credential_request_deny_id(&request.request_id),
+        "Not now",
+    ))
 }
 
 fn site_login_node(login: &SiteLoginSnap) -> UiNode {
@@ -706,7 +722,6 @@ fn site_login_node(login: &SiteLoginSnap) -> UiNode {
     ))
 }
 
-/// `approval-<call_id>-<verb>` → the answer it stands for.
 /// A recipe row's id, and only a row's. Every control on the recipe page is named
 /// `recipe-<something>` too, so a bare prefix match turned a click on a version tab into a
 /// fetch of a recipe called "version-1" — the page then said "no such recipe" and the driver
@@ -716,6 +731,7 @@ fn recipe_row_target(target: &str) -> Option<String> {
     rest.starts_with("rcp_").then(|| rest.to_string())
 }
 
+/// `approval-<call_id>-<verb>` → the answer it stands for.
 fn approval_target(target: &str) -> Option<(String, LocalExecResolution)> {
     let rest = target.strip_prefix("approval-")?;
     let verbs = [
@@ -729,6 +745,44 @@ fn approval_target(target: &str) -> Option<(String, LocalExecResolution)> {
             .filter(|call_id| !call_id.is_empty())
             .map(|call_id| (call_id.to_string(), *resolution))
     })
+}
+
+fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        args.get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn parse_invoke_allow(args: &serde_json::Value) -> Result<bool, String> {
+    if let Some(value) = args.get("allow") {
+        if let Some(flag) = value.as_bool() {
+            return Ok(flag);
+        }
+        if let Some(word) = value.as_str() {
+            return parse_allow_word(word).ok_or_else(|| format!("unknown allow `{word}`"));
+        }
+        if let Some(n) = value.as_i64() {
+            return Ok(n != 0);
+        }
+    }
+    if let Some(word) = args.get("answer").and_then(|value| value.as_str()) {
+        return parse_allow_word(word).ok_or_else(|| format!("unknown answer `{word}`"));
+    }
+    Err("AnswerCredentialRequest requires arg allow".into())
+}
+
+fn parse_allow_word(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "allow" | "yes" | "use" | "used" | "saved" => Some(true),
+        "false" | "deny" | "no" | "dismiss" | "dismissed" | "not now" | "not-now" | "skip" => {
+            Some(false)
+        }
+        _ => None,
+    }
 }
 
 /// `Default` is the host with nothing in it — signed out, no sessions, no panel. Typing ops
@@ -809,8 +863,13 @@ pub struct NativeChatHost {
     credential_requests: Vec<CredentialRequestSnap>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
-    /// Settings → Computers: Route traffic row, when host/env/box says to show it.
-    route_traffic_visible: bool,
+    computer_tab: bool,
+    updates_tab: bool,
+    /// Dedicated provisioned box: Route traffic icon on the Computer pane.
+    route_traffic_on_bot_pane: bool,
+    /// User-scope / shared box: Route traffic on Settings → Computer.
+    route_traffic_in_user_settings: bool,
+    egress_tunnel_enabled: bool,
     /// Box `egress_tunnel.ready` when the computer JSON exposed it.
     egress_tunnel_ready: Option<bool>,
     pending: Option<Command>,
@@ -1091,6 +1150,7 @@ impl NativeChatHost {
                                 request_id: spec.request_id.clone(),
                                 origin: spec.origin.clone(),
                                 username: spec.username.clone(),
+                                pill: spec.pill().map(str::to_string),
                             }),
                             _ => None,
                         })
@@ -1107,7 +1167,11 @@ impl NativeChatHost {
                 })
                 .collect(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
-            route_traffic_visible: state.show_egress_tunnel_settings(),
+            computer_tab: state.app_settings_tab == AppSettingsTab::Computer,
+            updates_tab: state.app_settings_tab == AppSettingsTab::Updates,
+            route_traffic_on_bot_pane: state.show_route_traffic_on_bot_pane(),
+            route_traffic_in_user_settings: state.show_route_traffic_in_user_settings(),
+            egress_tunnel_enabled: state.egress_tunnel_enabled,
             egress_tunnel_ready: state
                 .coworker_computer
                 .as_ref()
@@ -1286,6 +1350,13 @@ impl NativeChatHost {
                 "computer-reset",
                 self.computer_reset_label.clone(),
             ));
+        if self.computer_open && self.route_traffic_on_bot_pane {
+            computer = computer.with_child(UiNode::new(
+                "route-traffic-this-computer",
+                "switch",
+                "Route traffic through this computer",
+            ));
+        }
         if let Some(handoff) = self
             .computer_handoffs
             .iter()
@@ -1381,14 +1452,10 @@ impl NativeChatHost {
                     .with_child({
                         let mut settings = UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
                             .with_visible(self.account_open)
+                            .with_child(UiNode::button("app-settings-back", "← Back to app"))
+                            .with_child(UiNode::button("settings-tab-computer", "Computer"))
+                            .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"));
-                        if self.route_traffic_visible {
-                            settings = settings.with_child(UiNode::new(
-                                "route-traffic-this-computer",
-                                "switch",
-                                "Route traffic through this computer",
-                            ));
-                        }
                         if self.logins_tab {
                             if self.site_logins.is_empty() {
                                 settings = settings.with_child(UiNode::status(
@@ -1399,6 +1466,19 @@ impl NativeChatHost {
                             for login in &self.site_logins {
                                 settings = settings.with_child(site_login_node(login));
                             }
+                        }
+                        if self.updates_tab {
+                            settings = settings.with_child(UiNode::button(
+                                "settings-computer-update",
+                                self.computer_update_label.clone(),
+                            ));
+                        }
+                        if self.computer_tab && self.route_traffic_in_user_settings {
+                            settings = settings.with_child(UiNode::new(
+                                "route-traffic-this-computer",
+                                "switch",
+                                "Route traffic through this computer",
+                            ));
                         }
                         settings
                     })
@@ -1644,6 +1724,9 @@ impl NativeChatHost {
 
     fn credential_request_command(&self, target: &str) -> Option<Command> {
         for request in &self.credential_requests {
+            if request.pill.is_some() {
+                continue;
+            }
             if target == credential_request_allow_id(&request.request_id) {
                 return Some(Command::AnswerCredentialRequest {
                     request_id: request.request_id.clone(),
@@ -1836,6 +1919,18 @@ impl NativeChatHost {
             cmd
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
+        } else if target == "settings-tab-computer" {
+            Command::SetAppSettingsTab(AppSettingsTab::Computer)
+        } else if target == "settings-tab-updates" {
+            Command::SetAppSettingsTab(AppSettingsTab::Updates)
+        } else if target == "app-settings-back" {
+            Command::CloseAppSettings
+        } else if target == "computer-update" || target == "settings-computer-update" {
+            Command::OpenComputerConfirm(crate::state::ComputerAction::Update)
+        } else if target == "computer-reset" {
+            Command::OpenComputerConfirm(crate::state::ComputerAction::Reset)
+        } else if target == "route-traffic-this-computer" || target == "egress-tunnel-enabled" {
+            Command::SetEgressTunnelEnabled(!self.egress_tunnel_enabled)
         } else if let Some(id) = self.site_login_delete_target(target) {
             Command::DeleteSiteLogin { id }
         } else if let Some((card_key, field_id, kind, value)) = self.user_form_field(target) {
@@ -1979,6 +2074,66 @@ impl NativeChatHost {
         }
     }
 
+    fn invoke_user_form_card_key(&self, args: &serde_json::Value) -> Result<String, String> {
+        if let Some(key) = invoke_arg_str(args, &["card_key", "cardKey", "id"]) {
+            if self.user_forms.iter().any(|form| form.card_key == key) {
+                return Ok(key);
+            }
+            return Err(format!("no user-form `{key}`"));
+        }
+        let idle: Vec<&UserFormSnap> = self
+            .user_forms
+            .iter()
+            .filter(|form| form.pill.is_none())
+            .collect();
+        match idle.as_slice() {
+            [one] => Ok(one.card_key.clone()),
+            [] => Err("no idle user-form".into()),
+            _ => Err("user-form invoke requires arg card_key".into()),
+        }
+    }
+
+    fn invoke_credential_answer(&self, args: &serde_json::Value) -> Result<(String, bool), String> {
+        let mut allow = parse_invoke_allow(args).ok();
+        let mut request_id = invoke_arg_str(args, &["request_id", "requestId", "id"]);
+        if let Some(raw) = request_id.clone() {
+            if let Some(id) = raw.strip_prefix("credential-request-allow-") {
+                request_id = Some(id.to_string());
+                allow = Some(true);
+            } else if let Some(id) = raw.strip_prefix("credential-request-deny-") {
+                request_id = Some(id.to_string());
+                allow = Some(false);
+            }
+        }
+        let allow =
+            allow.ok_or_else(|| "AnswerCredentialRequest requires arg allow".to_string())?;
+        let request_id = match request_id {
+            Some(id) => id,
+            None => {
+                let idle: Vec<&CredentialRequestSnap> = self
+                    .credential_requests
+                    .iter()
+                    .filter(|request| request.pill.is_none())
+                    .collect();
+                match idle.as_slice() {
+                    [one] => one.request_id.clone(),
+                    [] => return Err("no open credential.request".into()),
+                    _ => {
+                        return Err("AnswerCredentialRequest requires arg request_id".into());
+                    }
+                }
+            }
+        };
+        if !self
+            .credential_requests
+            .iter()
+            .any(|request| request.request_id == request_id && request.pill.is_none())
+        {
+            return Err(format!("no open credential.request `{request_id}`"));
+        }
+        Ok((request_id, allow))
+    }
+
     fn invoke(&mut self, name: &str, args: &serde_json::Value) -> Result<DispatchResult, String> {
         let cmd = match name {
             "chat.new" => Command::NewChat,
@@ -2073,6 +2228,19 @@ impl NativeChatHost {
                     call_id,
                     resolution,
                 }
+            }
+            "UserFormContinue" | "user-form.continue" => Command::UserFormContinue {
+                card_key: self.invoke_user_form_card_key(args)?,
+            },
+            "UserFormDismiss" | "user-form.dismiss" => Command::UserFormDismiss {
+                card_key: self.invoke_user_form_card_key(args)?,
+            },
+            "UserFormOpenScreen" | "user-form.screen" => Command::UserFormOpenScreen {
+                card_key: self.invoke_user_form_card_key(args)?,
+            },
+            "AnswerCredentialRequest" | "credential.answer" => {
+                let (request_id, allow) = self.invoke_credential_answer(args)?;
+                Command::AnswerCredentialRequest { request_id, allow }
             }
             other => return Err(format!("unknown invoke `{other}`")),
         };
@@ -2947,12 +3115,15 @@ mod tests {
             request_id: "req-9".into(),
             origin: "google.com".into(),
             username: Some("ada@example.com".into()),
+            pill: None,
         }];
         let tree = host.snapshot();
         assert!(tree.find("save-login-e_form").is_some());
         assert!(tree.find("save-login-save-e_form").is_some());
         assert!(tree.find("save-login-skip-e_form").is_some());
         assert!(tree.find("credential-request-req-9").is_some());
+        assert!(tree.find("credential-request-allow-req-9").is_some());
+        assert!(tree.find("credential-request-deny-req-9").is_some());
         let dump = format!("{tree:?}");
         assert!(!dump.contains("s3cret"));
         host.dispatch(&Op::click("save-login-save-e_form")).unwrap();
@@ -2966,6 +3137,126 @@ mod tests {
             Some(Command::AnswerCredentialRequest { allow: true, .. }) => {}
             other => panic!("expected confirm, not a Box fill: {other:?}"),
         }
+        host.dispatch(&Op::click("credential-request-deny-req-9"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::AnswerCredentialRequest {
+                allow: false,
+                request_id,
+            }) => assert_eq!(request_id, "req-9"),
+            other => panic!("expected Not now via click, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answer_credential_request_is_a_named_invoke() {
+        let mut host = host();
+        host.credential_requests = vec![CredentialRequestSnap {
+            request_id: "req-9".into(),
+            origin: "facebook.com".into(),
+            username: None,
+            pill: None,
+        }];
+        host.dispatch(&Op::Invoke {
+            name: "AnswerCredentialRequest".into(),
+            args: serde_json::json!({ "request_id": "req-9", "allow": true }),
+        })
+        .unwrap();
+        match host.take_command() {
+            Some(Command::AnswerCredentialRequest {
+                request_id,
+                allow: true,
+            }) => assert_eq!(request_id, "req-9"),
+            other => panic!("expected Use saved invoke, got {other:?}"),
+        }
+        host.dispatch(&Op::Invoke {
+            name: "AnswerCredentialRequest".into(),
+            args: serde_json::json!({ "allow": false }),
+        })
+        .unwrap();
+        match host.take_command() {
+            Some(Command::AnswerCredentialRequest { allow: false, .. }) => {}
+            other => panic!("expected Not now invoke, got {other:?}"),
+        }
+        host.dispatch(&Op::Invoke {
+            name: "credential.answer".into(),
+            args: serde_json::json!({ "requestId": "req-9", "answer": "deny" }),
+        })
+        .unwrap();
+        match host.take_command() {
+            Some(Command::AnswerCredentialRequest { allow: false, .. }) => {}
+            other => panic!("expected kebab deny, got {other:?}"),
+        }
+        let unknown = host
+            .dispatch(&Op::Invoke {
+                name: "NotACommand".into(),
+                args: serde_json::json!({}),
+            })
+            .unwrap_err();
+        assert!(
+            unknown.contains("unknown invoke"),
+            "stray names still fail closed: {unknown}"
+        );
+    }
+
+    #[test]
+    fn user_form_continue_and_dismiss_are_named_invokes() {
+        let mut host = host();
+        host.user_forms = vec![google_login_form()];
+        host.dispatch(&Op::Invoke {
+            name: "UserFormContinue".into(),
+            args: serde_json::json!({ "card_key": "e_form" }),
+        })
+        .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormContinue { card_key }) => assert_eq!(card_key, "e_form"),
+            other => panic!("expected Continue invoke, got {other:?}"),
+        }
+        host.dispatch(&Op::Invoke {
+            name: "UserFormDismiss".into(),
+            args: serde_json::json!({}),
+        })
+        .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormDismiss { card_key }) => assert_eq!(card_key, "e_form"),
+            other => panic!("expected Dismiss invoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folded_credential_request_exposes_pill_not_buttons() {
+        let mut host = host();
+        host.credential_requests = vec![CredentialRequestSnap {
+            request_id: "req-9".into(),
+            origin: "facebook.com".into(),
+            username: None,
+            pill: Some("Dismissed".into()),
+        }];
+        let tree = host.snapshot();
+        assert!(tree.find("credential-request-req-9").is_some());
+        assert_eq!(
+            tree.find("credential-request-pill-req-9").unwrap().name,
+            "Dismissed"
+        );
+        assert!(tree.find("credential-request-allow-req-9").is_none());
+        assert!(tree.find("credential-request-deny-req-9").is_none());
+        let click = host
+            .dispatch(&Op::click("credential-request-deny-req-9"))
+            .unwrap_err();
+        assert!(
+            click.contains("unknown click target"),
+            "folded Not now must not stay clickable: {click}"
+        );
+        let invoke = host
+            .dispatch(&Op::Invoke {
+                name: "AnswerCredentialRequest".into(),
+                args: serde_json::json!({ "request_id": "req-9", "allow": false }),
+            })
+            .unwrap_err();
+        assert!(
+            invoke.contains("no open credential.request"),
+            "invoke must not fire on a folded card: {invoke}"
+        );
     }
 
     #[test]
@@ -2992,20 +3283,81 @@ mod tests {
     }
 
     #[test]
-    fn settings_shows_route_traffic_row_when_visible() {
+    fn dedicated_route_traffic_is_computer_pane_not_settings() {
         let mut host = host();
         host.account_open = true;
-        host.route_traffic_visible = false;
+        host.computer_tab = true;
+        host.route_traffic_on_bot_pane = true;
         assert!(
             host.snapshot()
                 .find("route-traffic-this-computer")
-                .is_none()
+                .is_none(),
+            "Settings must not host dedicated Route traffic"
         );
-        host.route_traffic_visible = true;
+        host.computer_open = true;
         assert!(
             host.snapshot()
                 .find("route-traffic-this-computer")
                 .is_some()
         );
+        host.dispatch(&Op::click("route-traffic-this-computer"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetEgressTunnelEnabled(true))
+        ));
+    }
+
+    #[test]
+    fn unprovisioned_hides_route_traffic() {
+        let mut host = host();
+        host.computer_open = true;
+        host.account_open = true;
+        host.computer_tab = true;
+        assert!(
+            host.snapshot()
+                .find("route-traffic-this-computer")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn user_scope_route_traffic_is_settings_computer_not_bot_pane() {
+        let mut host = host();
+        host.computer_open = true;
+        host.route_traffic_in_user_settings = true;
+        assert!(
+            host.snapshot()
+                .find("route-traffic-this-computer")
+                .is_none(),
+            "shared/user-scope Route traffic must not duplicate on every bot pane"
+        );
+        host.account_open = true;
+        host.computer_tab = true;
+        assert!(
+            host.snapshot()
+                .find("route-traffic-this-computer")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn settings_updates_has_update_and_no_reset() {
+        let mut host = host();
+        host.account_open = true;
+        host.updates_tab = true;
+        let tree = host.snapshot();
+        assert!(tree.find("settings-tab-updates").is_some());
+        assert!(tree.find("settings-computer-update").is_some());
+        assert!(
+            tree.find("settings-computer-reset").is_none(),
+            "Reset lives on the Computer pane, not Settings → Updates"
+        );
+        assert!(tree.find("computer-reset").is_some());
+        host.dispatch(&Op::click("settings-tab-updates")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetAppSettingsTab(AppSettingsTab::Updates))
+        ));
     }
 }

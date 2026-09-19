@@ -16,10 +16,11 @@ pub use activity::{
 };
 pub use credential::{
     CREDENTIAL_OFFER_SAVE, CREDENTIAL_REQUEST, CREDENTIAL_RESULT, CREDENTIAL_RESULT_PATH,
-    CredentialRequestSpec, CredentialResultStatus, SaveLoginSpec, credential_request_allow_id,
-    credential_request_card_id, credential_request_deny_id, credential_result_body,
-    keep_local_save_offer, result_without_broker, save_login_card_id, save_login_from_local,
-    save_login_save_id, save_login_skip_id,
+    CredentialRequestResolution, CredentialRequestSpec, CredentialResultStatus, SaveLoginSpec,
+    credential_request_allow_id, credential_request_card_id, credential_request_deny_id,
+    credential_request_pill_id, credential_result_body, fold_credential_answer,
+    keep_credential_request_offer, keep_local_save_offer, result_without_broker,
+    save_login_card_id, save_login_from_local, save_login_save_id, save_login_skip_id,
 };
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, CompletedUiTool, FormField, FormSpec,
@@ -31,8 +32,8 @@ pub use gen_ui::{
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use user_form::{
     BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, ComputerHandoffSpec,
-    ComputerHandoffStatus, FORM_ENTRY_MISSING, FormResolution, MASKED_PRESENCE_STUB,
-    REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
+    ComputerHandoffStatus, FORM_ENTRY_MISSING, FormResolution, HITL_INTERRUPT_AVAILABLE,
+    MASKED_PRESENCE_STUB, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
     USER_FORM_SERVER_FILL_AVAILABLE, USER_FORM_SUBMIT_PATH, UserFormActionReply,
     UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormHttpSettle, UserFormSpec,
     UserFormValues, UserFormVerb, WAITING_FOR_YOU, bind_call_peers, box_handoff_action_from_http,
@@ -49,13 +50,13 @@ pub use user_form::{
 pub use visibility::ImageVisibility;
 
 pub use client::{
-    ConnectedComputer, CoworkerComputer, EgressTunnel, ImageStatus, LocalExecMode, OpenGrokClient,
-    QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind, RecipeParameter,
-    RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare,
-    RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent,
-    RecipeVersion, RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus,
-    collapse_computer_roster, collapse_computers_by_machine_id, env_egress_tunnel_enabled,
-    host_egress_tunnel_enabled, thin_tape,
+    BoxShareScope, ConnectedComputer, CoworkerComputer, EgressTunnel, ImageStatus, LocalExecMode,
+    OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind,
+    RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen,
+    RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape,
+    RecipeTapeEvent, RecipeVersion, RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe,
+    UpdateStatus, collapse_computer_roster, collapse_computers_by_machine_id,
+    env_egress_tunnel_enabled, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
 pub use types::{

@@ -54,6 +54,31 @@ fn host_of(raw: &str) -> Option<String> {
     }
 }
 
+/// eTLD+1 equality so `facebook.com` matches `https://www.facebook.com/login`.
+pub fn origins_match(left: &str, right: &str) -> bool {
+    match (registrable_origin(left), registrable_origin(right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => left.trim().eq_ignore_ascii_case(right.trim()),
+    }
+}
+
+/// Settings→Logins row vs `credential.request`. Username `None` means any
+/// row for the origin; a named username must match exactly.
+pub fn login_matches_request(
+    row_origin: &str,
+    row_username: &str,
+    origin: &str,
+    username: Option<&str>,
+) -> bool {
+    if !origins_match(row_origin, origin) {
+        return false;
+    }
+    match username.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(want) => row_username == want,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +102,39 @@ mod tests {
             Some("localhost")
         );
         assert_eq!(registrable_origin("").as_deref(), None);
+    }
+
+    #[test]
+    fn request_origin_matches_saved_etld() {
+        assert!(origins_match(
+            "facebook.com",
+            "https://www.facebook.com/login"
+        ));
+        assert!(origins_match("127.0.0.1", "http://127.0.0.1:8765/"));
+        assert!(!origins_match("facebook.com", "google.com"));
+        assert!(login_matches_request(
+            "facebook.com",
+            "ada",
+            "https://www.facebook.com",
+            None
+        ));
+        assert!(login_matches_request(
+            "facebook.com",
+            "ada",
+            "facebook.com",
+            Some("ada")
+        ));
+        assert!(!login_matches_request(
+            "facebook.com",
+            "ada",
+            "facebook.com",
+            Some("other")
+        ));
+        assert!(!login_matches_request(
+            "google.com",
+            "ada",
+            "facebook.com",
+            None
+        ));
     }
 }

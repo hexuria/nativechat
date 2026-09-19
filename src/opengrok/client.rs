@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
+use futures::future::{FutureExt, Shared};
 use reqwest::cookie::{CookieStore, Jar};
 use reqwest::header::{ACCEPT, CACHE_CONTROL, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::error::OpenGrokError;
 use super::types::{
@@ -47,12 +49,34 @@ fn needs_refresh(seconds_left: Option<i64>) -> bool {
     }
 }
 
+/// Cloneable result of one `/auth/refresh` so concurrent callers can join
+/// the same in-flight POST.
+#[derive(Clone)]
+enum RefreshOutcome {
+    Ok,
+    Failed {
+        status: Option<u16>,
+        message: String,
+    },
+}
+
+type RefreshShared = Shared<futures::future::BoxFuture<'static, RefreshOutcome>>;
+
 #[derive(Clone)]
 pub struct OpenGrokClient {
     base: Url,
     http: Client,
     jar: Arc<Jar>,
     session_path: Option<PathBuf>,
+    /// Single-flight `/auth/refresh`. Concurrent `ensure_fresh_token` / 401
+    /// retry must await this instead of each POSTing: the first 200 rotates
+    /// the refresh cookie, and a second POST with the old cookie is 401 and
+    /// used to `clear_session` (SignedOut banner).
+    ///
+    /// OpenGrok today: one-time rotate. They are shipping a short grace so
+    /// presenting the just-rotated-away refresh returns the current pair
+    /// (idempotent). NativeChat single-flight is still required either way.
+    refresh_flight: Arc<AsyncMutex<Option<RefreshShared>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,6 +100,7 @@ impl OpenGrokClient {
             http,
             jar,
             session_path: None,
+            refresh_flight: Arc::new(AsyncMutex::new(None)),
         })
     }
 
@@ -251,6 +276,12 @@ impl OpenGrokClient {
         }
     }
 
+    /// Access cookie is present and not inside [`REFRESH_SLACK`]. After a
+    /// joined refresh, waiters see this and must not POST again or clear.
+    fn has_fresh_access(&self) -> bool {
+        self.access_token().is_some() && !needs_refresh(self.token_seconds_left())
+    }
+
     fn url(&self, path: &str) -> Result<Url, OpenGrokError> {
         self.base
             .join(path)
@@ -370,25 +401,81 @@ impl OpenGrokClient {
 
     /// Trade the refresh cookie for a new access token. Sent directly rather than through
     /// `send_json`, which would refresh before refreshing.
+    ///
+    /// Single-flight: concurrent callers await one POST. A second `/auth/refresh`
+    /// with the cookie the first just rotated is 401 today (OpenGrok one-time
+    /// rotate) and must not `clear_session` if the jar already holds a new pair.
+    /// OG short grace (idempotent current pair for the just-rotated-away
+    /// refresh) does not replace this join.
     pub async fn refresh(&self) -> Result<(), OpenGrokError> {
-        let url = self.url("/auth/refresh")?;
+        let shared = {
+            let mut flight = self.refresh_flight.lock().await;
+            if let Some(shared) = flight.as_ref() {
+                shared.clone()
+            } else if self.has_fresh_access() {
+                return Ok(());
+            } else {
+                let this = self.clone();
+                let shared = async move { this.refresh_once().await }.boxed().shared();
+                *flight = Some(shared.clone());
+                shared
+            }
+        };
+        let outcome = shared.await;
+        {
+            let mut flight = self.refresh_flight.lock().await;
+            *flight = None;
+        }
+        match outcome {
+            RefreshOutcome::Ok => Ok(()),
+            RefreshOutcome::Failed { status, message } => {
+                Err(OpenGrokError::from_server(status, message))
+            }
+        }
+    }
+
+    async fn refresh_once(&self) -> RefreshOutcome {
+        let url = match self.url("/auth/refresh") {
+            Ok(url) => url,
+            Err(error) => {
+                return RefreshOutcome::Failed {
+                    status: error.status,
+                    message: error.message,
+                };
+            }
+        };
         let mut req = self.http.post(url);
         if let Some(token) = self.access_token() {
             req = req.bearer_auth(token);
         }
-        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = OpenGrokError::transport(&error);
+                return RefreshOutcome::Failed {
+                    status: mapped.status,
+                    message: mapped.message,
+                };
+            }
+        };
         if response.status().is_success() {
             self.save_session();
-            Ok(())
-        } else {
-            let error = Self::read_error(response).await;
+            return RefreshOutcome::Ok;
+        }
+        let error = Self::read_error(response).await;
+        if error.is_unauthorized() {
+            // Concurrent refresh already wrote a new pair. Do not throw it away.
+            if self.has_fresh_access() {
+                return RefreshOutcome::Ok;
+            }
             // "session expired": the refresh token is gone, so the saved session is worthless
             // and every later request would try this again. Forget it; the next request fails
             // plainly with 401 and the person signs in.
-            if error.is_unauthorized() {
-                self.clear_session();
-            }
-            Err(error)
+            self.clear_session();
+        }
+        RefreshOutcome::Failed {
+            status: error.status,
+            message: error.message,
         }
     }
 
@@ -1436,6 +1523,29 @@ impl LocalExecMode {
     }
 }
 
+/// Who owns this bot's box. OpenGrok `shareScope` on GET `/coworkers/{id}/computer`.
+/// NativeChat chrome: dedicated → that bot's Computer pane; user → Settings → Computer;
+/// group / org → hide (no group sidebar; org is the admin console).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxShareScope {
+    Dedicated,
+    User,
+    Group,
+    Org,
+}
+
+impl BoxShareScope {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "dedicated" => Some(Self::Dedicated),
+            "user" => Some(Self::User),
+            "group" => Some(Self::Group),
+            "org" | "organization" | "organisation" => Some(Self::Org),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CoworkerComputer {
     #[serde(rename = "agentId", default)]
@@ -1454,21 +1564,119 @@ pub struct CoworkerComputer {
     /// An update in flight, or the failure the last one ended in.
     #[serde(default)]
     pub update: Option<UpdateStatus>,
-    /// OpenGrok #139: env `OG_*` / `SAND_*_EGRESS_TUNNEL_ENABLED=1` or host
-    /// setting `egressTunnelEnabled`. When true, Settings can offer **Route
-    /// traffic through this computer**. No tunnel is invented here.
+    /// Host env / `getHostSettings.egressTunnelEnabled`. Not box provisioned:
+    /// Route traffic chrome uses nested `egress_tunnel.ready` (or a tunnel URL).
     #[serde(rename = "isEgressTunnelAvailable", default)]
     pub is_egress_tunnel_available: bool,
     /// Box-owned tunnel endpoint, when the computer JSON exposes it.
-    #[serde(rename = "egress_tunnel", alias = "egressTunnel", default)]
+    #[serde(
+        rename = "egress_tunnel",
+        alias = "egressTunnel",
+        alias = "boxEgressTunnel",
+        default,
+        deserialize_with = "deserialize_optional_egress_tunnel"
+    )]
     pub egress_tunnel: Option<EgressTunnel>,
+    /// OpenGrok: `dedicated` | `user` | `group` | `org`. Missing until the
+    /// computer JSON grows the field; NativeChat then infers from shared `boxId`.
+    #[serde(
+        rename = "shareScope",
+        alias = "share_scope",
+        default,
+        deserialize_with = "deserialize_optional_share_scope"
+    )]
+    pub share_scope: Option<BoxShareScope>,
+    /// Present when `shareScope` is `group`.
+    #[serde(rename = "groupId", alias = "group_id", default)]
+    pub group_id: Option<String>,
 }
 
-/// `{ ready: bool }` on coworker computer JSON when the box owns the tunnel.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// Box tunnel. OpenGrok sends `{enabled, ready}` and may send a `ws://` URL.
+/// `enabled` is the box's current opt-in; it is not provisioned-ness (`ready` / URL).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressTunnel {
-    #[serde(default)]
     pub ready: bool,
+    pub enabled: Option<bool>,
+    pub url: Option<String>,
+}
+
+fn deserialize_optional_egress_tunnel<'de, D>(
+    deserializer: D,
+) -> Result<Option<EgressTunnel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(egress_tunnel_from_json(
+        Option::<Value>::deserialize(deserializer)?.unwrap_or(Value::Null),
+    ))
+}
+
+fn json_nonempty(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn deserialize_optional_share_scope<'de, D>(
+    deserializer: D,
+) -> Result<Option<BoxShareScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => BoxShareScope::parse(&raw),
+        Some(other) => other.as_str().and_then(BoxShareScope::parse),
+    })
+}
+
+fn egress_tunnel_from_json(value: Value) -> Option<EgressTunnel> {
+    match value {
+        Value::Null => None,
+        Value::Bool(ready) => Some(EgressTunnel {
+            ready,
+            enabled: None,
+            url: None,
+        }),
+        Value::String(url) => {
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                Some(EgressTunnel {
+                    ready: false,
+                    enabled: None,
+                    url: None,
+                })
+            } else {
+                Some(EgressTunnel {
+                    ready: true,
+                    enabled: None,
+                    url: Some(url),
+                })
+            }
+        }
+        Value::Object(_) => {
+            let url = json_nonempty(&value, &["url", "wsUrl", "ws_url", "endpoint", "uri"]);
+            let ready_flag = value.get("ready").and_then(Value::as_bool);
+            // Older payloads used `available` for "the box has a tunnel". That is
+            // ready, not the person's opt-in (`enabled`).
+            let available = value.get("available").and_then(Value::as_bool);
+            let enabled = value.get("enabled").and_then(Value::as_bool);
+            let ready = ready_flag.unwrap_or(false)
+                || available.unwrap_or(false)
+                || url.as_ref().is_some_and(|u| !u.is_empty());
+            Some(EgressTunnel {
+                ready,
+                enabled,
+                url,
+            })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1521,22 +1729,38 @@ impl CoworkerComputer {
     }
 
     pub fn image_stale(&self) -> bool {
-        self.image.as_ref().is_some_and(|image| image.stale)
+        self.image.as_ref().is_some_and(|image| {
+            image.stale
+                || (!image.running.is_empty()
+                    && !image.latest.is_empty()
+                    && image.running != image.latest)
+        })
     }
 
-    /// Host flag or nested `egress_tunnel.ready`. Either is enough to gate
-    /// Route traffic / Review an action. No tunnel is invented here.
+    /// Nested `egress_tunnel.ready` or a tunnel URL. Host `isEgressTunnelAvailable`
+    /// is not box provisioned — Route traffic chrome hides without this.
+    pub fn box_egress_provisioned(&self) -> bool {
+        self.egress_tunnel
+            .as_ref()
+            .is_some_and(|tunnel| tunnel.ready)
+    }
+
+    /// Same as [`Self::box_egress_provisioned`]. Review-an-action still AND-gates
+    /// this with host intent.
     pub fn egress_tunnel_ready(&self) -> bool {
-        self.is_egress_tunnel_available || self.egress_tunnel.as_ref().is_some_and(|t| t.ready)
+        self.box_egress_provisioned()
     }
 
     /// `Some` when the box JSON exposed a tunnel field. `None` means omit the node.
     pub fn box_egress_ready(&self) -> Option<bool> {
-        match &self.egress_tunnel {
-            Some(tunnel) => Some(tunnel.ready),
-            None if self.is_egress_tunnel_available => Some(true),
-            None => None,
-        }
+        self.egress_tunnel.as_ref().map(|tunnel| tunnel.ready)
+    }
+
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
     }
 }
 
@@ -1554,7 +1778,13 @@ pub fn env_egress_tunnel_enabled() -> bool {
 
 /// `getHostSettings.egressTunnelEnabled`.
 pub fn host_egress_tunnel_enabled(settings: &Value) -> bool {
-    settings.get("egressTunnelEnabled").and_then(Value::as_bool) == Some(true)
+    host_egress_tunnel_flag(settings) == Some(true)
+}
+
+/// `Some` only when the host actually sent the key. Missing must not overwrite
+/// NativeChat's default-on Route traffic toggle.
+pub fn host_egress_tunnel_flag(settings: &Value) -> Option<bool> {
+    settings.get("egressTunnelEnabled").and_then(Value::as_bool)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2793,6 +3023,117 @@ mod tests {
         assert!(err.is_unauthorized());
     }
 
+    /// Burst after access TTL: two refresh() callers must join one POST.
+    /// OpenGrok `/auth/refresh` is one-time rotate today (grace for the
+    /// just-rotated-away cookie is shipping and idempotent). NativeChat
+    /// single-flight is still required: a second POST 401 used to clear_session.
+    #[tokio::test]
+    async fn concurrent_refresh_is_single_flight_and_session_survives() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(200))
+                    .append_header("set-cookie", live_session().as_str())
+                    .append_header("set-cookie", "og_refresh=tok-r2; Path=/; Max-Age=3600"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("nativechat-refresh-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opengrok-session.json");
+        let client = OpenGrokClient::new(&server.uri())
+            .unwrap()
+            .with_session_file(path.clone());
+        put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
+        assert!(client.access_token().is_none());
+        assert!(client.has_session());
+
+        let a = client.clone();
+        let b = client.clone();
+        let (ra, rb) = tokio::join!(a.refresh(), b.refresh());
+        ra.expect("first refresh");
+        rb.expect("joined refresh");
+
+        let refresh_posts = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/auth/refresh")
+            .count();
+        assert_eq!(
+            refresh_posts, 1,
+            "concurrent refresh must join one POST /auth/refresh, got {refresh_posts}"
+        );
+        assert!(client.has_session(), "session must survive the join");
+        assert!(
+            client.access_token().is_some(),
+            "jar holds the new access cookie"
+        );
+        assert!(
+            path.exists(),
+            "save_session kept the file; did not clear_session"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `ensure_fresh_token` on a burst of requests (idle past access TTL) is
+    /// the live path that painted SignedOut. Both `/account` calls join one refresh.
+    #[tokio::test]
+    async fn concurrent_ensure_fresh_token_joins_one_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(200))
+                    .append_header("set-cookie", live_session().as_str())
+                    .append_header("set-cookie", "og_refresh=tok-r2; Path=/; Max-Age=3600"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acc_1",
+                "email": "a@b.c",
+                "firstName": "Ada",
+                "lastName": "Lovelace",
+                "avatarUrl": null,
+                "orgId": "org_1",
+                "verified": true,
+                "enabled": true,
+                "isAdmin": false
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
+        let a = client.clone();
+        let b = client.clone();
+        let (ma, mb) = tokio::join!(a.me(), b.me());
+        ma.expect("first me");
+        mb.expect("second me");
+
+        let refresh_posts = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/auth/refresh")
+            .count();
+        assert_eq!(
+            refresh_posts, 1,
+            "ensure_fresh_token burst must join one POST /auth/refresh, got {refresh_posts}"
+        );
+        assert!(client.has_session());
+        assert!(client.access_token().is_some());
+    }
+
     #[tokio::test]
     async fn empty_roster_is_empty_vec() {
         let server = MockServer::start().await;
@@ -3441,6 +3782,7 @@ mod tests {
         .unwrap();
         assert!(!off.is_egress_tunnel_available);
         assert!(!off.egress_tunnel_ready());
+        assert!(!off.box_egress_provisioned());
         assert!(off.box_egress_ready().is_none());
         let on: CoworkerComputer = serde_json::from_value(json!({
             "agentId": "cw_1",
@@ -3449,8 +3791,11 @@ mod tests {
         }))
         .unwrap();
         assert!(on.is_egress_tunnel_available);
-        assert!(on.egress_tunnel_ready());
-        assert_eq!(on.box_egress_ready(), Some(true));
+        assert!(
+            !on.box_egress_provisioned(),
+            "host isEgressTunnelAvailable is not box provisioned"
+        );
+        assert!(on.box_egress_ready().is_none());
         let nested: CoworkerComputer = serde_json::from_value(json!({
             "agentId": "cw_1",
             "state": "running",
@@ -3468,6 +3813,67 @@ mod tests {
         .unwrap();
         assert_eq!(nested_off.box_egress_ready(), Some(false));
         assert!(!nested_off.egress_tunnel_ready());
+        let enabled_only: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egress_tunnel": { "enabled": true }
+        }))
+        .unwrap();
+        assert_eq!(
+            enabled_only.egress_tunnel.as_ref().and_then(|t| t.enabled),
+            Some(true)
+        );
+        assert!(
+            !enabled_only.box_egress_provisioned(),
+            "egress_tunnel.enabled is not ready"
+        );
+        let dedicated: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "shareScope": "dedicated",
+            "egress_tunnel": { "ready": true, "enabled": false }
+        }))
+        .unwrap();
+        assert_eq!(dedicated.share_scope, Some(BoxShareScope::Dedicated));
+        assert!(dedicated.box_egress_provisioned());
+        assert_eq!(
+            dedicated.egress_tunnel.as_ref().and_then(|t| t.enabled),
+            Some(false)
+        );
+        let grouped: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "shareScope": "group",
+            "groupId": "grp_1",
+            "egress_tunnel": { "ready": true }
+        }))
+        .unwrap();
+        assert_eq!(grouped.share_scope, Some(BoxShareScope::Group));
+        assert_eq!(grouped.group_id(), Some("grp_1"));
+        let url_obj: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egress_tunnel": { "url": "ws://127.0.0.1:8790" }
+        }))
+        .unwrap();
+        assert!(
+            url_obj.egress_tunnel_ready(),
+            "a box tunnel URL is ready even without ready:true"
+        );
+        let url_str: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egressTunnel": "ws://127.0.0.1:8790"
+        }))
+        .unwrap();
+        assert!(url_str.egress_tunnel_ready());
+        let stale_by_digest: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "image": { "running": "old", "latest": "new" }
+        }))
+        .unwrap();
+        assert!(stale_by_digest.image_stale());
         assert!(host_egress_tunnel_enabled(
             &json!({ "egressTunnelEnabled": true })
         ));
@@ -3475,6 +3881,11 @@ mod tests {
             &json!({ "egressTunnelEnabled": false })
         ));
         assert!(!host_egress_tunnel_enabled(&json!({})));
+        assert_eq!(host_egress_tunnel_flag(&json!({})), None);
+        assert_eq!(
+            host_egress_tunnel_flag(&json!({ "egressTunnelEnabled": false })),
+            Some(false)
+        );
     }
 
     #[tokio::test]

@@ -230,7 +230,6 @@ impl Render for SidebarView {
             return div().id("sidebar").w(px(0.)).h_full().overflow_hidden();
         }
         let theme = cx.theme().clone();
-        let theme_mode = state.theme_mode.clone();
         let coworkers = state.ranked_coworkers();
         let conversations = state.conversations.clone();
         let active_coworker = state.active_coworker_id.clone();
@@ -493,7 +492,7 @@ impl Render for SidebarView {
             )
             .child(self.dock(
                 collapsed,
-                theme_mode,
+                cx.theme().is_dark(),
                 account_id,
                 account_label,
                 account_email,
@@ -774,7 +773,7 @@ impl SidebarView {
     fn dock(
         &self,
         collapsed: bool,
-        theme_mode: String,
+        is_dark: bool,
         account_id: String,
         account_label: String,
         account_email: String,
@@ -784,9 +783,10 @@ impl SidebarView {
         hover: Hsla,
         view: Entity<Self>,
     ) -> impl IntoElement {
-        let (theme_label, theme_icon) = match theme_mode.as_str() {
-            "dark" => ("Theme: Dark", "icons/moon.svg"),
-            _ => ("Theme: Light", "icons/sun.svg"),
+        let (theme_label, theme_icon) = if is_dark {
+            ("Theme: Dark", "icons/moon.svg")
+        } else {
+            ("Theme: Light", "icons/sun.svg")
         };
 
         v_flex()

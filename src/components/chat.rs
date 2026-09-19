@@ -48,7 +48,7 @@ struct ChatFeedRev {
     user_form_verbs: bool,
     user_form_handoffs: Vec<(String, String, bool)>,
     save_logins: Vec<(String, String)>,
-    credential_requests: Vec<(String, String)>,
+    credential_requests: Vec<(String, String, String)>,
     box_screen: bool,
     is_ai_responding: bool,
     debug_mode: bool,
@@ -185,15 +185,19 @@ impl ChatFeedRev {
                 cards
             },
             credential_requests: {
-                let mut cards: Vec<(String, String)> = conv
+                let mut cards: Vec<(String, String, String)> = conv
                     .map(|c| {
                         c.messages
                             .iter()
                             .flat_map(|m| m.parts.iter())
                             .filter_map(|part| match part {
-                                ChatPart::CredentialRequest(spec) => {
-                                    Some((spec.request_id.clone(), spec.origin.clone()))
-                                }
+                                ChatPart::CredentialRequest(spec) => Some((
+                                    spec.request_id.clone(),
+                                    spec.origin.clone(),
+                                    spec.resolution
+                                        .map(|resolution| resolution.as_str().to_string())
+                                        .unwrap_or_else(|| "idle".into()),
+                                )),
                                 _ => None,
                             })
                             .collect()

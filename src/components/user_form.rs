@@ -11,6 +11,10 @@
 //! Secrets collected here go only in the REST body, never `send_message` /
 //! AG-UI `content` / sqlite.
 
+use crate::chrome::BOX_SCREEN_ASPECT;
+use crate::components::alert_chrome::{
+    attention_cta, attention_ctas, attention_glass, attention_shadow,
+};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     BoxHandoffResolution, ComputerHandoffStatus, FormResolution, USER_FORM_SERVER_FILL_AVAILABLE,
@@ -244,7 +248,9 @@ fn render_live_computer_handoff(
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
-    let theme = cx.theme();
+    let dark = cx.theme().is_dark();
+    let glass = attention_glass(dark);
+    let ctas = attention_ctas(dark);
     // Live Action needed: Skip / I'm done stay clickable even if a sibling
     // 404 flipped the old global verbs lock. Do not POST until we have a
     // sibling `handoffEntryId`.
@@ -258,16 +264,16 @@ fn render_live_computer_handoff(
     });
     let key = spec.card_key().to_string();
     let prompt = spec.handoff_prompt();
-    let height = 512. * 800. / 1280.;
     v_flex()
         .id(ElementId::Name(computer_handoff_card_id(&key).into()))
         .w_full()
-        .gap(px(10.))
-        .p(px(14.))
-        .rounded(px(10.))
+        .gap(px(12.))
+        .p(px(16.))
+        .rounded(px(14.))
         .border_1()
-        .border_color(theme.border)
-        .bg(theme.background)
+        .border_color(glass.card_border)
+        .bg(glass.card_bg)
+        .shadow(attention_shadow(dark))
         .occlude()
         .child(
             h_flex()
@@ -285,32 +291,35 @@ fn render_live_computer_handoff(
                 .child(
                     h_flex()
                         .items_center()
+                        .gap(px(4.))
                         .px(px(8.))
                         .py(px(3.))
                         .rounded(px(999.))
-                        .bg(theme.yellow.opacity(0.22))
-                        .text_color(theme.yellow)
+                        .bg(glass.badge_bg)
+                        .text_color(glass.badge_fg)
                         .text_xs()
+                        .child(
+                            Icon::default()
+                                .path("icons/sun.svg")
+                                .size(px(12.))
+                                .text_color(glass.badge_fg),
+                        )
                         .child("Action needed"),
                 ),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(prompt),
-        )
+        .child(div().text_sm().text_color(glass.body).child(prompt))
         .child(
             div()
                 .id(ElementId::Name(
                     format!("computer-handoff-screen-{key}").into(),
                 ))
                 .w_full()
-                .h(px(height))
-                .rounded(px(10.))
+                .aspect_ratio(BOX_SCREEN_ASPECT)
+                .flex_shrink_0()
+                .rounded(px(12.))
                 .border_1()
-                .border_color(theme.border)
-                .bg(rgb(0x2a2a2a))
+                .border_color(glass.card_border)
+                .bg(glass.preview_bg)
                 .overflow_hidden()
                 .cursor_pointer()
                 .when_some(app.clone(), |this, app| {
@@ -324,7 +333,7 @@ fn render_live_computer_handoff(
                     Some(image) => this.child(
                         img(image)
                             .size_full()
-                            .rounded(px(10.))
+                            .rounded(px(12.))
                             .object_fit(ObjectFit::Fill),
                     ),
                     None => this.child(
@@ -348,11 +357,11 @@ fn render_live_computer_handoff(
                 .justify_end()
                 .gap(px(8.))
                 .flex_wrap()
-                .child(action_button(
+                .child(attention_cta(
                     computer_handoff_takeover_id(&key),
                     "Take over",
-                    ButtonKind::Primary,
-                    false,
+                    ctas.primary,
+                    true,
                     false,
                     {
                         let app = app.clone();
@@ -365,12 +374,12 @@ fn render_live_computer_handoff(
                         })
                     },
                 ))
-                .child(action_button(
+                .child(attention_cta(
                     computer_handoff_done_id(&key),
                     "I'm done",
-                    ButtonKind::Secondary,
+                    ctas.secondary,
+                    true,
                     !can_resolve,
-                    false,
                     {
                         let app = app.clone();
                         let key = key.clone();
@@ -387,12 +396,12 @@ fn render_live_computer_handoff(
                         })
                     },
                 ))
-                .child(action_button(
+                .child(attention_cta(
                     computer_handoff_skip_id(&key),
                     "Skip",
-                    ButtonKind::Ghost,
-                    !can_resolve,
+                    ctas.tertiary,
                     false,
+                    !can_resolve,
                     {
                         let app = app.clone();
                         can_resolve.then_some(move |cx: &mut App| {

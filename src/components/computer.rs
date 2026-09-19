@@ -1,7 +1,13 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::chrome::{HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats};
+use crate::chrome::{
+    BOX_SCREEN_ASPECT, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, box_screen_height_for_width,
+    chrome_floats, computer_pane_screen_width,
+};
+use crate::components::alert_chrome::{
+    attention_cta, attention_ctas, attention_glass, attention_shadow,
+};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     BoxHandoffResolution, computer_attention_done_id, computer_attention_id,
@@ -11,14 +17,13 @@ use crate::state::{
     AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
     ScheduleUiMode, ScheduleUnit,
 };
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable as _, h_flex, v_flex,
-};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme, Icon, Selectable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -282,16 +287,13 @@ impl ComputerPane {
 
     /// The pane's header row. In the title bar over the pane while the pane is docked (then
     /// its title and empty run drag the window), in the pane itself while it floats.
-    /// Overview: Update and Reset, then the close chevron; Routine: back, which keeps the
-    /// fields, and the title, then the close chevron.
+    /// Overview: close chevron (Update / Reset sit next to the screen). Routine: back, title,
+    /// close.
     pub fn header(&self, cx: &App, drag: bool) -> AnyElement {
         let app = self.state.clone();
         let state = self.state.read(cx);
         match state.computer_view.clone() {
-            ComputerView::Overview => {
-                let controls = ComputerControls::from_state(state);
-                pane_header(None, "", Some(&controls), app, drag).into_any_element()
-            }
+            ComputerView::Overview => pane_header(None, "", None, app, drag).into_any_element(),
             ComputerView::Editor { id } => {
                 let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
                 let persist = self.persist_routine(app.clone(), coworker_id, id);
@@ -342,6 +344,7 @@ impl ComputerPane {
                         cx,
                     ))
                 })
+                .child(box_chrome(controls, app.clone(), theme, cx))
                 .child(screen_tile(
                     has_screen,
                     screen,
@@ -783,8 +786,7 @@ impl ComputerControls {
             current: state
                 .coworker_computer
                 .as_ref()
-                .and_then(|s| s.image.as_ref())
-                .is_some_and(|image| !image.stale),
+                .is_some_and(|s| s.image.as_ref().is_some() && !s.image_stale()),
             error: state.computer_action_error.clone().or_else(|| {
                 state
                     .coworker_computer
@@ -845,6 +847,10 @@ fn recipes_entry(
 /// Grok **Needs your attention** while Open the screen is live.
 /// Skip this step = decline; I'm done, continue = hand back.
 /// Shared by the Computer pane and the launched noVNC window.
+///
+/// Glass: translucent peach/bronze over the sidebar (`theme.sidebar` shows
+/// through). GPUI has no element backdrop-filter; alpha + warm shadow is the
+/// frost. Orange is the title only — I'm done is a black (light) / white (dark) pill.
 pub(crate) fn computer_attention_banner(
     banner_id: impl Into<ElementId>,
     skip_id: impl Into<ElementId>,
@@ -859,116 +865,70 @@ pub(crate) fn computer_attention_banner(
     let done_app = app;
     let skip_key = key.clone();
     let done_key = key;
-    let colors = attention_colors(cx.theme().is_dark());
-    let skip_style = ButtonCustomVariant::new(cx)
-        .foreground(colors.body)
-        .hover(rgb(0xFFFFFF).opacity(0.14).into())
-        .active(rgb(0xFFFFFF).opacity(0.22).into());
-    let done_style = ButtonCustomVariant::new(cx)
-        .color(colors.done_bg)
-        .foreground(colors.done_fg)
-        .hover(rgb(0xFFF4DC).into())
-        .active(rgb(0xF0E0C0).into());
-    h_flex()
+    let dark = cx.theme().is_dark();
+    let glass = attention_glass(dark);
+    let ctas = attention_ctas(dark);
+    v_flex()
         .id(banner_id)
         .w_full()
         .flex_shrink_0()
-        .gap(px(12.))
-        .px(px(14.))
-        .py(px(10.))
-        .items_start()
-        .flex_wrap()
-        .rounded(px(10.))
+        .gap(px(10.))
+        .px(px(18.))
+        .py(px(16.))
+        .rounded(px(14.))
         .border_1()
-        .border_color(colors.border)
-        .bg(colors.bg)
+        .border_color(glass.border)
+        .bg(glass.bg)
+        .shadow(attention_shadow(dark))
         .child(
-            v_flex()
-                .flex_1()
-                .min_w(px(160.))
-                .gap(px(4.))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(colors.title)
-                        .child("Needs your attention"),
-                )
-                .child(div().text_xs().text_color(colors.body).child(instruction)),
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(glass.title)
+                .child("Needs your attention"),
         )
+        .child(div().text_sm().text_color(glass.body).child(instruction))
         .child(
             h_flex()
+                .w_full()
+                .justify_end()
                 .gap(px(8.))
                 .flex_shrink_0()
                 .items_center()
                 .flex_wrap()
-                .child(
-                    Button::new(skip_id)
-                        .small()
-                        .custom(skip_style)
-                        .label("Skip this step")
-                        .disabled(!can_resolve)
-                        .on_click(move |_, _, cx| {
-                            skip_app.update(cx, |state, cx| {
-                                state.resolve_user_form_handoff(
-                                    skip_key.clone(),
-                                    BoxHandoffResolution::Declined,
-                                    cx,
-                                );
-                            });
-                        }),
-                )
-                .child(
-                    Button::new(done_id)
-                        .small()
-                        .custom(done_style)
-                        .rounded(px(999.))
-                        .label("I'm done, continue")
-                        .disabled(!can_resolve)
-                        .on_click(move |_, _, cx| {
-                            done_app.update(cx, |state, cx| {
-                                state.resolve_user_form_handoff(
-                                    done_key.clone(),
-                                    BoxHandoffResolution::HandedBack,
-                                    cx,
-                                );
-                            });
-                        }),
-                ),
+                .child(attention_cta(
+                    skip_id,
+                    "Skip this step",
+                    ctas.tertiary,
+                    false,
+                    !can_resolve,
+                    can_resolve.then_some(move |cx: &mut App| {
+                        skip_app.update(cx, |state, cx| {
+                            state.resolve_user_form_handoff(
+                                skip_key.clone(),
+                                BoxHandoffResolution::Declined,
+                                cx,
+                            );
+                        });
+                    }),
+                ))
+                .child(attention_cta(
+                    done_id,
+                    "I'm done, continue",
+                    ctas.primary,
+                    true,
+                    !can_resolve,
+                    can_resolve.then_some(move |cx: &mut App| {
+                        done_app.update(cx, |state, cx| {
+                            state.resolve_user_form_handoff(
+                                done_key.clone(),
+                                BoxHandoffResolution::HandedBack,
+                                cx,
+                            );
+                        });
+                    }),
+                )),
         )
-}
-
-struct AttentionColors {
-    bg: Hsla,
-    border: Hsla,
-    title: Hsla,
-    body: Hsla,
-    done_bg: Hsla,
-    done_fg: Hsla,
-}
-
-/// Dark: Grok warm amber banner, gold title, cream body, white I'm done pill.
-/// Light: the same hue, saturated gold — not a beige wash.
-fn attention_colors(dark: bool) -> AttentionColors {
-    if dark {
-        AttentionColors {
-            bg: rgb(0x7A4A10).into(),
-            border: rgb(0xE0A020).into(),
-            title: rgb(0xF8C96A).into(),
-            body: rgb(0xF4E4C4).into(),
-            done_bg: rgb(0xFFFFFF).into(),
-            done_fg: rgb(0x1A140C).into(),
-        }
-    } else {
-        AttentionColors {
-            bg: rgb(0xFFC44D).into(),
-            border: rgb(0xD49212).into(),
-            title: rgb(0x8A3A00).into(),
-            body: rgb(0x3D2208).into(),
-            done_bg: rgb(0xFFFFFF).into(),
-            done_fg: rgb(0x1A140C).into(),
-        }
-    }
 }
 
 /// The coworker's screen. The Open pill is the control: it appears on hover
@@ -981,16 +941,18 @@ fn screen_tile(
     app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    // The tile is the screen's own shape (the box is 1280x800), so the picture fills it edge to
-    // edge with nothing cropped and nothing letterboxed — the way the reference client draws it.
-    let width = INFO_PANE_WIDTH - 32.;
-    let height = width * 800. / 1280.;
+    // The tile is the screen's own 1280×800 shape — same AR as the in-chat
+    // Computer card well (`BOX_SCREEN_ASPECT`) so neither letterboxes nor
+    // clips the taskbar.
+    let width = computer_pane_screen_width();
+    let height = box_screen_height_for_width(width);
     div()
         .id("agent-screen")
         .group("agent-screen")
         .relative()
         .w(px(width))
         .h(px(height))
+        .aspect_ratio(BOX_SCREEN_ASPECT)
         .flex_shrink_0()
         .rounded(px(12.))
         .border_1()
@@ -1089,6 +1051,111 @@ fn screen_tile(
         })
 }
 
+/// Update / Reset next to this bot's screen. Route traffic for a dedicated
+/// provisioned box is the header icon (`icons/route-traffic.svg`, analogue of
+/// SF Symbol arrow.triangle.swap). Status copy is a tooltip on download.
+/// `computer-update` / `computer-reset` stay the remasure ids.
+fn box_chrome(
+    controls: &ComputerControls,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> impl IntoElement {
+    let can_update = !controls.update_disabled();
+    let can_reset = controls.present && !controls.updating;
+    let stale = controls.stale;
+    let update_tip = if stale {
+        "Update available"
+    } else if controls.current {
+        "Up to date"
+    } else if controls.present {
+        "Update this computer"
+    } else {
+        "No computer yet"
+    };
+    let update_app = app.clone();
+    let reset_app = app.clone();
+    let show_route = app.read(cx).show_route_traffic_on_bot_pane();
+    h_flex()
+        .id("computer-box-chrome")
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap(px(8.))
+        .child(h_flex().items_center().when(show_route, |this| {
+            this.child(route_traffic_icon(app.clone(), theme, cx))
+        }))
+        .child(
+            h_flex()
+                .gap(px(4.))
+                .child(
+                    icon_btn_enabled(
+                        "computer-update",
+                        "icons/download.svg",
+                        can_update,
+                        move |cx| {
+                            update_app.update(cx, |state, cx| {
+                                state
+                                    .open_computer_confirm(crate::state::ComputerAction::Update, cx)
+                            });
+                        },
+                    )
+                    .when(stale, |this| this.text_color(gpui::blue()))
+                    .tooltip(move |window, cx| Tooltip::new(update_tip).build(window, cx)),
+                )
+                .child(
+                    icon_btn_enabled("computer-reset", "icons/reset.svg", can_reset, move |cx| {
+                        reset_app.update(cx, |state, cx| {
+                            state.open_computer_confirm(crate::state::ComputerAction::Reset, cx)
+                        });
+                    })
+                    .tooltip(|window, cx| Tooltip::new("Reset this computer").build(window, cx)),
+                ),
+        )
+}
+
+fn route_traffic_icon(
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> impl IntoElement {
+    let enabled = app.read(cx).egress_tunnel_enabled;
+    let color = if enabled {
+        theme.primary
+    } else {
+        theme.muted_foreground
+    };
+    let tip = if enabled {
+        "Routing traffic through this computer. New connections go out through this desktop."
+    } else {
+        "Route traffic through this computer. Web traffic from this Bot's computer goes out through this desktop instead of the cloud."
+    };
+    div()
+        .id("route-traffic-this-computer")
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .on_mouse_down(MouseButton::Left, {
+            let app = app.clone();
+            move |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    state.set_egress_tunnel_enabled(!state.egress_tunnel_enabled, cx);
+                });
+            }
+        })
+        .child(
+            Icon::default()
+                .path("icons/route-traffic.svg")
+                .size(px(16.))
+                .text_color(color),
+        )
+}
+
 fn pane_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: &'static str,
@@ -1096,8 +1163,9 @@ fn pane_header(
     app: Entity<AppState>,
     drag: bool,
 ) -> impl IntoElement {
-    // Update and Reset live up here as icons, apart from the close chevron, each behind a
-    // confirm dialog — the pane's body is for the screen, not for buttons.
+    // Close chevron (and Routine back). Update / Reset sit next to the screen
+    // in `box_chrome` so they are visible on the right sidebar, not only in
+    // an empty title-bar strip.
     let actions_app = app.clone();
     let actions = actions.map(|controls| {
         (

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NativeChat login demo</title>
+  <style>
+    body { font: 16px/1.4 system-ui, sans-serif; max-width: 28rem; margin: 3rem auto; padding: 0 1rem; }
+    label { display: block; margin: 0.75rem 0; }
+    input { display: block; width: 100%; margin-top: 0.25rem; padding: 0.4rem; }
+    button { margin-top: 0.75rem; padding: 0.45rem 0.9rem; }
+    #ok { color: #0a7; }
+  </style>
+</head>
+<body>
+  <h1>Sign in</h1>
+  <p>Local remasure fixture. Username and password only — no Facebook.</p>
+  <form id="login" action="/login" method="post">
+    <label>Username
+      <input name="username" autocomplete="username" value="ada">
+    </label>
+    <label>Password
+      <input name="password" type="password" autocomplete="current-password" value="demo-pass">
+    </label>
+    <button type="submit">Sign in</button>
+  </form>
+  <p id="ok" hidden>Signed in (demo). NativeChat can offer to save this login.</p>
+  <script>
+    document.getElementById("login").addEventListener("submit", function (event) {
+      event.preventDefault();
+      document.getElementById("ok").hidden = false;
+    });
+  </script>
+</body>
+</html>
