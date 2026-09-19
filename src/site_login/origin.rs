@@ -4,10 +4,60 @@ use std::net::IpAddr;
 
 use url::Url;
 
-/// A small multi-part public-suffix set so `login.google.co.uk` → `google.co.uk`.
+/// Multi-part ICANN suffixes, so `login.google.co.uk` → `google.co.uk`.
+///
+/// A hand list is the wrong long-term answer here and this one was short enough
+/// to be dangerous: anything not on it collapsed to its last two labels, so
+/// `bank.com.cn` and `evil.com.cn` compared equal and one site was offered
+/// another site's saved login. The durable fix is a real public-suffix list —
+/// see `PRIVATE_SUFFIXES` below for why that is a separate decision.
 const MULTI_PART_TLDS: &[&str] = &[
-    "ac.uk", "co.uk", "gov.uk", "org.uk", "com.au", "net.au", "org.au", "co.jp", "ne.jp", "or.jp",
-    "com.br", "com.mx", "co.nz", "co.za", "co.in", "com.sg", "com.hk",
+    "ac.uk", "co.uk", "gov.uk", "org.uk", "me.uk", "net.uk", "sch.uk", "com.au", "net.au",
+    "org.au", "edu.au", "gov.au", "id.au", "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "com.br",
+    "net.br", "org.br", "com.mx", "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "co.za",
+    "org.za", "co.in", "net.in", "org.in", "com.sg", "com.hk", "com.cn", "net.cn", "org.cn",
+    "gov.cn", "edu.cn", "co.kr", "or.kr", "ne.kr", "com.tr", "org.tr", "net.tr", "co.il", "org.il",
+    "com.tw", "org.tw", "com.my", "com.ph", "co.th", "in.th", "com.ar", "net.ar", "org.ar",
+    "co.id", "web.id", "com.pl", "net.pl", "org.pl", "com.ua", "com.vn", "com.pk", "co.ke",
+    "com.ng", "com.eg", "com.sa", "co.ao", "com.pe", "com.co", "com.uy", "com.ec", "com.do",
+    "com.gt", "com.ve", "com.bo", "com.py",
+];
+
+/// Suffixes under which *anyone* can register a name. These are the dangerous
+/// ones for a credential gate: `alice.github.io` and `bob.github.io` are two
+/// unrelated people, and treating them as one site hands one of them the
+/// other's password. Under these, the registrable unit is three labels.
+///
+/// This is the PRIVATE section of the public suffix list, abbreviated, and it
+/// cannot be complete. A real list belongs here; the only public-suffix crate
+/// vendored in this workspace (`publicsuffix`) is a parser that needs the
+/// ~250KB list shipped beside it, so adopting it means vendoring that file.
+const PRIVATE_SUFFIXES: &[&str] = &[
+    "github.io",
+    "gitlab.io",
+    "vercel.app",
+    "herokuapp.com",
+    "pages.dev",
+    "workers.dev",
+    "netlify.app",
+    "blogspot.com",
+    "wordpress.com",
+    "web.app",
+    "firebaseapp.com",
+    "azurewebsites.net",
+    "cloudfront.net",
+    "s3.amazonaws.com",
+    "elasticbeanstalk.com",
+    "onrender.com",
+    "fly.dev",
+    "surge.sh",
+    "glitch.me",
+    "repl.co",
+    "ngrok.io",
+    "ngrok-free.app",
+    "trycloudflare.com",
+    "githubusercontent.com",
+    "appspot.com",
 ];
 
 /// Host / eTLD+1 from a domain, live host, or URL. None when empty.
@@ -28,8 +78,18 @@ pub fn registrable_origin(raw: &str) -> Option<String> {
         return Some(host);
     }
     let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
-    if MULTI_PART_TLDS.iter().any(|tld| *tld == last_two) && labels.len() >= 3 {
-        return Some(format!("{}.{last_two}", labels[labels.len() - 3]));
+    if labels.len() >= 3 {
+        let last_three = format!("{}.{last_two}", labels[labels.len() - 3]);
+        // A private suffix can itself be three labels (`s3.amazonaws.com`), so
+        // check the longer candidate before the shorter one.
+        if labels.len() >= 4 && PRIVATE_SUFFIXES.iter().any(|s| *s == last_three) {
+            return Some(format!("{}.{last_three}", labels[labels.len() - 4]));
+        }
+        if PRIVATE_SUFFIXES.iter().any(|s| *s == last_two)
+            || MULTI_PART_TLDS.iter().any(|tld| *tld == last_two)
+        {
+            return Some(last_three);
+        }
     }
     Some(last_two)
 }
@@ -74,7 +134,10 @@ pub fn login_matches_request(
         return false;
     }
     match username.map(str::trim).filter(|name| !name.is_empty()) {
-        Some(want) => row_username == want,
+        // Both sides trimmed and compared without case: the stored side was
+        // previously used raw, so a row saved as `Ada@Example.com ` never
+        // matched a request for `ada@example.com`.
+        Some(want) => row_username.trim().eq_ignore_ascii_case(want),
         None => true,
     }
 }
@@ -102,6 +165,49 @@ mod tests {
             Some("localhost")
         );
         assert_eq!(registrable_origin("").as_deref(), None);
+    }
+
+    #[test]
+    fn distinct_sites_under_a_shared_suffix_do_not_match() {
+        // Each of these pairs compared EQUAL before this fix, which meant one
+        // site could be offered another site's saved login.
+        for (a, b) in [
+            ("bank.com.cn", "evil.com.cn"),
+            ("alice.github.io", "bob.github.io"),
+            ("x.vercel.app", "y.vercel.app"),
+            ("site.co.kr", "other.co.kr"),
+            ("a.herokuapp.com", "b.herokuapp.com"),
+            ("one.pages.dev", "two.pages.dev"),
+            ("example.s3.amazonaws.com", "other.s3.amazonaws.com"),
+        ] {
+            assert!(
+                !origins_match(a, b),
+                "{a} must not match {b}: they are different sites"
+            );
+        }
+    }
+
+    #[test]
+    fn a_site_still_matches_its_own_subdomains() {
+        assert!(origins_match("alice.github.io", "www.alice.github.io"));
+        assert!(origins_match("bank.com.cn", "login.bank.com.cn"));
+        assert!(origins_match("google.co.uk", "accounts.google.co.uk"));
+    }
+
+    #[test]
+    fn username_compare_is_trimmed_and_case_insensitive() {
+        assert!(login_matches_request(
+            "facebook.com",
+            " Ada@Example.com ",
+            "facebook.com",
+            Some("ada@example.com")
+        ));
+        assert!(!login_matches_request(
+            "facebook.com",
+            "ada",
+            "facebook.com",
+            Some("adam")
+        ));
     }
 
     #[test]
