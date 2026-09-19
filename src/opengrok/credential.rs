@@ -38,8 +38,11 @@ pub enum CredentialRequestResolution {
     /// Not now.
     Denied,
     /// Use saved login — confirmed locally. Broker-off A.0 stays here even
-    /// when REST posts `missing` / `error`.
+    /// when REST posts `error` (login exists, no session broker).
     Used,
+    /// Use saved with no matching Settings→Logins row, or metadata without
+    /// a Keychain hit. Must not look like success. REST posts `missing`.
+    Missing,
     /// Session broker put cookies/profile on Box (A.1).
     Filled,
 }
@@ -53,6 +56,7 @@ impl CredentialRequestResolution {
         match self {
             Self::Denied => "denied",
             Self::Used => "used",
+            Self::Missing => "missing",
             Self::Filled => "filled",
         }
     }
@@ -63,6 +67,7 @@ impl CredentialRequestResolution {
         match self {
             Self::Denied => "Dismissed",
             Self::Used => "Used saved login",
+            Self::Missing => "None saved",
             Self::Filled => "Filled",
         }
     }
@@ -73,6 +78,7 @@ impl CredentialRequestResolution {
             Self::Used => {
                 "Confirmed a saved login. NativeChat did not type a password into the computer."
             }
+            Self::Missing => "No saved login for this site.",
             Self::Filled => "Session restored on the computer. NativeChat did not type a password.",
         }
     }
@@ -287,6 +293,46 @@ pub fn result_without_broker(
     CredentialResultStatus::Error
 }
 
+/// Transcript fold after Use saved / Not now.
+///
+/// No matching Settings→Logins row → [`CredentialRequestResolution::Missing`]
+/// (not Used). A.0 still never returns [`CredentialRequestResolution::Filled`].
+pub fn fold_credential_answer(
+    allow: bool,
+    have_matching_login: bool,
+) -> CredentialRequestResolution {
+    if !allow {
+        return CredentialRequestResolution::Denied;
+    }
+    if have_matching_login {
+        CredentialRequestResolution::Used
+    } else {
+        CredentialRequestResolution::Missing
+    }
+}
+
+/// Paint an idle Use-saved card only when Settings→Logins has a row for the
+/// request origin (and username, when named). Empty vault → do not offer.
+/// `logins_ready` is false until the first sqlite list lands, so a request
+/// that races startup is not auto-missed against an empty in-memory vec.
+pub fn keep_credential_request_offer(
+    settled: bool,
+    have_matching_login: bool,
+    auto_missed: bool,
+    logins_ready: bool,
+) -> bool {
+    if auto_missed {
+        return false;
+    }
+    if settled {
+        return true;
+    }
+    if !logins_ready {
+        return true;
+    }
+    have_matching_login
+}
+
 /// Build the save prompt from values the host already has. Never takes a
 /// password — the secret stays in `PendingSave` until Keychain write.
 ///
@@ -434,6 +480,7 @@ mod tests {
     fn folded_pills_match_user_form_chrome_words() {
         assert_eq!(CredentialRequestResolution::Denied.pill(), "Dismissed");
         assert_eq!(CredentialRequestResolution::Used.pill(), "Used saved login");
+        assert_eq!(CredentialRequestResolution::Missing.pill(), "None saved");
         assert_eq!(CredentialRequestResolution::Filled.pill(), "Filled");
         assert_eq!(
             CredentialRequestResolution::from_allow(true),
@@ -448,6 +495,32 @@ mod tests {
             credential_request_pill_id("req-9"),
             "credential-request-pill-req-9"
         );
+        assert_eq!(
+            fold_credential_answer(true, true),
+            CredentialRequestResolution::Used
+        );
+        assert_eq!(
+            fold_credential_answer(true, false),
+            CredentialRequestResolution::Missing,
+            "Use saved with no row must not look like success"
+        );
+        assert_eq!(
+            fold_credential_answer(false, false),
+            CredentialRequestResolution::Denied
+        );
+        assert_ne!(
+            fold_credential_answer(true, false),
+            CredentialRequestResolution::Filled
+        );
+        assert_ne!(
+            fold_credential_answer(true, true),
+            CredentialRequestResolution::Filled
+        );
+        assert!(!keep_credential_request_offer(false, false, false, true));
+        assert!(keep_credential_request_offer(false, false, false, false));
+        assert!(keep_credential_request_offer(false, true, false, true));
+        assert!(keep_credential_request_offer(true, false, false, true));
+        assert!(!keep_credential_request_offer(false, true, true, true));
     }
 
     #[test]

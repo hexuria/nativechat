@@ -18,16 +18,19 @@ use crate::opengrok::{
     UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_flag, keep_local_save_offer, local_exec_outcome,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
-    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
-    tool_standin,
+    fold_credential_answer, host_egress_tunnel_flag, keep_credential_request_offer,
+    keep_local_save_offer, local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
+    stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
-use crate::site_login::{PendingSave, SiteLoginRecord, SiteLoginVault, save_candidate};
+use crate::site_login::{
+    PendingSave, SiteLoginRecord, SiteLoginVault, login_matches_request, registrable_origin,
+    save_candidate,
+};
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -1481,9 +1484,18 @@ pub struct AppState {
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
     user_form_resolutions: HashMap<String, FormResolution>,
-    /// Local `credential.request` settle (Dismissed / Used saved login).
-    /// Grafted across SSE overwrite so the remnant does not reopen.
+    /// Local `credential.request` settle (Dismissed / Used saved login /
+    /// None saved). Grafted across SSE overwrite so the remnant does not reopen.
     credential_request_resolutions: HashMap<String, CredentialRequestResolution>,
+    /// `credential.request` ids auto-answered `missing` because Settings→Logins
+    /// had no matching row. Do not re-offer or POST again.
+    credential_auto_missing: HashSet<String>,
+    /// Runs that posted empty-vault `missing` and still need follow_run rather
+    /// than persist-as-finished / Waiting.
+    empty_vault_continue_runs: HashSet<String>,
+    /// First sqlite `site_logins` list has landed. Until then, do not treat an
+    /// empty in-memory vec as "no logins" (startup race).
+    site_logins_ready: bool,
     /// Stable resolution to restore if a POST fails (never reopen a settled card).
     user_form_restore: HashMap<String, FormResolution>,
     /// Form card key → handoff card id from dismiss `handoffEntryId`.
@@ -1858,6 +1870,9 @@ impl AppState {
             user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
             user_form_resolutions: HashMap::new(),
             credential_request_resolutions: HashMap::new(),
+            credential_auto_missing: HashSet::new(),
+            empty_vault_continue_runs: HashSet::new(),
+            site_logins_ready: false,
             user_form_restore: HashMap::new(),
             user_form_handoffs: HashMap::new(),
             user_form_pending_resolves: HashMap::new(),
@@ -5177,7 +5192,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
-        let parts = self.graft_user_forms(parts);
+        let parts = self.graft_turn_parts(parts, Some(conversation_id), cx);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -5221,6 +5236,9 @@ impl AppState {
             "finished" => {
                 if self.has_open_user_form(conversation_id) {
                     self.park_waiting_for_you(conversation_id, &turn.run_id);
+                } else if self.empty_vault_continue_runs.contains(&turn.run_id) {
+                    // Empty-vault auto-miss posted `missing`; follow_run owns the rest.
+                    self.begin_responding(Some(conversation_id), "Working");
                 } else {
                     self.finish_responding(Some(conversation_id), false);
                 }
@@ -5229,6 +5247,7 @@ impl AppState {
                 // a thread that says everything twice.
                 if !self.has_open_user_form(conversation_id)
                     && !self.has_open_approval(conversation_id)
+                    && !self.empty_vault_continue_runs.contains(&turn.run_id)
                     && self.turn_is_unsettled(conversation_id, &turn.run_id)
                 {
                     self.persist_assistant_reply(
@@ -5260,6 +5279,7 @@ impl AppState {
     /// Named by run, because the turn being let go has to be the turn that ended: a thread whose
     /// next turn has already begun must not be let go by the last one finishing late.
     fn release_live_turn(&mut self, conversation_id: &str, run_id: &str) {
+        self.empty_vault_continue_runs.remove(run_id);
         if self
             .live_turns
             .get(conversation_id)
@@ -5334,6 +5354,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let settles = run_id.is_some_and(|run_id| {
+            self.empty_vault_continue_runs.remove(run_id);
             self.live_turns
                 .get(conversation_id)
                 .is_some_and(|turn| turn.run_id == run_id)
@@ -5540,7 +5561,11 @@ impl AppState {
                                     if let Some(shot) = box_shot {
                                         state.last_box_shot = Some(shot);
                                     }
-                                    let grafted = state.graft_user_forms(parts.clone());
+                                    let grafted = state.graft_turn_parts(
+                                        parts.clone(),
+                                        Some(&conversation_id),
+                                        cx,
+                                    );
                                     if let Some(message) = streaming_message_mut(
                                         &mut state.conversations,
                                         &conversation_id,
@@ -5587,7 +5612,7 @@ impl AppState {
                         if let Some(shot) = box_shot {
                             state.last_box_shot = Some(shot);
                         }
-                        let grafted = state.graft_user_forms(parts);
+                        let grafted = state.graft_turn_parts(parts, Some(&conversation_id), cx);
                         if let Some(message) = streaming_message_mut(
                             &mut state.conversations,
                             &conversation_id,
@@ -5657,7 +5682,11 @@ impl AppState {
                         }
                     }
                 }
-                if !waiting_approval && !waiting_user_form && result.is_ok() {
+                if !waiting_approval
+                    && !waiting_user_form
+                    && result.is_ok()
+                    && !state.empty_vault_continue_runs.contains(&run_id)
+                {
                     // The run is final; a run parked on a card is saved when it finishes.
                     // A status line is painted, never saved: `persist_assistant_reply` refuses
                     // it, so it cannot become history the model is shown next turn. Settling the
@@ -5711,6 +5740,8 @@ impl AppState {
                         state.fill_open_approval_commands(cx);
                         state.sync_pending_approvals(cx);
                     }
+                } else if state.empty_vault_continue_runs.contains(&run_id) {
+                    state.begin_responding(Some(&conversation_id), "Working");
                 } else {
                     state.finish_responding(Some(&conversation_id), false);
                 }
@@ -6114,7 +6145,11 @@ impl AppState {
                                     label: "Working".into(),
                                 });
                             let _ = this.update(cx, |state, cx| {
-                                let parts = state.graft_user_forms(parts.clone());
+                                let parts = state.graft_turn_parts(
+                                    parts.clone(),
+                                    conversation_id.as_deref(),
+                                    cx,
+                                );
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card.
@@ -6173,6 +6208,7 @@ impl AppState {
                                             if state.has_open_user_form(id) {
                                                 state.park_waiting_for_you(id, &run_id);
                                             } else {
+                                                state.empty_vault_continue_runs.remove(&run_id);
                                                 state.finish_responding(
                                                     conversation_id.as_deref(),
                                                     false,
@@ -6574,11 +6610,180 @@ impl AppState {
                 self.pending_save.contains_key(&spec.form_entry_id),
                 self.already_saved_login(&spec.origin, &spec.username),
             ),
+            ChatPart::CredentialRequest(spec) => keep_credential_request_offer(
+                spec.is_settled(),
+                self.has_matching_saved_login(&spec.origin, spec.username.as_deref()),
+                self.credential_auto_missing.contains(&spec.request_id),
+                self.site_logins_ready,
+            ),
             _ => true,
         });
         self.inject_local_save_logins(&mut parts);
         place_hitl_cards_in_document_order(&mut parts);
         parts
+    }
+
+    fn has_matching_saved_login(&self, origin: &str, username: Option<&str>) -> bool {
+        self.site_logins
+            .iter()
+            .any(|row| login_matches_request(&row.origin, &row.username, origin, username))
+    }
+
+    /// Vault-aware graft for a live turn: drop Use-saved when Settings has
+    /// no matching row, and POST `missing` so the agent does not park forever.
+    fn graft_turn_parts(
+        &mut self,
+        parts: Vec<ChatPart>,
+        conversation_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Vec<ChatPart> {
+        if let Some(id) = conversation_id {
+            self.queue_empty_vault_credential_misses(&parts, id, cx);
+        }
+        let grafted = self.graft_user_forms(parts);
+        if let Some(id) = conversation_id {
+            self.sweep_empty_vault_credential_requests(id, cx);
+        }
+        grafted
+    }
+
+    fn queue_empty_vault_credential_misses(
+        &mut self,
+        parts: &[ChatPart],
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.site_logins_ready {
+            return;
+        }
+        let unmatched: Vec<CredentialRequestSpec> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ChatPart::CredentialRequest(spec)
+                    if self.should_auto_miss_credential_request(spec) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for spec in unmatched {
+            self.auto_miss_empty_vault_credential_request(spec, conversation_id, cx);
+        }
+    }
+
+    fn should_auto_miss_credential_request(&self, spec: &CredentialRequestSpec) -> bool {
+        spec.is_unresolved()
+            && self.site_logins_ready
+            && !self
+                .credential_request_resolutions
+                .contains_key(&spec.request_id)
+            && !self.credential_auto_missing.contains(&spec.request_id)
+            && !self.has_matching_saved_login(&spec.origin, spec.username.as_deref())
+    }
+
+    fn sweep_empty_vault_credential_requests(
+        &mut self,
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.site_logins_ready {
+            return;
+        }
+        let unmatched: Vec<CredentialRequestSpec> = self
+            .conversations
+            .iter()
+            .filter(|conversation| conversation.id == conversation_id)
+            .flat_map(|conversation| conversation.messages.iter())
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                ChatPart::CredentialRequest(spec)
+                    if self.should_auto_miss_credential_request(spec) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for spec in unmatched {
+            self.auto_miss_empty_vault_credential_request(spec, conversation_id, cx);
+        }
+        self.strip_auto_missed_credential_requests(conversation_id);
+    }
+
+    fn strip_auto_missed_credential_requests(&mut self, conversation_id: &str) {
+        let auto_missed = &self.credential_auto_missing;
+        let ready = self.site_logins_ready;
+        let logins = &self.site_logins;
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::CredentialRequest(spec) => keep_credential_request_offer(
+                        spec.is_settled(),
+                        logins.iter().any(|row| {
+                            login_matches_request(
+                                &row.origin,
+                                &row.username,
+                                &spec.origin,
+                                spec.username.as_deref(),
+                            )
+                        }),
+                        auto_missed.contains(&spec.request_id),
+                        ready,
+                    ),
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn auto_miss_empty_vault_credential_request(
+        &mut self,
+        spec: CredentialRequestSpec,
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.credential_auto_missing.insert(spec.request_id.clone()) {
+            return;
+        }
+        if !spec.run_id.is_empty() {
+            self.empty_vault_continue_runs.insert(spec.run_id.clone());
+            self.begin_responding(Some(conversation_id), "Working");
+        } else {
+            self.sync_waiting_chrome(conversation_id);
+        }
+        let request_id = spec.request_id.clone();
+        let run_id = spec.run_id.clone();
+        let conversation = conversation_id.to_string();
+        let agent_id = self.active_coworker_id.clone().unwrap_or_default();
+        let client = self.opengrok.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if let Some(client) = client {
+                let _ = client
+                    .post_credential_result(
+                        CredentialResultStatus::Missing,
+                        &request_id,
+                        None,
+                        &agent_id,
+                    )
+                    .await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if !run_id.is_empty() {
+                    state.begin_responding(Some(&conversation), "Working");
+                    state.follow_run(run_id, Some(conversation), cx);
+                } else {
+                    state.sync_waiting_chrome(&conversation);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// After Continue, `follow_run` / SSE overwrite `message.parts` from the
@@ -7103,6 +7308,15 @@ impl AppState {
                     }
                     Err(err) => state.site_login_error = Some(err.to_string()),
                 }
+                state.site_logins_ready = true;
+                let ids: Vec<String> = state
+                    .conversations
+                    .iter()
+                    .map(|conversation| conversation.id.clone())
+                    .collect();
+                for id in ids {
+                    state.sweep_empty_vault_credential_requests(&id, cx);
+                }
                 cx.notify();
             });
         })
@@ -7304,9 +7518,11 @@ impl AppState {
     }
 
     /// Confirm or deny `credential.request`. Folds the card immediately
-    /// (Dismissed / Used saved login), the way user-form Continue/Dismiss
-    /// leave a remnant. A.0 never types into Box and never posts `filled`
-    /// — that status is the session broker (A.1).
+    /// (Dismissed / Used saved login / None saved), the way user-form
+    /// Continue/Dismiss leave a remnant. A.0 never types into Box and never
+    /// posts `filled` — that status is the session broker (A.1). Use saved
+    /// with no Settings→Logins row folds None saved (REST `missing`), not
+    /// Used.
     pub fn answer_credential_request(
         &mut self,
         request_id: String,
@@ -7322,13 +7538,17 @@ impl AppState {
         let conversation_id = self
             .conversation_id_for_credential_request(&request_id)
             .or_else(|| self.active_conversation_id.clone());
-        self.paint_credential_request_resolution(
-            &request_id,
-            CredentialRequestResolution::from_allow(allow),
+        let matching = self.has_matching_saved_login(&spec.origin, spec.username.as_deref());
+        let resolution = fold_credential_answer(allow, matching);
+        debug_assert_ne!(
+            resolution,
+            CredentialRequestResolution::Filled,
+            "A.0 must not fold Filled without the session broker"
         );
+        self.paint_credential_request_resolution(&request_id, resolution);
         if allow && !spec.run_id.is_empty() {
-            // Folded Used must not keep Waiting chrome; follow_run takes
-            // Working after the vault/broker result posts.
+            // Folded Used/Missing must not keep Waiting chrome; follow_run
+            // takes Working after the vault/broker result posts.
             self.begin_responding(conversation_id.as_deref(), "Working");
         } else if let Some(id) = conversation_id.as_deref() {
             self.sync_waiting_chrome(id);
@@ -7337,7 +7557,7 @@ impl AppState {
         let vault = self.site_login_vault.clone();
         let agent_id = self.active_coworker_id.clone().unwrap_or_default();
         let client = self.opengrok.clone();
-        let origin = spec.origin.clone();
+        let origin = registrable_origin(&spec.origin).unwrap_or_else(|| spec.origin.clone());
         let username = spec.username.clone();
         let run_id = spec.run_id.clone();
         cx.spawn(async move |this, cx| {
@@ -7377,6 +7597,13 @@ impl AppState {
                     .await;
             }
             let _ = this.update(cx, |state, cx| {
+                // Use saved with no vault hit must not keep a success remnant.
+                if allow && status == CredentialResultStatus::Missing {
+                    state.paint_credential_request_resolution(
+                        &request_id,
+                        CredentialRequestResolution::Missing,
+                    );
+                }
                 // Not now must not restart Working; Use saved follows the
                 // parked run after the vault/broker result posts.
                 if allow && !run_id.is_empty() {
@@ -10683,6 +10910,27 @@ mod tests {
         }
     }
 
+    fn demo_credential_request() -> crate::opengrok::CredentialRequestSpec {
+        crate::opengrok::CredentialRequestSpec {
+            request_id: "req-demo".into(),
+            origin: "http://127.0.0.1:8765/".into(),
+            username: Some("ada".into()),
+            run_id: "run_1".into(),
+            resolution: None,
+        }
+    }
+
+    fn saved_login_row(origin: &str, username: &str) -> crate::site_login::SiteLoginRecord {
+        crate::site_login::SiteLoginRecord {
+            id: format!("cred-{origin}-{username}"),
+            origin: origin.to_string(),
+            username: username.to_string(),
+            label: format!("{username} on {origin}"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        }
+    }
+
     #[test]
     fn not_now_folds_credential_request_and_clears_waiting() {
         let mut bot = message("m_live", false, "");
@@ -10758,6 +11006,114 @@ mod tests {
             }
             other => panic!("expected folded remnant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn graft_drops_idle_credential_request_when_vault_has_no_row() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        assert!(
+            grafted.is_empty(),
+            "empty Settings→Logins must not offer Use saved: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn graft_keeps_idle_credential_request_when_origin_matches_a_login() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state
+            .site_logins
+            .push(saved_login_row("facebook.com", "ada"));
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert!(spec.is_unresolved());
+                assert_eq!(spec.origin, "facebook.com");
+            }
+            other => panic!("expected Use-saved card for a real vault row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_matches_demo_origin_url_to_saved_etld() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.site_logins.push(saved_login_row("127.0.0.1", "ada"));
+        let grafted =
+            state.graft_user_forms(vec![ChatPart::CredentialRequest(demo_credential_request())]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert!(spec.is_unresolved());
+                assert_eq!(spec.username.as_deref(), Some("ada"));
+            }
+            other => panic!("expected Use-saved for 127.0.0.1 demo row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_drops_named_username_that_does_not_match_the_row() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.site_logins.push(saved_login_row("127.0.0.1", "ada"));
+        let mut spec = demo_credential_request();
+        spec.username = Some("other".into());
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(spec)]);
+        assert!(
+            grafted.is_empty(),
+            "wrong username is not a vault hit: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn use_saved_with_no_row_folds_none_saved_not_used() {
+        assert!(!crate::site_login::SESSION_BROKER_AVAILABLE);
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.site_logins_ready = true;
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        let matching = state.has_matching_saved_login("facebook.com", None);
+        assert!(!matching);
+        state.paint_credential_request_resolution(
+            "req-fb",
+            crate::opengrok::fold_credential_answer(true, matching),
+        );
+        state.sync_waiting_chrome("cw_1");
+
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Missing));
+        assert_eq!(spec.pill(), Some("None saved"));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Used));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Filled));
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "None saved remnant must not keep Waiting"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+    }
+
+    #[test]
+    fn graft_does_not_reoffer_auto_missed_request_after_a_login_is_saved() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.credential_auto_missing.insert("req-fb".into());
+        state
+            .site_logins
+            .push(saved_login_row("facebook.com", "ada"));
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        assert!(
+            grafted.is_empty(),
+            "already-answered missing must not reopen: {grafted:?}"
+        );
     }
 
     #[test]
