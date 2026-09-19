@@ -250,7 +250,7 @@ fn logins_page(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child("Saved site logins. Passwords stay in the OS keychain and are never shown."),
+                .child("Saved site logins on this Mac. Passwords stay in the OS keychain (not OpenGrok). Use saved login is offered only when a row here matches the site."),
         )
         .when_some(error, |this, error| {
             this.child(

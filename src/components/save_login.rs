@@ -166,7 +166,9 @@ fn render_settled_credential_request(
         CredentialRequestResolution::Used | CredentialRequestResolution::Filled => {
             (theme.green.opacity(0.18), theme.green)
         }
-        CredentialRequestResolution::Denied => (theme.secondary, theme.muted_foreground),
+        CredentialRequestResolution::Denied | CredentialRequestResolution::Missing => {
+            (theme.secondary, theme.muted_foreground)
+        }
     };
     v_flex()
         .id(ElementId::Name(
@@ -211,6 +213,7 @@ fn render_settled_credential_request(
                                 CredentialRequestResolution::Used
                                     | CredentialRequestResolution::Filled
                             ),
+                            // Missing / Denied: no check — must not look like success.
                             |this| this.child(Icon::new(IconName::Check).size(px(12.))),
                         )
                         .child(resolution.pill()),
