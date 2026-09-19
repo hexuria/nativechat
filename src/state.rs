@@ -5010,7 +5010,7 @@ impl AppState {
                     Ok(thread) => {
                         state.reconciled_threads.insert(conversation_id.clone());
                         state.apply_thread_replay(&conversation_id, &thread, cx);
-                        state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        state.overlay_replay_cards(&conversation_id, &thread.runs, cx);
                     }
                     Err(_) => {
                         state.reconciled_threads.remove(&conversation_id);
@@ -5083,15 +5083,21 @@ impl AppState {
     /// Idle + settled user-form cards (never secrets) from
     /// `formRequest` + sibling `formResolution`, local save prompts, and
     /// pinned screenshots from OpenGrok onto rows sqlite already has.
-    fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
-        let grafted: Vec<(String, Vec<ChatPart>)> = runs
-            .iter()
-            .filter(|run| !run.run_id.trim().is_empty())
-            .map(|run| {
-                let (_, parts) = reply_from_replay(&run.events, &run.status);
-                (run.run_id.clone(), self.graft_user_forms(parts))
-            })
-            .collect();
+    fn overlay_replay_cards(
+        &mut self,
+        conversation_id: &str,
+        runs: &[ThreadRun],
+        cx: &mut Context<Self>,
+    ) {
+        // `graft_turn_parts`, not the bare `graft_user_forms`: after a relaunch an
+        // unmatched live `credential.request` was dropped here with no `missing`
+        // posted, so the run parked forever with no card and no chrome.
+        let mut grafted: Vec<(String, Vec<ChatPart>)> = Vec::new();
+        for run in runs.iter().filter(|run| !run.run_id.trim().is_empty()) {
+            let (_, parts) = reply_from_replay(&run.events, &run.status);
+            let parts = self.graft_turn_parts(parts, Some(conversation_id), cx);
+            grafted.push((run.run_id.clone(), parts));
+        }
         let Some(conversation) = self
             .conversations
             .iter_mut()
