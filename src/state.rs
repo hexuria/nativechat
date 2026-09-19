@@ -8,16 +8,17 @@ use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
-    Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus,
-    Failure, FormResolution, FormSpec, HITL_INTERRUPT_AVAILABLE, ImageVisibility, LocalExecMode,
-    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
-    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
-    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay,
-    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE,
-    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
-    WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
-    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    env_egress_tunnel_enabled, host_egress_tunnel_flag, keep_local_save_offer, local_exec_outcome,
+    Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestResolution, CredentialRequestSpec,
+    CredentialResultStatus, Failure, FormResolution, FormSpec, HITL_INTERRUPT_AVAILABLE,
+    ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
+    OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
+    SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
+    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
+    host_egress_tunnel_flag, keep_local_save_offer, local_exec_outcome,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
     result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
     tool_standin,
@@ -1480,6 +1481,9 @@ pub struct AppState {
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
     user_form_resolutions: HashMap<String, FormResolution>,
+    /// Local `credential.request` settle (Dismissed / Used saved login).
+    /// Grafted across SSE overwrite so the remnant does not reopen.
+    credential_request_resolutions: HashMap<String, CredentialRequestResolution>,
     /// Stable resolution to restore if a POST fails (never reopen a settled card).
     user_form_restore: HashMap<String, FormResolution>,
     /// Form card key → handoff card id from dismiss `handoffEntryId`.
@@ -1853,6 +1857,7 @@ impl AppState {
             user_form_typed: HashMap::new(),
             user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
             user_form_resolutions: HashMap::new(),
+            credential_request_resolutions: HashMap::new(),
             user_form_restore: HashMap::new(),
             user_form_handoffs: HashMap::new(),
             user_form_pending_resolves: HashMap::new(),
@@ -2498,7 +2503,9 @@ impl AppState {
                 {
                     return Some(spec.run_id.clone());
                 }
-                ChatPart::CredentialRequest(spec) if !spec.run_id.is_empty() => {
+                ChatPart::CredentialRequest(spec)
+                    if spec.is_unresolved() && !spec.run_id.is_empty() =>
+                {
                     return Some(spec.run_id.clone());
                 }
                 _ => {}
@@ -6556,6 +6563,11 @@ impl AppState {
                     }
                 }
             }
+            if let ChatPart::CredentialRequest(spec) = part
+                && let Some(resolution) = self.credential_request_resolutions.get(&spec.request_id)
+            {
+                spec.resolution = Some(*resolution);
+            }
         }
         parts.retain(|part| match part {
             ChatPart::SaveLogin(spec) => keep_local_save_offer(
@@ -7182,13 +7194,38 @@ impl AppState {
         }
     }
 
-    fn remove_credential_request_part(&mut self, request_id: &str) {
+    fn conversation_id_for_credential_request(&self, request_id: &str) -> Option<String> {
+        self.conversations.iter().find_map(|conversation| {
+            conversation
+                .messages
+                .iter()
+                .flat_map(|message| message.parts.iter())
+                .any(|part| {
+                    matches!(
+                        part,
+                        ChatPart::CredentialRequest(spec) if spec.request_id == request_id
+                    )
+                })
+                .then(|| conversation.id.clone())
+        })
+    }
+
+    fn paint_credential_request_resolution(
+        &mut self,
+        request_id: &str,
+        resolution: CredentialRequestResolution,
+    ) {
+        self.credential_request_resolutions
+            .insert(request_id.to_string(), resolution);
         for conversation in &mut self.conversations {
             for message in &mut conversation.messages {
-                message.parts.retain(|part| match part {
-                    ChatPart::CredentialRequest(spec) => spec.request_id != request_id,
-                    _ => true,
-                });
+                for part in &mut message.parts {
+                    if let ChatPart::CredentialRequest(spec) = part
+                        && spec.request_id == request_id
+                    {
+                        spec.resolution = Some(resolution);
+                    }
+                }
             }
         }
     }
@@ -7266,8 +7303,10 @@ impl AppState {
         .detach();
     }
 
-    /// Confirm or deny `credential.request`. A.0 never types into Box and never
-    /// posts `filled` — that status is the session broker (A.1).
+    /// Confirm or deny `credential.request`. Folds the card immediately
+    /// (Dismissed / Used saved login), the way user-form Continue/Dismiss
+    /// leave a remnant. A.0 never types into Box and never posts `filled`
+    /// — that status is the session broker (A.1).
     pub fn answer_credential_request(
         &mut self,
         request_id: String,
@@ -7277,31 +7316,54 @@ impl AppState {
         let Some(spec) = self.credential_request_spec(&request_id) else {
             return;
         };
+        if spec.is_settled() {
+            return;
+        }
+        let conversation_id = self
+            .conversation_id_for_credential_request(&request_id)
+            .or_else(|| self.active_conversation_id.clone());
+        self.paint_credential_request_resolution(
+            &request_id,
+            CredentialRequestResolution::from_allow(allow),
+        );
+        if allow && !spec.run_id.is_empty() {
+            // Folded Used must not keep Waiting chrome; follow_run takes
+            // Working after the vault/broker result posts.
+            self.begin_responding(conversation_id.as_deref(), "Working");
+        } else if let Some(id) = conversation_id.as_deref() {
+            self.sync_waiting_chrome(id);
+        }
+        cx.notify();
         let vault = self.site_login_vault.clone();
         let agent_id = self.active_coworker_id.clone().unwrap_or_default();
         let client = self.opengrok.clone();
-        self.remove_credential_request_part(&request_id);
-        cx.notify();
+        let origin = spec.origin.clone();
+        let username = spec.username.clone();
+        let run_id = spec.run_id.clone();
         cx.spawn(async move |this, cx| {
-            let (status, credential_id) = match vault {
-                None => (CredentialResultStatus::Error, None),
-                Some(vault) => {
-                    let row = vault
-                        .find(&spec.origin, spec.username.as_deref())
-                        .await
-                        .ok()
-                        .flatten();
-                    let have_meta = row.is_some();
-                    let have_secret = row
-                        .as_ref()
-                        .is_some_and(|row| vault.secret_present(&row.id));
-                    let status = result_without_broker(allow, have_meta, have_secret);
-                    debug_assert_ne!(
-                        status,
-                        CredentialResultStatus::Filled,
-                        "A.0 must not claim filled without the session broker"
-                    );
-                    (status, row.map(|row| row.id))
+            let (status, credential_id) = if !allow {
+                (CredentialResultStatus::Denied, None)
+            } else {
+                match vault {
+                    None => (CredentialResultStatus::Error, None),
+                    Some(vault) => {
+                        let row = vault
+                            .find(&origin, username.as_deref())
+                            .await
+                            .ok()
+                            .flatten();
+                        let have_meta = row.is_some();
+                        let have_secret = row
+                            .as_ref()
+                            .is_some_and(|row| vault.secret_present(&row.id));
+                        let status = result_without_broker(true, have_meta, have_secret);
+                        debug_assert_ne!(
+                            status,
+                            CredentialResultStatus::Filled,
+                            "A.0 must not claim filled without the session broker"
+                        );
+                        (status, row.map(|row| row.id))
+                    }
                 }
             };
             if let Some(client) = client {
@@ -7315,10 +7377,11 @@ impl AppState {
                     .await;
             }
             let _ = this.update(cx, |state, cx| {
-                if !spec.run_id.is_empty() {
-                    let conversation_id = state.active_conversation_id.clone();
+                // Not now must not restart Working; Use saved follows the
+                // parked run after the vault/broker result posts.
+                if allow && !run_id.is_empty() {
                     state.begin_responding(conversation_id.as_deref(), "Working");
-                    state.follow_run(spec.run_id.clone(), conversation_id, cx);
+                    state.follow_run(run_id, conversation_id, cx);
                 }
                 cx.notify();
             });
@@ -7748,7 +7811,7 @@ impl AppState {
                             || spec.effective_resolution() == Some(FormResolution::Sending)
                             || spec.live_computer_handoff()
                     }
-                    ChatPart::CredentialRequest(_) => true,
+                    ChatPart::CredentialRequest(spec) => spec.is_unresolved(),
                     _ => false,
                 })
         })
@@ -8547,7 +8610,9 @@ mod tests {
         reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
         stream_paint_due, stream_part_sig, streaming_message_mut,
     };
-    use crate::opengrok::{Failure, FormResolution, ModelEntry, OpenGrokClient};
+    use crate::opengrok::{
+        CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
+    };
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -8891,6 +8956,7 @@ mod tests {
                 origin: "google.com".into(),
                 username: Some("ada@example.com".into()),
                 run_id: "run-1".into(),
+                resolution: None,
             }),
         ];
         assert!(saved_parts(&live).is_empty());
@@ -9069,7 +9135,14 @@ mod tests {
                     format!("save-login {} {}", spec.origin, spec.username)
                 }
                 ChatPart::CredentialRequest(spec) => {
-                    format!("credential-request {} {}", spec.origin, spec.request_id)
+                    format!(
+                        "credential-request {} {} {}",
+                        spec.origin,
+                        spec.request_id,
+                        spec.resolution
+                            .map(|resolution| resolution.as_str())
+                            .unwrap_or("idle")
+                    )
                 }
             })
             .collect()
@@ -10598,6 +10671,93 @@ mod tests {
             crate::opengrok::BoxHandoffResolution::Declined
         );
         assert_ne!(pending.resolution.as_str(), "e_form");
+    }
+
+    fn facebook_credential_request() -> crate::opengrok::CredentialRequestSpec {
+        crate::opengrok::CredentialRequestSpec {
+            request_id: "req-fb".into(),
+            origin: "facebook.com".into(),
+            username: None,
+            run_id: "run_1".into(),
+            resolution: None,
+        }
+    }
+
+    #[test]
+    fn not_now_folds_credential_request_and_clears_waiting() {
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert!(state.has_open_user_form("cw_1"));
+        assert!(state.has_hitl_to_interrupt("cw_1"));
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_credential_request_resolution("req-fb", CredentialRequestResolution::Denied);
+        state.sync_waiting_chrome("cw_1");
+
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "folded Dismissed is not open HITL"
+        );
+        assert!(
+            !state.has_hitl_to_interrupt("cw_1"),
+            "cold send must not /stop after Not now"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Denied));
+        assert_eq!(spec.pill(), Some("Dismissed"));
+        assert!(
+            state.conversations[0].messages.iter().any(|message| {
+                message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, ChatPart::CredentialRequest(_)))
+            }),
+            "Not now must leave a transcript remnant, not vanish"
+        );
+    }
+
+    #[test]
+    fn use_saved_folds_used_login_not_filled_without_broker() {
+        assert!(!crate::site_login::SESSION_BROKER_AVAILABLE);
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        state.paint_credential_request_resolution("req-fb", CredentialRequestResolution::Used);
+        state.sync_waiting_chrome("cw_1");
+
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Used));
+        assert_eq!(spec.pill(), Some("Used saved login"));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Filled));
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "Used remnant must not keep Waiting"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+    }
+
+    #[test]
+    fn graft_keeps_folded_credential_request_across_sse() {
+        let mut state = AppState::new();
+        state
+            .credential_request_resolutions
+            .insert("req-fb".into(), CredentialRequestResolution::Denied);
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert_eq!(spec.resolution, Some(CredentialRequestResolution::Denied));
+                assert_eq!(spec.pill(), Some("Dismissed"));
+                assert!(!spec.is_unresolved());
+            }
+            other => panic!("expected folded remnant, got {other:?}"),
+        }
     }
 
     #[test]

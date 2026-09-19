@@ -31,6 +31,53 @@ pub enum CredentialResultStatus {
     Error,
 }
 
+/// Local transcript settle for `credential.request`, independent of the
+/// REST `credential.result` status. A.0 never paints [`Self::Filled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRequestResolution {
+    /// Not now.
+    Denied,
+    /// Use saved login — confirmed locally. Broker-off A.0 stays here even
+    /// when REST posts `missing` / `error`.
+    Used,
+    /// Session broker put cookies/profile on Box (A.1).
+    Filled,
+}
+
+impl CredentialRequestResolution {
+    pub fn from_allow(allow: bool) -> Self {
+        if allow { Self::Used } else { Self::Denied }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::Used => "used",
+            Self::Filled => "filled",
+        }
+    }
+
+    /// Pill copy on the folded card — same chrome as user-form Submitted /
+    /// Dismissed.
+    pub fn pill(self) -> &'static str {
+        match self {
+            Self::Denied => "Dismissed",
+            Self::Used => "Used saved login",
+            Self::Filled => "Filled",
+        }
+    }
+
+    pub fn body(self) -> &'static str {
+        match self {
+            Self::Denied => "Dismissed without using a saved login.",
+            Self::Used => {
+                "Confirmed a saved login. NativeChat did not type a password into the computer."
+            }
+            Self::Filled => "Session restored on the computer. NativeChat did not type a password.",
+        }
+    }
+}
+
 impl CredentialResultStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -96,6 +143,8 @@ pub struct CredentialRequestSpec {
     pub origin: String,
     pub username: Option<String>,
     pub run_id: String,
+    /// None = idle (Use saved / Not now still on screen).
+    pub resolution: Option<CredentialRequestResolution>,
 }
 
 impl CredentialRequestSpec {
@@ -124,11 +173,28 @@ impl CredentialRequestSpec {
             origin,
             username: username.filter(|name| !name.is_empty()),
             run_id,
+            resolution: None,
         })
     }
 
     pub fn card_id(&self) -> String {
         credential_request_card_id(&self.request_id)
+    }
+
+    pub fn is_unresolved(&self) -> bool {
+        self.resolution.is_none()
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.resolution.is_some()
+    }
+
+    pub fn pill(&self) -> Option<&'static str> {
+        self.resolution.map(CredentialRequestResolution::pill)
+    }
+
+    pub fn body(&self) -> Option<&'static str> {
+        self.resolution.map(CredentialRequestResolution::body)
     }
 }
 
@@ -172,6 +238,10 @@ pub fn credential_request_allow_id(request_id: &str) -> String {
 
 pub fn credential_request_deny_id(request_id: &str) -> String {
     format!("credential-request-deny-{request_id}")
+}
+
+pub fn credential_request_pill_id(request_id: &str) -> String {
+    format!("credential-request-pill-{request_id}")
 }
 
 pub fn is_credential_custom_name(name: &str) -> bool {
@@ -295,6 +365,7 @@ mod tests {
         assert_eq!(spec.request_id, "req-9");
         assert_eq!(spec.origin, "github.com");
         assert_eq!(spec.username.as_deref(), Some("ada"));
+        assert!(spec.is_unresolved());
         assert!(!format!("{spec:?}").contains("nope"));
     }
 
@@ -357,6 +428,26 @@ mod tests {
         assert_eq!(CREDENTIAL_OFFER_SAVE, "credential.offer_save");
         assert_eq!(CREDENTIAL_REQUEST, "credential.request");
         assert_eq!(CREDENTIAL_RESULT, "credential.result");
+    }
+
+    #[test]
+    fn folded_pills_match_user_form_chrome_words() {
+        assert_eq!(CredentialRequestResolution::Denied.pill(), "Dismissed");
+        assert_eq!(CredentialRequestResolution::Used.pill(), "Used saved login");
+        assert_eq!(CredentialRequestResolution::Filled.pill(), "Filled");
+        assert_eq!(
+            CredentialRequestResolution::from_allow(true),
+            CredentialRequestResolution::Used,
+            "A.0 Use saved folds Used, never Filled without the broker"
+        );
+        assert_eq!(
+            CredentialRequestResolution::from_allow(false),
+            CredentialRequestResolution::Denied
+        );
+        assert_eq!(
+            credential_request_pill_id("req-9"),
+            "credential-request-pill-req-9"
+        );
     }
 
     #[test]
