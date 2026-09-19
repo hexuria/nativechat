@@ -313,7 +313,7 @@ impl OpenGrokClient {
         // A 401 on a signed-in session is a token that died between checks: refresh once and
         // send again. Auth routes are exempt, or a bad password would loop here.
         if response.status() == StatusCode::UNAUTHORIZED && !path.starts_with("/auth/") {
-            if self.refresh().await.is_ok() {
+            if self.refresh_after_unauthorized().await.is_ok() {
                 response = build(self.access_token())
                     .send()
                     .await
@@ -408,23 +408,49 @@ impl OpenGrokClient {
     /// OG short grace (idempotent current pair for the just-rotated-away
     /// refresh) does not replace this join.
     pub async fn refresh(&self) -> Result<(), OpenGrokError> {
+        self.refresh_inner(false).await
+    }
+
+    /// `refresh` for the 401 path. The server has already ruled on the token, so
+    /// the local "still looks fresh" check must not short-circuit: a revoked
+    /// session, a rotated signing key and clock skew all present as a fresh-
+    /// looking token the server refuses, and skipping the refresh here sends
+    /// the same dead token again and signs the person out.
+    pub async fn refresh_after_unauthorized(&self) -> Result<(), OpenGrokError> {
+        self.refresh_inner(true).await
+    }
+
+    async fn refresh_inner(&self, force: bool) -> Result<(), OpenGrokError> {
         let shared = {
             let mut flight = self.refresh_flight.lock().await;
-            if let Some(shared) = flight.as_ref() {
-                shared.clone()
-            } else if self.has_fresh_access() {
-                return Ok(());
-            } else {
-                let this = self.clone();
-                let shared = async move { this.refresh_once().await }.boxed().shared();
-                *flight = Some(shared.clone());
-                shared
+            // Join only a flight that is still running. One left behind finished
+            // (every waiter was cancelled before it could clear the slot) would
+            // hand a fresh caller its cached outcome instead of a real refresh.
+            let live = flight.as_ref().filter(|f| f.peek().is_none()).cloned();
+            match live {
+                Some(shared) => shared,
+                None if !force && self.has_fresh_access() => return Ok(()),
+                None => {
+                    let this = self.clone();
+                    let shared = async move { this.refresh_once().await }.boxed().shared();
+                    *flight = Some(shared.clone());
+                    shared
+                }
             }
         };
-        let outcome = shared.await;
+        let outcome = shared.clone().await;
         {
             let mut flight = self.refresh_flight.lock().await;
-            *flight = None;
+            // Clear only the flight this caller joined. `*flight = None` evicted
+            // whatever was there, so a late waiter from flight A could drop a
+            // newer flight B, and the next caller would start C beside it: two
+            // concurrent `/auth/refresh`, which is the sign-out this exists to stop.
+            if flight
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&shared))
+            {
+                *flight = None;
+            }
         }
         match outcome {
             RefreshOutcome::Ok => Ok(()),

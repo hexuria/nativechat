@@ -1953,13 +1953,15 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let account = match client.me().await {
                 Ok(account) => Ok(account),
-                Err(error) if error.is_unauthorized() => match client.refresh().await {
-                    Ok(()) => client.me().await,
-                    Err(_) => {
-                        client.clear_session();
-                        Err(error)
+                Err(error) if error.is_unauthorized() => {
+                    match client.refresh_after_unauthorized().await {
+                        Ok(()) => client.me().await,
+                        Err(_) => {
+                            client.clear_session();
+                            Err(error)
+                        }
                     }
-                },
+                }
                 Err(error) => Err(error),
             };
             let _ = this.update(cx, |state, cx| {
