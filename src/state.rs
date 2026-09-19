@@ -7305,10 +7305,15 @@ impl AppState {
                     Ok(rows) => {
                         state.site_logins = rows;
                         state.site_login_error = None;
+                        // Only a successful read makes the vault readable (the
+                        // contract at credential.rs:316). Every auto-miss guard keys
+                        // on this flag, so setting it on the error arm too made a
+                        // vault that failed to open answer `missing` to every
+                        // request. Left false, the person is asked instead.
+                        state.site_logins_ready = true;
                     }
                     Err(err) => state.site_login_error = Some(err.to_string()),
                 }
-                state.site_logins_ready = true;
                 let ids: Vec<String> = state
                     .conversations
                     .iter()
