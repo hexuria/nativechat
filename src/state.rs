@@ -7314,12 +7314,11 @@ impl AppState {
                     }
                     Err(err) => state.site_login_error = Some(err.to_string()),
                 }
-                let ids: Vec<String> = state
-                    .conversations
-                    .iter()
-                    .map(|conversation| conversation.id.clone())
-                    .collect();
-                for id in ids {
+                // Only the conversation on screen. Sweeping every conversation
+                // re-decided credential cards settled months ago: `missing` was
+                // POSTed for request ids that no longer existed, unrelated
+                // threads flipped to Working, and finished runs were polled again.
+                if let Some(id) = state.active_conversation_id.clone() {
                     state.sweep_empty_vault_credential_requests(&id, cx);
                 }
                 cx.notify();
