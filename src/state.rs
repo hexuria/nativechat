@@ -1497,7 +1497,10 @@ pub struct AppState {
     /// empty in-memory vec as "no logins" (startup race).
     site_logins_ready: bool,
     /// Stable resolution to restore if a POST fails (never reopen a settled card).
-    user_form_restore: HashMap<String, FormResolution>,
+    /// Prior resolution to restore if an optimistic paint is rolled back.
+    /// `Some(None)` means the card was idle; without that case a Dismiss that
+    /// failed on the server left the card Dismissed forever.
+    user_form_restore: HashMap<String, Option<FormResolution>>,
     /// Form card key → handoff card id from dismiss `handoffEntryId`.
     user_form_handoffs: HashMap<String, String>,
     /// Skip / I'm done before dismiss returned `handoffEntryId`. Local chrome
@@ -7165,9 +7168,12 @@ impl AppState {
     fn paint_user_form_resolution(&mut self, card_key: &str, resolution: FormResolution) {
         let (prior, call_id) = match self.user_form_mut(card_key) {
             Some(spec) => {
+                // Outer `None`: mid-Sending, leave the stored prior alone.
+                // `Some(None)`: the card was idle, and that is stored too. The
+                // old `.flatten()` folded both into `None`, so idle was never
+                // recorded and could never be restored.
                 let prior = (spec.resolution != Some(FormResolution::Sending))
-                    .then_some(spec.effective_resolution())
-                    .flatten();
+                    .then(|| spec.effective_resolution());
                 (prior, spec.call_id.clone())
             }
             None => (None, String::new()),
@@ -7248,10 +7254,17 @@ impl AppState {
         }
         if let Some(prior) = self.user_form_restore.remove(card_key) {
             if let Some(spec) = self.user_form_mut(card_key) {
-                spec.resolution = Some(prior);
+                spec.resolution = prior;
             }
-            self.user_form_resolutions
-                .insert(card_key.to_string(), prior);
+            match prior {
+                Some(prior) => {
+                    self.user_form_resolutions
+                        .insert(card_key.to_string(), prior);
+                }
+                None => {
+                    self.user_form_resolutions.remove(card_key);
+                }
+            }
         }
         self.restore_computer_handoff(card_key);
     }
