@@ -6,6 +6,7 @@ pub mod audio;
 pub mod chrome;
 pub mod components;
 pub mod config;
+pub mod cron_spec;
 pub mod db;
 pub mod error;
 pub mod find_text;

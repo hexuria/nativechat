@@ -5,6 +5,11 @@ use crate::chrome::{
     sidebar_from_resize,
 };
 use crate::config::Config;
+/// The routine editor's schedule and the cron line it becomes. Re-exported because every
+/// caller reads it as part of a routine, and a routine is a thing on `AppState`.
+pub use crate::cron_spec::{
+    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit,
+};
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
@@ -927,177 +932,6 @@ pub struct AgentRoutine {
     pub active: bool,
     pub triggers: Vec<RoutineTrigger>,
     pub runs: Vec<RoutineRun>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleUiMode {
-    Interval,
-    Custom,
-    Advanced,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleUnit {
-    Minutes,
-    Hours,
-    Days,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleDayKind {
-    EveryDay,
-    Weekdays,
-    DaysOfMonth,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScheduleSpec {
-    pub mode: ScheduleUiMode,
-    pub every: u32,
-    pub unit: ScheduleUnit,
-    pub expr: String,
-    pub months: Vec<u8>,
-    pub day_kind: ScheduleDayKind,
-    pub weekdays: Vec<u8>,
-    pub month_days: Vec<u8>,
-    pub times: Vec<(u8, u8)>,
-}
-
-impl ScheduleSpec {
-    pub fn interval(every: u32, unit: ScheduleUnit) -> Self {
-        Self {
-            mode: ScheduleUiMode::Interval,
-            every,
-            unit,
-            expr: String::new(),
-            months: Vec::new(),
-            day_kind: ScheduleDayKind::EveryDay,
-            weekdays: Vec::new(),
-            month_days: Vec::new(),
-            times: vec![(9, 0)],
-        }
-    }
-
-    pub fn custom(expr: &str) -> Self {
-        let mut spec = Self::interval(1, ScheduleUnit::Hours);
-        spec.mode = ScheduleUiMode::Custom;
-        spec.expr = expr.to_string();
-        spec
-    }
-
-    pub fn advanced_daily(hour: u8, minute: u8) -> Self {
-        let mut spec = Self::interval(1, ScheduleUnit::Days);
-        spec.mode = ScheduleUiMode::Advanced;
-        spec.day_kind = ScheduleDayKind::EveryDay;
-        spec.times = vec![(hour, minute)];
-        spec
-    }
-
-    pub fn from_preset(name: &str) -> Self {
-        match name {
-            "Every hour" => Self::interval(1, ScheduleUnit::Hours),
-            "Every day" => Self::advanced_daily(9, 0),
-            "Weekdays" => {
-                let mut spec = Self::advanced_daily(9, 0);
-                spec.day_kind = ScheduleDayKind::Weekdays;
-                spec.weekdays = vec![1, 2, 3, 4, 5];
-                spec
-            }
-            "Every week" => {
-                let mut spec = Self::advanced_daily(9, 0);
-                spec.day_kind = ScheduleDayKind::Weekdays;
-                spec.weekdays = vec![1];
-                spec
-            }
-            "Every month" => {
-                let mut spec = Self::advanced_daily(8, 0);
-                spec.day_kind = ScheduleDayKind::DaysOfMonth;
-                spec.month_days = vec![1];
-                spec
-            }
-            "Interval" => Self::interval(30, ScheduleUnit::Minutes),
-            "Advanced..." => Self::advanced_daily(9, 0),
-            _ => Self::interval(30, ScheduleUnit::Minutes),
-        }
-    }
-
-    pub fn label(&self) -> String {
-        match self.mode {
-            ScheduleUiMode::Interval => match (self.every, self.unit) {
-                (1, ScheduleUnit::Minutes) => "Every minute".into(),
-                (n, ScheduleUnit::Minutes) => format!("Every {n} minutes"),
-                (1, ScheduleUnit::Hours) => "Every hour".into(),
-                (n, ScheduleUnit::Hours) => format!("Every {n} hours"),
-                (1, ScheduleUnit::Days) => "Every day".into(),
-                (n, ScheduleUnit::Days) => format!("Every {n} days"),
-            },
-            ScheduleUiMode::Custom => {
-                if self.expr.trim().is_empty() {
-                    "Custom schedule".into()
-                } else {
-                    self.expr.clone()
-                }
-            }
-            ScheduleUiMode::Advanced => advanced_label(self),
-        }
-    }
-}
-
-fn format_clock(hour: u8, minute: u8) -> String {
-    let (h12, am) = if hour == 0 {
-        (12, true)
-    } else if hour < 12 {
-        (hour, true)
-    } else if hour == 12 {
-        (12, false)
-    } else {
-        (hour - 12, false)
-    };
-    format!("{}:{:02} {}", h12, minute, if am { "AM" } else { "PM" })
-}
-
-fn ordinal(n: u8) -> String {
-    let suffix = if matches!(n % 100, 11 | 12 | 13) {
-        "th"
-    } else {
-        match n % 10 {
-            1 => "st",
-            2 => "nd",
-            3 => "rd",
-            _ => "th",
-        }
-    };
-    format!("{n}{suffix}")
-}
-
-fn advanced_label(spec: &ScheduleSpec) -> String {
-    let time = spec
-        .times
-        .first()
-        .map(|(h, m)| format_clock(*h, *m))
-        .unwrap_or_else(|| "9:00 AM".into());
-    match spec.day_kind {
-        ScheduleDayKind::EveryDay => format!("Every day at {time}"),
-        ScheduleDayKind::Weekdays if spec.weekdays == [1, 2, 3, 4, 5] => {
-            format!("Weekdays at {time}")
-        }
-        ScheduleDayKind::Weekdays if spec.weekdays.len() == 1 => {
-            format!("Every week at {time}")
-        }
-        ScheduleDayKind::DaysOfMonth if spec.month_days == [1] => {
-            format!("Monthly on the 1st at {time}")
-        }
-        ScheduleDayKind::DaysOfMonth => {
-            let days = spec
-                .month_days
-                .iter()
-                .map(|d| ordinal(*d))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("Monthly on the {days} at {time}")
-        }
-        _ => format!("Scheduled at {time}"),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
