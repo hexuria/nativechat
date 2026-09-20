@@ -834,15 +834,18 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
                 "Webhook",
             ));
     }
-    if let (Some(url), Some(key)) = (&routine.webhook_url, &routine.webhook_key) {
+    // Tied to the kind and not to whether the server filled either in: a webhook whose key
+    // came back empty is a fact worth reading off an empty value, not one worth hiding the
+    // URL over.
+    if routine.kind == "webhook" {
         node = node
             .with_child(
                 UiNode::status(ids::routine_webhook_url(&routine.id), "POST to")
-                    .with_value(url.clone()),
+                    .with_value(routine.webhook_url.clone().unwrap_or_default()),
             )
             .with_child(
                 UiNode::status(ids::routine_webhook_key(&routine.id), "key")
-                    .with_value(key.clone()),
+                    .with_value(routine.webhook_key.clone().unwrap_or_default()),
             )
             .with_child(UiNode::button(
                 ids::routine_rotate(&routine.id),
@@ -2535,6 +2538,9 @@ impl NativeChatHost {
                             "cron": routine.cron,
                             "active": routine.active,
                             "webhook_url": routine.webhook_url,
+                            // The key rides with the row: firing the hook needs it, and so
+                            // does telling a rotated key from the one it replaced.
+                            "webhook_key": routine.webhook_key,
                         }))
                         .collect::<Vec<_>>(),
                 })));
@@ -2718,6 +2724,27 @@ mod tests {
             Some("og_live_abc")
         );
         assert!(tree.find(&ids::routine_rotate("sch_2")).is_some());
+
+        // A key the server did not send back reads as an empty value rather than as a webhook
+        // with no URL: the row is still there to fire, and the emptiness is the news.
+        let mut keyless = routine("sch_3", "webhook");
+        keyless.webhook_key = None;
+        host.routines = vec![keyless];
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::routine_webhook_url("sch_3"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("https://og.example/hooks/sch_2")
+        );
+        assert_eq!(
+            tree.find(&ids::routine_webhook_key("sch_3"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("")
+        );
     }
 
     /// A draft is the one routine with a trigger to offer, and the only one not on the server.
@@ -2797,6 +2824,11 @@ mod tests {
         assert_eq!(rows[0]["cron"], "0 9 * * *");
         assert_eq!(rows[1]["kind"], "webhook");
         assert_eq!(rows[1]["webhook_url"], "https://og.example/hooks/sch_2");
+        assert_eq!(
+            rows[1]["webhook_key"], "og_live_abc",
+            "a driver that cannot read the key cannot fire the hook or tell a rotation happened"
+        );
+        assert_eq!(rows[0]["webhook_key"], serde_json::Value::Null);
         assert!(host.take_command().is_none(), "a listing changes nothing");
     }
 

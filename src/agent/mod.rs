@@ -31,7 +31,7 @@
 //! `credential.answer`). Click ids above still work.
 //!
 //! Routines: `routine.list` (answers with the open bot's rows —
-//! `id, name, kind, cron, active, webhook_url`), `routine.create --arg
+//! `id, name, kind, cron, active, webhook_url, webhook_key`), `routine.create --arg
 //! kind=cron|webhook --arg prompt=... [--arg cron=...]`, `routine.rotate --arg id=...`,
 //! `routine.delete --arg id=...`.
 //!
