@@ -9,19 +9,19 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestResolution, CredentialRequestSpec,
-    CredentialResultStatus, Failure, FormResolution, FormSpec,
-    ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
-    OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
-    SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
-    TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
-    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    fold_credential_answer, host_egress_tunnel_flag, keep_credential_request_offer,
-    keep_local_save_offer, local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
-    reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
-    stored_machine_id, tool_standin,
+    CredentialResultStatus, Failure, FormResolution, FormSpec, ImageVisibility, LocalExecMode,
+    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
+    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay,
+    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE,
+    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
+    WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, fold_credential_answer, host_egress_tunnel_flag,
+    keep_credential_request_offer, keep_local_save_offer, local_exec_outcome,
+    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
+    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
+    tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -2561,10 +2561,7 @@ impl AppState {
                         || spec.effective_resolution() == Some(FormResolution::Sending)
                         || spec.live_computer_handoff() =>
                 {
-                    forms.push((
-                        spec.card_key().to_string(),
-                        spec.live_computer_handoff(),
-                    ));
+                    forms.push((spec.card_key().to_string(), spec.live_computer_handoff()));
                 }
                 ChatPart::CredentialRequest(spec) if spec.is_unresolved() => {
                     credentials.push(spec.request_id.clone());
@@ -7937,7 +7934,12 @@ impl AppState {
 
     /// `force_steer` is ⌘⇧↩: send now even if a turn is running. What that
     /// means for each state of the thread is [`plan_send`].
-    pub fn send_message_with(&mut self, content: String, force_steer: bool, cx: &mut Context<Self>) {
+    pub fn send_message_with(
+        &mut self,
+        content: String,
+        force_steer: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_signed_in() {
             self.auth_error = Some("Sign in first".to_string());
             cx.notify();
@@ -8120,7 +8122,10 @@ impl AppState {
             .conversations
             .iter_mut()
             .find(|c| c.id == conversation_id)
-            && !conversation.messages.iter().any(|m| m.id == next.message_id)
+            && !conversation
+                .messages
+                .iter()
+                .any(|m| m.id == next.message_id)
         {
             conversation.messages.push(Message {
                 id: next.message_id.clone(),
@@ -10620,7 +10625,10 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(spec.effective_resolution(), Some(FormResolution::Superseded));
+        assert_eq!(
+            spec.effective_resolution(),
+            Some(FormResolution::Superseded)
+        );
         assert_eq!(
             state.busy_state("cw_1"),
             Busy::Running,
@@ -10655,7 +10663,11 @@ mod tests {
             state.approval_decisions.get("c1"),
             Some(&ApprovalDecision::Superseded)
         );
-        assert_eq!(state.thread_status("cw_1"), None, "Waiting for approval is gone");
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Waiting for approval is gone"
+        );
 
         let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
             "type": "CUSTOM",

@@ -97,7 +97,11 @@ mod tests {
         let dir = scratch("other-keys");
         let path = prefs_path(&dir);
         std::fs::write(&path, r#"{"later_build":{"x":1},"on_send":"auto"}"#).unwrap();
-        assert_eq!(load_on_send_from(&path), OnSend::Queue, "unknown word is queue");
+        assert_eq!(
+            load_on_send_from(&path),
+            OnSend::Queue,
+            "unknown word is queue"
+        );
         save_on_send_to(&path, OnSend::Steer);
         let raw = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();

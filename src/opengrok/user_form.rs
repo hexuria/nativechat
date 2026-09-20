@@ -305,11 +305,7 @@ impl FormResolution {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Submitted
-                | Self::FillFailed
-                | Self::Dismissed
-                | Self::Skipped
-                | Self::Superseded
+            Self::Submitted | Self::FillFailed | Self::Dismissed | Self::Skipped | Self::Superseded
         )
     }
 }

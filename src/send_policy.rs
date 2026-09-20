@@ -92,10 +92,22 @@ mod tests {
 
     #[test]
     fn running_queues_by_default_and_steers_on_request() {
-        assert_eq!(plan_send(Busy::Running, OnSend::Queue, false), SendPlan::Queue);
-        assert_eq!(plan_send(Busy::Running, OnSend::Queue, true), SendPlan::Steer);
-        assert_eq!(plan_send(Busy::Running, OnSend::Steer, false), SendPlan::Steer);
-        assert_eq!(plan_send(Busy::Running, OnSend::Steer, true), SendPlan::Steer);
+        assert_eq!(
+            plan_send(Busy::Running, OnSend::Queue, false),
+            SendPlan::Queue
+        );
+        assert_eq!(
+            plan_send(Busy::Running, OnSend::Queue, true),
+            SendPlan::Steer
+        );
+        assert_eq!(
+            plan_send(Busy::Running, OnSend::Steer, false),
+            SendPlan::Steer
+        );
+        assert_eq!(
+            plan_send(Busy::Running, OnSend::Steer, true),
+            SendPlan::Steer
+        );
     }
 
     #[test]
