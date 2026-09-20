@@ -38,6 +38,9 @@ pub mod ids {
     /// The one button at the right of the composer: the send arrow, or the stop square while a
     /// turn is running. One id, because it is one button in one place.
     pub const COMPOSER_SEND: &str = "composer-send";
+    /// Messages the open thread is holding until it is idle; in the tree only while there
+    /// are any, so `assert --exists false` is "nothing queued".
+    pub const COMPOSER_QUEUED: &str = "composer-queued";
     /// The one wide list `+`, `@` and `/` all open above the composer.
     pub const COMPOSER_PANEL: &str = "composer-panel";
     /// The field inside that list, which takes the caret the moment the list opens.
@@ -93,6 +96,8 @@ pub enum Command {
     SelectSession(String),
     SelectCoworker(String),
     SendMessage(String),
+    /// ⌘⇧↩: send now, over a running turn.
+    SendMessageSteer(String),
     /// Stop the turn the open thread has in flight, which is what the composer's button does
     /// while it is a stop button.
     StopTurn,
@@ -207,6 +212,7 @@ impl Command {
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
+            Self::SendMessageSteer(text) => state.send_message_with(text, true, cx),
             Self::StopTurn => state.stop_turn(cx),
             Self::RetryTurn => state.retry_turn(cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
@@ -811,6 +817,8 @@ pub struct NativeChatHost {
     /// turn, which is kept per thread, and the line beside it was once one label for the whole
     /// app.
     turn_in_flight: bool,
+    /// Messages the open thread is holding until it is idle.
+    queued_sends: usize,
     agent_settings_open: bool,
     model_picker_open: bool,
     avatar_editor_open: bool,
@@ -927,6 +935,7 @@ impl NativeChatHost {
                 .unwrap_or_default(),
             bot_status: state.visible_bot_status(),
             turn_in_flight: state.is_turn_in_flight(),
+            queued_sends: state.queued_send_count(),
             agent_settings_open: state.is_agent_settings_open(),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
@@ -1286,6 +1295,13 @@ impl NativeChatHost {
             ));
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
+        }
+        if self.queued_sends > 0 {
+            page = page.with_child(UiNode::new(
+                ids::COMPOSER_QUEUED,
+                "status",
+                format!("{} queued", self.queued_sends),
+            ));
         }
         // What typing produces: the list `/` or `@` opened, the recipe that picking one put on
         // the draft, and the pictures a turn came back with. Each is in the tree only while it
@@ -2204,6 +2220,17 @@ impl NativeChatHost {
                     .to_string();
                 Command::SendMessage(text)
             }
+            // The forced send and the stop, under names, so a driver can exercise the
+            // queue: send while a turn runs, then send now, then stop.
+            "chat.send-steer" => {
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "chat.send-steer requires arg text".to_string())?
+                    .to_string();
+                Command::SendMessageSteer(text)
+            }
+            "turn.stop" => Command::StopTurn,
             "session.select" => {
                 let id = args
                     .get("id")
