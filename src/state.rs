@@ -4082,6 +4082,13 @@ impl AppState {
         cx.notify();
     }
 
+    /// Change when a routine runs, on screen.
+    ///
+    /// On screen only, for the same reason the name and the prompt are: `/schedules` has no
+    /// route to change a schedule once it is made. What this does do is say so the moment a
+    /// combination stops being one cron line — two times of day with different minutes past
+    /// the hour, a week with no day picked — because that is a thing the person is building
+    /// right now and can still put right.
     pub fn update_schedule_spec(
         &mut self,
         coworker_id: &str,
@@ -4090,12 +4097,14 @@ impl AppState {
         spec: ScheduleSpec,
         cx: &mut Context<Self>,
     ) {
+        let trouble = spec.to_cron().err();
         if let Some(row) = self.routine_mut(coworker_id, routine_id)
             && let Some(RoutineTrigger::Schedule { spec: current, .. }) =
                 row.triggers.iter_mut().find(|t| t.id() == trigger_id)
         {
             *current = spec;
         }
+        self.computer_action_error = trouble.map(|not_cron| not_cron.sentence().to_string());
         cx.notify();
     }
 

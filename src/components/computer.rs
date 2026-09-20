@@ -31,9 +31,6 @@ pub struct ComputerPane {
     state: Entity<AppState>,
     name_input: Entity<InputState>,
     instruction_input: Entity<TextareaState>,
-    webhook_url: Entity<InputState>,
-    webhook_key: Entity<InputState>,
-    webhook_header: Entity<InputState>,
     custom_cron: Entity<InputState>,
     loaded_editor: Option<Option<String>>,
     webhook_popover: Option<String>,
@@ -47,18 +44,12 @@ impl ComputerPane {
                 .placeholder("What should this routine do each time it runs?")
                 .auto_grow(3, 8)
         });
-        let webhook_url = cx.new(|cx| InputState::new(window, cx).placeholder("POST URL"));
-        let webhook_key = cx.new(|cx| InputState::new(window, cx).placeholder("key"));
-        let webhook_header = cx.new(|cx| InputState::new(window, cx).placeholder("header"));
         let custom_cron = cx.new(|cx| InputState::new(window, cx).placeholder("@every 1h"));
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         Self {
             state,
             name_input,
             instruction_input,
-            webhook_url,
-            webhook_key,
-            webhook_header,
             custom_cron,
             loaded_editor: None,
             webhook_popover: None,
@@ -96,24 +87,6 @@ impl ComputerPane {
         });
         self.instruction_input.update(cx, |input, cx| {
             input.set_value(instruction, window, cx);
-        });
-        let webhook = routine.as_ref().and_then(|r| {
-            r.triggers.iter().rev().find_map(|t| match t {
-                RoutineTrigger::Webhook {
-                    url, key, header, ..
-                } => Some((url.clone(), key.clone(), header.clone())),
-                _ => None,
-            })
-        });
-        let (url, key, header) = webhook.unwrap_or_default();
-        self.webhook_url.update(cx, |input, cx| {
-            input.set_value(url, window, cx);
-        });
-        self.webhook_key.update(cx, |input, cx| {
-            input.set_value(key, window, cx);
-        });
-        self.webhook_header.update(cx, |input, cx| {
-            input.set_value(header, window, cx);
         });
         let cron = routine
             .as_ref()
@@ -682,12 +655,11 @@ impl ComputerPane {
                     .p(px(10.))
                     .gap(px(10.))
                     .children({
-                        let webhook_url = self.webhook_url.clone();
-                        let webhook_key = self.webhook_key.clone();
-                        let webhook_header = self.webhook_header.clone();
                         let view = cx.entity();
                         let open_id = self.webhook_popover.clone();
                         let theme = theme.clone();
+                        let app = app.clone();
+                        let coworker_id = coworker_id.to_string();
                         triggers.iter().cloned().map(move |trigger| {
                             if let RoutineTrigger::Webhook {
                                 id,
@@ -698,15 +670,14 @@ impl ComputerPane {
                             {
                                 webhook_popover_row(
                                     id.clone(),
+                                    coworker_id.clone(),
                                     url.clone(),
                                     key.clone(),
                                     header.clone(),
                                     muted,
                                     open_id.as_ref() == Some(id),
                                     view.clone(),
-                                    webhook_url.clone(),
-                                    webhook_key.clone(),
-                                    webhook_header.clone(),
+                                    app.clone(),
                                     theme.clone(),
                                 )
                             } else {
@@ -1357,50 +1328,41 @@ impl RenderOnce for WebhookRowTrigger {
     }
 }
 
+/// The webhook trigger's row, and what opens under it: the URL, the key and the header the
+/// server minted, shown as they are.
+///
+/// Read-only, and that is the change. These three used to be fields somebody could type into,
+/// over values this app had made up — a URL pointing at a route that did not exist and a key
+/// nothing had ever been told about. Now they are the server's, and a field somebody could
+/// type into would be a field somebody could believe they had changed. Each copies, and the
+/// key can be replaced by asking the server for another one.
 fn webhook_popover_row(
-    id: String,
+    routine_id: String,
+    coworker_id: String,
     url: String,
     key: String,
     header: String,
     muted: Hsla,
     open: bool,
     view: Entity<ComputerPane>,
-    webhook_url: Entity<InputState>,
-    webhook_key: Entity<InputState>,
-    webhook_header: Entity<InputState>,
+    app: Entity<AppState>,
     theme: gpui_kit::component::Theme,
 ) -> AnyElement {
     let panel_bg = theme.sidebar;
-    Popover::new(SharedString::from(format!("webhook-pop-{id}")))
+    Popover::new(SharedString::from(format!("webhook-pop-{routine_id}")))
         .appearance(false)
         .overlay_closable(true)
         .open(open)
         .on_open_change({
             let view = view.clone();
-            let id = id.clone();
-            let url = url.clone();
-            let key = key.clone();
-            let header = header.clone();
-            let webhook_url = webhook_url.clone();
-            let webhook_key = webhook_key.clone();
-            let webhook_header = webhook_header.clone();
-            move |is_open, window, cx| {
+            let routine_id = routine_id.clone();
+            move |is_open, _, cx| {
                 view.update(cx, |this, cx| {
-                    this.webhook_popover = if *is_open { Some(id.clone()) } else { None };
-                    if *is_open {
-                        let url = url.clone();
-                        let key = key.clone();
-                        let header = header.clone();
-                        this.webhook_url.update(cx, |input, cx| {
-                            input.set_value(url, window, cx);
-                        });
-                        this.webhook_key.update(cx, |input, cx| {
-                            input.set_value(key, window, cx);
-                        });
-                        this.webhook_header.update(cx, |input, cx| {
-                            input.set_value(header, window, cx);
-                        });
-                    }
+                    this.webhook_popover = if *is_open {
+                        Some(routine_id.clone())
+                    } else {
+                        None
+                    };
                     cx.notify();
                 });
             }
@@ -1410,9 +1372,13 @@ fn webhook_popover_row(
             muted,
         })
         .content(move |_, _, _| {
+            let rotate_id = SharedString::from(format!("routine-{routine_id}-rotate"));
+            let app = app.clone();
+            let coworker_id = coworker_id.clone();
+            let rotating_id = routine_id.clone();
             v_flex()
                 .id("webhook-pop-panel")
-                .w(px(260.))
+                .w(px(280.))
                 .p(px(12.))
                 .gap(px(8.))
                 .rounded(px(12.))
@@ -1423,13 +1389,91 @@ fn webhook_popover_row(
                 .occlude()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(field_label("POST to", muted))
-                .child(field_input(&webhook_url))
+                .child(copy_row(
+                    format!("routine-{routine_id}-webhook-url"),
+                    url.clone(),
+                    muted,
+                    &theme,
+                ))
                 .child(field_label("key", muted))
-                .child(field_input(&webhook_key))
+                .child(copy_row(
+                    format!("routine-{routine_id}-webhook-key"),
+                    key.clone(),
+                    muted,
+                    &theme,
+                ))
                 .child(field_label("header", muted))
-                .child(field_input(&webhook_header))
+                .child(copy_row(
+                    format!("routine-{routine_id}-webhook-header"),
+                    header.clone(),
+                    muted,
+                    &theme,
+                ))
+                .child(
+                    Button::new(rotate_id)
+                        .ghost()
+                        .label("Rotate key")
+                        .tooltip("The old key stops working at once.")
+                        .on_click(move |_, _, cx| {
+                            let coworker_id = coworker_id.clone();
+                            let routine_id = rotating_id.clone();
+                            app.update(cx, |state, cx| {
+                                state.rotate_routine_webhook(&coworker_id, &routine_id, cx);
+                            });
+                        }),
+                )
         })
         .into_any_element()
+}
+
+/// One value the server minted, as it is, with the button that puts it on the clipboard.
+fn copy_row(
+    id: String,
+    value: String,
+    muted: Hsla,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let copied = value.clone();
+    h_flex()
+        .w_full()
+        .gap(px(6.))
+        .items_center()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.input)
+        .bg(theme.input_background())
+        .px(px(8.))
+        .py(px(4.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_xs()
+                .truncate()
+                .child(value),
+        )
+        .child(
+            div()
+                .id(SharedString::from(id))
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                .tooltip(|window, cx| Tooltip::new("Copy").build(window, cx))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                })
+                .child(
+                    Icon::default()
+                        .path("icons/copy.svg")
+                        .size(px(12.))
+                        .text_color(muted),
+                ),
+        )
 }
 
 fn add_trigger_button(
