@@ -32,6 +32,7 @@ use crate::site_login::{
     PendingSave, SiteLoginRecord, SiteLoginVault, login_matches_request, registrable_origin,
     save_candidate,
 };
+use crate::threads::conversation_for_thread;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -6086,14 +6087,16 @@ impl AppState {
             });
         // The thread the run belongs to, not the thread that happens to be open: a card can be
         // answered from the notification while the person is reading somewhere else, and the
-        // resumed run must go on filling in its own bubble. Falling back to the open thread only
-        // covers a card the app never saw start, which is how cards off the approval queue
-        // arrive.
+        // resumed run must go on filling in its own bubble. Failing that, the thread the card
+        // was filed under — which for the MCP door is not a conversation at all but the coworker
+        // whose calls it audits, and that is the thread the card was grafted onto. The open
+        // thread is the last resort, for a card that came with no thread on it.
         let conversation_id = self
             .live_turns
             .iter()
             .find(|(_, turn)| turn.run_id == spec.run_id)
             .map(|(id, _)| id.clone())
+            .or_else(|| spec.conversation_id().map(str::to_string))
             .or_else(|| self.active_conversation_id.clone());
         let (approved, decision, mode) = match resolution {
             LocalExecResolution::Always => (true, ApprovalDecision::Always, Some("bypass")),
@@ -6493,7 +6496,10 @@ impl AppState {
                 if state.is_thread_responding(thread_id) {
                     return;
                 }
-                let Some(item) = QueuedApproval::latest_for_thread(&needs_card, thread_id) else {
+                // By conversation: the queue files an MCP door's card under `mcp-{coworker}`,
+                // and this thread is where that coworker is read.
+                let Some(item) = QueuedApproval::latest_for_conversation(&needs_card, thread_id)
+                else {
                     return;
                 };
                 if item.run_id.trim().is_empty() {
@@ -6540,10 +6546,11 @@ impl AppState {
         self.approval_decisions
             .entry(spec.call_id.clone())
             .or_insert(ApprovalDecision::Pending);
+        let conversation_id = conversation_for_thread(&item.thread_id);
         let Some(conversation) = self
             .conversations
             .iter_mut()
-            .find(|c| c.id == item.thread_id)
+            .find(|c| c.id == conversation_id)
         else {
             return;
         };
@@ -8811,6 +8818,7 @@ impl AppState {
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
     ApprovalSpec {
         run_id: item.run_id.clone(),
+        thread_id: some_unless_blank(&item.thread_id),
         call_id: item.call_id.clone(),
         tool: item.tool.clone(),
         command: command_from_args(&item.arguments),
@@ -9128,10 +9136,11 @@ mod tests {
         apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
         is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
         reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
-        stream_paint_due, stream_part_sig, streaming_message_mut,
+        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut,
     };
     use crate::opengrok::{
         CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
+        QueuedApproval, USER_MACHINE_SHELL,
     };
     use crate::state::{ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave};
     use std::str::FromStr;
@@ -10760,6 +10769,7 @@ mod tests {
     fn an_open_approval_or_live_handoff_is_parked_and_a_steer_settles_it() {
         let approval = crate::opengrok::ApprovalSpec {
             run_id: "run_1".into(),
+            thread_id: None,
             call_id: "c1".into(),
             tool: "Shell".into(),
             command: "ls".into(),
@@ -11826,6 +11836,52 @@ mod tests {
             Some("Running commands")
         );
         assert!(state.is_active_bot_responding());
+    }
+
+    // ---- A card the MCP door raised ---------------------------------------------------------
+
+    fn queued(thread_id: &str, call_id: &str, tool: &str) -> QueuedApproval {
+        QueuedApproval {
+            run_id: "run_mcp".into(),
+            thread_id: thread_id.into(),
+            call_id: call_id.into(),
+            tool: tool.into(),
+            arguments: serde_json::json!({ "path": "/etc/hosts" }),
+        }
+    }
+
+    /// The door files its cards under a thread of its own, `mcp-{coworker}`. There is no
+    /// conversation by that name and there should not be one: the card goes to the coworker.
+    #[test]
+    fn a_card_filed_under_an_mcp_thread_is_grafted_onto_its_coworkers_thread() {
+        let mut state = AppState::new();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![at(message("m_said", false, "Done."), 10)],
+        ));
+
+        state.attach_queued_approval(queued("mcp-cw_1", "call_9", "read_file"));
+
+        let parts = &state.conversations[0].messages[0].parts;
+        assert!(
+            matches!(parts.as_slice(), [ChatPart::Approval(spec)] if spec.call_id == "call_9"),
+            "the coworker's thread is holding the card, not a thread named after the door"
+        );
+        assert_eq!(state.conversations.len(), 1, "no `mcp-cw_1` conversation");
+    }
+
+    /// The card knows where it came from, so answering it puts the working line on the thread
+    /// it was grafted onto rather than on whatever happens to be open.
+    #[test]
+    fn a_queued_card_carries_the_thread_it_was_filed_under() {
+        let spec = spec_from_queued(&queued("mcp-cw_1", "call_9", "read_file"));
+        assert_eq!(spec.thread_id.as_deref(), Some("mcp-cw_1"));
+        assert_eq!(spec.conversation_id(), Some("cw_1"));
+        assert!(spec.is_mcp());
+
+        let chat = spec_from_queued(&queued("cw_1", "call_1", USER_MACHINE_SHELL));
+        assert_eq!(chat.conversation_id(), Some("cw_1"));
+        assert!(!chat.is_mcp());
     }
 
     // ---- Reaching the gateway, and the list that depends on it ------------------------------

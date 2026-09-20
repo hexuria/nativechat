@@ -15,6 +15,7 @@ use super::user_form::{
     ComputerHandoffSpec, UserFormSpec, is_user_form_awaiting, is_user_form_tool,
 };
 use super::visibility::{ImageVisibility, pin_shot_at_turn_end, pin_shot_now};
+use crate::threads::{conversation_for_thread, is_mcp_thread};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatPart {
@@ -149,6 +150,10 @@ impl ScreenshotSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalSpec {
     pub run_id: String,
+    /// The thread the run belongs to, when the server said which. An `mcp-…`
+    /// thread is the MCP door auditing a call the coworker made somewhere
+    /// else, and its cards belong in that coworker's conversation.
+    pub thread_id: Option<String>,
     pub call_id: String,
     pub tool: String,
     pub command: String,
@@ -175,6 +180,17 @@ pub enum LocalExecResolution {
 impl ApprovalSpec {
     pub fn runs_on_this_mac(&self) -> bool {
         self.tool == USER_MACHINE_SHELL
+    }
+
+    /// The card came off the MCP door rather than out of a turn of the chat.
+    pub fn is_mcp(&self) -> bool {
+        self.thread_id.as_deref().is_some_and(is_mcp_thread)
+    }
+
+    /// The conversation this card belongs in, when the server said which
+    /// thread raised it.
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.thread_id.as_deref().map(conversation_for_thread)
     }
 
     /// Where the command runs, the way the card and its outcome line say it.
@@ -1028,6 +1044,7 @@ pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
         .unwrap_or(Value::Null);
     Some(ApprovalSpec {
         run_id,
+        thread_id: string_at(event, "threadId").filter(|id| !id.trim().is_empty()),
         call_id,
         command: command_from_args(&arguments),
         why: string_at(event, "why").unwrap_or_default(),
@@ -1415,6 +1432,7 @@ mod tests {
     fn ask(call_id: &str, command: &str) -> ChatPart {
         ChatPart::Approval(ApprovalSpec {
             run_id: "r".into(),
+            thread_id: None,
             call_id: call_id.into(),
             tool: "user_machine_shell".into(),
             command: command.into(),
@@ -1526,6 +1544,7 @@ mod tests {
     fn approval_for(tool: &str) -> ApprovalSpec {
         ApprovalSpec {
             run_id: "r1".into(),
+            thread_id: None,
             call_id: "c1".into(),
             tool: tool.into(),
             command: "ls".into(),
