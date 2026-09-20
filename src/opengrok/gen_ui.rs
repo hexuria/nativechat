@@ -206,11 +206,27 @@ impl ApprovalSpec {
     /// Allow/Deny once. OpenGrok stamps this reason only when
     /// `isEgressTunnelAvailable` (env `OG_*`/`SAND_*_EGRESS_TUNNEL_ENABLED=1`
     /// or host `egressTunnelEnabled`). We do not invent it.
+    ///
+    /// Never for an MCP card. The door reuses the same words for why it
+    /// stopped a call — `auto-review` among them — and Review chrome would
+    /// put an Always allow on a card that has no standing policy behind it:
+    /// there is nothing on this Mac for Always to write to.
     pub fn is_review_an_action(&self) -> bool {
-        matches!(
-            self.reason.trim().to_ascii_lowercase().as_str(),
-            "auto-review" | "review-an-action" | "computer-action" | "egress"
-        )
+        !self.is_mcp()
+            && matches!(
+                self.reason.trim().to_ascii_lowercase().as_str(),
+                "auto-review" | "review-an-action" | "computer-action" | "egress"
+            )
+    }
+
+    /// The centered line this card leaves behind once it is answered, in the
+    /// words its own kind of card uses.
+    pub fn outcome(&self, bot: &str, resolution: LocalExecResolution) -> String {
+        if self.is_mcp() {
+            mcp_call_outcome(bot, resolution, &self.tool)
+        } else {
+            local_exec_outcome(bot, resolution, self.place())
+        }
     }
 }
 
@@ -1070,6 +1086,24 @@ pub fn local_exec_outcome(bot: &str, resolution: LocalExecResolution, place: &st
     }
 }
 
+/// The same line for a card the MCP door raised.
+///
+/// The local-shell wording is about a machine and a policy that outlives the
+/// answer — "can run commands on your computer" — and none of that is what was
+/// answered here: one call, by one tool, once. There is no policy to move
+/// either, which is why an MCP card has no Always and no Never to reach this
+/// with; the two that cannot happen read as the once they would have been.
+pub fn mcp_call_outcome(bot: &str, resolution: LocalExecResolution, tool: &str) -> String {
+    match resolution {
+        LocalExecResolution::AllowOnce | LocalExecResolution::Always => {
+            format!("{bot} may run {tool} once.")
+        }
+        LocalExecResolution::DenyOnce | LocalExecResolution::Never => {
+            format!("{bot} was told no.")
+        }
+    }
+}
+
 pub fn command_from_replay_events(events: &[Value], call_id: &str) -> String {
     let mut args = String::new();
     for event in events {
@@ -1567,6 +1601,54 @@ mod tests {
         review.reason = "auto-review".into();
         assert!(review.is_review_an_action());
         assert!(!local.is_review_an_action());
+    }
+
+    fn mcp_card() -> ApprovalSpec {
+        let mut spec = approval_for("read_file");
+        spec.thread_id = Some("mcp-cw_1".into());
+        spec.reason = "policy-approval".into();
+        spec
+    }
+
+    /// An MCP card is one call being let through, not a machine being let
+    /// loose, and it says so where the card was.
+    #[test]
+    fn an_mcp_card_leaves_behind_what_was_actually_answered() {
+        let spec = mcp_card();
+        assert!(spec.is_mcp());
+        assert_eq!(
+            spec.outcome("Hexuria", LocalExecResolution::AllowOnce),
+            "Hexuria may run read_file once."
+        );
+        assert_eq!(
+            spec.outcome("Hexuria", LocalExecResolution::DenyOnce),
+            "Hexuria was told no."
+        );
+        // The local shell keeps every word it had.
+        let local = approval_for(USER_MACHINE_SHELL);
+        assert!(!local.is_mcp());
+        assert_eq!(
+            local.outcome("Hexuria", LocalExecResolution::AllowOnce),
+            "Hexuria can run commands on your computer this time."
+        );
+        assert_eq!(
+            local.outcome("Hexuria", LocalExecResolution::Always),
+            "Hexuria can run commands on your computer."
+        );
+    }
+
+    /// Review chrome is Always allow, and Always writes a standing policy for
+    /// this Mac. An MCP card has no such thing behind it, whatever word the
+    /// door used for why it stopped the call.
+    #[test]
+    fn an_mcp_card_is_never_review_an_action() {
+        let mut spec = mcp_card();
+        spec.reason = "auto-review".into();
+        assert!(!spec.is_review_an_action());
+
+        let mut box_tool = approval_for("Shell");
+        box_tool.reason = "auto-review".into();
+        assert!(box_tool.is_review_an_action());
     }
 
     #[test]
