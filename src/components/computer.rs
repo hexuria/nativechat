@@ -3,16 +3,22 @@ use std::sync::Arc;
 
 use crate::chrome::{HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats};
 use crate::components::fields::field_input;
+use crate::opengrok::{
+    BoxHandoffResolution, computer_attention_done_id, computer_attention_id,
+    computer_attention_skip_id,
+};
 use crate::state::{
     AgentRoutine, AppState, ComputerView, RoutineTrigger, ScheduleDayKind, ScheduleSpec,
     ScheduleUiMode, ScheduleUnit,
 };
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Icon, Selectable, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable, Icon, Selectable, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -129,7 +135,17 @@ impl Render for ComputerPane {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
-        let (view, agent_name, coworker_id, box_id, routines, has_screen, screen, controls) = {
+        let (
+            view,
+            agent_name,
+            coworker_id,
+            box_id,
+            routines,
+            has_screen,
+            screen,
+            controls,
+            attention,
+        ) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -153,6 +169,9 @@ impl Render for ComputerPane {
                 .as_ref()
                 .and_then(|status| status.vnc_url())
                 .is_some();
+            let attention = state
+                .active_computer_handoff()
+                .map(|spec| (spec.card_key().to_string(), spec.handoff_prompt()));
             (
                 state.computer_view.clone(),
                 name,
@@ -162,6 +181,7 @@ impl Render for ComputerPane {
                 has_screen,
                 state.coworker_screen.clone(),
                 controls,
+                attention,
             )
         };
 
@@ -193,9 +213,11 @@ impl Render for ComputerPane {
                         has_screen,
                         screen,
                         &controls,
+                        attention,
                         muted,
                         app,
                         &theme,
+                        cx,
                     )
                     .into_any_element(),
                 ComputerView::Editor { id } => self
@@ -294,9 +316,11 @@ impl ComputerPane {
         has_screen: bool,
         screen: Option<Arc<gpui_kit::Image>>,
         controls: &ComputerControls,
+        attention: Option<(String, String)>,
         muted: Hsla,
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
+        cx: &App,
     ) -> impl IntoElement {
         v_flex().size_full().child(
             v_flex()
@@ -306,6 +330,18 @@ impl ComputerPane {
                 .pt(px(8.))
                 .pb(px(16.))
                 .gap(px(12.))
+                .when_some(attention, |this, (key, instruction)| {
+                    this.child(computer_attention_banner(
+                        computer_attention_id(),
+                        computer_attention_skip_id(&key),
+                        computer_attention_done_id(&key),
+                        key,
+                        instruction,
+                        true,
+                        app.clone(),
+                        cx,
+                    ))
+                })
                 .child(screen_tile(
                     has_screen,
                     screen,
@@ -804,6 +840,135 @@ fn recipes_entry(
                         .child("Tasks taught on this screen"),
                 ),
         )
+}
+
+/// Grok **Needs your attention** while Open the screen is live.
+/// Skip this step = decline; I'm done, continue = hand back.
+/// Shared by the Computer pane and the launched noVNC window.
+pub(crate) fn computer_attention_banner(
+    banner_id: impl Into<ElementId>,
+    skip_id: impl Into<ElementId>,
+    done_id: impl Into<ElementId>,
+    key: String,
+    instruction: String,
+    can_resolve: bool,
+    app: Entity<AppState>,
+    cx: &App,
+) -> impl IntoElement {
+    let skip_app = app.clone();
+    let done_app = app;
+    let skip_key = key.clone();
+    let done_key = key;
+    let colors = attention_colors(cx.theme().is_dark());
+    let skip_style = ButtonCustomVariant::new(cx)
+        .foreground(colors.body)
+        .hover(rgb(0xFFFFFF).opacity(0.14).into())
+        .active(rgb(0xFFFFFF).opacity(0.22).into());
+    let done_style = ButtonCustomVariant::new(cx)
+        .color(colors.done_bg)
+        .foreground(colors.done_fg)
+        .hover(rgb(0xFFF4DC).into())
+        .active(rgb(0xF0E0C0).into());
+    h_flex()
+        .id(banner_id)
+        .w_full()
+        .flex_shrink_0()
+        .gap(px(12.))
+        .px(px(14.))
+        .py(px(10.))
+        .items_start()
+        .flex_wrap()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(colors.border)
+        .bg(colors.bg)
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(160.))
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors.title)
+                        .child("Needs your attention"),
+                )
+                .child(div().text_xs().text_color(colors.body).child(instruction)),
+        )
+        .child(
+            h_flex()
+                .gap(px(8.))
+                .flex_shrink_0()
+                .items_center()
+                .flex_wrap()
+                .child(
+                    Button::new(skip_id)
+                        .small()
+                        .custom(skip_style)
+                        .label("Skip this step")
+                        .disabled(!can_resolve)
+                        .on_click(move |_, _, cx| {
+                            skip_app.update(cx, |state, cx| {
+                                state.resolve_user_form_handoff(
+                                    skip_key.clone(),
+                                    BoxHandoffResolution::Declined,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(done_id)
+                        .small()
+                        .custom(done_style)
+                        .rounded(px(999.))
+                        .label("I'm done, continue")
+                        .disabled(!can_resolve)
+                        .on_click(move |_, _, cx| {
+                            done_app.update(cx, |state, cx| {
+                                state.resolve_user_form_handoff(
+                                    done_key.clone(),
+                                    BoxHandoffResolution::HandedBack,
+                                    cx,
+                                );
+                            });
+                        }),
+                ),
+        )
+}
+
+struct AttentionColors {
+    bg: Hsla,
+    border: Hsla,
+    title: Hsla,
+    body: Hsla,
+    done_bg: Hsla,
+    done_fg: Hsla,
+}
+
+/// Dark: Grok warm amber banner, gold title, cream body, white I'm done pill.
+/// Light: the same hue, saturated gold — not a beige wash.
+fn attention_colors(dark: bool) -> AttentionColors {
+    if dark {
+        AttentionColors {
+            bg: rgb(0x7A4A10).into(),
+            border: rgb(0xE0A020).into(),
+            title: rgb(0xF8C96A).into(),
+            body: rgb(0xF4E4C4).into(),
+            done_bg: rgb(0xFFFFFF).into(),
+            done_fg: rgb(0x1A140C).into(),
+        }
+    } else {
+        AttentionColors {
+            bg: rgb(0xFFC44D).into(),
+            border: rgb(0xD49212).into(),
+            title: rgb(0x8A3A00).into(),
+            body: rgb(0x3D2208).into(),
+            done_bg: rgb(0xFFFFFF).into(),
+            done_fg: rgb(0x1A140C).into(),
+        }
+    }
 }
 
 /// The coworker's screen. The Open pill is the control: it appears on hover

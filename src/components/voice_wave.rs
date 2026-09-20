@@ -47,6 +47,14 @@ impl VoiceWave {
                                 f32::from_bits(this.amplitude.load(Ordering::Relaxed)) * 0.1
                             };
 
+                            let before = (
+                                this.scroll_phase.to_bits(),
+                                this.animation_offset.to_bits(),
+                                this.smoothed_amp.to_bits(),
+                                this.current_peak.to_bits(),
+                                this.history.len(),
+                            );
+
                             // Peak sampling: capture the highest amplitude since the last bar push
                             if current_amp > this.current_peak {
                                 this.current_peak = current_amp;
@@ -63,32 +71,46 @@ impl VoiceWave {
                                 this.smoothed_amp += (target - this.smoothed_amp) * 0.05;
                             }
 
-                            // Scroll speed in pixels per frame
-                            // 2.0px per 16ms = ~120px per second (Faster, smoother scroll)
-                            let speed = 2.0;
-                            this.scroll_phase += speed;
+                            let idle = current_amp < 0.0005
+                                && this.smoothed_amp < 0.0005
+                                && this.current_peak < 0.0005;
+                            if !idle {
+                                // Scroll speed in pixels per frame
+                                // 2.0px per 16ms = ~120px per second (Faster, smoother scroll)
+                                let speed = 2.0;
+                                this.scroll_phase += speed;
 
-                            // Animation speed for the "living" effect
-                            // Increased to 0.8 (2x) for faster height transitions
-                            this.animation_offset += 0.8;
+                                // Animation speed for the "living" effect
+                                // Increased to 0.8 (2x) for faster height transitions
+                                this.animation_offset += 0.8;
 
-                            let bar_width = 2.0;
-                            let spacing = 3.0;
-                            let stride = bar_width + spacing;
+                                let bar_width = 2.0;
+                                let spacing = 3.0;
+                                let stride = bar_width + spacing;
 
-                            // When we've scrolled a full bar's width, push the SMOOTHED value to history
-                            if this.scroll_phase >= stride {
-                                this.history.push_front(this.smoothed_amp);
-                                this.current_peak = 0.0; // Reset peak for next bar
-                                this.scroll_phase -= stride; // Keep remainder for smooth continuity
+                                // When we've scrolled a full bar's width, push the SMOOTHED value to history
+                                if this.scroll_phase >= stride {
+                                    this.history.push_front(this.smoothed_amp);
+                                    this.current_peak = 0.0; // Reset peak for next bar
+                                    this.scroll_phase -= stride; // Keep remainder for smooth continuity
 
-                                // Keep history size large enough
-                                if this.history.len() > 300 {
-                                    this.history.pop_back();
+                                    // Keep history size large enough
+                                    if this.history.len() > 300 {
+                                        this.history.pop_back();
+                                    }
                                 }
                             }
 
-                            cx.notify();
+                            let after = (
+                                this.scroll_phase.to_bits(),
+                                this.animation_offset.to_bits(),
+                                this.smoothed_amp.to_bits(),
+                                this.current_peak.to_bits(),
+                                this.history.len(),
+                            );
+                            if before != after {
+                                cx.notify();
+                            }
                         })
                         .is_err()
                     {

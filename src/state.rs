@@ -6,25 +6,33 @@ use crate::chrome::{
 };
 use crate::config::Config;
 use crate::opengrok::{
-    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, ChatPart, ConnectedComputer,
-    Coworker, CoworkerComputer, CoworkerPatch, Failure, FormSpec, LocalExecMode,
-    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
-    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
-    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, Unreachable, activity_from_replay, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, local_exec_outcome,
-    policy_answer, reads_as_gateway_unreachable, serve_local_exec, stored_machine_id, tool_standin,
+    Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
+    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, ConnectedComputer, Coworker,
+    CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus, Failure,
+    FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue,
+    OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
+    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
+    RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
+    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
+    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
+    host_egress_tunnel_enabled, keep_local_save_offer, local_exec_outcome,
+    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
+    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
+    tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
+use crate::site_login::{PendingSave, SiteLoginRecord, SiteLoginVault, save_candidate};
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -51,7 +59,12 @@ impl Message {
         !self.content.trim().is_empty()
             || self.parts.iter().any(|part| match part {
                 ChatPart::Text(text) => !text.trim().is_empty(),
-                ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => true,
+                ChatPart::Ui(_)
+                | ChatPart::Approval(_)
+                | ChatPart::Screenshot(_)
+                | ChatPart::UserForm(_)
+                | ChatPart::SaveLogin(_)
+                | ChatPart::CredentialRequest(_) => true,
             })
     }
 
@@ -61,7 +74,12 @@ impl Message {
         !self.content.trim().is_empty()
             || self.parts.iter().any(|part| match part {
                 ChatPart::Text(text) => !text.trim().is_empty(),
-                ChatPart::Ui(_) | ChatPart::Approval(_) | ChatPart::Screenshot(_) => false,
+                ChatPart::Ui(_)
+                | ChatPart::Approval(_)
+                | ChatPart::Screenshot(_)
+                | ChatPart::UserForm(_)
+                | ChatPart::SaveLogin(_)
+                | ChatPart::CredentialRequest(_) => false,
             })
     }
 
@@ -79,20 +97,28 @@ impl Message {
     }
 }
 
-/// What is worth keeping of a message the person watched arrive: its words and the pictures of
-/// the box's screen, in the order they appeared.
+/// What is worth keeping of a message the person watched arrive: its words.
 ///
 /// A turn that was only words keeps nothing here — `content` already holds them, and a second
 /// copy would double every thread on disk. Cards are left out on purpose; see `MessagePart`.
-/// Because a card is dropped, the words on either side of one are kept apart by a blank line,
-/// the same break `content` gets, rather than running together into one sentence. A chart, which
-/// is cut out of the middle of a sentence, leaves that sentence whole.
+/// Pinned screenshots (`image.visibility` = `transcript` | `failure` | `end`, plus untagged
+/// failure/turn-end pins) stay on disk so a bot switch still has the picture without waiting
+/// on OpenGrok. `agent` shots never become [`ChatPart::Screenshot`]. User-form cards still
+/// rehydrate from `formRequest` + sibling `formResolution`. Because a card is dropped, the
+/// words on either side of one are kept apart by a blank line, the same break `content` gets,
+/// rather than running together into one sentence. A chart, which is cut out of the middle of
+/// a sentence, leaves that sentence whole.
 fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
     let mut saved: Vec<MessagePart> = Vec::new();
     let mut words = String::new();
     for part in parts {
         match part {
             ChatPart::Text(text) => words.push_str(text),
+            ChatPart::Screenshot(spec)
+                if matches!(spec.visibility, Some(ImageVisibility::Agent)) =>
+            {
+                break_paragraph(&mut words);
+            }
             ChatPart::Screenshot(spec) => {
                 close_text_run(&mut words, &mut saved);
                 saved.push(MessagePart::Screenshot {
@@ -103,8 +129,11 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
                     height: spec.height,
                 });
             }
+            ChatPart::Approval(_)
+            | ChatPart::UserForm(_)
+            | ChatPart::SaveLogin(_)
+            | ChatPart::CredentialRequest(_) => break_paragraph(&mut words),
             ChatPart::Ui(_) => {}
-            ChatPart::Approval(_) => break_paragraph(&mut words),
         }
     }
     close_text_run(&mut words, &mut saved);
@@ -166,9 +195,71 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 )),
                 width,
                 height,
+                visibility: Some(ImageVisibility::Transcript),
             }),
         })
         .collect()
+}
+
+/// Fold OpenGrok-owned cards onto a sqlite row that dropped them.
+///
+/// User-form (idle + settled, never secrets) lives on the server as
+/// `formRequest` + sibling `formResolution`. Pinned screenshots may already
+/// be in sqlite; overlay still fills gaps. Save-login is origin+username
+/// only — the password stays in host `pending_save`, never on the wire.
+fn overlay_server_cards(message: &mut Message, replayed: &[ChatPart]) {
+    for part in replayed {
+        match part {
+            ChatPart::UserForm(incoming) => {
+                if let Some(existing) = message.parts.iter_mut().find_map(|part| match part {
+                    ChatPart::UserForm(spec)
+                        if spec.same_card(incoming) || spec.shares_call_id(&incoming.call_id) =>
+                    {
+                        Some(spec)
+                    }
+                    _ => None,
+                }) {
+                    existing.merge(incoming.clone());
+                } else {
+                    message.parts.push(ChatPart::UserForm(incoming.clone()));
+                }
+            }
+            ChatPart::Screenshot(incoming) => {
+                let already = message.parts.iter().any(|part| {
+                    matches!(part, ChatPart::Screenshot(spec) if spec.call_id == incoming.call_id)
+                });
+                if !already {
+                    message.parts.push(ChatPart::Screenshot(incoming.clone()));
+                }
+            }
+            ChatPart::CredentialRequest(incoming) => {
+                let already = message.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        ChatPart::CredentialRequest(spec) if spec.request_id == incoming.request_id
+                    )
+                });
+                if !already {
+                    message
+                        .parts
+                        .push(ChatPart::CredentialRequest(incoming.clone()));
+                }
+            }
+            ChatPart::SaveLogin(incoming) => {
+                let already = message.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        ChatPart::SaveLogin(spec) if spec.form_entry_id == incoming.form_entry_id
+                    )
+                });
+                if !already {
+                    message.parts.push(ChatPart::SaveLogin(incoming.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    place_hitl_cards_in_document_order(&mut message.parts);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +321,27 @@ pub const TURN_SIGNED_OUT_NOTE: &str = "This turn was not sent: the app is signe
 /// thread's own line for it before deciding the turn is over, and a spelling that drifted
 /// between the two would end the turn out from under the person's answer.
 const WAITING_APPROVAL_STATUS: &str = "Waiting for approval";
+
+/// The working line while an unresolved user-form card is on screen. Distinct from
+/// [`WAITING_APPROVAL_STATUS`]: that one is a yes/no on a command, this one is credentials
+/// the bot must not see.
+const WAITING_FOR_YOU_STATUS: &str = WAITING_FOR_YOU;
+
+pub fn is_waiting_on_person(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some(WAITING_APPROVAL_STATUS) | Some(WAITING_FOR_YOU_STATUS)
+    )
+}
+
+/// Footer chrome: the server waiting label as-is, else `{name} is working`.
+pub fn bot_status_line(name: &str, label: &str) -> String {
+    if is_waiting_on_person(Some(label)) {
+        label.to_string()
+    } else {
+        format!("{name} is working")
+    }
+}
 
 /// A turn that never reached the server, in either of the two ways that happens.
 ///
@@ -553,6 +665,34 @@ fn restored_message(row: ChatMessage) -> Message {
         parts,
         run_id: row.run_id,
     }
+}
+
+/// Paint the streaming bubble at most ~60Hz. Non-text parts (form, screenshot,
+/// approval, generative UI) flush immediately so a card is not delayed a frame.
+const STREAM_PAINT_MIN: Duration = Duration::from_millis(16);
+
+fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
+    let flags = parts.iter().fold(0u8, |acc, part| {
+        acc | match part {
+            ChatPart::Text(_) => 0,
+            ChatPart::Ui(_) => 1,
+            ChatPart::Approval(_) => 2,
+            ChatPart::Screenshot(_) => 4,
+            ChatPart::UserForm(_) => 8,
+            ChatPart::SaveLogin(_) => 16,
+            ChatPart::CredentialRequest(_) => 32,
+        }
+    });
+    (parts.len(), flags)
+}
+
+fn stream_paint_due(
+    last: Option<Instant>,
+    now: Instant,
+    prev_sig: (usize, u8),
+    sig: (usize, u8),
+) -> bool {
+    sig != prev_sig || last.is_none_or(|at| now.saturating_duration_since(at) >= STREAM_PAINT_MIN)
 }
 
 /// A run rebuilt from the frames the server kept, as the live stream would have painted it.
@@ -1126,6 +1266,7 @@ pub enum AppSettingsTab {
     Shortcuts,
     Computer,
     Updates,
+    Logins,
 }
 
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
@@ -1314,6 +1455,39 @@ pub struct AppState {
     pub message_reactions: HashMap<String, String>,
     pub emoji_picker: Option<EmojiPickerOpen>,
     pub form_picks: HashMap<String, HashMap<String, String>>,
+    /// Checkbox / select picks on a user-form. Never passwords or other secrets —
+    /// those stay in the transcript view's input state and are never written here.
+    /// Keyed by [`crate::opengrok::UserFormSpec::card_key`].
+    pub user_form_picks: HashMap<String, HashMap<String, String>>,
+    /// Agent/E2E typed values (including secrets). In-memory only — never
+    /// sqlite / AG-UI content. Continue prefers live InputState, then this.
+    pub user_form_typed: HashMap<String, HashMap<String, String>>,
+    /// Routes exist on this server. Diagnostic only — a missing-route 404
+    /// must not freeze every stacked open user-form. Unresolved cards stay
+    /// clickable until that card settles.
+    pub user_form_verbs_available: bool,
+    /// Local/server settlements grafted onto AG-UI replay, which does not carry
+    /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
+    user_form_resolutions: HashMap<String, FormResolution>,
+    /// Stable resolution to restore if a POST fails (never reopen a settled card).
+    user_form_restore: HashMap<String, FormResolution>,
+    /// Form card key → handoff card id from dismiss `handoffEntryId`.
+    user_form_handoffs: HashMap<String, String>,
+    /// Skip / I'm done before dismiss returned `handoffEntryId`. Local chrome
+    /// already settled; POST once the sibling id lands. Never the form entryId.
+    user_form_pending_resolves: HashMap<String, PendingBoxHandoff>,
+    /// Form card keys whose box-handoff already resolved (I'm done / Skip).
+    user_form_handoff_done: HashSet<String>,
+    /// Computer sibling chrome grafted across hide→reshow / SSE replay.
+    user_form_computer_handoffs: HashMap<String, ComputerHandoffStatus>,
+    /// Prior Computer sibling to restore if Open the screen POST fails.
+    user_form_handoff_restore: HashMap<String, Option<ComputerHandoffStatus>>,
+    /// Site-login metadata for Settings → Logins. Never passwords.
+    pub site_logins: Vec<SiteLoginRecord>,
+    site_login_vault: Option<SiteLoginVault>,
+    /// Password held only until Save / Not now. Never sqlite / ChatPart / tree.
+    pending_save: HashMap<String, PendingSave>,
+    pub site_login_error: Option<String>,
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
@@ -1322,12 +1496,19 @@ pub struct AppState {
     /// The active coworker's computer, as last polled. Cleared on a switch so a
     /// bot never shows the previous one's screen.
     pub coworker_computer: Option<CoworkerComputer>,
+    /// From `POST /api/isEgressTunnelAvailable` (env OR host setting on the server).
+    pub host_egress_tunnel_available: bool,
+    /// Local/host opt-in for **Route traffic through this computer**. No tunnel
+    /// is invented here.
+    pub egress_tunnel_enabled: bool,
     /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
     /// endpoint, so polling stops until the roster reloads.
     pub computer_endpoint_missing: bool,
     /// The active coworker's screen as last fetched, painted in the Computer
     /// pane's tile. Polled with the status, only while the box has a screen.
     pub coworker_screen: Option<std::sync::Arc<gpui_kit::Image>>,
+    /// Newest tool PNG for thumbs / Open-the-screen pin. Not every chat row.
+    pub last_box_shot: Option<ScreenshotSpec>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
     /// One screen window per coworker: Open brings the existing one forward rather than
@@ -1407,6 +1588,20 @@ impl ApprovalDecision {
         };
         Some(local_exec_outcome(bot, resolution, place))
     }
+}
+
+enum UserFormDispatch {
+    Submit(UserFormValues),
+    Dismiss(UserFormDismissMode),
+    ResolveHandoff(BoxHandoffResolution),
+}
+
+#[derive(Clone, Debug)]
+struct PendingBoxHandoff {
+    resolution: BoxHandoffResolution,
+    run_id: String,
+    conversation_id: String,
+    agent_id: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1642,13 +1837,30 @@ impl AppState {
             message_reactions: HashMap::new(),
             emoji_picker: None,
             form_picks: HashMap::new(),
+            user_form_picks: HashMap::new(),
+            user_form_typed: HashMap::new(),
+            user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
+            user_form_resolutions: HashMap::new(),
+            user_form_restore: HashMap::new(),
+            user_form_handoffs: HashMap::new(),
+            user_form_pending_resolves: HashMap::new(),
+            user_form_handoff_done: HashSet::new(),
+            user_form_computer_handoffs: HashMap::new(),
+            user_form_handoff_restore: HashMap::new(),
+            site_logins: Vec::new(),
+            site_login_vault: None,
+            pending_save: HashMap::new(),
+            site_login_error: None,
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
             expanded_shell_output: HashSet::new(),
             computers: Vec::new(),
             coworker_computer: None,
+            host_egress_tunnel_available: false,
+            egress_tunnel_enabled: false,
             coworker_screen: None,
+            last_box_shot: None,
             computer_confirm: None,
             computer_action_error: None,
             computer_heal_requested: None,
@@ -1691,6 +1903,7 @@ impl AppState {
             }
         }
         self.config = Some(config);
+        self.ensure_site_login_vault(cx);
         cx.notify();
     }
 
@@ -1730,6 +1943,7 @@ impl AppState {
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.refresh_computers(cx);
+                        state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
                     }
                     Err(error) => {
@@ -1829,7 +2043,13 @@ impl AppState {
         match tick {
             ActivityTick::Keep => {}
             ActivityTick::Clear => {
-                if let Some(activity) = self.thread_activity.get_mut(conversation_id) {
+                if self.has_open_user_form(conversation_id) {
+                    // Settled CUSTOM / RUN_FINISHED must not blank Waiting
+                    // while another unresolved form or live handoff remains.
+                    self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+                } else if self.has_open_approval(conversation_id) {
+                    self.end_turn_waiting(Some(conversation_id), Some(WAITING_APPROVAL_STATUS));
+                } else if let Some(activity) = self.thread_activity.get_mut(conversation_id) {
                     activity.label = None;
                 }
             }
@@ -1897,6 +2117,217 @@ impl AppState {
         true
     }
 
+    /// Idle user-form cards in the open thread (fields still on screen).
+    pub fn open_user_forms(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::UserForm(spec) if spec.is_unresolved() => Some(spec.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Escalated Open-the-screen cards waiting on Take over / I'm done / Skip.
+    pub fn open_computer_handoffs(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::UserForm(spec)
+                    if spec.live_computer_handoff()
+                        && !self.user_form_handoff_done.contains(spec.card_key()) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Form cards that paint in the transcript (idle or settled). Computer-only
+    /// stubs are omitted so E2E does not see a fake form named Computer.
+    pub fn visible_user_forms(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_thread_user_forms()
+            .into_iter()
+            .filter(|spec| spec.shows_form_chrome())
+            .collect()
+    }
+
+    /// Computer siblings that paint in the transcript, including Done / Skipped.
+    pub fn visible_computer_handoffs(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_thread_user_forms()
+            .into_iter()
+            .filter(|spec| spec.shows_computer_handoff())
+            .collect()
+    }
+
+    fn active_thread_user_forms(&self) -> Vec<crate::opengrok::UserFormSpec> {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .into_iter()
+            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .filter_map(|part| match part {
+                ChatPart::UserForm(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn active_computer_handoff(&self) -> Option<crate::opengrok::UserFormSpec> {
+        self.open_computer_handoffs().into_iter().next_back()
+    }
+
+    /// Copy for the Computer window strip. The window must not `app.read` this
+    /// during Take over's first draw (`open_window` paints before the lease ends).
+    pub fn computer_window_attention(&self) -> Option<(String, String)> {
+        self.active_computer_handoff()
+            .map(|spec| (spec.card_key().to_string(), spec.handoff_prompt()))
+    }
+
+    /// Take over: open/focus the Computer pane and the coworker's screen.
+    pub fn take_over_computer(&mut self, cx: &mut Context<Self>) {
+        self.show_computer_pane(cx);
+        self.open_coworker_screen(cx);
+    }
+
+    /// Agent/E2E typed a field. Secrets stay in-memory; never sqlite.
+    pub fn set_user_form_typed_field(
+        &mut self,
+        card_key: String,
+        field_id: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.user_form_typed
+            .entry(card_key)
+            .or_default()
+            .insert(field_id, value);
+        cx.notify();
+    }
+
+    /// Agent Continue: picks, then typed overlay. Secrets stay in-memory.
+    pub fn user_form_submit_values(&self, card_key: &str) -> UserFormValues {
+        let mut values = UserFormValues::default();
+        if let Some(picks) = self.user_form_picks.get(card_key) {
+            for (id, value) in picks {
+                values.by_id.insert(id.clone(), value.clone());
+            }
+        }
+        if let Some(typed) = self.user_form_typed.get(card_key) {
+            for (id, value) in typed {
+                values.by_id.insert(id.clone(), value.clone());
+            }
+        }
+        values
+    }
+
+    pub fn submit_open_user_form(&mut self, card_key: String, cx: &mut Context<Self>) {
+        let values = self.user_form_submit_values(&card_key);
+        self.submit_user_form(card_key, values, cx);
+    }
+
+    /// Host env (`OG_*` / `SAND_*_EGRESS_TUNNEL_ENABLED=1`) or gateway
+    /// `isEgressTunnelAvailable`. Independent of box `egress_tunnel.ready`.
+    pub fn host_intends_egress_tunnel(&self) -> bool {
+        self.host_egress_tunnel_available || env_egress_tunnel_enabled()
+    }
+
+    fn box_egress_tunnel_ready(&self) -> bool {
+        self.coworker_computer
+            .as_ref()
+            .is_some_and(|computer| computer.egress_tunnel_ready())
+    }
+
+    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** box
+    /// `egress_tunnel.ready`. No tunnel is invented. The Settings row can
+    /// still *show* when only one side is known; this AND-gate is what may
+    /// actually turn the tunnel on.
+    pub fn egress_tunnel_available(&self) -> bool {
+        self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
+    }
+
+    /// Grok shows the Network row when the host intends a tunnel, the box
+    /// already exposed one, or the toggle is already on. Box status lag or a
+    /// 401 on the host poll must not hide the row.
+    pub fn show_egress_tunnel_settings(&self) -> bool {
+        self.host_intends_egress_tunnel()
+            || self.box_egress_tunnel_ready()
+            || self.egress_tunnel_enabled
+    }
+
+    pub fn set_egress_tunnel_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled && !self.egress_tunnel_available() {
+            return;
+        }
+        self.egress_tunnel_enabled = enabled;
+        cx.notify();
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .set_host_settings(&serde_json::json!({ "egressTunnelEnabled": enabled }))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if let Ok(settings) = result {
+                    if let Some(flag) = settings
+                        .get("egressTunnelEnabled")
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        state.egress_tunnel_enabled = flag;
+                    }
+                    if enabled {
+                        state.host_egress_tunnel_available = true;
+                    } else {
+                        state.refresh_host_egress(cx);
+                        return;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Read `isEgressTunnelAvailable` + `getHostSettings` from the gateway.
+    /// A 401 is the host bearer, not a signed-out AG-UI session.
+    pub fn refresh_host_egress(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let available = client.is_egress_tunnel_available().await.ok();
+            let settings = client.get_host_settings().await.ok();
+            let _ = this.update(cx, |state, cx| {
+                let mut changed = false;
+                if let Some(available) = available
+                    && state.host_egress_tunnel_available != available
+                {
+                    state.host_egress_tunnel_available = available;
+                    changed = true;
+                }
+                if let Some(settings) = settings {
+                    let enabled = host_egress_tunnel_enabled(&settings);
+                    if state.egress_tunnel_enabled != enabled {
+                        state.egress_tunnel_enabled = enabled;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
         if let Some(line) = self
             .approval_decisions
@@ -1916,18 +2347,60 @@ impl AppState {
     /// bot's ending clearing another's line, and it leaked both ways. Keyed by thread there is
     /// nothing to guard: A's ending can no more reach B's line than B's frames can reach A's.
     fn finish_responding(&mut self, conversation_id: Option<&str>, waiting_approval: bool) {
+        self.end_turn_waiting(
+            conversation_id,
+            waiting_approval.then_some(WAITING_APPROVAL_STATUS),
+        );
+    }
+
+    fn end_turn_waiting(&mut self, conversation_id: Option<&str>, waiting: Option<&str>) {
         let Some(conversation_id) = conversation_id else {
             return;
         };
-        if waiting_approval {
+        if let Some(label) = waiting {
             let activity = self
                 .thread_activity
                 .entry(conversation_id.to_string())
                 .or_default();
             activity.responding = false;
-            activity.label = Some(WAITING_APPROVAL_STATUS.to_string());
+            activity.label = Some(label.to_string());
         } else {
             self.thread_activity.remove(conversation_id);
+        }
+    }
+
+    /// Server run is finished; the person holds a form. Mirror that: chrome
+    /// **Waiting for you**, drop the local live-turn (Stop only while a run
+    /// is actually in flight). The open form lives on OpenGrok and comes
+    /// back from replay after quit/relaunch.
+    fn park_waiting_for_you(&mut self, conversation_id: &str, run_id: &str) {
+        self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+        if !run_id.is_empty() {
+            self.release_live_turn(conversation_id, run_id);
+        }
+    }
+
+    /// After Skip / Dismiss / Done (and after SSE graft): Waiting only while
+    /// an unresolved form or live Computer sibling remains. Do not leave
+    /// green Waiting over settled pills, and do not blank it while another
+    /// stacked card is still open.
+    fn sync_waiting_chrome(&mut self, conversation_id: &str) {
+        if self.is_thread_responding(conversation_id) {
+            return;
+        }
+        if self.has_open_user_form(conversation_id) {
+            self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
+            return;
+        }
+        if self.has_open_approval(conversation_id) {
+            self.end_turn_waiting(Some(conversation_id), Some(WAITING_APPROVAL_STATUS));
+            return;
+        }
+        if matches!(
+            self.thread_status(conversation_id),
+            Some(WAITING_FOR_YOU_STATUS) | Some(WAITING_APPROVAL_STATUS)
+        ) {
+            self.end_turn_waiting(Some(conversation_id), None);
         }
     }
 
@@ -1966,6 +2439,7 @@ impl AppState {
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.refresh_computers(cx);
+                        state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
                     }
                     Err(error) => {
@@ -2001,6 +2475,9 @@ impl AppState {
         self.stop_local_exec();
         self.approval_decisions.clear();
         self.computers.clear();
+        self.host_egress_tunnel_available = false;
+        self.egress_tunnel_enabled = false;
+        self.coworker_computer = None;
         cx.notify();
         if let Some(client) = client {
             cx.spawn(async move |_, _| {
@@ -2315,6 +2792,7 @@ impl AppState {
         self.ensure_active_coworker(cx);
         self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
+        self.refresh_coworker_screen(cx);
         self.record_nav();
         cx.notify();
     }
@@ -2450,9 +2928,18 @@ impl AppState {
                 }
                 match result {
                     Ok(frame) => {
-                        state.coworker_screen =
+                        let next =
                             crate::opengrok::ScreenshotSpec::from_frame("screen", "", &frame)
                                 .map(|spec| spec.image);
+                        let unchanged = match (state.coworker_screen.as_ref(), next.as_ref()) {
+                            (Some(old), Some(new)) => old.bytes == new.bytes,
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if unchanged {
+                            return;
+                        }
+                        state.coworker_screen = next;
                         cx.notify();
                     }
                     Err(_) => {
@@ -3086,11 +3573,13 @@ impl AppState {
             .unwrap_or_else(|| "Computer".into());
         #[cfg(target_os = "macos")]
         {
+            let attention = self.computer_window_attention();
             // Already open: bring it forward. A handle whose window was closed fails to
             // update, and that is the cue to open a fresh one.
             if let Some(existing) = self.computer_windows.get(coworker_id)
                 && existing
                     .update(cx, |screen, window, cx| {
+                        screen.set_handoff_attention(attention.clone(), cx);
                         window.activate_window();
                         if teach {
                             screen.start_teaching(window, cx);
@@ -3122,7 +3611,7 @@ impl AppState {
             let opened = cx.open_window(options, move |window, cx| {
                 cx.new(|cx| {
                     crate::components::computer_screen::ComputerScreen::new(
-                        &url, &coworker, &title, app, window, cx,
+                        &url, &coworker, &title, app, attention, window, cx,
                     )
                 })
             });
@@ -3151,6 +3640,20 @@ impl AppState {
         {
             let _ = teach;
             eprintln!("NativeChat computer: {title} is at {url}; opening it in-app is macOS-only");
+        }
+    }
+
+    /// Push the live Open-the-screen strip onto any Computer window. Safe to
+    /// call while this AppState is leased: the window stores a copy and does
+    /// not read AppState from `render`.
+    #[cfg(target_os = "macos")]
+    fn push_computer_window_attention(&mut self, cx: &mut Context<Self>) {
+        let attention = self.computer_window_attention();
+        for handle in self.computer_windows.values() {
+            let attention = attention.clone();
+            let _ = handle.update(cx, |screen, _, cx| {
+                screen.set_handoff_attention(attention, cx);
+            });
         }
     }
 
@@ -3672,6 +4175,7 @@ impl AppState {
 
     pub fn set_database_service(&mut self, service: DatabaseService, cx: &mut Context<Self>) {
         self.database_service = Some(service.clone());
+        self.ensure_site_login_vault(cx);
         cx.notify();
 
         // Load sessions when DB service is set
@@ -3826,6 +4330,7 @@ impl AppState {
         // The previous bot's screen must not show under this bot's name.
         self.coworker_computer = None;
         self.coworker_screen = None;
+        self.last_box_shot = None;
         self.computer_confirm = None;
         self.computer_action_error = None;
         if !self.conversations.iter().any(|c| c.id == id) {
@@ -4298,11 +4803,13 @@ impl AppState {
     ///
     /// Once per thread per session, and only for the thread being read. After that the app has
     /// been watching, and every turn since has gone to disk through the same door.
+    /// Bring a thread up to what the server says was said in it.
+    ///
+    /// SQLite is a cache of words and pinned feed shots. User-form cards live
+    /// on OpenGrok (`formRequest` + `formResolution`) and are folded on every
+    /// visit (bot switch / thread load), not only the first reconcile.
     fn reconcile_thread(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
         if self.active_conversation_id.as_deref() != Some(conversation_id) {
-            return;
-        }
-        if !self.reconciled_threads.insert(conversation_id.to_string()) {
             return;
         }
         let Some(client) = self.opengrok.clone() else {
@@ -4313,10 +4820,11 @@ impl AppState {
             let thread = client.replay_thread(&conversation_id, RECONCILE_RUNS).await;
             let _ = this.update(cx, |state, cx| {
                 match thread {
-                    Ok(thread) => state.apply_thread_replay(&conversation_id, &thread, cx),
-                    // A server that cannot answer leaves the thread exactly as the cache drew
-                    // it, and leaves it un-reconciled so the next visit tries again — an offline
-                    // app is still a usable one, it is just not up to date.
+                    Ok(thread) => {
+                        state.reconciled_threads.insert(conversation_id.clone());
+                        state.apply_thread_replay(&conversation_id, &thread, cx);
+                        state.overlay_replay_cards(&conversation_id, &thread.runs);
+                    }
                     Err(_) => {
                         state.reconciled_threads.remove(&conversation_id);
                     }
@@ -4330,10 +4838,12 @@ impl AppState {
     /// The runs the server has that this thread has not, put back into it.
     ///
     /// A run that ended goes onto the thread and into the database, through the same
-    /// `persist_assistant_reply` a turn watched to the end goes through, so its screenshots land
-    /// in `chat_message_parts` like any other turn's. A run still going is a turn that outlived
-    /// whatever stopped watching it — a bot switch, or the app closing — and is re-attached to:
-    /// the bubble comes back, the status line comes back, and the rest of the turn arrives in it.
+    /// `persist_assistant_reply` a turn watched to the end goes through. Pinned
+    /// feed shots (`transcript`/`failure`/`end`) go to sqlite; `overlay_replay_cards`
+    /// still folds user-form cards and any pins the cache dropped. A run still going is a turn that
+    /// outlived whatever stopped watching it — a bot switch, or the app closing — and is
+    /// re-attached to: the bubble comes back, the status line comes back, and the rest of
+    /// the turn arrives in it.
     fn apply_thread_replay(
         &mut self,
         conversation_id: &str,
@@ -4381,6 +4891,55 @@ impl AppState {
             }
         }
         cx.notify();
+    }
+
+    /// Idle + settled user-form cards (never secrets) from
+    /// `formRequest` + sibling `formResolution`, local save prompts, and
+    /// pinned screenshots from OpenGrok onto rows sqlite already has.
+    fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
+        let grafted: Vec<(String, Vec<ChatPart>)> = runs
+            .iter()
+            .filter(|run| !run.run_id.trim().is_empty())
+            .map(|run| {
+                let (_, parts) = reply_from_replay(&run.events, &run.status);
+                (run.run_id.clone(), self.graft_user_forms(parts))
+            })
+            .collect();
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return;
+        };
+        for (run_id, parts) in &grafted {
+            if let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.run_id.as_deref() == Some(run_id.as_str()))
+            {
+                overlay_server_cards(message, parts);
+            }
+        }
+        for (_, parts) in &grafted {
+            for part in parts {
+                if let ChatPart::UserForm(spec) = part {
+                    self.remember_user_form_resolution(spec);
+                }
+            }
+        }
+        if let Some(shot) = grafted
+            .iter()
+            .rev()
+            .flat_map(|(_, parts)| parts.iter())
+            .rev()
+            .find_map(|part| match part {
+                ChatPart::Screenshot(spec) => Some(spec.clone()),
+                _ => None,
+            })
+        {
+            self.last_box_shot = Some(shot);
+        }
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
@@ -4448,6 +5007,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
+        let parts = self.graft_user_forms(parts);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -4460,6 +5020,12 @@ impl AppState {
         {
             message.content = plain.clone();
             message.parts = parts.clone();
+        }
+        if let Some(shot) = parts.iter().rev().find_map(|part| match part {
+            ChatPart::Screenshot(spec) => Some(spec.clone()),
+            _ => None,
+        }) {
+            self.last_box_shot = Some(shot);
         }
         // A card whose command already ran is not a question any more, so the thread stops
         // asking it.
@@ -4483,11 +5049,18 @@ impl AppState {
                 self.fill_open_approval_commands(cx);
             }
             "finished" => {
-                self.finish_responding(Some(conversation_id), false);
+                if self.has_open_user_form(conversation_id) {
+                    self.park_waiting_for_you(conversation_id, &turn.run_id);
+                } else {
+                    self.finish_responding(Some(conversation_id), false);
+                }
                 // Only when nobody has written this turn down yet. The live stream may have come
                 // back and settled it while the replay was in the air, and a turn saved twice is
                 // a thread that says everything twice.
-                if self.turn_is_unsettled(conversation_id, &turn.run_id) {
+                if !self.has_open_user_form(conversation_id)
+                    && !self.has_open_approval(conversation_id)
+                    && self.turn_is_unsettled(conversation_id, &turn.run_id)
+                {
                     self.persist_assistant_reply(
                         conversation_id,
                         plain,
@@ -4503,6 +5076,7 @@ impl AppState {
             }
             _ => {}
         }
+        self.collect_handoff_ids_and_flush(conversation_id, cx);
     }
 
     /// This thread is no longer answerable for a turn.
@@ -4727,10 +5301,12 @@ impl AppState {
                     Err(error) => Err(error),
                 },
             };
-            let (result, waiting_approval, deeds) = match coworker {
+            let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
+                    let mut last_stream_paint: Option<Instant> = None;
+                    let mut last_stream_sig = (0usize, 0u8);
                     let result = client
                         .run_turn(
                             &id,
@@ -4759,19 +5335,33 @@ impl AppState {
                                 }
                                 assembler.push_event(&event);
                                 let (plain, parts) = assembler.snapshot();
+                                let box_shot = assembler.latest_screenshot().cloned();
+                                let sig = stream_part_sig(&parts);
+                                let now = Instant::now();
+                                let paint =
+                                    stream_paint_due(last_stream_paint, now, last_stream_sig, sig);
                                 let _ = this.update(cx, |state, cx| {
                                     // Into the thread the run belongs to, and into the row the run
                                     // was given — not the thread that happens to be open, and not
                                     // whichever row happens to be last in it.
+                                    if let Some(shot) = box_shot {
+                                        state.last_box_shot = Some(shot);
+                                    }
+                                    let grafted = state.graft_user_forms(parts.clone());
                                     if let Some(message) = streaming_message_mut(
                                         &mut state.conversations,
                                         &conversation_id,
                                         &reply_id,
                                     ) {
                                         message.content = plain.clone();
-                                        message.parts = parts.clone();
-                                        cx.notify();
+                                        message.parts = grafted;
+                                        // Tokens update the row every frame; notify at ~60Hz
+                                        // or when a card/picture lands, not on every SSE event.
+                                        if paint {
+                                            cx.notify();
+                                        }
                                     }
+                                    state.collect_handoff_ids_and_flush(&conversation_id, cx);
                                     if assembler.waiting_approval() {
                                         let open = parts.iter().rev().find_map(|part| match part {
                                             ChatPart::Approval(spec) => Some(spec.clone()),
@@ -4786,28 +5376,42 @@ impl AppState {
                                         }
                                     }
                                 });
+                                if paint {
+                                    last_stream_paint = Some(now);
+                                    last_stream_sig = sig;
+                                }
                             },
                         )
                         .await;
                     assembler.finish();
                     let waiting_approval = assembler.waiting_approval();
+                    let waiting_user_form = assembler.waiting_user_form();
                     // What the tools did, in case the turn ends without a word about it.
                     let deeds = tracker.deeds();
                     let (plain, parts) = assembler.snapshot();
+                    let box_shot = assembler.latest_screenshot().cloned();
                     let _ = this.update(cx, |state, cx| {
+                        if let Some(shot) = box_shot {
+                            state.last_box_shot = Some(shot);
+                        }
+                        let grafted = state.graft_user_forms(parts);
                         if let Some(message) = streaming_message_mut(
                             &mut state.conversations,
                             &conversation_id,
                             &reply_id,
                         ) {
                             message.content = plain;
-                            message.parts = parts;
+                            message.parts = grafted;
                         }
+                        state.collect_handoff_ids_and_flush(&conversation_id, cx);
                         cx.notify();
                     });
-                    (result, waiting_approval, deeds)
+                    let waiting_form = this
+                        .update(cx, |state, _| state.has_open_user_form(&conversation_id))
+                        .unwrap_or(waiting_user_form);
+                    (result, waiting_approval, waiting_form, deeds)
                 }
-                Err(error) => (Err(error), false, Vec::new()),
+                Err(error) => (Err(error), false, false, Vec::new()),
             };
             let _ = this.update(cx, |state, cx| {
                 // Something else has already decided what this turn came to: the person stopped
@@ -4831,8 +5435,8 @@ impl AppState {
                     if !message.has_text_body() {
                         match &result {
                             Ok(text) if !text.is_empty() => message.content = text.clone(),
-                            // Parked on a permission card: the turn is not over yet.
-                            Ok(_) if waiting_approval => {}
+                            // Parked on a permission card or a user-form: the turn is not over yet.
+                            Ok(_) if waiting_approval || waiting_user_form => {}
                             Ok(_) => {
                                 message.content = tool_standin(&deeds)
                                     .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
@@ -4860,7 +5464,7 @@ impl AppState {
                         }
                     }
                 }
-                if !waiting_approval && result.is_ok() {
+                if !waiting_approval && !waiting_user_form && result.is_ok() {
                     // The run is final; a run parked on a card is saved when it finishes.
                     // A status line is painted, never saved: `persist_assistant_reply` refuses
                     // it, so it cannot become history the model is shown next turn. Settling the
@@ -4888,7 +5492,9 @@ impl AppState {
                     // here instead.
                     state.release_live_turn(&conversation_id, &run_id);
                 }
-                if waiting_approval {
+                if waiting_user_form {
+                    state.park_waiting_for_you(&conversation_id, &run_id);
+                } else if waiting_approval {
                     let open = state
                         .conversations
                         .iter()
@@ -5039,10 +5645,16 @@ impl AppState {
     /// fault: the button is not a stop button then, but a keystroke or a driver can still ask.
     /// Neither is a turn whose outcome is already decided and on its way to disk — it stays
     /// registered until the write lands, but nothing is running under it.
+    ///
+    /// A finished run that left a user-form card is not in flight on the
+    /// server. Do not keep Stop over **Waiting for you**.
     fn turn_to_stop(&self) -> Option<(String, LiveTurn)> {
         let conversation_id = self.active_conversation_id.clone()?;
         let turn = self.live_turns.get(&conversation_id)?;
         if turn.persisting {
+            return None;
+        }
+        if self.thread_status(&conversation_id) == Some(WAITING_FOR_YOU_STATUS) {
             return None;
         }
         Some((conversation_id, turn.clone()))
@@ -5309,6 +5921,7 @@ impl AppState {
                                     label: "Working".into(),
                                 });
                             let _ = this.update(cx, |state, cx| {
+                                let parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card.
@@ -5333,6 +5946,14 @@ impl AppState {
                                 {
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
+                                    if let Some(shot) =
+                                        parts.iter().rev().find_map(|part| match part {
+                                            ChatPart::Screenshot(spec) => Some(spec.clone()),
+                                            _ => None,
+                                        })
+                                    {
+                                        state.last_box_shot = Some(shot);
+                                    }
                                     for part in &parts {
                                         if let ChatPart::Approval(spec) = part
                                             && spec.output.is_some()
@@ -5355,15 +5976,24 @@ impl AppState {
                                         );
                                     }
                                     "finished" => {
-                                        state.finish_responding(conversation_id.as_deref(), false);
-                                        if let Some(id) = conversation_id.as_ref() {
-                                            state.persist_assistant_reply(
-                                                id,
-                                                plain.clone(),
-                                                &parts,
-                                                Some(&run_id),
-                                                cx,
-                                            );
+                                        if let Some(id) = conversation_id.as_deref() {
+                                            if state.has_open_user_form(id) {
+                                                state.park_waiting_for_you(id, &run_id);
+                                            } else {
+                                                state.finish_responding(
+                                                    conversation_id.as_deref(),
+                                                    false,
+                                                );
+                                                if !state.has_open_approval(id) {
+                                                    state.persist_assistant_reply(
+                                                        id,
+                                                        plain.clone(),
+                                                        &parts,
+                                                        Some(&run_id),
+                                                        cx,
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                     "failed" => {
@@ -5373,6 +6003,9 @@ impl AppState {
                                         }
                                     }
                                     _ => {}
+                                }
+                                if let Some(id) = conversation_id.as_deref() {
+                                    state.collect_handoff_ids_and_flush(id, cx);
                                 }
                                 cx.notify();
                             });
@@ -5397,10 +6030,11 @@ impl AppState {
                 // This thread's own line, not the app's: a poll that has run out of patience
                 // must not decide that some other bot's turn is over, and must not end this one
                 // while it is stopped at a card waiting for a person.
-                let waiting = conversation_id
-                    .as_deref()
-                    .and_then(|id| state.thread_status(id))
-                    == Some(WAITING_APPROVAL_STATUS);
+                let waiting = is_waiting_on_person(
+                    conversation_id
+                        .as_deref()
+                        .and_then(|id| state.thread_status(id)),
+                );
                 if !waiting {
                     state.finish_responding(conversation_id.as_deref(), false);
                 }
@@ -5669,7 +6303,1086 @@ impl AppState {
         cx.notify();
     }
 
+    /// Non-secret user-form control (checkbox / select). Do not call this with a
+    /// password or otp; those never belong on `AppState`. `card_key` is
+    /// [`crate::opengrok::UserFormSpec::card_key`], not `callId` as a fill id.
+    pub fn pick_user_form_option(
+        &mut self,
+        card_key: String,
+        field_id: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let masked = self.conversations.iter().any(|conversation| {
+            conversation.messages.iter().any(|message| {
+                message.parts.iter().any(|part| match part {
+                    ChatPart::UserForm(spec) if spec.card_key() == card_key => spec
+                        .fields
+                        .iter()
+                        .any(|field| field.id == field_id && field.masked()),
+                    _ => false,
+                })
+            })
+        });
+        if masked {
+            return;
+        }
+        self.user_form_picks
+            .entry(card_key)
+            .or_default()
+            .insert(field_id, value);
+        cx.notify();
+    }
+
+    fn graft_user_forms(&self, mut parts: Vec<ChatPart>) -> Vec<ChatPart> {
+        for part in &mut parts {
+            if let ChatPart::UserForm(spec) = part {
+                let key = spec.card_key().to_string();
+                let local_res = self
+                    .user_form_resolutions
+                    .get(&spec.entry_id)
+                    .or_else(|| self.user_form_resolutions.get(&key))
+                    .copied()
+                    .or_else(|| {
+                        (!spec.call_id.is_empty())
+                            .then(|| self.user_form_resolutions.get(&spec.call_id).copied())
+                            .flatten()
+                    });
+                if spec.effective_resolution() != Some(FormResolution::Sending)
+                    && let Some(res) = local_res
+                {
+                    spec.resolution = Some(res);
+                }
+                let local_handoff = self
+                    .user_form_computer_handoffs
+                    .get(&spec.entry_id)
+                    .or_else(|| self.user_form_computer_handoffs.get(&key))
+                    .copied();
+                spec.computer_handoff =
+                    ComputerHandoffStatus::fold(spec.computer_handoff, local_handoff);
+                if spec.handoff_entry_id.is_none() {
+                    if let Some(id) = self
+                        .user_form_handoffs
+                        .get(&spec.entry_id)
+                        .or_else(|| self.user_form_handoffs.get(&key))
+                    {
+                        spec.handoff_entry_id = Some(id.clone());
+                    }
+                }
+            }
+        }
+        parts.retain(|part| match part {
+            ChatPart::SaveLogin(spec) => keep_local_save_offer(
+                self.pending_save.contains_key(&spec.form_entry_id),
+                self.already_saved_login(&spec.origin, &spec.username),
+            ),
+            _ => true,
+        });
+        self.inject_local_save_logins(&mut parts);
+        place_hitl_cards_in_document_order(&mut parts);
+        parts
+    }
+
+    /// After Continue, `follow_run` / SSE overwrite `message.parts` from the
+    /// assembler. Re-attach the save prompt from local form values so we do
+    /// not wait for `credential.offer_save` (and never for a password).
+    fn inject_local_save_logins(&self, parts: &mut Vec<ChatPart>) {
+        for pending in self.pending_save.values() {
+            let already_has_card = parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ChatPart::SaveLogin(spec) if spec.form_entry_id == pending.form_entry_id
+                )
+            });
+            let form_submitted = parts.iter().any(|part| match part {
+                ChatPart::UserForm(spec) => {
+                    let same = spec.entry_id == pending.form_entry_id
+                        || spec.card_key() == pending.form_entry_id;
+                    same && spec.effective_resolution() == Some(FormResolution::Submitted)
+                }
+                _ => false,
+            });
+            if let Some(spec) = save_login_from_local(
+                &pending.form_entry_id,
+                &pending.origin,
+                &pending.username,
+                self.already_saved_login(&pending.origin, &pending.username),
+                form_submitted,
+                already_has_card,
+            ) {
+                parts.push(ChatPart::SaveLogin(spec));
+            }
+        }
+    }
+
+    fn user_form_mut(&mut self, card_key: &str) -> Option<&mut crate::opengrok::UserFormSpec> {
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                for part in &mut message.parts {
+                    if let ChatPart::UserForm(spec) = part
+                        && spec.card_key() == card_key
+                    {
+                        return Some(spec);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn user_form_context(&self, card_key: &str) -> Option<(String, String, String, String)> {
+        for conversation in &self.conversations {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    if let ChatPart::UserForm(spec) = part
+                        && spec.card_key() == card_key
+                    {
+                        let run_id = if spec.run_id.is_empty() {
+                            self.live_turns
+                                .get(&conversation.id)
+                                .map(|turn| turn.run_id.clone())
+                                .unwrap_or_default()
+                        } else {
+                            spec.run_id.clone()
+                        };
+                        return Some((
+                            spec.entry_id.clone(),
+                            run_id,
+                            conversation.id.clone(),
+                            conversation.id.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn user_form_handoff_id(&self, card_key: &str) -> Option<String> {
+        self.user_form_handoffs.get(card_key).cloned()
+    }
+
+    /// POST id for I'm done / Skip. Sibling `handoffEntryId` only — never the
+    /// form gateway `entryId` (that hits `is_live_handoff`).
+    fn box_handoff_post_id(&self, card_key: &str, form_entry_id: &str) -> Option<String> {
+        let stored = self
+            .user_form_handoffs
+            .get(card_key)
+            .or_else(|| {
+                (!form_entry_id.is_empty())
+                    .then(|| self.user_form_handoffs.get(form_entry_id))
+                    .flatten()
+            })
+            .map(String::as_str);
+        let spec_id = self.conversations.iter().find_map(|conversation| {
+            conversation.messages.iter().find_map(|message| {
+                message.parts.iter().find_map(|part| match part {
+                    ChatPart::UserForm(spec)
+                        if spec.card_key() == card_key || spec.entry_id == form_entry_id =>
+                    {
+                        spec.handoff_entry_id.as_deref()
+                    }
+                    _ => None,
+                })
+            })
+        });
+        box_handoff_resolve_entry_id(stored.or(spec_id), form_entry_id)
+    }
+
+    fn queue_pending_box_handoff(
+        &mut self,
+        card_key: &str,
+        form_entry_id: &str,
+        pending: PendingBoxHandoff,
+    ) {
+        if !form_entry_id.is_empty() && form_entry_id != card_key {
+            self.user_form_pending_resolves
+                .insert(form_entry_id.to_string(), pending.clone());
+        }
+        self.user_form_pending_resolves
+            .insert(card_key.to_string(), pending);
+    }
+
+    fn take_pending_box_handoff(
+        &mut self,
+        card_key: &str,
+        form_entry_id: &str,
+    ) -> Option<PendingBoxHandoff> {
+        self.user_form_pending_resolves
+            .remove(card_key)
+            .or_else(|| {
+                (!form_entry_id.is_empty())
+                    .then(|| self.user_form_pending_resolves.remove(form_entry_id))
+                    .flatten()
+            })
+    }
+
+    fn flush_pending_box_handoff(
+        &mut self,
+        card_key: &str,
+        form_entry_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handoff_id) = self.box_handoff_post_id(card_key, form_entry_id) else {
+            return;
+        };
+        let Some(pending) = self.take_pending_box_handoff(card_key, form_entry_id) else {
+            return;
+        };
+        self.post_box_handoff_resolve(
+            card_key.to_string(),
+            handoff_id,
+            pending.resolution,
+            pending.run_id,
+            pending.conversation_id,
+            pending.agent_id,
+            cx,
+        );
+    }
+
+    fn collect_handoff_ids_and_flush(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        let pending_keys: Vec<String> = self.user_form_pending_resolves.keys().cloned().collect();
+        let mut discovered: Vec<(String, String, String)> = Vec::new();
+        let mut flush: Vec<(String, String)> = Vec::new();
+        if let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    let ChatPart::UserForm(spec) = part else {
+                        continue;
+                    };
+                    let key = spec.card_key().to_string();
+                    if let Some(id) = spec
+                        .handoff_entry_id
+                        .as_deref()
+                        .filter(|id| !id.is_empty() && *id != spec.entry_id)
+                    {
+                        discovered.push((key.clone(), spec.entry_id.clone(), id.to_string()));
+                    }
+                    if pending_keys.iter().any(|pending| {
+                        pending == &key || (!spec.entry_id.is_empty() && pending == &spec.entry_id)
+                    }) {
+                        flush.push((key, spec.entry_id.clone()));
+                    }
+                }
+            }
+        }
+        for (key, entry_id, id) in discovered {
+            self.user_form_handoffs.insert(key, id.clone());
+            if !entry_id.is_empty() {
+                self.user_form_handoffs.insert(entry_id, id);
+            }
+        }
+        for (card_key, entry_id) in flush {
+            self.flush_pending_box_handoff(&card_key, &entry_id, cx);
+        }
+        self.sync_waiting_chrome(conversation_id);
+    }
+
+    fn post_box_handoff_resolve(
+        &mut self,
+        card_key: String,
+        handoff_entry_id: String,
+        resolution: BoxHandoffResolution,
+        run_id: String,
+        conversation_id: String,
+        agent_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .resolve_box_handoff(&handoff_entry_id, &agent_id, resolution)
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(
+                        BoxHandoffReply::Settled
+                        | BoxHandoffReply::AlreadyAnswered
+                        | BoxHandoffReply::Empty,
+                    ) => {
+                        state.user_form_handoff_done.insert(card_key.clone());
+                        #[cfg(target_os = "macos")]
+                        state.push_computer_window_attention(cx);
+                        if !run_id.is_empty() {
+                            state.begin_responding(Some(&conversation_id), "Working");
+                            state.follow_run(run_id, Some(conversation_id.clone()), cx);
+                        }
+                    }
+                    Ok(BoxHandoffReply::MissingRoute) => {
+                        // Wrong id or a resolve 404 is not "routes missing".
+                        // Do not freeze every stacked open user-form.
+                    }
+                    Ok(BoxHandoffReply::MissingEntryId) => {
+                        state.user_form_handoff_done.remove(&card_key);
+                        if let Some(spec) = state.user_form_mut(&card_key) {
+                            spec.resolution = None;
+                        }
+                        state.user_form_resolutions.remove(&card_key);
+                        state.set_computer_handoff(&card_key, ComputerHandoffStatus::ActionNeeded);
+                        #[cfg(target_os = "macos")]
+                        state.push_computer_window_attention(cx);
+                    }
+                    Err(error) => {
+                        if error.is_signed_out() {
+                            state.note_signed_out(cx);
+                        }
+                    }
+                }
+                state.sync_waiting_chrome(&conversation_id);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn user_form_handoff_resolved(&self, card_key: &str) -> bool {
+        self.user_form_handoff_done.contains(card_key)
+    }
+
+    fn remember_user_form_resolution(&mut self, spec: &crate::opengrok::UserFormSpec) {
+        if let Some(resolution) = spec.effective_resolution() {
+            if resolution == FormResolution::Sending {
+                return;
+            }
+            if spec.has_gateway_entry_id() {
+                self.user_form_resolutions
+                    .insert(spec.entry_id.clone(), resolution);
+            }
+            self.user_form_resolutions
+                .insert(spec.card_key().to_string(), resolution);
+            if !spec.call_id.is_empty() {
+                self.user_form_resolutions
+                    .insert(spec.call_id.clone(), resolution);
+            }
+            self.user_form_restore.remove(spec.card_key());
+        }
+        if let Some(id) = spec.handoff_entry_id.as_deref().filter(|id| !id.is_empty()) {
+            self.user_form_handoffs
+                .insert(spec.card_key().to_string(), id.to_string());
+            if spec.has_gateway_entry_id() {
+                self.user_form_handoffs
+                    .insert(spec.entry_id.clone(), id.to_string());
+            }
+        }
+        if let Some(status) = spec.computer_handoff {
+            self.remember_computer_handoff(spec.card_key(), spec, status);
+        }
+    }
+
+    fn remember_computer_handoff(
+        &mut self,
+        card_key: &str,
+        spec: &crate::opengrok::UserFormSpec,
+        status: ComputerHandoffStatus,
+    ) {
+        let folded = ComputerHandoffStatus::fold(
+            self.user_form_computer_handoffs.get(card_key).copied(),
+            Some(status),
+        )
+        .unwrap_or(status);
+        self.user_form_computer_handoffs
+            .insert(card_key.to_string(), folded);
+        if spec.has_gateway_entry_id() {
+            self.user_form_computer_handoffs
+                .insert(spec.entry_id.clone(), folded);
+        }
+    }
+
+    fn set_computer_handoff(&mut self, card_key: &str, status: ComputerHandoffStatus) {
+        let call_id = self
+            .user_form_mut(card_key)
+            .map(|spec| spec.call_id.clone())
+            .unwrap_or_default();
+        let painted = if let Some(spec) = self.user_form_mut(card_key) {
+            spec.computer_handoff = Some(status);
+            Some((
+                spec.card_key().to_string(),
+                spec.entry_id.clone(),
+                spec.has_gateway_entry_id(),
+            ))
+        } else {
+            None
+        };
+        if let Some((key, entry_id, has_entry)) = painted {
+            self.user_form_computer_handoffs.insert(key, status);
+            if has_entry {
+                self.user_form_computer_handoffs.insert(entry_id, status);
+            }
+        } else {
+            self.user_form_computer_handoffs
+                .insert(card_key.to_string(), status);
+        }
+        if !call_id.is_empty() {
+            for conversation in &mut self.conversations {
+                for message in &mut conversation.messages {
+                    for part in &mut message.parts {
+                        if let ChatPart::UserForm(spec) = part
+                            && spec.shares_call_id(&call_id)
+                        {
+                            spec.computer_handoff = Some(status);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_computer_handoff(&mut self, card_key: &str) {
+        let Some(prior) = self.user_form_handoff_restore.remove(card_key) else {
+            return;
+        };
+        if let Some(spec) = self.user_form_mut(card_key) {
+            spec.computer_handoff = prior;
+        }
+        match prior {
+            Some(status) => {
+                self.user_form_computer_handoffs
+                    .insert(card_key.to_string(), status);
+            }
+            None => {
+                self.user_form_computer_handoffs.remove(card_key);
+            }
+        }
+    }
+
+    fn paint_user_form_resolution(&mut self, card_key: &str, resolution: FormResolution) {
+        let (prior, call_id) = match self.user_form_mut(card_key) {
+            Some(spec) => {
+                let prior = (spec.resolution != Some(FormResolution::Sending))
+                    .then_some(spec.effective_resolution())
+                    .flatten();
+                (prior, spec.call_id.clone())
+            }
+            None => (None, String::new()),
+        };
+        if let Some(prior) = prior {
+            self.user_form_restore.insert(card_key.to_string(), prior);
+        }
+        if let Some(spec) = self.user_form_mut(card_key) {
+            spec.resolution = Some(resolution);
+        }
+        self.paint_user_form_call_peers(&call_id, resolution);
+        if resolution != FormResolution::Sending {
+            self.user_form_resolutions
+                .insert(card_key.to_string(), resolution);
+        }
+    }
+
+    /// Collapse every `ChatPart::UserForm` that shares this AG-UI `callId`
+    /// (`user-form-call-{callId}-*`). Clone `call_id` before this walk — do
+    /// not hold `user_form_mut` across the iteration (Mac E0499).
+    fn paint_user_form_call_peers(&mut self, call_id: &str, resolution: FormResolution) {
+        if call_id.is_empty() {
+            return;
+        }
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                for part in &mut message.parts {
+                    if let ChatPart::UserForm(spec) = part
+                        && spec.shares_call_id(call_id)
+                    {
+                        spec.resolution = Some(resolution);
+                    }
+                }
+            }
+        }
+        if resolution != FormResolution::Sending {
+            self.user_form_resolutions
+                .insert(call_id.to_string(), resolution);
+        }
+    }
+
+    /// Open-the-screen milestone: pin the last box PNG into chat once, not every step.
+    /// Treat it as `transcript` (explicit observe), even if the live frame was `agent`.
+    fn pin_open_screen_shot(&mut self, conversation_id: &str) {
+        let Some(mut shot) = self.last_box_shot.clone() else {
+            return;
+        };
+        shot.visibility = Some(ImageVisibility::Transcript);
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return;
+        };
+        let Some(last) = conversation.messages.iter_mut().rev().find(|m| !m.is_me) else {
+            return;
+        };
+        if last
+            .parts
+            .iter()
+            .any(|part| matches!(part, ChatPart::Screenshot(spec) if spec.call_id == shot.call_id))
+        {
+            return;
+        }
+        last.parts.push(ChatPart::Screenshot(shot));
+        place_hitl_cards_in_document_order(&mut last.parts);
+    }
+
+    fn restore_user_form(&mut self, card_key: &str) {
+        let local_call_settle = self
+            .user_form_mut(card_key)
+            .is_some_and(|spec| spec.entry_id.is_empty() && !spec.call_id.is_empty());
+        if local_call_settle {
+            // call-* cards settle locally; HTTP never had a gateway target.
+            self.user_form_restore.remove(card_key);
+            return;
+        }
+        if let Some(prior) = self.user_form_restore.remove(card_key) {
+            if let Some(spec) = self.user_form_mut(card_key) {
+                spec.resolution = Some(prior);
+            }
+            self.user_form_resolutions
+                .insert(card_key.to_string(), prior);
+        }
+        self.restore_computer_handoff(card_key);
+    }
+
+    /// Continue: POST `/ag-ui/user-form/submit`. Secrets stay in `values` for
+    /// this request only — never `send_message`, AG-UI `content`, or sqlite.
+    pub fn submit_user_form(
+        &mut self,
+        card_key: String,
+        values: UserFormValues,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_user_form(card_key, UserFormDispatch::Submit(values), cx);
+    }
+
+    /// Open the screen (`escalated`) or Dismiss (`dismissed`).
+    pub fn dismiss_user_form(
+        &mut self,
+        card_key: String,
+        mode: UserFormDismissMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_user_form(card_key, UserFormDispatch::Dismiss(mode), cx);
+    }
+
+    /// Hand back / decline. POSTs dismiss `handoffEntryId` / sibling Computer
+    /// card id. Never the form gateway `entryId`. Queues until that id lands.
+    pub fn resolve_user_form_handoff(
+        &mut self,
+        card_key: String,
+        resolution: BoxHandoffResolution,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_user_form(card_key, UserFormDispatch::ResolveHandoff(resolution), cx);
+    }
+
+    fn ensure_site_login_vault(&mut self, cx: &mut Context<Self>) {
+        if self.site_login_vault.is_some() {
+            return;
+        }
+        let Some(db) = self.database_service.as_ref() else {
+            return;
+        };
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        self.site_login_vault = Some(SiteLoginVault::open(db.pool(), &config.data_dir));
+        self.reload_site_logins(cx);
+    }
+
+    fn reload_site_logins(&mut self, cx: &mut Context<Self>) {
+        let Some(vault) = self.site_login_vault.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let list = vault.list().await;
+            let _ = this.update(cx, |state, cx| {
+                match list {
+                    Ok(rows) => {
+                        state.site_logins = rows;
+                        state.site_login_error = None;
+                    }
+                    Err(err) => state.site_login_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn already_saved_login(&self, origin: &str, username: &str) -> bool {
+        self.site_logins
+            .iter()
+            .any(|row| row.origin == origin && row.username == username)
+    }
+
+    fn stash_save_candidate(&mut self, card_key: &str, values: &UserFormValues) {
+        let pending = {
+            let Some(spec) = self.user_form_mut(card_key) else {
+                return;
+            };
+            save_candidate(spec, values)
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        self.pending_save
+            .insert(pending.form_entry_id.clone(), pending);
+    }
+
+    fn offer_save_login(&mut self, card_key: &str) {
+        let entry_id = self
+            .user_form_mut(card_key)
+            .map(|spec| {
+                if spec.has_gateway_entry_id() {
+                    spec.entry_id.clone()
+                } else {
+                    spec.card_key().to_string()
+                }
+            })
+            .unwrap_or_else(|| card_key.to_string());
+        let Some(pending) = self.pending_save.get(&entry_id) else {
+            return;
+        };
+        if self.already_saved_login(&pending.origin, &pending.username) {
+            self.pending_save.remove(&entry_id);
+            return;
+        }
+        let spec = SaveLoginSpec {
+            form_entry_id: pending.form_entry_id.clone(),
+            origin: pending.origin.clone(),
+            username: pending.username.clone(),
+        };
+        self.push_save_login_part(spec);
+    }
+
+    fn push_save_login_part(&mut self, spec: SaveLoginSpec) {
+        let entry = spec.form_entry_id.clone();
+        for conversation in &mut self.conversations {
+            for message in conversation.messages.iter_mut().rev() {
+                let has_form = message.parts.iter().any(|part| match part {
+                    ChatPart::UserForm(form) => form.card_key() == entry || form.entry_id == entry,
+                    _ => false,
+                });
+                if !has_form {
+                    continue;
+                }
+                if let Some(existing) = message.parts.iter_mut().find_map(|part| match part {
+                    ChatPart::SaveLogin(existing)
+                        if existing.form_entry_id == spec.form_entry_id =>
+                    {
+                        Some(existing)
+                    }
+                    _ => None,
+                }) {
+                    *existing = spec;
+                    return;
+                }
+                message.parts.push(ChatPart::SaveLogin(spec));
+                return;
+            }
+        }
+    }
+
+    fn remove_save_login_part(&mut self, form_entry_id: &str) {
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::SaveLogin(spec) => spec.form_entry_id != form_entry_id,
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn remove_credential_request_part(&mut self, request_id: &str) {
+        for conversation in &mut self.conversations {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::CredentialRequest(spec) => spec.request_id != request_id,
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn credential_request_spec(&self, request_id: &str) -> Option<CredentialRequestSpec> {
+        for conversation in &self.conversations {
+            for message in &conversation.messages {
+                for part in &message.parts {
+                    if let ChatPart::CredentialRequest(spec) = part
+                        && spec.request_id == request_id
+                    {
+                        return Some(spec.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Save the offered login: Keychain + sqlite metadata. Never a ChatPart password.
+    pub fn save_offered_login(&mut self, form_entry_id: String, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_save.remove(&form_entry_id) else {
+            return;
+        };
+        self.remove_save_login_part(&form_entry_id);
+        let Some(vault) = self.site_login_vault.clone() else {
+            self.site_login_error = Some("Login vault is not ready.".into());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = vault
+                .save(&pending.origin, &pending.username, &pending.password)
+                .await;
+            drop(pending);
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(_) => {
+                        state.site_login_error = None;
+                        state.reload_site_logins(cx);
+                    }
+                    Err(err) => state.site_login_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn skip_save_login(&mut self, form_entry_id: String, cx: &mut Context<Self>) {
+        self.pending_save.remove(&form_entry_id);
+        self.remove_save_login_part(&form_entry_id);
+        cx.notify();
+    }
+
+    pub fn delete_site_login(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(vault) = self.site_login_vault.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = vault.delete(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(()) => {
+                        state.site_logins.retain(|row| row.id != id);
+                        state.site_login_error = None;
+                        state.reload_site_logins(cx);
+                    }
+                    Err(err) => state.site_login_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Confirm or deny `credential.request`. A.0 never types into Box and never
+    /// posts `filled` — that status is the session broker (A.1).
+    pub fn answer_credential_request(
+        &mut self,
+        request_id: String,
+        allow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(spec) = self.credential_request_spec(&request_id) else {
+            return;
+        };
+        let vault = self.site_login_vault.clone();
+        let agent_id = self.active_coworker_id.clone().unwrap_or_default();
+        let client = self.opengrok.clone();
+        self.remove_credential_request_part(&request_id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (status, credential_id) = match vault {
+                None => (CredentialResultStatus::Error, None),
+                Some(vault) => {
+                    let row = vault
+                        .find(&spec.origin, spec.username.as_deref())
+                        .await
+                        .ok()
+                        .flatten();
+                    let have_meta = row.is_some();
+                    let have_secret = row
+                        .as_ref()
+                        .is_some_and(|row| vault.secret_present(&row.id));
+                    let status = result_without_broker(allow, have_meta, have_secret);
+                    debug_assert_ne!(
+                        status,
+                        CredentialResultStatus::Filled,
+                        "A.0 must not claim filled without the session broker"
+                    );
+                    (status, row.map(|row| row.id))
+                }
+            };
+            if let Some(client) = client {
+                let _ = client
+                    .post_credential_result(
+                        status,
+                        &request_id,
+                        credential_id.as_deref(),
+                        &agent_id,
+                    )
+                    .await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if !spec.run_id.is_empty() {
+                    let conversation_id = state.active_conversation_id.clone();
+                    state.begin_responding(conversation_id.as_deref(), "Working");
+                    state.follow_run(spec.run_id.clone(), conversation_id, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn dispatch_user_form(
+        &mut self,
+        card_key: String,
+        action: UserFormDispatch,
+        cx: &mut Context<Self>,
+    ) {
+        // Do not early-return on `user_form_verbs_available`. That global lock
+        // left every stacked open card gray after one MissingRoute 404.
+        let Some((entry_id, run_id, conversation_id, agent_id)) = self.user_form_context(&card_key)
+        else {
+            return;
+        };
+        let handoff_entry_id = match &action {
+            UserFormDispatch::ResolveHandoff(_) => self.box_handoff_post_id(&card_key, &entry_id),
+            _ => None,
+        };
+        if matches!(action, UserFormDispatch::Submit(_)) && entry_id.is_empty() {
+            // #140: never POST callId as submit. Dismiss / Open the screen
+            // still paint locally on call-* cards.
+            return;
+        }
+        match &action {
+            UserFormDispatch::Submit(values) => {
+                self.stash_save_candidate(&card_key, values);
+                self.paint_user_form_resolution(&card_key, FormResolution::Sending);
+                if self
+                    .user_form_mut(&card_key)
+                    .is_some_and(|spec| spec.live_computer_handoff())
+                {
+                    self.set_computer_handoff(&card_key, ComputerHandoffStatus::Done);
+                    self.user_form_handoff_done.insert(card_key.clone());
+                }
+            }
+            UserFormDispatch::Dismiss(mode) => match mode {
+                UserFormDismissMode::Dismissed => {
+                    self.paint_user_form_resolution(&card_key, FormResolution::Dismissed);
+                    if self
+                        .user_form_mut(&card_key)
+                        .is_some_and(|spec| spec.shows_computer_handoff())
+                    {
+                        self.set_computer_handoff(&card_key, ComputerHandoffStatus::Skipped);
+                        self.user_form_handoff_done.insert(card_key.clone());
+                    }
+                }
+                UserFormDismissMode::Escalated => {
+                    let prior = self
+                        .user_form_mut(&card_key)
+                        .and_then(|spec| spec.computer_handoff);
+                    self.user_form_handoff_restore
+                        .insert(card_key.clone(), prior);
+                    self.set_computer_handoff(&card_key, ComputerHandoffStatus::ActionNeeded);
+                    self.pin_open_screen_shot(&conversation_id);
+                    self.show_computer_pane(cx);
+                    #[cfg(target_os = "macos")]
+                    self.push_computer_window_attention(cx);
+                }
+            },
+            UserFormDispatch::ResolveHandoff(resolution) => {
+                self.paint_user_form_resolution(
+                    &card_key,
+                    crate::opengrok::UserFormSpec::settle_form_from_box(*resolution),
+                );
+                let computer = match resolution {
+                    BoxHandoffResolution::Declined => ComputerHandoffStatus::Skipped,
+                    BoxHandoffResolution::HandedBack | BoxHandoffResolution::TimedOut => {
+                        ComputerHandoffStatus::Done
+                    }
+                };
+                self.set_computer_handoff(&card_key, computer);
+                self.user_form_handoff_done.insert(card_key.clone());
+                #[cfg(target_os = "macos")]
+                self.push_computer_window_attention(cx);
+            }
+        }
+        self.sync_waiting_chrome(&conversation_id);
+        cx.notify();
+        if let UserFormDispatch::ResolveHandoff(resolution) = action {
+            if let Some(handoff_entry_id) = handoff_entry_id {
+                self.post_box_handoff_resolve(
+                    card_key,
+                    handoff_entry_id,
+                    resolution,
+                    run_id,
+                    conversation_id,
+                    agent_id,
+                    cx,
+                );
+            } else {
+                // Sibling id not back yet. Keep Skip live (do not POST form id).
+                self.queue_pending_box_handoff(
+                    &card_key,
+                    &entry_id,
+                    PendingBoxHandoff {
+                        resolution,
+                        run_id,
+                        conversation_id,
+                        agent_id,
+                    },
+                );
+            }
+            return;
+        }
+        if entry_id.is_empty() {
+            // Local Dismiss / Open the screen on call-* (#140). Never POST
+            // callId as entryId, never restore the optimistic settle.
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            self.restore_user_form(&card_key);
+            self.sync_waiting_chrome(&conversation_id);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let verb = match &action {
+                UserFormDispatch::Submit(_) => UserFormVerb::Submit,
+                UserFormDispatch::Dismiss(_) => UserFormVerb::Dismiss,
+                UserFormDispatch::ResolveHandoff(_) => unreachable!("resolved above"),
+            };
+            let dismissed = matches!(
+                action,
+                UserFormDispatch::Dismiss(UserFormDismissMode::Dismissed)
+            );
+            let result = match action {
+                UserFormDispatch::Submit(values) => {
+                    client.submit_user_form(&entry_id, &agent_id, &values).await
+                }
+                UserFormDispatch::Dismiss(mode) => {
+                    client.dismiss_user_form(&entry_id, &agent_id, mode).await
+                }
+                UserFormDispatch::ResolveHandoff(_) => unreachable!("resolved above"),
+            };
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(reply) => {
+                        match crate::opengrok::settle_user_form_http(verb, &reply) {
+                            UserFormHttpSettle::Merge(incoming) => {
+                                let resolution = incoming.effective_resolution();
+                                let incoming_call = incoming.call_id.clone();
+                                let origin_call = state
+                                    .user_form_mut(&card_key)
+                                    .map(|spec| spec.call_id.clone())
+                                    .unwrap_or_default();
+                                state.remember_user_form_resolution(&incoming);
+                                if let Some(spec) = state.user_form_mut(&card_key) {
+                                    spec.merge(incoming);
+                                }
+                                if let Some(res) = resolution {
+                                    let call_id = if !incoming_call.is_empty() {
+                                        incoming_call
+                                    } else {
+                                        origin_call
+                                    };
+                                    state.paint_user_form_call_peers(&call_id, res);
+                                }
+                                if resolution != Some(FormResolution::FillFailed) {
+                                    state.user_form_picks.remove(&card_key);
+                                    state.user_form_typed.remove(&card_key);
+                                }
+                                if resolution == Some(FormResolution::Submitted) {
+                                    state.offer_save_login(&card_key);
+                                }
+                                let had_pending =
+                                    state.user_form_pending_resolves.contains_key(&card_key)
+                                        || state.user_form_pending_resolves.contains_key(&entry_id);
+                                state.flush_pending_box_handoff(&card_key, &entry_id, cx);
+                                let live_handoff = state
+                                    .user_form_mut(&card_key)
+                                    .is_some_and(|spec| spec.live_computer_handoff());
+                                let follow = if had_pending {
+                                    // Skip already queued a resolve; that POST resumes.
+                                    false
+                                } else if live_handoff
+                                    || resolution == Some(FormResolution::Escalated)
+                                {
+                                    state.end_turn_waiting(
+                                        Some(&conversation_id),
+                                        Some(WAITING_FOR_YOU_STATUS),
+                                    );
+                                    false
+                                } else if resolution == Some(FormResolution::FillFailed) {
+                                    false
+                                } else {
+                                    true
+                                };
+                                if follow && !run_id.is_empty() {
+                                    state.begin_responding(Some(&conversation_id), "Working");
+                                    state.follow_run(run_id, Some(conversation_id.clone()), cx);
+                                }
+                            }
+                            UserFormHttpSettle::Paint(resolution) => {
+                                // After Sending: Not filled on 200-null / 404.
+                                // Submitted only from a body formResolution (Merge).
+                                state.paint_user_form_resolution(&card_key, resolution);
+                                state.user_form_restore.remove(&card_key);
+                                if resolution != FormResolution::FillFailed {
+                                    state.user_form_picks.remove(&card_key);
+                                    state.user_form_typed.remove(&card_key);
+                                }
+                                if resolution == FormResolution::Submitted {
+                                    state.offer_save_login(&card_key);
+                                }
+                                if resolution == FormResolution::Submitted && !run_id.is_empty() {
+                                    state.begin_responding(Some(&conversation_id), "Working");
+                                    state.follow_run(run_id, Some(conversation_id.clone()), cx);
+                                }
+                            }
+                            UserFormHttpSettle::Keep => {
+                                if dismissed && !run_id.is_empty() {
+                                    state.begin_responding(Some(&conversation_id), "Working");
+                                    state.follow_run(run_id, Some(conversation_id.clone()), cx);
+                                }
+                            }
+                            UserFormHttpSettle::Restore => {
+                                state.restore_user_form(&card_key);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        match verb {
+                            UserFormVerb::Submit => {
+                                state.paint_user_form_resolution(
+                                    &card_key,
+                                    FormResolution::FillFailed,
+                                );
+                                state.user_form_restore.remove(&card_key);
+                            }
+                            UserFormVerb::Dismiss => state.restore_user_form(&card_key),
+                        }
+                        if error.is_signed_out() {
+                            state.note_signed_out(cx);
+                        }
+                    }
+                }
+                state.sync_waiting_chrome(&conversation_id);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn submit_form(&mut self, message_id: String, spec: FormSpec, cx: &mut Context<Self>) {
+        // Generative UI only. User-form secrets must never take this path:
+        // it concatenates values into `send_message` / AG-UI `content`.
         let picks = self
             .form_picks
             .get(&message_id)
@@ -5801,9 +7514,18 @@ impl AppState {
             .detach();
         }
 
-        if self.has_open_approval(&conversation_id) {
+        if self.has_open_approval(&conversation_id) || self.has_open_user_form(&conversation_id) {
             // The card is this thread's, and so is the line saying what it is waiting for.
-            self.finish_responding(Some(&conversation_id), true);
+            if self.has_open_user_form(&conversation_id) {
+                let run_id = self
+                    .live_turns
+                    .get(&conversation_id)
+                    .map(|turn| turn.run_id.clone())
+                    .unwrap_or_default();
+                self.park_waiting_for_you(&conversation_id, &run_id);
+            } else {
+                self.finish_responding(Some(&conversation_id), true);
+            }
             cx.notify();
             return;
         }
@@ -5830,6 +7552,28 @@ impl AppState {
                             && !self.approval_answered(&spec.call_id)
                             && self.auto_resolve_local_exec(spec).is_none()
                     }
+                    _ => false,
+                })
+        })
+    }
+
+    fn has_open_user_form(&self, conversation_id: &str) -> bool {
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return false;
+        };
+        conversation.messages.iter().rev().any(|message| {
+            !message.is_me
+                && message.parts.iter().any(|part| match part {
+                    ChatPart::UserForm(spec) => {
+                        spec.is_unresolved()
+                            || spec.effective_resolution() == Some(FormResolution::Sending)
+                            || spec.live_computer_handoff()
+                    }
+                    ChatPart::CredentialRequest(_) => true,
                     _ => false,
                 })
         })
@@ -5937,6 +7681,10 @@ impl AppState {
         self.is_app_settings_open = !self.is_app_settings_open;
         if self.is_app_settings_open {
             self.dismiss_popovers(cx);
+            self.refresh_host_egress(cx);
+            if self.app_settings_tab == AppSettingsTab::Computer {
+                self.refresh_computers(cx);
+            }
         }
         self.record_nav();
         cx.notify();
@@ -5948,6 +7696,7 @@ impl AppState {
             self.record_nav();
             if tab == AppSettingsTab::Computer {
                 self.refresh_computers(cx);
+                self.refresh_host_egress(cx);
             }
             cx.notify();
         }
@@ -5970,6 +7719,7 @@ impl AppState {
                     computer.online = true;
                 }
             }
+            computers = collapse_computer_roster(computers);
             computers.sort_by_key(|computer| !computer.this_machine);
             let _ = this.update(cx, |state, cx| {
                 state.computers = computers;
@@ -6050,6 +7800,7 @@ impl AppState {
             self.is_app_settings_open = true;
             self.dismiss_popovers(cx);
         }
+        self.refresh_host_egress(cx);
         if tab == AppSettingsTab::Computer {
             self.refresh_computers(cx);
         }
@@ -6623,15 +8374,16 @@ mod tests {
         DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
         REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE,
         STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler,
-        WAITING_APPROVAL_STATUS, agui_messages, apply_catalogue, apply_reload, graft_reply,
-        is_status_line, is_tool_standin, is_unsent_turn_note, missing_replies,
-        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
+        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
+        apply_reload, bot_status_line, graft_reply, is_status_line, is_tool_standin,
+        is_unsent_turn_note, missing_replies, overlay_server_cards, reads_as_gateway_unreachable,
+        reply_from_replay, restored_parts, saved_parts, stream_paint_due, stream_part_sig,
         streaming_message_mut,
     };
-    use crate::opengrok::{Failure, ModelEntry, OpenGrokClient};
+    use crate::opengrok::{Failure, FormResolution, ModelEntry, OpenGrokClient};
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn message(id: &str, is_me: bool, content: &str) -> Message {
         Message {
@@ -6671,6 +8423,43 @@ mod tests {
         assert_eq!(quote.message_id, "m1");
         assert_eq!(quote.preview, "The build is green.");
         assert!(!quote.is_me);
+    }
+
+    #[test]
+    fn stream_paint_coalesces_text_and_flushes_on_a_card() {
+        let t0 = Instant::now();
+        let text = vec![ChatPart::Text("hi".into())];
+        let sig = stream_part_sig(&text);
+        assert!(
+            stream_paint_due(None, t0, (0, 0), sig),
+            "the first token paints"
+        );
+        assert!(
+            !stream_paint_due(Some(t0), t0, sig, sig),
+            "another token in the same 16ms does not notify"
+        );
+        assert!(
+            stream_paint_due(Some(t0), t0 + Duration::from_millis(16), sig, sig),
+            "text flushes at ~60Hz"
+        );
+        let card = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e1",
+                "formRequest": {
+                    "title": "Login",
+                    "fields": [{"id": "p", "label": "Password", "type": "password", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let with_form = vec![ChatPart::Text("hi".into()), ChatPart::UserForm(card)];
+        let form_sig = stream_part_sig(&with_form);
+        assert_ne!(sig, form_sig);
+        assert!(
+            stream_paint_due(Some(t0), t0, sig, form_sig),
+            "a user-form card paints immediately"
+        );
     }
 
     #[test]
@@ -6729,6 +8518,327 @@ mod tests {
         );
     }
 
+    /// A user-form card's typed values — especially a password — must never become the
+    /// next turn's AG-UI `content`. The card lives in `parts`; `content` is the prose.
+    #[test]
+    fn user_form_values_never_enter_agui_content() {
+        let spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "entry-pw",
+                "formRequest": {
+                    "title": "Google password",
+                    "fields": [{
+                        "id": "password",
+                        "label": "Password",
+                        "type": "password",
+                        "required": true,
+                        "value": "s3cret-pass"
+                    }]
+                }
+            }),
+            None,
+        )
+        .expect("a card");
+        assert!(spec.fields[0].prefill.is_none());
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let sent = agui_messages(&[bot]);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].content, "I'll sign you in.");
+        assert!(
+            !sent[0].content.contains("s3cret-pass"),
+            "password leaked into AguiMessage.content: {}",
+            sent[0].content
+        );
+        let dump = format!("{sent:?}");
+        assert!(
+            !dump.contains("s3cret-pass"),
+            "password in Debug of messages: {dump}"
+        );
+        let mut values = crate::opengrok::UserFormValues::default();
+        values.by_id.insert("password".into(), "s3cret-pass".into());
+        let body = crate::opengrok::submit_request_body("e_form", "cw_1", &values);
+        assert_eq!(body["values"]["password"], "s3cret-pass");
+        assert_eq!(body["entryId"], "e_form");
+        assert_ne!(body["entryId"], "mock-form-1");
+        assert!(
+            !sent[0].content.contains("s3cret-pass"),
+            "submit values must not leak into AguiMessage.content"
+        );
+        let official = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "mock-form-1",
+            "reason": "user-form",
+            "entryId": "e_form",
+            "arguments": {
+                "title": "Google password",
+                "fields": [{
+                    "id": "password",
+                    "label": "Password",
+                    "type": "password",
+                    "required": true
+                }]
+            }
+        }))
+        .expect("d12fffc card");
+        assert_eq!(official.entry_id, "e_form");
+        assert_eq!(official.call_id, "mock-form-1");
+        let rest = crate::opengrok::submit_request_body(&official.entry_id, "cw_1", &values);
+        assert_eq!(rest["entryId"], official.entry_id);
+        assert_ne!(rest["entryId"], official.call_id);
+        assert_eq!(
+            crate::opengrok::user_form_action_from_http(404, &serde_json::Value::Null),
+            crate::opengrok::UserFormActionReply::MissingRoute
+        );
+    }
+
+    #[test]
+    fn paint_settle_collapses_the_same_call_id_twin() {
+        let call_twin = crate::opengrok::UserFormSpec::from_tool_args(
+            &serde_json::json!({
+                "formRequest": {
+                    "title": "Google account",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true},
+                        {"id": "password", "label": "Password", "type": "password", "required": true}
+                    ]
+                }
+            }),
+            "call-9",
+        )
+        .unwrap();
+        let entry = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [
+                    {"id": "email", "label": "Email", "type": "email", "required": true},
+                    {"id": "password", "label": "Password", "type": "password", "required": true}
+                ]
+            }
+        }))
+        .unwrap();
+        let otp = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-otp",
+            "entryId": "e_otp",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Enter the code",
+                "fields": [{"id": "otp", "label": "Code", "type": "otp", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m1", false, "");
+        bot.parts = vec![
+            ChatPart::UserForm(call_twin),
+            ChatPart::UserForm(entry),
+            ChatPart::UserForm(otp),
+        ];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+
+        state.paint_user_form_resolution("e_form", FormResolution::Submitted);
+
+        let open = state.open_user_forms();
+        assert!(
+            open.iter().all(|spec| spec.call_id != "call-9"),
+            "call twin must not stay unresolved: {open:?}"
+        );
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].entry_id, "e_otp");
+
+        let fresh = crate::opengrok::UserFormSpec::from_tool_args(
+            &serde_json::json!({
+                "formRequest": {
+                    "title": "Google account",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true}
+                    ]
+                }
+            }),
+            "call-9",
+        )
+        .unwrap();
+        let grafted = state.graft_user_forms(vec![ChatPart::UserForm(fresh)]);
+        match grafted.as_slice() {
+            [ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+                assert!(!spec.is_unresolved());
+            }
+            other => panic!("expected grafted settle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn saved_parts_drop_user_form_cards_and_keep_no_password() {
+        let spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "entry-pw",
+                "formRequest": {
+                    "title": "Google password",
+                    "fields": [{
+                        "id": "password",
+                        "label": "Password",
+                        "type": "password",
+                        "value": "s3cret-pass"
+                    }]
+                }
+            }),
+            None,
+        )
+        .expect("a card");
+        let live = vec![
+            ChatPart::Text("I'll sign you in.".into()),
+            ChatPart::UserForm(spec),
+            ChatPart::Text("The page is ready.".into()),
+        ];
+        let saved = saved_parts(&live);
+        let blob = format!("{saved:?}");
+        assert!(!blob.contains("s3cret-pass"));
+        assert!(
+            saved
+                .iter()
+                .all(|part| matches!(part, crate::services::database::MessagePart::Text(_))),
+            "a card is not a saved part: {saved:?}"
+        );
+    }
+
+    #[test]
+    fn saved_parts_drop_save_login_and_credential_request() {
+        let live = vec![
+            ChatPart::SaveLogin(crate::opengrok::SaveLoginSpec {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+            }),
+            ChatPart::CredentialRequest(crate::opengrok::CredentialRequestSpec {
+                request_id: "req-9".into(),
+                origin: "google.com".into(),
+                username: Some("ada@example.com".into()),
+                run_id: "run-1".into(),
+            }),
+        ];
+        assert!(saved_parts(&live).is_empty());
+    }
+
+    #[test]
+    fn graft_injects_save_login_from_local_form_not_from_server() {
+        let mut submitted = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Google account",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true},
+                        {"id": "password", "label": "Password", "type": "password", "required": true}
+                    ]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        submitted.resolution = Some(FormResolution::Submitted);
+        let mut state = AppState::new();
+        state.pending_save.insert(
+            "e_form".into(),
+            PendingSave {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+                password: "s3cret-pass".into(),
+            },
+        );
+        let grafted = state.graft_user_forms(vec![ChatPart::UserForm(submitted)]);
+        match grafted.as_slice() {
+            [ChatPart::UserForm(_), ChatPart::SaveLogin(spec)] => {
+                assert_eq!(spec.origin, "google.com");
+                assert_eq!(spec.username, "ada@example.com");
+                assert_eq!(spec.form_entry_id, "e_form");
+            }
+            other => panic!("expected submitted form + local save prompt, got {other:?}"),
+        }
+        let dump = format!("{grafted:?}");
+        assert!(!dump.contains("s3cret-pass"));
+        assert!(saved_parts(&grafted).is_empty());
+    }
+
+    #[test]
+    fn graft_drops_server_offer_save_without_local_secret() {
+        let state = AppState::new();
+        let grafted =
+            state.graft_user_forms(vec![ChatPart::SaveLogin(crate::opengrok::SaveLoginSpec {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+            })]);
+        assert!(
+            grafted.is_empty(),
+            "never wait for the server to echo a password: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_puts_local_save_login_back_on_a_sqlite_row() {
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.parts = vec![ChatPart::Text("I'll sign you in.".into())];
+        overlay_server_cards(
+            &mut bot,
+            &[ChatPart::SaveLogin(crate::opengrok::SaveLoginSpec {
+                form_entry_id: "e_form".into(),
+                origin: "google.com".into(),
+                username: "ada@example.com".into(),
+            })],
+        );
+        match bot.parts.as_slice() {
+            [ChatPart::Text(_), ChatPart::SaveLogin(spec)] => {
+                assert_eq!(spec.origin, "google.com");
+                assert_eq!(spec.username, "ada@example.com");
+            }
+            other => panic!("expected save prompt overlaid, got {other:?}"),
+        }
+        assert!(!format!("{:?}", bot.parts).contains("password"));
+    }
+
+    #[test]
+    fn overlay_settles_user_form_from_send_message_envelope() {
+        let settled = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "user-form",
+            "value": {
+                "kind": "send-message",
+                "id": "e_form",
+                "message": {
+                    "type": "user-form",
+                    "formRequest": {
+                        "title": "Sign in",
+                        "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                    }
+                },
+                "formResolution": "submitted"
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.parts = vec![ChatPart::Text("I'll sign you in.".into())];
+        overlay_server_cards(&mut bot, &[ChatPart::UserForm(settled)]);
+        match bot.parts.as_slice() {
+            [ChatPart::Text(_), ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+                assert!(spec.fields.iter().all(|f| f.prefill.is_none()));
+            }
+            other => panic!("expected settled send-message card, got {other:?}"),
+        }
+    }
+
     /// The app's own schema on a database that lives for the length of the test. One connection:
     /// a second connection to `:memory:` would open a second, empty database.
     async fn test_db() -> DatabaseService {
@@ -6760,6 +8870,7 @@ mod tests {
             )),
             width: size.0,
             height: size.1,
+            visibility: None,
         })
     }
 
@@ -6777,6 +8888,22 @@ mod tests {
                 ),
                 ChatPart::Ui(_) => "ui".to_string(),
                 ChatPart::Approval(_) => "approval".to_string(),
+                ChatPart::UserForm(spec) => format!(
+                    "user-form {} {} {}",
+                    spec.entry_id,
+                    spec.effective_resolution()
+                        .map(|r| r.as_str())
+                        .unwrap_or("idle"),
+                    spec.computer_handoff
+                        .map(|s| s.as_str())
+                        .unwrap_or("no-computer")
+                ),
+                ChatPart::SaveLogin(spec) => {
+                    format!("save-login {} {}", spec.origin, spec.username)
+                }
+                ChatPart::CredentialRequest(spec) => {
+                    format!("credential-request {} {}", spec.origin, spec.request_id)
+                }
             })
             .collect()
     }
@@ -6806,6 +8933,14 @@ mod tests {
         ];
         let content = "I'll open YouTube on my box using the taught recipe.\n\nYouTube is open on my box (not your Mac).";
 
+        // Pinned feed shots persist. `agent` computer-step PNGs never become ChatPart.
+        assert!(
+            saved_parts(&live).iter().any(
+                |part| matches!(part, MessagePart::Screenshot { call_id, .. } if call_id == "c1")
+            ),
+            "pinned shots belong in sqlite: {:?}",
+            saved_parts(&live)
+        );
         db.save_message(
             "s1",
             "assistant",
@@ -6822,13 +8957,308 @@ mod tests {
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         assert_eq!(rows.len(), 1);
         let restored = restored_parts(&rows[0].content, rows[0].parts.clone());
-        assert_eq!(shape(&restored), shape(&live));
+        assert_eq!(
+            shape(&restored),
+            shape(&live),
+            "sqlite keeps the words and the pinned pictures"
+        );
         assert_eq!(
             rows[0].run_id.as_deref(),
             Some("run_1"),
             "the row says which run it came out of, which is how reconciling against the server \
              knows it already has this turn"
         );
+    }
+
+    #[test]
+    fn overlay_puts_submitted_user_form_back_on_a_sqlite_row() {
+        let submitted = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "formResolution": "submitted",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut submitted = submitted;
+        submitted.resolution = Some(FormResolution::Submitted);
+        let mut bot = message("m1", false, "I'll sign you in.");
+        bot.run_id = Some("run_1".into());
+        bot.parts = vec![ChatPart::Text("I'll sign you in.".into())];
+        overlay_server_cards(
+            &mut bot,
+            &[
+                ChatPart::Text("I'll sign you in.".into()),
+                ChatPart::UserForm(submitted.clone()),
+            ],
+        );
+        match bot.parts.as_slice() {
+            [ChatPart::Text(_), ChatPart::UserForm(spec)] => {
+                assert_eq!(spec.entry_id, "e_form");
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Submitted));
+                assert!(spec.fields.iter().all(|f| f.prefill.is_none()));
+            }
+            other => panic!("expected text + Submitted card, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_mounts_the_open_form_above_screenshots_not_at_the_bottom() {
+        let open = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Form Label",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let mut bot = message("m1", false, "I'll raise a single in-chat form…");
+        bot.parts = vec![
+            ChatPart::Text("I'll raise a single in-chat form…".into()),
+            screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+        ];
+        overlay_server_cards(
+            &mut bot,
+            &[
+                ChatPart::Text("I'll raise a single in-chat form…".into()),
+                ChatPart::UserForm(open.clone()),
+                screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+            ],
+        );
+        match bot.parts.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+            ] => {
+                assert_eq!(spec.title, "Form Label");
+                assert!(spec.is_unresolved());
+            }
+            other => panic!("open form must not sit under the screenshot block: {other:?}"),
+        }
+        let mut dismissed = open;
+        dismissed.resolution = Some(FormResolution::Dismissed);
+        overlay_server_cards(&mut bot, &[ChatPart::UserForm(dismissed)]);
+        match bot.parts.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+            ] => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Dismissed));
+            }
+            other => panic!("Dismissed must stay in the same slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_handoff_does_not_post_form_entry_id_when_sibling_id_is_missing() {
+        let mut spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Form Label",
+                    "instruction": "Sign in on the computer.",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded);
+        assert!(spec.shows_form_chrome());
+        assert!(spec.shows_computer_handoff());
+        assert!(spec.handoff_entry_id.is_none());
+        let mut bot = message("m1", false, "Open the screen");
+        bot.parts = vec![ChatPart::UserForm(spec.clone())];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form"),
+            None,
+            "Skip / I'm done must wait for handoffEntryId — never POST the form id"
+        );
+        spec.handoff_entry_id = Some("e_hand".into());
+        state.conversations[0].messages[0].parts = vec![ChatPart::UserForm(spec)];
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form").as_deref(),
+            Some("e_hand")
+        );
+        state
+            .user_form_handoffs
+            .insert("e_form".into(), "e_form".into());
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form"),
+            None,
+            "a stored form id is not a sibling"
+        );
+    }
+
+    #[test]
+    fn computer_window_attention_is_a_copy_of_the_open_handoff() {
+        let mut spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Form Label",
+                    "instruction": "Sign in on the computer.",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded);
+        let mut bot = message("m1", false, "Open the screen");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+        assert_eq!(
+            state.computer_window_attention(),
+            Some(("e_form".into(), "Sign in on the computer.".into())),
+            "Take over copies this into ComputerScreen so first draw never reads AppState"
+        );
+        state.user_form_handoff_done.insert("e_form".into());
+        if let ChatPart::UserForm(spec) = &mut state.conversations[0].messages[0].parts[0] {
+            spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::Done);
+        }
+        assert_eq!(
+            state.computer_window_attention(),
+            None,
+            "Done / Skipped drops the strip"
+        );
+        assert!(
+            state.visible_computer_handoffs().iter().any(|spec| {
+                spec.computer_handoff == Some(crate::opengrok::ComputerHandoffStatus::Done)
+            }),
+            "Computer card remains as Done history"
+        );
+    }
+
+    #[test]
+    fn form_computer_lifecycle_keeps_both_cards_and_document_order() {
+        let idle = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Form Label",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let mut bot = message("m1", false, "I'll raise a single in-chat form…");
+        bot.parts = vec![
+            ChatPart::Text("I'll raise a single in-chat form…".into()),
+            ChatPart::UserForm(idle.clone()),
+            screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+        ];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+        let before = shape(&state.conversations[0].messages[0].parts);
+
+        state.set_computer_handoff(
+            "e_form",
+            crate::opengrok::ComputerHandoffStatus::ActionNeeded,
+        );
+        {
+            let spec = match &state.conversations[0].messages[0].parts[1] {
+                ChatPart::UserForm(spec) => spec,
+                other => panic!("form must stay in slot 1, got {other:?}"),
+            };
+            assert!(spec.is_unresolved());
+            assert!(spec.shows_form_chrome());
+            assert_eq!(
+                spec.computer_handoff,
+                Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded)
+            );
+            assert_ne!(spec.pill(), Some("On the computer"));
+        }
+        let after_open = shape(&state.conversations[0].messages[0].parts);
+        assert_eq!(
+            before
+                .iter()
+                .map(|s| s.split_whitespace().next())
+                .collect::<Vec<_>>(),
+            after_open
+                .iter()
+                .map(|s| s.split_whitespace().next())
+                .collect::<Vec<_>>(),
+            "Open the screen must not reorder parts: {before:?} vs {after_open:?}"
+        );
+
+        state.paint_user_form_resolution("e_form", FormResolution::Dismissed);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Done);
+        {
+            let spec = match &state.conversations[0].messages[0].parts[1] {
+                ChatPart::UserForm(spec) => spec,
+                other => panic!("I'm done must not drop the form, got {other:?}"),
+            };
+            assert_eq!(spec.effective_resolution(), Some(FormResolution::Dismissed));
+            assert_eq!(spec.pill(), Some("Dismissed"));
+            assert_eq!(
+                spec.computer_handoff,
+                Some(crate::opengrok::ComputerHandoffStatus::Done)
+            );
+        }
+
+        state.paint_user_form_resolution("e_form", FormResolution::Skipped);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Skipped);
+        {
+            let spec = match &state.conversations[0].messages[0].parts[1] {
+                ChatPart::UserForm(spec) => spec,
+                other => panic!("Skip must not drop the form, got {other:?}"),
+            };
+            assert_eq!(spec.effective_resolution(), Some(FormResolution::Skipped));
+            assert_eq!(
+                spec.computer_handoff,
+                Some(crate::opengrok::ComputerHandoffStatus::Skipped)
+            );
+        }
+
+        let remounted = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formResolution": "escalated",
+                "formRequest": {
+                    "title": "Form Label",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        let grafted = state.graft_user_forms(vec![
+            ChatPart::Text("I'll raise a single in-chat form…".into()),
+            ChatPart::UserForm(remounted),
+            screenshot("obs-1", "observe", b"png-1", (1280, 800)),
+        ]);
+        match grafted.as_slice() {
+            [
+                ChatPart::Text(_),
+                ChatPart::UserForm(spec),
+                ChatPart::Screenshot(_),
+            ] => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Skipped));
+                assert_eq!(
+                    spec.computer_handoff,
+                    Some(crate::opengrok::ComputerHandoffStatus::Skipped)
+                );
+                assert_ne!(spec.pill(), Some("On the computer"));
+            }
+            other => panic!("hide→reshow must keep form+computer in order, got {other:?}"),
+        }
     }
 
     /// A row written before pieces were kept has none of them — which is also every row the
@@ -7232,14 +9662,13 @@ mod tests {
                 .any(|part| part.starts_with("shot c1 1280x800")),
             "the picture is in the turn, or this proves nothing about pictures"
         );
-        // And through the door both go to disk by, since that is where the pictures are kept.
         assert_eq!(saved_parts(&replayed_parts), saved_parts(&live_parts));
         assert!(
-            saved_parts(&replayed_parts).iter().any(|part| matches!(
-                part,
-                crate::services::database::MessagePart::Screenshot { .. }
-            )),
-            "a rebuilt turn saves its picture, or coming back to it loses the picture again"
+            saved_parts(&replayed_parts)
+                .iter()
+                .any(|part| matches!(part, crate::services::database::MessagePart::Screenshot { call_id, .. } if call_id == "c1")),
+            "the turn-end pin is kept: {:?}",
+            saved_parts(&replayed_parts)
         );
     }
 
@@ -7468,6 +9897,419 @@ mod tests {
         // And an ending is what lets the button go back to a send arrow.
         state.release_live_turn("cw_1", "run_1");
         assert!(!state.is_turn_in_flight());
+    }
+
+    #[test]
+    fn finished_user_form_wait_drops_stop_and_keeps_waiting_chrome() {
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        assert!(state.is_turn_in_flight());
+
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        assert_eq!(
+            state.visible_bot_status().as_deref(),
+            Some(WAITING_FOR_YOU_STATUS)
+        );
+        assert_eq!(
+            bot_status_line("Grok", WAITING_FOR_YOU_STATUS),
+            "Waiting for you"
+        );
+        assert_eq!(bot_status_line("Grok", "Working"), "Grok is working");
+        assert!(
+            !state.is_turn_in_flight(),
+            "server run is finished; composer is Send, not Stop"
+        );
+        assert!(state.turn_to_stop().is_none());
+        assert!(
+            state.live_turns.get("cw_1").is_none(),
+            "do not keep a local live-turn past the run"
+        );
+        assert_eq!(state.open_user_forms().len(), 1);
+    }
+
+    #[test]
+    fn skip_clears_waiting_when_no_open_form_or_handoff_remains() {
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Website login",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_user_form_resolution("e_form", FormResolution::Skipped);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Skipped);
+        state.user_form_handoff_done.insert("e_form".into());
+        state.sync_waiting_chrome("cw_1");
+
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Waiting for you must drop once Skip settles the last open card"
+        );
+        assert!(state.open_user_forms().is_empty());
+        assert!(state.open_computer_handoffs().is_empty());
+    }
+
+    #[test]
+    fn stacked_open_forms_stay_enabled_and_waiting_until_each_settles() {
+        fn login(entry: &str, call: &str) -> crate::opengrok::UserFormSpec {
+            crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+                "type": "CUSTOM",
+                "name": "run-awaiting-approval",
+                "callId": call,
+                "entryId": entry,
+                "reason": "user-form",
+                "arguments": {
+                    "title": "Website login",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true},
+                        {"id": "password", "label": "Password", "type": "password", "required": true}
+                    ]
+                }
+            }))
+            .unwrap()
+        }
+        let a = login("e_a", "call-a");
+        let b = login("e_b", "call-b");
+        let c = login("e_c", "call-c");
+        assert!(a.can_post(true));
+        assert!(
+            b.can_post(false),
+            "global verbs-off must not gray this card"
+        );
+        assert!(c.can_post(false));
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![
+            ChatPart::UserForm(a),
+            ChatPart::UserForm(b),
+            ChatPart::UserForm(c),
+        ];
+        let mut state = mid_turn(at(bot, 20));
+        state.user_form_verbs_available = false;
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.open_user_forms().len(), 3);
+        for spec in state.open_user_forms() {
+            assert!(
+                spec.can_post(state.user_form_verbs_available),
+                "{} must stay Continue-able",
+                spec.entry_id
+            );
+            assert!(
+                spec.can_dismiss(),
+                "{} must stay Dismiss-able",
+                spec.entry_id
+            );
+        }
+
+        state.paint_user_form_resolution("e_a", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(
+            state.thread_status("cw_1"),
+            Some(WAITING_FOR_YOU_STATUS),
+            "Dismiss one of three must not blank Waiting"
+        );
+        let open = state.open_user_forms();
+        assert_eq!(open.len(), 2);
+        assert!(open.iter().all(|spec| spec.can_post(false)));
+        assert!(open.iter().all(|spec| spec.entry_id != "e_a"));
+
+        state.paint_user_form_resolution("e_b", FormResolution::Dismissed);
+        state.paint_user_form_resolution("e_c", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Waiting clears only after the last open form settles"
+        );
+        assert!(state.open_user_forms().is_empty());
+    }
+
+    fn call_keyed_login(call: &str) -> crate::opengrok::UserFormSpec {
+        crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": call,
+            "reason": "user-form",
+            "arguments": {
+                "title": "Website login",
+                "fields": [
+                    {"id": "email", "label": "Email", "type": "email", "required": true}
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// `user-form-dismiss-call-*` must settle the card locally. HTTP has no
+    /// gateway `entryId`; restore must not snap the form back to live.
+    #[test]
+    fn call_keyed_dismiss_settles_locally_and_survives_restore() {
+        let spec = call_keyed_login("call-9");
+        assert_eq!(spec.card_key(), "call-9");
+        assert!(spec.entry_id.is_empty());
+        assert!(spec.can_dismiss());
+        assert!(!spec.can_post(true), "Continue stays gated without entryId");
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.open_user_forms().len(), 1);
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_user_form_resolution("call-9", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert!(
+            state.open_user_forms().is_empty(),
+            "call-* Dismiss must settle that card"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+
+        state.restore_user_form("call-9");
+        assert!(
+            state.open_user_forms().is_empty(),
+            "no-gateway restore must not revive call-*"
+        );
+        match &state.conversations[0].messages[1].parts[0] {
+            ChatPart::UserForm(spec) => {
+                assert_eq!(spec.effective_resolution(), Some(FormResolution::Dismissed));
+            }
+            other => panic!("expected user-form, got {other:?}"),
+        }
+    }
+
+    /// Open the screen on a call-keyed card mints `computer-handoff-call-*`
+    /// even without a gateway `entryId`.
+    #[test]
+    fn call_keyed_open_screen_mints_computer_handoff() {
+        let spec = call_keyed_login("call-9");
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = mid_turn(at(bot, 20));
+        state.set_computer_handoff(
+            "call-9",
+            crate::opengrok::ComputerHandoffStatus::ActionNeeded,
+        );
+        let handoffs = state.visible_computer_handoffs();
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].card_key(), "call-9");
+        assert_eq!(
+            crate::opengrok::computer_handoff_card_id(handoffs[0].card_key()),
+            "computer-handoff-call-9"
+        );
+        assert!(handoffs[0].live_computer_handoff());
+        state
+            .user_form_handoff_restore
+            .insert("call-9".into(), None);
+        state.restore_user_form("call-9");
+        assert!(
+            state
+                .visible_computer_handoffs()
+                .iter()
+                .any(|spec| spec.card_key() == "call-9" && spec.live_computer_handoff()),
+            "call-* Open the screen must keep computer-handoff-call-*"
+        );
+    }
+
+    /// Stacked call-* Dismiss one; others stay enabled. After those settle,
+    /// Skip both e_* siblings with nothing else pending clears Waiting.
+    #[test]
+    fn call_keyed_dismiss_one_then_skip_siblings_clears_waiting() {
+        fn gateway_login(entry: &str, call: &str) -> crate::opengrok::UserFormSpec {
+            crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+                "type": "CUSTOM",
+                "name": "run-awaiting-approval",
+                "callId": call,
+                "entryId": entry,
+                "reason": "user-form",
+                "arguments": {
+                    "title": "Website login",
+                    "fields": [
+                        {"id": "email", "label": "Email", "type": "email", "required": true}
+                    ]
+                }
+            }))
+            .unwrap()
+        }
+        let e_a = gateway_login("e_a", "call-a");
+        let e_b = gateway_login("e_b", "call-b");
+        let extra_x = call_keyed_login("call-x");
+        let extra_y = call_keyed_login("call-y");
+        assert!(extra_x.can_dismiss() && extra_y.can_dismiss());
+        assert!(!extra_x.can_post(true) && !extra_y.can_post(true));
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![
+            ChatPart::UserForm(e_a),
+            ChatPart::UserForm(e_b),
+            ChatPart::UserForm(extra_x),
+            ChatPart::UserForm(extra_y),
+        ];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.open_user_forms().len(), 4);
+
+        state.paint_user_form_resolution("call-x", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        let open = state.open_user_forms();
+        assert_eq!(open.len(), 3, "dismiss one call-* leaves the rest live");
+        assert!(open.iter().all(|spec| spec.card_key() != "call-x"));
+        assert!(open.iter().any(|spec| spec.card_key() == "call-y"));
+        assert!(open.iter().any(|spec| spec.entry_id == "e_a"));
+        assert!(open.iter().any(|spec| spec.entry_id == "e_b"));
+        assert!(open.iter().all(|spec| spec.can_dismiss()));
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_user_form_resolution("call-y", FormResolution::Dismissed);
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(state.open_user_forms().len(), 2);
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        for key in ["e_a", "e_b"] {
+            state.paint_user_form_resolution(key, FormResolution::Skipped);
+            state.set_computer_handoff(key, crate::opengrok::ComputerHandoffStatus::Skipped);
+            state.user_form_handoff_done.insert(key.into());
+        }
+        state.sync_waiting_chrome("cw_1");
+        assert!(state.open_user_forms().is_empty());
+        assert!(state.open_computer_handoffs().is_empty());
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Skip both e_* siblings with no other pending forms must clear Waiting"
+        );
+    }
+
+    #[test]
+    fn skip_without_sibling_id_queues_instead_of_posting_form_id() {
+        let mut spec = crate::opengrok::UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_form",
+                "formRequest": {
+                    "title": "Website login",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                }
+            }),
+            None,
+        )
+        .unwrap();
+        spec.computer_handoff = Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded);
+        let mut bot = message("m1", false, "");
+        bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut state = AppState::new();
+        state.conversations.push(thread("cw_1", vec![bot]));
+        state.active_conversation_id = Some("cw_1".into());
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        state.paint_user_form_resolution("e_form", FormResolution::Skipped);
+        state.set_computer_handoff("e_form", crate::opengrok::ComputerHandoffStatus::Skipped);
+        state.user_form_handoff_done.insert("e_form".into());
+        state.queue_pending_box_handoff(
+            "e_form",
+            "e_form",
+            PendingBoxHandoff {
+                resolution: crate::opengrok::BoxHandoffResolution::Declined,
+                run_id: "run_1".into(),
+                conversation_id: "cw_1".into(),
+                agent_id: "cw_1".into(),
+            },
+        );
+        state.sync_waiting_chrome("cw_1");
+        assert_eq!(state.box_handoff_post_id("e_form", "e_form"), None);
+        assert!(state.user_form_pending_resolves.contains_key("e_form"));
+        assert_eq!(state.thread_status("cw_1"), None);
+
+        if let ChatPart::UserForm(spec) = &mut state.conversations[0].messages[0].parts[0] {
+            spec.handoff_entry_id = Some("e_hand".into());
+        }
+        assert_eq!(
+            state.box_handoff_post_id("e_form", "e_form").as_deref(),
+            Some("e_hand")
+        );
+        let pending = state.take_pending_box_handoff("e_form", "e_form").unwrap();
+        assert_eq!(
+            pending.resolution,
+            crate::opengrok::BoxHandoffResolution::Declined
+        );
+        assert_ne!(pending.resolution.as_str(), "e_form");
+    }
+
+    #[test]
+    fn egress_tunnel_is_host_and_box_ready() {
+        let mut state = AppState::new();
+        state.host_egress_tunnel_available = true;
+        assert!(
+            !state.egress_tunnel_available(),
+            "host without a ready box is not a tunnel"
+        );
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "ready": true }
+            }))
+            .unwrap(),
+        );
+        assert!(state.egress_tunnel_available());
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "ready": false }
+            }))
+            .unwrap(),
+        );
+        assert!(!state.egress_tunnel_available());
+        state.host_egress_tunnel_available = false;
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "ready": true }
+            }))
+            .unwrap(),
+        );
+        assert!(
+            !state.egress_tunnel_available(),
+            "a ready box without host/env is not a tunnel"
+        );
+        assert!(
+            state.show_egress_tunnel_settings(),
+            "box ready still paints the Network row if the host poll missed"
+        );
+        state.coworker_computer = None;
+        state.host_egress_tunnel_available = true;
+        assert!(!state.egress_tunnel_available());
+        assert!(
+            state.show_egress_tunnel_settings(),
+            "host intent paints the row while box status lags"
+        );
+        state.host_egress_tunnel_available = false;
+        state.egress_tunnel_enabled = true;
+        assert!(state.show_egress_tunnel_settings());
     }
 
     /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".

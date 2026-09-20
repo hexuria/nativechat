@@ -64,7 +64,12 @@ impl RootView {
             lightbox,
             circular_viz: None,
             focus_handle,
-            show_fps: true,
+            // Off: gpui-fps default headline is MAX = 1/mean_draw (how fast a
+            // full redraw could go), not Observed (how often we actually paint).
+            // A heavy signed-in tree can read ~20 vs login ~120 with the overlay
+            // on even without a dirty loop. cmd-shift-f toggles; click the
+            // figure to switch MAX ↔ Observed.
+            show_fps: false,
             was_signed_in: false,
             #[cfg(feature = "agent")]
             mailbox: None,
@@ -517,6 +522,8 @@ impl Render for RootView {
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
             .when(self.show_fps, |this| {
+                // Default off. Headline MAX is 1/mean_draw, not Observed FPS;
+                // click the figure to switch.
                 this.child(gpui_fps::fps_monitor(window, cx))
             })
     }

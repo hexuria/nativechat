@@ -243,30 +243,30 @@ impl Render for Layout {
             // somebody is looking at this page, and a password typed against it will not work
             // however carefully it is typed.
             let theme = cx.theme().clone();
-            return v_flex().size_full().child(self.title_bar.clone()).child(
-                div()
-                    .w_full()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(self.login.clone())
-                    .when_some(reconnect, |this, (title, detail)| {
-                        this.child(reconnect_banner(title, detail, &theme))
-                    })
-                    .when(app_settings_open, |this| {
-                        this.child(
-                            div()
-                                .id("app-settings-overlay")
-                                .absolute()
-                                .inset_0()
-                                .occlude()
-                                .child(self.app_settings.clone()),
-                        )
-                    })
-                    .when(command_palette_open, |this| {
-                        this.child(self.command_palette.clone())
-                    }),
-            );
+            return v_flex()
+                .size_full()
+                .relative()
+                .child(self.title_bar.clone())
+                .child(
+                    div()
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .child(self.login.clone())
+                        .when_some(reconnect, |this, (title, detail)| {
+                            this.child(reconnect_banner(title, detail, &theme))
+                        })
+                        .when(command_palette_open, |this| {
+                            this.child(self.command_palette.clone())
+                        }),
+                )
+                .when(app_settings_open, |this| {
+                    this.child(app_settings_overlay(
+                        self.app_settings.clone(),
+                        theme.background,
+                    ))
+                });
         }
         let has_agent = state.active_coworker_id.is_some();
         let hiring = state.hiring;
@@ -445,16 +445,6 @@ impl Render for Layout {
                         }),
                 )
             })
-            .when(app_settings_open, |this| {
-                this.child(
-                    div()
-                        .id("app-settings-overlay")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .child(self.app_settings.clone()),
-                )
-            })
             .when(command_palette_open, |this| {
                 this.child(self.command_palette.clone())
             })
@@ -482,12 +472,30 @@ impl Render for Layout {
                 this.child(recipe_delete_overlay(self.state.clone(), name, &theme))
             });
 
-        // The title bar, then the sidebar, chat and right pane in what is left.
+        // Title bar + panes. App Settings is a full-window modal (Grok Bot): it
+        // covers the title-bar tabs and both side columns, not only the chat slot.
         v_flex()
             .size_full()
+            .relative()
             .child(self.title_bar.clone())
             .child(row)
+            .when(app_settings_open, |this| {
+                this.child(app_settings_overlay(
+                    self.app_settings.clone(),
+                    theme.background,
+                ))
+            })
     }
+}
+
+fn app_settings_overlay(settings: Entity<AppSettings>, background: Hsla) -> impl IntoElement {
+    div()
+        .id("app-settings-overlay")
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(background)
+        .child(settings)
 }
 
 /// "Update Hexuria's computer?" — the question, what it means, Cancel and Confirm. Click

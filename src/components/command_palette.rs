@@ -373,6 +373,13 @@ fn action_catalog(state: &AppState) -> Vec<PaletteItem> {
             false,
         ),
         action_item(
+            "Settings: Logins",
+            "Settings",
+            "icons/account_settings.svg",
+            PaletteAction::OpenSettings(AppSettingsTab::Logins),
+            false,
+        ),
+        action_item(
             "Theme: Light",
             "Settings · Appearance",
             "icons/sun.svg",

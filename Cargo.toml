@@ -69,3 +69,5 @@ NSMicrophoneUsageDescription = "NativeChat needs access to your microphone for v
 [target.'cfg(target_os = "macos")'.dependencies]
 # The coworker-screen window is a WebView; only macOS builds it (see components/computer_screen.rs).
 wry = "0.53"
+# Site-login passwords: Keychain service `ai.nativechat.site-login`. Never sqlite.
+security-framework = "3.7"

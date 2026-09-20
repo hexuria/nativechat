@@ -173,7 +173,7 @@ fn eye_scrim(radius: f32) -> impl IntoElement {
 
 pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    let (decision, bot, machine) = app
+    let (decision, bot, machine, tunnel) = app
         .as_ref()
         .map(|entity| {
             let state = entity.read(cx);
@@ -186,12 +186,14 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 decision,
                 state.active_bot_name(),
                 state.local_exec_machine_id.clone().unwrap_or_default(),
+                state.egress_tunnel_available(),
             )
         })
         .unwrap_or((
             ApprovalDecision::Pending,
             "this agent".into(),
             String::new(),
+            false,
         ));
     if let Some(line) = decision.outcome_line(&bot, spec.place()) {
         return div()
@@ -244,7 +246,9 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                     .flex_1()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(if spec.runs_on_this_mac() {
+                    .child(if spec.is_review_an_action() && (tunnel || app.is_none()) {
+                        "Review an action".to_string()
+                    } else if spec.runs_on_this_mac() {
                         format!("Allow {bot} and all Bots to run commands on your local computer?")
                     } else {
                         format!("Allow {bot} to run {} on its computer?", spec.tool)
@@ -296,14 +300,19 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
     } else {
         // Always/Never set this Mac's policy, so only the local-shell tool
         // offers them. A box tool is answered one request at a time.
+        // Review an action (egress / auto-review): Always allow / Allow once / Deny.
+        // Gated on host/env/box isEgressTunnelAvailable — OpenGrok only stamps
+        // the reason when the tunnel is on; we still require the flag here so
+        // exec-consent never grows Review chrome because a leftover reason.
         let local = spec.runs_on_this_mac();
+        let review = spec.is_review_an_action() && (tunnel || app.is_none());
         let (primary, plain) = (
             (theme.primary, theme.primary_foreground, theme.primary),
             (theme.border, theme.foreground, theme.background),
         );
-        let allow_once = if local { plain } else { primary };
+        let allow_once = if local || review { plain } else { primary };
         let mut row = h_flex().w_full().justify_end().gap(px(8.)).flex_wrap();
-        if local {
+        if local || review {
             row = row.child(approval_button(
                 spec,
                 "Always allow",
@@ -326,14 +335,14 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
             ))
             .child(approval_button(
                 spec,
-                "Deny once",
+                if review { "Deny" } else { "Deny once" },
                 LocalExecResolution::DenyOnce,
                 app.clone(),
                 plain.0,
                 plain.1,
                 plain.2,
             ));
-        if local {
+        if local && !review {
             row = row.child(approval_button(
                 spec,
                 "Never",
@@ -460,6 +469,8 @@ fn render_form(
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
+    // Generative choice chips → `submit_form` → `send_message`. Never used for
+    // passwords; those are `render_user_form`.
     let theme = cx.theme();
     let picks = app
         .as_ref()

@@ -7,7 +7,15 @@
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
-//! `image-thumb-{n}`, `lightbox`.
+//! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
+//! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
+//! `user-form-pill-{key}`, `computer-handoff-{key}`,
+//! `computer-handoff-takeover-{key}`, `computer-handoff-done-{key}`,
+//! `computer-handoff-skip-{key}`,
+//! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
+//! `credential-request-{id}`, `credential-request-allow-{id}`,
+//! `credential-request-deny-{id}`, `settings-tab-logins`,
+//! `settings-login-row-{id}`, `settings-login-delete-{id}`.
 //!
 //! Typing goes in as GPUI keystrokes. `type`, `key` and `set_value` on the composer are
 //! planned here ([`ComposePlan`]) and pressed by [`RootView`](crate::root::RootView), because

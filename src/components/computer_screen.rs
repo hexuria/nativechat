@@ -3,8 +3,9 @@
 //!
 //! The window has a strip of its own above the screen — the WebView is a
 //! native child view, so nothing GPUI draws can sit on top of it — with the
-//! "Teach a task" control, and it answers the window keys itself: ⌘W and ⌘Q
-//! close this window only, ⌘M minimizes it, ⌘H hides the app.
+//! "Teach a task" control, Open the screen **Needs your attention** (Skip /
+//! I'm done) when a handoff is live, and it answers the window keys itself:
+//! ⌘W and ⌘Q close this window only, ⌘M minimizes it, ⌘H hides the app.
 //!
 //! A stopped tape is written to disk and offered on a sheet under the title bar: named, and told
 //! which of three things to become, it goes up as a recipe (`POST /recipes`) and the Recipes page
@@ -26,8 +27,12 @@ use wry::{
 };
 
 use crate::actions::{CloseWindow, Hide, Minimize, Quit};
+use crate::components::computer::computer_attention_banner;
 use crate::components::fields::field_input;
-use crate::opengrok::thin_tape;
+use crate::opengrok::{
+    computer_window_attention_done_id, computer_window_attention_id,
+    computer_window_attention_skip_id, thin_tape,
+};
 use crate::state::AppState;
 
 /// The title bar the window paints for itself: tall enough for the traffic lights and a
@@ -227,6 +232,10 @@ pub struct ComputerScreen {
     last_saved: Option<SavedTape>,
     /// The app: its client uploads a tape, and its Recipes list is refreshed after.
     app: Entity<AppState>,
+    /// Open-the-screen strip. Copied in — `render` must not `app.read` while
+    /// Take over still holds the AppState lease (`open_window` draws before it
+    /// returns; a nested read is `double_lease_panic`).
+    handoff_attention: Option<(String, String)>,
     /// A stopped tape waiting on Save or Discard, with the sheet under the title bar.
     pending: Option<PendingTape>,
     /// Which of the three things the tape on the sheet is to become.
@@ -245,11 +254,30 @@ impl ComputerScreen {
         coworker_id: &str,
         title: &str,
         app: Entity<AppState>,
+        handoff_attention: Option<(String, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // The theme is app-wide; a toggle in the main window must repaint this one too.
-        cx.observe(&app, |_, _, cx| cx.notify()).detach();
+        // Theme + handoff: do not `app.read` here or in `render`. `open_window`
+        // draws before Take over's AppState update ends. Refresh attention on
+        // a spawn so the read runs after that lease is dropped.
+        cx.observe(&app, |_this, app, cx| {
+            // Theme can repaint now. Do not `app.read` here: this observer can
+            // run in `open_window`'s nested flush while Take over still holds
+            // the AppState lease.
+            cx.notify();
+            let app = app.downgrade();
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(app) = app.upgrade() {
+                        this.set_handoff_attention(app.read(cx).computer_window_attention(), cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        })
+        .detach();
         // Every render paints the page, but the page may not have loaded by the first one;
         // paint it once more when it has had time to.
         cx.spawn(async move |this, cx| {
@@ -295,6 +323,7 @@ impl ComputerScreen {
             teaching: None,
             last_saved: None,
             app,
+            handoff_attention,
             pending: None,
             outcome: TeachOutcome::default(),
             name_input,
@@ -302,6 +331,18 @@ impl ComputerScreen {
             saving: false,
             save_error: None,
         }
+    }
+
+    pub(crate) fn set_handoff_attention(
+        &mut self,
+        attention: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.handoff_attention == attention {
+            return;
+        }
+        self.handoff_attention = attention;
+        cx.notify();
     }
 
     /// Let go of every modifier the page holds in the box before this window stops receiving
@@ -753,6 +794,8 @@ impl Render for ComputerScreen {
             .pending
             .as_ref()
             .map(|pending| self.save_sheet(pending, &theme, cx));
+        // Cached copy from new() / observe spawn — never `self.app.read` here.
+        let attention = self.handoff_attention.clone();
         let body = match &self.webview {
             Ok(webview) => {
                 let webview = webview.clone();
@@ -809,6 +852,18 @@ impl Render for ComputerScreen {
                 cx.hide();
             }))
             .child(header)
+            .when_some(attention, |this, (key, instruction)| {
+                this.child(computer_attention_banner(
+                    computer_window_attention_id(),
+                    computer_window_attention_skip_id(&key),
+                    computer_window_attention_done_id(&key),
+                    key,
+                    instruction,
+                    true,
+                    self.app.clone(),
+                    cx,
+                ))
+            })
             .when_some(sheet, |this, sheet| this.child(sheet))
             .child(body)
     }
