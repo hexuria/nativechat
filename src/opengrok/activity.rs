@@ -3,6 +3,11 @@
 
 use serde_json::Value;
 
+/// The label while a turn waits for the coworker's box to wake. The server sends a CUSTOM
+/// `box-waking` frame right before the first box-bound tool of a turn starts a sleeping box, and
+/// the footer turns it into "Waking {name}'s computer" (`bot_status_line`).
+pub const WAKING_COMPUTER: &str = "Waking the computer";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotActivity {
     pub label: String,
@@ -227,6 +232,10 @@ pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTic
             } else if event.get("name").and_then(Value::as_str) == Some("run-awaiting-approval") {
                 ActivityTick::Set(BotActivity {
                     label: "Waiting for approval".into(),
+                })
+            } else if event.get("name").and_then(Value::as_str) == Some("box-waking") {
+                ActivityTick::Set(BotActivity {
+                    label: WAKING_COMPUTER.into(),
                 })
             } else if event.get("name").and_then(Value::as_str)
                 == Some(super::credential::CREDENTIAL_REQUEST)
@@ -503,6 +512,19 @@ mod tests {
         assert_eq!(
             tool_standin(&deeds_from_replay(&events)),
             Some("[showed you a form, then drew you a chart]".into())
+        );
+    }
+
+    /// The server says so with one frame before the first box-bound tool of a turn wakes a
+    /// sleeping box; the footer must say what the wait is, not "working".
+    #[test]
+    fn a_box_being_woken_is_a_status() {
+        let ev = json!({"type":"CUSTOM","name":"box-waking","coworkerId":"cw_1"});
+        assert_eq!(
+            activity_from_agui(&ev, None),
+            ActivityTick::Set(BotActivity {
+                label: WAKING_COMPUTER.into()
+            })
         );
     }
 

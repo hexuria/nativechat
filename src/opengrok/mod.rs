@@ -11,8 +11,8 @@ mod user_form;
 mod visibility;
 
 pub use activity::{
-    ActivityTick, BotActivity, ToolCallTracker, activity_from_agui, activity_from_replay,
-    deeds_from_replay, tool_standin,
+    ActivityTick, BotActivity, ToolCallTracker, WAKING_COMPUTER, activity_from_agui,
+    activity_from_replay, deeds_from_replay, tool_standin,
 };
 pub use credential::{
     CREDENTIAL_OFFER_SAVE, CREDENTIAL_REQUEST, CREDENTIAL_RESULT, CREDENTIAL_RESULT_PATH,

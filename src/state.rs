@@ -359,6 +359,8 @@ pub fn is_waiting_on_person(status: Option<&str>) -> bool {
 pub fn bot_status_line(name: &str, label: &str) -> String {
     if is_waiting_on_person(Some(label)) {
         label.to_string()
+    } else if label == crate::opengrok::WAKING_COMPUTER {
+        format!("Waking {name}'s computer")
     } else {
         format!("{name} is working")
     }
@@ -11082,6 +11084,11 @@ mod tests {
             "Waiting for you"
         );
         assert_eq!(bot_status_line("Grok", "Working"), "Grok is working");
+        assert_eq!(
+            bot_status_line("Vamos", crate::opengrok::WAKING_COMPUTER),
+            "Waking Vamos's computer",
+            "the wait for the box is named, not folded into working"
+        );
         assert!(
             !state.is_turn_in_flight(),
             "server run is finished; composer is Send, not Stop"
