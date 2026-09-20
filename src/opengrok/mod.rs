@@ -32,7 +32,7 @@ pub use gen_ui::{
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use user_form::{
     BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, ComputerHandoffSpec,
-    ComputerHandoffStatus, FORM_ENTRY_MISSING, FormResolution, HITL_INTERRUPT_AVAILABLE,
+    ComputerHandoffStatus, FORM_ENTRY_MISSING, FormResolution,
     MASKED_PRESENCE_STUB, REQUEST_USER_FORM_TOOL, USER_FORM_CUSTOM, USER_FORM_DISMISS_PATH,
     USER_FORM_SERVER_FILL_AVAILABLE, USER_FORM_SUBMIT_PATH, UserFormActionReply,
     UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormHttpSettle, UserFormSpec,

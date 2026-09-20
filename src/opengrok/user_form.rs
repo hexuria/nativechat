@@ -113,13 +113,6 @@ pub const BOX_HANDOFF_RESOLVE_PATH: &str = "/ag-ui/box-handoff/resolve";
 /// read-only. Per-card fill still requires a real gateway `entryId`.
 pub const USER_FORM_SERVER_FILL_AVAILABLE: bool = true;
 
-/// Composer steer while a user-form / approval / live handoff is parked.
-/// OpenGrok A2: `POST /ag-ui/runs/{run_id}/stop` on `AwaitingApproval` takes
-/// effect immediately and closes the card. Box `interruptAgentRun` /
-/// `POST /boxes/{boxId}/interrupt` is a different surface. False only if a
-/// server predates `/ag-ui/runs/{id}/stop` — send still POSTs a new turn.
-pub const HITL_INTERRUPT_AVAILABLE: bool = true;
-
 /// OpenGrok #139 @ c09bc6c: stamped `entryId` that is gone from the
 /// transcript. Distinct from a server that has no `/ag-ui/user-form/*`.
 pub const FORM_ENTRY_MISSING: &str = "form entry missing";
@@ -247,6 +240,9 @@ pub enum FormResolution {
     Escalated,
     Dismissed,
     Skipped,
+    /// A later message moved the thread on. The server closed the card when
+    /// that message arrived; the app paints the same ending at once.
+    Superseded,
 }
 
 impl FormResolution {
@@ -259,6 +255,7 @@ impl FormResolution {
                 Self::Escalated
             }
             "skipped" | "skip" => Self::Skipped,
+            "superseded" => Self::Superseded,
             _ => Self::Dismissed,
         }
     }
@@ -271,6 +268,7 @@ impl FormResolution {
             Self::Escalated => "escalated",
             Self::Dismissed => "dismissed",
             Self::Skipped => "skipped",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -285,6 +283,7 @@ impl FormResolution {
             Self::Escalated => "Dismissed",
             Self::Dismissed => "Dismissed",
             Self::Skipped => "Skipped",
+            Self::Superseded => "Superseded",
         }
     }
 
@@ -299,13 +298,18 @@ impl FormResolution {
             Self::Escalated => "Dismissed without filling anything.",
             Self::Dismissed => "Dismissed without filling anything.",
             Self::Skipped => "Skipped without filling anything.",
+            Self::Superseded => "Moved on to your next message.",
         }
     }
 
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Submitted | Self::FillFailed | Self::Dismissed | Self::Skipped
+            Self::Submitted
+                | Self::FillFailed
+                | Self::Dismissed
+                | Self::Skipped
+                | Self::Superseded
         )
     }
 }

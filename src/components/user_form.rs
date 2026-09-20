@@ -555,7 +555,8 @@ fn render_settled(
         FormResolution::Escalated
         | FormResolution::Sending
         | FormResolution::Dismissed
-        | FormResolution::Skipped => theme.secondary,
+        | FormResolution::Skipped
+        | FormResolution::Superseded => theme.secondary,
     };
     let pill_text = match resolution {
         FormResolution::Submitted => theme.green,

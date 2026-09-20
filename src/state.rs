@@ -9,7 +9,7 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestResolution, CredentialRequestSpec,
-    CredentialResultStatus, Failure, FormResolution, FormSpec, HITL_INTERRUPT_AVAILABLE,
+    CredentialResultStatus, Failure, FormResolution, FormSpec,
     ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue, OpenGrokClient,
     OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
     RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
@@ -24,6 +24,7 @@ use crate::opengrok::{
     stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
+use crate::send_policy::Busy;
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
@@ -871,6 +872,9 @@ pub enum VoiceStatus {
     Error(String),
 }
 
+/// Body of a card a later message closed: user-form, credential or approval.
+pub const SUPERSEDED_NOTE: &str = "Moved on to your next message.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SubmitChord {
     /// Enter sends; Shift+Enter inserts a newline.
@@ -1594,6 +1598,9 @@ pub enum ApprovalDecision {
     Always,
     Denied,
     Never,
+    /// A later message moved the thread on. The server closed the card when
+    /// that message arrived; nothing was allowed or denied.
+    Superseded,
     Failed(String),
 }
 
@@ -1614,6 +1621,7 @@ impl ApprovalDecision {
             Self::Always => LocalExecResolution::Always,
             Self::Denied => LocalExecResolution::DenyOnce,
             Self::Never => LocalExecResolution::Never,
+            Self::Superseded => return Some(SUPERSEDED_NOTE.to_string()),
             _ => return None,
         };
         Some(local_exec_outcome(bot, resolution, place))
@@ -2472,8 +2480,8 @@ impl AppState {
         }
     }
 
-    /// Open user-form / approval / live handoff, or Waiting chrome. Cold
-    /// composer send has none of these and must not POST `/stop`.
+    /// Open user-form / credential / approval / live handoff, or Waiting
+    /// chrome: something is parked on the person. A send here is a steer.
     fn has_hitl_to_interrupt(&self, conversation_id: &str) -> bool {
         self.has_open_approval(conversation_id)
             || self.has_open_user_form(conversation_id)
@@ -2483,90 +2491,96 @@ impl AppState {
             )
     }
 
-    /// Run id of a parked HITL turn, if this thread still has one.
-    ///
-    /// Only a live or HITL-parked run. Never invent an id for a cold send —
-    /// stopping the run we are about to mint is 202 then "did not go through."
-    fn parked_hitl_run_id(&self, conversation_id: &str) -> Option<String> {
-        if !self.has_hitl_to_interrupt(conversation_id) {
-            return None;
-        }
-        if let Some(id) = self.parked_hitl_runs.get(conversation_id)
-            && !id.is_empty()
+    /// The thread as the composer finds it. Parked wins over running: a card
+    /// painted mid-stream is already waiting on the person even though the
+    /// stream that painted it is still open.
+    fn busy_state(&self, conversation_id: &str) -> Busy {
+        if self.has_hitl_to_interrupt(conversation_id) {
+            Busy::Parked
+        } else if self.is_thread_responding(conversation_id)
+            || self.is_turn_in_flight_for(conversation_id)
         {
-            return Some(id.clone());
+            Busy::Running
+        } else {
+            Busy::Idle
         }
+    }
+
+    /// A run registered against this thread that is still running, whether or
+    /// not it is the open thread: the composer's button reads the open thread
+    /// only, but a steer decides about the thread the message is for.
+    fn is_turn_in_flight_for(&self, conversation_id: &str) -> bool {
+        self.live_turns
+            .get(conversation_id)
+            .is_some_and(|turn| !turn.persisting)
+            && self.thread_status(conversation_id) != Some(WAITING_FOR_YOU_STATUS)
+    }
+
+    /// A steer over parked cards. The server ends the parked run and closes
+    /// its cards when the next message arrives (`interrupt_parked_hitl` on
+    /// `POST /ag-ui`), so the app must not `/stop` it first — a stopped run
+    /// is not parked, the server then finds nothing to settle, and the card
+    /// keeps the coworker's screen held for ten minutes. What the app does
+    /// is paint the same ending here: every open card in the thread becomes
+    /// **Superseded**, so nothing keeps reading the thread as parked and the
+    /// Waiting chrome can go.
+    fn settle_parked_cards(&mut self, conversation_id: &str) {
         let Some(conversation) = self
             .conversations
             .iter()
             .find(|conversation| conversation.id == conversation_id)
         else {
-            return None;
+            return;
         };
+        let mut forms = Vec::new();
+        let mut credentials = Vec::new();
+        let mut approvals = Vec::new();
         for part in conversation
             .messages
             .iter()
-            .rev()
             .flat_map(|message| message.parts.iter())
         {
             match part {
                 ChatPart::UserForm(spec)
-                    if (spec.is_unresolved() || spec.live_computer_handoff())
-                        && !spec.run_id.is_empty() =>
+                    if spec.is_unresolved()
+                        || spec.effective_resolution() == Some(FormResolution::Sending)
+                        || spec.live_computer_handoff() =>
                 {
-                    return Some(spec.run_id.clone());
+                    forms.push((
+                        spec.card_key().to_string(),
+                        spec.live_computer_handoff(),
+                    ));
+                }
+                ChatPart::CredentialRequest(spec) if spec.is_unresolved() => {
+                    credentials.push(spec.request_id.clone());
                 }
                 ChatPart::Approval(spec)
-                    if !spec.run_id.is_empty()
-                        && !self.approval_answered(&spec.call_id)
+                    if !self.approval_answered(&spec.call_id)
                         && self.auto_resolve_local_exec(spec).is_none() =>
                 {
-                    return Some(spec.run_id.clone());
-                }
-                ChatPart::CredentialRequest(spec)
-                    if spec.is_unresolved() && !spec.run_id.is_empty() =>
-                {
-                    return Some(spec.run_id.clone());
+                    approvals.push(spec.call_id.clone());
                 }
                 _ => {}
             }
         }
-        // Form painted mid-stream: live_turns still holds the run that
-        // `park_waiting_for_you` has not copied yet. Caller must snapshot
-        // this *before* minting the next turn's run id.
-        if let Some(turn) = self.live_turns.get(conversation_id)
-            && !turn.run_id.is_empty()
-            && !turn.persisting
-        {
-            return Some(turn.run_id.clone());
+        for (card_key, handoff) in forms {
+            self.paint_user_form_resolution(&card_key, FormResolution::Superseded);
+            if handoff {
+                self.set_computer_handoff(&card_key, ComputerHandoffStatus::Skipped);
+            }
         }
-        None
-    }
-
-    fn take_parked_hitl_run(&mut self, conversation_id: &str) -> Option<String> {
-        let id = self.parked_hitl_run_id(conversation_id)?;
+        for request_id in credentials {
+            self.paint_credential_request_resolution(
+                &request_id,
+                CredentialRequestResolution::Denied,
+            );
+        }
+        for call_id in approvals {
+            self.approval_decisions
+                .insert(call_id, ApprovalDecision::Superseded);
+        }
         self.parked_hitl_runs.remove(conversation_id);
-        Some(id)
-    }
-
-    /// Snapshot the HITL run to stop, if any. Stale map entries without
-    /// open HITL / Waiting are dropped so a later "hi" cannot `/stop`.
-    fn take_hitl_interrupt_target(&mut self, conversation_id: &str) -> Option<String> {
-        if !self.has_hitl_to_interrupt(conversation_id) {
-            self.parked_hitl_runs.remove(conversation_id);
-            return None;
-        }
-        self.take_parked_hitl_run(conversation_id)
-    }
-
-    /// Composer send POSTs a real OpenGrok turn. Open forms / approvals /
-    /// live handoff used to paint a local bubble and return — that is the
-    /// orphan-steer bug. A working turn with no HITL still keeps Stop.
-    fn composer_send_posts_turn(&self, conversation_id: &str) -> bool {
-        if self.has_open_approval(conversation_id) || self.has_open_user_form(conversation_id) {
-            return true;
-        }
-        !self.is_thread_responding(conversation_id)
+        self.sync_waiting_chrome(conversation_id);
     }
 
     /// After Skip / Dismiss / Done (and after SSE graft): Waiting only while
@@ -5439,11 +5453,6 @@ impl AppState {
             self.note_signed_out(cx);
             return;
         }
-        // Snapshot the HITL run to interrupt *before* minting this turn's
-        // run id. A cold send has no open form / approval / live handoff /
-        // Waiting — do not POST `/stop` at all. Stopping the id we are
-        // about to send is 202 then "This turn did not go through."
-        let interrupt_run_id = self.take_hitl_interrupt_target(&conversation_id);
         let coworker_id = self.active_coworker_id.clone();
         // The recipe as it stands now, not when the turn reaches the wire: the composer clears
         // the draft the moment it is sent, and the turn should carry what was on the message.
@@ -5487,8 +5496,6 @@ impl AppState {
                 persisting: false,
             },
         );
-        // Never `/stop` the run this POST is about to start.
-        let interrupt_run_id = interrupt_run_id.filter(|id| id != &run_id);
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -5512,22 +5519,6 @@ impl AppState {
             };
             let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
-                    // OpenGrok A2: `POST /ag-ui/runs/{id}/stop` on a parked
-                    // AwaitingApproval run, then POST `/ag-ui`. Cold send
-                    // has `interrupt_run_id == None` and skips stop.
-                    // `HITL_INTERRUPT_AVAILABLE = false` skips stop only —
-                    // the new turn still POSTs. 404 on stop is success.
-                    if HITL_INTERRUPT_AVAILABLE {
-                        if let Some(parked) = interrupt_run_id.as_deref() {
-                            if let Err(error) = client.stop_run(parked).await
-                                && error.status != Some(404)
-                            {
-                                eprintln!(
-                                    "NativeChat: HITL interrupt of {parked} did not land: {error}"
-                                );
-                            }
-                        }
-                    }
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
@@ -8015,13 +8006,16 @@ impl AppState {
             .detach();
         }
 
-        // Open form / approval / live Computer handoff used to paint this
-        // bubble and return. That is the orphan-steer bug: the order never
-        // reached OpenGrok. Composer send POSTs a real turn. A working turn
-        // with no HITL still keeps Stop.
-        if !self.composer_send_posts_turn(&conversation_id) {
-            cx.notify();
-            return;
+        match self.busy_state(&conversation_id) {
+            Busy::Idle => {}
+            // A steer. The server ends the parked run on this message and
+            // closes its cards; the app paints the same ending (Superseded)
+            // and never `/stop`s first — see `settle_parked_cards`.
+            Busy::Parked => self.settle_parked_cards(&conversation_id),
+            Busy::Running => {
+                cx.notify();
+                return;
+            }
         }
         self.send_opengrok_turn(conversation_id, content, cx);
     }
@@ -10433,15 +10427,8 @@ mod tests {
         assert_eq!(state.open_user_forms().len(), 1);
     }
 
-    /// Composer send while a form / approval / live handoff is open POSTs a
-    /// real OpenGrok turn. A working turn with no HITL still keeps Stop.
-    #[test]
-    fn composer_send_posts_turn_while_hitl_is_open() {
-        assert!(
-            crate::opengrok::HITL_INTERRUPT_AVAILABLE,
-            "wire stop_run; flip the gate only if OG predates /ag-ui/runs/{{id}}/stop"
-        );
-        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+    fn parked_form() -> crate::opengrok::UserFormSpec {
+        crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
             "type": "CUSTOM",
             "name": "run-awaiting-approval",
             "runId": "run_1",
@@ -10453,31 +10440,46 @@ mod tests {
                 "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
             }
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    /// A card painted mid-stream is already parked, and a send over it is a
+    /// steer that settles the card here: the server closes it on the same
+    /// message, and the app must not `/stop` the run first.
+    #[test]
+    fn a_form_painted_mid_stream_is_parked_and_a_steer_settles_it() {
         let mut bot = message("m_live", false, "");
-        bot.parts = vec![ChatPart::UserForm(spec)];
+        bot.parts = vec![ChatPart::UserForm(parked_form())];
         let mut state = mid_turn(at(bot, 20));
         assert!(state.has_open_user_form("cw_1"));
-        assert!(
-            state.composer_send_posts_turn("cw_1"),
-            "open form must POST a steer even while the stream is still registered"
-        );
-        assert_eq!(state.parked_hitl_run_id("cw_1").as_deref(), Some("run_1"));
+        assert_eq!(state.busy_state("cw_1"), Busy::Parked);
 
-        state.park_waiting_for_you("cw_1", "run_1");
-        assert!(!state.is_turn_in_flight());
-        assert!(!state.is_active_bot_responding());
-        assert!(state.composer_send_posts_turn("cw_1"));
-        assert_eq!(state.take_parked_hitl_run("cw_1").as_deref(), Some("run_1"));
+        state.settle_parked_cards("cw_1");
+        assert!(!state.has_open_user_form("cw_1"));
+        assert!(!state.has_hitl_to_interrupt("cw_1"));
+        let spec = state
+            .conversations
+            .iter()
+            .flat_map(|c| c.messages.iter())
+            .flat_map(|m| m.parts.iter())
+            .find_map(|part| match part {
+                ChatPart::UserForm(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(spec.effective_resolution(), Some(FormResolution::Superseded));
         assert_eq!(
-            state.parked_hitl_run_id("cw_1").as_deref(),
-            Some("run_1"),
-            "form run_id remains after the map is taken, so a second steer still stops"
+            state.busy_state("cw_1"),
+            Busy::Running,
+            "the stream that painted the card is still open; it is not parked any more"
         );
     }
 
+    /// An open approval and a live Computer handoff are parked too, and a
+    /// steer settles both: the approval reads Superseded (no allow, no deny
+    /// line), the handoff is skipped, and neither keeps the thread parked.
     #[test]
-    fn composer_send_posts_turn_while_approval_or_live_handoff_is_open() {
+    fn an_open_approval_or_live_handoff_is_parked_and_a_steer_settles_it() {
         let approval = crate::opengrok::ApprovalSpec {
             run_id: "run_1".into(),
             call_id: "c1".into(),
@@ -10493,10 +10495,14 @@ mod tests {
         let mut state = mid_turn(at(bot, 20));
         state.finish_responding(Some("cw_1"), true);
         assert!(state.has_open_approval("cw_1"));
-        assert!(
-            state.composer_send_posts_turn("cw_1"),
-            "open approval must POST a steer"
+        assert_eq!(state.busy_state("cw_1"), Busy::Parked);
+        state.settle_parked_cards("cw_1");
+        assert!(!state.has_open_approval("cw_1"));
+        assert_eq!(
+            state.approval_decisions.get("c1"),
+            Some(&ApprovalDecision::Superseded)
         );
+        assert_eq!(state.thread_status("cw_1"), None, "Waiting for approval is gone");
 
         let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
             "type": "CUSTOM",
@@ -10523,28 +10529,34 @@ mod tests {
             handoff.has_open_user_form("cw_1"),
             "live Computer handoff is HITL"
         );
-        assert!(handoff.composer_send_posts_turn("cw_1"));
+        assert_eq!(handoff.busy_state("cw_1"), Busy::Parked);
+        handoff.settle_parked_cards("cw_1");
+        assert!(!handoff.has_open_user_form("cw_1"));
+        assert_eq!(
+            handoff.user_form_computer_handoffs.get("e_form"),
+            Some(&crate::opengrok::ComputerHandoffStatus::Skipped)
+        );
+        assert_eq!(handoff.busy_state("cw_1"), Busy::Idle);
     }
 
+    /// A working turn with no card is running, not parked: a plain send is
+    /// held (queue) rather than sent over it, and nothing settles.
     #[test]
-    fn composer_send_keeps_stop_on_a_working_turn_without_hitl() {
-        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+    fn a_working_turn_without_hitl_is_running_not_parked() {
+        let state = mid_turn(at(message("m_live", false, ""), 20));
         assert!(state.is_active_bot_responding());
         assert!(state.is_turn_in_flight());
-        assert!(
-            !state.composer_send_posts_turn("cw_1"),
-            "working turn with no form/approval/handoff still keeps Stop"
-        );
-        assert!(
-            state.take_hitl_interrupt_target("cw_1").is_none(),
-            "working turn with no HITL must not stop-then-send"
+        assert_eq!(state.busy_state("cw_1"), Busy::Running);
+        assert_eq!(
+            crate::send_policy::plan_send(Busy::Running, crate::send_policy::OnSend::Queue, false),
+            crate::send_policy::SendPlan::Queue
         );
     }
 
-    /// Cold "hi": no open HITL, no Waiting, no parked run. Composer POSTs
-    /// `/ag-ui` only — never `/ag-ui/runs/{id}/stop` of the run it just minted.
+    /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle
+    /// and a stale parked-run entry does not make it otherwise.
     #[test]
-    fn cold_composer_send_does_not_stop_a_run() {
+    fn cold_composer_send_is_idle() {
         let mut state = AppState::new();
         state
             .conversations
@@ -10554,11 +10566,7 @@ mod tests {
         assert!(!state.has_open_user_form("cw_1"));
         assert!(!state.has_open_approval("cw_1"));
         assert!(!state.has_hitl_to_interrupt("cw_1"));
-        assert!(state.parked_hitl_run_id("cw_1").is_none());
-        assert!(
-            state.take_hitl_interrupt_target("cw_1").is_none(),
-            "cold hi must not POST /stop"
-        );
+        assert_eq!(state.busy_state("cw_1"), Busy::Idle);
 
         let mut stale = AppState::new();
         stale
@@ -10568,45 +10576,30 @@ mod tests {
         stale
             .parked_hitl_runs
             .insert("cw_1".into(), "01a0b381-stale".into());
-        assert!(
-            stale.take_hitl_interrupt_target("cw_1").is_none(),
-            "stale parked id without open HITL / Waiting must not stop"
-        );
-        assert!(
-            stale.parked_hitl_runs.get("cw_1").is_none(),
-            "stale map entry is dropped so the next hi cannot /stop"
+        assert_eq!(
+            stale.busy_state("cw_1"),
+            Busy::Idle,
+            "a stale parked id without open HITL / Waiting is not a parked thread"
         );
     }
 
+    /// The run finished and left the card (**Waiting for you**). A send is a
+    /// steer: the card settles as Superseded, the Waiting chrome goes, the
+    /// parked-run entry goes, and the thread reads idle — nothing to `/stop`.
     #[test]
-    fn hitl_steer_stops_the_parked_run_not_the_new_mint() {
-        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
-            "type": "CUSTOM",
-            "name": "run-awaiting-approval",
-            "runId": "run_1",
-            "callId": "call-9",
-            "entryId": "e_form",
-            "reason": "user-form",
-            "arguments": {
-                "title": "Google account",
-                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
-            }
-        }))
-        .unwrap();
+    fn a_parked_steer_settles_every_card_and_clears_waiting() {
         let mut bot = message("m_live", false, "");
-        bot.parts = vec![ChatPart::UserForm(spec)];
+        bot.parts = vec![ChatPart::UserForm(parked_form())];
         let mut state = mid_turn(at(bot, 20));
         state.park_waiting_for_you("cw_1", "run_1");
-        assert!(state.has_hitl_to_interrupt("cw_1"));
-        let parked = state.take_hitl_interrupt_target("cw_1");
-        assert_eq!(parked.as_deref(), Some("run_1"));
-        let new_run = "01a0b381-new-mint".to_string();
-        let interrupt = parked.filter(|id| id != &new_run);
-        assert_eq!(
-            interrupt.as_deref(),
-            Some("run_1"),
-            "steer stops the parked HITL run, never the run about to POST"
-        );
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+        assert_eq!(state.busy_state("cw_1"), Busy::Parked);
+
+        state.settle_parked_cards("cw_1");
+        assert!(!state.has_hitl_to_interrupt("cw_1"));
+        assert_eq!(state.thread_status("cw_1"), None);
+        assert!(state.parked_hitl_runs.get("cw_1").is_none());
+        assert_eq!(state.busy_state("cw_1"), Busy::Idle);
     }
 
     #[test]
@@ -10975,7 +10968,7 @@ mod tests {
         );
         assert!(
             !state.has_hitl_to_interrupt("cw_1"),
-            "cold send must not /stop after Not now"
+            "Not now leaves nothing parked: the next send is a plain post"
         );
         assert_eq!(state.thread_status("cw_1"), None);
         let spec = state.credential_request_spec("req-fb").expect("remnant");
