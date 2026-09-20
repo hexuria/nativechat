@@ -354,7 +354,7 @@ impl ComputerPane {
                         )
                         .child(
                             div()
-                                .id("create-routine")
+                                .id("routine-new")
                                 .px(px(12.))
                                 .py(px(8.))
                                 .rounded(px(8.))
@@ -390,7 +390,7 @@ impl ComputerPane {
                                 )
                                 .child(
                                     div()
-                                        .id("add-routine")
+                                        .id("routine-new")
                                         .px(px(8.))
                                         .py(px(4.))
                                         .rounded(px(8.))
@@ -407,6 +407,9 @@ impl ComputerPane {
                                         .child(div().text_sm().child("+")),
                                 ),
                         )
+                        // `routine-{id}` here and in the driver's tree
+                        // (`crate::agent::ids::routine`): one routine, one name, whether it is
+                        // clicked by a person or by a test.
                         .children(routines.iter().map(|row| {
                             let id = row.id.clone();
                             let name = if row.name.trim().is_empty() {
@@ -522,21 +525,24 @@ impl ComputerPane {
                         .child(div().flex_1())
                         .when(id.is_some(), |this| {
                             this.child(
-                                Button::new("routine-delete")
-                                    .ghost()
-                                    .label("Delete")
-                                    .on_click({
-                                        let app = app.clone();
-                                        let coworker_id = coworker_id.clone();
-                                        let id = id.clone();
-                                        move |_, _, cx| {
-                                            if let Some(id) = id.clone() {
-                                                app.update(cx, |state, cx| {
-                                                    state.delete_routine(&coworker_id, &id, cx);
-                                                });
-                                            }
+                                Button::new(SharedString::from(format!(
+                                    "routine-{}-delete",
+                                    id.as_deref().unwrap_or_default()
+                                )))
+                                .ghost()
+                                .label("Delete")
+                                .on_click({
+                                    let app = app.clone();
+                                    let coworker_id = coworker_id.clone();
+                                    let id = id.clone();
+                                    move |_, _, cx| {
+                                        if let Some(id) = id.clone() {
+                                            app.update(cx, |state, cx| {
+                                                state.delete_routine(&coworker_id, &id, cx);
+                                            });
                                         }
-                                    }),
+                                    }
+                                }),
                             )
                         })
                         .child(
