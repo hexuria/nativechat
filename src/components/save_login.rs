@@ -166,9 +166,9 @@ fn render_settled_credential_request(
         CredentialRequestResolution::Used | CredentialRequestResolution::Filled => {
             (theme.green.opacity(0.18), theme.green)
         }
-        CredentialRequestResolution::Denied | CredentialRequestResolution::Missing => {
-            (theme.secondary, theme.muted_foreground)
-        }
+        CredentialRequestResolution::Denied
+        | CredentialRequestResolution::Missing
+        | CredentialRequestResolution::Superseded => (theme.secondary, theme.muted_foreground),
     };
     v_flex()
         .id(ElementId::Name(

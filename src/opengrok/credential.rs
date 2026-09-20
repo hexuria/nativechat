@@ -45,6 +45,9 @@ pub enum CredentialRequestResolution {
     Missing,
     /// Session broker put cookies/profile on Box (A.1).
     Filled,
+    /// A later message moved the thread on; the server closed the request
+    /// when that message arrived. Nothing was denied.
+    Superseded,
 }
 
 impl CredentialRequestResolution {
@@ -58,6 +61,7 @@ impl CredentialRequestResolution {
             Self::Used => "used",
             Self::Missing => "missing",
             Self::Filled => "filled",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -69,6 +73,7 @@ impl CredentialRequestResolution {
             Self::Used => "Used saved login",
             Self::Missing => "None saved",
             Self::Filled => "Filled",
+            Self::Superseded => "Superseded",
         }
     }
 
@@ -80,6 +85,7 @@ impl CredentialRequestResolution {
             }
             Self::Missing => "No saved login for this site.",
             Self::Filled => "Session restored on the computer. NativeChat did not type a password.",
+            Self::Superseded => "Moved on to your next message.",
         }
     }
 }

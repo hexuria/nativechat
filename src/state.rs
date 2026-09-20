@@ -515,6 +515,11 @@ pub struct QueuedSend {
     /// The bubble's id — the local one until the save lands, then the row's.
     message_id: String,
     content: String,
+    /// The recipe as it was when the message was typed: the composer clears it the moment
+    /// the draft goes, and the turn has to carry what was on the message.
+    recipe: Option<TurnRecipe>,
+    /// The message this one answers, for the quote the coworker is sent.
+    reply: Option<ReplyTo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1373,8 +1378,6 @@ pub struct AppState {
     /// coming back to it asks the server what became of the run.
     live_turns: HashMap<String, LiveTurn>,
     /// Server run parked on HITL (user-form / approval / live handoff) after
-    /// [`Self::live_turns`] is released. Composer steer POSTs stop then a new turn.
-    parked_hitl_runs: HashMap<String, String>,
     /// Threads already reconciled against the server this session. Once is enough: after it, the
     /// app has been watching, and every turn since has gone through the same door on its way to
     /// disk. Asking again on every visit would fetch a thread's frames — screenshots and all —
@@ -1825,7 +1828,6 @@ impl AppState {
         let mut state = Self {
             conversations: Vec::new(),
             live_turns: HashMap::new(),
-            parked_hitl_runs: HashMap::new(),
             reconciled_threads: HashSet::new(),
             last_active_at: HashMap::new(),
             active_conversation_id: None,
@@ -2489,8 +2491,6 @@ impl AppState {
     fn park_waiting_for_you(&mut self, conversation_id: &str, run_id: &str) {
         self.end_turn_waiting(Some(conversation_id), Some(WAITING_FOR_YOU_STATUS));
         if !run_id.is_empty() {
-            self.parked_hitl_runs
-                .insert(conversation_id.to_string(), run_id.to_string());
             self.release_live_turn(conversation_id, run_id);
         }
     }
@@ -2510,7 +2510,12 @@ impl AppState {
     /// painted mid-stream is already waiting on the person even though the
     /// stream that painted it is still open.
     fn busy_state(&self, conversation_id: &str) -> Busy {
-        if self.has_hitl_to_interrupt(conversation_id) {
+        if self.has_sending_form(conversation_id) {
+            // A submit is on the wire and the run resumes the moment it lands: the thread
+            // is as good as running. Queue behind it rather than settle a card the server
+            // is about to answer.
+            Busy::Running
+        } else if self.has_hitl_to_interrupt(conversation_id) {
             Busy::Parked
         } else if self.is_thread_responding(conversation_id)
             || self.is_turn_in_flight_for(conversation_id)
@@ -2519,6 +2524,24 @@ impl AppState {
         } else {
             Busy::Idle
         }
+    }
+
+    fn has_sending_form(&self, conversation_id: &str) -> bool {
+        self.conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .is_some_and(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.parts.iter())
+                    .any(|part| match part {
+                        ChatPart::UserForm(spec) => {
+                            spec.effective_resolution() == Some(FormResolution::Sending)
+                        }
+                        _ => false,
+                    })
+            })
     }
 
     /// A run registered against this thread that is still running, whether or
@@ -2556,10 +2579,10 @@ impl AppState {
             .flat_map(|message| message.parts.iter())
         {
             match part {
+                // Not a form mid-`Sending`: its submit is on the wire and the reply repaints
+                // it; `busy_state` reads such a thread as running, not parked.
                 ChatPart::UserForm(spec)
-                    if spec.is_unresolved()
-                        || spec.effective_resolution() == Some(FormResolution::Sending)
-                        || spec.live_computer_handoff() =>
+                    if spec.is_unresolved() || spec.live_computer_handoff() =>
                 {
                     forms.push((spec.card_key().to_string(), spec.live_computer_handoff()));
                 }
@@ -2584,14 +2607,13 @@ impl AppState {
         for request_id in credentials {
             self.paint_credential_request_resolution(
                 &request_id,
-                CredentialRequestResolution::Denied,
+                CredentialRequestResolution::Superseded,
             );
         }
         for call_id in approvals {
             self.approval_decisions
                 .insert(call_id, ApprovalDecision::Superseded);
         }
-        self.parked_hitl_runs.remove(conversation_id);
         self.sync_waiting_chrome(conversation_id);
     }
 
@@ -5451,7 +5473,21 @@ impl AppState {
     fn send_opengrok_turn(
         &mut self,
         conversation_id: String,
-        _content: String,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
+        self.send_opengrok_turn_with(conversation_id, content, recipe, None, cx);
+    }
+
+    /// `recipe` is the recipe the message was typed with. `stop_first` is a run this turn
+    /// replaces: it is stopped on the wire before the turn is posted.
+    fn send_opengrok_turn_with(
+        &mut self,
+        conversation_id: String,
+        content: String,
+        recipe: Option<TurnRecipe>,
+        stop_first: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -5468,9 +5504,6 @@ impl AppState {
             return;
         }
         let coworker_id = self.active_coworker_id.clone();
-        // The recipe as it stands now, not when the turn reaches the wire: the composer clears
-        // the draft the moment it is sent, and the turn should carry what was on the message.
-        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
         let history: Vec<AguiMessage> = self
             .conversations
             .iter()
@@ -5533,6 +5566,16 @@ impl AppState {
             };
             let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
+                    // A forced send over a running turn: that turn is stopped here, in order,
+                    // before this one is posted. 404 means it had already ended.
+                    if let Some(stopped) = stop_first.as_deref()
+                        && let Err(error) = client.stop_run(stopped).await
+                        && error.status != Some(404)
+                    {
+                        eprintln!(
+                            "NativeChat: the stop before a forced send did not land: {error}"
+                        );
+                    }
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
@@ -5576,6 +5619,11 @@ impl AppState {
                                 let paint =
                                     stream_paint_due(last_stream_paint, now, last_stream_sig, sig);
                                 let _ = this.update(cx, |state, cx| {
+                                    // A run the person stopped or sent past has no row any more;
+                                    // its late frames must not graft into the turn that replaced it.
+                                    if !state.turn_is_unsettled(&conversation_id, &run_id) {
+                                        return;
+                                    }
                                     // Into the thread the run belongs to, and into the row the run
                                     // was given — not the thread that happens to be open, and not
                                     // whichever row happens to be last in it.
@@ -5766,7 +5814,11 @@ impl AppState {
                 } else {
                     state.finish_responding(Some(&conversation_id), false);
                 }
-                state.drain_queued_send(&conversation_id, cx);
+                // A failed turn does not send the next held message into the same failure:
+                // the queue keeps them, still marked, until something goes through.
+                if result.is_ok() {
+                    state.drain_queued_send(&conversation_id, cx);
+                }
                 // A failed run has already ended the last assistant row, with the server's
                 // sentence or with the note that the turn never left; `auth_error` is the
                 // sign-in / settings error and the settings pane paints it, so a run's failure
@@ -5891,8 +5943,26 @@ impl AppState {
             })
             .detach();
         }
-        if let Some((content, parts)) = self.end_stopped_turn(&conversation_id, &turn) {
-            self.persist_assistant_reply(&conversation_id, content, &parts, Some(&turn.run_id), cx);
+        self.paint_stopped_turn(&conversation_id, &turn, cx);
+    }
+
+    /// A forced send's half of the stop: end the turn here and hand back the run id, which
+    /// the send then stops on the wire *before* posting — so the server never has the two
+    /// turns at once. The button's stop (`stop_live_turn`) has no turn to order it against.
+    fn take_running_turn_for_steer(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let (conversation_id, turn) = self.turn_to_stop()?;
+        self.paint_stopped_turn(&conversation_id, &turn, cx);
+        Some(turn.run_id)
+    }
+
+    fn paint_stopped_turn(
+        &mut self,
+        conversation_id: &str,
+        turn: &LiveTurn,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((content, parts)) = self.end_stopped_turn(conversation_id, turn) {
+            self.persist_assistant_reply(conversation_id, content, &parts, Some(&turn.run_id), cx);
         }
         cx.notify();
     }
@@ -7599,7 +7669,9 @@ impl AppState {
             // takes Working after the vault/broker result posts.
             self.begin_responding(conversation_id.as_deref(), "Working");
         } else if let Some(id) = conversation_id.as_deref() {
-            self.settle_chrome_and_drain(id, cx);
+            // Chrome only: the server may resume the run on the declined result, and the
+            // app does not follow that run, so a held message must not be posted over it.
+            self.sync_waiting_chrome(id);
         }
         cx.notify();
         let vault = self.site_login_vault.clone();
@@ -7738,7 +7810,9 @@ impl AppState {
                 self.push_computer_window_attention(cx);
             }
         }
-        self.settle_chrome_and_drain(&conversation_id, cx);
+        // Chrome only: the POST below resumes the parked run on the server, so the thread is
+        // not idle yet. The queue is looked at once the server has answered.
+        self.sync_waiting_chrome(&conversation_id);
         cx.notify();
         if let UserFormDispatch::ResolveHandoff(resolution) = action {
             if let Some(handoff_entry_id) = handoff_entry_id {
@@ -7768,7 +7842,9 @@ impl AppState {
         }
         if entry_id.is_empty() {
             // Local Dismiss / Open the screen on call-* (#140). Never POST
-            // callId as entryId, never restore the optimistic settle.
+            // callId as entryId, never restore the optimistic settle. Nothing resumes on
+            // the server, so a held message may go now.
+            self.drain_queued_send(&conversation_id, cx);
             return;
         }
         let Some(client) = self.opengrok.clone() else {
@@ -7967,14 +8043,20 @@ impl AppState {
         // the message that stopped it.
         let busy = self.busy_state(&conversation_id);
         let plan = plan_send(busy, self.on_send, force_steer);
-        if plan == SendPlan::Steer && busy == Busy::Running {
-            self.stop_live_turn(cx);
-        }
+        let stop_first = if plan == SendPlan::Steer && busy == Busy::Running {
+            self.take_running_turn_for_steer(cx)
+        } else {
+            None
+        };
+        // The recipe as it stands now, not when the turn reaches the wire: the composer clears
+        // it the moment the draft is sent, and a held message must still carry it.
+        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
 
         let local_id = uuid::Uuid::now_v7().to_string();
         // The whole reply, not just its preview: the bubble paints the preview, and the quote
         // the coworker is sent is built from the message this one points at.
         let reply = self.reply_to.take();
+        let reply_for_queue = reply.clone();
         // Add user message to UI immediately
         if let Some(conversation) = self
             .conversations
@@ -8078,6 +8160,8 @@ impl AppState {
                     .push_back(QueuedSend {
                         message_id: local_id,
                         content,
+                        recipe,
+                        reply: reply_for_queue,
                     });
                 cx.notify();
                 return;
@@ -8093,7 +8177,7 @@ impl AppState {
                 }
             }
         }
-        self.send_opengrok_turn(conversation_id, content, cx);
+        self.send_opengrok_turn_with(conversation_id, content, recipe, stop_first, cx);
     }
 
     /// Post the next held message, if the thread has one and is idle — and is the open
@@ -8102,9 +8186,23 @@ impl AppState {
     /// after it, and coming back to the thread. Safe to call anywhere else too: it is a no-op
     /// while anything is running or parked.
     fn drain_queued_send(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        // Nothing held is the common case, and this runs on every frame: answer it before
+        // walking the thread for its busy state.
+        if !self
+            .queued_sends
+            .get(conversation_id)
+            .is_some_and(|queue| !queue.is_empty())
+        {
+            return;
+        }
         if self.active_conversation_id.as_deref() != Some(conversation_id)
             || self.busy_state(conversation_id) != Busy::Idle
         {
+            return;
+        }
+        // A turn that cannot leave stays held rather than popped and lost: the signed-out
+        // banner already says why, and the pill keeps saying the message is waiting.
+        if self.opengrok.is_none() || !self.can_send_turn() {
             return;
         }
         let Some(next) = self
@@ -8140,14 +8238,20 @@ impl AppState {
                 content: next.content.clone(),
                 sent_at: SystemTime::now(),
                 is_me: true,
-                reply_preview: None,
-                reply_to_id: None,
-                reply_is_me: false,
+                reply_preview: next.reply.as_ref().map(|r| r.preview.clone()),
+                reply_to_id: next.reply.as_ref().map(|r| r.message_id.clone()),
+                reply_is_me: next.reply.as_ref().is_some_and(|r| r.is_me),
                 parts: Vec::new(),
                 run_id: None,
             });
         }
-        self.send_opengrok_turn(conversation_id.to_string(), next.content, cx);
+        self.send_opengrok_turn_with(
+            conversation_id.to_string(),
+            next.content,
+            next.recipe,
+            None,
+            cx,
+        );
     }
 
     /// Waiting chrome, then the queue: the two things a thread going idle has to settle.
@@ -10725,8 +10829,7 @@ mod tests {
         );
     }
 
-    /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle
-    /// and a stale parked-run entry does not make it otherwise.
+    /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle.
     #[test]
     fn cold_composer_send_is_idle() {
         let mut state = AppState::new();
@@ -10739,20 +10842,6 @@ mod tests {
         assert!(!state.has_open_approval("cw_1"));
         assert!(!state.has_hitl_to_interrupt("cw_1"));
         assert_eq!(state.busy_state("cw_1"), Busy::Idle);
-
-        let mut stale = AppState::new();
-        stale
-            .conversations
-            .push(thread("cw_1", vec![at(message("m_hi", true, "hi"), 10)]));
-        stale.active_conversation_id = Some("cw_1".to_string());
-        stale
-            .parked_hitl_runs
-            .insert("cw_1".into(), "01a0b381-stale".into());
-        assert_eq!(
-            stale.busy_state("cw_1"),
-            Busy::Idle,
-            "a stale parked id without open HITL / Waiting is not a parked thread"
-        );
     }
 
     /// The run finished and left the card (**Waiting for you**). A send is a
@@ -10770,7 +10859,6 @@ mod tests {
         state.settle_parked_cards("cw_1");
         assert!(!state.has_hitl_to_interrupt("cw_1"));
         assert_eq!(state.thread_status("cw_1"), None);
-        assert!(state.parked_hitl_runs.get("cw_1").is_none());
         assert_eq!(state.busy_state("cw_1"), Busy::Idle);
     }
 
