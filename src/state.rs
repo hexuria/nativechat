@@ -9133,6 +9133,7 @@ mod tests {
     use crate::opengrok::{
         CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
     };
+    use crate::state::{ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave};
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};

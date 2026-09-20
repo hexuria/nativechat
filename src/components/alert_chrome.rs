@@ -182,7 +182,14 @@ pub fn attention_cta(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Named imports, not a glob: this module globs `gpui_kit::*`, whose root
+    // re-exports `gpui::*` — and that includes GPUI's own `test` attribute
+    // macro. A glob shadows the prelude, so `use super::*` here would make
+    // every `#[test]` below resolve to `gpui::test`, which emits a `#[test]`
+    // of its own and expands until rustc runs out of recursion. Kit says as
+    // much where it re-exports: "Test modules should import their Kit types
+    // explicitly to avoid shadowing Rust's #[test]."
+    use super::{attention_ctas, attention_glass};
 
     #[test]
     fn attention_glass_is_translucent() {

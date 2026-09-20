@@ -3689,6 +3689,10 @@ mod tests {
                 "agentId": "cw_1",
                 "resolution": "handed_back"
             })))
+            // Never answered, because it must never be asked: `expect` is a
+            // method on a mounted `Mock`, and a `MockBuilder` only becomes one
+            // once it has been given a response.
+            .respond_with(ResponseTemplate::new(500))
             .expect(0)
             .mount(&server)
             .await;
