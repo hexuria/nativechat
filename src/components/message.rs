@@ -49,6 +49,8 @@ pub struct MessageBubble {
     picker_open: bool,
     ts_peek: f32,
     timestamps_ok: bool,
+    /// Held until the thread is idle: a small "Queued" under the bubble says so.
+    queued: bool,
     app: Option<Entity<AppState>>,
 }
 
@@ -77,6 +79,7 @@ impl MessageBubble {
             picker_open: false,
             ts_peek: 0.0,
             timestamps_ok: true,
+            queued: false,
             app: None,
         }
     }
@@ -212,6 +215,10 @@ impl MessageBubble {
         self
     }
     pub fn is_cached(self, _is_cached: bool) -> Self {
+        self
+    }
+    pub fn queued(mut self, queued: bool) -> Self {
+        self.queued = queued;
         self
     }
 }
@@ -372,6 +379,19 @@ impl RenderOnce for MessageBubble {
             .min_w_0()
             .when(self.reaction.is_some(), |this| this.mb(px(12.)))
             .child(bubble)
+            // Under the bubble rather than in it: the words are the person's, the wait is
+            // the app's, and the line goes the moment the turn is posted.
+            .when(self.queued, |this| {
+                this.child(
+                    div()
+                        .mt(px(3.))
+                        .pr(px(4.))
+                        .text_xs()
+                        .text_color(muted)
+                        .when(is_me, |this| this.text_right())
+                        .child("Queued — sends when the coworker is free"),
+                )
+            })
             .when_some(self.reaction.clone(), |this, emoji| {
                 this.child(
                     div()

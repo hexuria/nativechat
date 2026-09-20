@@ -247,6 +247,7 @@ fn main() {
                         state.set_database_service(db_service.clone(), cx);
                         state.warm_tts(cx);
                         state.restore_saved_theme(cx);
+                        state.restore_saved_on_send();
                     });
 
                     cx.on_action(|_: &CopyMessage, _cx: &mut App| {});

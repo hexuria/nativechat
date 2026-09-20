@@ -270,6 +270,8 @@ struct ChatRow {
     is_ai_paused: bool,
     is_ai_loading: bool,
     is_cached: bool,
+    /// The person's message is on screen but its turn is held until the thread is idle.
+    queued: bool,
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_native: bool,
     use_markdown: bool,
@@ -309,6 +311,7 @@ impl ChatRow {
             is_ai_paused: false,
             is_ai_loading: false,
             is_cached: false,
+            queued: false,
             highlight_range: None,
             highlight_native: false,
             use_markdown: false,
@@ -414,6 +417,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 content: SharedString::from(text.clone()),
                 is_me: msg.is_me,
                 timestamp: SharedString::from(msg.formatted_time()),
+                queued: msg.is_me && state.is_send_queued(&msg.id),
                 is_native_speaking,
                 is_native_paused: state.native_tts.is_paused && is_native_speaking,
                 is_native_loading: state.native_tts.is_loading && is_native_speaking,
@@ -1219,6 +1223,7 @@ impl Render for ChatTranscript {
                                 .is_ai_paused(row.is_ai_paused)
                                 .is_ai_loading(row.is_ai_loading)
                                 .is_cached(row.is_cached)
+                                .queued(row.queued)
                                 .highlight_range(row.highlight_range.clone())
                                 .highlight_color(highlight_color)
                                 .find_marks(marks_for_row(ix, &find_hits, find_current))

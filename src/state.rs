@@ -24,7 +24,7 @@ use crate::opengrok::{
     stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
-use crate::send_policy::Busy;
+use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
@@ -34,7 +34,7 @@ use crate::site_login::{
 };
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -508,6 +508,15 @@ impl Conversation {
 /// with one of these is never refilled from the database, and why the run id has to be kept: the
 /// server has the whole of the run under it, and that is what the thread is reconciled against
 /// instead.
+/// A message held back while its thread is busy. The bubble is already on
+/// screen and on its way to disk; what waits is the turn.
+#[derive(Clone, Debug)]
+pub struct QueuedSend {
+    /// The bubble's id — the local one until the save lands, then the row's.
+    message_id: String,
+    content: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveTurn {
     /// The id the turn was sent under, so `GET /ag-ui/runs/{run_id}` can be asked what became
@@ -1404,6 +1413,10 @@ pub struct AppState {
     nav: NavHistory,
     pub app_settings_tab: AppSettingsTab,
     pub submit_chord: SubmitChord,
+    /// What a plain send does while a turn is running. Read from prefs.json at boot.
+    pub on_send: OnSend,
+    /// Messages held per thread until it is idle, in the order they were typed.
+    queued_sends: HashMap<String, VecDeque<QueuedSend>>,
     pub audio_input: Option<AudioInput>,
     pub sidebar_collapsed: bool,
     pub sidebar_hidden: bool,
@@ -1834,6 +1847,8 @@ impl AppState {
             nav: NavHistory::default(),
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
+            on_send: OnSend::default(),
+            queued_sends: HashMap::new(),
             audio_input: None,
             sidebar_collapsed: false,
             sidebar_hidden: false,
@@ -5161,6 +5176,8 @@ impl AppState {
         // sight, which is the only chance there is to write that ending down.
         self.resync_live_turn(&conversation_id, cx);
         self.sync_pending_approvals(cx);
+        // A message held while this thread was out of sight goes now if the thread is idle.
+        self.drain_queued_send(&conversation_id, cx);
         cx.notify();
     }
 
@@ -5535,6 +5552,11 @@ impl AppState {
                                     ActivityTick::Keep => {}
                                     tick => {
                                         let _ = this.update(cx, |state, cx| {
+                                            // A frame from a run the person has stopped or sent
+                                            // past must not write over the turn that replaced it.
+                                            if !state.turn_is_unsettled(&conversation_id, &run_id) {
+                                                return;
+                                            }
                                             // The frame is this thread's news, and it is written
                                             // into this thread's line whoever else is working.
                                             let before = state
@@ -5747,6 +5769,7 @@ impl AppState {
                 } else {
                     state.finish_responding(Some(&conversation_id), false);
                 }
+                state.drain_queued_send(&conversation_id, cx);
                 // A failed run has already ended the last assistant row, with the server's
                 // sentence or with the note that the turn never left; `auth_error` is the
                 // sign-in / settings error and the settings pane paints it, so a run's failure
@@ -5840,6 +5863,18 @@ impl AppState {
     /// but a keystroke or a driver can still ask, and "there is nothing to stop" is an answer
     /// rather than a fault.
     pub fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(conversation_id) = self.active_conversation_id.clone() else {
+            return;
+        };
+        self.stop_live_turn(cx);
+        // Stop with messages held is "send them now": the thread is idle the moment the stop
+        // is painted, and the first held message goes.
+        self.drain_queued_send(&conversation_id, cx);
+    }
+
+    /// The stop itself, without the queue: a forced send (⌘⇧↩) stops this way and then posts
+    /// its own message ahead of anything held.
+    fn stop_live_turn(&mut self, cx: &mut Context<Self>) {
         let Some((conversation_id, turn)) = self.turn_to_stop() else {
             return;
         };
@@ -6756,7 +6791,7 @@ impl AppState {
             self.empty_vault_continue_runs.insert(spec.run_id.clone());
             self.begin_responding(Some(conversation_id), "Working");
         } else {
-            self.sync_waiting_chrome(conversation_id);
+            self.settle_chrome_and_drain(conversation_id, cx);
         }
         let request_id = spec.request_id.clone();
         let run_id = spec.run_id.clone();
@@ -6780,7 +6815,7 @@ impl AppState {
                     state.begin_responding(Some(&conversation), "Working");
                     state.follow_run(run_id, Some(conversation), cx);
                 } else {
-                    state.sync_waiting_chrome(&conversation);
+                    state.settle_chrome_and_drain(&conversation, cx);
                 }
                 cx.notify();
             });
@@ -6984,7 +7019,7 @@ impl AppState {
         for (card_key, entry_id) in flush {
             self.flush_pending_box_handoff(&card_key, &entry_id, cx);
         }
-        self.sync_waiting_chrome(conversation_id);
+        self.settle_chrome_and_drain(conversation_id, cx);
     }
 
     fn post_box_handoff_resolve(
@@ -7039,7 +7074,7 @@ impl AppState {
                         }
                     }
                 }
-                state.sync_waiting_chrome(&conversation_id);
+                state.settle_chrome_and_drain(&conversation_id, cx);
                 cx.notify();
             });
         })
@@ -7567,7 +7602,7 @@ impl AppState {
             // takes Working after the vault/broker result posts.
             self.begin_responding(conversation_id.as_deref(), "Working");
         } else if let Some(id) = conversation_id.as_deref() {
-            self.sync_waiting_chrome(id);
+            self.settle_chrome_and_drain(id, cx);
         }
         cx.notify();
         let vault = self.site_login_vault.clone();
@@ -7706,7 +7741,7 @@ impl AppState {
                 self.push_computer_window_attention(cx);
             }
         }
-        self.sync_waiting_chrome(&conversation_id);
+        self.settle_chrome_and_drain(&conversation_id, cx);
         cx.notify();
         if let UserFormDispatch::ResolveHandoff(resolution) = action {
             if let Some(handoff_entry_id) = handoff_entry_id {
@@ -7741,7 +7776,7 @@ impl AppState {
         }
         let Some(client) = self.opengrok.clone() else {
             self.restore_user_form(&card_key);
-            self.sync_waiting_chrome(&conversation_id);
+            self.settle_chrome_and_drain(&conversation_id, cx);
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -7865,7 +7900,7 @@ impl AppState {
                         }
                     }
                 }
-                state.sync_waiting_chrome(&conversation_id);
+                state.settle_chrome_and_drain(&conversation_id, cx);
                 cx.notify();
             });
         })
@@ -7897,6 +7932,12 @@ impl AppState {
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
+        self.send_message_with(content, false, cx);
+    }
+
+    /// `force_steer` is ⌘⇧↩: send now even if a turn is running. What that
+    /// means for each state of the thread is [`plan_send`].
+    pub fn send_message_with(&mut self, content: String, force_steer: bool, cx: &mut Context<Self>) {
         if !self.is_signed_in() {
             self.auth_error = Some("Sign in first".to_string());
             cx.notify();
@@ -7983,6 +8024,15 @@ impl AppState {
                 {
                     Ok(id) => {
                         this.update(cx, |state, cx| {
+                            // A held message follows its bubble to the saved id, or the
+                            // "Queued" pill would come off the moment the save landed.
+                            if let Some(queue) = state.queued_sends.get_mut(&conversation_id_clone)
+                            {
+                                for queued in queue.iter_mut().filter(|q| q.message_id == local_id)
+                                {
+                                    queued.message_id = id.clone();
+                                }
+                            }
                             if let Some(conversation) = state
                                 .conversations
                                 .iter_mut()
@@ -8006,18 +8056,92 @@ impl AppState {
             .detach();
         }
 
-        match self.busy_state(&conversation_id) {
-            Busy::Idle => {}
-            // A steer. The server ends the parked run on this message and
-            // closes its cards; the app paints the same ending (Superseded)
-            // and never `/stop`s first — see `settle_parked_cards`.
-            Busy::Parked => self.settle_parked_cards(&conversation_id),
-            Busy::Running => {
+        let busy = self.busy_state(&conversation_id);
+        match plan_send(busy, self.on_send, force_steer) {
+            SendPlan::Post => {}
+            // Held until the thread is idle; `drain_queued_send` posts it then. The bubble is
+            // on screen and on its way to disk already, so nothing is lost if the app quits
+            // first — the row reads as a message that got no answer, which is what it is.
+            SendPlan::Queue => {
+                self.queued_sends
+                    .entry(conversation_id)
+                    .or_default()
+                    .push_back(QueuedSend {
+                        message_id: local_id,
+                        content,
+                    });
                 cx.notify();
                 return;
             }
+            // Parked: the server ends the parked run on this message and closes its cards;
+            // the app paints the same ending (Superseded) and never `/stop`s first — see
+            // `settle_parked_cards`. Running: stop the run at its next step, the way the
+            // button does, and send. Anything already held stays held — the message the
+            // person just forced ahead goes first, and the rest follow when it ends.
+            SendPlan::Steer => match busy {
+                Busy::Parked => self.settle_parked_cards(&conversation_id),
+                Busy::Running => self.stop_live_turn(cx),
+                Busy::Idle => {}
+            },
         }
         self.send_opengrok_turn(conversation_id, content, cx);
+    }
+
+    /// Post the next held message, if the thread has one and is idle — and is the open
+    /// thread, since a turn is sent for the open coworker. Called wherever a thread can go
+    /// idle: the ending of a live, replayed or followed run, a card settling with no run
+    /// after it, and coming back to the thread. Safe to call anywhere else too: it is a no-op
+    /// while anything is running or parked.
+    fn drain_queued_send(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        if self.active_conversation_id.as_deref() != Some(conversation_id)
+            || self.busy_state(conversation_id) != Busy::Idle
+        {
+            return;
+        }
+        let Some(next) = self
+            .queued_sends
+            .get_mut(conversation_id)
+            .and_then(VecDeque::pop_front)
+        else {
+            return;
+        };
+        if self
+            .queued_sends
+            .get(conversation_id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.queued_sends.remove(conversation_id);
+        }
+        // The turn is built from the thread as it is in memory. A reload may have replaced the
+        // thread from disk meanwhile: the bubble is there under its saved id, or — if the save
+        // never landed — not at all, in which case it is put back so the coworker is sent what
+        // the person typed.
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+            && !conversation.messages.iter().any(|m| m.id == next.message_id)
+        {
+            conversation.messages.push(Message {
+                id: next.message_id.clone(),
+                sender: "Me".to_string(),
+                content: next.content.clone(),
+                sent_at: SystemTime::now(),
+                is_me: true,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: Vec::new(),
+                run_id: None,
+            });
+        }
+        self.send_opengrok_turn(conversation_id.to_string(), next.content, cx);
+    }
+
+    /// Waiting chrome, then the queue: the two things a thread going idle has to settle.
+    fn settle_chrome_and_drain(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        self.sync_waiting_chrome(conversation_id);
+        self.drain_queued_send(conversation_id, cx);
     }
 
     fn has_open_approval(&self, conversation_id: &str) -> bool {
@@ -8143,6 +8267,35 @@ impl AppState {
         self.theme_mode = crate::theme::load_saved_mode();
         crate::theme::apply_mode(&self.theme_mode, cx);
         cx.notify();
+    }
+
+    pub fn restore_saved_on_send(&mut self) {
+        self.on_send = crate::prefs::load_on_send(&Config::data_dir());
+    }
+
+    pub fn set_on_send(&mut self, on_send: OnSend, cx: &mut Context<Self>) {
+        if self.on_send != on_send {
+            self.on_send = on_send;
+            #[cfg(not(test))]
+            crate::prefs::save_on_send(&Config::data_dir(), on_send);
+            cx.notify();
+        }
+    }
+
+    /// The bubble is on screen but its turn has not gone yet.
+    pub fn is_send_queued(&self, message_id: &str) -> bool {
+        self.queued_sends
+            .values()
+            .flatten()
+            .any(|queued| queued.message_id == message_id)
+    }
+
+    /// How many messages the open thread is holding back.
+    pub fn queued_send_count(&self) -> usize {
+        self.active_conversation_id
+            .as_deref()
+            .and_then(|id| self.queued_sends.get(id))
+            .map_or(0, VecDeque::len)
     }
 
     pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
