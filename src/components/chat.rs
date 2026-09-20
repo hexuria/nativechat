@@ -48,7 +48,7 @@ struct ChatFeedRev {
     user_form_verbs: bool,
     user_form_handoffs: Vec<(String, String, bool)>,
     save_logins: Vec<(String, String)>,
-    credential_requests: Vec<(String, String)>,
+    credential_requests: Vec<(String, String, String)>,
     box_screen: bool,
     is_ai_responding: bool,
     debug_mode: bool,
@@ -185,15 +185,19 @@ impl ChatFeedRev {
                 cards
             },
             credential_requests: {
-                let mut cards: Vec<(String, String)> = conv
+                let mut cards: Vec<(String, String, String)> = conv
                     .map(|c| {
                         c.messages
                             .iter()
                             .flat_map(|m| m.parts.iter())
                             .filter_map(|part| match part {
-                                ChatPart::CredentialRequest(spec) => {
-                                    Some((spec.request_id.clone(), spec.origin.clone()))
-                                }
+                                ChatPart::CredentialRequest(spec) => Some((
+                                    spec.request_id.clone(),
+                                    spec.origin.clone(),
+                                    spec.resolution
+                                        .map(|resolution| resolution.as_str().to_string())
+                                        .unwrap_or_else(|| "idle".into()),
+                                )),
                                 _ => None,
                             })
                             .collect()
@@ -266,6 +270,8 @@ struct ChatRow {
     is_ai_paused: bool,
     is_ai_loading: bool,
     is_cached: bool,
+    /// The person's message is on screen but its turn is held until the thread is idle.
+    queued: bool,
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_native: bool,
     use_markdown: bool,
@@ -305,6 +311,7 @@ impl ChatRow {
             is_ai_paused: false,
             is_ai_loading: false,
             is_cached: false,
+            queued: false,
             highlight_range: None,
             highlight_native: false,
             use_markdown: false,
@@ -410,6 +417,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 content: SharedString::from(text.clone()),
                 is_me: msg.is_me,
                 timestamp: SharedString::from(msg.formatted_time()),
+                queued: msg.is_me && state.is_send_queued(&msg.id),
                 is_native_speaking,
                 is_native_paused: state.native_tts.is_paused && is_native_speaking,
                 is_native_loading: state.native_tts.is_loading && is_native_speaking,
@@ -833,7 +841,19 @@ impl ChatTranscript {
             let Some(spec) = &row.user_form else {
                 continue;
             };
-            if !spec.is_unresolved() {
+            // Keep the typed values through Sending and FillFailed. These inputs
+            // are what "Try again" re-posts, and clearing them the moment a
+            // submit went out meant the retry after a failed fill left with
+            // the password gone.
+            let live = spec.is_unresolved()
+                || matches!(
+                    spec.effective_resolution(),
+                    Some(
+                        crate::opengrok::FormResolution::Sending
+                            | crate::opengrok::FormResolution::FillFailed
+                    )
+                );
+            if !live {
                 continue;
             }
             for field in &spec.fields {
@@ -1203,6 +1223,7 @@ impl Render for ChatTranscript {
                                 .is_ai_paused(row.is_ai_paused)
                                 .is_ai_loading(row.is_ai_loading)
                                 .is_cached(row.is_cached)
+                                .queued(row.queued)
                                 .highlight_range(row.highlight_range.clone())
                                 .highlight_color(highlight_color)
                                 .find_marks(marks_for_row(ix, &find_hits, find_current))
@@ -1462,9 +1483,9 @@ impl ChatView {
         let input = cx.new(|cx| {
             MessageInput::new(window, state.clone(), cx).on_submit({
                 let state = state.clone();
-                move |text, cx| {
+                move |text, steer, cx| {
                     state.update(cx, |state, cx| {
-                        state.send_message(text, cx);
+                        state.send_message_with(text, steer, cx);
                     });
                 }
             })

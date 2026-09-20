@@ -11,7 +11,7 @@ use nativechat::actions::{
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::chrome::TITLE_BAR_H;
-use nativechat::components::chat_input::{SendDraft, SubmitMessage};
+use nativechat::components::chat_input::{SendDraft, SendDraftSteer, SubmitMessage};
 use nativechat::config::Config;
 use nativechat::db::{create_pool, run_migrations};
 use nativechat::root::RootView;
@@ -64,6 +64,10 @@ fn main() {
                 // out. The composer's own context does not reach into the panel, hence two.
                 KeyBinding::new("cmd-enter", SendDraft, Some("MessageInput")),
                 KeyBinding::new("cmd-enter", SendDraft, Some("ComposerPanel")),
+                // Send now, over a running turn: the turn is stopped at its next step and the
+                // message goes ahead of anything queued. Same two contexts, for the same reason.
+                KeyBinding::new("cmd-shift-enter", SendDraftSteer, Some("MessageInput")),
+                KeyBinding::new("cmd-shift-enter", SendDraftSteer, Some("ComposerPanel")),
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-b", ToggleSidebar, Some("Editor")),
                 KeyBinding::new("cmd-b", ToggleSidebar, Some("AppSettings")),
@@ -246,6 +250,8 @@ fn main() {
                         state.set_config(config.clone(), cx);
                         state.set_database_service(db_service.clone(), cx);
                         state.warm_tts(cx);
+                        state.restore_saved_theme(cx);
+                        state.restore_saved_on_send();
                     });
 
                     cx.on_action(|_: &CopyMessage, _cx: &mut App| {});

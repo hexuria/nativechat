@@ -7,29 +7,34 @@ use crate::chrome::{
 use crate::config::Config;
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
-    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, ConnectedComputer, Coworker,
-    CoworkerComputer, CoworkerPatch, CredentialRequestSpec, CredentialResultStatus, Failure,
-    FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecResolution, ModelCatalogue,
-    OpenGrokClient, OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
-    RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote,
-    RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
-    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_enabled, keep_local_save_offer, local_exec_outcome,
+    BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
+    Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestResolution, CredentialRequestSpec,
+    CredentialResultStatus, Failure, FormResolution, FormSpec, ImageVisibility, LocalExecMode,
+    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
+    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay,
+    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE,
+    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
+    WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, fold_credential_answer, host_egress_tunnel_flag,
+    keep_credential_request_offer, keep_local_save_offer, local_exec_outcome,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
     result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
     tool_standin,
 };
 use crate::reachability::Reachability;
+use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
 use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
-use crate::site_login::{PendingSave, SiteLoginRecord, SiteLoginVault, save_candidate};
+use crate::site_login::{
+    PendingSave, SiteLoginRecord, SiteLoginVault, login_matches_request, registrable_origin,
+    save_candidate,
+};
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -503,6 +508,20 @@ impl Conversation {
 /// with one of these is never refilled from the database, and why the run id has to be kept: the
 /// server has the whole of the run under it, and that is what the thread is reconciled against
 /// instead.
+/// A message held back while its thread is busy. The bubble is already on
+/// screen and on its way to disk; what waits is the turn.
+#[derive(Clone, Debug)]
+pub struct QueuedSend {
+    /// The bubble's id — the local one until the save lands, then the row's.
+    message_id: String,
+    content: String,
+    /// The recipe as it was when the message was typed: the composer clears it the moment
+    /// the draft goes, and the turn has to carry what was on the message.
+    recipe: Option<TurnRecipe>,
+    /// The message this one answers, for the quote the coworker is sent.
+    reply: Option<ReplyTo>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveTurn {
     /// The id the turn was sent under, so `GET /ag-ui/runs/{run_id}` can be asked what became
@@ -866,6 +885,9 @@ pub enum VoiceStatus {
     Disconnected,
     Error(String),
 }
+
+/// Body of a card a later message closed: user-form, credential or approval.
+pub const SUPERSEDED_NOTE: &str = "Moved on to your next message.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SubmitChord {
@@ -1269,6 +1291,14 @@ pub enum AppSettingsTab {
     Logins,
 }
 
+/// Where Route traffic chrome belongs for the active bot's box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteTrafficSurface {
+    Hidden,
+    BotPane,
+    UserSettings,
+}
+
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
 /// so ⌘[ / ⌘] can walk agents, the right pane, and Settings the way macOS apps do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1347,6 +1377,7 @@ pub struct AppState {
     /// refilled from the database, its run is written into by name rather than by position, and
     /// coming back to it asks the server what became of the run.
     live_turns: HashMap<String, LiveTurn>,
+    /// Server run parked on HITL (user-form / approval / live handoff) after
     /// Threads already reconciled against the server this session. Once is enough: after it, the
     /// app has been watching, and every turn since has gone through the same door on its way to
     /// disk. Asking again on every visit would fetch a thread's frames — screenshots and all —
@@ -1385,6 +1416,10 @@ pub struct AppState {
     nav: NavHistory,
     pub app_settings_tab: AppSettingsTab,
     pub submit_chord: SubmitChord,
+    /// What a plain send does while a turn is running. Read from prefs.json at boot.
+    pub on_send: OnSend,
+    /// Messages held per thread until it is idle, in the order they were typed.
+    queued_sends: HashMap<String, VecDeque<QueuedSend>>,
     pub audio_input: Option<AudioInput>,
     pub sidebar_collapsed: bool,
     pub sidebar_hidden: bool,
@@ -1469,8 +1504,23 @@ pub struct AppState {
     /// Local/server settlements grafted onto AG-UI replay, which does not carry
     /// `formResolution`. Keyed by gateway `entryId` or `card_key`.
     user_form_resolutions: HashMap<String, FormResolution>,
+    /// Local `credential.request` settle (Dismissed / Used saved login /
+    /// None saved). Grafted across SSE overwrite so the remnant does not reopen.
+    credential_request_resolutions: HashMap<String, CredentialRequestResolution>,
+    /// `credential.request` ids auto-answered `missing` because Settings→Logins
+    /// had no matching row. Do not re-offer or POST again.
+    credential_auto_missing: HashSet<String>,
+    /// Runs that posted empty-vault `missing` and still need follow_run rather
+    /// than persist-as-finished / Waiting.
+    empty_vault_continue_runs: HashSet<String>,
+    /// First sqlite `site_logins` list has landed. Until then, do not treat an
+    /// empty in-memory vec as "no logins" (startup race).
+    site_logins_ready: bool,
     /// Stable resolution to restore if a POST fails (never reopen a settled card).
-    user_form_restore: HashMap<String, FormResolution>,
+    /// Prior resolution to restore if an optimistic paint is rolled back.
+    /// `Some(None)` means the card was idle; without that case a Dismiss that
+    /// failed on the server left the card Dismissed forever.
+    user_form_restore: HashMap<String, Option<FormResolution>>,
     /// Form card key → handoff card id from dismiss `handoffEntryId`.
     user_form_handoffs: HashMap<String, String>,
     /// Skip / I'm done before dismiss returned `handoffEntryId`. Local chrome
@@ -1498,8 +1548,8 @@ pub struct AppState {
     pub coworker_computer: Option<CoworkerComputer>,
     /// From `POST /api/isEgressTunnelAvailable` (env OR host setting on the server).
     pub host_egress_tunnel_available: bool,
-    /// Local/host opt-in for **Route traffic through this computer**. No tunnel
-    /// is invented here.
+    /// Local/host opt-in for **Route traffic through this computer**. Defaults
+    /// ON; host `egressTunnelEnabled` overwrites only when the key is present.
     pub egress_tunnel_enabled: bool,
     /// This server answered 404 to `/coworkers/{id}/computer`: it has no such
     /// endpoint, so polling stops until the roster reloads.
@@ -1564,6 +1614,9 @@ pub enum ApprovalDecision {
     Always,
     Denied,
     Never,
+    /// A later message moved the thread on. The server closed the card when
+    /// that message arrived; nothing was allowed or denied.
+    Superseded,
     Failed(String),
 }
 
@@ -1584,6 +1637,7 @@ impl ApprovalDecision {
             Self::Always => LocalExecResolution::Always,
             Self::Denied => LocalExecResolution::DenyOnce,
             Self::Never => LocalExecResolution::Never,
+            Self::Superseded => return Some(SUPERSEDED_NOTE.to_string()),
             _ => return None,
         };
         Some(local_exec_outcome(bot, resolution, place))
@@ -1795,6 +1849,8 @@ impl AppState {
             nav: NavHistory::default(),
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
+            on_send: OnSend::default(),
+            queued_sends: HashMap::new(),
             audio_input: None,
             sidebar_collapsed: false,
             sidebar_hidden: false,
@@ -1841,6 +1897,10 @@ impl AppState {
             user_form_typed: HashMap::new(),
             user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
             user_form_resolutions: HashMap::new(),
+            credential_request_resolutions: HashMap::new(),
+            credential_auto_missing: HashSet::new(),
+            empty_vault_continue_runs: HashSet::new(),
+            site_logins_ready: false,
             user_form_restore: HashMap::new(),
             user_form_handoffs: HashMap::new(),
             user_form_pending_resolves: HashMap::new(),
@@ -1858,7 +1918,7 @@ impl AppState {
             computers: Vec::new(),
             coworker_computer: None,
             host_egress_tunnel_available: false,
-            egress_tunnel_enabled: false,
+            egress_tunnel_enabled: true,
             coworker_screen: None,
             last_box_shot: None,
             computer_confirm: None,
@@ -1921,13 +1981,15 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let account = match client.me().await {
                 Ok(account) => Ok(account),
-                Err(error) if error.is_unauthorized() => match client.refresh().await {
-                    Ok(()) => client.me().await,
-                    Err(_) => {
-                        client.clear_session();
-                        Err(error)
+                Err(error) if error.is_unauthorized() => {
+                    match client.refresh_after_unauthorized().await {
+                        Ok(()) => client.me().await,
+                        Err(_) => {
+                            client.clear_session();
+                            Err(error)
+                        }
                     }
-                },
+                }
                 Err(error) => Err(error),
             };
             let _ = this.update(cx, |state, cx| {
@@ -2239,31 +2301,86 @@ impl AppState {
         self.host_egress_tunnel_available || env_egress_tunnel_enabled()
     }
 
-    fn box_egress_tunnel_ready(&self) -> bool {
-        self.coworker_computer
-            .as_ref()
-            .is_some_and(|computer| computer.egress_tunnel_ready())
+    fn nonempty_box_id(id: Option<&str>) -> Option<&str> {
+        id.map(str::trim).filter(|id| !id.is_empty())
     }
 
-    /// OpenGrok #139 @ 1b19ac2: host setting/env **and** box
-    /// `egress_tunnel.ready`. No tunnel is invented. The Settings row can
-    /// still *show* when only one side is known; this AND-gate is what may
-    /// actually turn the tunnel on.
+    fn active_box_id(&self) -> Option<&str> {
+        Self::nonempty_box_id(
+            self.coworker_computer
+                .as_ref()
+                .and_then(|computer| computer.box_id.as_deref()),
+        )
+        .or_else(|| {
+            let active = self.active_coworker_id.as_deref()?;
+            Self::nonempty_box_id(
+                self.coworkers
+                    .iter()
+                    .find(|coworker| coworker.id == active)?
+                    .box_id
+                    .as_deref(),
+            )
+        })
+    }
+
+    fn box_shared_among_coworkers(&self) -> bool {
+        let Some(box_id) = self.active_box_id() else {
+            return false;
+        };
+        self.coworkers
+            .iter()
+            .filter(|coworker| Self::nonempty_box_id(coworker.box_id.as_deref()) == Some(box_id))
+            .count()
+            > 1
+    }
+
+    /// Nested `egress_tunnel.ready` / URL on this bot's computer JSON.
+    pub fn box_egress_provisioned(&self) -> bool {
+        self.coworker_computer
+            .as_ref()
+            .is_some_and(CoworkerComputer::box_egress_provisioned)
+    }
+
+    fn box_egress_tunnel_ready(&self) -> bool {
+        self.box_egress_provisioned()
+    }
+
+    /// OpenGrok #139: host setting/env **and** this bot's box tunnel. No tunnel
+    /// is invented. Review-an-action uses this AND-gate; Route traffic chrome
+    /// uses [`Self::route_traffic_surface`] (provisioned + shareScope).
     pub fn egress_tunnel_available(&self) -> bool {
         self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
     }
 
-    /// Grok shows the Network row when the host intends a tunnel, the box
-    /// already exposed one, or the toggle is already on. Box status lag or a
-    /// 401 on the host poll must not hide the row.
-    pub fn show_egress_tunnel_settings(&self) -> bool {
-        self.host_intends_egress_tunnel()
-            || self.box_egress_tunnel_ready()
-            || self.egress_tunnel_enabled
+    /// Dedicated → bot Computer pane header icon. User (or unknown + shared
+    /// `boxId`) → Settings → Computer. Group/org → hide. Unprovisioned → hide.
+    pub fn route_traffic_surface(&self) -> RouteTrafficSurface {
+        if !self.box_egress_provisioned() {
+            return RouteTrafficSurface::Hidden;
+        }
+        match self
+            .coworker_computer
+            .as_ref()
+            .and_then(|computer| computer.share_scope)
+        {
+            Some(BoxShareScope::Dedicated) => RouteTrafficSurface::BotPane,
+            Some(BoxShareScope::User) => RouteTrafficSurface::UserSettings,
+            Some(BoxShareScope::Group) | Some(BoxShareScope::Org) => RouteTrafficSurface::Hidden,
+            None if self.box_shared_among_coworkers() => RouteTrafficSurface::UserSettings,
+            None => RouteTrafficSurface::BotPane,
+        }
+    }
+
+    pub fn show_route_traffic_on_bot_pane(&self) -> bool {
+        self.route_traffic_surface() == RouteTrafficSurface::BotPane
+    }
+
+    pub fn show_route_traffic_in_user_settings(&self) -> bool {
+        self.route_traffic_surface() == RouteTrafficSurface::UserSettings
     }
 
     pub fn set_egress_tunnel_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if enabled && !self.egress_tunnel_available() {
+        if enabled && !self.box_egress_provisioned() {
             return;
         }
         self.egress_tunnel_enabled = enabled;
@@ -2277,10 +2394,7 @@ impl AppState {
                 .await;
             let _ = this.update(cx, |state, cx| {
                 if let Ok(settings) = result {
-                    if let Some(flag) = settings
-                        .get("egressTunnelEnabled")
-                        .and_then(serde_json::Value::as_bool)
-                    {
+                    if let Some(flag) = host_egress_tunnel_flag(&settings) {
                         state.egress_tunnel_enabled = flag;
                     }
                     if enabled {
@@ -2314,8 +2428,9 @@ impl AppState {
                     changed = true;
                 }
                 if let Some(settings) = settings {
-                    let enabled = host_egress_tunnel_enabled(&settings);
-                    if state.egress_tunnel_enabled != enabled {
+                    if let Some(enabled) = host_egress_tunnel_flag(&settings)
+                        && state.egress_tunnel_enabled != enabled
+                    {
                         state.egress_tunnel_enabled = enabled;
                         changed = true;
                     }
@@ -2378,6 +2493,128 @@ impl AppState {
         if !run_id.is_empty() {
             self.release_live_turn(conversation_id, run_id);
         }
+    }
+
+    /// Open user-form / credential / approval / live handoff, or Waiting
+    /// chrome: something is parked on the person. A send here is a steer.
+    fn has_hitl_to_interrupt(&self, conversation_id: &str) -> bool {
+        self.has_open_approval(conversation_id)
+            || self.has_open_user_form(conversation_id)
+            || matches!(
+                self.thread_status(conversation_id),
+                Some(WAITING_FOR_YOU_STATUS) | Some(WAITING_APPROVAL_STATUS)
+            )
+    }
+
+    /// The thread as the composer finds it. Parked wins over running: a card
+    /// painted mid-stream is already waiting on the person even though the
+    /// stream that painted it is still open.
+    fn busy_state(&self, conversation_id: &str) -> Busy {
+        if self.has_sending_form(conversation_id) {
+            // A submit is on the wire and the run resumes the moment it lands: the thread
+            // is as good as running. Queue behind it rather than settle a card the server
+            // is about to answer.
+            Busy::Running
+        } else if self.has_hitl_to_interrupt(conversation_id) {
+            Busy::Parked
+        } else if self.is_thread_responding(conversation_id)
+            || self.is_turn_in_flight_for(conversation_id)
+        {
+            Busy::Running
+        } else {
+            Busy::Idle
+        }
+    }
+
+    fn has_sending_form(&self, conversation_id: &str) -> bool {
+        self.conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .is_some_and(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.parts.iter())
+                    .any(|part| match part {
+                        ChatPart::UserForm(spec) => {
+                            spec.effective_resolution() == Some(FormResolution::Sending)
+                        }
+                        _ => false,
+                    })
+            })
+    }
+
+    /// A run registered against this thread that is still running, whether or
+    /// not it is the open thread: the composer's button reads the open thread
+    /// only, but a steer decides about the thread the message is for.
+    fn is_turn_in_flight_for(&self, conversation_id: &str) -> bool {
+        self.live_turns
+            .get(conversation_id)
+            .is_some_and(|turn| !turn.persisting)
+            && self.thread_status(conversation_id) != Some(WAITING_FOR_YOU_STATUS)
+    }
+
+    /// A steer over parked cards. The server ends the parked run and closes
+    /// its cards when the next message arrives (`interrupt_parked_hitl` on
+    /// `POST /ag-ui`), so the app must not `/stop` it first — a stopped run
+    /// is not parked, the server then finds nothing to settle, and the card
+    /// keeps the coworker's screen held for ten minutes. What the app does
+    /// is paint the same ending here: every open card in the thread becomes
+    /// **Superseded**, so nothing keeps reading the thread as parked and the
+    /// Waiting chrome can go.
+    fn settle_parked_cards(&mut self, conversation_id: &str) {
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return;
+        };
+        let mut forms = Vec::new();
+        let mut credentials = Vec::new();
+        let mut approvals = Vec::new();
+        for part in conversation
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+        {
+            match part {
+                // Not a form mid-`Sending`: its submit is on the wire and the reply repaints
+                // it; `busy_state` reads such a thread as running, not parked.
+                ChatPart::UserForm(spec)
+                    if spec.is_unresolved() || spec.live_computer_handoff() =>
+                {
+                    forms.push((spec.card_key().to_string(), spec.live_computer_handoff()));
+                }
+                ChatPart::CredentialRequest(spec) if spec.is_unresolved() => {
+                    credentials.push(spec.request_id.clone());
+                }
+                ChatPart::Approval(spec)
+                    if !self.approval_answered(&spec.call_id)
+                        && self.auto_resolve_local_exec(spec).is_none() =>
+                {
+                    approvals.push(spec.call_id.clone());
+                }
+                _ => {}
+            }
+        }
+        for (card_key, handoff) in forms {
+            self.paint_user_form_resolution(&card_key, FormResolution::Superseded);
+            if handoff {
+                self.set_computer_handoff(&card_key, ComputerHandoffStatus::Skipped);
+            }
+        }
+        for request_id in credentials {
+            self.paint_credential_request_resolution(
+                &request_id,
+                CredentialRequestResolution::Superseded,
+            );
+        }
+        for call_id in approvals {
+            self.approval_decisions
+                .insert(call_id, ApprovalDecision::Superseded);
+        }
+        self.sync_waiting_chrome(conversation_id);
     }
 
     /// After Skip / Dismiss / Done (and after SSE graft): Waiting only while
@@ -2476,7 +2713,7 @@ impl AppState {
         self.approval_decisions.clear();
         self.computers.clear();
         self.host_egress_tunnel_available = false;
-        self.egress_tunnel_enabled = false;
+        self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
         cx.notify();
         if let Some(client) = client {
@@ -2755,6 +2992,7 @@ impl AppState {
         self.computer_action_error = None;
         if computer {
             self.refresh_coworker_computer(cx);
+            self.refresh_host_egress(cx);
             self.start_computer_poll(cx);
         } else {
             self.computer_poll = None;
@@ -4823,7 +5061,7 @@ impl AppState {
                     Ok(thread) => {
                         state.reconciled_threads.insert(conversation_id.clone());
                         state.apply_thread_replay(&conversation_id, &thread, cx);
-                        state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        state.overlay_replay_cards(&conversation_id, &thread.runs, cx);
                     }
                     Err(_) => {
                         state.reconciled_threads.remove(&conversation_id);
@@ -4896,15 +5134,21 @@ impl AppState {
     /// Idle + settled user-form cards (never secrets) from
     /// `formRequest` + sibling `formResolution`, local save prompts, and
     /// pinned screenshots from OpenGrok onto rows sqlite already has.
-    fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
-        let grafted: Vec<(String, Vec<ChatPart>)> = runs
-            .iter()
-            .filter(|run| !run.run_id.trim().is_empty())
-            .map(|run| {
-                let (_, parts) = reply_from_replay(&run.events, &run.status);
-                (run.run_id.clone(), self.graft_user_forms(parts))
-            })
-            .collect();
+    fn overlay_replay_cards(
+        &mut self,
+        conversation_id: &str,
+        runs: &[ThreadRun],
+        cx: &mut Context<Self>,
+    ) {
+        // `graft_turn_parts`, not the bare `graft_user_forms`: after a relaunch an
+        // unmatched live `credential.request` was dropped here with no `missing`
+        // posted, so the run parked forever with no card and no chrome.
+        let mut grafted: Vec<(String, Vec<ChatPart>)> = Vec::new();
+        for run in runs.iter().filter(|run| !run.run_id.trim().is_empty()) {
+            let (_, parts) = reply_from_replay(&run.events, &run.status);
+            let parts = self.graft_turn_parts(parts, Some(conversation_id), cx);
+            grafted.push((run.run_id.clone(), parts));
+        }
         let Some(conversation) = self
             .conversations
             .iter_mut()
@@ -4951,6 +5195,8 @@ impl AppState {
         // sight, which is the only chance there is to write that ending down.
         self.resync_live_turn(&conversation_id, cx);
         self.sync_pending_approvals(cx);
+        // A message held while this thread was out of sight goes now if the thread is idle.
+        self.drain_queued_send(&conversation_id, cx);
         cx.notify();
     }
 
@@ -5007,7 +5253,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
-        let parts = self.graft_user_forms(parts);
+        let parts = self.graft_turn_parts(parts, Some(conversation_id), cx);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -5051,6 +5297,9 @@ impl AppState {
             "finished" => {
                 if self.has_open_user_form(conversation_id) {
                     self.park_waiting_for_you(conversation_id, &turn.run_id);
+                } else if self.empty_vault_continue_runs.contains(&turn.run_id) {
+                    // Empty-vault auto-miss posted `missing`; follow_run owns the rest.
+                    self.begin_responding(Some(conversation_id), "Working");
                 } else {
                     self.finish_responding(Some(conversation_id), false);
                 }
@@ -5059,6 +5308,7 @@ impl AppState {
                 // a thread that says everything twice.
                 if !self.has_open_user_form(conversation_id)
                     && !self.has_open_approval(conversation_id)
+                    && !self.empty_vault_continue_runs.contains(&turn.run_id)
                     && self.turn_is_unsettled(conversation_id, &turn.run_id)
                 {
                     self.persist_assistant_reply(
@@ -5090,6 +5340,7 @@ impl AppState {
     /// Named by run, because the turn being let go has to be the turn that ended: a thread whose
     /// next turn has already begun must not be let go by the last one finishing late.
     fn release_live_turn(&mut self, conversation_id: &str, run_id: &str) {
+        self.empty_vault_continue_runs.remove(run_id);
         if self
             .live_turns
             .get(conversation_id)
@@ -5164,6 +5415,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let settles = run_id.is_some_and(|run_id| {
+            self.empty_vault_continue_runs.remove(run_id);
             self.live_turns
                 .get(conversation_id)
                 .is_some_and(|turn| turn.run_id == run_id)
@@ -5221,7 +5473,21 @@ impl AppState {
     fn send_opengrok_turn(
         &mut self,
         conversation_id: String,
-        _content: String,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
+        self.send_opengrok_turn_with(conversation_id, content, recipe, None, cx);
+    }
+
+    /// `recipe` is the recipe the message was typed with. `stop_first` is a run this turn
+    /// replaces: it is stopped on the wire before the turn is posted.
+    fn send_opengrok_turn_with(
+        &mut self,
+        conversation_id: String,
+        content: String,
+        recipe: Option<TurnRecipe>,
+        stop_first: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -5238,9 +5504,6 @@ impl AppState {
             return;
         }
         let coworker_id = self.active_coworker_id.clone();
-        // The recipe as it stands now, not when the turn reaches the wire: the composer clears
-        // the draft the moment it is sent, and the turn should carry what was on the message.
-        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
         let history: Vec<AguiMessage> = self
             .conversations
             .iter()
@@ -5303,6 +5566,16 @@ impl AppState {
             };
             let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
                 Ok(id) => {
+                    // A forced send over a running turn: that turn is stopped here, in order,
+                    // before this one is posted. 404 means it had already ended.
+                    if let Some(stopped) = stop_first.as_deref()
+                        && let Err(error) = client.stop_run(stopped).await
+                        && error.status != Some(404)
+                    {
+                        eprintln!(
+                            "NativeChat: the stop before a forced send did not land: {error}"
+                        );
+                    }
                     let mut tracker = ToolCallTracker::default();
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
@@ -5319,6 +5592,11 @@ impl AppState {
                                     ActivityTick::Keep => {}
                                     tick => {
                                         let _ = this.update(cx, |state, cx| {
+                                            // A frame from a run the person has stopped or sent
+                                            // past must not write over the turn that replaced it.
+                                            if !state.turn_is_unsettled(&conversation_id, &run_id) {
+                                                return;
+                                            }
                                             // The frame is this thread's news, and it is written
                                             // into this thread's line whoever else is working.
                                             let before = state
@@ -5341,13 +5619,22 @@ impl AppState {
                                 let paint =
                                     stream_paint_due(last_stream_paint, now, last_stream_sig, sig);
                                 let _ = this.update(cx, |state, cx| {
+                                    // A run the person stopped or sent past has no row any more;
+                                    // its late frames must not graft into the turn that replaced it.
+                                    if !state.turn_is_unsettled(&conversation_id, &run_id) {
+                                        return;
+                                    }
                                     // Into the thread the run belongs to, and into the row the run
                                     // was given — not the thread that happens to be open, and not
                                     // whichever row happens to be last in it.
                                     if let Some(shot) = box_shot {
                                         state.last_box_shot = Some(shot);
                                     }
-                                    let grafted = state.graft_user_forms(parts.clone());
+                                    let grafted = state.graft_turn_parts(
+                                        parts.clone(),
+                                        Some(&conversation_id),
+                                        cx,
+                                    );
                                     if let Some(message) = streaming_message_mut(
                                         &mut state.conversations,
                                         &conversation_id,
@@ -5394,7 +5681,7 @@ impl AppState {
                         if let Some(shot) = box_shot {
                             state.last_box_shot = Some(shot);
                         }
-                        let grafted = state.graft_user_forms(parts);
+                        let grafted = state.graft_turn_parts(parts, Some(&conversation_id), cx);
                         if let Some(message) = streaming_message_mut(
                             &mut state.conversations,
                             &conversation_id,
@@ -5464,7 +5751,11 @@ impl AppState {
                         }
                     }
                 }
-                if !waiting_approval && !waiting_user_form && result.is_ok() {
+                if !waiting_approval
+                    && !waiting_user_form
+                    && result.is_ok()
+                    && !state.empty_vault_continue_runs.contains(&run_id)
+                {
                     // The run is final; a run parked on a card is saved when it finishes.
                     // A status line is painted, never saved: `persist_assistant_reply` refuses
                     // it, so it cannot become history the model is shown next turn. Settling the
@@ -5518,8 +5809,15 @@ impl AppState {
                         state.fill_open_approval_commands(cx);
                         state.sync_pending_approvals(cx);
                     }
+                } else if state.empty_vault_continue_runs.contains(&run_id) {
+                    state.begin_responding(Some(&conversation_id), "Working");
                 } else {
                     state.finish_responding(Some(&conversation_id), false);
+                }
+                // A failed turn does not send the next held message into the same failure:
+                // the queue keeps them, still marked, until something goes through.
+                if result.is_ok() {
+                    state.drain_queued_send(&conversation_id, cx);
                 }
                 // A failed run has already ended the last assistant row, with the server's
                 // sentence or with the note that the turn never left; `auth_error` is the
@@ -5614,6 +5912,18 @@ impl AppState {
     /// but a keystroke or a driver can still ask, and "there is nothing to stop" is an answer
     /// rather than a fault.
     pub fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(conversation_id) = self.active_conversation_id.clone() else {
+            return;
+        };
+        self.stop_live_turn(cx);
+        // Stop with messages held is "send them now": the thread is idle the moment the stop
+        // is painted, and the first held message goes.
+        self.drain_queued_send(&conversation_id, cx);
+    }
+
+    /// The stop itself, without the queue: a forced send (⌘⇧↩) stops this way and then posts
+    /// its own message ahead of anything held.
+    fn stop_live_turn(&mut self, cx: &mut Context<Self>) {
         let Some((conversation_id, turn)) = self.turn_to_stop() else {
             return;
         };
@@ -5633,8 +5943,26 @@ impl AppState {
             })
             .detach();
         }
-        if let Some((content, parts)) = self.end_stopped_turn(&conversation_id, &turn) {
-            self.persist_assistant_reply(&conversation_id, content, &parts, Some(&turn.run_id), cx);
+        self.paint_stopped_turn(&conversation_id, &turn, cx);
+    }
+
+    /// A forced send's half of the stop: end the turn here and hand back the run id, which
+    /// the send then stops on the wire *before* posting — so the server never has the two
+    /// turns at once. The button's stop (`stop_live_turn`) has no turn to order it against.
+    fn take_running_turn_for_steer(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let (conversation_id, turn) = self.turn_to_stop()?;
+        self.paint_stopped_turn(&conversation_id, &turn, cx);
+        Some(turn.run_id)
+    }
+
+    fn paint_stopped_turn(
+        &mut self,
+        conversation_id: &str,
+        turn: &LiveTurn,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((content, parts)) = self.end_stopped_turn(conversation_id, turn) {
+            self.persist_assistant_reply(conversation_id, content, &parts, Some(&turn.run_id), cx);
         }
         cx.notify();
     }
@@ -5921,7 +6249,11 @@ impl AppState {
                                     label: "Working".into(),
                                 });
                             let _ = this.update(cx, |state, cx| {
-                                let parts = state.graft_user_forms(parts.clone());
+                                let parts = state.graft_turn_parts(
+                                    parts.clone(),
+                                    conversation_id.as_deref(),
+                                    cx,
+                                );
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card.
@@ -5980,6 +6312,7 @@ impl AppState {
                                             if state.has_open_user_form(id) {
                                                 state.park_waiting_for_you(id, &run_id);
                                             } else {
+                                                state.empty_vault_continue_runs.remove(&run_id);
                                                 state.finish_responding(
                                                     conversation_id.as_deref(),
                                                     false,
@@ -6370,17 +6703,191 @@ impl AppState {
                     }
                 }
             }
+            if let ChatPart::CredentialRequest(spec) = part
+                && let Some(resolution) = self.credential_request_resolutions.get(&spec.request_id)
+            {
+                spec.resolution = Some(*resolution);
+            }
         }
         parts.retain(|part| match part {
             ChatPart::SaveLogin(spec) => keep_local_save_offer(
                 self.pending_save.contains_key(&spec.form_entry_id),
                 self.already_saved_login(&spec.origin, &spec.username),
             ),
+            ChatPart::CredentialRequest(spec) => keep_credential_request_offer(
+                spec.is_settled(),
+                self.has_matching_saved_login(&spec.origin, spec.username.as_deref()),
+                self.credential_auto_missing.contains(&spec.request_id),
+                self.site_logins_ready,
+            ),
             _ => true,
         });
         self.inject_local_save_logins(&mut parts);
         place_hitl_cards_in_document_order(&mut parts);
         parts
+    }
+
+    fn has_matching_saved_login(&self, origin: &str, username: Option<&str>) -> bool {
+        self.site_logins
+            .iter()
+            .any(|row| login_matches_request(&row.origin, &row.username, origin, username))
+    }
+
+    /// Vault-aware graft for a live turn: drop Use-saved when Settings has
+    /// no matching row, and POST `missing` so the agent does not park forever.
+    fn graft_turn_parts(
+        &mut self,
+        parts: Vec<ChatPart>,
+        conversation_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Vec<ChatPart> {
+        if let Some(id) = conversation_id {
+            self.queue_empty_vault_credential_misses(&parts, id, cx);
+        }
+        let grafted = self.graft_user_forms(parts);
+        if let Some(id) = conversation_id {
+            self.sweep_empty_vault_credential_requests(id, cx);
+        }
+        grafted
+    }
+
+    fn queue_empty_vault_credential_misses(
+        &mut self,
+        parts: &[ChatPart],
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.site_logins_ready {
+            return;
+        }
+        let unmatched: Vec<CredentialRequestSpec> = parts
+            .iter()
+            .filter_map(|part| match part {
+                ChatPart::CredentialRequest(spec)
+                    if self.should_auto_miss_credential_request(spec) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for spec in unmatched {
+            self.auto_miss_empty_vault_credential_request(spec, conversation_id, cx);
+        }
+    }
+
+    fn should_auto_miss_credential_request(&self, spec: &CredentialRequestSpec) -> bool {
+        spec.is_unresolved()
+            && self.site_logins_ready
+            && !self
+                .credential_request_resolutions
+                .contains_key(&spec.request_id)
+            && !self.credential_auto_missing.contains(&spec.request_id)
+            && !self.has_matching_saved_login(&spec.origin, spec.username.as_deref())
+    }
+
+    fn sweep_empty_vault_credential_requests(
+        &mut self,
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.site_logins_ready {
+            return;
+        }
+        let unmatched: Vec<CredentialRequestSpec> = self
+            .conversations
+            .iter()
+            .filter(|conversation| conversation.id == conversation_id)
+            .flat_map(|conversation| conversation.messages.iter())
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                ChatPart::CredentialRequest(spec)
+                    if self.should_auto_miss_credential_request(spec) =>
+                {
+                    Some(spec.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for spec in unmatched {
+            self.auto_miss_empty_vault_credential_request(spec, conversation_id, cx);
+        }
+        self.strip_auto_missed_credential_requests(conversation_id);
+    }
+
+    fn strip_auto_missed_credential_requests(&mut self, conversation_id: &str) {
+        let auto_missed = &self.credential_auto_missing;
+        let ready = self.site_logins_ready;
+        let logins = &self.site_logins;
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            for message in &mut conversation.messages {
+                message.parts.retain(|part| match part {
+                    ChatPart::CredentialRequest(spec) => keep_credential_request_offer(
+                        spec.is_settled(),
+                        logins.iter().any(|row| {
+                            login_matches_request(
+                                &row.origin,
+                                &row.username,
+                                &spec.origin,
+                                spec.username.as_deref(),
+                            )
+                        }),
+                        auto_missed.contains(&spec.request_id),
+                        ready,
+                    ),
+                    _ => true,
+                });
+            }
+        }
+    }
+
+    fn auto_miss_empty_vault_credential_request(
+        &mut self,
+        spec: CredentialRequestSpec,
+        conversation_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.credential_auto_missing.insert(spec.request_id.clone()) {
+            return;
+        }
+        if !spec.run_id.is_empty() {
+            self.empty_vault_continue_runs.insert(spec.run_id.clone());
+            self.begin_responding(Some(conversation_id), "Working");
+        } else {
+            self.settle_chrome_and_drain(conversation_id, cx);
+        }
+        let request_id = spec.request_id.clone();
+        let run_id = spec.run_id.clone();
+        let conversation = conversation_id.to_string();
+        let agent_id = self.active_coworker_id.clone().unwrap_or_default();
+        let client = self.opengrok.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if let Some(client) = client {
+                let _ = client
+                    .post_credential_result(
+                        CredentialResultStatus::Missing,
+                        &request_id,
+                        None,
+                        &agent_id,
+                    )
+                    .await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                if !run_id.is_empty() {
+                    state.begin_responding(Some(&conversation), "Working");
+                    state.follow_run(run_id, Some(conversation), cx);
+                } else {
+                    state.settle_chrome_and_drain(&conversation, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// After Continue, `follow_run` / SSE overwrite `message.parts` from the
@@ -6579,7 +7086,7 @@ impl AppState {
         for (card_key, entry_id) in flush {
             self.flush_pending_box_handoff(&card_key, &entry_id, cx);
         }
-        self.sync_waiting_chrome(conversation_id);
+        self.settle_chrome_and_drain(conversation_id, cx);
     }
 
     fn post_box_handoff_resolve(
@@ -6634,7 +7141,7 @@ impl AppState {
                         }
                     }
                 }
-                state.sync_waiting_chrome(&conversation_id);
+                state.settle_chrome_and_drain(&conversation_id, cx);
                 cx.notify();
             });
         })
@@ -6754,9 +7261,12 @@ impl AppState {
     fn paint_user_form_resolution(&mut self, card_key: &str, resolution: FormResolution) {
         let (prior, call_id) = match self.user_form_mut(card_key) {
             Some(spec) => {
+                // Outer `None`: mid-Sending, leave the stored prior alone.
+                // `Some(None)`: the card was idle, and that is stored too. The
+                // old `.flatten()` folded both into `None`, so idle was never
+                // recorded and could never be restored.
                 let prior = (spec.resolution != Some(FormResolution::Sending))
-                    .then_some(spec.effective_resolution())
-                    .flatten();
+                    .then(|| spec.effective_resolution());
                 (prior, spec.call_id.clone())
             }
             None => (None, String::new()),
@@ -6837,10 +7347,17 @@ impl AppState {
         }
         if let Some(prior) = self.user_form_restore.remove(card_key) {
             if let Some(spec) = self.user_form_mut(card_key) {
-                spec.resolution = Some(prior);
+                spec.resolution = prior;
             }
-            self.user_form_resolutions
-                .insert(card_key.to_string(), prior);
+            match prior {
+                Some(prior) => {
+                    self.user_form_resolutions
+                        .insert(card_key.to_string(), prior);
+                }
+                None => {
+                    self.user_form_resolutions.remove(card_key);
+                }
+            }
         }
         self.restore_computer_handoff(card_key);
     }
@@ -6902,8 +7419,21 @@ impl AppState {
                     Ok(rows) => {
                         state.site_logins = rows;
                         state.site_login_error = None;
+                        // Only a successful read makes the vault readable (the
+                        // contract at credential.rs:316). Every auto-miss guard keys
+                        // on this flag, so setting it on the error arm too made a
+                        // vault that failed to open answer `missing` to every
+                        // request. Left false, the person is asked instead.
+                        state.site_logins_ready = true;
                     }
                     Err(err) => state.site_login_error = Some(err.to_string()),
+                }
+                // Only the conversation on screen. Sweeping every conversation
+                // re-decided credential cards settled months ago: `missing` was
+                // POSTed for request ids that no longer existed, unrelated
+                // threads flipped to Working, and finished runs were polled again.
+                if let Some(id) = state.active_conversation_id.clone() {
+                    state.sweep_empty_vault_credential_requests(&id, cx);
                 }
                 cx.notify();
             });
@@ -6996,13 +7526,38 @@ impl AppState {
         }
     }
 
-    fn remove_credential_request_part(&mut self, request_id: &str) {
+    fn conversation_id_for_credential_request(&self, request_id: &str) -> Option<String> {
+        self.conversations.iter().find_map(|conversation| {
+            conversation
+                .messages
+                .iter()
+                .flat_map(|message| message.parts.iter())
+                .any(|part| {
+                    matches!(
+                        part,
+                        ChatPart::CredentialRequest(spec) if spec.request_id == request_id
+                    )
+                })
+                .then(|| conversation.id.clone())
+        })
+    }
+
+    fn paint_credential_request_resolution(
+        &mut self,
+        request_id: &str,
+        resolution: CredentialRequestResolution,
+    ) {
+        self.credential_request_resolutions
+            .insert(request_id.to_string(), resolution);
         for conversation in &mut self.conversations {
             for message in &mut conversation.messages {
-                message.parts.retain(|part| match part {
-                    ChatPart::CredentialRequest(spec) => spec.request_id != request_id,
-                    _ => true,
-                });
+                for part in &mut message.parts {
+                    if let ChatPart::CredentialRequest(spec) = part
+                        && spec.request_id == request_id
+                    {
+                        spec.resolution = Some(resolution);
+                    }
+                }
             }
         }
     }
@@ -7080,8 +7635,12 @@ impl AppState {
         .detach();
     }
 
-    /// Confirm or deny `credential.request`. A.0 never types into Box and never
-    /// posts `filled` — that status is the session broker (A.1).
+    /// Confirm or deny `credential.request`. Folds the card immediately
+    /// (Dismissed / Used saved login / None saved), the way user-form
+    /// Continue/Dismiss leave a remnant. A.0 never types into Box and never
+    /// posts `filled` — that status is the session broker (A.1). Use saved
+    /// with no Settings→Logins row folds None saved (REST `missing`), not
+    /// Used.
     pub fn answer_credential_request(
         &mut self,
         request_id: String,
@@ -7091,31 +7650,60 @@ impl AppState {
         let Some(spec) = self.credential_request_spec(&request_id) else {
             return;
         };
+        if spec.is_settled() {
+            return;
+        }
+        let conversation_id = self
+            .conversation_id_for_credential_request(&request_id)
+            .or_else(|| self.active_conversation_id.clone());
+        let matching = self.has_matching_saved_login(&spec.origin, spec.username.as_deref());
+        let resolution = fold_credential_answer(allow, matching);
+        debug_assert_ne!(
+            resolution,
+            CredentialRequestResolution::Filled,
+            "A.0 must not fold Filled without the session broker"
+        );
+        self.paint_credential_request_resolution(&request_id, resolution);
+        if allow && !spec.run_id.is_empty() {
+            // Folded Used/Missing must not keep Waiting chrome; follow_run
+            // takes Working after the vault/broker result posts.
+            self.begin_responding(conversation_id.as_deref(), "Working");
+        } else if let Some(id) = conversation_id.as_deref() {
+            // Chrome only: the server may resume the run on the declined result, and the
+            // app does not follow that run, so a held message must not be posted over it.
+            self.sync_waiting_chrome(id);
+        }
+        cx.notify();
         let vault = self.site_login_vault.clone();
         let agent_id = self.active_coworker_id.clone().unwrap_or_default();
         let client = self.opengrok.clone();
-        self.remove_credential_request_part(&request_id);
-        cx.notify();
+        let origin = registrable_origin(&spec.origin).unwrap_or_else(|| spec.origin.clone());
+        let username = spec.username.clone();
+        let run_id = spec.run_id.clone();
         cx.spawn(async move |this, cx| {
-            let (status, credential_id) = match vault {
-                None => (CredentialResultStatus::Error, None),
-                Some(vault) => {
-                    let row = vault
-                        .find(&spec.origin, spec.username.as_deref())
-                        .await
-                        .ok()
-                        .flatten();
-                    let have_meta = row.is_some();
-                    let have_secret = row
-                        .as_ref()
-                        .is_some_and(|row| vault.secret_present(&row.id));
-                    let status = result_without_broker(allow, have_meta, have_secret);
-                    debug_assert_ne!(
-                        status,
-                        CredentialResultStatus::Filled,
-                        "A.0 must not claim filled without the session broker"
-                    );
-                    (status, row.map(|row| row.id))
+            let (status, credential_id) = if !allow {
+                (CredentialResultStatus::Denied, None)
+            } else {
+                match vault {
+                    None => (CredentialResultStatus::Error, None),
+                    Some(vault) => {
+                        let row = vault
+                            .find(&origin, username.as_deref())
+                            .await
+                            .ok()
+                            .flatten();
+                        let have_meta = row.is_some();
+                        let have_secret = row
+                            .as_ref()
+                            .is_some_and(|row| vault.secret_present(&row.id));
+                        let status = result_without_broker(true, have_meta, have_secret);
+                        debug_assert_ne!(
+                            status,
+                            CredentialResultStatus::Filled,
+                            "A.0 must not claim filled without the session broker"
+                        );
+                        (status, row.map(|row| row.id))
+                    }
                 }
             };
             if let Some(client) = client {
@@ -7129,10 +7717,18 @@ impl AppState {
                     .await;
             }
             let _ = this.update(cx, |state, cx| {
-                if !spec.run_id.is_empty() {
-                    let conversation_id = state.active_conversation_id.clone();
+                // Use saved with no vault hit must not keep a success remnant.
+                if allow && status == CredentialResultStatus::Missing {
+                    state.paint_credential_request_resolution(
+                        &request_id,
+                        CredentialRequestResolution::Missing,
+                    );
+                }
+                // Not now must not restart Working; Use saved follows the
+                // parked run after the vault/broker result posts.
+                if allow && !run_id.is_empty() {
                     state.begin_responding(conversation_id.as_deref(), "Working");
-                    state.follow_run(spec.run_id.clone(), conversation_id, cx);
+                    state.follow_run(run_id, conversation_id, cx);
                 }
                 cx.notify();
             });
@@ -7214,6 +7810,8 @@ impl AppState {
                 self.push_computer_window_attention(cx);
             }
         }
+        // Chrome only: the POST below resumes the parked run on the server, so the thread is
+        // not idle yet. The queue is looked at once the server has answered.
         self.sync_waiting_chrome(&conversation_id);
         cx.notify();
         if let UserFormDispatch::ResolveHandoff(resolution) = action {
@@ -7244,12 +7842,14 @@ impl AppState {
         }
         if entry_id.is_empty() {
             // Local Dismiss / Open the screen on call-* (#140). Never POST
-            // callId as entryId, never restore the optimistic settle.
+            // callId as entryId, never restore the optimistic settle. Nothing resumes on
+            // the server, so a held message may go now.
+            self.drain_queued_send(&conversation_id, cx);
             return;
         }
         let Some(client) = self.opengrok.clone() else {
             self.restore_user_form(&card_key);
-            self.sync_waiting_chrome(&conversation_id);
+            self.settle_chrome_and_drain(&conversation_id, cx);
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -7373,7 +7973,7 @@ impl AppState {
                         }
                     }
                 }
-                state.sync_waiting_chrome(&conversation_id);
+                state.settle_chrome_and_drain(&conversation_id, cx);
                 cx.notify();
             });
         })
@@ -7405,6 +8005,17 @@ impl AppState {
     }
 
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
+        self.send_message_with(content, false, cx);
+    }
+
+    /// `force_steer` is ⌘⇧↩: send now even if a turn is running. What that
+    /// means for each state of the thread is [`plan_send`].
+    pub fn send_message_with(
+        &mut self,
+        content: String,
+        force_steer: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_signed_in() {
             self.auth_error = Some("Sign in first".to_string());
             cx.notify();
@@ -7427,11 +8038,25 @@ impl AppState {
             Some(id) => id.clone(),
             None => return,
         };
+        // Decided before the bubble goes in: a forced send over a running turn stops that turn
+        // first, so its "You stopped this turn." lands under the turn it is about, not under
+        // the message that stopped it.
+        let busy = self.busy_state(&conversation_id);
+        let plan = plan_send(busy, self.on_send, force_steer);
+        let stop_first = if plan == SendPlan::Steer && busy == Busy::Running {
+            self.take_running_turn_for_steer(cx)
+        } else {
+            None
+        };
+        // The recipe as it stands now, not when the turn reaches the wire: the composer clears
+        // it the moment the draft is sent, and a held message must still carry it.
+        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
 
         let local_id = uuid::Uuid::now_v7().to_string();
         // The whole reply, not just its preview: the bubble paints the preview, and the quote
         // the coworker is sent is built from the message this one points at.
         let reply = self.reply_to.take();
+        let reply_for_queue = reply.clone();
         // Add user message to UI immediately
         if let Some(conversation) = self
             .conversations
@@ -7491,6 +8116,15 @@ impl AppState {
                 {
                     Ok(id) => {
                         this.update(cx, |state, cx| {
+                            // A held message follows its bubble to the saved id, or the
+                            // "Queued" pill would come off the moment the save landed.
+                            if let Some(queue) = state.queued_sends.get_mut(&conversation_id_clone)
+                            {
+                                for queued in queue.iter_mut().filter(|q| q.message_id == local_id)
+                                {
+                                    queued.message_id = id.clone();
+                                }
+                            }
                             if let Some(conversation) = state
                                 .conversations
                                 .iter_mut()
@@ -7514,26 +8148,116 @@ impl AppState {
             .detach();
         }
 
-        if self.has_open_approval(&conversation_id) || self.has_open_user_form(&conversation_id) {
-            // The card is this thread's, and so is the line saying what it is waiting for.
-            if self.has_open_user_form(&conversation_id) {
-                let run_id = self
-                    .live_turns
-                    .get(&conversation_id)
-                    .map(|turn| turn.run_id.clone())
-                    .unwrap_or_default();
-                self.park_waiting_for_you(&conversation_id, &run_id);
-            } else {
-                self.finish_responding(Some(&conversation_id), true);
+        match plan {
+            SendPlan::Post => {}
+            // Held until the thread is idle; `drain_queued_send` posts it then. The bubble is
+            // on screen and on its way to disk already, so nothing is lost if the app quits
+            // first — the row reads as a message that got no answer, which is what it is.
+            SendPlan::Queue => {
+                self.queued_sends
+                    .entry(conversation_id)
+                    .or_default()
+                    .push_back(QueuedSend {
+                        message_id: local_id,
+                        content,
+                        recipe,
+                        reply: reply_for_queue,
+                    });
+                cx.notify();
+                return;
             }
-            cx.notify();
+            // Parked: the server ends the parked run on this message and closes its cards;
+            // the app paints the same ending (Superseded) and never `/stop`s first — see
+            // `settle_parked_cards`. Running: the turn was stopped above, the way the button
+            // does it, and this message goes now. Anything already held stays held — the
+            // message the person forced ahead goes first, and the rest follow when it ends.
+            SendPlan::Steer => {
+                if busy == Busy::Parked {
+                    self.settle_parked_cards(&conversation_id);
+                }
+            }
+        }
+        self.send_opengrok_turn_with(conversation_id, content, recipe, stop_first, cx);
+    }
+
+    /// Post the next held message, if the thread has one and is idle — and is the open
+    /// thread, since a turn is sent for the open coworker. Called wherever a thread can go
+    /// idle: the ending of a live, replayed or followed run, a card settling with no run
+    /// after it, and coming back to the thread. Safe to call anywhere else too: it is a no-op
+    /// while anything is running or parked.
+    fn drain_queued_send(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        // Nothing held is the common case, and this runs on every frame: answer it before
+        // walking the thread for its busy state.
+        if !self
+            .queued_sends
+            .get(conversation_id)
+            .is_some_and(|queue| !queue.is_empty())
+        {
             return;
         }
-        if self.is_active_bot_responding() {
-            cx.notify();
+        if self.active_conversation_id.as_deref() != Some(conversation_id)
+            || self.busy_state(conversation_id) != Busy::Idle
+        {
             return;
         }
-        self.send_opengrok_turn(conversation_id, content, cx);
+        // A turn that cannot leave stays held rather than popped and lost: the signed-out
+        // banner already says why, and the pill keeps saying the message is waiting.
+        if self.opengrok.is_none() || !self.can_send_turn() {
+            return;
+        }
+        let Some(next) = self
+            .queued_sends
+            .get_mut(conversation_id)
+            .and_then(VecDeque::pop_front)
+        else {
+            return;
+        };
+        if self
+            .queued_sends
+            .get(conversation_id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.queued_sends.remove(conversation_id);
+        }
+        // The turn is built from the thread as it is in memory. A reload may have replaced the
+        // thread from disk meanwhile: the bubble is there under its saved id, or — if the save
+        // never landed — not at all, in which case it is put back so the coworker is sent what
+        // the person typed.
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+            && !conversation
+                .messages
+                .iter()
+                .any(|m| m.id == next.message_id)
+        {
+            conversation.messages.push(Message {
+                id: next.message_id.clone(),
+                sender: "Me".to_string(),
+                content: next.content.clone(),
+                sent_at: SystemTime::now(),
+                is_me: true,
+                reply_preview: next.reply.as_ref().map(|r| r.preview.clone()),
+                reply_to_id: next.reply.as_ref().map(|r| r.message_id.clone()),
+                reply_is_me: next.reply.as_ref().is_some_and(|r| r.is_me),
+                parts: Vec::new(),
+                run_id: None,
+            });
+        }
+        self.send_opengrok_turn_with(
+            conversation_id.to_string(),
+            next.content,
+            next.recipe,
+            None,
+            cx,
+        );
+    }
+
+    /// Waiting chrome, then the queue: the two things a thread going idle has to settle.
+    fn settle_chrome_and_drain(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        self.sync_waiting_chrome(conversation_id);
+        self.drain_queued_send(conversation_id, cx);
     }
 
     fn has_open_approval(&self, conversation_id: &str) -> bool {
@@ -7573,7 +8297,7 @@ impl AppState {
                             || spec.effective_resolution() == Some(FormResolution::Sending)
                             || spec.live_computer_handoff()
                     }
-                    ChatPart::CredentialRequest(_) => true,
+                    ChatPart::CredentialRequest(spec) => spec.is_unresolved(),
                     _ => false,
                 })
         })
@@ -7648,32 +8372,53 @@ impl AppState {
     }
 
     pub fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let next = match self.theme_mode.as_str() {
-            "light" => "dark",
-            "dark" => "system",
-            _ => "light",
-        };
+        use gpui_kit::component::{ActiveTheme, Theme};
+
+        let visually_dark = cx.has_global::<Theme>() && cx.theme().is_dark();
+        let next = crate::theme::next_toggle_mode(&self.theme_mode, visually_dark);
         self.set_theme_mode(next, cx);
     }
 
-    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
-        use gpui_kit::component::{Theme, ThemeRegistry};
+    pub fn restore_saved_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_mode = crate::theme::load_saved_mode();
+        crate::theme::apply_mode(&self.theme_mode, cx);
+        cx.notify();
+    }
 
-        self.theme_mode = mode.to_string();
-        let theme_name = match self.theme_mode.as_str() {
-            "light" => "macOS Classic Light",
-            "dark" => "macOS Classic Dark",
-            "system" => "macOS Classic Dark",
-            _ => "macOS Classic Light",
-        };
-        if let Some(theme) = ThemeRegistry::global(cx)
-            .themes()
-            .get(&SharedString::from(theme_name))
-            .cloned()
-        {
-            Theme::global_mut(cx).apply_config(&theme);
-            Theme::sync_base(cx);
+    pub fn restore_saved_on_send(&mut self) {
+        self.on_send = crate::prefs::load_on_send(&Config::data_dir());
+    }
+
+    pub fn set_on_send(&mut self, on_send: OnSend, cx: &mut Context<Self>) {
+        if self.on_send != on_send {
+            self.on_send = on_send;
+            #[cfg(not(test))]
+            crate::prefs::save_on_send(&Config::data_dir(), on_send);
+            cx.notify();
         }
+    }
+
+    /// The bubble is on screen but its turn has not gone yet.
+    pub fn is_send_queued(&self, message_id: &str) -> bool {
+        self.queued_sends
+            .values()
+            .flatten()
+            .any(|queued| queued.message_id == message_id)
+    }
+
+    /// How many messages the open thread is holding back.
+    pub fn queued_send_count(&self) -> usize {
+        self.active_conversation_id
+            .as_deref()
+            .and_then(|id| self.queued_sends.get(id))
+            .map_or(0, VecDeque::len)
+    }
+
+    pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        self.theme_mode = crate::theme::normalize_mode(mode).to_string();
+        #[cfg(not(test))]
+        crate::theme::save_mode(&self.theme_mode);
+        crate::theme::apply_mode(&self.theme_mode, cx);
         cx.notify();
     }
 
@@ -8372,15 +9117,17 @@ mod tests {
     use super::{
         ActiveRecipe, ActivityTick, AppState, BotActivity, ChatMessage, ChatPart, Conversation,
         DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
-        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, STOP_UNSENT_NOTE,
-        STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler,
-        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
-        apply_reload, bot_status_line, graft_reply, is_status_line, is_tool_standin,
-        is_unsent_turn_note, missing_replies, overlay_server_cards, reads_as_gateway_unreachable,
-        reply_from_replay, restored_parts, saved_parts, stream_paint_due, stream_part_sig,
-        streaming_message_mut,
+        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
+        STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
+        TurnAssembler, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
+        apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
+        is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
+        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
+        stream_paint_due, stream_part_sig, streaming_message_mut,
     };
-    use crate::opengrok::{Failure, FormResolution, ModelEntry, OpenGrokClient};
+    use crate::opengrok::{
+        CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
+    };
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -8724,6 +9471,7 @@ mod tests {
                 origin: "google.com".into(),
                 username: Some("ada@example.com".into()),
                 run_id: "run-1".into(),
+                resolution: None,
             }),
         ];
         assert!(saved_parts(&live).is_empty());
@@ -8902,7 +9650,14 @@ mod tests {
                     format!("save-login {} {}", spec.origin, spec.username)
                 }
                 ChatPart::CredentialRequest(spec) => {
-                    format!("credential-request {} {}", spec.origin, spec.request_id)
+                    format!(
+                        "credential-request {} {} {}",
+                        spec.origin,
+                        spec.request_id,
+                        spec.resolution
+                            .map(|resolution| resolution.as_str())
+                            .unwrap_or("idle")
+                    )
                 }
             })
             .collect()
@@ -9941,6 +10696,172 @@ mod tests {
         assert_eq!(state.open_user_forms().len(), 1);
     }
 
+    fn parked_form() -> crate::opengrok::UserFormSpec {
+        crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "runId": "run_1",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// A card painted mid-stream is already parked, and a send over it is a
+    /// steer that settles the card here: the server closes it on the same
+    /// message, and the app must not `/stop` the run first.
+    #[test]
+    fn a_form_painted_mid_stream_is_parked_and_a_steer_settles_it() {
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(parked_form())];
+        let mut state = mid_turn(at(bot, 20));
+        assert!(state.has_open_user_form("cw_1"));
+        assert_eq!(state.busy_state("cw_1"), Busy::Parked);
+
+        state.settle_parked_cards("cw_1");
+        assert!(!state.has_open_user_form("cw_1"));
+        assert!(!state.has_hitl_to_interrupt("cw_1"));
+        let spec = state
+            .conversations
+            .iter()
+            .flat_map(|c| c.messages.iter())
+            .flat_map(|m| m.parts.iter())
+            .find_map(|part| match part {
+                ChatPart::UserForm(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            spec.effective_resolution(),
+            Some(FormResolution::Superseded)
+        );
+        assert_eq!(
+            state.busy_state("cw_1"),
+            Busy::Running,
+            "the stream that painted the card is still open; it is not parked any more"
+        );
+    }
+
+    /// An open approval and a live Computer handoff are parked too, and a
+    /// steer settles both: the approval reads Superseded (no allow, no deny
+    /// line), the handoff is skipped, and neither keeps the thread parked.
+    #[test]
+    fn an_open_approval_or_live_handoff_is_parked_and_a_steer_settles_it() {
+        let approval = crate::opengrok::ApprovalSpec {
+            run_id: "run_1".into(),
+            call_id: "c1".into(),
+            tool: "Shell".into(),
+            command: "ls".into(),
+            why: String::new(),
+            reason: "exec-consent".into(),
+            output: None,
+            ok: None,
+        };
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::Approval(approval)];
+        let mut state = mid_turn(at(bot, 20));
+        state.finish_responding(Some("cw_1"), true);
+        assert!(state.has_open_approval("cw_1"));
+        assert_eq!(state.busy_state("cw_1"), Busy::Parked);
+        state.settle_parked_cards("cw_1");
+        assert!(!state.has_open_approval("cw_1"));
+        assert_eq!(
+            state.approval_decisions.get("c1"),
+            Some(&ApprovalDecision::Superseded)
+        );
+        assert_eq!(
+            state.thread_status("cw_1"),
+            None,
+            "Waiting for approval is gone"
+        );
+
+        let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "callId": "call-9",
+            "entryId": "e_form",
+            "reason": "user-form",
+            "arguments": {
+                "title": "Website login",
+                "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+            }
+        }))
+        .unwrap();
+        let mut form_bot = message("m_live", false, "");
+        form_bot.parts = vec![ChatPart::UserForm(spec)];
+        let mut handoff = mid_turn(at(form_bot, 20));
+        handoff.park_waiting_for_you("cw_1", "run_1");
+        handoff.paint_user_form_resolution("e_form", FormResolution::Dismissed);
+        handoff.set_computer_handoff(
+            "e_form",
+            crate::opengrok::ComputerHandoffStatus::ActionNeeded,
+        );
+        assert!(
+            handoff.has_open_user_form("cw_1"),
+            "live Computer handoff is HITL"
+        );
+        assert_eq!(handoff.busy_state("cw_1"), Busy::Parked);
+        handoff.settle_parked_cards("cw_1");
+        assert!(!handoff.has_open_user_form("cw_1"));
+        assert_eq!(
+            handoff.user_form_computer_handoffs.get("e_form"),
+            Some(&crate::opengrok::ComputerHandoffStatus::Skipped)
+        );
+        assert_eq!(handoff.busy_state("cw_1"), Busy::Idle);
+    }
+
+    /// A working turn with no card is running, not parked: a plain send is
+    /// held (queue) rather than sent over it, and nothing settles.
+    #[test]
+    fn a_working_turn_without_hitl_is_running_not_parked() {
+        let state = mid_turn(at(message("m_live", false, ""), 20));
+        assert!(state.is_active_bot_responding());
+        assert!(state.is_turn_in_flight());
+        assert_eq!(state.busy_state("cw_1"), Busy::Running);
+        assert_eq!(
+            crate::send_policy::plan_send(Busy::Running, crate::send_policy::OnSend::Queue, false),
+            crate::send_policy::SendPlan::Queue
+        );
+    }
+
+    /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle.
+    #[test]
+    fn cold_composer_send_is_idle() {
+        let mut state = AppState::new();
+        state
+            .conversations
+            .push(thread("cw_1", vec![at(message("m_hi", true, "hi"), 10)]));
+        state.active_conversation_id = Some("cw_1".to_string());
+        state.active_coworker_id = Some("cw_1".to_string());
+        assert!(!state.has_open_user_form("cw_1"));
+        assert!(!state.has_open_approval("cw_1"));
+        assert!(!state.has_hitl_to_interrupt("cw_1"));
+        assert_eq!(state.busy_state("cw_1"), Busy::Idle);
+    }
+
+    /// The run finished and left the card (**Waiting for you**). A send is a
+    /// steer: the card settles as Superseded, the Waiting chrome goes, the
+    /// parked-run entry goes, and the thread reads idle — nothing to `/stop`.
+    #[test]
+    fn a_parked_steer_settles_every_card_and_clears_waiting() {
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::UserForm(parked_form())];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+        assert_eq!(state.busy_state("cw_1"), Busy::Parked);
+
+        state.settle_parked_cards("cw_1");
+        assert!(!state.has_hitl_to_interrupt("cw_1"));
+        assert_eq!(state.thread_status("cw_1"), None);
+        assert_eq!(state.busy_state("cw_1"), Busy::Idle);
+    }
+
     #[test]
     fn skip_clears_waiting_when_no_open_form_or_handoff_remains() {
         let spec = crate::opengrok::UserFormSpec::from_custom_event(&serde_json::json!({
@@ -10257,13 +11178,235 @@ mod tests {
         assert_ne!(pending.resolution.as_str(), "e_form");
     }
 
+    fn facebook_credential_request() -> crate::opengrok::CredentialRequestSpec {
+        crate::opengrok::CredentialRequestSpec {
+            request_id: "req-fb".into(),
+            origin: "facebook.com".into(),
+            username: None,
+            run_id: "run_1".into(),
+            resolution: None,
+        }
+    }
+
+    fn demo_credential_request() -> crate::opengrok::CredentialRequestSpec {
+        crate::opengrok::CredentialRequestSpec {
+            request_id: "req-demo".into(),
+            origin: "http://127.0.0.1:8765/".into(),
+            username: Some("ada".into()),
+            run_id: "run_1".into(),
+            resolution: None,
+        }
+    }
+
+    fn saved_login_row(origin: &str, username: &str) -> crate::site_login::SiteLoginRecord {
+        crate::site_login::SiteLoginRecord {
+            id: format!("cred-{origin}-{username}"),
+            origin: origin.to_string(),
+            username: username.to_string(),
+            label: format!("{username} on {origin}"),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        }
+    }
+
+    #[test]
+    fn not_now_folds_credential_request_and_clears_waiting() {
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+        assert!(state.has_open_user_form("cw_1"));
+        assert!(state.has_hitl_to_interrupt("cw_1"));
+        assert_eq!(state.thread_status("cw_1"), Some(WAITING_FOR_YOU_STATUS));
+
+        state.paint_credential_request_resolution("req-fb", CredentialRequestResolution::Denied);
+        state.sync_waiting_chrome("cw_1");
+
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "folded Dismissed is not open HITL"
+        );
+        assert!(
+            !state.has_hitl_to_interrupt("cw_1"),
+            "Not now leaves nothing parked: the next send is a plain post"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Denied));
+        assert_eq!(spec.pill(), Some("Dismissed"));
+        assert!(
+            state.conversations[0].messages.iter().any(|message| {
+                message
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, ChatPart::CredentialRequest(_)))
+            }),
+            "Not now must leave a transcript remnant, not vanish"
+        );
+    }
+
+    #[test]
+    fn use_saved_folds_used_login_not_filled_without_broker() {
+        assert!(!crate::site_login::SESSION_BROKER_AVAILABLE);
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        state.paint_credential_request_resolution("req-fb", CredentialRequestResolution::Used);
+        state.sync_waiting_chrome("cw_1");
+
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Used));
+        assert_eq!(spec.pill(), Some("Used saved login"));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Filled));
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "Used remnant must not keep Waiting"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+    }
+
+    #[test]
+    fn graft_keeps_folded_credential_request_across_sse() {
+        let mut state = AppState::new();
+        state
+            .credential_request_resolutions
+            .insert("req-fb".into(), CredentialRequestResolution::Denied);
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert_eq!(spec.resolution, Some(CredentialRequestResolution::Denied));
+                assert_eq!(spec.pill(), Some("Dismissed"));
+                assert!(!spec.is_unresolved());
+            }
+            other => panic!("expected folded remnant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_drops_idle_credential_request_when_vault_has_no_row() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        assert!(
+            grafted.is_empty(),
+            "empty Settings→Logins must not offer Use saved: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn graft_keeps_idle_credential_request_when_origin_matches_a_login() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state
+            .site_logins
+            .push(saved_login_row("facebook.com", "ada"));
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert!(spec.is_unresolved());
+                assert_eq!(spec.origin, "facebook.com");
+            }
+            other => panic!("expected Use-saved card for a real vault row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_matches_demo_origin_url_to_saved_etld() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.site_logins.push(saved_login_row("127.0.0.1", "ada"));
+        let grafted =
+            state.graft_user_forms(vec![ChatPart::CredentialRequest(demo_credential_request())]);
+        match grafted.as_slice() {
+            [ChatPart::CredentialRequest(spec)] => {
+                assert!(spec.is_unresolved());
+                assert_eq!(spec.username.as_deref(), Some("ada"));
+            }
+            other => panic!("expected Use-saved for 127.0.0.1 demo row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graft_drops_named_username_that_does_not_match_the_row() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.site_logins.push(saved_login_row("127.0.0.1", "ada"));
+        let mut spec = demo_credential_request();
+        spec.username = Some("other".into());
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(spec)]);
+        assert!(
+            grafted.is_empty(),
+            "wrong username is not a vault hit: {grafted:?}"
+        );
+    }
+
+    #[test]
+    fn use_saved_with_no_row_folds_none_saved_not_used() {
+        assert!(!crate::site_login::SESSION_BROKER_AVAILABLE);
+        let mut bot = message("m_live", false, "");
+        bot.parts = vec![ChatPart::CredentialRequest(facebook_credential_request())];
+        let mut state = mid_turn(at(bot, 20));
+        state.site_logins_ready = true;
+        state.park_waiting_for_you("cw_1", "run_1");
+
+        let matching = state.has_matching_saved_login("facebook.com", None);
+        assert!(!matching);
+        state.paint_credential_request_resolution(
+            "req-fb",
+            crate::opengrok::fold_credential_answer(true, matching),
+        );
+        state.sync_waiting_chrome("cw_1");
+
+        let spec = state.credential_request_spec("req-fb").expect("remnant");
+        assert_eq!(spec.resolution, Some(CredentialRequestResolution::Missing));
+        assert_eq!(spec.pill(), Some("None saved"));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Used));
+        assert_ne!(spec.resolution, Some(CredentialRequestResolution::Filled));
+        assert!(
+            !state.has_open_user_form("cw_1"),
+            "None saved remnant must not keep Waiting"
+        );
+        assert_eq!(state.thread_status("cw_1"), None);
+    }
+
+    #[test]
+    fn graft_does_not_reoffer_auto_missed_request_after_a_login_is_saved() {
+        let mut state = AppState::new();
+        state.site_logins_ready = true;
+        state.credential_auto_missing.insert("req-fb".into());
+        state
+            .site_logins
+            .push(saved_login_row("facebook.com", "ada"));
+        let grafted = state.graft_user_forms(vec![ChatPart::CredentialRequest(
+            facebook_credential_request(),
+        )]);
+        assert!(
+            grafted.is_empty(),
+            "already-answered missing must not reopen: {grafted:?}"
+        );
+    }
+
     #[test]
     fn egress_tunnel_is_host_and_box_ready() {
         let mut state = AppState::new();
+        assert!(state.egress_tunnel_enabled, "Route traffic defaults ON");
         state.host_egress_tunnel_available = true;
         assert!(
             !state.egress_tunnel_available(),
             "host without a ready box is not a tunnel"
+        );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "unprovisioned hides Route traffic"
         );
         state.coworker_computer = Some(
             serde_json::from_value(serde_json::json!({
@@ -10283,6 +11426,7 @@ mod tests {
             .unwrap(),
         );
         assert!(!state.egress_tunnel_available());
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
         state.host_egress_tunnel_available = false;
         state.coworker_computer = Some(
             serde_json::from_value(serde_json::json!({
@@ -10294,22 +11438,116 @@ mod tests {
         );
         assert!(
             !state.egress_tunnel_available(),
-            "a ready box without host/env is not a tunnel"
+            "a ready box without host/env is not a Review-an-action tunnel"
         );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::BotPane,
+            "provisioned unique box still shows dedicated chrome without host intent"
+        );
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egress_tunnel": { "url": "ws://127.0.0.1:8790" }
+            }))
+            .unwrap(),
+        );
+        state.host_egress_tunnel_available = true;
         assert!(
-            state.show_egress_tunnel_settings(),
-            "box ready still paints the Network row if the host poll missed"
+            state.egress_tunnel_available(),
+            "box tunnel URL is ready for Route traffic"
         );
         state.coworker_computer = None;
         state.host_egress_tunnel_available = true;
         assert!(!state.egress_tunnel_available());
-        assert!(
-            state.show_egress_tunnel_settings(),
-            "host intent paints the row while box status lags"
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "host intent without a provisioned box does not paint Route traffic"
         );
         state.host_egress_tunnel_available = false;
         state.egress_tunnel_enabled = true;
-        assert!(state.show_egress_tunnel_settings());
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "isEgressTunnelAvailable": true
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::Hidden,
+            "host isEgressTunnelAvailable is not box provisioned"
+        );
+    }
+
+    #[test]
+    fn route_traffic_surface_follows_share_scope() {
+        fn computer(extra: serde_json::Value) -> crate::opengrok::CoworkerComputer {
+            let mut body = serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "boxId": "box_1",
+                "egress_tunnel": { "ready": true }
+            });
+            if let serde_json::Value::Object(map) = extra {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.extend(map);
+                }
+            }
+            serde_json::from_value(body).unwrap()
+        }
+        fn coworker(id: &str, box_id: &str) -> Coworker {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "name": id,
+                "boxId": box_id
+            }))
+            .unwrap()
+        }
+
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        state.coworkers = vec![coworker("cw_1", "box_1")];
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "dedicated"
+        })));
+        assert!(state.show_route_traffic_on_bot_pane());
+        assert!(!state.show_route_traffic_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "user"
+        })));
+        assert!(!state.show_route_traffic_on_bot_pane());
+        assert!(state.show_route_traffic_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "group",
+            "groupId": "grp_1"
+        })));
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "org"
+        })));
+        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+
+        state.coworker_computer = Some(computer(serde_json::json!({})));
+        state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_1")];
+        assert!(
+            state.show_route_traffic_in_user_settings(),
+            "missing shareScope + shared boxId is user-level Settings, not both panes"
+        );
+        assert!(!state.show_route_traffic_on_bot_pane());
+
+        state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_2")];
+        assert!(
+            state.show_route_traffic_on_bot_pane(),
+            "missing shareScope + unique box is dedicated pane chrome"
+        );
     }
 
     /// Nothing is in flight, so a stop is a question with the answer "there is nothing to stop".

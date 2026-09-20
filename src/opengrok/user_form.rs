@@ -240,6 +240,9 @@ pub enum FormResolution {
     Escalated,
     Dismissed,
     Skipped,
+    /// A later message moved the thread on. The server closed the card when
+    /// that message arrived; the app paints the same ending at once.
+    Superseded,
 }
 
 impl FormResolution {
@@ -252,6 +255,7 @@ impl FormResolution {
                 Self::Escalated
             }
             "skipped" | "skip" => Self::Skipped,
+            "superseded" => Self::Superseded,
             _ => Self::Dismissed,
         }
     }
@@ -264,6 +268,7 @@ impl FormResolution {
             Self::Escalated => "escalated",
             Self::Dismissed => "dismissed",
             Self::Skipped => "skipped",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -278,6 +283,7 @@ impl FormResolution {
             Self::Escalated => "Dismissed",
             Self::Dismissed => "Dismissed",
             Self::Skipped => "Skipped",
+            Self::Superseded => "Superseded",
         }
     }
 
@@ -292,13 +298,14 @@ impl FormResolution {
             Self::Escalated => "Dismissed without filling anything.",
             Self::Dismissed => "Dismissed without filling anything.",
             Self::Skipped => "Skipped without filling anything.",
+            Self::Superseded => "Moved on to your next message.",
         }
     }
 
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Submitted | Self::FillFailed | Self::Dismissed | Self::Skipped
+            Self::Submitted | Self::FillFailed | Self::Dismissed | Self::Skipped | Self::Superseded
         )
     }
 }
@@ -722,25 +729,23 @@ impl UserFormSpec {
     }
 
     /// Fold an awaiting CUSTOM onto a later send-message envelope (one id
-    /// missing). A second OTP form with a different `entryId` / `callId` is a
-    /// new card — do not merge it onto a password form that already settled.
+    /// missing). Two `request_user_form` cards that each carry a gateway
+    /// `entryId` (or two different `callId`s) are siblings, not twins —
+    /// merging them would gray Continue on the one that lost its id.
     pub fn completes_with(&self, other: &Self) -> bool {
-        if self.has_gateway_entry_id()
-            && other.has_gateway_entry_id()
-            && self.entry_id != other.entry_id
-        {
-            return false;
+        if self.has_gateway_entry_id() && other.has_gateway_entry_id() {
+            return self.entry_id == other.entry_id;
         }
-        if !self.call_id.is_empty() && !other.call_id.is_empty() && self.call_id != other.call_id {
-            return false;
+        if !self.call_id.is_empty() && !other.call_id.is_empty() {
+            return self.call_id == other.call_id;
         }
         true
     }
 
-    /// Continue POST when we have a gateway `entryId`. Required fields are
-    /// an extra Continue gate. `server_fill` is leftover from a global
-    /// missing-route lock that froze every stacked open card — it does not
-    /// disable an unresolved form.
+    /// Continue POST when **this** card has a gateway `entryId`. Required
+    /// fields are a per-card extra gate. `server_fill` is leftover from a
+    /// global missing-route lock that froze every stacked open card — it
+    /// does not disable a sibling that has its own `entryId`.
     pub fn continue_enabled(&self, values: &UserFormValues, server_fill: bool) -> bool {
         self.can_post(server_fill) && self.required_fields_filled(values)
     }
@@ -1717,6 +1722,38 @@ mod tests {
         filled.by_id.insert("password".into(), "s3cret-pass".into());
         assert!(continue_enabled(&spec, &filled, true));
         assert!(USER_FORM_SERVER_FILL_AVAILABLE);
+    }
+
+    #[test]
+    fn stamped_siblings_do_not_complete_with_each_other() {
+        let a = UserFormSpec::from_custom_event(&live_awaiting(Some("e_a"))).expect("a");
+        let mut b_event = live_awaiting(Some("e_b"));
+        b_event["callId"] = json!("call-b");
+        let b = UserFormSpec::from_custom_event(&b_event).expect("b");
+        assert!(a.has_gateway_entry_id() && b.has_gateway_entry_id());
+        assert!(
+            !a.completes_with(&b),
+            "two stamped request_user_form cards are siblings, not twins"
+        );
+        assert!(a.can_post(false) && b.can_post(false));
+        let empty = UserFormValues::default();
+        assert!(!a.continue_enabled(&empty, true));
+        assert!(!b.continue_enabled(&empty, true));
+        let mut filled = UserFormValues::default();
+        filled.by_id.insert("email".into(), "you@gmail.com".into());
+        filled.by_id.insert("password".into(), "s3cret-pass".into());
+        assert!(a.continue_enabled(&filled, true));
+        assert!(
+            b.continue_enabled(&filled, false),
+            "per-card requireds; server_fill must not gray a sibling that has entryId"
+        );
+        let awaiting = UserFormSpec::from_custom_event(&live_awaiting(None)).expect("awaiting");
+        let envelope =
+            UserFormSpec::from_custom_event(&live_awaiting(Some("e_form"))).expect("env");
+        assert!(
+            awaiting.completes_with(&envelope),
+            "awaiting without entryId still folds onto a later stamped envelope"
+        );
     }
 
     #[test]
