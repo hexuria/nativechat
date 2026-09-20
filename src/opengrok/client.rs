@@ -2015,7 +2015,7 @@ impl ScheduleKind {
 ///
 /// The server keeps the key rather than hashing it, so it comes back on every listing and not
 /// only on the create — which is what lets the app show it to the person who set it up.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct WebhookInfo {
     #[serde(default)]
     pub url: String,
