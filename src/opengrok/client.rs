@@ -881,57 +881,32 @@ impl OpenGrokClient {
         ))
     }
 
-    /// Seam A `POST /api/{method}`. Account JWT as Bearer **and**
-    /// `x-opengrok-account`. A 401 here is usually the host bearer, not a
-    /// signed-out AG-UI session — callers must not treat it as sign-out.
-    async fn gateway_command(
-        &self,
-        method: &str,
-        args: Option<&Value>,
-    ) -> Result<Value, OpenGrokError> {
-        let path = format!("/api/{method}");
-        let url = self.url(&path)?;
-        self.ensure_fresh_token("/account").await;
-        let token = self.access_token();
-        let mut req = self.http.post(url);
-        if let Some(token) = token.as_ref() {
-            req = req
-                .bearer_auth(token)
-                .header("x-opengrok-account", token.as_str());
-        }
-        req = req.json(args.unwrap_or(&json!({})));
-        let response = req.send().await.map_err(|e| OpenGrokError::transport(&e))?;
-        let status = response.status().as_u16();
-        if matches!(status, 401 | 403 | 404) {
-            let body = response.text().await.unwrap_or_default();
-            return Err(OpenGrokError::from_server(
-                Some(status),
-                error_message_from_body(&body),
-            ));
-        }
+    /// The host's settings record, on the AG-UI door: `GET /ag-ui/host-settings`, with
+    /// `egressTunnelAvailable` for the coworker named — host intent AND that coworker's box
+    /// advertising the tunnel. Ordinary account auth, like every other AG-UI call; the desktop
+    /// client's `POST /api/{method}` door this once went through is closing with that client.
+    pub async fn host_settings(&self, coworker: Option<&str>) -> Result<Value, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &host_settings_path(coworker), None)
+            .await?;
         Self::json_or_error(response).await
     }
 
-    /// Host `isEgressTunnelAvailable`: env `OG_EGRESS_TUNNEL_ENABLED=1` /
-    /// `SAND_EGRESS_TUNNEL_ENABLED=1` or setting `egressTunnelEnabled`.
-    pub async fn is_egress_tunnel_available(&self) -> Result<bool, OpenGrokError> {
-        let value = self
-            .gateway_command("isEgressTunnelAvailable", None)
+    /// A partial record, merged on the host key by key; the whole record comes back, with the
+    /// same `egressTunnelAvailable` the GET carries.
+    pub async fn patch_host_settings(
+        &self,
+        coworker: Option<&str>,
+        patch: &Value,
+    ) -> Result<Value, OpenGrokError> {
+        let response = self
+            .send_json(
+                reqwest::Method::PUT,
+                &host_settings_path(coworker),
+                Some(patch),
+            )
             .await?;
-        Ok(value.as_bool().unwrap_or_else(|| {
-            value
-                .get("isEgressTunnelAvailable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        }))
-    }
-
-    pub async fn get_host_settings(&self) -> Result<Value, OpenGrokError> {
-        self.gateway_command("getHostSettings", None).await
-    }
-
-    pub async fn set_host_settings(&self, patch: &Value) -> Result<Value, OpenGrokError> {
-        self.gateway_command("setHostSettings", Some(patch)).await
+        Self::json_or_error(response).await
     }
 
     /// Stop a run that is still going.
@@ -1802,7 +1777,23 @@ pub fn env_egress_tunnel_enabled() -> bool {
     )
 }
 
-/// `getHostSettings.egressTunnelEnabled`.
+/// `/ag-ui/host-settings`, with the coworker whose box the egress question is about.
+fn host_settings_path(coworker: Option<&str>) -> String {
+    match coworker {
+        Some(id) if !id.is_empty() => format!("/ag-ui/host-settings?coworker={id}"),
+        _ => "/ag-ui/host-settings".to_string(),
+    }
+}
+
+/// `egressTunnelAvailable` on the host-settings record: the tunnel is live for the coworker
+/// asked about. `Some` only when the host sent the key.
+pub fn host_egress_tunnel_available(settings: &Value) -> Option<bool> {
+    settings
+        .get("egressTunnelAvailable")
+        .and_then(Value::as_bool)
+}
+
+/// `egressTunnelEnabled` on the host-settings record: host intent.
 pub fn host_egress_tunnel_enabled(settings: &Value) -> bool {
     host_egress_tunnel_flag(settings) == Some(true)
 }
@@ -3915,38 +3906,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_is_egress_tunnel_available_reads_boolean() {
+    async fn host_settings_read_the_record_and_its_availability() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/isEgressTunnelAvailable"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(true))
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/host-settings"))
+            .and(wiremock::matchers::query_param("coworker", "cw_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "egressTunnelEnabled": true,
+                "egressTunnelAvailable": true,
+                "hasSeenOnboarding": true
+            })))
+            .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("POST"))
-            .and(path("/api/getHostSettings"))
+        Mock::given(method("PUT"))
+            .and(path("/ag-ui/host-settings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "egressTunnelEnabled": true
+                "egressTunnelEnabled": false,
+                "egressTunnelAvailable": false
             })))
+            .expect(1)
             .mount(&server)
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
-        assert!(client.is_egress_tunnel_available().await.unwrap());
-        let settings = client.get_host_settings().await.unwrap();
+        let settings = client.host_settings(Some("cw_1")).await.unwrap();
         assert!(host_egress_tunnel_enabled(&settings));
+        assert_eq!(host_egress_tunnel_available(&settings), Some(true));
+        let after = client
+            .patch_host_settings(None, &json!({ "egressTunnelEnabled": false }))
+            .await
+            .unwrap();
+        assert_eq!(host_egress_tunnel_flag(&after), Some(false));
+        assert_eq!(host_egress_tunnel_available(&after), Some(false));
+        assert_eq!(
+            host_egress_tunnel_available(&json!({})),
+            None,
+            "a host that did not send the key must not flip the toggle"
+        );
+        assert_eq!(host_settings_path(None), "/ag-ui/host-settings");
+        assert_eq!(host_settings_path(Some("")), "/ag-ui/host-settings");
+        assert_eq!(
+            host_settings_path(Some("cw_1")),
+            "/ag-ui/host-settings?coworker=cw_1"
+        );
     }
 
+    /// The old door's 401 was the shared host bearer and not the session; on the AG-UI door a
+    /// 401 that survives one refresh is the session, like everywhere else.
     #[tokio::test]
-    async fn gateway_is_egress_tunnel_available_401_is_not_signed_out() {
+    async fn host_settings_401_is_the_session() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/isEgressTunnelAvailable"))
-            .respond_with(ResponseTemplate::new(401).set_body_json(json!({ "error": "bad token" })))
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/host-settings"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({ "error": "sign in first" })),
+            )
             .mount(&server)
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
-        let error = client.is_egress_tunnel_available().await.unwrap_err();
+        let error = client.host_settings(None).await.unwrap_err();
         assert_eq!(error.status, Some(401));
-        assert!(!error.is_signed_out());
+        assert!(error.is_signed_out());
     }
 
     #[tokio::test]

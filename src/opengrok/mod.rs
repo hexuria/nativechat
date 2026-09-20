@@ -56,7 +56,8 @@ pub use client::{
     RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape,
     RecipeTapeEvent, RecipeVersion, RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe,
     UpdateStatus, collapse_computer_roster, collapse_computers_by_machine_id,
-    env_egress_tunnel_enabled, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_enabled,
+    host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
 pub use types::{
