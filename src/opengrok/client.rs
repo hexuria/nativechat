@@ -1246,6 +1246,90 @@ impl OpenGrokClient {
         }
     }
 
+    /// The coworker's schedules, which is what a routine is on the server.
+    ///
+    /// The `?coworker=` is the server's filter; the answer is filtered again here on the same
+    /// field, because a server that ignores the query would otherwise put another bot's
+    /// routines under this one's name.
+    pub async fn list_schedules(
+        &self,
+        coworker_id: &str,
+    ) -> Result<Vec<ScheduleRow>, OpenGrokError> {
+        let path = format!("/schedules?coworker={coworker_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        let rows: Vec<ScheduleRow> = Self::json_or_error(response).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.coworker_id.is_empty() || row.coworker_id == coworker_id)
+            .collect())
+    }
+
+    /// Put one on the server. The answer is the whole row, and for a webhook it is the one
+    /// time the app is told the key by anything other than a rotate.
+    pub async fn create_schedule(&self, new: &NewSchedule) -> Result<ScheduleRow, OpenGrokError> {
+        let mut body = json!({
+            "coworkerId": new.coworker_id,
+            "prompt": new.prompt,
+            "kind": new.kind.word(),
+        });
+        if !new.name.trim().is_empty() {
+            body["name"] = json!(new.name);
+        }
+        if let Some(cron) = &new.cron {
+            body["cron"] = json!(cron);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, "/schedules", Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    pub async fn pause_schedule(&self, id: &str) -> Result<(), OpenGrokError> {
+        self.schedule_action(&format!("/schedules/{id}/pause"))
+            .await
+    }
+
+    pub async fn resume_schedule(&self, id: &str) -> Result<(), OpenGrokError> {
+        self.schedule_action(&format!("/schedules/{id}/resume"))
+            .await
+    }
+
+    pub async fn delete_schedule(&self, id: &str) -> Result<(), OpenGrokError> {
+        let path = format!("/schedules/{id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
+    /// A new key for the webhook. The old one stops working the moment this answers, so the
+    /// row it brings back is the only copy of the new one.
+    pub async fn rotate_webhook_key(&self, id: &str) -> Result<ScheduleRow, OpenGrokError> {
+        let path = format!("/schedules/{id}/rotate-key");
+        let response = self
+            .send_json::<()>(reqwest::Method::POST, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// A bodiless POST that answers with nothing worth reading.
+    async fn schedule_action(&self, path: &str) -> Result<(), OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::POST, path, None)
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
     pub async fn enrol_daemon(
         &self,
         label: &str,
@@ -1903,6 +1987,77 @@ pub struct DaemonEnrol {
 struct LocalExecPolicyView {
     #[serde(default)]
     mode: String,
+}
+
+/// What sets a schedule off: the clock, or somebody POSTing to a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduleKind {
+    Webhook,
+    /// Last, and the catch-all: a word this client has no name for is a schedule with a line
+    /// it cannot read, which is a routine that still lists, pauses and deletes.
+    #[default]
+    #[serde(other)]
+    Cron,
+}
+
+impl ScheduleKind {
+    /// The word the server sends and takes.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Cron => "cron",
+            Self::Webhook => "webhook",
+        }
+    }
+}
+
+/// The URL a webhook schedule fires from, and what has to be on the request.
+///
+/// The server keeps the key rather than hashing it, so it comes back on every listing and not
+/// only on the create — which is what lets the app show it to the person who set it up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct WebhookInfo {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub header: String,
+}
+
+/// One schedule as `/schedules` keeps it: a coworker, a prompt, and when to send it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleRow {
+    pub id: String,
+    #[serde(default)]
+    pub coworker_id: String,
+    #[serde(default)]
+    pub kind: ScheduleKind,
+    /// The cron line, on a cron schedule. A webhook has no clock, so this is `null`.
+    #[serde(default)]
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub next_due_ms: Option<i64>,
+    #[serde(default)]
+    pub webhook: Option<WebhookInfo>,
+}
+
+/// What `POST /schedules` is asked for. `cron` is the line for a cron schedule and nothing at
+/// all for a webhook, whose URL and key the server mints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSchedule {
+    pub coworker_id: String,
+    pub kind: ScheduleKind,
+    pub prompt: String,
+    pub name: String,
+    pub cron: Option<String>,
 }
 
 /// The screen every recipe is taught on and played back on, in CSS pixels.
@@ -4643,6 +4798,214 @@ mod tests {
         assert_eq!(list[0].name, "Mail");
         assert_eq!(list[0].relation, RecipeRelation::Shared);
         assert_eq!(list[0].latest_version, 3);
+    }
+
+    #[tokio::test]
+    async fn list_schedules_asks_for_one_coworker_and_reads_both_kinds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules"))
+            .and(wiremock::matchers::query_param("coworker", "cw_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 9 * * *",
+                    "prompt": "Read the inbox", "name": "Morning post", "active": true,
+                    "nextDueMs": 1717000000000i64, "somethingNew": "ignored"
+                },
+                {
+                    "id": "sch_2", "coworkerId": "cw_1", "kind": "webhook", "cron": null,
+                    "prompt": "Deal with it", "active": false,
+                    "webhook": {
+                        "url": "https://og.example/hooks/sch_2",
+                        "key": "og_live_abc",
+                        "header": "Authorization: Bearer og_live_abc"
+                    }
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client.list_schedules("cw_1").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, ScheduleKind::Cron);
+        assert_eq!(rows[0].cron.as_deref(), Some("0 9 * * *"));
+        assert_eq!(rows[0].name.as_deref(), Some("Morning post"));
+        assert!(rows[0].active);
+        assert_eq!(rows[1].kind, ScheduleKind::Webhook);
+        assert_eq!(rows[1].cron, None);
+        assert_eq!(
+            rows[1].webhook.as_ref().map(|hook| hook.key.as_str()),
+            Some("og_live_abc"),
+            "the key is on the listing, not only on the create"
+        );
+    }
+
+    /// A server that ignores `?coworker=` must not put another bot's routines under this one.
+    #[tokio::test]
+    async fn a_row_for_another_coworker_is_dropped() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "* * * * *", "prompt": "mine", "active": true},
+                {"id": "sch_2", "coworkerId": "cw_2", "kind": "cron", "cron": "* * * * *", "prompt": "theirs", "active": true}
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client.list_schedules("cw_1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "sch_1");
+    }
+
+    #[tokio::test]
+    async fn create_schedule_sends_the_cron_line_and_the_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules"))
+            .and(body_json(json!({
+                "coworkerId": "cw_1",
+                "prompt": "Read the inbox",
+                "kind": "cron",
+                "name": "Morning post",
+                "cron": "0 9 * * *"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 9 * * *",
+                "prompt": "Read the inbox", "name": "Morning post", "active": true
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let row = client
+            .create_schedule(&NewSchedule {
+                coworker_id: "cw_1".into(),
+                kind: ScheduleKind::Cron,
+                prompt: "Read the inbox".into(),
+                name: "Morning post".into(),
+                cron: Some("0 9 * * *".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.id, "sch_1");
+        assert!(row.active);
+    }
+
+    /// A webhook is created with no clock at all, and the answer carries the minted URL and key.
+    #[tokio::test]
+    async fn create_schedule_asks_for_a_webhook_without_a_cron_line() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules"))
+            .and(body_json(json!({
+                "coworkerId": "cw_1",
+                "prompt": "Deal with it",
+                "kind": "webhook"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "sch_2", "coworkerId": "cw_1", "kind": "webhook", "cron": null,
+                "prompt": "Deal with it", "active": true,
+                "webhook": {
+                    "url": "https://og.example/hooks/sch_2",
+                    "key": "og_live_abc",
+                    "header": "Authorization: Bearer og_live_abc"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let row = client
+            .create_schedule(&NewSchedule {
+                coworker_id: "cw_1".into(),
+                kind: ScheduleKind::Webhook,
+                prompt: "Deal with it".into(),
+                name: String::new(),
+                cron: None,
+            })
+            .await
+            .unwrap();
+        let hook = row.webhook.unwrap();
+        assert_eq!(hook.url, "https://og.example/hooks/sch_2");
+        assert_eq!(hook.header, "Authorization: Bearer og_live_abc");
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_post_to_the_schedule() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_1/pause"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_1/resume"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client.pause_schedule("sch_1").await.unwrap();
+        client.resume_schedule("sch_1").await.unwrap();
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert_eq!(paths, ["/schedules/sch_1/pause", "/schedules/sch_1/resume"]);
+    }
+
+    #[tokio::test]
+    async fn delete_schedule_keeps_the_servers_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/schedules/sch_1"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("No such schedule."))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.delete_schedule("sch_1").await.unwrap_err();
+        assert_eq!(error.status, Some(404));
+        assert_eq!(error.message, "No such schedule.");
+    }
+
+    #[tokio::test]
+    async fn rotating_a_key_answers_with_the_new_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_2/rotate-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sch_2", "coworkerId": "cw_1", "kind": "webhook", "cron": null,
+                "prompt": "Deal with it", "active": true,
+                "webhook": {
+                    "url": "https://og.example/hooks/sch_2",
+                    "key": "og_live_xyz",
+                    "header": "Authorization: Bearer og_live_xyz"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let row = client.rotate_webhook_key("sch_2").await.unwrap();
+        assert_eq!(row.webhook.unwrap().key, "og_live_xyz");
+    }
+
+    /// Rotating the key of a schedule that has no key is a 409, and the sentence is the
+    /// server's: the app has nothing truer to say about it.
+    #[tokio::test]
+    async fn rotating_a_cron_schedule_is_the_servers_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_1/rotate-key"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_string("This schedule has no webhook key."),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.rotate_webhook_key("sch_1").await.unwrap_err();
+        assert_eq!(error.status, Some(409));
+        assert_eq!(error.message, "This schedule has no webhook key.");
     }
 
     #[tokio::test]

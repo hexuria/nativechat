@@ -58,6 +58,9 @@ pub mod ids {
     pub const HEADER_SETTINGS: &str = "header-settings";
     pub const AGENT_SETTINGS: &str = "agent-settings";
     pub const AGENT_SAVE: &str = "agent-save";
+    /// The one control that opens a blank routine, whichever of its two shapes the Computer
+    /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
+    pub const ROUTINE_NEW: &str = "routine-new";
 
     pub fn session(id: &str) -> String {
         format!("session-{id}")
@@ -77,6 +80,39 @@ pub mod ids {
     /// `composer-recipe-param-<name>` here, `composer-param-<name>` in the panel.
     pub fn recipe_param(name: &str) -> String {
         format!("composer-recipe-param-{name}")
+    }
+
+    /// One routine's row. The id is the schedule's, which is the server's, so a driver that
+    /// made a routine through `routine.create` can address the thing it made.
+    pub fn routine(id: &str) -> String {
+        format!("routine-{id}")
+    }
+
+    /// The two triggers the editor offers, on a routine that has none. Gone once it has one:
+    /// a routine is one schedule, so the second would be a second routine.
+    pub fn routine_trigger_schedule(id: &str) -> String {
+        format!("routine-{id}-trigger-schedule")
+    }
+
+    pub fn routine_trigger_webhook(id: &str) -> String {
+        format!("routine-{id}-trigger-webhook")
+    }
+
+    /// What the webhook popover shows, and only while there is a webhook to show.
+    pub fn routine_webhook_url(id: &str) -> String {
+        format!("routine-{id}-webhook-url")
+    }
+
+    pub fn routine_webhook_key(id: &str) -> String {
+        format!("routine-{id}-webhook-key")
+    }
+
+    pub fn routine_rotate(id: &str) -> String {
+        format!("routine-{id}-rotate")
+    }
+
+    pub fn routine_delete(id: &str) -> String {
+        format!("routine-{id}-delete")
     }
 }
 
@@ -180,6 +216,25 @@ pub enum Command {
     },
     SetAppSettingsTab(crate::state::AppSettingsTab),
     CloseAppSettings,
+    /// The Computer pane's routines: open one (or a blank one), give a draft its trigger, ask
+    /// for a new webhook key, drop one.
+    OpenRoutineEditor(Option<String>),
+    AddRoutineTrigger {
+        routine_id: String,
+        trigger: crate::state::NewTrigger,
+    },
+    /// A routine made outright, with no draft in between: the prompt and how it fires.
+    CreateRoutine {
+        kind: crate::opengrok::ScheduleKind,
+        prompt: String,
+        cron: Option<String>,
+    },
+    RotateRoutineWebhook {
+        routine_id: String,
+    },
+    DeleteRoutine {
+        routine_id: String,
+    },
     Shutdown,
 }
 
@@ -276,6 +331,28 @@ impl Command {
             Self::CloseAppSettings => {
                 if state.is_app_settings_open {
                     state.toggle_app_settings(cx);
+                }
+            }
+            Self::OpenRoutineEditor(id) => state.open_routine_editor(id, cx),
+            Self::AddRoutineTrigger {
+                routine_id,
+                trigger,
+            } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone() {
+                    state.add_routine_trigger(&coworker_id, &routine_id, trigger, cx);
+                }
+            }
+            Self::CreateRoutine { kind, prompt, cron } => {
+                state.create_routine(kind, prompt, cron, cx)
+            }
+            Self::RotateRoutineWebhook { routine_id } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone() {
+                    state.rotate_routine_webhook(&coworker_id, &routine_id, cx);
+                }
+            }
+            Self::DeleteRoutine { routine_id } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone() {
+                    state.delete_routine(&coworker_id, &routine_id, cx);
                 }
             }
             Self::Shutdown => {}
@@ -560,6 +637,21 @@ struct RecipeSnap {
     pending: bool,
 }
 
+/// One routine on the open bot's Computer pane, which is one schedule on the server.
+#[derive(Clone)]
+struct RoutineSnap {
+    id: String,
+    name: String,
+    /// `cron`, `webhook`, or `draft` for one nobody has given a trigger yet — the only kind
+    /// that is not on the server at all.
+    kind: &'static str,
+    /// The line the server keeps, on a cron routine.
+    cron: Option<String>,
+    active: bool,
+    webhook_url: Option<String>,
+    webhook_key: Option<String>,
+}
+
 /// An approval card still waiting on the person.
 #[derive(Clone)]
 struct ApprovalSnap {
@@ -683,6 +775,84 @@ fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
         .with_child(UiNode::button(computer_handoff_done_id(key), "I'm done"))
         .with_child(UiNode::button(computer_handoff_skip_id(key), "Skip"));
     card
+}
+
+/// One routine as the driver sees it.
+///
+/// A routine is one schedule, so the trigger says what kind it is and carries the one fact
+/// worth asserting on: the cron line the server keeps, or the URL it minted.
+fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
+    let mut snap = RoutineSnap {
+        id: routine.id.clone(),
+        name: if routine.name.trim().is_empty() {
+            "Untitled routine".to_string()
+        } else {
+            routine.name.clone()
+        },
+        kind: "draft",
+        cron: None,
+        active: routine.active,
+        webhook_url: None,
+        webhook_key: None,
+    };
+    match routine.triggers.first() {
+        Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
+            snap.kind = "cron";
+            snap.cron = spec.to_cron().ok();
+        }
+        Some(crate::state::RoutineTrigger::Webhook { url, key, .. }) => {
+            snap.kind = "webhook";
+            snap.webhook_url = Some(url.clone());
+            snap.webhook_key = Some(key.clone());
+        }
+        Some(crate::state::RoutineTrigger::Event { .. }) | None => {}
+    }
+    snap
+}
+
+/// The routine's row and everything reachable from it.
+///
+/// The two triggers are here only while the routine has none, and the webhook's three only
+/// while it has one: `assert --exists false` on either is then the whole question — "this
+/// routine already has its trigger", "this one is not a webhook" — without reading a word.
+fn routine_node(routine: &RoutineSnap) -> UiNode {
+    let mut node = UiNode::listitem(ids::routine(&routine.id), routine.name.clone());
+    node.states.push(routine.kind.to_string());
+    node.states
+        .push(if routine.active { "active" } else { "paused" }.to_string());
+    if let Some(cron) = &routine.cron {
+        node = node.with_value(cron.clone());
+    }
+    if routine.kind == "draft" {
+        node = node
+            .with_child(UiNode::button(
+                ids::routine_trigger_schedule(&routine.id),
+                "On a schedule",
+            ))
+            .with_child(UiNode::button(
+                ids::routine_trigger_webhook(&routine.id),
+                "Webhook",
+            ));
+    }
+    // Tied to the kind and not to whether the server filled either in: a webhook whose key
+    // came back empty is a fact worth reading off an empty value, not one worth hiding the
+    // URL over.
+    if routine.kind == "webhook" {
+        node = node
+            .with_child(
+                UiNode::status(ids::routine_webhook_url(&routine.id), "POST to")
+                    .with_value(routine.webhook_url.clone().unwrap_or_default()),
+            )
+            .with_child(
+                UiNode::status(ids::routine_webhook_key(&routine.id), "key")
+                    .with_value(routine.webhook_key.clone().unwrap_or_default()),
+            )
+            .with_child(UiNode::button(
+                ids::routine_rotate(&routine.id),
+                "Rotate key",
+            ));
+    }
+    node.with_child(UiNode::button(ids::routine_delete(&routine.id), "Delete"))
 }
 
 fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
@@ -859,6 +1029,8 @@ pub struct NativeChatHost {
     recipes_filter: &'static str,
     recipes: Vec<RecipeSnap>,
     recipe_open: Option<String>,
+    /// The open bot's routines, as the Computer pane lists them.
+    routines: Vec<RoutineSnap>,
     /// The composer's panel, when one is open: which list it is, and the rows in it.
     composer_panel: Option<PanelMode>,
     panel_rows: Vec<PanelRow>,
@@ -1034,6 +1206,14 @@ impl NativeChatHost {
                 })
                 .collect(),
             recipe_open: state.recipe_open_id.clone(),
+            routines: state
+                .active_coworker_id
+                .as_deref()
+                .map(|id| state.coworker_routines(id))
+                .unwrap_or_default()
+                .iter()
+                .map(routine_snap)
+                .collect(),
             composer_panel: state.composer_panel,
             panel_rows: state
                 .composer_panel
@@ -1385,6 +1565,10 @@ impl NativeChatHost {
                 "switch",
                 "Route traffic through this computer",
             ));
+        }
+        computer = computer.with_child(UiNode::button(ids::ROUTINE_NEW, "Create routine"));
+        for routine in &self.routines {
+            computer = computer.with_child(routine_node(routine));
         }
         if let Some(handoff) = self
             .computer_handoffs
@@ -1960,6 +2144,10 @@ impl NativeChatHost {
             Command::OpenComputerConfirm(crate::state::ComputerAction::Reset)
         } else if target == "route-traffic-this-computer" || target == "egress-tunnel-enabled" {
             Command::SetEgressTunnelEnabled(!self.egress_tunnel_enabled)
+        } else if target == ids::ROUTINE_NEW {
+            Command::OpenRoutineEditor(None)
+        } else if let Some(cmd) = self.routine_command(target) {
+            cmd
         } else if let Some(id) = self.site_login_delete_target(target) {
             Command::DeleteSiteLogin { id }
         } else if let Some((card_key, field_id, kind, value)) = self.user_form_field(target) {
@@ -2163,6 +2351,60 @@ impl NativeChatHost {
         Ok((request_id, allow))
     }
 
+    /// One of a routine's controls, or `None` for a target that is not a routine's at all.
+    ///
+    /// The id is the server's and can hold anything, dashes included, so this reads the tail
+    /// first and takes what is left as the id — and then only if that id is a routine the open
+    /// bot has. An id nobody is showing is a wrong address, not a click.
+    fn routine_command(&self, target: &str) -> Option<Command> {
+        let rest = target.strip_prefix("routine-")?;
+        let mut cmd: Option<(&str, fn(String) -> Command)> = None;
+        for (tail, make) in [
+            (
+                "-trigger-schedule",
+                (|id| Command::AddRoutineTrigger {
+                    routine_id: id,
+                    // The menu's own first offer, so a driver that asks for "a schedule" gets
+                    // the one a person clicking the same row would get.
+                    trigger: crate::state::NewTrigger::Schedule(
+                        crate::state::ScheduleSpec::from_preset("Every day"),
+                    ),
+                }) as fn(String) -> Command,
+            ),
+            (
+                "-trigger-webhook",
+                (|id| Command::AddRoutineTrigger {
+                    routine_id: id,
+                    trigger: crate::state::NewTrigger::Webhook,
+                }) as fn(String) -> Command,
+            ),
+            (
+                "-rotate",
+                (|id| Command::RotateRoutineWebhook { routine_id: id }) as fn(String) -> Command,
+            ),
+            (
+                "-delete",
+                (|id| Command::DeleteRoutine { routine_id: id }) as fn(String) -> Command,
+            ),
+        ] {
+            if let Some(id) = rest.strip_suffix(tail) {
+                cmd = Some((id, make));
+                break;
+            }
+        }
+        let (id, make) = match cmd {
+            Some((id, make)) => (id, Some(make)),
+            None => (rest, None),
+        };
+        if !self.routines.iter().any(|routine| routine.id == id) {
+            return None;
+        }
+        Some(match make {
+            Some(make) => make(id.to_string()),
+            None => Command::OpenRoutineEditor(Some(id.to_string())),
+        })
+    }
+
     fn invoke(&mut self, name: &str, args: &serde_json::Value) -> Result<DispatchResult, String> {
         let cmd = match name {
             "chat.new" => Command::NewChat,
@@ -2282,10 +2524,74 @@ impl NativeChatHost {
                 let (request_id, allow) = self.invoke_credential_answer(args)?;
                 Command::AnswerCredentialRequest { request_id, allow }
             }
+            // The open bot's routines as the pane lists them, so a driver can find the id of
+            // the one it just made without reading the tree.
+            "routine.list" => {
+                return Ok(DispatchResult::json(serde_json::json!({
+                    "routines": self
+                        .routines
+                        .iter()
+                        .map(|routine| serde_json::json!({
+                            "id": routine.id,
+                            "name": routine.name,
+                            "kind": routine.kind,
+                            "cron": routine.cron,
+                            "active": routine.active,
+                            "webhook_url": routine.webhook_url,
+                            // The key rides with the row: firing the hook needs it, and so
+                            // does telling a rotated key from the one it replaced.
+                            "webhook_key": routine.webhook_key,
+                        }))
+                        .collect::<Vec<_>>(),
+                })));
+            }
+            "routine.create" => {
+                let prompt = invoke_arg_str(args, &["prompt", "instruction"])
+                    .ok_or_else(|| "routine.create requires arg prompt".to_string())?;
+                let cron = invoke_arg_str(args, &["cron"]);
+                let kind = match invoke_arg_str(args, &["kind"]).as_deref() {
+                    Some("webhook") => crate::opengrok::ScheduleKind::Webhook,
+                    None | Some("cron") => crate::opengrok::ScheduleKind::Cron,
+                    Some(other) => {
+                        return Err(format!("unknown routine kind `{other}` (cron, webhook)"));
+                    }
+                };
+                if kind == crate::opengrok::ScheduleKind::Cron && cron.is_none() {
+                    return Err(
+                        "routine.create with kind=cron requires arg cron (a line like \
+                         `0 9 * * 1-5`)"
+                            .to_string(),
+                    );
+                }
+                Command::CreateRoutine {
+                    kind,
+                    prompt,
+                    // A webhook has no clock, and sending one a line would be asking the server
+                    // for something it has no way to honour.
+                    cron: cron.filter(|_| kind == crate::opengrok::ScheduleKind::Cron),
+                }
+            }
+            "routine.rotate" => Command::RotateRoutineWebhook {
+                routine_id: self.invoke_routine_id(args, "routine.rotate")?,
+            },
+            "routine.delete" => Command::DeleteRoutine {
+                routine_id: self.invoke_routine_id(args, "routine.delete")?,
+            },
             other => return Err(format!("unknown invoke `{other}`")),
         };
         self.pending = Some(cmd);
         Ok(DispatchResult::empty())
+    }
+
+    /// The routine an invoke names, checked against the ones on screen: an id nobody is
+    /// showing is worth saying so about before a call goes out under it.
+    fn invoke_routine_id(&self, args: &serde_json::Value, invoke: &str) -> Result<String, String> {
+        let id = invoke_arg_str(args, &["id", "routine_id", "routineId"])
+            .ok_or_else(|| format!("{invoke} requires arg id"))?;
+        if !self.routines.iter().any(|routine| routine.id == id) {
+            return Err(format!("no routine `{id}` on the open bot"));
+        }
+        Ok(id)
     }
 }
 
@@ -2360,6 +2666,214 @@ mod tests {
             host.snapshot().find(ids::COMPOSER_RECIPE_BAR).unwrap().name,
             "Workflow · Search and retry"
         );
+    }
+
+    fn routine(id: &str, kind: &'static str) -> RoutineSnap {
+        RoutineSnap {
+            id: id.into(),
+            name: "Morning post".into(),
+            kind,
+            cron: (kind == "cron").then(|| "0 9 * * *".to_string()),
+            active: true,
+            webhook_url: (kind == "webhook").then(|| "https://og.example/hooks/sch_2".to_string()),
+            webhook_key: (kind == "webhook").then(|| "og_live_abc".to_string()),
+        }
+    }
+
+    /// A cron routine carries the line the server keeps, and nothing about a webhook it has
+    /// not got.
+    #[test]
+    fn a_cron_routine_is_its_line_and_the_webhook_ids_are_not_there() {
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_1", "cron")];
+        let tree = host.snapshot();
+        let node = tree.find(&ids::routine("sch_1")).unwrap();
+        assert_eq!(node.value.as_deref(), Some("0 9 * * *"));
+        assert!(node.states.contains(&"cron".to_string()));
+        assert!(node.states.contains(&"active".to_string()));
+        assert!(tree.find(&ids::routine_webhook_url("sch_1")).is_none());
+        assert!(tree.find(&ids::routine_rotate("sch_1")).is_none());
+        assert!(
+            tree.find(&ids::routine_trigger_schedule("sch_1")).is_none(),
+            "a routine with a trigger is not offered another"
+        );
+        assert!(tree.find(&ids::routine_delete("sch_1")).is_some());
+    }
+
+    /// The URL and the key are on the tree because they are the two things a person copies,
+    /// and a test that fires the hook needs both.
+    #[test]
+    fn a_webhook_routine_shows_the_url_and_the_key_it_was_given() {
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_2", "webhook")];
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::routine_webhook_url("sch_2"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("https://og.example/hooks/sch_2")
+        );
+        assert_eq!(
+            tree.find(&ids::routine_webhook_key("sch_2"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("og_live_abc")
+        );
+        assert!(tree.find(&ids::routine_rotate("sch_2")).is_some());
+
+        // A key the server did not send back reads as an empty value rather than as a webhook
+        // with no URL: the row is still there to fire, and the emptiness is the news.
+        let mut keyless = routine("sch_3", "webhook");
+        keyless.webhook_key = None;
+        host.routines = vec![keyless];
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::routine_webhook_url("sch_3"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("https://og.example/hooks/sch_2")
+        );
+        assert_eq!(
+            tree.find(&ids::routine_webhook_key("sch_3"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    /// A draft is the one routine with a trigger to offer, and the only one not on the server.
+    #[test]
+    fn a_draft_offers_the_two_triggers() {
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("draft-1", "draft")];
+        let tree = host.snapshot();
+        assert!(
+            tree.find(&ids::routine_trigger_schedule("draft-1"))
+                .is_some()
+        );
+        assert!(
+            tree.find(&ids::routine_trigger_webhook("draft-1"))
+                .is_some()
+        );
+        assert!(tree.find(&ids::routine_webhook_url("draft-1")).is_none());
+    }
+
+    /// A server id can hold dashes, and three of this routine's controls end in one. The tail
+    /// is read first so `sch-1-2` stays `sch-1-2` and does not lose its last two characters to
+    /// a suffix that was never there.
+    #[test]
+    fn a_routines_controls_are_told_apart_from_an_id_with_dashes_in_it() {
+        let mut host = host();
+        host.routines = vec![routine("sch-1-2", "webhook")];
+        let opened = |host: &mut NativeChatHost, target: &str| {
+            host.click(target).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            opened(&mut host, &ids::routine("sch-1-2")),
+            Command::OpenRoutineEditor(Some(id)) if id == "sch-1-2"
+        ));
+        assert!(matches!(
+            opened(&mut host, &ids::routine_delete("sch-1-2")),
+            Command::DeleteRoutine { routine_id } if routine_id == "sch-1-2"
+        ));
+        assert!(matches!(
+            opened(&mut host, &ids::routine_rotate("sch-1-2")),
+            Command::RotateRoutineWebhook { routine_id } if routine_id == "sch-1-2"
+        ));
+        assert!(matches!(
+            opened(&mut host, &ids::routine_trigger_webhook("sch-1-2")),
+            Command::AddRoutineTrigger { routine_id, trigger }
+                if routine_id == "sch-1-2" && trigger == crate::state::NewTrigger::Webhook
+        ));
+    }
+
+    /// An id nobody is showing is a wrong address, and saying so beats sending a call under it.
+    #[test]
+    fn a_routine_the_open_bot_does_not_have_is_not_a_target() {
+        let mut host = host();
+        host.routines = vec![routine("sch_1", "cron")];
+        assert!(host.click("routine-sch_9").is_err());
+        assert!(
+            host.invoke("routine.delete", &serde_json::json!({ "id": "sch_9" }))
+                .is_err()
+        );
+    }
+
+    /// `routine.list` answers with the rows themselves, so a driver that has just made one can
+    /// find its id without reading the tree.
+    #[test]
+    fn routine_list_answers_with_the_rows() {
+        let mut host = host();
+        host.routines = vec![routine("sch_1", "cron"), routine("sch_2", "webhook")];
+        let answer = host
+            .invoke("routine.list", &serde_json::json!({}))
+            .unwrap()
+            .value
+            .unwrap();
+        let rows = answer["routines"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "sch_1");
+        assert_eq!(rows[0]["cron"], "0 9 * * *");
+        assert_eq!(rows[1]["kind"], "webhook");
+        assert_eq!(rows[1]["webhook_url"], "https://og.example/hooks/sch_2");
+        assert_eq!(
+            rows[1]["webhook_key"], "og_live_abc",
+            "a driver that cannot read the key cannot fire the hook or tell a rotation happened"
+        );
+        assert_eq!(rows[0]["webhook_key"], serde_json::Value::Null);
+        assert!(host.take_command().is_none(), "a listing changes nothing");
+    }
+
+    /// A cron routine with no line is a routine that never fires, which is worth refusing
+    /// before it is made rather than reading off the listing afterwards.
+    #[test]
+    fn routine_create_wants_a_line_for_a_cron_routine() {
+        let mut host = host();
+        let error = host
+            .invoke(
+                "routine.create",
+                &serde_json::json!({ "kind": "cron", "prompt": "Read the inbox" }),
+            )
+            .unwrap_err();
+        assert!(error.contains("cron"), "{error}");
+
+        host.invoke(
+            "routine.create",
+            &serde_json::json!({ "kind": "cron", "prompt": "Read the inbox", "cron": "0 9 * * *" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::CreateRoutine { kind, prompt, cron }
+                if kind == crate::opengrok::ScheduleKind::Cron
+                    && prompt == "Read the inbox"
+                    && cron.as_deref() == Some("0 9 * * *")
+        ));
+    }
+
+    /// A webhook has no clock, so a line sent with one is dropped rather than sent to a server
+    /// with no way to honour it.
+    #[test]
+    fn a_webhook_routine_is_created_without_a_line() {
+        let mut host = host();
+        host.invoke(
+            "routine.create",
+            &serde_json::json!({ "kind": "webhook", "prompt": "Deal with it", "cron": "0 9 * * *" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::CreateRoutine { kind, cron, .. }
+                if kind == crate::opengrok::ScheduleKind::Webhook && cron.is_none()
+        ));
     }
 
     /// A host with a bot and a session, which is what the chat tree is drawn for.

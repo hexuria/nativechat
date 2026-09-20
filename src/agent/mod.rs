@@ -16,12 +16,24 @@
 //! `credential-request-{id}`, `credential-request-allow-{id}`,
 //! `credential-request-deny-{id}`, `credential-request-pill-{id}`,
 //! `settings-tab-logins`,
-//! `settings-login-row-{id}`, `settings-login-delete-{id}`.
+//! `settings-login-row-{id}`, `settings-login-delete-{id}`,
+//! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
+//! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
+//! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-delete`.
+//!
+//! A routine's `{id}` is the server's schedule id. The two trigger ids are in the tree only
+//! while the routine has no trigger, and the webhook's three only while it has one, so
+//! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `AnswerCredentialRequest` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /
 //! `credential.answer`). Click ids above still work.
+//!
+//! Routines: `routine.list` (answers with the open bot's rows —
+//! `id, name, kind, cron, active, webhook_url, webhook_key`), `routine.create --arg
+//! kind=cron|webhook --arg prompt=... [--arg cron=...]`, `routine.rotate --arg id=...`,
+//! `routine.delete --arg id=...`.
 //!
 //! Typing goes in as GPUI keystrokes. `type`, `key` and `set_value` on the composer are
 //! planned here ([`ComposePlan`]) and pressed by [`RootView`](crate::root::RootView), because

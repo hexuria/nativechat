@@ -5,23 +5,28 @@ use crate::chrome::{
     sidebar_from_resize,
 };
 use crate::config::Config;
+/// The routine editor's schedule and the cron line it becomes. Re-exported because every
+/// caller reads it as part of a routine, and a routine is a thing on `AppState`.
+pub use crate::cron_spec::{
+    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit,
+};
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, CredentialRequestResolution, CredentialRequestSpec,
     CredentialResultStatus, Failure, FormResolution, FormSpec, ImageVisibility, LocalExecMode,
-    LocalExecResolution, ModelCatalogue, OpenGrokClient, OpenGrokError, ProfileUpdate,
+    LocalExecResolution, ModelCatalogue, NewSchedule, OpenGrokClient, OpenGrokError, ProfileUpdate,
     QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
-    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec, ScreenshotSpec, ThreadReplay,
-    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE,
-    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
-    WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
-    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    env_egress_tunnel_enabled, fold_credential_answer, host_egress_tunnel_available,
-    host_egress_tunnel_flag, keep_credential_request_offer, keep_local_save_offer,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
-    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
-    tool_standin,
+    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec, ScheduleKind, ScheduleRow,
+    ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
+    UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
+    fold_credential_answer, host_egress_tunnel_available, host_egress_tunnel_flag,
+    keep_credential_request_offer, keep_local_save_offer, place_hitl_cards_in_document_order,
+    policy_answer, reads_as_gateway_unreachable, result_without_broker, save_login_from_local,
+    serve_local_exec, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -929,175 +934,59 @@ pub struct AgentRoutine {
     pub runs: Vec<RoutineRun>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleUiMode {
-    Interval,
-    Custom,
-    Advanced,
+/// What the app says when somebody asks a routine for a second way of firing.
+///
+/// One routine is one schedule, because one schedule is one prompt and one trigger. Two ways
+/// of setting the same instruction off are two schedules on the server, and the honest way to
+/// have both is to have two routines.
+pub const ROUTINE_IS_ONE_SCHEDULE: &str =
+    "A routine is one schedule on the server: make another routine for a second trigger.";
+
+/// One schedule as the editor draws it.
+fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
+    let trigger = trigger_from_schedule(&row);
+    AgentRoutine {
+        name: row.name.unwrap_or_default(),
+        instruction: row.prompt,
+        active: row.active,
+        triggers: vec![trigger],
+        // The server keeps no history of a schedule's runs, so there is none to show. Test run
+        // still writes its own line, which is this app's note of a thing it just did.
+        runs: Vec::new(),
+        id: row.id,
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleUnit {
-    Minutes,
-    Hours,
-    Days,
+/// The trigger a schedule is. A cron row is read back into the picker where the line is one of
+/// the shapes it can draw and left as the line where it is not; a webhook row is the URL and
+/// key the server minted, which are the only ones there have ever been.
+fn trigger_from_schedule(row: &ScheduleRow) -> RoutineTrigger {
+    match row.kind {
+        ScheduleKind::Webhook => {
+            let hook = row.webhook.clone().unwrap_or_default();
+            RoutineTrigger::Webhook {
+                id: row.id.clone(),
+                url: hook.url,
+                key: hook.key,
+                header: hook.header,
+            }
+        }
+        ScheduleKind::Cron => RoutineTrigger::Schedule {
+            id: row.id.clone(),
+            spec: ScheduleSpec::from_cron(row.cron.as_deref().unwrap_or_default()),
+        },
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleDayKind {
-    EveryDay,
-    Weekdays,
-    DaysOfMonth,
-}
-
+/// What a trigger is before the server has made it: the only two the editor offers.
+///
+/// A [`RoutineTrigger`] carries an id, and for a webhook a URL and a key, none of which the
+/// app is in a position to know. This is what it asks for; the row that comes back is the
+/// trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScheduleSpec {
-    pub mode: ScheduleUiMode,
-    pub every: u32,
-    pub unit: ScheduleUnit,
-    pub expr: String,
-    pub months: Vec<u8>,
-    pub day_kind: ScheduleDayKind,
-    pub weekdays: Vec<u8>,
-    pub month_days: Vec<u8>,
-    pub times: Vec<(u8, u8)>,
-}
-
-impl ScheduleSpec {
-    pub fn interval(every: u32, unit: ScheduleUnit) -> Self {
-        Self {
-            mode: ScheduleUiMode::Interval,
-            every,
-            unit,
-            expr: String::new(),
-            months: Vec::new(),
-            day_kind: ScheduleDayKind::EveryDay,
-            weekdays: Vec::new(),
-            month_days: Vec::new(),
-            times: vec![(9, 0)],
-        }
-    }
-
-    pub fn custom(expr: &str) -> Self {
-        let mut spec = Self::interval(1, ScheduleUnit::Hours);
-        spec.mode = ScheduleUiMode::Custom;
-        spec.expr = expr.to_string();
-        spec
-    }
-
-    pub fn advanced_daily(hour: u8, minute: u8) -> Self {
-        let mut spec = Self::interval(1, ScheduleUnit::Days);
-        spec.mode = ScheduleUiMode::Advanced;
-        spec.day_kind = ScheduleDayKind::EveryDay;
-        spec.times = vec![(hour, minute)];
-        spec
-    }
-
-    pub fn from_preset(name: &str) -> Self {
-        match name {
-            "Every hour" => Self::interval(1, ScheduleUnit::Hours),
-            "Every day" => Self::advanced_daily(9, 0),
-            "Weekdays" => {
-                let mut spec = Self::advanced_daily(9, 0);
-                spec.day_kind = ScheduleDayKind::Weekdays;
-                spec.weekdays = vec![1, 2, 3, 4, 5];
-                spec
-            }
-            "Every week" => {
-                let mut spec = Self::advanced_daily(9, 0);
-                spec.day_kind = ScheduleDayKind::Weekdays;
-                spec.weekdays = vec![1];
-                spec
-            }
-            "Every month" => {
-                let mut spec = Self::advanced_daily(8, 0);
-                spec.day_kind = ScheduleDayKind::DaysOfMonth;
-                spec.month_days = vec![1];
-                spec
-            }
-            "Interval" => Self::interval(30, ScheduleUnit::Minutes),
-            "Advanced..." => Self::advanced_daily(9, 0),
-            _ => Self::interval(30, ScheduleUnit::Minutes),
-        }
-    }
-
-    pub fn label(&self) -> String {
-        match self.mode {
-            ScheduleUiMode::Interval => match (self.every, self.unit) {
-                (1, ScheduleUnit::Minutes) => "Every minute".into(),
-                (n, ScheduleUnit::Minutes) => format!("Every {n} minutes"),
-                (1, ScheduleUnit::Hours) => "Every hour".into(),
-                (n, ScheduleUnit::Hours) => format!("Every {n} hours"),
-                (1, ScheduleUnit::Days) => "Every day".into(),
-                (n, ScheduleUnit::Days) => format!("Every {n} days"),
-            },
-            ScheduleUiMode::Custom => {
-                if self.expr.trim().is_empty() {
-                    "Custom schedule".into()
-                } else {
-                    self.expr.clone()
-                }
-            }
-            ScheduleUiMode::Advanced => advanced_label(self),
-        }
-    }
-}
-
-fn format_clock(hour: u8, minute: u8) -> String {
-    let (h12, am) = if hour == 0 {
-        (12, true)
-    } else if hour < 12 {
-        (hour, true)
-    } else if hour == 12 {
-        (12, false)
-    } else {
-        (hour - 12, false)
-    };
-    format!("{}:{:02} {}", h12, minute, if am { "AM" } else { "PM" })
-}
-
-fn ordinal(n: u8) -> String {
-    let suffix = if matches!(n % 100, 11 | 12 | 13) {
-        "th"
-    } else {
-        match n % 10 {
-            1 => "st",
-            2 => "nd",
-            3 => "rd",
-            _ => "th",
-        }
-    };
-    format!("{n}{suffix}")
-}
-
-fn advanced_label(spec: &ScheduleSpec) -> String {
-    let time = spec
-        .times
-        .first()
-        .map(|(h, m)| format_clock(*h, *m))
-        .unwrap_or_else(|| "9:00 AM".into());
-    match spec.day_kind {
-        ScheduleDayKind::EveryDay => format!("Every day at {time}"),
-        ScheduleDayKind::Weekdays if spec.weekdays == [1, 2, 3, 4, 5] => {
-            format!("Weekdays at {time}")
-        }
-        ScheduleDayKind::Weekdays if spec.weekdays.len() == 1 => {
-            format!("Every week at {time}")
-        }
-        ScheduleDayKind::DaysOfMonth if spec.month_days == [1] => {
-            format!("Monthly on the 1st at {time}")
-        }
-        ScheduleDayKind::DaysOfMonth => {
-            let days = spec
-                .month_days
-                .iter()
-                .map(|d| ordinal(*d))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("Monthly on the {days} at {time}")
-        }
-        _ => format!("Scheduled at {time}"),
-    }
+pub enum NewTrigger {
+    Schedule(ScheduleSpec),
+    Webhook,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2760,6 +2649,11 @@ impl AppState {
                             {
                                 state.select_coworker(first.id, cx);
                             }
+                        } else {
+                            // The open bot did not change, so nothing above went and asked for
+                            // its routines. A roster fetched after a sign-in or a spell out of
+                            // reach is exactly when they are worth asking for again.
+                            state.load_routines(cx);
                         }
                         // The roster is a server route and says nothing about the gateway, so
                         // this clears the server's state only.
@@ -3962,6 +3856,11 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// The editor's two fields, written back to the routine on screen.
+    ///
+    /// Only on screen: `/schedules` takes a name and a prompt when a schedule is made and has
+    /// no route to change either afterwards. So this is what a routine reads as here until the
+    /// next listing, which is the server's copy and wins.
     pub fn save_routine_fields(
         &mut self,
         coworker_id: &str,
@@ -3988,44 +3887,208 @@ impl AppState {
             .find(|row| row.id == routine_id)
     }
 
+    /// The trigger that makes a draft a routine.
+    ///
+    /// This is where a routine stops being something the app made up: the trigger goes to
+    /// `POST /schedules` with the name and prompt beside it, and the row that comes back is
+    /// the routine — the server's id, the server's URL and key. Until this runs, a draft is a
+    /// blank form and the coworker has never heard of it.
     pub fn add_routine_trigger(
         &mut self,
         coworker_id: &str,
         routine_id: &str,
-        trigger: RoutineTrigger,
+        trigger: NewTrigger,
         cx: &mut Context<Self>,
     ) {
-        if let Some(row) = self.routine_mut(coworker_id, routine_id) {
-            row.triggers.push(trigger);
+        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
+            return;
+        };
+        if !row.triggers.is_empty() {
+            self.say_routine_trouble(ROUTINE_IS_ONE_SCHEDULE.to_string(), cx);
+            return;
         }
-        cx.notify();
+        let name = row.name.clone();
+        let prompt = row.instruction.clone();
+        let (kind, cron) = match trigger {
+            NewTrigger::Schedule(spec) => match spec.to_cron() {
+                Ok(cron) => (ScheduleKind::Cron, Some(cron)),
+                // A schedule that is not one cron line is not one the server can keep, and the
+                // sentence says which part of it cannot be said. Nothing is created.
+                Err(not_cron) => {
+                    self.say_routine_trouble(not_cron.sentence().to_string(), cx);
+                    return;
+                }
+            },
+            NewTrigger::Webhook => (ScheduleKind::Webhook, None),
+        };
+        self.create_schedule(
+            coworker_id.to_string(),
+            Some(routine_id.to_string()),
+            NewSchedule {
+                coworker_id: coworker_id.to_string(),
+                kind,
+                prompt,
+                name,
+                cron,
+            },
+            cx,
+        );
     }
 
-    pub fn update_webhook(
+    /// The open coworker's routines, as `/schedules` keeps them.
+    pub fn load_routines(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client.list_schedules(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                // A late answer for a bot the person has since left is stale.
+                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(rows) => {
+                        // A draft has no trigger, which means it has never been to the server,
+                        // which means no listing can know about it. Somebody is writing it.
+                        let mut routines: Vec<AgentRoutine> = state
+                            .routines
+                            .get(&coworker_id)
+                            .map(|rows| {
+                                rows.iter()
+                                    .filter(|row| row.triggers.is_empty())
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        routines.extend(rows.into_iter().map(routine_from_schedule));
+                        state.routines.insert(coworker_id, routines);
+                    }
+                    Err(error) => state.computer_action_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Put a routine on the server outright: a prompt and a way of firing it, no draft in
+    /// between. The e2e driver's `routine.create`, and nothing a person does.
+    pub fn create_routine(
+        &mut self,
+        kind: ScheduleKind,
+        prompt: String,
+        cron: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.create_schedule(
+            coworker_id.clone(),
+            None,
+            NewSchedule {
+                coworker_id,
+                kind,
+                prompt,
+                name: String::new(),
+                cron,
+            },
+            cx,
+        );
+    }
+
+    fn create_schedule(
+        &mut self,
+        coworker_id: String,
+        draft_id: Option<String>,
+        new: NewSchedule,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        self.computer_action_error = None;
+        cx.spawn(async move |this, cx| {
+            let result = client.create_schedule(&new).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(row) => state.settle_new_routine(&coworker_id, draft_id.as_deref(), row),
+                    Err(error) => state.computer_action_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The created row takes the draft's place, id and all.
+    ///
+    /// The draft's id was a uuid this app minted to have something to open the editor on. The
+    /// server's id is the one every call after this uses, so the editor has to follow it over.
+    fn settle_new_routine(&mut self, coworker_id: &str, draft_id: Option<&str>, row: ScheduleRow) {
+        let routine = routine_from_schedule(row);
+        let id = routine.id.clone();
+        let rows = self.routines.entry(coworker_id.to_string()).or_default();
+        match draft_id.and_then(|draft| rows.iter().position(|row| row.id == draft)) {
+            Some(at) => rows[at] = routine,
+            None => rows.insert(0, routine),
+        }
+        if let ComputerView::Editor { id: Some(open) } = &self.computer_view
+            && draft_id == Some(open.as_str())
+        {
+            self.computer_view = ComputerView::Editor { id: Some(id) };
+        }
+    }
+
+    /// A new key for the routine's webhook. The old one stops working at once, so the row that
+    /// comes back is the only copy of the new one and it goes straight onto the trigger.
+    pub fn rotate_routine_webhook(
         &mut self,
         coworker_id: &str,
         routine_id: &str,
-        trigger_id: &str,
-        url: String,
-        key: String,
-        header: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(row) = self.routine_mut(coworker_id, routine_id)
-            && let Some(RoutineTrigger::Webhook {
-                url: u,
-                key: k,
-                header: h,
-                ..
-            }) = row.triggers.iter_mut().find(|t| t.id() == trigger_id)
-        {
-            *u = url;
-            *k = key;
-            *h = header;
-        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let coworker_id = coworker_id.to_string();
+        let routine_id = routine_id.to_string();
+        self.computer_action_error = None;
+        cx.spawn(async move |this, cx| {
+            let result = client.rotate_webhook_key(&routine_id).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(row) => {
+                        if let Some(routine) = state.routine_mut(&coworker_id, &routine_id) {
+                            routine.triggers = vec![trigger_from_schedule(&row)];
+                        }
+                    }
+                    Err(error) => state.computer_action_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Say what went wrong with a routine where the person is looking: the same line the
+    /// Computer pane puts a refused Update or Reset on.
+    fn say_routine_trouble(&mut self, sentence: String, cx: &mut Context<Self>) {
+        self.computer_action_error = Some(sentence);
         cx.notify();
     }
 
+    /// Change when a routine runs, on screen.
+    ///
+    /// On screen only, for the same reason the name and the prompt are: `/schedules` has no
+    /// route to change a schedule once it is made. What this does do is say so the moment a
+    /// combination stops being one cron line — two times of day with different minutes past
+    /// the hour, a week with no day picked — because that is a thing the person is building
+    /// right now and can still put right.
     pub fn update_schedule_spec(
         &mut self,
         coworker_id: &str,
@@ -4034,12 +4097,14 @@ impl AppState {
         spec: ScheduleSpec,
         cx: &mut Context<Self>,
     ) {
+        let trouble = spec.to_cron().err();
         if let Some(row) = self.routine_mut(coworker_id, routine_id)
             && let Some(RoutineTrigger::Schedule { spec: current, .. }) =
                 row.triggers.iter_mut().find(|t| t.id() == trigger_id)
         {
             *current = spec;
         }
+        self.computer_action_error = trouble.map(|not_cron| not_cron.sentence().to_string());
         cx.notify();
     }
 
@@ -4065,14 +4130,45 @@ impl AppState {
         cx.notify();
     }
 
+    /// Drop the routine here and on the server.
+    ///
+    /// It goes off the list first, because that is what the click meant and waiting on a round
+    /// trip to act on it would read as the click not having landed. A refusal puts it back:
+    /// the listing is asked for again, and what the server still has is what is shown.
     pub fn delete_routine(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| !row.triggers.is_empty());
         if let Some(rows) = self.routines.get_mut(coworker_id) {
             rows.retain(|row| row.id != routine_id);
         }
         self.computer_view = ComputerView::Overview;
         cx.notify();
+        // A draft nobody finished is nobody's but this app's.
+        if !on_the_server {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let routine_id = routine_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = client.delete_schedule(&routine_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    state.computer_action_error = Some(error.message);
+                    state.load_routines(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
+    /// The Active switch: pause or resume the schedule.
+    ///
+    /// The switch moves first and moves back if the server refuses, because a switch that sat
+    /// still for a round trip would read as a click that missed.
     pub fn set_routine_active(
         &mut self,
         coworker_id: &str,
@@ -4080,12 +4176,41 @@ impl AppState {
         active: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(rows) = self.routines.get_mut(coworker_id)
-            && let Some(row) = rows.iter_mut().find(|row| row.id == routine_id)
-        {
-            row.active = active;
+        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
+            return;
+        };
+        if row.active == active {
+            return;
         }
+        row.active = active;
+        let on_the_server = !row.triggers.is_empty();
         cx.notify();
+        // A draft has no schedule to pause; it is created active, whichever way this sits now.
+        if !on_the_server {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let coworker_id = coworker_id.to_string();
+        let routine_id = routine_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = if active {
+                client.resume_schedule(&routine_id).await
+            } else {
+                client.pause_schedule(&routine_id).await
+            };
+            let _ = this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
+                        row.active = !active;
+                    }
+                    state.computer_action_error = Some(error.message);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
@@ -4593,6 +4718,9 @@ impl AppState {
             );
         }
         self.select_conversation(id, cx);
+        // Routines are the server's schedules for this bot and nobody else's; the ones on
+        // screen belong to whoever was open a moment ago.
+        self.load_routines(cx);
         self.record_nav();
     }
 
@@ -8998,6 +9126,72 @@ fn settled_option(echo: Option<String>, cleared: bool, before: Option<String>) -
 
 #[cfg(test)]
 mod tests {
+
+    /// A cron row is the schedule picker again, so the editor opens a routine off the wire
+    /// showing the words it was chosen by rather than a line to decipher.
+    #[test]
+    fn a_cron_row_is_a_routine_with_the_picker_back_on_it() {
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 9 * * 1,2,3,4,5",
+                "prompt": "Read the inbox", "name": "Morning post", "active": true
+            }))
+            .unwrap(),
+        );
+        assert_eq!(routine.id, "sch_1");
+        assert_eq!(routine.name, "Morning post");
+        assert_eq!(routine.instruction, "Read the inbox");
+        assert!(routine.active);
+        let [super::RoutineTrigger::Schedule { id, spec }] = &routine.triggers[..] else {
+            panic!("a cron row is a schedule trigger: {:?}", routine.triggers);
+        };
+        assert_eq!(id, "sch_1", "the trigger is the schedule, so it is its id");
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM");
+    }
+
+    /// The URL and key on a webhook routine are the server's and no others: the app used to
+    /// mint both, and what it minted was never anywhere but the app.
+    #[test]
+    fn a_webhook_row_carries_the_servers_url_and_key() {
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_2", "coworkerId": "cw_1", "kind": "webhook", "cron": null,
+                "prompt": "Deal with it", "active": false,
+                "webhook": {
+                    "url": "https://og.example/hooks/sch_2",
+                    "key": "og_live_abc",
+                    "header": "Authorization: Bearer og_live_abc"
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(!routine.active, "a paused schedule is a paused routine");
+        let [
+            super::RoutineTrigger::Webhook {
+                url, key, header, ..
+            },
+        ] = &routine.triggers[..]
+        else {
+            panic!("a webhook row is a webhook trigger: {:?}", routine.triggers);
+        };
+        assert_eq!(url, "https://og.example/hooks/sch_2");
+        assert_eq!(key, "og_live_abc");
+        assert_eq!(header, "Authorization: Bearer og_live_abc");
+    }
+
+    /// A line the pickers cannot draw is still a routine: it lists, it pauses, it deletes, and
+    /// the line is shown as the server wrote it.
+    #[test]
+    fn a_line_with_no_picker_for_it_is_still_a_routine() {
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_3", "coworkerId": "cw_1", "kind": "cron", "cron": "@every 90m",
+                "prompt": "Sweep", "active": true
+            }))
+            .unwrap(),
+        );
+        assert_eq!(routine.triggers[0].label(), "@every 90m");
+    }
 
     #[test]
     fn a_picked_tool_knows_whether_it_is_a_tool_or_an_app() {
