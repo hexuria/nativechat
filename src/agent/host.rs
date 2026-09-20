@@ -568,6 +568,11 @@ struct ApprovalSnap {
     place: &'static str,
     local: bool,
     review: bool,
+    /// The server's word for what suspended the run, and the thread it filed
+    /// the card under. Both on the card as states, so a driver can tell an
+    /// MCP card from a shell's without reading the title.
+    reason: String,
+    thread_id: String,
 }
 
 /// User-form card in the open thread. Idle cards expose fields + Continue /
@@ -946,6 +951,8 @@ impl NativeChatHost {
                     local: spec.runs_on_this_mac(),
                     review: spec.is_review_an_action() && state.egress_tunnel_available(),
                     place: spec.place(),
+                    reason: spec.reason,
+                    thread_id: spec.thread_id.unwrap_or_default(),
                     call_id: spec.call_id,
                     tool: spec.tool,
                 })
@@ -1331,6 +1338,12 @@ impl NativeChatHost {
                     format!("{id}-deny-once"),
                     if approval.review { "Deny" } else { "Deny once" },
                 ));
+            // Bare facts as states, so an assert does not have to match a sentence.
+            for state in [&approval.reason, &approval.thread_id] {
+                if !state.is_empty() {
+                    card.states.push(state.clone());
+                }
+            }
             if approval.local || approval.review {
                 card = card.with_child(UiNode::button(format!("{id}-always"), "Always allow"));
             }
@@ -3386,5 +3399,36 @@ mod tests {
             host.take_command(),
             Some(Command::SetAppSettingsTab(AppSettingsTab::Updates))
         ));
+    }
+
+    /// A card the MCP door raised: two answers, because Always and Never write
+    /// a policy for this Mac and there is none behind an MCP call. The reason
+    /// and the thread ride along as states so a driver can say which card this
+    /// is without reading the title.
+    #[test]
+    fn an_mcp_card_offers_two_answers_and_says_where_it_came_from() {
+        let mut host = host();
+        host.approvals = vec![ApprovalSnap {
+            call_id: "call_9".into(),
+            tool: "read_file".into(),
+            place: "its computer",
+            local: false,
+            review: false,
+            reason: "policy-approval".into(),
+            thread_id: "mcp-cw_1".into(),
+        }];
+        let tree = host.snapshot();
+        let card = tree.find("approval-call_9").unwrap();
+        assert_eq!(
+            card.children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["approval-call_9-allow-once", "approval-call_9-deny-once"]
+        );
+        assert_eq!(
+            card.states,
+            vec!["policy-approval".to_string(), "mcp-cw_1".to_string()]
+        );
     }
 }

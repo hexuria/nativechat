@@ -15,6 +15,7 @@ use super::user_form::{
     ComputerHandoffSpec, UserFormSpec, is_user_form_awaiting, is_user_form_tool,
 };
 use super::visibility::{ImageVisibility, pin_shot_at_turn_end, pin_shot_now};
+use crate::threads::{conversation_for_thread, is_mcp_thread};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatPart {
@@ -149,6 +150,10 @@ impl ScreenshotSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalSpec {
     pub run_id: String,
+    /// The thread the run belongs to, when the server said which. An `mcp-…`
+    /// thread is the MCP door auditing a call the coworker made somewhere
+    /// else, and its cards belong in that coworker's conversation.
+    pub thread_id: Option<String>,
     pub call_id: String,
     pub tool: String,
     pub command: String,
@@ -177,6 +182,17 @@ impl ApprovalSpec {
         self.tool == USER_MACHINE_SHELL
     }
 
+    /// The card came off the MCP door rather than out of a turn of the chat.
+    pub fn is_mcp(&self) -> bool {
+        self.thread_id.as_deref().is_some_and(is_mcp_thread)
+    }
+
+    /// The conversation this card belongs in, when the server said which
+    /// thread raised it.
+    pub fn conversation_id(&self) -> Option<&str> {
+        self.thread_id.as_deref().map(conversation_for_thread)
+    }
+
     /// Where the command runs, the way the card and its outcome line say it.
     pub fn place(&self) -> &'static str {
         if self.runs_on_this_mac() {
@@ -190,11 +206,27 @@ impl ApprovalSpec {
     /// Allow/Deny once. OpenGrok stamps this reason only when
     /// `isEgressTunnelAvailable` (env `OG_*`/`SAND_*_EGRESS_TUNNEL_ENABLED=1`
     /// or host `egressTunnelEnabled`). We do not invent it.
+    ///
+    /// Never for an MCP card. The door reuses the same words for why it
+    /// stopped a call — `auto-review` among them — and Review chrome would
+    /// put an Always allow on a card that has no standing policy behind it:
+    /// there is nothing on this Mac for Always to write to.
     pub fn is_review_an_action(&self) -> bool {
-        matches!(
-            self.reason.trim().to_ascii_lowercase().as_str(),
-            "auto-review" | "review-an-action" | "computer-action" | "egress"
-        )
+        !self.is_mcp()
+            && matches!(
+                self.reason.trim().to_ascii_lowercase().as_str(),
+                "auto-review" | "review-an-action" | "computer-action" | "egress"
+            )
+    }
+
+    /// The centered line this card leaves behind once it is answered, in the
+    /// words its own kind of card uses.
+    pub fn outcome(&self, bot: &str, resolution: LocalExecResolution) -> String {
+        if self.is_mcp() {
+            mcp_call_outcome(bot, resolution, &self.tool)
+        } else {
+            local_exec_outcome(bot, resolution, self.place())
+        }
     }
 }
 
@@ -1028,6 +1060,7 @@ pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
         .unwrap_or(Value::Null);
     Some(ApprovalSpec {
         run_id,
+        thread_id: string_at(event, "threadId").filter(|id| !id.trim().is_empty()),
         call_id,
         command: command_from_args(&arguments),
         why: string_at(event, "why").unwrap_or_default(),
@@ -1049,6 +1082,24 @@ pub fn local_exec_outcome(bot: &str, resolution: LocalExecResolution, place: &st
         }
         LocalExecResolution::AllowOnce => {
             format!("{bot} can run commands on {place} this time.")
+        }
+    }
+}
+
+/// The same line for a card the MCP door raised.
+///
+/// The local-shell wording is about a machine and a policy that outlives the
+/// answer — "can run commands on your computer" — and none of that is what was
+/// answered here: one call, by one tool, once. There is no policy to move
+/// either, which is why an MCP card has no Always and no Never to reach this
+/// with; the two that cannot happen read as the once they would have been.
+pub fn mcp_call_outcome(bot: &str, resolution: LocalExecResolution, tool: &str) -> String {
+    match resolution {
+        LocalExecResolution::AllowOnce | LocalExecResolution::Always => {
+            format!("{bot} may run {tool} once.")
+        }
+        LocalExecResolution::DenyOnce | LocalExecResolution::Never => {
+            format!("{bot} was told no.")
         }
     }
 }
@@ -1415,6 +1466,7 @@ mod tests {
     fn ask(call_id: &str, command: &str) -> ChatPart {
         ChatPart::Approval(ApprovalSpec {
             run_id: "r".into(),
+            thread_id: None,
             call_id: call_id.into(),
             tool: "user_machine_shell".into(),
             command: command.into(),
@@ -1526,6 +1578,7 @@ mod tests {
     fn approval_for(tool: &str) -> ApprovalSpec {
         ApprovalSpec {
             run_id: "r1".into(),
+            thread_id: None,
             call_id: "c1".into(),
             tool: tool.into(),
             command: "ls".into(),
@@ -1548,6 +1601,54 @@ mod tests {
         review.reason = "auto-review".into();
         assert!(review.is_review_an_action());
         assert!(!local.is_review_an_action());
+    }
+
+    fn mcp_card() -> ApprovalSpec {
+        let mut spec = approval_for("read_file");
+        spec.thread_id = Some("mcp-cw_1".into());
+        spec.reason = "policy-approval".into();
+        spec
+    }
+
+    /// An MCP card is one call being let through, not a machine being let
+    /// loose, and it says so where the card was.
+    #[test]
+    fn an_mcp_card_leaves_behind_what_was_actually_answered() {
+        let spec = mcp_card();
+        assert!(spec.is_mcp());
+        assert_eq!(
+            spec.outcome("Hexuria", LocalExecResolution::AllowOnce),
+            "Hexuria may run read_file once."
+        );
+        assert_eq!(
+            spec.outcome("Hexuria", LocalExecResolution::DenyOnce),
+            "Hexuria was told no."
+        );
+        // The local shell keeps every word it had.
+        let local = approval_for(USER_MACHINE_SHELL);
+        assert!(!local.is_mcp());
+        assert_eq!(
+            local.outcome("Hexuria", LocalExecResolution::AllowOnce),
+            "Hexuria can run commands on your computer this time."
+        );
+        assert_eq!(
+            local.outcome("Hexuria", LocalExecResolution::Always),
+            "Hexuria can run commands on your computer."
+        );
+    }
+
+    /// Review chrome is Always allow, and Always writes a standing policy for
+    /// this Mac. An MCP card has no such thing behind it, whatever word the
+    /// door used for why it stopped the call.
+    #[test]
+    fn an_mcp_card_is_never_review_an_action() {
+        let mut spec = mcp_card();
+        spec.reason = "auto-review".into();
+        assert!(!spec.is_review_an_action());
+
+        let mut box_tool = approval_for("Shell");
+        box_tool.reason = "auto-review".into();
+        assert!(box_tool.is_review_an_action());
     }
 
     #[test]

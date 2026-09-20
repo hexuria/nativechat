@@ -19,9 +19,9 @@ use crate::opengrok::{
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
     env_egress_tunnel_enabled, fold_credential_answer, host_egress_tunnel_available,
     host_egress_tunnel_flag, keep_credential_request_offer, keep_local_save_offer,
-    local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
-    reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
-    stored_machine_id, tool_standin,
+    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
+    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
+    tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -32,6 +32,7 @@ use crate::site_login::{
     PendingSave, SiteLoginRecord, SiteLoginVault, login_matches_request, registrable_origin,
     save_candidate,
 };
+use crate::threads::conversation_for_thread;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1631,8 +1632,10 @@ impl ApprovalDecision {
         !matches!(self, Self::Pending)
     }
 
-    /// `place` is [`ApprovalSpec::place`].
-    pub fn outcome_line(&self, bot: &str, place: &str) -> Option<String> {
+    /// What the transcript says where the card was, once it is answered. The
+    /// card itself chooses the words: a local shell and an MCP call are not
+    /// answering the same question. See [`ApprovalSpec::outcome`].
+    pub fn outcome_line(&self, bot: &str, spec: &ApprovalSpec) -> Option<String> {
         let resolution = match self {
             Self::AllowOnce => LocalExecResolution::AllowOnce,
             Self::Always => LocalExecResolution::Always,
@@ -1641,7 +1644,7 @@ impl ApprovalDecision {
             Self::Superseded => return Some(SUPERSEDED_NOTE.to_string()),
             _ => return None,
         };
-        Some(local_exec_outcome(bot, resolution, place))
+        Some(spec.outcome(bot, resolution))
     }
 }
 
@@ -2452,12 +2455,12 @@ impl AppState {
         if let Some(line) = self
             .approval_decisions
             .get(&spec.call_id)
-            .and_then(|decision| decision.outcome_line(bot, spec.place()))
+            .and_then(|decision| decision.outcome_line(bot, spec))
         {
             return Some(line);
         }
         self.auto_resolve_local_exec(spec)
-            .map(|resolution| local_exec_outcome(bot, resolution, spec.place()))
+            .map(|resolution| spec.outcome(bot, resolution))
     }
 
     /// This thread's turn is over, either for good or until somebody answers a card.
@@ -6086,14 +6089,16 @@ impl AppState {
             });
         // The thread the run belongs to, not the thread that happens to be open: a card can be
         // answered from the notification while the person is reading somewhere else, and the
-        // resumed run must go on filling in its own bubble. Falling back to the open thread only
-        // covers a card the app never saw start, which is how cards off the approval queue
-        // arrive.
+        // resumed run must go on filling in its own bubble. Failing that, the thread the card
+        // was filed under — which for the MCP door is not a conversation at all but the coworker
+        // whose calls it audits, and that is the thread the card was grafted onto. The open
+        // thread is the last resort, for a card that came with no thread on it.
         let conversation_id = self
             .live_turns
             .iter()
             .find(|(_, turn)| turn.run_id == spec.run_id)
             .map(|(id, _)| id.clone())
+            .or_else(|| spec.conversation_id().map(str::to_string))
             .or_else(|| self.active_conversation_id.clone());
         let (approved, decision, mode) = match resolution {
             LocalExecResolution::Always => (true, ApprovalDecision::Always, Some("bypass")),
@@ -6103,6 +6108,14 @@ impl AppState {
         };
         // Only the local-shell tool can move this Mac's policy.
         let mode = mode.filter(|_| spec.runs_on_this_mac());
+        // What the thread says while the answered run finishes. "Running commands" is the
+        // local shell being let loose; an MCP card is one call being let through, so it says
+        // which. A no reads the same either way — it is the same no.
+        let working = match (approved, spec.is_mcp()) {
+            (false, _) => "Telling them no".to_string(),
+            (true, true) => format!("Answering {}", spec.tool),
+            (true, false) => "Running commands".to_string(),
+        };
         if let (Some(machine_id), Some(stored)) = (machine_id.as_ref(), mode) {
             if let Some(computer) = self
                 .computers
@@ -6159,15 +6172,12 @@ impl AppState {
                         // stayed registered and the send button stayed a stop button over a turn
                         // the app was no longer watching. Following it is what lets the ordinary
                         // ending arrive and settle the thread.
-                        state.begin_responding(
-                            conversation_id.as_deref(),
-                            if approved {
-                                "Running commands"
-                            } else {
-                                "Telling them no"
-                            },
-                        );
-                        state.follow_run(run_id.clone(), conversation_id, cx);
+                        state.begin_responding(conversation_id.as_deref(), &working);
+                        if spec.is_mcp() {
+                            state.follow_mcp_answer(run_id.clone(), conversation_id, cx);
+                        } else {
+                            state.follow_run(run_id.clone(), conversation_id, cx);
+                        }
                     }
                     Err(error) => {
                         if error.message.contains("no such run") {
@@ -6180,6 +6190,39 @@ impl AppState {
                         }
                     }
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Watch an answered MCP run to its end, for the working line and nothing else.
+    ///
+    /// The door answers such a run by finishing it: there is no remainder to stream and no
+    /// reply text ever comes. What its journal does hold is the audit of a call the coworker
+    /// made somewhere else, and that is not a turn of this conversation — [`Self::follow_run`]
+    /// would paint it over the bubble this thread is holding, which is whatever the coworker
+    /// last said. So the run is followed only far enough to know when to put the line down.
+    fn follow_mcp_answer(
+        &mut self,
+        run_id: String,
+        conversation_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.finish_responding(conversation_id.as_deref(), false);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            for _ in 0..40 {
+                match client.replay_run(&run_id).await {
+                    Ok(replay) if replay.status == "running" => {}
+                    _ => break,
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let _ = this.update(cx, |state, cx| {
+                state.finish_responding(conversation_id.as_deref(), false);
                 cx.notify();
             });
         })
@@ -6493,7 +6536,10 @@ impl AppState {
                 if state.is_thread_responding(thread_id) {
                     return;
                 }
-                let Some(item) = QueuedApproval::latest_for_thread(&needs_card, thread_id) else {
+                // By conversation: the queue files an MCP door's card under `mcp-{coworker}`,
+                // and this thread is where that coworker is read.
+                let Some(item) = QueuedApproval::latest_for_conversation(&needs_card, thread_id)
+                else {
                     return;
                 };
                 if item.run_id.trim().is_empty() {
@@ -6540,10 +6586,11 @@ impl AppState {
         self.approval_decisions
             .entry(spec.call_id.clone())
             .or_insert(ApprovalDecision::Pending);
+        let conversation_id = conversation_for_thread(&item.thread_id);
         let Some(conversation) = self
             .conversations
             .iter_mut()
-            .find(|c| c.id == item.thread_id)
+            .find(|c| c.id == conversation_id)
         else {
             return;
         };
@@ -8808,14 +8855,30 @@ impl AppState {
     }
 }
 
+/// The queue's own words where it has them.
+///
+/// A card off the queue used to be described by the app: every one of them was
+/// a host shell waiting on consent, so saying so cost nothing. The MCP door
+/// raises cards for reasons of its own — a policy, an auto-review — and says
+/// why in the item, so the card now reads back what the server sent and only
+/// falls through to the old wording for a server that sends neither.
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
     ApprovalSpec {
         run_id: item.run_id.clone(),
+        thread_id: some_unless_blank(&item.thread_id),
         call_id: item.call_id.clone(),
         tool: item.tool.clone(),
         command: command_from_args(&item.arguments),
-        why: "your machine's owner must approve this command".into(),
-        reason: "exec-consent".into(),
+        why: item
+            .why
+            .as_deref()
+            .and_then(some_unless_blank)
+            .unwrap_or_else(|| "your machine's owner must approve this command".to_string()),
+        reason: item
+            .reason
+            .as_deref()
+            .and_then(some_unless_blank)
+            .unwrap_or_else(|| "exec-consent".to_string()),
         output: None,
         ok: None,
     }
@@ -9128,10 +9191,11 @@ mod tests {
         apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
         is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
         reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
-        stream_paint_due, stream_part_sig, streaming_message_mut,
+        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut,
     };
     use crate::opengrok::{
         CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
+        QueuedApproval, USER_MACHINE_SHELL,
     };
     use crate::state::{ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave};
     use std::str::FromStr;
@@ -10760,6 +10824,7 @@ mod tests {
     fn an_open_approval_or_live_handoff_is_parked_and_a_steer_settles_it() {
         let approval = crate::opengrok::ApprovalSpec {
             run_id: "run_1".into(),
+            thread_id: None,
             call_id: "c1".into(),
             tool: "Shell".into(),
             command: "ls".into(),
@@ -11826,6 +11891,102 @@ mod tests {
             Some("Running commands")
         );
         assert!(state.is_active_bot_responding());
+    }
+
+    // ---- A card the MCP door raised ---------------------------------------------------------
+
+    fn queued(thread_id: &str, call_id: &str, tool: &str) -> QueuedApproval {
+        QueuedApproval {
+            run_id: "run_mcp".into(),
+            thread_id: thread_id.into(),
+            call_id: call_id.into(),
+            tool: tool.into(),
+            arguments: serde_json::json!({ "path": "/etc/hosts" }),
+            reason: Some("policy-approval".into()),
+            why: Some("Reading a file outside the workspace.".into()),
+        }
+    }
+
+    /// The door files its cards under a thread of its own, `mcp-{coworker}`. There is no
+    /// conversation by that name and there should not be one: the card goes to the coworker.
+    #[test]
+    fn a_card_filed_under_an_mcp_thread_is_grafted_onto_its_coworkers_thread() {
+        let mut state = AppState::new();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![at(message("m_said", false, "Done."), 10)],
+        ));
+
+        state.attach_queued_approval(queued("mcp-cw_1", "call_9", "read_file"));
+
+        let parts = &state.conversations[0].messages[0].parts;
+        assert!(
+            matches!(parts.as_slice(), [ChatPart::Approval(spec)] if spec.call_id == "call_9"),
+            "the coworker's thread is holding the card, not a thread named after the door"
+        );
+        assert_eq!(state.conversations.len(), 1, "no `mcp-cw_1` conversation");
+    }
+
+    /// The card knows where it came from, so answering it puts the working line on the thread
+    /// it was grafted onto rather than on whatever happens to be open.
+    #[test]
+    fn a_queued_card_carries_the_thread_it_was_filed_under() {
+        let spec = spec_from_queued(&queued("mcp-cw_1", "call_9", "read_file"));
+        assert_eq!(spec.thread_id.as_deref(), Some("mcp-cw_1"));
+        assert_eq!(spec.conversation_id(), Some("cw_1"));
+        assert!(spec.is_mcp());
+
+        let chat = spec_from_queued(&queued("cw_1", "call_1", USER_MACHINE_SHELL));
+        assert_eq!(chat.conversation_id(), Some("cw_1"));
+        assert!(!chat.is_mcp());
+    }
+
+    /// The queue says why it stopped, and the card says it back. Only a server
+    /// that sends neither gets the sentence the app used to make up.
+    #[test]
+    fn a_queued_card_reads_back_the_reason_the_server_sent() {
+        let told = spec_from_queued(&queued("mcp-cw_1", "call_9", "read_file"));
+        assert_eq!(told.reason, "policy-approval");
+        assert_eq!(told.why, "Reading a file outside the workspace.");
+
+        let mut silent = queued("cw_1", "call_1", USER_MACHINE_SHELL);
+        silent.reason = None;
+        silent.why = Some("   ".into());
+        let spec = spec_from_queued(&silent);
+        assert_eq!(spec.reason, "exec-consent");
+        assert_eq!(spec.why, "your machine's owner must approve this command");
+    }
+
+    /// The card the door raised is answered from the coworker's thread, and the line it leaves
+    /// behind is about the call, not about this Mac.
+    #[test]
+    fn an_answered_mcp_card_says_which_call_was_let_through() {
+        let mut state = AppState::new();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![at(message("m_said", false, "Done."), 10)],
+        ));
+        state.attach_queued_approval(queued("mcp-cw_1", "call_9", "read_file"));
+        let spec = match &state.conversations[0].messages[0].parts[0] {
+            ChatPart::Approval(spec) => spec.clone(),
+            other => panic!("the card is the part on the row: {other:?}"),
+        };
+
+        state
+            .approval_decisions
+            .insert("call_9".into(), ApprovalDecision::AllowOnce);
+        assert_eq!(
+            state.approval_status_line(&spec, "Hexuria").as_deref(),
+            Some("Hexuria may run read_file once.")
+        );
+
+        state
+            .approval_decisions
+            .insert("call_9".into(), ApprovalDecision::Denied);
+        assert_eq!(
+            state.approval_status_line(&spec, "Hexuria").as_deref(),
+            Some("Hexuria was told no.")
+        );
     }
 
     // ---- Reaching the gateway, and the list that depends on it ------------------------------

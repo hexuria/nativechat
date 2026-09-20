@@ -20,4 +20,5 @@ pub mod session;
 pub mod site_login;
 pub mod state;
 pub mod theme;
+pub mod threads;
 pub mod tts_text;

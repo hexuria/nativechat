@@ -195,7 +195,7 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
             String::new(),
             false,
         ));
-    if let Some(line) = decision.outcome_line(&bot, spec.place()) {
+    if let Some(line) = decision.outcome_line(&bot, spec) {
         return div()
             .w_full()
             .py(px(8.))
