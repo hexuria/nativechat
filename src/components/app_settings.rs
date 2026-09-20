@@ -1,6 +1,7 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
 use crate::opengrok::LocalExecMode;
+use crate::send_policy::OnSend;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -24,7 +25,17 @@ impl Render for AppSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
-        let (tab, chord, theme_mode, account_name, account_email, computers, bot_name, controls) = {
+        let (
+            tab,
+            chord,
+            on_send,
+            theme_mode,
+            account_name,
+            account_email,
+            computers,
+            bot_name,
+            controls,
+        ) = {
             let state = self.state.read(cx);
             let (name, email) = state
                 .account
@@ -34,6 +45,7 @@ impl Render for AppSettings {
             (
                 state.app_settings_tab,
                 state.submit_chord,
+                state.on_send,
                 state.theme_mode.clone(),
                 name,
                 email,
@@ -83,7 +95,8 @@ impl Render for AppSettings {
                             )
                             .child(match tab {
                                 AppSettingsTab::General => {
-                                    general_page(chord, muted, app.clone()).into_any_element()
+                                    general_page(chord, on_send, muted, app.clone())
+                                        .into_any_element()
                                 }
                                 AppSettingsTab::Profile => {
                                     profile_page(account_name, account_email, muted, app.clone())
@@ -427,17 +440,26 @@ fn nav_item(
         .child(div().text_sm().child(label))
 }
 
-fn general_page(chord: SubmitChord, muted: Hsla, app: Entity<AppState>) -> impl IntoElement {
+fn general_page(
+    chord: SubmitChord,
+    on_send: OnSend,
+    muted: Hsla,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    let card = || {
+        v_flex()
+            .w_full()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(0x777777).opacity(0.24))
+            .overflow_hidden()
+    };
+    let divider = || div().h(px(1.)).bg(rgb(0x777777).opacity(0.16));
     v_flex()
         .gap(px(12.))
         .child(div().text_xs().text_color(muted).child("Chat"))
         .child(
-            v_flex()
-                .w_full()
-                .rounded(px(12.))
-                .border_1()
-                .border_color(rgb(0x777777).opacity(0.24))
-                .overflow_hidden()
+            card()
                 .child(choice_row(
                     "settings-send-enter",
                     "Enter to send",
@@ -452,15 +474,55 @@ fn general_page(chord: SubmitChord, muted: Hsla, app: Entity<AppState>) -> impl 
                         }
                     },
                 ))
-                .child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
+                .child(divider())
                 .child(choice_row(
                     "settings-send-cmd-enter",
                     "⌘Enter to send",
                     "Enter inserts a newline",
                     chord == SubmitChord::CommandEnter,
+                    {
+                        let app = app.clone();
+                        move |cx| {
+                            app.update(cx, |state, cx| {
+                                state.set_submit_chord(SubmitChord::CommandEnter, cx);
+                            });
+                        }
+                    },
+                )),
+        )
+        // What a plain send does while the coworker is mid-turn. A card waiting on the person
+        // is not this case: a send over it always steers, whatever is picked here.
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("While the coworker is busy"),
+        )
+        .child(
+            card()
+                .child(choice_row(
+                    "settings-on-send-queue",
+                    "Queue it",
+                    "Sends when the current turn ends. ⌘⇧Enter sends now.",
+                    on_send == OnSend::Queue,
+                    {
+                        let app = app.clone();
+                        move |cx| {
+                            app.update(cx, |state, cx| {
+                                state.set_on_send(OnSend::Queue, cx);
+                            });
+                        }
+                    },
+                ))
+                .child(divider())
+                .child(choice_row(
+                    "settings-on-send-steer",
+                    "Interrupt and send",
+                    "Stops the current turn at its next step, then sends.",
+                    on_send == OnSend::Steer,
                     move |cx| {
                         app.update(cx, |state, cx| {
-                            state.set_submit_chord(SubmitChord::CommandEnter, cx);
+                            state.set_on_send(OnSend::Steer, cx);
                         });
                     },
                 )),
@@ -871,6 +933,7 @@ fn shortcuts_page(
                 ("Focus chat input", "⌘L"),
                 ("Close palette / finder", "Esc"),
                 ("Send message", send),
+                ("Send now, interrupting the turn", "⌘⇧Enter"),
                 ("Insert newline", newline),
             ],
         ),
