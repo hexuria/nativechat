@@ -17,11 +17,11 @@ use crate::opengrok::{
     Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
     WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    env_egress_tunnel_enabled, fold_credential_answer, host_egress_tunnel_flag,
-    keep_credential_request_offer, keep_local_save_offer, local_exec_outcome,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
-    result_without_broker, save_login_from_local, serve_local_exec, stored_machine_id,
-    tool_standin,
+    env_egress_tunnel_enabled, fold_credential_answer, host_egress_tunnel_available,
+    host_egress_tunnel_flag, keep_credential_request_offer, keep_local_save_offer,
+    local_exec_outcome, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, result_without_broker, save_login_from_local, serve_local_exec,
+    stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -1546,7 +1546,8 @@ pub struct AppState {
     /// The active coworker's computer, as last polled. Cleared on a switch so a
     /// bot never shows the previous one's screen.
     pub coworker_computer: Option<CoworkerComputer>,
-    /// From `POST /api/isEgressTunnelAvailable` (env OR host setting on the server).
+    /// `egressTunnelAvailable` on `GET /ag-ui/host-settings`: host intent AND the open
+    /// coworker's box advertising the tunnel.
     pub host_egress_tunnel_available: bool,
     /// Local/host opt-in for **Route traffic through this computer**. Defaults
     /// ON; host `egressTunnelEnabled` overwrites only when the key is present.
@@ -2388,21 +2389,19 @@ impl AppState {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
+        let coworker = self.active_coworker_id.clone();
         cx.spawn(async move |this, cx| {
+            // One round trip: the record comes back whole, with `egressTunnelAvailable` for
+            // this coworker already on it.
             let result = client
-                .set_host_settings(&serde_json::json!({ "egressTunnelEnabled": enabled }))
+                .patch_host_settings(
+                    coworker.as_deref(),
+                    &serde_json::json!({ "egressTunnelEnabled": enabled }),
+                )
                 .await;
             let _ = this.update(cx, |state, cx| {
                 if let Ok(settings) = result {
-                    if let Some(flag) = host_egress_tunnel_flag(&settings) {
-                        state.egress_tunnel_enabled = flag;
-                    }
-                    if enabled {
-                        state.host_egress_tunnel_available = true;
-                    } else {
-                        state.refresh_host_egress(cx);
-                        return;
-                    }
+                    state.take_host_egress(&settings);
                 }
                 cx.notify();
             });
@@ -2410,37 +2409,43 @@ impl AppState {
         .detach();
     }
 
-    /// Read `isEgressTunnelAvailable` + `getHostSettings` from the gateway.
-    /// A 401 is the host bearer, not a signed-out AG-UI session.
+    /// Read the host's settings record from the AG-UI door — the toggle's intent and whether
+    /// the tunnel is live for the open coworker.
     pub fn refresh_host_egress(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
+        let coworker = self.active_coworker_id.clone();
         cx.spawn(async move |this, cx| {
-            let available = client.is_egress_tunnel_available().await.ok();
-            let settings = client.get_host_settings().await.ok();
+            let settings = client.host_settings(coworker.as_deref()).await.ok();
             let _ = this.update(cx, |state, cx| {
-                let mut changed = false;
-                if let Some(available) = available
-                    && state.host_egress_tunnel_available != available
+                if let Some(settings) = settings
+                    && state.take_host_egress(&settings)
                 {
-                    state.host_egress_tunnel_available = available;
-                    changed = true;
-                }
-                if let Some(settings) = settings {
-                    if let Some(enabled) = host_egress_tunnel_flag(&settings)
-                        && state.egress_tunnel_enabled != enabled
-                    {
-                        state.egress_tunnel_enabled = enabled;
-                        changed = true;
-                    }
-                }
-                if changed {
                     cx.notify();
                 }
             });
         })
         .detach();
+    }
+
+    /// The two egress facts off a host-settings record. A key the host did not send changes
+    /// nothing. Returns whether anything changed.
+    fn take_host_egress(&mut self, settings: &serde_json::Value) -> bool {
+        let mut changed = false;
+        if let Some(available) = host_egress_tunnel_available(settings)
+            && self.host_egress_tunnel_available != available
+        {
+            self.host_egress_tunnel_available = available;
+            changed = true;
+        }
+        if let Some(enabled) = host_egress_tunnel_flag(settings)
+            && self.egress_tunnel_enabled != enabled
+        {
+            self.egress_tunnel_enabled = enabled;
+            changed = true;
+        }
+        changed
     }
 
     pub fn approval_status_line(&self, spec: &ApprovalSpec, bot: &str) -> Option<String> {
