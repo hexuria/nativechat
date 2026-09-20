@@ -179,6 +179,11 @@ fn deed_from_tool(name: &str, args: Option<&str>) -> Option<String> {
         "request_user_form" | "request-user-form" | "user-form" => {
             "asked you to fill a form".into()
         }
+        "form" | "show_form" | "show-form" | "render_form" | "render-form" => {
+            "showed you a form".into()
+        }
+        "bar_chart" | "bar-chart" | "barchart" | "show_bar_chart" | "show-bar-chart"
+        | "render_bar_chart" | "render-bar-chart" => "drew you a chart".into(),
         other => format!("used {other}"),
     };
     Some(deed)
@@ -483,6 +488,21 @@ mod tests {
         assert_eq!(
             tool_standin(&deeds_from_replay(&events)),
             Some("[opened example.com, then took a screenshot of my screen]".into())
+        );
+    }
+
+    /// A turn that answered with a generative form and no words used to be written down as
+    /// "[used form]" — the fallback for a tool nobody had named — which is what the thread
+    /// showed for it ever after (Vamos, 21 Sep 2026). The stand-in says what the coworker did.
+    #[test]
+    fn a_generative_form_or_chart_is_remembered_as_shown_not_used() {
+        let events = vec![
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"form"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c2","toolCallName":"bar_chart"}),
+        ];
+        assert_eq!(
+            tool_standin(&deeds_from_replay(&events)),
+            Some("[showed you a form, then drew you a chart]".into())
         );
     }
 
