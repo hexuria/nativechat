@@ -1167,7 +1167,12 @@ pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionRe
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if let Some(spec) = UserFormSpec::parse(body, gateway_entry_id_in(body)) {
-        if spec.effective_resolution().is_some() {
+        // A Computer handoff counts as a reply the caller has to be given, even
+        // though it settles nothing: `escalated` deliberately leaves the form
+        // unresolved (see `absorb_escalated_wire`), and it is this body that
+        // carries the `handoffEntryId` the hand-back route needs. Gating on the
+        // resolution alone sent that back as `Empty` and threw the id away.
+        if spec.effective_resolution().is_some() || spec.computer_handoff.is_some() {
             return UserFormActionReply::Settled(spec);
         }
     }

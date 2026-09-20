@@ -196,7 +196,13 @@ pub fn init(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Named imports, not a glob, for the same reason as in `alert_chrome`:
+    // this module globs `gpui_kit::*`, which re-exports GPUI's `test`
+    // attribute macro, and a glob shadows the prelude's built-in `#[test]`.
+    use super::{
+        DARK_THEME, LIGHT_THEME, WindowAppearance, classic_theme_name, load_saved_mode_from,
+        next_toggle_mode, save_mode_to, window_appearance_override,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
