@@ -7962,6 +7962,14 @@ impl AppState {
             Some(id) => id.clone(),
             None => return,
         };
+        // Decided before the bubble goes in: a forced send over a running turn stops that turn
+        // first, so its "You stopped this turn." lands under the turn it is about, not under
+        // the message that stopped it.
+        let busy = self.busy_state(&conversation_id);
+        let plan = plan_send(busy, self.on_send, force_steer);
+        if plan == SendPlan::Steer && busy == Busy::Running {
+            self.stop_live_turn(cx);
+        }
 
         let local_id = uuid::Uuid::now_v7().to_string();
         // The whole reply, not just its preview: the bubble paints the preview, and the quote
@@ -8058,8 +8066,7 @@ impl AppState {
             .detach();
         }
 
-        let busy = self.busy_state(&conversation_id);
-        match plan_send(busy, self.on_send, force_steer) {
+        match plan {
             SendPlan::Post => {}
             // Held until the thread is idle; `drain_queued_send` posts it then. The bubble is
             // on screen and on its way to disk already, so nothing is lost if the app quits
@@ -8077,14 +8084,14 @@ impl AppState {
             }
             // Parked: the server ends the parked run on this message and closes its cards;
             // the app paints the same ending (Superseded) and never `/stop`s first — see
-            // `settle_parked_cards`. Running: stop the run at its next step, the way the
-            // button does, and send. Anything already held stays held — the message the
-            // person just forced ahead goes first, and the rest follow when it ends.
-            SendPlan::Steer => match busy {
-                Busy::Parked => self.settle_parked_cards(&conversation_id),
-                Busy::Running => self.stop_live_turn(cx),
-                Busy::Idle => {}
-            },
+            // `settle_parked_cards`. Running: the turn was stopped above, the way the button
+            // does it, and this message goes now. Anything already held stays held — the
+            // message the person forced ahead goes first, and the rest follow when it ends.
+            SendPlan::Steer => {
+                if busy == Busy::Parked {
+                    self.settle_parked_cards(&conversation_id);
+                }
+            }
         }
         self.send_opengrok_turn(conversation_id, content, cx);
     }
