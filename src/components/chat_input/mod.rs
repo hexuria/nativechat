@@ -36,11 +36,15 @@ actions!(
         SubmitMessage,
         /// Send the draft, from the field or from the panel standing over it. See
         /// `MessageInput::send_draft` for why the send needs an action of its own.
-        SendDraft
+        SendDraft,
+        /// ⌘⇧↵: send the draft now, even over a running turn. The turn is stopped at its
+        /// next step and this message goes ahead of anything queued behind it.
+        SendDraftSteer
     ]
 );
 
-type SubmitCallback = Box<dyn Fn(String, &mut Context<MessageInput>)>;
+/// The text, and whether the person asked for it to go now (⌘⇧↵) rather than queue.
+type SubmitCallback = Box<dyn Fn(String, bool, &mut Context<MessageInput>)>;
 
 /// The images that may be attached. The picker itself cannot be told to show only these — GPUI's
 /// path prompt has no type filter — so the list is applied to what comes back.
@@ -254,7 +258,7 @@ impl MessageInput {
                         SubmitChord::CommandEnter => *secondary,
                     };
                     if send {
-                        this.trigger_submit(window, cx);
+                        this.trigger_submit(false, window, cx);
                     }
                 }
                 InputEvent::Change => {
@@ -287,7 +291,10 @@ impl MessageInput {
         this
     }
 
-    pub fn on_submit(mut self, handler: impl Fn(String, &mut Context<Self>) + 'static) -> Self {
+    pub fn on_submit(
+        mut self,
+        handler: impl Fn(String, bool, &mut Context<Self>) + 'static,
+    ) -> Self {
         self.on_submit = Some(Box::new(handler));
         self
     }
@@ -324,10 +331,15 @@ impl MessageInput {
     /// happened.
     fn send_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_panel(true, window, cx);
-        self.trigger_submit(window, cx);
+        self.trigger_submit(false, window, cx);
     }
 
-    fn trigger_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn send_draft_steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_panel(true, window, cx);
+        self.trigger_submit(true, window, cx);
+    }
+
+    fn trigger_submit(&mut self, steer: bool, window: &mut Window, cx: &mut Context<Self>) {
         println!("Triggering submit...");
         let text = self.input_state.read(cx).value();
         let trimmed = text.trim();
@@ -348,7 +360,7 @@ impl MessageInput {
             }
             println!("Submitting message: {}", trimmed);
             if let Some(handler) = &self.on_submit {
-                (handler)(trimmed.to_string(), cx);
+                (handler)(trimmed.to_string(), steer, cx);
             }
             self.input_state.update(cx, |state, cx| {
                 state.set_value("".to_string(), window, cx);
@@ -1528,6 +1540,9 @@ impl Render for MessageInput {
                 .on_action(cx.listener(|this, _: &SendDraft, window, cx| {
                     this.send_draft(window, cx);
                 }))
+                .on_action(cx.listener(|this, _: &SendDraftSteer, window, cx| {
+                    this.send_draft_steer(window, cx);
+                }))
                 .when(panel_open, |this| {
                     this.child(deferred(
                         // Above the composer and the width of it: `bottom: 100%` puts the
@@ -2039,7 +2054,7 @@ impl Render for MessageInput {
                                             let mut send_btn = div()
                                                 .id("send-btn")
                                                 .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.trigger_submit(window, cx);
+                                                    this.trigger_submit(false, window, cx);
                                                 }))
                                                 .w(px(36.0))
                                                 .h(px(36.0))

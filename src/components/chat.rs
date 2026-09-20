@@ -1483,9 +1483,9 @@ impl ChatView {
         let input = cx.new(|cx| {
             MessageInput::new(window, state.clone(), cx).on_submit({
                 let state = state.clone();
-                move |text, cx| {
+                move |text, steer, cx| {
                     state.update(cx, |state, cx| {
-                        state.send_message(text, cx);
+                        state.send_message_with(text, steer, cx);
                     });
                 }
             })
