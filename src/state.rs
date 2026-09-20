@@ -589,6 +589,28 @@ fn streaming_message_mut<'a>(
 /// the bubble but still drop whatever else had not landed yet, and it would have to guess where
 /// the row belongs; refusing the reload keeps the whole thread, and gives up nothing, because
 /// the rows the database has are the rows already on screen.
+/// Whose ending a run's stream is delivering, once it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnEnding {
+    /// This run still holds the thread: paint the ending, write it down, let the thread go.
+    Ours,
+    /// A later run holds the thread, or this reply is already on its way to the database.
+    /// Painting now would write over an ending that is already there.
+    Superseded,
+    /// Nothing holds the thread. It was let go while this stream was still open — the person
+    /// pressed stop, or a resync could not find the run — and nothing else is going to end the
+    /// line the run lit up, so this ending clears it and nothing more.
+    Orphaned,
+}
+
+fn turn_ending(live: Option<&LiveTurn>, run_id: &str) -> TurnEnding {
+    match live {
+        Some(turn) if turn.run_id == run_id && !turn.persisting => TurnEnding::Ours,
+        Some(_) => TurnEnding::Superseded,
+        None => TurnEnding::Orphaned,
+    }
+}
+
 fn apply_reload(
     conversation: &mut Conversation,
     live: Option<&LiveTurn>,
@@ -5359,12 +5381,19 @@ impl AppState {
                 match replay {
                     Ok(replay) => state.apply_replayed_turn(&conversation_id, &turn, &replay, cx),
                     Err(_) => {
-                        // The server has no such run: it never started, or it is old enough to
-                        // have been forgotten. Holding the thread out of reload after that would
-                        // strand it on a bubble nothing will ever finish, so the turn is let go
-                        // and the thread reads from the database like any other.
-                        state.live_turns.remove(&conversation_id);
-                        state.load_session_messages(conversation_id.clone(), cx);
+                        // The server has no such run *yet*. A run is recorded once the turn is
+                        // past whatever it waits on first — a sleeping box takes up to 90 s to
+                        // wake — and the stream that sent it stays open the whole time, so the
+                        // turn is kept: that stream ends it, with the reply or with the reason
+                        // there is none. Letting go here was the bug (21 Sep 2026): the reply
+                        // then arrived to a thread that had stopped listening, was thrown away
+                        // as somebody else's, and the line said "working" until the app was
+                        // restarted. A turn that truly never started ends the same way, from
+                        // its own stream's error, so nothing here has to guess.
+                        eprintln!(
+                            "NativeChat: the server has no run {} yet; the turn stays open",
+                            turn.run_id
+                        );
                     }
                 }
                 cx.notify();
@@ -5837,16 +5866,33 @@ impl AppState {
                 Err(error) => (Err(error), false, false, Vec::new()),
             };
             let _ = this.update(cx, |state, cx| {
-                // Something else has already decided what this turn came to: the person stopped
-                // it, a replay settled it while the stream was still open, or the thread has
-                // moved on to a later turn. Painting an ending now would write over the one
-                // that is there — and in the stopped case it would report the person's own
-                // stop as a run that failed, then save the turn a second time.
-                if !state.turn_is_unsettled(&conversation_id, &run_id) {
-                    if let Err(error) = &result {
-                        eprintln!("NativeChat: the turn failed: {}", error.message);
+                // Something else may already have decided what this turn came to: the person
+                // stopped it, a replay settled it while the stream was still open, or the
+                // thread has moved on to a later turn. Painting an ending now would write over
+                // the one that is there — and in the stopped case it would report the person's
+                // own stop as a run that failed, then save the turn a second time.
+                match turn_ending(state.live_turns.get(&conversation_id), &run_id) {
+                    TurnEnding::Ours => {}
+                    TurnEnding::Superseded => {
+                        if let Err(error) = &result {
+                            eprintln!("NativeChat: the turn failed: {}", error.message);
+                        }
+                        return;
                     }
-                    return;
+                    TurnEnding::Orphaned => {
+                        // Nobody holds the thread, so nobody else will put out the status line
+                        // this run lit. Left alone it read "working" until the app was
+                        // restarted, and every message sent meanwhile queued behind it.
+                        if let Err(error) = &result {
+                            eprintln!("NativeChat: the turn failed: {}", error.message);
+                        }
+                        let waiting = is_waiting_on_person(state.thread_status(&conversation_id));
+                        if !waiting {
+                            state.finish_responding(Some(&conversation_id), false);
+                        }
+                        cx.notify();
+                        return;
+                    }
                 }
                 if let Some(message) =
                     streaming_message_mut(&mut state.conversations, &conversation_id, &reply_id)
@@ -9381,11 +9427,11 @@ mod tests {
         DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
         REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
         STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
-        TurnAssembler, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
+        TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
         apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
         is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
         reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
-        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut,
+        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
     };
     use crate::opengrok::{
         CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
@@ -10613,6 +10659,34 @@ mod tests {
             "with no turn in flight the rows are taken, which is what every other reload is"
         );
         assert_eq!(ids(&conversation.messages), vec!["db_ask"]);
+    }
+
+    #[test]
+    fn a_turn_ending_belongs_to_the_run_that_still_holds_the_thread() {
+        assert_eq!(turn_ending(Some(&in_flight()), "run_1"), TurnEnding::Ours);
+    }
+
+    #[test]
+    fn a_turn_ending_stands_down_when_another_run_holds_the_thread_or_the_reply_is_being_saved() {
+        let later = LiveTurn {
+            run_id: "run_2".to_string(),
+            ..in_flight()
+        };
+        assert_eq!(turn_ending(Some(&later), "run_1"), TurnEnding::Superseded);
+        let saving = LiveTurn {
+            persisting: true,
+            ..in_flight()
+        };
+        assert_eq!(turn_ending(Some(&saving), "run_1"), TurnEnding::Superseded);
+    }
+
+    /// The thread was let go while this run's stream was still open — the person pressed stop,
+    /// or (until 21 Sep 2026) a resync read the server's 404 for a run it had not recorded yet
+    /// as "never started". Nobody else will end the line the run started, so its ending still
+    /// has to clear it, or the thread says "working" until the app is restarted.
+    #[test]
+    fn a_turn_let_go_while_its_stream_was_open_still_ends_its_own_line() {
+        assert_eq!(turn_ending(None, "run_1"), TurnEnding::Orphaned);
     }
 
     /// "The last one, if it isn't mine" was the whole of the old rule, and everything that
