@@ -1464,6 +1464,16 @@ pub struct QueuedApproval {
     pub tool: String,
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// Why the run stopped, in the server's word for it — `exec-consent`,
+    /// `policy-approval`, `auto-review`. Any word at all: the app reads the
+    /// ones it has a card for and shows the rest as they come.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The sentence the card puts under the command. A server that does not
+    /// send one leaves the app to say something generic, which is what it
+    /// said for every card before this.
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 impl QueuedApproval {
@@ -3765,21 +3775,42 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/ag-ui/approvals"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
-                "runId": "run-1",
-                "threadId": "t1",
-                "callId": "call-9",
-                "tool": "user_machine_shell",
-                "arguments": {"command": "ls"}
-            }])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "runId": "run-1",
+                    "threadId": "t1",
+                    "callId": "call-9",
+                    "tool": "user_machine_shell",
+                    "arguments": {"command": "ls"}
+                },
+                {
+                    "runId": "run-2",
+                    "threadId": "mcp-cw_1",
+                    "callId": "call-10",
+                    "tool": "read_file",
+                    "arguments": {"path": "/etc/hosts"},
+                    "reason": "policy-approval",
+                    "why": "Reading a file outside the workspace."
+                }
+            ])))
             .mount(&server)
             .await;
 
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let queue = client.list_approvals().await.unwrap();
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].call_id, "call-9");
         assert_eq!(queue[0].tool, "user_machine_shell");
+        assert_eq!(
+            (queue[0].reason.as_deref(), queue[0].why.as_deref()),
+            (None, None),
+            "a server that sends neither still parses"
+        );
+        assert_eq!(queue[1].reason.as_deref(), Some("policy-approval"));
+        assert_eq!(
+            queue[1].why.as_deref(),
+            Some("Reading a file outside the workspace.")
+        );
     }
 
     #[tokio::test]
@@ -4042,6 +4073,8 @@ mod tests {
                 call_id: "old".into(),
                 tool: "user_machine_shell".into(),
                 arguments: json!({"command": "ls"}),
+                reason: None,
+                why: None,
             },
             QueuedApproval {
                 run_id: "r2".into(),
@@ -4049,6 +4082,8 @@ mod tests {
                 call_id: "other".into(),
                 tool: "user_machine_shell".into(),
                 arguments: json!({"command": "pwd"}),
+                reason: None,
+                why: None,
             },
             QueuedApproval {
                 run_id: "r3".into(),
@@ -4056,6 +4091,8 @@ mod tests {
                 call_id: "new".into(),
                 tool: "user_machine_shell".into(),
                 arguments: json!({"command": "uname"}),
+                reason: None,
+                why: None,
             },
         ];
         let latest = QueuedApproval::latest_for_conversation(&queue, "t1").unwrap();

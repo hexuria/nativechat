@@ -8815,6 +8815,13 @@ impl AppState {
     }
 }
 
+/// The queue's own words where it has them.
+///
+/// A card off the queue used to be described by the app: every one of them was
+/// a host shell waiting on consent, so saying so cost nothing. The MCP door
+/// raises cards for reasons of its own — a policy, an auto-review — and says
+/// why in the item, so the card now reads back what the server sent and only
+/// falls through to the old wording for a server that sends neither.
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
     ApprovalSpec {
         run_id: item.run_id.clone(),
@@ -8822,8 +8829,16 @@ fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
         call_id: item.call_id.clone(),
         tool: item.tool.clone(),
         command: command_from_args(&item.arguments),
-        why: "your machine's owner must approve this command".into(),
-        reason: "exec-consent".into(),
+        why: item
+            .why
+            .as_deref()
+            .and_then(some_unless_blank)
+            .unwrap_or_else(|| "your machine's owner must approve this command".to_string()),
+        reason: item
+            .reason
+            .as_deref()
+            .and_then(some_unless_blank)
+            .unwrap_or_else(|| "exec-consent".to_string()),
         output: None,
         ok: None,
     }
@@ -11847,6 +11862,8 @@ mod tests {
             call_id: call_id.into(),
             tool: tool.into(),
             arguments: serde_json::json!({ "path": "/etc/hosts" }),
+            reason: Some("policy-approval".into()),
+            why: Some("Reading a file outside the workspace.".into()),
         }
     }
 
@@ -11882,6 +11899,22 @@ mod tests {
         let chat = spec_from_queued(&queued("cw_1", "call_1", USER_MACHINE_SHELL));
         assert_eq!(chat.conversation_id(), Some("cw_1"));
         assert!(!chat.is_mcp());
+    }
+
+    /// The queue says why it stopped, and the card says it back. Only a server
+    /// that sends neither gets the sentence the app used to make up.
+    #[test]
+    fn a_queued_card_reads_back_the_reason_the_server_sent() {
+        let told = spec_from_queued(&queued("mcp-cw_1", "call_9", "read_file"));
+        assert_eq!(told.reason, "policy-approval");
+        assert_eq!(told.why, "Reading a file outside the workspace.");
+
+        let mut silent = queued("cw_1", "call_1", USER_MACHINE_SHELL);
+        silent.reason = None;
+        silent.why = Some("   ".into());
+        let spec = spec_from_queued(&silent);
+        assert_eq!(spec.reason, "exec-consent");
+        assert_eq!(spec.why, "your machine's owner must approve this command");
     }
 
     // ---- Reaching the gateway, and the list that depends on it ------------------------------
