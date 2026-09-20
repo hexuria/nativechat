@@ -732,6 +732,32 @@ impl TurnAssembler {
 }
 
 impl UiSpec {
+    /// The widget as a value `from_value` reads back unchanged — what the database keeps, so a
+    /// thread read back off disk mounts the same form or chart the stream did.
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Form(form) => serde_json::json!({
+                "component": "form",
+                "title": form.title,
+                "prompt": form.prompt,
+                "submit": form.submit,
+                "fields": form.fields.iter().map(|field| serde_json::json!({
+                    "id": field.id,
+                    "label": field.label,
+                    "options": field.options,
+                })).collect::<Vec<_>>(),
+            }),
+            Self::BarChart(chart) => serde_json::json!({
+                "component": "bar-chart",
+                "title": chart.title,
+                "bars": chart.bars.iter().map(|bar| serde_json::json!({
+                    "label": bar.label,
+                    "value": bar.value,
+                })).collect::<Vec<_>>(),
+            }),
+        }
+    }
+
     pub fn from_value(value: &Value) -> Option<Self> {
         let kind = ui_kind(value)?;
         match kind.as_str() {
@@ -1247,6 +1273,39 @@ mod tests {
 
     fn text(delta: &str) -> Value {
         json!({"type":"TEXT_MESSAGE_CONTENT","delta":delta})
+    }
+
+    /// A generative form or chart is saved as the value it was parsed from, so a thread read
+    /// back from the database mounts the same widget the stream did.
+    #[test]
+    fn a_form_and_a_chart_survive_the_trip_through_their_own_value() {
+        let form = UiSpec::Form(FormSpec {
+            title: Some("QA collapse remasure".into()),
+            prompt: Some("Enter a label.".into()),
+            fields: vec![
+                FormField {
+                    id: "label".into(),
+                    label: "Label".into(),
+                    options: vec![],
+                },
+                FormField {
+                    id: "size".into(),
+                    label: "Size".into(),
+                    options: vec!["S".into(), "M".into()],
+                },
+            ],
+            submit: "Submit".into(),
+        });
+        assert_eq!(UiSpec::from_value(&form.to_value()), Some(form));
+
+        let chart = UiSpec::BarChart(BarChartSpec {
+            title: Some("Visits".into()),
+            bars: vec![BarItem {
+                label: "Mon".into(),
+                value: 3.5,
+            }],
+        });
+        assert_eq!(UiSpec::from_value(&chart.to_value()), Some(chart));
     }
 
     #[test]

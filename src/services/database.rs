@@ -218,6 +218,14 @@ pub enum MessagePart {
         width: u32,
         height: u32,
     },
+    /// A generative widget the coworker answered with — a form of choice chips, a bar chart —
+    /// kept as the JSON it was parsed from, so the thread mounts the same widget when it is read
+    /// back. Without it a turn that said nothing but the form came back as its stand-in line
+    /// alone, "[used form]", on the very next visit.
+    Ui {
+        /// `{"component": "form" | "bar-chart", ...}` as `UiSpec::to_value` writes it.
+        spec: String,
+    },
 }
 
 impl MessagePart {
@@ -225,41 +233,44 @@ impl MessagePart {
         match self {
             Self::Text(_) => "text",
             Self::Screenshot { .. } => "screenshot",
+            Self::Ui { .. } => "ui",
         }
     }
 
-    /// One text column serves both: a text part's words, a screenshot's caption.
+    /// One text column serves all three: a text part's words, a screenshot's caption, a
+    /// widget's JSON.
     fn text(&self) -> String {
         match self {
             Self::Text(text) => text.clone(),
             Self::Screenshot { caption, .. } => caption.clone(),
+            Self::Ui { spec } => spec.clone(),
         }
     }
 
     fn call_id(&self) -> Option<String> {
         match self {
-            Self::Text(_) => None,
+            Self::Text(_) | Self::Ui { .. } => None,
             Self::Screenshot { call_id, .. } => Some(call_id.clone()),
         }
     }
 
     fn image(&self) -> Option<Vec<u8>> {
         match self {
-            Self::Text(_) => None,
+            Self::Text(_) | Self::Ui { .. } => None,
             Self::Screenshot { image, .. } => Some(image.clone()),
         }
     }
 
     fn width(&self) -> Option<i64> {
         match self {
-            Self::Text(_) => None,
+            Self::Text(_) | Self::Ui { .. } => None,
             Self::Screenshot { width, .. } => Some(i64::from(*width)),
         }
     }
 
     fn height(&self) -> Option<i64> {
         match self {
-            Self::Text(_) => None,
+            Self::Text(_) | Self::Ui { .. } => None,
             Self::Screenshot { height, .. } => Some(i64::from(*height)),
         }
     }
@@ -292,6 +303,9 @@ impl PartRow {
                 width: width.max(0) as u32,
                 height: height.max(0) as u32,
             };
+        }
+        if self.kind == "ui" {
+            return MessagePart::Ui { spec: text };
         }
         MessagePart::Text(text)
     }

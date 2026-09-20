@@ -144,7 +144,12 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
             | ChatPart::UserForm(_)
             | ChatPart::SaveLogin(_)
             | ChatPart::CredentialRequest(_) => break_paragraph(&mut words),
-            ChatPart::Ui(_) => {}
+            ChatPart::Ui(spec) => {
+                close_text_run(&mut words, &mut saved);
+                saved.push(MessagePart::Ui {
+                    spec: spec.to_value().to_string(),
+                });
+            }
         }
     }
     close_text_run(&mut words, &mut saved);
@@ -189,15 +194,20 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
     }
     saved
         .into_iter()
-        .map(|part| match part {
-            MessagePart::Text(text) => ChatPart::Text(text),
+        .filter_map(|part| match part {
+            MessagePart::Text(text) => Some(ChatPart::Text(text)),
+            // A widget this build cannot rebuild leaves the stand-in line to speak for it.
+            MessagePart::Ui { spec } => serde_json::from_str::<serde_json::Value>(&spec)
+                .ok()
+                .and_then(|value| crate::opengrok::UiSpec::from_value(&value))
+                .map(ChatPart::Ui),
             MessagePart::Screenshot {
                 call_id,
                 caption,
                 image,
                 width,
                 height,
-            } => ChatPart::Screenshot(crate::opengrok::ScreenshotSpec {
+            } => Some(ChatPart::Screenshot(crate::opengrok::ScreenshotSpec {
                 call_id,
                 caption,
                 image: Arc::new(gpui_kit::Image::from_bytes(
@@ -207,7 +217,7 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 width,
                 height,
                 visibility: Some(ImageVisibility::Transcript),
-            }),
+            })),
         })
         .collect()
 }
@@ -9430,12 +9440,13 @@ mod tests {
         TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
         apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
         is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
-        reads_as_gateway_unreachable, reply_from_replay, restored_parts, saved_parts,
-        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
+        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_parts,
+        saved_parts, spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut,
+        turn_ending,
     };
     use crate::opengrok::{
-        CredentialRequestResolution, Failure, FormResolution, ModelEntry, OpenGrokClient,
-        QueuedApproval, USER_MACHINE_SHELL,
+        CredentialRequestResolution, Failure, FormField, FormResolution, FormSpec, ModelEntry,
+        OpenGrokClient, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
     use crate::state::{ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave};
     use std::str::FromStr;
@@ -10687,6 +10698,55 @@ mod tests {
     #[test]
     fn a_turn_let_go_while_its_stream_was_open_still_ends_its_own_line() {
         assert_eq!(turn_ending(None, "run_1"), TurnEnding::Orphaned);
+    }
+
+    fn a_form() -> UiSpec {
+        UiSpec::Form(FormSpec {
+            title: Some("QA collapse remasure".into()),
+            prompt: Some("Enter a label.".into()),
+            fields: vec![FormField {
+                id: "label".into(),
+                label: "Label".into(),
+                options: vec![],
+            }],
+            submit: "Submit".into(),
+        })
+    }
+
+    /// A turn that answered with a form and no words was saved as its stand-in line alone —
+    /// `saved_parts` dropped every `Ui` part — so the thread showed "[used form]" the moment it
+    /// was read back from the database: on the next visit, and forever after a restart.
+    #[test]
+    fn a_wordless_form_turn_is_saved_with_its_form_and_comes_back_as_one() {
+        let saved = saved_parts(&[ChatPart::Ui(a_form())]);
+        assert_eq!(saved.len(), 1, "the form is written down: {saved:?}");
+        assert!(matches!(saved[0], MessagePart::Ui { .. }), "{saved:?}");
+        assert_eq!(
+            restored_parts("[showed you a form]", saved),
+            vec![ChatPart::Ui(a_form())]
+        );
+    }
+
+    /// The frames of the run behind the Vamos "hi" of 21 Sep 2026: a `form` tool call, its
+    /// arguments in pieces, no words. Read back off the server it has to be a form again, and
+    /// the line it leaves for the model has to say so.
+    #[test]
+    fn a_form_only_run_replays_as_a_form_with_a_line_that_says_so() {
+        let events = vec![
+            serde_json::json!({"type":"RUN_STARTED","runId":"run_f","threadId":"cw_1"}),
+            serde_json::json!({"type":"TOOL_CALL_START","toolCallId":"call_1","toolCallName":"form"}),
+            serde_json::json!({"type":"TOOL_CALL_ARGS","toolCallId":"call_1","delta":"{\"title\":\"QA collapse remasure\",\"prompt\":\"Enter a label.\","}),
+            serde_json::json!({"type":"TOOL_CALL_ARGS","toolCallId":"call_1","delta":"\"submit\":\"Submit\",\"fields\":[{\"id\":\"label\",\"label\":\"Label\",\"options\":[]}] }"}),
+            serde_json::json!({"type":"TOOL_CALL_END","toolCallId":"call_1"}),
+            serde_json::json!({"type":"TOOL_CALL_RESULT","toolCallId":"call_1","content":"rendered"}),
+            serde_json::json!({"type":"RUN_FINISHED","runId":"run_f"}),
+        ];
+        let (plain, parts) = reply_from_replay(&events, "finished");
+        assert_eq!(parts, vec![ChatPart::Ui(a_form())]);
+        assert_eq!(
+            replayed_ending(&events, "finished", None, &plain).as_deref(),
+            Some("[showed you a form]")
+        );
     }
 
     /// "The last one, if it isn't mine" was the whole of the old rule, and everything that
