@@ -553,7 +553,7 @@ fn last_screenshot_set(state: &AppState) -> Vec<ScreenshotSpec> {
     else {
         return Vec::new();
     };
-    for message in conversation.messages.iter().rev() {
+    for message in conversation.messages.iter().rev().filter(|m| !m.hidden) {
         let mut set: Vec<ScreenshotSpec> = Vec::new();
         for part in message.parts.iter().rev() {
             match part {
@@ -1228,7 +1228,7 @@ impl NativeChatHost {
                 .conversations
                 .iter()
                 .find(|c| Some(&c.id) == state.active_conversation_id.as_ref())
-                .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me))
+                .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me && !m.hidden))
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
             bot_status: state.visible_bot_status(),
@@ -1462,6 +1462,7 @@ impl NativeChatHost {
                     conversation
                         .messages
                         .iter()
+                        .filter(|message| !message.hidden)
                         .flat_map(|message| message.parts.iter())
                         .filter_map(|part| match part {
                             ChatPart::SaveLogin(spec) => Some(SaveLoginSnap {

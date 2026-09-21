@@ -62,6 +62,10 @@ pub struct Message {
     /// knows which of the server's runs it can already account for, so reconciling against the
     /// server adds what is missing instead of saying everything a second time.
     pub run_id: Option<String>,
+    /// The person hid this message. It stays in the thread, unpainted, because it is the only
+    /// thing that still names its run — take it out and the thread fetches that run back from
+    /// the server on the next visit, which is the person watching what they deleted return.
+    pub hidden: bool,
 }
 
 impl Message {
@@ -662,6 +666,7 @@ fn status_row(line: &str) -> Message {
         reply_is_me: false,
         parts: Vec::new(),
         run_id: None,
+        hidden: false,
     }
 }
 
@@ -696,6 +701,7 @@ fn restored_message(row: ChatMessage) -> Message {
     let content = row.content;
     let parts = restored_parts(&content, row.parts);
     Message {
+        hidden: row.deleted_at.is_some(),
         id: row.id,
         sender: if row.role == "user" { "Me" } else { "AI" }.to_string(),
         content,
@@ -856,6 +862,7 @@ fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
             reply_is_me: false,
             parts: reply.parts.clone(),
             run_id: Some(reply.run_id.clone()),
+            hidden: false,
         },
     );
     id
@@ -2092,7 +2099,8 @@ impl AppState {
             .as_ref()
             .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
             .into_iter()
-            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .flat_map(|c| c.messages.iter().filter(|m| !m.hidden))
+            .flat_map(|m| m.parts.iter())
             .filter_map(|part| match part {
                 ChatPart::Approval(spec) if !self.approval_answered(&spec.call_id) => {
                     Some(spec.clone())
@@ -2126,7 +2134,8 @@ impl AppState {
             .as_ref()
             .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
             .into_iter()
-            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .flat_map(|c| c.messages.iter().filter(|m| !m.hidden))
+            .flat_map(|m| m.parts.iter())
             .filter_map(|part| match part {
                 ChatPart::UserForm(spec) if spec.is_unresolved() => Some(spec.clone()),
                 _ => None,
@@ -2140,7 +2149,8 @@ impl AppState {
             .as_ref()
             .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
             .into_iter()
-            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .flat_map(|c| c.messages.iter().filter(|m| !m.hidden))
+            .flat_map(|m| m.parts.iter())
             .filter_map(|part| match part {
                 ChatPart::UserForm(spec)
                     if spec.live_computer_handoff()
@@ -2175,7 +2185,8 @@ impl AppState {
             .as_ref()
             .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
             .into_iter()
-            .flat_map(|c| c.messages.iter().flat_map(|m| m.parts.iter()))
+            .flat_map(|c| c.messages.iter().filter(|m| !m.hidden))
+            .flat_map(|m| m.parts.iter())
             .filter_map(|part| match part {
                 ChatPart::UserForm(spec) => Some(spec.clone()),
                 _ => None,
@@ -4597,10 +4608,17 @@ impl AppState {
             }
             self.native_tts = SourceTtsState::default();
         }
-        if let Some(id) = &self.active_conversation_id {
-            if let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id) {
-                conversation.messages.retain(|m| m.id != message_id);
-            }
+        // Marked, not taken out. A hidden message is the thread's own memory of a run it has
+        // already accounted for; without it the next reconcile decides the server knows
+        // something this thread does not and grafts the turn back on.
+        if let Some(id) = &self.active_conversation_id
+            && let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id)
+            && let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|m| m.id == message_id)
+        {
+            message.hidden = true;
         }
         self.message_reactions.remove(message_id);
         if self
@@ -4620,8 +4638,8 @@ impl AppState {
         if let Some(db) = self.database_service.clone() {
             let id = message_id.to_string();
             cx.spawn(async move |_, _| {
-                if let Err(error) = db.delete_message(&id).await {
-                    eprintln!("Failed to delete message: {error}");
+                if let Err(error) = db.hide_message(&id).await {
+                    eprintln!("Failed to hide message: {error}");
                 }
             })
             .detach();
@@ -5937,6 +5955,7 @@ impl AppState {
                 reply_is_me: false,
                 parts: Vec::new(),
                 run_id: Some(run_id.clone()),
+                hidden: false,
             });
         }
         self.live_turns.insert(
@@ -6274,7 +6293,7 @@ impl AppState {
             .conversations
             .iter()
             .find(|c| Some(&c.id) == self.active_conversation_id.as_ref())?;
-        let last = conversation.messages.last()?;
+        let last = conversation.messages.iter().rev().find(|m| !m.hidden)?;
         (!last.is_me && is_unsent_turn_note(&last.content)).then(|| last.id.clone())
     }
 
@@ -7066,6 +7085,7 @@ impl AppState {
             reply_is_me: false,
             run_id: Some(spec.run_id.clone()),
             parts: vec![ChatPart::Approval(spec)],
+            hidden: false,
         });
     }
 
@@ -9233,6 +9253,7 @@ impl AppState {
                 reply_is_me: reply.as_ref().is_some_and(|r| r.is_me),
                 parts: Vec::new(),
                 run_id: None,
+                hidden: false,
             };
             conversation.messages.push(message);
         }
@@ -9378,6 +9399,7 @@ impl AppState {
                 reply_is_me: next.reply.as_ref().is_some_and(|r| r.is_me),
                 parts: Vec::new(),
                 run_id: None,
+                hidden: false,
             });
         }
         self.send_opengrok_turn_with(
@@ -9405,6 +9427,7 @@ impl AppState {
         };
         conversation.messages.iter().rev().any(|message| {
             !message.is_me
+                && !message.hidden
                 && message.parts.iter().any(|part| match part {
                     ChatPart::Approval(spec) => {
                         !spec.run_id.is_empty()
@@ -9426,6 +9449,7 @@ impl AppState {
         };
         conversation.messages.iter().rev().any(|message| {
             !message.is_me
+                && !message.hidden
                 && message.parts.iter().any(|part| match part {
                     ChatPart::UserForm(spec) => {
                         spec.is_unresolved()
@@ -10674,6 +10698,7 @@ mod tests {
             reply_is_me: false,
             parts: Vec::new(),
             run_id: None,
+            hidden: false,
         }
     }
 
@@ -11531,6 +11556,52 @@ mod tests {
     /// A row written before pieces were kept has none of them — which is also every row the
     /// build in the person's hands is writing right now. It must still open, as the one bubble
     /// its words always were.
+    /// What the person hid stays in the thread, unpainted, so the thread keeps its memory.
+    ///
+    /// The row is the only thing that names the run it came out of. Take it away and the next
+    /// reconcile decides the server knows a turn this thread does not, and grafts it back on —
+    /// which is the person watching what they deleted return.
+    #[test]
+    fn a_hidden_reply_still_names_its_run_so_the_thread_does_not_fetch_it_back() {
+        let runs = vec![
+            thread_run("run_1", "finished", 1_000, &turn_frames()),
+            thread_run("run_2", "finished", 2_000, &turn_frames()),
+        ];
+        let mut messages = vec![
+            at(message("m_ask", true, "do it"), 500),
+            from_run("m_1", "done", "run_1", 1_000),
+            from_run("m_2", "done again", "run_2", 2_000),
+        ];
+        assert!(
+            missing_replies(&messages, &runs).is_empty(),
+            "a thread that can name both runs asks for nothing"
+        );
+
+        // The person hides both replies. The rows stay, so the thread still names both runs.
+        for message in messages.iter_mut().filter(|m| !m.is_me) {
+            message.hidden = true;
+        }
+        assert!(
+            missing_replies(&messages, &runs).is_empty(),
+            "hidden is still known: {:?}",
+            missing_replies(&messages, &runs)
+                .iter()
+                .map(|reply| reply.run_id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Taking the rows away is what used to bring the turns back.
+        messages.retain(|m| m.is_me);
+        assert_eq!(
+            missing_replies(&messages, &runs)
+                .iter()
+                .map(|reply| reply.run_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["run_1", "run_2"],
+            "a thread that can name nothing takes the lot back"
+        );
+    }
+
     /// A bubble and its row answer to one name, so the delete finds it.
     ///
     /// The row used to be filed under an id the database minted, which nothing on screen had:
@@ -11557,9 +11628,13 @@ mod tests {
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         assert_eq!(ids_of(&rows), vec!["bubble_1"], "the row is the bubble's");
 
-        db.delete_message("bubble_1").await.expect("deleted");
+        db.hide_message("bubble_1").await.expect("hidden");
         let rows = db.get_messages("s1").await.expect("the thread reopens");
-        assert!(rows.is_empty(), "it stays deleted: {:?}", ids_of(&rows));
+        assert_eq!(rows.len(), 1, "the row stays, so the run stays named");
+        assert!(
+            rows[0].deleted_at.is_some(),
+            "and it comes back marked, so nothing paints it"
+        );
     }
 
     /// Two paths can settle one run — the live stream and the watcher that outlives it. Both
@@ -11848,6 +11923,7 @@ mod tests {
             reply_preview: None,
             reply_is_me: None,
             run_id: None,
+            deleted_at: None,
             parts: Vec::new(),
         }
     }

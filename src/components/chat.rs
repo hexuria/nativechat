@@ -329,6 +329,11 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     let retryable = state.retryable_turn();
     let mut rows = Vec::new();
     for msg in &conv.messages {
+        // A message the person hid is still here — it is what keeps the thread from fetching
+        // its turn back off the server — but it is never painted again.
+        if msg.hidden {
+            continue;
+        }
         let is_native_speaking = state.native_tts.message_id.as_ref() == Some(&msg.id);
         let full_highlight = if is_native_speaking {
             state

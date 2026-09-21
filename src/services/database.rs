@@ -155,11 +155,19 @@ impl DatabaseService {
         Ok(())
     }
 
-    pub async fn delete_message(&self, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM chat_messages WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    /// Hide a message rather than take it away.
+    ///
+    /// The row is what names the run it came out of, and a thread that can name a run does not
+    /// fetch it back from the server. Take the row away and the thread forgets, and what the
+    /// person deleted returns on their next visit. So the row stays, stamped, and nothing
+    /// paints it.
+    pub async fn hide_message(&self, id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE chat_messages SET deleted_at = strftime('%Y-%m-%d %H:%M:%S', 'now') WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -167,7 +175,7 @@ impl DatabaseService {
     /// pieces were kept has none, and reads back as the words in `content`.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let mut rows = sqlx::query_as::<_, ChatMessage>(
-            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -218,6 +226,9 @@ pub struct ChatMessage {
     /// reconciled against the server tells a run it has already written down from one it has
     /// only just heard about.
     pub run_id: Option<String>,
+    /// When the person hid this message, for a message they hid. The row stays so the thread
+    /// can still name its run; nothing paints it.
+    pub deleted_at: Option<String>,
     /// The pieces of the message, in the order they were seen. They live in a table of their own
     /// so the picture bytes stay off this row; `get_messages` is what fills this in.
     #[sqlx(skip)]

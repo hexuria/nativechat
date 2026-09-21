@@ -1,0 +1,15 @@
+-- A message the person deleted is kept, and hidden.
+--
+-- Deleting a turn used to take the row away, which lost the one thing that kept the thread from
+-- fetching it back: a thread decides what the server has that it does not by asking which runs it
+-- can still name, and a row is what names a run. With the row gone the thread could name nothing,
+-- so the next visit grafted the last few runs back on and the person watched what they deleted
+-- return.
+--
+-- So the row stays, stamped with the moment it was hidden, and nothing paints it. What the person
+-- asked for is what they get — it is off their screen for good — and the thread keeps its memory
+-- of what it has already accounted for. Nothing is destroyed here or on the server, which is the
+-- decision behind this whole change.
+--
+-- Null on every row written before this, and on every row still on screen.
+ALTER TABLE chat_messages ADD COLUMN deleted_at TEXT;
