@@ -1019,6 +1019,26 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// `PUT /coworkers/{id}/computer/egress-policy` — the standing answer for this coworker's
+    /// computer to the egress tunnel's card. The server keys it by the computer's scope, so
+    /// every bot sharing the box sees the same choice.
+    pub async fn set_egress_policy(
+        &self,
+        coworker_id: &str,
+        mode: LocalExecMode,
+    ) -> Result<(), OpenGrokError> {
+        let path = format!("/coworkers/{coworker_id}/computer/egress-policy");
+        let body = json!({ "mode": mode.as_stored() });
+        let response = self
+            .send_json(reqwest::Method::PUT, &path, Some(&body))
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::read_error(response).await)
+        }
+    }
+
     /// Rebuild the coworker's computer on the newest image, keeping its files. The server
     /// answers at once; `coworker_computer` carries the phases.
     pub async fn update_coworker_computer(
@@ -1612,6 +1632,17 @@ impl LocalExecMode {
         }
     }
 
+    /// Exactly one of the three words, or nothing — for a field whose absence means "no such
+    /// control", where `from_stored`'s catch-all would invent a Never.
+    pub fn parse(mode: &str) -> Option<Self> {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "bypass" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
     pub fn as_stored(self) -> &'static str {
         match self {
             Self::Ask => "ask",
@@ -1695,6 +1726,28 @@ pub struct CoworkerComputer {
     /// Present when `shareScope` is `group`.
     #[serde(rename = "groupId", alias = "group_id", default)]
     pub group_id: Option<String>,
+    /// The person's standing answer, for this computer, to the egress tunnel's card:
+    /// `bypass` | `ask` | `never` in the same words as this Mac's local-exec policy. `None`
+    /// on a server that does not carry it, which hides the control.
+    #[serde(
+        rename = "egressPolicy",
+        alias = "egress_policy",
+        default,
+        deserialize_with = "deserialize_optional_exec_mode"
+    )]
+    pub egress_policy: Option<LocalExecMode>,
+}
+
+fn deserialize_optional_exec_mode<'de, D>(
+    deserializer: D,
+) -> Result<Option<LocalExecMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::String(raw)) => LocalExecMode::parse(&raw),
+        _ => None,
+    })
 }
 
 /// Box tunnel. OpenGrok sends `{enabled, ready}` and may send a `ws://` URL.
@@ -3989,6 +4042,55 @@ mod tests {
             "omitted isEgressTunnelAvailable defaults false"
         );
         assert!(status.box_egress_ready().is_none());
+    }
+
+    /// The standing choice arrives in the local-exec words; an older server sends nothing and
+    /// a word this build does not know must not be read as a Never.
+    #[test]
+    fn coworker_computer_reads_the_egress_policy_or_none() {
+        let older: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running"
+        }))
+        .unwrap();
+        assert_eq!(older.egress_policy, None);
+        for (word, mode) in [
+            ("bypass", LocalExecMode::Always),
+            ("ask", LocalExecMode::Ask),
+            ("never", LocalExecMode::Never),
+        ] {
+            let status: CoworkerComputer = serde_json::from_value(json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "egressPolicy": word
+            }))
+            .unwrap();
+            assert_eq!(status.egress_policy, Some(mode), "{word}");
+        }
+        let odd: CoworkerComputer = serde_json::from_value(json!({
+            "agentId": "cw_1",
+            "state": "running",
+            "egressPolicy": "sometimes"
+        }))
+        .unwrap();
+        assert_eq!(odd.egress_policy, None, "an unknown word hides the control");
+    }
+
+    #[tokio::test]
+    async fn set_egress_policy_puts_the_stored_word() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/computer/egress-policy"))
+            .and(body_json(json!({ "mode": "never" })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client
+            .set_egress_policy("cw_1", LocalExecMode::Never)
+            .await
+            .expect("204 is success");
     }
 
     #[test]

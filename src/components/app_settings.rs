@@ -689,10 +689,19 @@ fn computer_page(
     cx: &App,
 ) -> impl IntoElement {
     let show_route = app.read(cx).show_route_traffic_in_user_settings();
+    let egress_policy = app
+        .read(cx)
+        .show_egress_policy_in_user_settings()
+        .then(|| app.read(cx).egress_policy())
+        .flatten();
     let page = v_flex()
         .gap(px(12.))
         .when(show_route, |this| {
             this.child(settings_route_traffic_row(app.clone(), muted, cx))
+        })
+        .when_some(egress_policy, |this, current| {
+            let org = app.read(cx).computer_is_org_shared();
+            this.child(settings_egress_policy_row(app.clone(), current, org, muted))
         })
         .child(div().text_xs().text_color(muted).child("This Mac"))
         .child(
@@ -769,6 +778,83 @@ fn settings_route_traffic_row(app: Entity<AppState>, muted: Hsla, cx: &App) -> i
                         }),
                 ),
         )
+}
+
+/// The standing answer to the tunnel's card for the computer the open bot shares: sits under
+/// Route traffic, because it only matters while traffic is routed through this desktop.
+fn settings_egress_policy_row(
+    app: Entity<AppState>,
+    current: LocalExecMode,
+    org: bool,
+    muted: Hsla,
+) -> impl IntoElement {
+    let (title, description) = if org {
+        (
+            "Use your network from the organization's computer",
+            "Whether Bots on the organization's shared computer may reach the web through this desktop without asking each time. Set by the organization's admin for every member.",
+        )
+    } else {
+        (
+            "Use your network from this computer",
+            "Whether Bots on this computer may reach the web through this desktop without asking each time. Never allow keeps their browser off while traffic is routed here.",
+        )
+    };
+    h_flex()
+        .id("egress-policy-row")
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap(px(12.))
+        .px(px(16.))
+        .py(px(14.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0x777777).opacity(0.24))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(2.))
+                .child(div().text_sm().child(title))
+                .child(div().text_xs().text_color(muted).child(description)),
+        )
+        .child(egress_policy_picker(current, app))
+}
+
+/// The same three-way dropdown this Mac's local-exec policy uses, for a computer's network use.
+pub(crate) fn egress_policy_picker(
+    current: LocalExecMode,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    Button::new("egress-policy-menu")
+        .label(current.label())
+        .ghost()
+        .compact()
+        .icon(IconName::ChevronDown)
+        .dropdown_menu(move |menu, _, _| {
+            menu.item(egress_menu_item(
+                LocalExecMode::Always,
+                current,
+                app.clone(),
+            ))
+            .item(egress_menu_item(LocalExecMode::Ask, current, app.clone()))
+            .item(egress_menu_item(LocalExecMode::Never, current, app.clone()))
+        })
+}
+
+fn egress_menu_item(
+    mode: LocalExecMode,
+    current: LocalExecMode,
+    app: Entity<AppState>,
+) -> PopupMenuItem {
+    PopupMenuItem::new(mode.label())
+        .checked(mode == current)
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            app.update(cx, |state, cx| {
+                state.set_egress_policy(mode, cx);
+            });
+        })
 }
 
 fn computer_row(
