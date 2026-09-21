@@ -859,6 +859,59 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
 /// to another run, and since a reply is written down under its bubble's own name, painting it
 /// would overwrite that run's row on disk — the reply the person kept replaced by one they were
 /// never shown.
+/// The messages of these runs, put out of sight. Returns the ones that were not already.
+///
+/// A hidden message keeps its row and its run id: it is the only thing that tells the thread it
+/// has already accounted for that turn, so taking it out would have the thread fetch it back.
+fn hide_messages_of_runs(messages: &mut [Message], runs: &[String]) -> Vec<String> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let runs: HashSet<&str> = runs.iter().map(String::as_str).collect();
+    let mut newly_hidden = Vec::new();
+    for message in messages.iter_mut() {
+        if message.hidden {
+            continue;
+        }
+        if message
+            .run_id
+            .as_deref()
+            .is_some_and(|run| runs.contains(run))
+        {
+            message.hidden = true;
+            newly_hidden.push(message.id.clone());
+        }
+    }
+    newly_hidden
+}
+
+/// The turns this machine has hidden that the server is still offering.
+///
+/// Deleting asks the server to withhold the turn, and that ask can fail. This is what the
+/// failure looks like afterwards: a run still in the thread's answer that this machine has
+/// already put out of sight. Asking again costs nothing — the server's answer to hiding a turn
+/// twice is the same as to hiding it once — and it means a delete made on a bad connection is
+/// not quietly lost for every other machine.
+fn unheard_hidden_runs(messages: &[Message], offered: &[ThreadRun]) -> Vec<String> {
+    if offered.is_empty() {
+        return Vec::new();
+    }
+    let hidden: HashSet<&str> = messages
+        .iter()
+        .filter(|message| message.hidden)
+        .filter_map(|message| message.run_id.as_deref())
+        .collect();
+    if hidden.is_empty() {
+        return Vec::new();
+    }
+    offered
+        .iter()
+        .map(|run| run.run_id.as_str())
+        .filter(|run| hidden.contains(run))
+        .map(str::to_string)
+        .collect()
+}
+
 fn bubble_for_run(
     messages: &mut Vec<Message>,
     target: Option<&str>,
@@ -5569,7 +5622,7 @@ impl AppState {
                 match thread {
                     Ok(thread) => {
                         state.reconciled_threads.insert(conversation_id.clone());
-                        state.hide_withheld_runs(&conversation_id, &thread.hidden_run_ids, cx);
+                        state.hide_withheld_runs(&conversation_id, &thread, cx);
                         state.apply_thread_replay(&conversation_id, &thread, cx);
                         state.overlay_replay_cards(&conversation_id, &thread.runs);
                     }
@@ -5583,21 +5636,25 @@ impl AppState {
         .detach();
     }
 
-    /// Put out of sight the turns this account hid somewhere else.
+    /// Put out of sight the turns this account hid somewhere else, and tell the server about
+    /// any it has not heard of.
     ///
     /// Each machine keeps its own copy of a thread, so a turn deleted on one would go on being
     /// painted by the others from their caches. The server names what it withheld; this is the
     /// other half of that sentence. The row stays, as it does for a delete made here, so the
     /// thread still knows it has accounted for that run.
+    ///
+    /// It heals the other direction too. A delete asks the server to withhold the turn, and
+    /// that ask can fail — a flaky connection, an app closed a moment later. The server is
+    /// still offering a turn this machine has hidden, which is exactly how that failure looks
+    /// from here, so it is asked again. Nothing has to be remembered between runs of the app
+    /// for that: the rows say what was hidden, and the answer says what the server knows.
     fn hide_withheld_runs(
         &mut self,
         conversation_id: &str,
-        hidden: &[String],
+        thread: &ThreadReplay,
         cx: &mut Context<Self>,
     ) {
-        if hidden.is_empty() {
-            return;
-        }
         let Some(conversation) = self
             .conversations
             .iter_mut()
@@ -5605,19 +5662,20 @@ impl AppState {
         else {
             return;
         };
-        let mut newly_hidden: Vec<String> = Vec::new();
-        for message in conversation.messages.iter_mut() {
-            if message.hidden {
-                continue;
-            }
-            if message
-                .run_id
-                .as_deref()
-                .is_some_and(|run| hidden.iter().any(|id| id == run))
-            {
-                message.hidden = true;
-                newly_hidden.push(message.id.clone());
-            }
+        let unheard = unheard_hidden_runs(&conversation.messages, &thread.runs);
+        let newly_hidden =
+            hide_messages_of_runs(&mut conversation.messages, &thread.hidden_run_ids);
+        if !unheard.is_empty()
+            && let Some(client) = self.opengrok.clone()
+        {
+            cx.spawn(async move |_, _| {
+                for run_id in unheard {
+                    if let Err(error) = client.hide_run(&run_id).await {
+                        log::warn!("could not tell the server a turn was hidden: {error}");
+                    }
+                }
+            })
+            .detach();
         }
         if let Some(db) = self.database_service.clone()
             && !newly_hidden.is_empty()
@@ -5653,7 +5711,22 @@ impl AppState {
         let Some(conversation) = self.conversations.iter().find(|c| c.id == conversation_id) else {
             return;
         };
-        let missing = missing_replies(&conversation.messages, &thread.runs);
+        // A turn named as withheld is not grafted, whatever else the answer carries. The
+        // server leaves hidden runs out of the list, and this thread is not painted from a
+        // promise: a run named in both places was hidden on some machine, and putting it back
+        // is the one thing this must never do.
+        let offered: Vec<ThreadRun> = if thread.hidden_run_ids.is_empty() {
+            thread.runs.clone()
+        } else {
+            let hidden: HashSet<&str> = thread.hidden_run_ids.iter().map(String::as_str).collect();
+            thread
+                .runs
+                .iter()
+                .filter(|run| !hidden.contains(run.run_id.as_str()))
+                .cloned()
+                .collect()
+        };
+        let missing = missing_replies(&conversation.messages, &offered);
         if missing.is_empty() {
             return;
         }
@@ -10831,10 +10904,11 @@ mod tests {
         STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
         TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
         apply_catalogue, apply_reload, bot_status_line, bubble_for_run, graft_reply,
-        is_status_line, is_tool_standin, is_unsent_turn_note, missing_replies,
-        overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable, replayed_ending,
-        reply_from_replay, restored_message, restored_parts, saved_parts, spec_from_queued,
-        stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
+        hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note,
+        missing_replies, overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable,
+        replayed_ending, reply_from_replay, restored_message, restored_parts, saved_parts,
+        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
+        unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -11771,6 +11845,70 @@ mod tests {
             messages[1].content, "an older reply",
             "the last thing said before is untouched"
         );
+    }
+
+    /// A turn hidden on another machine goes out of sight here, and is never fetched back.
+    #[test]
+    fn a_turn_hidden_somewhere_else_is_put_out_of_sight_here() {
+        let mut messages = vec![
+            at(message("m_ask", true, "do it"), 500),
+            from_run("m_1", "done", "run_1", 1_000),
+            from_run("m_2", "done again", "run_2", 2_000),
+        ];
+        let hidden = vec!["run_1".to_string()];
+
+        let newly = hide_messages_of_runs(&mut messages, &hidden);
+        assert_eq!(
+            newly,
+            vec!["m_1".to_string()],
+            "only the turn that was hidden"
+        );
+        assert!(messages[1].hidden);
+        assert!(!messages[2].hidden, "the other turn is untouched");
+
+        // Asking again changes nothing, so a thread opened every day writes nothing every day.
+        assert!(hide_messages_of_runs(&mut messages, &hidden).is_empty());
+
+        // And a hidden message still names its run, so the thread never fetches it back.
+        let runs = vec![
+            thread_run("run_1", "finished", 1_000, &turn_frames()),
+            thread_run("run_2", "finished", 2_000, &turn_frames()),
+        ];
+        assert!(missing_replies(&messages, &runs).is_empty());
+    }
+
+    /// A delete the server never heard is asked again, rather than lost.
+    ///
+    /// Telling the server can fail — a bad connection, an app closed a moment later — and the
+    /// message is already hidden here, so there is no second delete to try. This is what the
+    /// failure looks like from the next visit: the server still offering a turn this machine
+    /// has put out of sight.
+    #[test]
+    fn a_turn_hidden_here_that_the_server_still_offers_is_asked_for_again() {
+        let mut messages = vec![
+            at(message("m_ask", true, "do it"), 500),
+            from_run("m_1", "done", "run_1", 1_000),
+            from_run("m_2", "done again", "run_2", 2_000),
+        ];
+        let runs = vec![
+            thread_run("run_1", "finished", 1_000, &turn_frames()),
+            thread_run("run_2", "finished", 2_000, &turn_frames()),
+        ];
+        assert!(
+            unheard_hidden_runs(&messages, &runs).is_empty(),
+            "nothing is hidden yet, so there is nothing to tell"
+        );
+
+        messages[1].hidden = true;
+        assert_eq!(
+            unheard_hidden_runs(&messages, &runs),
+            vec!["run_1".to_string()],
+            "the server is still offering a turn this machine hid"
+        );
+
+        // Once the server withholds it, there is nothing left to say.
+        let withheld = vec![thread_run("run_2", "finished", 2_000, &turn_frames())];
+        assert!(unheard_hidden_runs(&messages, &withheld).is_empty());
     }
 
     /// A run that does not say when it began is placed now, not at the start of time.

@@ -1671,6 +1671,15 @@ pub struct RunReplay {
 }
 
 /// A thread's runs as the server kept them, from `GET /ag-ui/threads/{thread_id}`.
+/// A list, or nothing at all. A server that has no answer may leave the field out or send a
+/// null, and a thread that will not load is a worse answer than an empty list.
+fn list_or_nothing<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ThreadReplay {
     #[serde(rename = "threadId", default)]
@@ -1681,7 +1690,7 @@ pub struct ThreadReplay {
     /// The turns this account hid, which the server withheld from `runs`. A thread is cached
     /// on each machine, so without being told, the machine that did not do the hiding would
     /// go on painting from its own copy what the person deleted on another.
-    #[serde(rename = "hiddenRunIds", default)]
+    #[serde(rename = "hiddenRunIds", default, deserialize_with = "list_or_nothing")]
     pub hidden_run_ids: Vec<String>,
 }
 
@@ -3295,6 +3304,24 @@ mod tests {
             "so this machine can put its own copy out of sight"
         );
         assert!(thread.runs.is_empty(), "and it is not offered again");
+    }
+
+    /// A server that answers with nothing where a list would be is still a thread that reads.
+    #[tokio::test]
+    async fn a_thread_whose_hidden_list_is_nothing_at_all_still_reads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "hiddenRunIds": serde_json::Value::Null,
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        assert!(thread.hidden_run_ids.is_empty());
     }
 
     /// A server that predates hiding says nothing about it, and the thread still reads.
