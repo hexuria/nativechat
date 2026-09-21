@@ -843,6 +843,43 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
 /// to the message that asked for it. Placing it by when its run started puts it after that
 /// message and before whatever the person said next — which is the difference between a
 /// transcript and a pile.
+/// The bubble a run's reply belongs to, made if there is none.
+///
+/// A run's reply has to land in that run's own message: the turn's, by the name it was given
+/// when it started, or the one already carrying the run — a bubble grafted for it while nobody
+/// was watching. A run picked up off the approvals queue after a restart has neither, and then
+/// one is made for it.
+///
+/// What it must never do is fall back to the last thing the coworker said. That message belongs
+/// to another run, and since a reply is written down under its bubble's own name, painting it
+/// would overwrite that run's row on disk — the reply the person kept replaced by one they were
+/// never shown.
+fn bubble_for_run(messages: &mut Vec<Message>, target: Option<&str>, run_id: &str) -> usize {
+    if let Some(at) = target.and_then(|id| messages.iter().position(|m| m.id == id)) {
+        return at;
+    }
+    if let Some(at) = messages
+        .iter()
+        .position(|m| m.run_id.as_deref() == Some(run_id))
+    {
+        return at;
+    }
+    messages.push(Message {
+        id: uuid::Uuid::now_v7().to_string(),
+        sender: "AI".to_string(),
+        content: String::new(),
+        sent_at: SystemTime::now(),
+        is_me: false,
+        reply_preview: None,
+        reply_to_id: None,
+        reply_is_me: false,
+        parts: Vec::new(),
+        run_id: Some(run_id.to_string()),
+        hidden: false,
+    });
+    messages.len() - 1
+}
+
 fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
     let id = uuid::Uuid::now_v7().to_string();
     let at = messages
@@ -6763,17 +6800,13 @@ impl AppState {
                                         .conversations
                                         .iter_mut()
                                         .find(|c| &c.id == conversation_id)
-                                    && let Some(last) = match target.as_deref() {
-                                        Some(id) => {
-                                            conversation.messages.iter_mut().find(|m| m.id == id)
-                                        }
-                                        None => conversation
-                                            .messages
-                                            .iter_mut()
-                                            .rev()
-                                            .find(|m| !m.is_me),
-                                    }
                                 {
+                                    let at = bubble_for_run(
+                                        &mut conversation.messages,
+                                        target.as_deref(),
+                                        &run_id,
+                                    );
+                                    let last = &mut conversation.messages[at];
                                     painted = Some(last.id.clone());
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
@@ -10270,7 +10303,8 @@ async fn sync_site_logins(
                 // up. A notes edit the server refused at the time is filed on the next
                 // sync instead of being lost.
                 if !took
-                    && (mine.label.trim() != row.label.trim() || mine.notes.trim() != row.notes.trim())
+                    && (mine.label.trim() != row.label.trim()
+                        || mine.notes.trim() != row.notes.trim())
                 {
                     let update = crate::opengrok::SiteLoginUpdate {
                         label: Some(mine.label.trim().to_string()),
@@ -10319,7 +10353,8 @@ async fn sync_site_logins(
         // secret is on another Mac only has nothing to file. A keychain that would not
         // answer is not the same as a row with no secret: the row waits for the next sync
         // rather than being filed without what it holds.
-        let (Ok(password), Ok(otpauth)) = (vault.secret_for_fill(&mine.id), vault.code_for(&mine.id))
+        let (Ok(password), Ok(otpauth)) =
+            (vault.secret_for_fill(&mine.id), vault.code_for(&mine.id))
         else {
             log::warn!("the keychain would not answer for a login; leaving it for the next sync");
             continue;
@@ -10666,11 +10701,11 @@ mod tests {
         REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
         STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
         TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
-        apply_catalogue, apply_reload, bot_status_line, graft_reply, is_status_line,
-        is_tool_standin, is_unsent_turn_note, missing_replies, overlay_server_cards,
-        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_parts,
-        saved_parts, spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut,
-        turn_ending,
+        apply_catalogue, apply_reload, bot_status_line, bubble_for_run, graft_reply,
+        is_status_line, is_tool_standin, is_unsent_turn_note, missing_replies,
+        overlay_server_cards, reads_as_gateway_unreachable, replayed_ending, reply_from_replay,
+        restored_parts, saved_parts, spec_from_queued, stream_paint_due, stream_part_sig,
+        streaming_message_mut, turn_ending,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -11556,6 +11591,47 @@ mod tests {
     /// A row written before pieces were kept has none of them — which is also every row the
     /// build in the person's hands is writing right now. It must still open, as the one bubble
     /// its words always were.
+    /// A run's reply lands in that run's own bubble, or in one made for it.
+    ///
+    /// It used to fall back to the last thing the coworker said, which was harmless only while
+    /// a reply was written down under a fresh name every time. Now that a reply is written down
+    /// under its bubble's own name, that fallback would put this run's words on another run's
+    /// row and take that row's pictures with it.
+    #[test]
+    fn a_run_writes_into_its_own_bubble_or_one_made_for_it() {
+        let mut messages = vec![
+            at(message("m_ask", true, "do it"), 500),
+            from_run("m_old", "an older reply", "run_old", 1_000),
+        ];
+
+        // The turn named its bubble when it started.
+        let named = from_run("m_live", "", "run_1", 2_000);
+        messages.push(named);
+        assert_eq!(
+            bubble_for_run(&mut messages, Some("m_live"), "run_1"),
+            2,
+            "the bubble the turn named"
+        );
+
+        // No name, but the thread already carries a bubble for the run.
+        assert_eq!(
+            bubble_for_run(&mut messages, None, "run_1"),
+            2,
+            "found by the run it carries"
+        );
+
+        // Neither: a bubble is made, and the older reply is left alone.
+        let before = messages.len();
+        let made = bubble_for_run(&mut messages, None, "run_new");
+        assert_eq!(made, before, "appended rather than borrowed");
+        assert_eq!(messages.len(), before + 1);
+        assert_eq!(messages[made].run_id.as_deref(), Some("run_new"));
+        assert_eq!(
+            messages[1].content, "an older reply",
+            "the last thing said before is untouched"
+        );
+    }
+
     /// What the person hid stays in the thread, unpainted, so the thread keeps its memory.
     ///
     /// The row is the only thing that names the run it came out of. Take it away and the next

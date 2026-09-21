@@ -621,7 +621,10 @@ mod tests {
             .save("code.com", "ada", "", "", "code", "")
             .await
             .expect("code beside it");
-        assert_eq!(after_code.kind, "password", "the row is not turned into a code row");
+        assert_eq!(
+            after_code.kind, "password",
+            "the row is not turned into a code row"
+        );
         assert_eq!(after_code.id, with_password.id);
         // A code for a login nothing else knows is a code row.
         let only_code = vault

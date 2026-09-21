@@ -593,7 +593,11 @@ mod tests {
             username: "ada".into(),
             password: String::new(),
         };
-        assert!(passkey.note().contains("Press Use passkey"), "{}", passkey.note());
+        assert!(
+            passkey.note().contains("Press Use passkey"),
+            "{}",
+            passkey.note()
+        );
         let register = SavedLoginUse::Ready {
             login_id: String::new(),
             username: "webauthn.io".into(),
@@ -618,12 +622,18 @@ mod tests {
             where_the_secret_is(KIND_PASSKEY, false),
             "The key stays on the server and is used in the bot's browser"
         );
-        assert_eq!(where_the_secret_is(KIND_CODE, true), "Code seed in this Mac's keychain");
+        assert_eq!(
+            where_the_secret_is(KIND_CODE, true),
+            "Code seed in this Mac's keychain"
+        );
         assert_eq!(
             where_the_secret_is(KIND_PASSWORD, false),
             "Password on the server; fetched here on first use"
         );
-        assert_eq!(secret_placeholder(KIND_PASSKEY), ("Passkey", "On the server"));
+        assert_eq!(
+            secret_placeholder(KIND_PASSKEY),
+            ("Passkey", "On the server")
+        );
         assert_eq!(secret_placeholder(KIND_PASSWORD).1, "••••••••••");
     }
 }

@@ -205,7 +205,10 @@ mod tests {
         )
         .expect("item");
         assert_eq!(nested.origin, "github.com", "the folder the entry is in");
-        assert_eq!(nested.label, "github.com", "the title follows the site, not the path");
+        assert_eq!(
+            nested.label, "github.com",
+            "the title follows the site, not the path"
+        );
         assert_eq!(nested.username, "ada");
         assert_eq!(nested.notes, "the work account");
         assert!(
