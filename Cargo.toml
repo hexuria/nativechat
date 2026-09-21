@@ -53,6 +53,10 @@ chrono = "0.4.42"
 objc = "0.2"
 cocoa = "0.26"
 block = "0.1"
+# Authenticator codes for the code card and the Logins detail pane.
+totp-rs = { version = "6", features = ["otpauth"] }
+# 1Password's 1PUX export is a ZIP with the JSON inside.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 wiremock = "0.6"

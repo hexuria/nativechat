@@ -20,10 +20,11 @@
 //! The LLM `credentials` table and local-exec daemon JSON are not this store.
 
 mod extract;
-pub mod import;
+pub mod importers;
 mod origin;
 mod secrets;
 mod store;
+pub mod totp;
 pub mod touch_id;
 
 pub use extract::{LoginFields, PendingSave, login_fields, login_origin, save_candidate};

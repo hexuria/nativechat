@@ -544,18 +544,66 @@ impl OpenGrokClient {
         kind: &str,
         password: &str,
     ) -> Result<RemoteSiteLogin, OpenGrokError> {
-        let body = serde_json::json!({
-            "origin": origin,
-            "username": username,
-            "label": label,
-            "notes": notes,
-            "kind": kind,
-            "password": password,
+        self.save_site_login_full(&SiteLoginSave {
+            origin,
+            username,
+            label,
+            notes,
+            kind,
+            password: Some(password),
+            otpauth: None,
+        })
+        .await
+    }
+
+    /// Save a row with what it has: a password, an authenticator-code seed, or both.
+    pub async fn save_site_login_full(
+        &self,
+        save: &SiteLoginSave<'_>,
+    ) -> Result<RemoteSiteLogin, OpenGrokError> {
+        let mut body = serde_json::json!({
+            "origin": save.origin,
+            "username": save.username,
+            "label": save.label,
+            "notes": save.notes,
+            "kind": save.kind,
         });
+        if let Some(password) = save.password {
+            body["password"] = serde_json::Value::String(password.to_string());
+        }
+        if let Some(otpauth) = save.otpauth {
+            body["otpauth"] = serde_json::Value::String(otpauth.to_string());
+        }
         let response = self
             .send_json(reqwest::Method::POST, "/site-logins", Some(&body))
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// Both secrets of one of the person's own site logins, after Touch ID on this Mac:
+    /// the password and the authenticator-code seed, whichever the row has.
+    pub async fn reveal_site_login_secrets(
+        &self,
+        id: &str,
+    ) -> Result<RevealedSecrets, OpenGrokError> {
+        let response = self
+            .send_json::<()>(
+                reqwest::Method::POST,
+                &format!("/site-logins/{id}/reveal"),
+                None,
+            )
+            .await?;
+        let body: serde_json::Value = Self::json_or_error(response).await?;
+        let text = |key: &str| {
+            body.get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Ok(RevealedSecrets {
+            password: text("password"),
+            otpauth: text("otpauth"),
+        })
     }
 
     /// Change the title or the notes of one of the person's site logins. The reply is the
@@ -2909,6 +2957,44 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         fs::write(path, bytes)
+    }
+}
+
+/// What a save sends. The secrets are redacted in Debug.
+#[derive(Clone)]
+pub struct SiteLoginSave<'a> {
+    pub origin: &'a str,
+    pub username: &'a str,
+    pub label: &'a str,
+    pub notes: &'a str,
+    pub kind: &'a str,
+    pub password: Option<&'a str>,
+    pub otpauth: Option<&'a str>,
+}
+
+impl std::fmt::Debug for SiteLoginSave<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteLoginSave")
+            .field("origin", &self.origin)
+            .field("username", &self.username)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+/// What a reveal gives back. Redacted in Debug.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RevealedSecrets {
+    pub password: Option<String>,
+    pub otpauth: Option<String>,
+}
+
+impl std::fmt::Debug for RevealedSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevealedSecrets")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("otpauth", &self.otpauth.as_ref().map(|_| "<redacted>"))
+            .finish()
     }
 }
 

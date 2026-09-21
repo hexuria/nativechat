@@ -127,7 +127,10 @@ impl SiteLoginVault {
             .map(|row| row.id.clone())
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         let (label, notes) = Self::keep_words(existing.as_ref(), origin, username, label, notes);
-        self.secrets.set(&id, password)?;
+        // A code-only row has no password; nothing empty goes in the keychain.
+        if !password.is_empty() {
+            self.secrets.set(&id, password)?;
+        }
         sqlx::query(
             "INSERT INTO site_logins (id, origin, username, label, kind, notes, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
@@ -174,7 +177,9 @@ impl SiteLoginVault {
         {
             self.adopt_id(&existing.id, id).await?;
         }
-        self.secrets.set(id, password)?;
+        if !password.is_empty() {
+            self.secrets.set(id, password)?;
+        }
         sqlx::query(
             "INSERT INTO site_logins (id, origin, username, label, kind, notes, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -298,6 +303,10 @@ impl SiteLoginVault {
         if let Some(secret) = self.secrets.get(old_id)? {
             self.secrets.set(new_id, &secret)?;
         }
+        if let Some(code) = self.secrets.get(&Self::code_key(old_id))? {
+            self.secrets.set(&Self::code_key(new_id), &code)?;
+            self.secrets.delete(&Self::code_key(old_id))?;
+        }
         sqlx::query("UPDATE site_logins SET id = ? WHERE id = ?")
             .bind(new_id)
             .bind(old_id)
@@ -313,12 +322,32 @@ impl SiteLoginVault {
         self.secrets.set(id, password)
     }
 
+    /// The keychain item that holds a row's authenticator-code seed, beside its password.
+    fn code_key(id: &str) -> String {
+        format!("{id}:otp")
+    }
+
+    /// Keep a row's code seed (an `otpauth://` URI) in this Mac's keychain.
+    pub fn set_code(&self, id: &str, otpauth: &str) -> Result<(), StoreError> {
+        self.secrets.set(&Self::code_key(id), otpauth)
+    }
+
+    pub fn code_present(&self, id: &str) -> bool {
+        self.secrets.contains(&Self::code_key(id))
+    }
+
+    /// The seed itself, for minting a code after Touch ID or for the detail pane's ticker.
+    pub fn code_for(&self, id: &str) -> Result<Option<String>, StoreError> {
+        self.secrets.get(&Self::code_key(id))
+    }
+
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM site_logins WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
         self.secrets.delete(id)?;
+        self.secrets.delete(&Self::code_key(id))?;
         Ok(())
     }
 

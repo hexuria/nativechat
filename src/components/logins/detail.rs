@@ -16,6 +16,7 @@ use gpui_kit::*;
 pub(super) fn render(
     row: Option<&SiteLoginRecord>,
     on_this_mac: bool,
+    code: Option<(String, u64)>,
     icon: Option<&Arc<Image>>,
     notes: &Entity<TextareaState>,
     notes_dirty: bool,
@@ -119,6 +120,17 @@ pub(super) fn render(
                     kv_row("Where", where_line, theme)
                         .id(SharedString::from(format!("settings-login-where-{id}"))),
                 )
+                .when_some(code, |this, (digits, ttl)| {
+                    let shown = format!(
+                        "{} {} · {ttl} s",
+                        &digits[..digits.len() / 2],
+                        &digits[digits.len() / 2..]
+                    );
+                    this.child(divider(theme)).child(
+                        kv_row("Code", shown, theme)
+                            .id(SharedString::from(format!("settings-login-code-{id}"))),
+                    )
+                })
                 .child(divider(theme))
                 .child(kv_row("Last used", last_used, theme))
                 .child(divider(theme))

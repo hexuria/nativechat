@@ -41,6 +41,19 @@ impl LoginsPage {
                 .auto_grow(4, 12)
         });
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
+        // A row with an authenticator code shows the current digits and the seconds they
+        // have left; the pane redraws once a second so the countdown is honest.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // What is typed in the field is what the list filters by; the state keeps the copy
         // so the driver can write it too.
         cx.subscribe(&search, |this, input, event: &InputEvent, cx| {
@@ -155,6 +168,10 @@ impl Render for LoginsPage {
         let picked_here = picked
             .as_ref()
             .is_some_and(|row| on_this_mac.contains(&row.id));
+        let picked_code = picked.as_ref().and_then(|row| {
+            let totp = self.state.read(cx).site_login_codes.get(&row.id)?;
+            crate::site_login::totp::current(totp).ok()
+        });
         let picked_icon = picked
             .as_ref()
             .and_then(|row| icons.get(&row.origin))
@@ -181,6 +198,7 @@ impl Render for LoginsPage {
             .child(detail::render(
                 picked.as_ref(),
                 picked_here,
+                picked_code,
                 picked_icon.as_ref(),
                 &self.notes,
                 self.notes_dirty,

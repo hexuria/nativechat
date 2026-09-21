@@ -93,7 +93,7 @@ pub(super) fn render(
                 .min_h(px(0.))
                 .overflow_y_scroll()
                 .mt(px(6.))
-                .when(!any_rows || groups.is_empty(), |this| {
+                .when(groups.iter().all(|(_, rows)| rows.is_empty()), |this| {
                     this.child(
                         div()
                             .id("settings-logins-empty")

@@ -1438,6 +1438,9 @@ pub struct AppState {
     /// Ids of the saved logins whose password is in this Mac's keychain. The others are on
     /// the server only and are fetched, after Touch ID, the first time they are used here.
     pub site_logins_on_this_mac: HashSet<String>,
+    /// The authenticator-code seeds this Mac holds, parsed, for the detail pane's ticker and
+    /// the code card. Read off the keychain on each load.
+    pub site_login_codes: HashMap<String, totp_rs::TOTP>,
     /// What the last Add / Import / sync did, for Settings → Logins.
     pub site_login_notice: Option<String>,
     pub site_login_error: Option<String>,
@@ -1825,6 +1828,7 @@ impl AppState {
             pending_save: HashMap::new(),
             saved_login_use: HashMap::new(),
             site_logins_on_this_mac: HashSet::new(),
+            site_login_codes: HashMap::new(),
             site_login_notice: None,
             site_login_error: None,
             site_login_icons: HashMap::new(),
@@ -7495,7 +7499,16 @@ impl AppState {
                                 .filter(|row| vault.secret_present(&row.id))
                                 .map(|row| row.id.clone())
                                 .collect();
-                            (rows, here)
+                            let codes: HashMap<String, totp_rs::TOTP> = rows
+                                .iter()
+                                .filter_map(|row| {
+                                    let seed = vault.code_for(&row.id).ok().flatten()?;
+                                    crate::site_login::totp::parse(&seed)
+                                        .ok()
+                                        .map(|totp| (row.id.clone(), totp))
+                                })
+                                .collect();
+                            (rows, here, codes)
                         })
                         .await)
                 }
@@ -7503,8 +7516,9 @@ impl AppState {
             };
             let _ = this.update(cx, |state, cx| {
                 match list {
-                    Ok((rows, here)) => {
+                    Ok((rows, here, codes)) => {
                         state.site_logins_on_this_mac = here;
+                        state.site_login_codes = codes;
                         state.site_logins = rows;
                         state.site_login_error = None;
                         // Only a successful read makes the vault readable. A vault
@@ -7615,19 +7629,27 @@ impl AppState {
             // once and keep it in the keychain for next time.
             let unlocked = match unlocked {
                 Ok(Ok(None)) => match client.as_ref() {
-                    Some(client) => match client.reveal_site_login(&row.id).await {
-                        Ok(password) => {
-                            match vault.cache_secret(&row.id, &password) {
-                                Ok(()) => {
-                                    let _ = this.update(cx, |state, _| {
-                                        state.site_logins_on_this_mac.insert(row.id.clone());
-                                    });
-                                }
-                                Err(error) => {
-                                    log::warn!("could not cache a revealed site login: {error}");
-                                }
+                    Some(client) => match client.reveal_site_login_secrets(&row.id).await {
+                        Ok(secrets) => {
+                            if let Some(seed) = &secrets.otpauth
+                                && let Err(error) = vault.set_code(&row.id, seed)
+                            {
+                                log::warn!("could not cache a revealed code seed: {error}");
                             }
-                            Ok(Ok(Some(password)))
+                            match &secrets.password {
+                                Some(password) => match vault.cache_secret(&row.id, password) {
+                                    Ok(()) => {
+                                        let _ = this.update(cx, |state, _| {
+                                            state.site_logins_on_this_mac.insert(row.id.clone());
+                                        });
+                                    }
+                                    Err(error) => {
+                                        log::warn!("could not cache a revealed site login: {error}");
+                                    }
+                                },
+                                None => {}
+                            }
+                            Ok(Ok(secrets.password))
                         }
                         Err(error) => Ok(Err(crate::site_login::StoreError::Secret(format!(
                             "the server would not reveal it: {error}"
@@ -7834,6 +7856,7 @@ impl AppState {
                 "",
                 KIND_PASSWORD,
                 &pending.password,
+                None,
             )
             .await;
             drop(pending);
@@ -7895,6 +7918,7 @@ impl AppState {
                 &notes,
                 KIND_PASSWORD,
                 &password,
+                None,
             )
             .await;
             let _ = this.update(cx, |state, cx| {
@@ -7926,22 +7950,23 @@ impl AppState {
         };
         let client = self.opengrok.clone();
         cx.spawn(async move |this, cx| {
-            let report = cx
+            // A file is one of the exports; a directory is a `pass` store, read through the
+            // `pass` command with the person's own key.
+            let read = cx
                 .background_executor()
                 .spawn({
                     let path = path.clone();
                     async move {
-                        match std::fs::read_to_string(&path) {
-                            Ok(text) => crate::site_login::import::parse_export(&text),
-                            Err(error) => {
-                                Err(format!("could not read {}: {error}", path.display()))
-                            }
+                        if path.is_dir() {
+                            crate::site_login::importers::pass::read_store(&path)
+                        } else {
+                            crate::site_login::importers::read_file(&path).map(|r| (r, None))
                         }
                     }
                 })
                 .await;
-            let report = match report {
-                Ok(report) => report,
+            let (report, first_error) = match read {
+                Ok(read) => read,
                 Err(error) => {
                     let _ = this.update(cx, |state, cx| {
                         state.site_login_error = Some(format!("Import failed: {error}"));
@@ -7952,39 +7977,45 @@ impl AppState {
             };
             let mut saved = 0;
             let mut failed = Vec::new();
-            for login in &report.logins {
+            for item in &report.items {
                 match save_site_login_everywhere(
                     &vault,
                     client.as_ref(),
-                    &login.origin,
-                    &login.username,
-                    "",
-                    "",
-                    KIND_PASSWORD,
-                    &login.password,
+                    &item.origin,
+                    &item.username,
+                    &item.label,
+                    &item.notes,
+                    item.kind,
+                    item.password.as_deref().unwrap_or(""),
+                    item.otpauth.as_deref(),
                 )
                 .await
                 {
                     Ok(_) => saved += 1,
                     Err(error) => {
-                        failed.push(format!("{} on {}: {error}", login.username, login.origin))
+                        failed.push(format!("{} on {}: {error}", item.username, item.origin))
                     }
                 }
             }
             let _ = this.update(cx, |state, cx| {
                 let mut notice = format!(
-                    "Imported {saved} login{}.",
-                    if saved == 1 { "" } else { "s" }
+                    "Imported {saved} login{} from {}.",
+                    if saved == 1 { "" } else { "s" },
+                    report.source
                 );
                 if report.skipped > 0 {
                     notice.push_str(&format!(
-                        " Skipped {} row{} with no site, name or password.",
+                        " Skipped {} row{} with no site, name or secret.",
                         report.skipped,
                         if report.skipped == 1 { "" } else { "s" }
                     ));
                 }
                 state.site_login_notice = Some(notice);
-                state.site_login_error = (!failed.is_empty()).then(|| failed.join("; "));
+                let mut errors = failed;
+                if let Some(first) = first_error {
+                    errors.insert(0, first);
+                }
+                state.site_login_error = (!errors.is_empty()).then(|| errors.join("; "));
                 state.reload_site_logins(cx);
                 cx.notify();
             });
@@ -7994,9 +8025,10 @@ impl AppState {
 
     /// Settings → Logins → Import…: the file picker, then [`Self::import_site_logins`].
     pub fn pick_site_logins_import(&mut self, cx: &mut Context<Self>) {
+        // A file (an export) or a directory (a `pass` store).
         let answer = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: false,
             prompt: Some("Import".into()),
         });
@@ -9426,6 +9458,7 @@ fn settled_option(echo: Option<String>, cleared: bool, before: Option<String>) -
 /// so; the next sync files it on the server. The row's id comes back with the notice, so
 /// the page can show what was just saved.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn save_site_login_everywhere(
     vault: &SiteLoginVault,
     client: Option<&crate::opengrok::OpenGrokClient>,
@@ -9435,17 +9468,31 @@ async fn save_site_login_everywhere(
     notes: &str,
     kind: &str,
     password: &str,
+    otpauth: Option<&str>,
 ) -> Result<(String, Option<String>), String> {
+    let save = crate::opengrok::SiteLoginSave {
+        origin,
+        username,
+        label,
+        notes,
+        kind,
+        password: (!password.is_empty()).then_some(password),
+        otpauth,
+    };
+    let keep_code = |row_id: &str| -> Result<(), String> {
+        if let Some(seed) = otpauth {
+            vault.set_code(row_id, seed).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
     if let Some(client) = client {
-        match client
-            .save_site_login(origin, username, label, notes, kind, password)
-            .await
-        {
+        match client.save_site_login_full(&save).await {
             Ok(remote) => {
                 let row = vault
                     .save_with_id(&remote.id, origin, username, label, notes, kind, password)
                     .await
                     .map_err(|error| error.to_string())?;
+                keep_code(&row.id)?;
                 return Ok((row.id, None));
             }
             Err(error) => {
@@ -9453,6 +9500,7 @@ async fn save_site_login_everywhere(
                     .save(origin, username, label, notes, kind, password)
                     .await
                     .map_err(|error| error.to_string())?;
+                keep_code(&row.id)?;
                 return Ok((
                     row.id,
                     Some(format!(
@@ -9466,6 +9514,7 @@ async fn save_site_login_everywhere(
         .save(origin, username, label, notes, kind, password)
         .await
         .map_err(|error| error.to_string())?;
+    keep_code(&row.id)?;
     Ok((
         row.id,
         Some("Saved on this Mac. Sign in to keep it on the server too.".to_string()),
