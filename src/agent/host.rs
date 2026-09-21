@@ -15,7 +15,8 @@ use crate::opengrok::{
     computer_window_attention_skip_id, credential_request_allow_id, credential_request_card_id,
     credential_request_deny_id, credential_request_pill_id, save_login_card_id, save_login_save_id,
     save_login_skip_id, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_pill_id, user_form_screen_id,
+    user_form_field_id, user_form_pill_id, user_form_saved_note_id, user_form_screen_id,
+    user_form_use_saved_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -181,6 +182,21 @@ pub enum Command {
     UserFormContinue {
         card_key: String,
     },
+    /// "Use saved login" on an idle card: Touch ID, then the keychain, then the fill.
+    UserFormUseSaved {
+        card_key: String,
+        login_id: String,
+    },
+    /// Settings → Logins → Add, with the values the driver gives.
+    AddSiteLogin {
+        origin: String,
+        username: String,
+        password: String,
+    },
+    /// Settings → Logins → Import, from a file path the driver gives (no picker).
+    ImportSiteLogins {
+        path: String,
+    },
     UserFormDismiss {
         card_key: String,
     },
@@ -303,6 +319,17 @@ impl Command {
             Self::Logout => state.logout(cx),
             Self::SignInAgain => state.sign_in_again(cx),
             Self::UserFormContinue { card_key } => state.submit_open_user_form(card_key, cx),
+            Self::UserFormUseSaved { card_key, login_id } => {
+                state.use_saved_login(card_key, login_id, cx)
+            }
+            Self::AddSiteLogin {
+                origin,
+                username,
+                password,
+            } => state.add_site_login(origin, username, password, cx),
+            Self::ImportSiteLogins { path } => {
+                state.import_site_logins(std::path::PathBuf::from(path), cx)
+            }
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -679,6 +706,10 @@ struct UserFormSnap {
     pill: Option<String>,
     /// What the primary button says: "Log in" on a one-page login, else "Continue".
     continue_label: &'static str,
+    /// Saved logins the card can take: (login id, username), one button each.
+    saved_logins: Vec<(String, String)>,
+    /// The line under the buttons while a saved login is used, or after it was not.
+    saved_login_note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -729,6 +760,8 @@ struct SiteLoginSnap {
     id: String,
     origin: String,
     username: String,
+    /// The password is in this Mac's keychain (else on the server only).
+    on_this_mac: bool,
 }
 
 fn user_form_node(form: &UserFormSnap) -> UiNode {
@@ -749,6 +782,15 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
             box_
         };
         card = card.with_child(node);
+    }
+    for (login_id, username) in &form.saved_logins {
+        card = card.with_child(UiNode::button(
+            user_form_use_saved_id(key, login_id),
+            format!("Use {username}"),
+        ));
+    }
+    if let Some(note) = &form.saved_login_note {
+        card = card.with_child(UiNode::status(user_form_saved_note_id(key), note.clone()));
     }
     card.with_child(UiNode::button(
         user_form_continue_id(key),
@@ -902,6 +944,14 @@ fn site_login_node(login: &SiteLoginSnap) -> UiNode {
         format!("settings-login-row-{}", login.id),
         format!("{} · {}", login.username, login.origin),
     )
+    .with_child(UiNode::status(
+        format!("settings-login-where-{}", login.id),
+        if login.on_this_mac {
+            "Password in this Mac's keychain"
+        } else {
+            "Password on the server; fetched here on first use"
+        },
+    ))
     .with_child(UiNode::button(
         format!("settings-login-delete-{}", login.id),
         "Delete",
@@ -1290,6 +1340,19 @@ impl NativeChatHost {
                             })
                             .collect()
                     };
+                    let saved_logins = if pill.is_some() {
+                        Vec::new()
+                    } else {
+                        state
+                            .saved_logins_for_form(&spec)
+                            .into_iter()
+                            .map(|row| (row.id, row.username))
+                            .collect()
+                    };
+                    let saved_login_note = state
+                        .saved_login_use
+                        .get(&key)
+                        .map(crate::site_login::SavedLoginUse::note);
                     UserFormSnap {
                         title: if spec.title.is_empty() {
                             "Form".into()
@@ -1297,6 +1360,8 @@ impl NativeChatHost {
                             spec.title.clone()
                         },
                         fields,
+                        saved_logins,
+                        saved_login_note,
                         card_key: key,
                         pill,
                         continue_label: spec.continue_label(),
@@ -1363,6 +1428,7 @@ impl NativeChatHost {
                 .site_logins
                 .iter()
                 .map(|row| SiteLoginSnap {
+                    on_this_mac: state.site_logins_on_this_mac.contains(&row.id),
                     id: row.id.clone(),
                     origin: row.origin.clone(),
                     username: row.username.clone(),
@@ -1882,6 +1948,14 @@ impl NativeChatHost {
                 return Some(Command::UserFormContinue {
                     card_key: key.clone(),
                 });
+            }
+            for (login_id, _) in &form.saved_logins {
+                if target == user_form_use_saved_id(key, login_id) {
+                    return Some(Command::UserFormUseSaved {
+                        card_key: key.clone(),
+                        login_id: login_id.clone(),
+                    });
+                }
             }
             if target == user_form_dismiss_id(key) {
                 return Some(Command::UserFormDismiss {
@@ -2520,6 +2594,35 @@ impl NativeChatHost {
             "UserFormContinue" | "user-form.continue" => Command::UserFormContinue {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
+            "AddSiteLogin" | "logins.add" => Command::AddSiteLogin {
+                origin: invoke_arg_str(args, &["origin", "site"])
+                    .ok_or_else(|| "logins.add requires arg origin".to_string())?,
+                username: invoke_arg_str(args, &["username", "user"])
+                    .ok_or_else(|| "logins.add requires arg username".to_string())?,
+                password: invoke_arg_str(args, &["password"])
+                    .ok_or_else(|| "logins.add requires arg password".to_string())?,
+            },
+            "ImportSiteLogins" | "logins.import" => Command::ImportSiteLogins {
+                path: invoke_arg_str(args, &["path", "file"])
+                    .ok_or_else(|| "logins.import requires arg path".to_string())?,
+            },
+            "UserFormUseSaved" | "user-form.use-saved" => {
+                let card_key = self.invoke_user_form_card_key(args)?;
+                let form = self
+                    .user_forms
+                    .iter()
+                    .find(|form| form.card_key == card_key)
+                    .ok_or_else(|| format!("no user-form `{card_key}`"))?;
+                let login_id = match invoke_arg_str(args, &["login_id", "loginId", "id"]) {
+                    Some(id) => id,
+                    None => match form.saved_logins.as_slice() {
+                        [(one, _)] => one.clone(),
+                        [] => return Err("that card offers no saved login".into()),
+                        _ => return Err("user-form.use-saved requires arg login_id".into()),
+                    },
+                };
+                Command::UserFormUseSaved { card_key, login_id }
+            }
             "UserFormDismiss" | "user-form.dismiss" => Command::UserFormDismiss {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
@@ -3394,6 +3497,8 @@ mod tests {
         UserFormSnap {
             card_key: "e_form".into(),
             continue_label: "Continue",
+            saved_logins: Vec::new(),
+            saved_login_note: None,
             title: "Google account".into(),
             fields: vec![
                 UserFormFieldSnap {
@@ -3492,6 +3597,8 @@ mod tests {
         host.user_forms = vec![UserFormSnap {
             card_key: "call-9".into(),
             continue_label: "Continue",
+            saved_logins: Vec::new(),
+            saved_login_note: None,
             title: "Website login".into(),
             fields: vec![UserFormFieldSnap {
                 id: "email".into(),
@@ -3621,6 +3728,8 @@ mod tests {
         host.user_forms = vec![UserFormSnap {
             card_key: "e_form".into(),
             continue_label: "Continue",
+            saved_logins: Vec::new(),
+            saved_login_note: None,
             title: "Google account".into(),
             fields: Vec::new(),
             pill: Some("Dismissed".into()),
@@ -3831,6 +3940,7 @@ mod tests {
             id: "cred-1".into(),
             origin: "google.com".into(),
             username: "ada@example.com".into(),
+            on_this_mac: true,
         }];
         let tree = host.snapshot();
         let row = tree.find("settings-login-row-cred-1").unwrap();

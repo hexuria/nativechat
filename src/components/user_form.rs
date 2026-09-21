@@ -21,8 +21,10 @@ use crate::opengrok::{
     UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues,
     computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
     computer_handoff_takeover_id, continue_enabled, user_form_card_id, user_form_continue_id,
-    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_screen_id,
+    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_note_id,
+    user_form_screen_id, user_form_use_saved_id,
 };
+use crate::site_login::SavedLoginUse;
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputContentType, InputState, Textarea, TextareaState};
@@ -103,7 +105,19 @@ fn render_idle(
     }
     // Live InputState / TextareaState / picks / agent-typed — not a masked stub.
     let live = collect_submit_values(spec, inputs, textareas, &picks, cx);
-    let can_continue = continue_enabled(spec, &live, server_fill);
+    let (saved_rows, saved_use) = app
+        .as_ref()
+        .map(|entity| {
+            let state = entity.read(cx);
+            (
+                state.saved_logins_for_form(spec),
+                state.saved_login_use.get(spec.card_key()).cloned(),
+            )
+        })
+        .unwrap_or_default();
+    let saved_busy = saved_use.as_ref().is_some_and(SavedLoginUse::is_busy);
+    let can_continue = continue_enabled(spec, &live, server_fill) && !saved_busy;
+    let can_post = can_post && !saved_busy;
     let mut body = v_flex()
         .id(ElementId::Name(user_form_card_id(spec.card_key()).into()))
         .w_full()
@@ -153,6 +167,17 @@ fn render_idle(
         ));
     }
     let key = spec.card_key().to_string();
+    if !saved_rows.is_empty() || saved_use.is_some() {
+        body = body.child(render_saved_login_offer(
+            &key,
+            &saved_rows,
+            saved_use.as_ref(),
+            can_post,
+            app.clone(),
+            cx,
+        ));
+    }
+    let can_dismiss = can_dismiss && !saved_busy;
     body.child(
         h_flex()
             .w_full()
@@ -227,6 +252,70 @@ fn render_idle(
             )),
     )
     .into_any_element()
+}
+
+/// "Use saved login" — one button per saved row for this site, and the line that says
+/// where a press is (Touch ID up, filling, cancelled, refused). The password never
+/// appears here: the press goes Touch ID → keychain → the fill channel.
+fn render_saved_login_offer(
+    key: &str,
+    rows: &[crate::site_login::SiteLoginRecord],
+    current: Option<&SavedLoginUse>,
+    can_post: bool,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let busy = current.is_some_and(SavedLoginUse::is_busy);
+    let mut strip = v_flex().w_full().gap(px(6.));
+    if !rows.is_empty() {
+        let mut row_line = h_flex().w_full().gap(px(8.)).flex_wrap().items_center();
+        row_line = row_line.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Saved login"),
+        );
+        for row in rows {
+            let id = user_form_use_saved_id(key, &row.id);
+            let enabled = can_post && !busy;
+            let label = format!("Use {}", row.username);
+            row_line = row_line.child(action_button(
+                id,
+                label,
+                ButtonKind::Secondary,
+                !enabled,
+                !can_post,
+                {
+                    let app = app.clone();
+                    let key = key.to_string();
+                    let login_id = row.id.clone();
+                    enabled.then_some(move |cx: &mut App| {
+                        if let Some(app) = &app {
+                            app.update(cx, |state, cx| {
+                                state.use_saved_login(key.clone(), login_id.clone(), cx);
+                            });
+                        }
+                    })
+                },
+            ));
+        }
+        strip = strip.child(row_line);
+    }
+    if let Some(current) = current {
+        let color = match current {
+            SavedLoginUse::Refused { .. } | SavedLoginUse::Unavailable { .. } => theme.danger,
+            _ => theme.muted_foreground,
+        };
+        strip = strip.child(
+            div()
+                .id(ElementId::Name(user_form_saved_note_id(key).into()))
+                .text_xs()
+                .text_color(color)
+                .child(current.note()),
+        );
+    }
+    strip.into_any_element()
 }
 
 fn render_computer_handoff(

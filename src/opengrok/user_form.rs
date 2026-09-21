@@ -425,6 +425,9 @@ pub enum UserFormActionReply {
     MissingEntry,
     /// No gateway card id — we must not POST `callId` as `entryId`.
     MissingEntryId,
+    /// 403: the server would not do this on that computer (a saved login on a shared box).
+    /// The card stays open; the message is the server's own sentence.
+    Refused(String),
 }
 
 /// Continue vs Dismiss. Hand-back is a different route.
@@ -446,6 +449,9 @@ pub enum UserFormHttpSettle {
     Keep,
     /// No POST, or dismiss 404. Undo the optimistic paint.
     Restore,
+    /// The server refused the submit and nothing was typed: idle fields come back, with
+    /// the server's reason under them.
+    Refused(String),
 }
 
 /// After Continue has painted **Sending**, never restore idle fields.
@@ -459,6 +465,10 @@ pub fn settle_user_form_http(
 ) -> UserFormHttpSettle {
     match (verb, reply) {
         (_, UserFormActionReply::Settled(spec)) => UserFormHttpSettle::Merge(spec.clone()),
+        (UserFormVerb::Submit, UserFormActionReply::Refused(message)) => {
+            UserFormHttpSettle::Refused(message.clone())
+        }
+        (UserFormVerb::Dismiss, UserFormActionReply::Refused(_)) => UserFormHttpSettle::Restore,
         (UserFormVerb::Submit, UserFormActionReply::Empty)
         | (UserFormVerb::Submit, UserFormActionReply::AlreadyAnswered)
         | (UserFormVerb::Submit, UserFormActionReply::MissingRoute)
@@ -646,6 +656,16 @@ fn is_computer_handoff_payload(value: &Value) -> bool {
 
 pub fn user_form_field_id(card_key: &str, field_id: &str) -> String {
     format!("user-form-field-{card_key}-{field_id}")
+}
+
+/// One button per saved login the card can take.
+pub fn user_form_use_saved_id(card_key: &str, login_id: &str) -> String {
+    format!("user-form-use-saved-{card_key}-{login_id}")
+}
+
+/// The line under the buttons while a saved login is being used, or after it was not.
+pub fn user_form_saved_note_id(card_key: &str) -> String {
+    format!("user-form-saved-note-{card_key}")
 }
 
 /// A user-form card in the transcript. Field values are not stored on this type.
@@ -1132,12 +1152,23 @@ pub fn is_user_form_awaiting(event: &Value) -> bool {
     is_user_form_tool(&tool)
 }
 
-pub fn submit_request_body(entry_id: &str, agent_id: &str, values: &UserFormValues) -> Value {
-    json!({
+/// `saved_login` marks values that came from the person's saved logins after Touch ID; the
+/// server puts those only on a computer that is this bot's own.
+pub fn submit_request_body(
+    entry_id: &str,
+    agent_id: &str,
+    values: &UserFormValues,
+    saved_login: bool,
+) -> Value {
+    let mut body = json!({
         "entryId": entry_id,
         "agentId": agent_id,
         "values": values.as_json_object(),
-    })
+    });
+    if saved_login {
+        body["savedLogin"] = Value::Bool(true);
+    }
+    body
 }
 
 pub fn dismiss_request_body(entry_id: &str, agent_id: &str, mode: UserFormDismissMode) -> Value {
@@ -1193,6 +1224,15 @@ pub fn resolve_handoff_request_body(
 /// [`Empty`] — after Continue, [`settle_user_form_http`] paints Not filled.
 /// Prefer a body with `formResolution`.
 pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionReply {
+    if status == 403 {
+        let message = body
+            .get("message")
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("The server would not fill this form on that computer.");
+        return UserFormActionReply::Refused(message.to_string());
+    }
     if status == 404 {
         if is_form_entry_missing(body) {
             return UserFormActionReply::MissingEntry;
@@ -1874,7 +1914,7 @@ mod tests {
             spec.can_post(false),
             "a missing-route 404 on another card must not freeze this one"
         );
-        let submit = submit_request_body(&spec.entry_id, "cw_1", &filled);
+        let submit = submit_request_body(&spec.entry_id, "cw_1", &filled, false);
         assert_eq!(submit["entryId"], "e_form");
         assert_ne!(submit["entryId"], spec.call_id);
         assert_eq!(submit["values"]["password"], "s3cret-pass");
@@ -2398,7 +2438,7 @@ mod tests {
             .by_id
             .insert("email".into(), "ada@example.com".into());
         values.by_id.insert("password".into(), "s3cret-pass".into());
-        let body = submit_request_body("e_form", "cw_1", &values);
+        let body = submit_request_body("e_form", "cw_1", &values, false);
         assert_eq!(body["entryId"], "e_form");
         assert_eq!(body["agentId"], "cw_1");
         assert_eq!(body["values"]["password"], "s3cret-pass");
@@ -2724,6 +2764,33 @@ mod tests {
         assert_eq!(
             UserFormSpec::settle_form_from_box(BoxHandoffResolution::Declined),
             FormResolution::Skipped
+        );
+    }
+
+    #[test]
+    fn a_saved_login_submit_says_so_and_a_typed_one_does_not() {
+        let values = UserFormValues::default();
+        let typed = submit_request_body("e_form", "cw_1", &values, false);
+        assert!(typed.get("savedLogin").is_none(), "{typed}");
+        let saved = submit_request_body("e_form", "cw_1", &values, true);
+        assert_eq!(saved["savedLogin"], true, "{saved}");
+    }
+
+    #[test]
+    fn a_403_keeps_the_card_open_with_the_servers_reason() {
+        let body = serde_json::json!({ "error": "shared-computer", "message": "This computer is shared." });
+        let reply = user_form_action_from_http(403, &body);
+        assert_eq!(
+            reply,
+            UserFormActionReply::Refused("This computer is shared.".to_string())
+        );
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Submit, &reply),
+            UserFormHttpSettle::Refused("This computer is shared.".to_string())
+        );
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Dismiss, &reply),
+            UserFormHttpSettle::Restore
         );
     }
 }

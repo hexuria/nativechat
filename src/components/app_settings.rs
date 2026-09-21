@@ -1,9 +1,11 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
+use crate::components::fields::field_input;
 use crate::opengrok::LocalExecMode;
 use crate::send_policy::OnSend;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -12,17 +14,52 @@ use gpui_kit::*;
 
 pub struct AppSettings {
     state: Entity<AppState>,
+    /// The Add-login form on Settings → Logins: site, username, password. Made on the first
+    /// render of that page (an input needs a window), emptied after a successful Add.
+    add_login: Option<AddLoginInputs>,
+}
+
+#[derive(Clone)]
+struct AddLoginInputs {
+    origin: Entity<InputState>,
+    username: Entity<InputState>,
+    password: Entity<InputState>,
 }
 
 impl AppSettings {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
-        Self { state }
+        Self {
+            state,
+            add_login: None,
+        }
+    }
+
+    fn add_login_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AddLoginInputs {
+        if let Some(inputs) = &self.add_login {
+            return inputs.clone();
+        }
+        let origin =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Site, like facebook.com"));
+        let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username or email"));
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password")
+                .masked(true)
+        });
+        let inputs = AddLoginInputs {
+            origin,
+            username,
+            password,
+        };
+        self.add_login = Some(inputs.clone());
+        inputs
     }
 }
 
 impl Render for AppSettings {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let add_login = self.add_login_inputs(window, cx);
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let (
@@ -120,13 +157,19 @@ impl Render for AppSettings {
                                     updates_page(&bot_name, &controls, muted, app.clone(), &theme)
                                         .into_any_element()
                                 }
-                                AppSettingsTab::Logins => logins_page(
-                                    &app.read(cx).site_logins,
-                                    app.read(cx).site_login_error.clone(),
-                                    muted,
-                                    app.clone(),
-                                )
-                                .into_any_element(),
+                                AppSettingsTab::Logins => {
+                                    let state = app.read(cx);
+                                    logins_page(
+                                        &state.site_logins,
+                                        &state.site_logins_on_this_mac,
+                                        state.site_login_error.clone(),
+                                        state.site_login_notice.clone(),
+                                        add_login.clone(),
+                                        muted,
+                                        app.clone(),
+                                    )
+                                    .into_any_element()
+                                }
                             }),
                     ),
             )
@@ -252,7 +295,10 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
 
 fn logins_page(
     logins: &[crate::site_login::SiteLoginRecord],
+    on_this_mac: &std::collections::HashSet<String>,
     error: Option<String>,
+    notice: Option<String>,
+    inputs: AddLoginInputs,
     muted: Hsla,
     app: Entity<AppState>,
 ) -> impl IntoElement {
@@ -263,8 +309,18 @@ fn logins_page(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child("Saved site logins on this Mac. Passwords stay in the OS keychain (not OpenGrok). Use saved login is offered only when a row here matches the site."),
+                .child("Your saved site logins. They are kept sealed on the server so they follow you to every Mac, and a copy sits in this Mac's keychain. A login is offered on a login card only for its own site, only on a bot's own computer, and only after Touch ID. Your bot never sees the password."),
         )
+        .child(add_login_form(inputs, muted, app.clone()))
+        .when_some(notice, |this, notice| {
+            this.child(
+                div()
+                    .id("settings-logins-notice")
+                    .text_xs()
+                    .text_color(muted)
+                    .child(notice),
+            )
+        })
         .when_some(error, |this, error| {
             this.child(
                 div()
@@ -315,6 +371,17 @@ fn logins_page(
                                 ),
                         )
                         .child(
+                            div()
+                                .id(format!("settings-login-where-{id}"))
+                                .text_xs()
+                                .text_color(muted)
+                                .child(if on_this_mac.contains(&login.id) {
+                                    "Password in this Mac's keychain"
+                                } else {
+                                    "Password on the server; fetched here on first use"
+                                }),
+                        )
+                        .child(
                             Button::new(format!("settings-login-delete-{id}"))
                                 .label("Delete")
                                 .ghost()
@@ -335,6 +402,78 @@ fn logins_page(
 
 /// The active bot's computer: Update (keeps files). Reset lives on the
 /// Computer pane next to download — Settings no longer duplicates it.
+/// Add one login by hand, or import a passwords export. The password field is masked and
+/// cleared once Add is pressed.
+fn add_login_form(inputs: AddLoginInputs, muted: Hsla, app: Entity<AppState>) -> impl IntoElement {
+    let AddLoginInputs {
+        origin,
+        username,
+        password,
+    } = inputs;
+    v_flex()
+        .w_full()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0x777777).opacity(0.24))
+        .px(px(16.))
+        .py(px(14.))
+        .gap(px(10.))
+        .child(div().text_xs().text_color(muted).child("Add a login"))
+        .child(
+            h_flex()
+                .w_full()
+                .gap(px(8.))
+                .flex_wrap()
+                .child(div().flex_1().min_w(px(160.)).child(field_input(&origin)))
+                .child(div().flex_1().min_w(px(160.)).child(field_input(&username)))
+                .child(div().flex_1().min_w(px(160.)).child(field_input(&password))),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap(px(8.))
+                .flex_wrap()
+                .items_center()
+                .child(
+                    Button::new("settings-login-add")
+                        .label("Add")
+                        .primary()
+                        .on_click({
+                            let app = app.clone();
+                            let origin = origin.clone();
+                            let username = username.clone();
+                            let password = password.clone();
+                            move |_, window, cx| {
+                                let site = origin.read(cx).value().to_string();
+                                let name = username.read(cx).value().to_string();
+                                let secret = password.read(cx).value().to_string();
+                                app.update(cx, |state, cx| {
+                                    state.add_site_login(site, name, secret, cx);
+                                });
+                                password.update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("settings-login-import")
+                        .label("Import a passwords export…")
+                        .outline()
+                        .on_click({
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| state.pick_site_logins_import(cx));
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("CSV from the Passwords app, Safari, Chrome or 1Password."),
+                ),
+        )
+}
+
 fn updates_page(
     bot_name: &str,
     controls: &crate::components::computer::ComputerControls,

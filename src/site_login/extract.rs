@@ -28,14 +28,69 @@ impl std::fmt::Debug for PendingSave {
     }
 }
 
+/// The site a card belongs to, as the vault keys it: the registrable origin of the
+/// card's domain, else of the live host.
+pub fn login_origin(spec: &UserFormSpec) -> Option<String> {
+    spec.domain
+        .as_deref()
+        .and_then(registrable_origin)
+        .or_else(|| spec.live_host.as_deref().and_then(registrable_origin))
+}
+
+/// The two fields a saved login is typed into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginFields {
+    pub username_id: String,
+    pub password_id: String,
+}
+
+/// A card takes a saved login when it has a password field and a field for the name: an
+/// email field, else one named like one (email, user, login, phone), else the first plain
+/// text or phone field. An OTP-only or password-only card takes none.
+pub fn login_fields(spec: &UserFormSpec) -> Option<LoginFields> {
+    let password_id = spec
+        .fields
+        .iter()
+        .find(|field| field.kind == UserFormFieldKind::Password)?
+        .id
+        .clone();
+    let candidates = spec.fields.iter().filter(|field| {
+        matches!(
+            field.kind,
+            UserFormFieldKind::Email | UserFormFieldKind::Text | UserFormFieldKind::Tel
+        ) && !field.masked()
+    });
+    let mut email = None;
+    let mut named = None;
+    let mut first = None;
+    for field in candidates {
+        if field.kind == UserFormFieldKind::Email && email.is_none() {
+            email = Some(field.id.clone());
+        }
+        let key = format!("{} {}", field.id, field.label).to_ascii_lowercase();
+        if named.is_none()
+            && (key.contains("email")
+                || key.contains("user")
+                || key.contains("login")
+                || key.contains("phone"))
+        {
+            named = Some(field.id.clone());
+        }
+        if first.is_none() {
+            first = Some(field.id.clone());
+        }
+    }
+    let username_id = email.or(named).or(first)?;
+    Some(LoginFields {
+        username_id,
+        password_id,
+    })
+}
+
 /// Username + password + origin from the card the person just continued.
 /// None when there is no password, no username, or no origin to hang metadata on.
 pub fn save_candidate(spec: &UserFormSpec, values: &UserFormValues) -> Option<PendingSave> {
-    let origin = spec
-        .domain
-        .as_deref()
-        .and_then(registrable_origin)
-        .or_else(|| spec.live_host.as_deref().and_then(registrable_origin))?;
+    let origin = login_origin(spec)?;
     let username = username_from(spec, values)?;
     let password = password_from(spec, values)?;
     let form_entry_id = if spec.has_gateway_entry_id() {
@@ -152,5 +207,85 @@ mod tests {
             .by_id
             .insert("password".into(), MASKED_PRESENCE_STUB.into());
         assert!(save_candidate(&spec, &values).is_none());
+    }
+
+    fn field(id: &str, kind: UserFormFieldKind) -> serde_json::Value {
+        let kind = match kind {
+            UserFormFieldKind::Email => "email",
+            UserFormFieldKind::Password => "password",
+            UserFormFieldKind::Otp => "otp",
+            UserFormFieldKind::Tel => "tel",
+            _ => "text",
+        };
+        json!({"id": id, "label": id, "type": kind, "required": true})
+    }
+
+    fn card_with(fields: Vec<serde_json::Value>) -> UserFormSpec {
+        UserFormSpec::parse(
+            &json!({
+                "entryId": "e_login",
+                "formRequest": {
+                    "title": "Log in",
+                    "domain": "The-Internet.herokuapp.com",
+                    "fields": fields
+                }
+            }),
+            None,
+        )
+        .expect("form")
+    }
+
+    #[test]
+    fn a_login_card_names_its_two_fields() {
+        let spec = card_with(vec![
+            field("username", UserFormFieldKind::Text),
+            field("password", UserFormFieldKind::Password),
+        ]);
+        assert_eq!(
+            login_fields(&spec),
+            Some(LoginFields {
+                username_id: "username".to_string(),
+                password_id: "password".to_string()
+            })
+        );
+        assert_eq!(
+            login_origin(&spec).as_deref(),
+            Some("the-internet.herokuapp.com")
+        );
+    }
+
+    #[test]
+    fn the_email_field_wins_over_a_plain_text_field() {
+        let spec = card_with(vec![
+            field("nickname", UserFormFieldKind::Text),
+            field("email", UserFormFieldKind::Email),
+            field("password", UserFormFieldKind::Password),
+        ]);
+        assert_eq!(
+            login_fields(&spec).map(|f| f.username_id).as_deref(),
+            Some("email")
+        );
+    }
+
+    #[test]
+    fn a_password_only_or_otp_card_takes_no_saved_login() {
+        assert_eq!(
+            login_fields(&card_with(vec![field(
+                "password",
+                UserFormFieldKind::Password
+            )])),
+            None
+        );
+        assert_eq!(
+            login_fields(&card_with(vec![
+                field("code", UserFormFieldKind::Otp),
+                field("password", UserFormFieldKind::Password)
+            ])),
+            None
+        );
+        assert_eq!(
+            login_fields(&card_with(vec![field("username", UserFormFieldKind::Text)])),
+            None
+        );
     }
 }
