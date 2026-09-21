@@ -7429,6 +7429,15 @@ impl AppState {
         mut values: UserFormValues,
         cx: &mut Context<Self>,
     ) {
+        // A card with a sheet up, a code waiting for its next step, or a fill already on
+        // its way, does not take a second press — wherever the press came from.
+        if self
+            .saved_login_use
+            .get(&card_key)
+            .is_some_and(SavedLoginUse::is_busy)
+        {
+            return;
+        }
         // A held code near the end of its step is minted on the next step instead. The
         // card is busy meanwhile, so Continue cannot be pressed twice, and the send happens
         // only if that same pick is still the one on that same open card.
@@ -7616,9 +7625,13 @@ impl AppState {
                 CardTarget::Login(_) => row.kind == crate::site_login::KIND_PASSWORD,
                 // A code can sit beside a password or on a row of its own; either way the
                 // seed has to be on this Mac (or the row on the server) to be offered.
+                // Only a row that really carries a code: its seed is on this Mac, or the
+                // row is a code row. A password row whose seed is on the server and has
+                // never been used here is not offered — nothing here knows it has one —
+                // and one reveal puts it in `site_login_codes` for every card after that.
                 CardTarget::Code { .. } => {
                     self.site_login_codes.contains_key(&row.id)
-                        || !self.site_logins_on_this_mac.contains(&row.id)
+                        || row.kind == crate::site_login::KIND_CODE
                 }
                 CardTarget::Passkey { register: false } => {
                     row.kind == crate::site_login::KIND_PASSKEY
@@ -8261,11 +8274,20 @@ impl AppState {
                     report.source
                 );
                 if report.skipped > 0 {
-                    notice.push_str(&format!(
-                        " Skipped {} row{} with no site, name or secret.",
-                        report.skipped,
-                        if report.skipped == 1 { "" } else { "s" }
-                    ));
+                    notice.push_str(&match &report.stopped_early {
+                        // A store that stops decrypting stops the read: the rest were not
+                        // looked at, and saying they had nothing in them would be untrue.
+                        Some(entry) => format!(
+                            " Stopped at {entry}: {} row{} were not read.",
+                            report.skipped,
+                            if report.skipped == 1 { "" } else { "s" }
+                        ),
+                        None => format!(
+                            " Skipped {} row{} with no site, name or secret.",
+                            report.skipped,
+                            if report.skipped == 1 { "" } else { "s" }
+                        ),
+                    });
                 }
                 state.site_login_notice = Some(notice);
                 let mut errors = failed;
@@ -8531,6 +8553,9 @@ impl AppState {
                     }
                 }
                 UserFormDismissMode::Escalated => {
+                    // The person is taking the screen: a held secret (and a code waiting
+                    // for its next step) is not theirs to send any more.
+                    self.saved_login_use.remove(&card_key);
                     let prior = self
                         .user_form_mut(&card_key)
                         .and_then(|spec| spec.computer_handoff);
@@ -9855,13 +9880,31 @@ async fn sync_site_logins(
                 // This Mac's copy is the newer one and says something else: the words go
                 // up. A notes edit the server refused at the time is filed on the next
                 // sync instead of being lost.
-                if !took && (mine.label != row.label || mine.notes != row.notes) {
+                if !took
+                    && (mine.label.trim() != row.label.trim() || mine.notes.trim() != row.notes.trim())
+                {
                     let update = crate::opengrok::SiteLoginUpdate {
-                        label: Some(mine.label.clone()),
-                        notes: Some(mine.notes.clone()),
+                        label: Some(mine.label.trim().to_string()),
+                        notes: Some(mine.notes.trim().to_string()),
                     };
-                    if let Err(error) = client.update_site_login(&row.id, &update).await {
-                        log::warn!("could not send a login's words to the server: {error}");
+                    match client.update_site_login(&row.id, &update).await {
+                        // The server's reply is the last word, stamp included, so the two
+                        // are level and the next sync sends nothing.
+                        Ok(filed) => {
+                            let _ = vault
+                                .update_from_server(
+                                    mine,
+                                    &filed.label,
+                                    &filed.notes,
+                                    &filed.kind,
+                                    filed.last_used_at_ms,
+                                    filed.updated_at_ms,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            log::warn!("could not send a login's words to the server: {error}")
+                        }
                     }
                 }
             }
@@ -9884,9 +9927,14 @@ async fn sync_site_logins(
             continue;
         }
         // A row the server can be given: its password, its code seed, or both. A row whose
-        // secret is on another Mac only has nothing to file.
-        let password = vault.secret_for_fill(&mine.id).ok().flatten();
-        let otpauth = vault.code_for(&mine.id).ok().flatten();
+        // secret is on another Mac only has nothing to file. A keychain that would not
+        // answer is not the same as a row with no secret: the row waits for the next sync
+        // rather than being filed without what it holds.
+        let (Ok(password), Ok(otpauth)) = (vault.secret_for_fill(&mine.id), vault.code_for(&mine.id))
+        else {
+            log::warn!("the keychain would not answer for a login; leaving it for the next sync");
+            continue;
+        };
         if password.is_none() && otpauth.is_none() {
             continue;
         }

@@ -63,8 +63,14 @@ fn pass_binary() -> PathBuf {
     }
     dirs.iter()
         .map(|dir| dir.join("pass"))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_runnable(candidate))
         .unwrap_or_else(|| PathBuf::from("pass"))
+}
+
+fn is_runnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// One entry's decrypted text, through `pass show`, against the store at `dir` (not
@@ -105,6 +111,7 @@ pub fn read_store(dir: &Path) -> Result<(ImportReport, Option<String>), String> 
             },
             Err(error) => {
                 report.skipped += total - done;
+                report.stopped_early = Some(name.clone());
                 first_error = Some(error);
                 break;
             }
@@ -159,7 +166,11 @@ pub fn parse_entry(name: &str, text: &str) -> Option<super::ImportedItem> {
     if username.is_empty() && !dir.is_empty() {
         username = leaf.to_string();
     }
-    let title = if dir.is_empty() { leaf } else { dir };
+    let title = if dir.is_empty() {
+        leaf
+    } else {
+        dir.rsplit('/').next().unwrap_or(dir)
+    };
     item_from(&url, &username, &password, &otp, title, &notes.join("\n"))
 }
 
@@ -194,6 +205,7 @@ mod tests {
         )
         .expect("item");
         assert_eq!(nested.origin, "github.com", "the folder the entry is in");
+        assert_eq!(nested.label, "github.com", "the title follows the site, not the path");
         assert_eq!(nested.username, "ada");
         assert_eq!(nested.notes, "the work account");
         assert!(

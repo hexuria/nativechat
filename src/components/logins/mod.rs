@@ -110,7 +110,8 @@ impl LoginsPage {
     /// Whether anything on the page is counting down: the picked row has a live code.
     fn counting_down(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
-        state.app_settings_tab == crate::state::AppSettingsTab::Logins
+        state.is_app_settings_open
+            && state.app_settings_tab == crate::state::AppSettingsTab::Logins
             && state
                 .site_login_selected
                 .as_ref()

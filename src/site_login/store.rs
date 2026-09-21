@@ -192,11 +192,18 @@ impl SiteLoginVault {
         password: &str,
         updated_at_ms: Option<i64>,
     ) -> Result<SiteLoginRecord, StoreError> {
+        let existing = self.find(origin, Some(username)).await?;
+        // The server's stamp, unless this Mac's row is already newer: a stamp that moved
+        // backwards would hide an edit made here that the server has not seen yet.
+        let local_ms = existing
+            .as_ref()
+            .and_then(|row| timestamp_ms(&row.updated_at))
+            .unwrap_or(0);
         let now = updated_at_ms
+            .filter(|at| *at >= local_ms)
             .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
             .map(|at| at.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        let existing = self.find(origin, Some(username)).await?;
         let (label, notes) = Self::keep_words(existing.as_ref(), origin, username, label, notes);
         let kind = kind_after_save(existing.as_ref(), kind, password);
         // A row already here under another id moves to this one, keychain item included,
@@ -295,6 +302,16 @@ impl SiteLoginVault {
         let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(updated_at_ms)
             .map(|at| at.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        // A row this Mac holds a password for is not turned into a code row by the
+        // server's word either: the password is still here, and a login card lists
+        // password rows.
+        let kind = if kind_or_default(kind) == crate::site_login::KIND_CODE
+            && self.secrets.contains(&row.id)
+        {
+            crate::site_login::KIND_PASSWORD
+        } else {
+            kind_or_default(kind)
+        };
         sqlx::query(
             "UPDATE site_logins
              SET label = ?, notes = ?, kind = ?, last_used_at_ms = ?, updated_at = ?
@@ -302,7 +319,7 @@ impl SiteLoginVault {
         )
         .bind(&label)
         .bind(notes)
-        .bind(kind_or_default(kind))
+        .bind(kind)
         .bind(last_used_at_ms)
         .bind(&stamp)
         .bind(&row.id)

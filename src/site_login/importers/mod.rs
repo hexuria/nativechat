@@ -47,6 +47,9 @@ pub struct ImportReport {
     pub items: Vec<ImportedItem>,
     /// Rows with no usable site, name or secret, counted so the person knows.
     pub skipped: usize,
+    /// The entry the read stopped at, when it stopped before the end. The skipped count
+    /// is then "not read", not "nothing in them".
+    pub stopped_early: Option<String>,
 }
 
 /// Build an item from the pieces an export gives, or nothing when it is not a login: no
