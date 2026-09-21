@@ -203,7 +203,7 @@ impl DatabaseService {
     /// pieces were kept has none, and reads back as the words in `content`.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let mut rows = sqlx::query_as::<_, ChatMessage>(
-            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)

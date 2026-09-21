@@ -1655,6 +1655,11 @@ pub struct RunReplay {
     pub run_id: String,
     #[serde(default)]
     pub status: String,
+    /// When the turn began. A run picked up after a restart has no bubble here yet, and one
+    /// made for it is stamped with this rather than the moment it was noticed. Zero from a
+    /// server that does not say.
+    #[serde(rename = "startedAtMs", default)]
+    pub started_at_ms: i64,
     /// Why a `failed` run failed, in the server's words. A turn that died after the app stopped
     /// listening has no error to report from its own stream, so this is the only account of it.
     #[serde(default)]

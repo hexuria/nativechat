@@ -828,8 +828,15 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                 content: plain,
                 parts,
                 live: run.is_live(),
-                started_at: SystemTime::UNIX_EPOCH
-                    + Duration::from_millis(run.started_at_ms.max(0) as u64),
+                // A run that says when it began is placed there. One that does not — an older
+                // server, or a field left out — is placed now rather than at the start of the
+                // epoch, which would pin it above the message it answers for good, on screen
+                // and on disk.
+                started_at: (run.started_at_ms > 0)
+                    .then(|| {
+                        SystemTime::UNIX_EPOCH + Duration::from_millis(run.started_at_ms as u64)
+                    })
+                    .unwrap_or_else(SystemTime::now),
             })
         })
         .collect()
@@ -852,7 +859,12 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
 /// to another run, and since a reply is written down under its bubble's own name, painting it
 /// would overwrite that run's row on disk — the reply the person kept replaced by one they were
 /// never shown.
-fn bubble_for_run(messages: &mut Vec<Message>, target: Option<&str>, run_id: &str) -> usize {
+fn bubble_for_run(
+    messages: &mut Vec<Message>,
+    target: Option<&str>,
+    run_id: &str,
+    started_at: Option<SystemTime>,
+) -> usize {
     if let Some(at) = target.and_then(|id| messages.iter().position(|m| m.id == id)) {
         return at;
     }
@@ -866,7 +878,10 @@ fn bubble_for_run(messages: &mut Vec<Message>, target: Option<&str>, run_id: &st
         id: uuid::Uuid::now_v7().to_string(),
         sender: "AI".to_string(),
         content: String::new(),
-        sent_at: SystemTime::now(),
+        // When the run began, not when this machine noticed it: the bubble's time is what the
+        // row is stamped with, and a turn recovered after a restart happened before the ones
+        // either side of it.
+        sent_at: started_at.unwrap_or_else(SystemTime::now),
         is_me: false,
         reply_preview: None,
         reply_to_id: None,
@@ -6887,6 +6902,11 @@ impl AppState {
                                 activity_from_replay(&replay.events).unwrap_or(BotActivity {
                                     label: "Working".into(),
                                 });
+                            // When the run began, for a bubble that has to be made for it.
+                            let run_started_at = (replay.started_at_ms > 0).then(|| {
+                                SystemTime::UNIX_EPOCH
+                                    + Duration::from_millis(replay.started_at_ms as u64)
+                            });
                             let _ = this.update(cx, |state, cx| {
                                 let parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
@@ -6908,6 +6928,7 @@ impl AppState {
                                         &mut conversation.messages,
                                         target.as_deref(),
                                         &run_id,
+                                        run_started_at,
                                     );
                                     let last = &mut conversation.messages[at];
                                     painted = Some(last.id.clone());
@@ -11718,27 +11739,62 @@ mod tests {
         let named = from_run("m_live", "", "run_1", 2_000);
         messages.push(named);
         assert_eq!(
-            bubble_for_run(&mut messages, Some("m_live"), "run_1"),
+            bubble_for_run(&mut messages, Some("m_live"), "run_1", None),
             2,
             "the bubble the turn named"
         );
 
         // No name, but the thread already carries a bubble for the run.
         assert_eq!(
-            bubble_for_run(&mut messages, None, "run_1"),
+            bubble_for_run(&mut messages, None, "run_1", None),
             2,
             "found by the run it carries"
         );
 
         // Neither: a bubble is made, and the older reply is left alone.
         let before = messages.len();
-        let made = bubble_for_run(&mut messages, None, "run_new");
+        let made = bubble_for_run(
+            &mut messages,
+            None,
+            "run_new",
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_500)),
+        );
         assert_eq!(made, before, "appended rather than borrowed");
         assert_eq!(messages.len(), before + 1);
         assert_eq!(messages[made].run_id.as_deref(), Some("run_new"));
         assert_eq!(
+            messages[made].sent_at,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_500),
+            "stamped with when the run began, not when it was noticed"
+        );
+        assert_eq!(
             messages[1].content, "an older reply",
             "the last thing said before is untouched"
+        );
+    }
+
+    /// A run that does not say when it began is placed now, not at the start of time.
+    ///
+    /// The reply is placed by its run's start, and an older server — or a field left out —
+    /// reads as zero. Taken at face value that is 1970, which would pin the reply above the
+    /// message it answers, on screen and then on disk, for good.
+    #[test]
+    fn a_run_that_never_said_when_it_began_is_not_pinned_to_the_start_of_time() {
+        let runs = vec![thread_run("run_1", "finished", 0, &turn_frames())];
+        let messages = vec![at(message("m_ask", true, "do it"), 1_000)];
+        let recovered = missing_replies(&messages, &runs);
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            recovered[0].started_at > SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            "not the epoch"
+        );
+
+        let mut thread = messages.clone();
+        graft_reply(&mut thread, &recovered[0]);
+        assert_eq!(
+            ids(&thread)[0],
+            "m_ask",
+            "the reply lands after the message it answers, not above it"
         );
     }
 
@@ -11789,6 +11845,62 @@ mod tests {
             restored_message(rows[1].clone()).sent_at,
             reply,
             "and the reply keeps its own time"
+        );
+    }
+
+    /// A second write of a message leaves the time it was said alone.
+    ///
+    /// Two paths can settle one run, and the later one must not move the message down the
+    /// thread: it is the same message, said when it was said.
+    #[tokio::test]
+    async fn a_second_write_does_not_move_when_a_message_was_said() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let said = SystemTime::UNIX_EPOCH + Duration::from_millis(1_000);
+        let noticed = SystemTime::UNIX_EPOCH + Duration::from_millis(9_000);
+        for at in [said, noticed] {
+            db.save_message(
+                "bubble_1",
+                "s1",
+                "assistant",
+                "done",
+                None,
+                None,
+                None,
+                &[],
+                Some("run_1"),
+                false,
+                at,
+            )
+            .await
+            .expect("saved");
+        }
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            restored_message(rows[0].clone()).sent_at,
+            said,
+            "the first word on when it was said is the last"
+        );
+    }
+
+    /// Two messages inside one second keep their order.
+    #[tokio::test]
+    async fn two_messages_in_the_same_second_still_read_in_order() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let ask = SystemTime::UNIX_EPOCH + Duration::from_millis(4_100);
+        let reply = SystemTime::UNIX_EPOCH + Duration::from_millis(4_350);
+        for (id, role, at) in [("m_reply", "assistant", reply), ("m_ask", "user", ask)] {
+            db.save_message(id, "s1", role, "x", None, None, None, &[], None, false, at)
+                .await
+                .expect("saved");
+        }
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(
+            ids_of(&rows),
+            vec!["m_ask", "m_reply"],
+            "a quarter of a second apart is enough to tell them apart"
         );
     }
 
