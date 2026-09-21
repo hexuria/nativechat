@@ -38,7 +38,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
-        if path.is_dir() {
+        // A directory as the store lists it; a link to one is not followed, so a store that
+        // links back into itself does not recurse until the path runs out.
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_dir {
             walk(root, &path, out)?;
         } else if path.extension().is_some_and(|e| e == "gpg")
             && let Ok(rel) = path.strip_prefix(root)
@@ -50,9 +53,25 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// One entry's decrypted text, through `pass show`.
-pub fn show(entry: &str) -> Result<String, String> {
-    let output = Command::new("pass")
+/// Where `pass` is: on the inherited PATH, or in the places Homebrew and MacPorts put it,
+/// which an app opened from Finder does not have on its PATH.
+fn pass_binary() -> PathBuf {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&inherited).collect();
+    for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"] {
+        dirs.push(PathBuf::from(extra));
+    }
+    dirs.iter()
+        .map(|dir| dir.join("pass"))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("pass"))
+}
+
+/// One entry's decrypted text, through `pass show`, against the store at `dir` (not
+/// whatever store the environment names).
+pub fn show(dir: &Path, entry: &str) -> Result<String, String> {
+    let output = Command::new(pass_binary())
+        .env("PASSWORD_STORE_DIR", dir)
         .arg("show")
         .arg(entry)
         .output()
@@ -66,24 +85,28 @@ pub fn show(entry: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// The whole store, one `pass show` per entry. Entries that fail to decrypt are skipped and
-/// counted; the first failure's reason is returned with the report so the person sees it.
+/// The whole store, one `pass show` per entry. The first entry that fails to decrypt ends
+/// the read (the key was refused or the passphrase cancelled: asking again for every
+/// remaining entry would put the same sheet up over and over); the rest are counted as
+/// skipped and the reason is returned with the report so the person sees it.
 pub fn read_store(dir: &Path) -> Result<(ImportReport, Option<String>), String> {
     let names = entries(dir)?;
+    let total = names.len();
     let mut report = ImportReport {
         source: "pass",
         ..ImportReport::default()
     };
     let mut first_error = None;
-    for name in names {
-        match show(&name) {
-            Ok(text) => match parse_entry(&name, &text) {
+    for (done, name) in names.iter().enumerate() {
+        match show(dir, name) {
+            Ok(text) => match parse_entry(name, &text) {
                 Some(item) => report.items.push(item),
                 None => report.skipped += 1,
             },
             Err(error) => {
-                report.skipped += 1;
-                first_error.get_or_insert(error);
+                report.skipped += total - done;
+                first_error = Some(error);
+                break;
             }
         }
     }
@@ -104,10 +127,10 @@ pub fn parse_entry(name: &str, text: &str) -> Option<super::ImportedItem> {
             otp = trimmed.to_string();
             continue;
         }
+        // Only a line that calls itself a note comes along as one. The rest of an entry
+        // (`pin:`, `recovery codes:`, a security answer) was kept encrypted for a reason
+        // and is not copied into plain notes.
         let Some((key, value)) = trimmed.split_once(':') else {
-            if !trimmed.is_empty() {
-                notes.push(trimmed.to_string());
-            }
             continue;
         };
         let value = value.trim();
@@ -117,16 +140,20 @@ pub fn parse_entry(name: &str, text: &str) -> Option<super::ImportedItem> {
             }
             "url" | "website" | "site" if url.is_empty() => url = value.to_string(),
             "otpauth" => otp = format!("otpauth:{value}"),
-            _ => notes.push(trimmed.to_string()),
+            "note" | "notes" | "comment" | "comments" if !value.is_empty() => {
+                notes.push(value.to_string())
+            }
+            _ => {}
         }
     }
-    // The path fills what the lines did not: `github.com/ada` is the site and the name.
+    // The path fills what the lines did not: `github.com/ada` is the site and the name,
+    // and under a folder (`work/github.com/ada`) the site is the folder the entry is in.
     let (dir, leaf) = name.rsplit_once('/').unwrap_or(("", name));
     if url.is_empty() {
         url = if dir.is_empty() {
             leaf.to_string()
         } else {
-            dir.to_string()
+            dir.rsplit('/').next().unwrap_or(dir).to_string()
         };
     }
     if username.is_empty() && !dir.is_empty() {
@@ -154,10 +181,21 @@ mod tests {
         );
         assert_eq!(item.password.as_deref(), Some("Yw|ZSNH!}z\"6{ym9pI"));
         assert!(item.otpauth.is_some());
-        assert_eq!(item.notes, "Secret question: none");
+        assert_eq!(
+            item.notes, "",
+            "a line that is not a note stays encrypted where it was"
+        );
         let bare = parse_entry("amazon.com/alice", "pw\n").expect("item");
         assert_eq!(bare.username, "alice");
         assert_eq!(bare.origin, "amazon.com");
+        let nested = parse_entry(
+            "work/github.com/ada",
+            "pw\nnotes: the work account\npin: 1234\n",
+        )
+        .expect("item");
+        assert_eq!(nested.origin, "github.com", "the folder the entry is in");
+        assert_eq!(nested.username, "ada");
+        assert_eq!(nested.notes, "the work account");
         assert!(
             parse_entry("just-a-note", "text\n").is_none(),
             "no site, no name"

@@ -37,6 +37,27 @@ fn kind_or_default(kind: &str) -> &str {
     if kind.is_empty() { "password" } else { kind }
 }
 
+/// What a save leaves the row's kind as. An import that carries only a code for a login
+/// this Mac already holds a password for must not turn that row into a code row: the
+/// password is still there, and a login card lists password rows only.
+fn kind_after_save<'a>(
+    existing: Option<&SiteLoginRecord>,
+    incoming: &'a str,
+    password: &str,
+) -> &'a str {
+    let incoming = kind_or_default(incoming);
+    match existing {
+        Some(row)
+            if password.is_empty()
+                && incoming == crate::site_login::KIND_CODE
+                && row.kind == crate::site_login::KIND_PASSWORD =>
+        {
+            crate::site_login::KIND_PASSWORD
+        }
+        _ => incoming,
+    }
+}
+
 #[derive(Clone)]
 pub struct SiteLoginVault {
     pool: DbPool,
@@ -127,6 +148,7 @@ impl SiteLoginVault {
             .map(|row| row.id.clone())
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         let (label, notes) = Self::keep_words(existing.as_ref(), origin, username, label, notes);
+        let kind = kind_after_save(existing.as_ref(), kind, password);
         // A code-only row has no password; nothing empty goes in the keychain.
         if !password.is_empty() {
             self.secrets.set(&id, password)?;
@@ -146,7 +168,7 @@ impl SiteLoginVault {
         .bind(origin)
         .bind(username)
         .bind(&label)
-        .bind(kind_or_default(kind))
+        .bind(kind)
         .bind(&notes)
         .execute(&self.pool)
         .await?;
@@ -156,6 +178,8 @@ impl SiteLoginVault {
     }
 
     /// Save under an id the server chose, so the keychain copy and the server row share it.
+    /// The stamp is the server's, when it gave one: a row stamped later here than there
+    /// would never take a correction back from the server.
     #[allow(clippy::too_many_arguments)]
     pub async fn save_with_id(
         &self,
@@ -166,10 +190,15 @@ impl SiteLoginVault {
         notes: &str,
         kind: &str,
         password: &str,
+        updated_at_ms: Option<i64>,
     ) -> Result<SiteLoginRecord, StoreError> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = updated_at_ms
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         let existing = self.find(origin, Some(username)).await?;
         let (label, notes) = Self::keep_words(existing.as_ref(), origin, username, label, notes);
+        let kind = kind_after_save(existing.as_ref(), kind, password);
         // A row already here under another id moves to this one, keychain item included,
         // so no copy is left behind under an id nothing points at.
         if let Some(existing) = existing
@@ -191,7 +220,7 @@ impl SiteLoginVault {
         .bind(origin)
         .bind(username)
         .bind(&label)
-        .bind(kind_or_default(kind))
+        .bind(kind)
         .bind(&notes)
         .bind(&now)
         .bind(&now)
@@ -330,10 +359,6 @@ impl SiteLoginVault {
     /// Keep a row's code seed (an `otpauth://` URI) in this Mac's keychain.
     pub fn set_code(&self, id: &str, otpauth: &str) -> Result<(), StoreError> {
         self.secrets.set(&Self::code_key(id), otpauth)
-    }
-
-    pub fn code_present(&self, id: &str) -> bool {
-        self.secrets.contains(&Self::code_key(id))
     }
 
     /// The seed itself, for minting a code after Touch ID or for the detail pane's ticker.
@@ -501,7 +526,7 @@ mod tests {
         assert_eq!(rows.iter().filter(|r| r.origin == "gitlab.com").count(), 1);
 
         let saved = vault
-            .save_with_id("sl_new", "x.com", "bea", "", "", "", "pw")
+            .save_with_id("sl_new", "x.com", "bea", "", "", "", "pw", None)
             .await
             .expect("save with id");
         assert_eq!(saved.id, "sl_new");
@@ -511,7 +536,7 @@ mod tests {
             .await
             .expect("save");
         let moved = vault
-            .save_with_id("sl_y", "y.com", "cy", "", "", "", "pw2")
+            .save_with_id("sl_y", "y.com", "cy", "", "", "", "pw2", None)
             .await
             .expect("save with id");
         assert_eq!(moved.id, "sl_y");
@@ -555,12 +580,33 @@ mod tests {
                 "Security: 2FA on the phone",
                 "passkey",
                 "pw",
+                None,
             )
             .await
             .expect("save with id");
         assert_eq!(full.label, "Work mail");
         assert_eq!(full.kind, "passkey");
         assert_eq!(full.notes, "Security: 2FA on the phone");
+
+        // An import that carries only a code for a login already saved with a password
+        // leaves the row a password row: the password is still there to fill a login card.
+        let with_password = vault
+            .save("code.com", "ada", "", "", "password", "pw")
+            .await
+            .expect("password row");
+        assert_eq!(with_password.kind, "password");
+        let after_code = vault
+            .save("code.com", "ada", "", "", "code", "")
+            .await
+            .expect("code beside it");
+        assert_eq!(after_code.kind, "password", "the row is not turned into a code row");
+        assert_eq!(after_code.id, with_password.id);
+        // A code for a login nothing else knows is a code row.
+        let only_code = vault
+            .save("otp.com", "ada", "", "", "code", "")
+            .await
+            .expect("code row");
+        assert_eq!(only_code.kind, "code");
 
         vault
             .remember_remote(
@@ -607,7 +653,7 @@ mod tests {
         assert_eq!(again.label, "Bank");
         assert_eq!(again.notes, "Security: ask for the card");
         let renamed = vault
-            .save_with_id("sl_1", "x.com", "ada", "Savings", "", "", "pw3")
+            .save_with_id("sl_1", "x.com", "ada", "Savings", "", "", "pw3", None)
             .await
             .expect("save with id");
         assert_eq!(renamed.label, "Savings");
@@ -620,7 +666,7 @@ mod tests {
     async fn notes_update_and_a_newer_server_row_wins() {
         let vault = memory_db().await;
         let row = vault
-            .save_with_id("sl_1", "x.com", "ada", "", "", "", "pw")
+            .save_with_id("sl_1", "x.com", "ada", "", "", "", "pw", None)
             .await
             .expect("save");
         vault

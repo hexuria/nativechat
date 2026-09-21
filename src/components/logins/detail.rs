@@ -34,11 +34,8 @@ pub(super) fn render(
         .last_used_at_ms
         .map(|at| relative_time(at, now_ms))
         .unwrap_or_else(|| "Never".to_string());
-    let where_line = if on_this_mac {
-        "Password in this Mac's keychain"
-    } else {
-        "Password on the server; fetched here on first use"
-    };
+    let where_line = crate::site_login::where_the_secret_is(&row.kind, on_this_mac);
+    let (secret_label, secret_value) = crate::site_login::secret_placeholder(&row.kind);
     v_flex()
         .id(SharedString::from(format!("settings-login-detail-{id}")))
         .flex_1()
@@ -73,7 +70,7 @@ pub(super) fn render(
                 .child(kv_row("User Name", row.username.clone(), theme))
                 .child(divider(theme))
                 // Dots, and nothing to copy: the secret is never read to paint this pane.
-                .child(kv_row("Password", "••••••••••", theme))
+                .child(kv_row(secret_label, secret_value, theme))
                 .child(divider(theme))
                 .child(kv_row("Website", row.origin.clone(), theme)),
         )

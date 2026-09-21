@@ -119,7 +119,10 @@ pub(super) fn render(
                 .small()
                 .w_full()
                 .mt(px(8.))
-                .tooltip("A CSV from the Passwords app, Safari, Chrome or 1Password.")
+                .tooltip(
+                    "A CSV from the Passwords app, Safari or Chrome; a 1Password 1PUX or CSV; \
+                     a LastPass CSV; a Bitwarden JSON; or a `pass` store folder.",
+                )
                 .on_click(move |_, _, cx| {
                     app.update(cx, |state, cx| state.pick_site_logins_import(cx));
                 }),

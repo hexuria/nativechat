@@ -7429,46 +7429,59 @@ impl AppState {
         mut values: UserFormValues,
         cx: &mut Context<Self>,
     ) {
-        // A held code near the end of its step is minted on the next step instead: the
-        // card shows "Filling" meanwhile and the send follows the wait.
+        // A held code near the end of its step is minted on the next step instead. The
+        // card is busy meanwhile, so Continue cannot be pressed twice, and the send happens
+        // only if that same pick is still the one on that same open card.
         if let Some(wait) = self.held_code_wait(&card_key) {
-            let username = self
+            let held = self
                 .saved_login_use
                 .get(&card_key)
                 .and_then(SavedLoginUse::ready)
-                .map(|(u, _)| u.to_string())
-                .unwrap_or_default();
+                .map(|(username, secret)| (username.to_string(), secret.to_string()));
+            let login_id = self
+                .saved_login_use
+                .get(&card_key)
+                .and_then(SavedLoginUse::held_id)
+                .unwrap_or_default()
+                .to_string();
+            let Some((username, password)) = held else {
+                return;
+            };
             self.saved_login_use.insert(
                 card_key.clone(),
-                SavedLoginUse::Ready {
-                    login_id: self
-                        .saved_login_use
-                        .get(&card_key)
-                        .and_then(|u| match u {
-                            SavedLoginUse::Ready { login_id, .. } => Some(login_id.clone()),
-                            _ => None,
-                        })
-                        .unwrap_or_default(),
+                SavedLoginUse::Waiting {
+                    login_id: login_id.clone(),
                     username,
-                    password: self
-                        .saved_login_use
-                        .get(&card_key)
-                        .and_then(SavedLoginUse::ready)
-                        .map(|(_, s)| s.to_string())
-                        .unwrap_or_default(),
+                    password,
                 },
             );
+            cx.notify();
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
                 let _ = this.update(cx, |state, cx| {
-                    state.fold_held_saved_login(&card_key, &mut values);
+                    let still_ours = matches!(
+                        state.saved_login_use.get(&card_key),
+                        Some(SavedLoginUse::Waiting { login_id: held, .. }) if held == &login_id
+                    ) && state
+                        .user_form_mut(&card_key)
+                        .is_some_and(|spec| spec.effective_resolution().is_none());
+                    if !still_ours {
+                        return;
+                    }
+                    if !state.fold_held_saved_login(&card_key, &mut values) {
+                        cx.notify();
+                        return;
+                    }
                     state.dispatch_user_form(card_key, UserFormDispatch::Submit(values), cx);
                 });
             })
             .detach();
             return;
         }
-        self.fold_held_saved_login(&card_key, &mut values);
+        if !self.fold_held_saved_login(&card_key, &mut values) {
+            cx.notify();
+            return;
+        }
         self.dispatch_user_form(card_key, UserFormDispatch::Submit(values), cx);
     }
 
@@ -7605,8 +7618,7 @@ impl AppState {
                 // seed has to be on this Mac (or the row on the server) to be offered.
                 CardTarget::Code { .. } => {
                     self.site_login_codes.contains_key(&row.id)
-                        || (row.kind == crate::site_login::KIND_CODE
-                            && !self.site_logins_on_this_mac.contains(&row.id))
+                        || !self.site_logins_on_this_mac.contains(&row.id)
                 }
                 CardTarget::Passkey { register: false } => {
                     row.kind == crate::site_login::KIND_PASSKEY
@@ -7698,10 +7710,18 @@ impl AppState {
                 Ok(Ok(None)) => match client.as_ref() {
                     Some(client) => match client.reveal_site_login_secrets(&row.id).await {
                         Ok(secrets) => {
-                            if let Some(seed) = &secrets.otpauth
-                                && let Err(error) = vault.set_code(&row.id, seed)
-                            {
-                                log::warn!("could not cache a revealed code seed: {error}");
+                            if let Some(seed) = &secrets.otpauth {
+                                if let Err(error) = vault.set_code(&row.id, seed) {
+                                    log::warn!("could not cache a revealed code seed: {error}");
+                                }
+                                // The row can fill a code card from now on, without waiting
+                                // for the next reload to notice.
+                                if let Ok(totp) = crate::site_login::totp::parse(seed) {
+                                    let row_id = row.id.clone();
+                                    let _ = this.update(cx, |state, _| {
+                                        state.site_login_codes.insert(row_id, totp);
+                                    });
+                                }
                             }
                             if let Some(password) = &secrets.password {
                                 match vault.cache_secret(&row.id, password) {
@@ -7746,16 +7766,31 @@ impl AppState {
                 }
                 let next = match unlocked {
                     Ok(Ok(Some(secret))) => {
+                        let mut unreadable = false;
                         if wants == HeldSecret::CodeSeed {
-                            if let Ok(totp) = crate::site_login::totp::parse(&secret) {
-                                state.site_login_codes.insert(row.id.clone(), totp);
+                            match crate::site_login::totp::parse(&secret) {
+                                Ok(totp) => {
+                                    state.site_login_codes.insert(row.id.clone(), totp);
+                                }
+                                // Better to say so now than to send a card with an empty
+                                // field and let the person wonder what the box typed.
+                                Err(_) => unreadable = true,
                             }
                         }
-                        Some(SavedLoginUse::Ready {
-                            login_id: row.id.clone(),
-                            username: username.clone(),
-                            password: secret,
-                        })
+                        if unreadable {
+                            Some(SavedLoginUse::Unavailable {
+                                message: format!(
+                                    "The code seed for {username} is not readable. Import it \
+                                     again, or type the code."
+                                ),
+                            })
+                        } else {
+                            Some(SavedLoginUse::Ready {
+                                login_id: row.id.clone(),
+                                username: username.clone(),
+                                password: secret,
+                            })
+                        }
                     }
                     Ok(Ok(None)) => Some(SavedLoginUse::Unavailable {
                         message: match wants {
@@ -7811,15 +7846,13 @@ impl AppState {
         {
             return;
         }
-        let username = self
-            .account
-            .as_ref()
-            .map(|account| account.email.clone())
-            .unwrap_or_else(|| "you".to_string());
+        // No name here: the site makes the passkey for whichever account is signed in
+        // there, which is not this app's account and may not be a name at all.
+        let username = origin.clone();
         self.saved_login_use.insert(
             card_key.clone(),
-            SavedLoginUse::Confirming {
-                username: username.clone(),
+            SavedLoginUse::ConfirmingRegister {
+                site: origin.clone(),
             },
         );
         cx.notify();
@@ -7828,15 +7861,14 @@ impl AppState {
                 .background_executor()
                 .spawn({
                     let origin = origin.clone();
-                    let username = username.clone();
-                    async move { crate::site_login::touch_id::confirm_use(&origin, &username) }
+                    async move { crate::site_login::touch_id::confirm_register(&origin) }
                 })
                 .await;
             let _ = this.update(cx, |state, cx| {
                 use crate::site_login::touch_id::TouchIdOutcome;
                 let still_waiting = matches!(
                     state.saved_login_use.get(&card_key),
-                    Some(SavedLoginUse::Confirming { .. })
+                    Some(SavedLoginUse::ConfirmingRegister { .. })
                 );
                 if !still_waiting {
                     return;
@@ -7873,7 +7905,9 @@ impl AppState {
     /// code the digits are minted now, from the held seed; for a passkey nothing is added,
     /// the row's id is enough. The submit is marked as a saved login for the server's
     /// own-computer rule.
-    fn fold_held_saved_login(&mut self, card_key: &str, values: &mut UserFormValues) {
+    /// `false` when the card must not be sent: a held code seed this Mac cannot read is
+    /// said so on the card instead of sending an empty field to the box.
+    fn fold_held_saved_login(&mut self, card_key: &str, values: &mut UserFormValues) -> bool {
         let Some((login_id, username, secret)) =
             self.saved_login_use
                 .get(card_key)
@@ -7882,17 +7916,23 @@ impl AppState {
                         login_id,
                         username,
                         password,
+                    }
+                    | SavedLoginUse::Waiting {
+                        login_id,
+                        username,
+                        password,
                     } => Some((login_id.clone(), username.clone(), password.clone())),
                     _ => None,
                 })
         else {
-            return;
+            // Nothing is held: an ordinary typed submit.
+            return true;
         };
         let Some(target) = self
             .user_form_mut(card_key)
             .and_then(|spec| card_target(spec))
         else {
-            return;
+            return true;
         };
         match target {
             CardTarget::Login(fields) => {
@@ -7903,7 +7943,16 @@ impl AppState {
             }
             CardTarget::Code { code_id } => {
                 let Ok(totp) = crate::site_login::totp::parse(&secret) else {
-                    return;
+                    self.saved_login_use.insert(
+                        card_key.to_string(),
+                        SavedLoginUse::Unavailable {
+                            message: format!(
+                                "The code seed for {username} is not readable. Import it again, \
+                                 or type the code."
+                            ),
+                        },
+                    );
+                    return false;
                 };
                 values
                     .by_id
@@ -7915,6 +7964,7 @@ impl AppState {
             card_key.to_string(),
             SavedLoginUse::Filling { username, login_id },
         );
+        true
     }
 
     /// How long a submit should wait before minting a held code, so the digits are still
@@ -9684,7 +9734,6 @@ enum HeldSecret {
 /// so; the next sync files it on the server. The row's id comes back with the notice, so
 /// the page can show what was just saved.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn save_site_login_everywhere(
     vault: &SiteLoginVault,
     client: Option<&crate::opengrok::OpenGrokClient>,
@@ -9714,8 +9763,19 @@ async fn save_site_login_everywhere(
     if let Some(client) = client {
         match client.save_site_login_full(&save).await {
             Ok(remote) => {
+                // The server's words and stamp, not this Mac's: the row it wrote is the one
+                // every Mac syncs from, and a later local stamp would refuse its corrections.
                 let row = vault
-                    .save_with_id(&remote.id, origin, username, label, notes, kind, password)
+                    .save_with_id(
+                        &remote.id,
+                        origin,
+                        username,
+                        &remote.label,
+                        &remote.notes,
+                        &remote.kind,
+                        password,
+                        (remote.updated_at_ms > 0).then_some(remote.updated_at_ms),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 keep_code(&row.id)?;
@@ -9781,7 +9841,7 @@ async fn sync_site_logins(
                 .await
                 .map_err(|error| error.to_string())?,
             Some(mine) => {
-                vault
+                let took = vault
                     .update_from_server(
                         mine,
                         &row.label,
@@ -9792,6 +9852,18 @@ async fn sync_site_logins(
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                // This Mac's copy is the newer one and says something else: the words go
+                // up. A notes edit the server refused at the time is filed on the next
+                // sync instead of being lost.
+                if !took && (mine.label != row.label || mine.notes != row.notes) {
+                    let update = crate::opengrok::SiteLoginUpdate {
+                        label: Some(mine.label.clone()),
+                        notes: Some(mine.notes.clone()),
+                    };
+                    if let Err(error) = client.update_site_login(&row.id, &update).await {
+                        log::warn!("could not send a login's words to the server: {error}");
+                    }
+                }
             }
         }
     }
@@ -9811,19 +9883,23 @@ async fn sync_site_logins(
                 .map_err(|error| error.to_string())?;
             continue;
         }
-        // Only a row with its password here can be filed on the server.
-        let Ok(Some(password)) = vault.secret_for_fill(&mine.id) else {
+        // A row the server can be given: its password, its code seed, or both. A row whose
+        // secret is on another Mac only has nothing to file.
+        let password = vault.secret_for_fill(&mine.id).ok().flatten();
+        let otpauth = vault.code_for(&mine.id).ok().flatten();
+        if password.is_none() && otpauth.is_none() {
             continue;
-        };
+        }
         let filed = client
-            .save_site_login(
-                &mine.origin,
-                &mine.username,
-                &mine.label,
-                &mine.notes,
-                &mine.kind,
-                &password,
-            )
+            .save_site_login_full(&crate::opengrok::SiteLoginSave {
+                origin: &mine.origin,
+                username: &mine.username,
+                label: &mine.label,
+                notes: &mine.notes,
+                kind: &mine.kind,
+                password: password.as_deref(),
+                otpauth: otpauth.as_deref(),
+            })
             .await
             .map_err(|error| error.to_string())?;
         vault

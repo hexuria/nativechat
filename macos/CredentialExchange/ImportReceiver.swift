@@ -18,13 +18,16 @@ struct ImportedRow: Encodable {
     var notes: String
 }
 
+// A passkey the exporter offered. Its private key is deliberately NOT carried across:
+// this app keeps passkey keys on the server, where they are used in the bot's browser, and
+// a key that reached the Mac would have nowhere to live. Until the server takes a key by
+// this road, a passkey item is counted and named, not imported.
 @available(macOS 26.0, *)
 struct ImportedPasskey: Encodable {
     var credentialId: String   // base64url
     var rpId: String
     var userName: String
     var userHandle: String     // base64url
-    var privateKey: String     // PKCS#8, base64url, as the exchange gives it
 }
 
 @available(macOS 26.0, *)
@@ -61,8 +64,7 @@ enum ImportReceiver {
                     credentialId: key.credentialID.base64URLEncodedString(),
                     rpId: key.relyingPartyIdentifier,
                     userName: key.userName,
-                    userHandle: key.userHandle.base64URLEncodedString(),
-                    privateKey: key.key.base64URLEncodedString()
+                    userHandle: key.userHandle.base64URLEncodedString()
                 )
                 if username.isEmpty { username = key.userName }
             case .note(let note):

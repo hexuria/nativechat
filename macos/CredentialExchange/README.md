@@ -10,10 +10,14 @@ nothing here is compiled into `nativechat` today.
 What is here:
 
 - `ImportReceiver.swift` — the receiver. The OS launches the app with an `NSUserActivity`
-  of type `ASCredentialExchangeActivity` whose `userInfo` carries the import token; the
+  of type `ASCredentialExchangeActivityType` (the string in `App-Info.plist.fragment`)
+  whose `userInfo` carries the import token; the
   receiver calls `ASCredentialImportManager().importCredentials(token:)` and turns the
   result into the same `ImportedItem` rows the file importers produce (JSON over a C ABI,
-  see `shim.h`). Secrets stay in memory; nothing is logged.
+  see `shim.h`). Secrets stay in memory; nothing is logged. A passkey's private key is not
+  carried across: this app keeps passkey keys on the server, so a passkey item comes over
+  named but not imported until the server takes a key by this road. `nc_credential_exchange_import`
+  blocks until the import finishes and must be called off the main thread.
 - `shim.h` / `shim.swift` — the C ABI the Rust app calls: `nc_credential_exchange_import`
   (token in, JSON out, freed with `nc_credential_exchange_free`).
 - `Extension-Info.plist` — the keys the **extension** target needs:

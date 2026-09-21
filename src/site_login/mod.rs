@@ -214,14 +214,46 @@ pub fn added_date(created_at: &str) -> String {
     }
 }
 
+/// What the detail pane and the driver tree say a row holds and where it is kept. A
+/// passkey's key is never on this Mac; a code's seed is, or the server has it.
+pub fn where_the_secret_is(kind: &str, on_this_mac: bool) -> &'static str {
+    match (kind, on_this_mac) {
+        (KIND_PASSKEY, _) => "The key stays on the server and is used in the bot's browser",
+        (KIND_CODE, true) => "Code seed in this Mac's keychain",
+        (KIND_CODE, false) => "Code seed on the server; fetched here on first use",
+        (_, true) => "Password in this Mac's keychain",
+        (_, false) => "Password on the server; fetched here on first use",
+    }
+}
+
+/// What the pane shows in place of the secret: dots for a password, nothing to show for a
+/// passkey (its key never comes here).
+pub fn secret_placeholder(kind: &str) -> (&'static str, &'static str) {
+    match kind {
+        KIND_PASSKEY => ("Passkey", "On the server"),
+        KIND_CODE => ("Password", "None saved"),
+        _ => ("Password", "••••••••••"),
+    }
+}
+
 /// Where a pick from the card's account list is, until the form settles.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SavedLoginUse {
     /// The Touch ID sheet is up.
     Confirming { username: String },
+    /// The Touch ID sheet is up for a passkey the site is about to make. There is no name
+    /// yet: the site makes the key for whichever account is signed in there.
+    ConfirmingRegister { site: String },
     /// Touch ID passed: the name is in its field, the password is held for the submit and
     /// shown as dots. Log in sends both.
     Ready {
+        login_id: String,
+        username: String,
+        password: String,
+    },
+    /// Continue was pressed on a code card whose step is nearly over: the digits are
+    /// minted when the next step starts, and the card's buttons wait until then.
+    Waiting {
         login_id: String,
         username: String,
         password: String,
@@ -248,7 +280,16 @@ impl std::fmt::Debug for SavedLoginUse {
                 .field("username", username)
                 .field("password", &"<redacted>")
                 .finish(),
+            Self::Waiting {
+                login_id, username, ..
+            } => f
+                .debug_struct("Waiting")
+                .field("login_id", login_id)
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
             Self::Confirming { username } => write!(f, "Confirming({username})"),
+            Self::ConfirmingRegister { site } => write!(f, "ConfirmingRegister({site})"),
             Self::Filling { username, .. } => write!(f, "Filling({username})"),
             Self::Cancelled { username } => write!(f, "Cancelled({username})"),
             Self::Refused { message } => write!(f, "Refused({message})"),
@@ -264,8 +305,16 @@ impl SavedLoginUse {
             Self::Confirming { username } => {
                 format!("Confirm with Touch ID to fill in {username}.")
             }
-            Self::Ready { username, .. } => {
-                format!("Password for {username} from your keychain. Press Log in.")
+            Self::ConfirmingRegister { site } => {
+                format!("Confirm with Touch ID to let {site} create a passkey.")
+            }
+            Self::Ready {
+                username,
+                password,
+                login_id,
+            } => Self::ready_note(username, password, login_id),
+            Self::Waiting { username, .. } => {
+                format!("The code for {username} is about to change; the next one is sent.")
             }
             Self::Filling { username, .. } => {
                 format!("Logging in as {username}. The password goes straight to the computer.")
@@ -274,6 +323,22 @@ impl SavedLoginUse {
                 format!("Touch ID was cancelled. Try {username} again, or type the login.")
             }
             Self::Refused { message } | Self::Unavailable { message } => message.clone(),
+        }
+    }
+
+    /// What a held pick says it is waiting for. A passkey holds no secret at all, and a
+    /// code seed is not a password, so neither is called one.
+    fn ready_note(username: &str, password: &str, login_id: &str) -> String {
+        if password.is_empty() {
+            if login_id.is_empty() {
+                format!("Touch ID confirmed for {username}. Press Create passkey.")
+            } else {
+                format!("Passkey for {username} ready. Press Use passkey.")
+            }
+        } else if password.starts_with("otpauth://") {
+            format!("The code for {username} is minted when you press Continue.")
+        } else {
+            format!("Password for {username} from your keychain. Press Log in.")
         }
     }
 
@@ -291,14 +356,33 @@ impl SavedLoginUse {
         match self {
             Self::Ready {
                 username, password, ..
+            }
+            | Self::Waiting {
+                username, password, ..
             } => Some((username.as_str(), password.as_str())),
+            _ => None,
+        }
+    }
+
+    /// The row a held pick came from, whether it is still waiting or already ready.
+    pub fn held_id(&self) -> Option<&str> {
+        match self {
+            Self::Ready { login_id, .. } | Self::Waiting { login_id, .. } => {
+                Some(login_id.as_str())
+            }
             _ => None,
         }
     }
 
     /// While the sheet is up or the fill is in flight, the card's own buttons wait.
     pub fn is_busy(&self) -> bool {
-        matches!(self, Self::Confirming { .. } | Self::Filling { .. })
+        matches!(
+            self,
+            Self::Confirming { .. }
+                | Self::ConfirmingRegister { .. }
+                | Self::Waiting { .. }
+                | Self::Filling { .. }
+        )
     }
 }
 
@@ -484,5 +568,62 @@ mod tests {
         );
         assert!(added_date("2026-09-21 10:00:00").contains("2026"));
         assert_eq!(added_date("not a date"), "not a date");
+    }
+
+    #[test]
+    fn a_held_pick_is_named_for_what_it_actually_holds() {
+        let password = SavedLoginUse::Ready {
+            login_id: "sl_1".into(),
+            username: "ada".into(),
+            password: "pw".into(),
+        };
+        assert!(password.note().starts_with("Password for ada"));
+        let code = SavedLoginUse::Ready {
+            login_id: "sl_2".into(),
+            username: "ada".into(),
+            password: "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP".into(),
+        };
+        assert!(
+            code.note().contains("code for ada") && !code.note().contains("Password"),
+            "{}",
+            code.note()
+        );
+        let passkey = SavedLoginUse::Ready {
+            login_id: "sl_3".into(),
+            username: "ada".into(),
+            password: String::new(),
+        };
+        assert!(passkey.note().contains("Press Use passkey"), "{}", passkey.note());
+        let register = SavedLoginUse::Ready {
+            login_id: String::new(),
+            username: "webauthn.io".into(),
+            password: String::new(),
+        };
+        assert!(register.note().contains("Press Create passkey"));
+        // A pick waiting for the next code step keeps the card busy, so Continue cannot be
+        // pressed a second time and send an empty field.
+        let waiting = SavedLoginUse::Waiting {
+            login_id: "sl_2".into(),
+            username: "ada".into(),
+            password: "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP".into(),
+        };
+        assert!(waiting.is_busy());
+        assert_eq!(waiting.held_id(), Some("sl_2"));
+        assert!(format!("{waiting:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn a_row_says_where_its_own_secret_is() {
+        assert_eq!(
+            where_the_secret_is(KIND_PASSKEY, false),
+            "The key stays on the server and is used in the bot's browser"
+        );
+        assert_eq!(where_the_secret_is(KIND_CODE, true), "Code seed in this Mac's keychain");
+        assert_eq!(
+            where_the_secret_is(KIND_PASSWORD, false),
+            "Password on the server; fetched here on first use"
+        );
+        assert_eq!(secret_placeholder(KIND_PASSKEY), ("Passkey", "On the server"));
+        assert_eq!(secret_placeholder(KIND_PASSWORD).1, "••••••••••");
     }
 }

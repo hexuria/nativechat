@@ -997,11 +997,7 @@ fn site_login_detail_node(login: &SiteLoginSnap) -> UiNode {
     )
     .with_child(UiNode::status(
         format!("settings-login-where-{}", row.id),
-        if login.on_this_mac {
-            "Password in this Mac's keychain"
-        } else {
-            "Password on the server; fetched here on first use"
-        },
+        crate::site_login::where_the_secret_is(&row.kind, login.on_this_mac),
     ))
     .with_child(
         UiNode::textbox(format!("settings-login-notes-{}", row.id), "Notes")

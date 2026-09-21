@@ -14,6 +14,9 @@ public func nc_credential_exchange_import(
         errorOut.pointee = strdup("the import token is not a UUID")
         return nil
     }
+    // This blocks until the import finishes, so it must never be called on the main
+    // thread: the import may need the main actor, and the wait would hold it. The Rust
+    // side calls it from a background task.
     let group = DispatchGroup()
     var result: Result<[ImportedRow], Error>?
     group.enter()

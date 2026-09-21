@@ -42,13 +42,20 @@ impl LoginsPage {
         });
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         // A row with an authenticator code shows the current digits and the seconds they
-        // have left; the pane redraws once a second so the countdown is honest.
+        // have left; while one is on the pane the page redraws once a second so the
+        // countdown is honest. With no code shown there is nothing to count, and the timer
+        // is not started (this page outlives a visit to it).
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                let ticking = this.update(cx, |page: &mut Self, cx| {
+                    if page.counting_down(cx) {
+                        cx.notify();
+                    }
+                });
+                if ticking.is_err() {
                     break;
                 }
             }
@@ -100,6 +107,16 @@ impl LoginsPage {
     /// The fields follow the state: a search the driver wrote lands in the field, and the
     /// notes textarea is refilled when the pick moves or the row's notes change under it —
     /// never while the person is mid-edit.
+    /// Whether anything on the page is counting down: the picked row has a live code.
+    fn counting_down(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state.app_settings_tab == crate::state::AppSettingsTab::Logins
+            && state
+                .site_login_selected
+                .as_ref()
+                .is_some_and(|id| state.site_login_codes.contains_key(id))
+    }
+
     fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (query, selected, row_notes, add_open) = {
             let state = self.state.read(cx);
@@ -197,7 +214,9 @@ impl Render for LoginsPage {
                 selected.as_deref(),
                 &icons,
                 notice,
-                error.clone(),
+                // While the Add sheet is up it shows the error itself; the list does not
+                // repeat it behind the dimmed page.
+                error.clone().filter(|_| !add_open),
                 rows.is_empty(),
                 &theme,
                 app.clone(),

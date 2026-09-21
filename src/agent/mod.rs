@@ -22,6 +22,9 @@
 //! leaves one empty, Security only while a row has a `Security:` note) with its rows
 //! `settings-login-row-{id}` under it (a row with a `Security:` note is under its kind and
 //! under Security, one id twice; the picked one has state `selected`),
+//! `settings-login-code-{id}` (a row's live code and the seconds left, on the pane and in
+//! the list), `settings-login-add-error` while the Add sheet shows one,
+//! `settings-login-notes-save-{id}` (the button that files an edited note),
 //! `settings-login-detail-{id}` (the picked row's pane: `settings-login-username-{id}`,
 //! `settings-login-website-{id}`, `settings-login-where-{id}`, `settings-login-notes-{id}`
 //! (value = the notes), `settings-login-last-used-{id}`, `settings-login-delete-{id}`),

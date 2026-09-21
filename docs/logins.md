@@ -6,7 +6,9 @@ _21 Sep 2026._
 
 A row lives on the server (`site_login`, secrets sealed apart; see opengrok-server `docs/site-logins.md`) and is mirrored in this Mac's sqlite (`site_logins`: id, origin, username, label, kind, notes, last_used_at_ms). The password is in this Mac's keychain under the row's id (service `ai.nativechat.site-login`), the authenticator-code seed under `<id>:otp`. A passkey's key never comes to the Mac.
 
-Sync (`reload_site_logins` → `sync_site_logins`) runs on load and after sign-in: rows the server has and this Mac does not are remembered without their secret; rows saved here before the server knew them are filed there and take the server's id (the keychain item moves with it); words (title, notes) follow the newer stamp. A secret missing here is fetched once from the server after Touch ID (`reveal_site_login_secrets`) and cached.
+Sync (`reload_site_logins` → `sync_site_logins`) runs on load and after sign-in: rows the server has and this Mac does not are remembered without their secret; rows saved here before the server knew them are filed there with whatever secret this Mac holds, a code seed included, and take the server's id (the keychain item moves with it); words (title, notes) follow the newer stamp, in either direction, so a note the server refused at the time goes up on the next sync. A secret missing here is fetched once from the server after Touch ID (`reveal_site_login_secrets`) and cached; a revealed seed can mint a code straight away.
+
+A save never changes what a row is: an import that carries only a code for a login already saved with a password leaves it a password row.
 
 ## Settings → Logins
 
@@ -25,17 +27,17 @@ Site icons come from the server's `GET /site-logins/icon/{origin}`, one request 
 | 1Password | 1PUX (ZIP, `export.data`) or CSV | `OTPAuth` / `One-time password` |
 | LastPass | CSV `url,username,password,totp,extra,name,…` | `totp` (bare seed) |
 | Bitwarden | unencrypted JSON `items[].login` | `login.totp` (URI or seed) |
-| `pass` | a directory: one GPG file per entry, read with `pass show` and the person's own key | an `otpauth://` line |
+| `pass` | a directory: one GPG file per entry, read with `pass show` against that directory, with the person's own key | an `otpauth://` line |
 
-Every row becomes the same item (site, name, password, seed, title, notes); a bare seed becomes an `otpauth://` URI with the usual defaults. The file is read once and not kept. Apple's Credential Exchange (in-memory hand-off of passwords, passkeys and codes) needs the signed app with a credential-provider extension; the receiver is in `macos/CredentialExchange/` and is not built into the dev app.
+Every row becomes the same item (site, name, password, seed, title, notes); a bare seed becomes an `otpauth://` URI with the usual defaults. The file is read once and not kept. From `pass`, only a line that calls itself a note (`note:`, `notes:`, `comment:`) becomes notes: the rest of an entry was kept encrypted for a reason. An entry in a folder takes the folder it sits in as its site, and the first entry that will not decrypt ends the read rather than putting the same passphrase sheet up for every one after it. Apple's Credential Exchange (in-memory hand-off of passwords, passkeys and codes) needs the signed app with a credential-provider extension; the receiver is in `macos/CredentialExchange/` and is not built into the dev app.
 
 ## The card
 
 A `request_user_form` card knows what it takes (`site_login::card_target`): a login (name and password fields), a code (one `otp` field), or a passkey (no fields, `challengeKind: "passkey"`). The rows of that kind for the card's site are listed under the field. A pick puts up Touch ID (`site_login::touch_id`, LocalAuthentication, the Mac password as fallback); then:
 
 - a login: both fields lock with the picked name and dots; Log in sends the password held in memory, marked `savedLogin` with the row's id;
-- a code: the field locks; Continue mints the six digits at that moment (`site_login::totp`; a step with fewer than eight seconds left waits for the next one);
-- a passkey: "Passkey for … ready"; Use passkey sends only the row's id, and the server does the rest in the bot's browser. A register-mode card is one row to confirm; Create passkey tells the server to hold a place for the key the site makes.
+- a code: the field locks; Continue mints the six digits at that moment (`site_login::totp`; a step with fewer than eight seconds left waits for the next one, and the card is busy until it does, so Continue cannot be pressed twice). A seed this Mac cannot read says so on the card instead of sending an empty field;
+- a passkey: "Passkey for … ready"; Use passkey sends only the row's id, and the server does the rest in the bot's browser. A register-mode card is one row to confirm; its Touch ID sheet asks to let the site create a passkey, and names no account, because the site makes the key for whichever account is signed in there.
 
 Change frees a held pick. A pick does not outlive its card: a settled, dismissed or superseded card, a fill that did not end in Submitted, and a sign-out all drop it. The secret is never painted, never put in an input, and the Bot never sees it. A 403 from the server (a shared computer) brings the fields back with the reason.
 

@@ -997,7 +997,8 @@ fn render_passkey_block(
     if let Some((username, _)) = saved.current.as_ref().and_then(SavedLoginUse::ready) {
         let text = if saved.is_passkey_register() {
             format!(
-                "Touch ID confirmed. Press Create passkey; {site} makes one for {username} in the bot's browser."
+                "Touch ID confirmed. Press Create passkey; {site} makes one in the bot's browser, \
+                 for whichever account is signed in there."
             )
         } else {
             format!(
