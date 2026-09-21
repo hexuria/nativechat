@@ -2394,7 +2394,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "product question: when a narrower send-message envelope folds onto the awaiting card, which side owns the field list? merge takes the incoming list whole and drops the password field; decide before un-ignoring"]
     fn send_message_envelope_folds_onto_the_awaiting_card() {
         let mut turn = TurnAssembler::default();
         turn.push_event(&json!({
