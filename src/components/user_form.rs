@@ -963,8 +963,12 @@ fn render_field(
     let field_el = user_form_field_id(spec.card_key(), &field.id);
     let mut control = div()
         .id(ElementId::Name(field_el.into()))
+        .relative()
         .w_full()
         .child(control);
+    if saved.list_field() == Some(field.id.as_str()) && saved.shows_list() {
+        control = control.child(floating_account_list(spec, saved, inputs, app.clone(), cx));
+    }
     // A click in the field the accounts belong to brings the list up, whether or not the
     // cursor was already there. The focus event covers tabbing into it.
     if saved.list_field() == Some(field.id.as_str()) && !saved.shows_list() {
@@ -980,7 +984,7 @@ fn render_field(
         });
     }
     let show_label = field.kind != UserFormFieldKind::Checkbox;
-    let mut column = v_flex()
+    let column = v_flex()
         .gap(px(6.))
         .when(show_label, |this| {
             this.child(
@@ -991,9 +995,6 @@ fn render_field(
             )
         })
         .child(control);
-    if saved.list_field() == Some(field.id.as_str()) && saved.shows_list() {
-        column = column.child(floating_account_list(spec, saved, inputs, app.clone(), cx));
-    }
     column.into_any_element()
 }
 
@@ -1275,8 +1276,12 @@ fn floating_account_list(
     let card_key = spec.card_key().to_string();
     let away = app.clone();
     let list = render_account_list(spec, saved, inputs, app, cx);
+    // Pinned to the field's bottom edge and out of the flow: it adds no height, and no gap
+    // to the column either, so the card is exactly as tall with the list up as without it.
     div()
-        .relative()
+        .absolute()
+        .bottom_0()
+        .left_0()
         .w_full()
         .h(px(0.))
         .child(
