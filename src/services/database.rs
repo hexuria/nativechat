@@ -100,6 +100,7 @@ impl DatabaseService {
         reply: Option<ReplyRef>,
         parts: &[MessagePart],
         run_id: Option<&str>,
+        hidden: bool,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
@@ -108,13 +109,18 @@ impl DatabaseService {
             .await?;
 
         sqlx::query(
-            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            // A message hidden before it was ever written down is written down hidden, and a
+            // write that comes later never clears a mark that is already there. The person
+            // can hide a reply while it is still being typed out, and the row for it does not
+            // exist until the turn settles.
+            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                content = excluded.content,
                model = excluded.model,
                provider = excluded.provider,
-               run_id = excluded.run_id",
+               run_id = excluded.run_id,
+               deleted_at = coalesce(chat_messages.deleted_at, excluded.deleted_at)",
         )
         .bind(id)
         .bind(session_id)
@@ -126,6 +132,7 @@ impl DatabaseService {
         .bind(reply.as_ref().map(|r| r.preview.clone()))
         .bind(reply.as_ref().map(|r| i64::from(r.is_me)))
         .bind(run_id)
+        .bind(hidden.then(Self::hidden_now))
         .execute(&mut *tx)
         .await?;
 
@@ -153,6 +160,11 @@ impl DatabaseService {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The stamp a hidden row carries, in the same shape as `created_at`.
+    fn hidden_now() -> String {
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 
     /// Hide a message rather than take it away.

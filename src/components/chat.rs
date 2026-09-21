@@ -39,6 +39,10 @@ use gpui_kit::*;
 struct ChatFeedRev {
     conversation_id: Option<String>,
     message_count: usize,
+    /// How many of the thread's messages the person has hidden. Hiding changes no other
+    /// field here — the message stays in the thread, same id, same words — so without this
+    /// the feed would decide nothing had changed and leave the bubble on screen.
+    hidden_count: usize,
     last_id: Option<String>,
     last_len: usize,
     last_ui: usize,
@@ -78,6 +82,9 @@ impl ChatFeedRev {
         Self {
             conversation_id: state.active_conversation_id.clone(),
             message_count: conv.map(|c| c.messages.len()).unwrap_or(0),
+            hidden_count: conv
+                .map(|c| c.messages.iter().filter(|m| m.hidden).count())
+                .unwrap_or(0),
             last_id: last.map(|m| m.id.clone()),
             last_len: last.map(|m| m.content.len()).unwrap_or(0),
             last_ui: last.map(|m| m.parts.len()).unwrap_or(0),

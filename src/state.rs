@@ -4648,6 +4648,7 @@ impl AppState {
         // Marked, not taken out. A hidden message is the thread's own memory of a run it has
         // already accounted for; without it the next reconcile decides the server knows
         // something this thread does not and grafts the turn back on.
+        let mut hidden_shots: Vec<String> = Vec::new();
         if let Some(id) = &self.active_conversation_id
             && let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id)
             && let Some(message) = conversation
@@ -4656,6 +4657,23 @@ impl AppState {
                 .find(|m| m.id == message_id)
         {
             message.hidden = true;
+            hidden_shots = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    ChatPart::Screenshot(spec) => Some(spec.call_id.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+        // The last picture of the computer is kept aside to stand in for a screen that has
+        // not arrived yet. A picture the person hid must not be the one standing in.
+        if self
+            .last_box_shot
+            .as_ref()
+            .is_some_and(|shot| hidden_shots.contains(&shot.call_id))
+        {
+            self.last_box_shot = None;
         }
         self.message_reactions.remove(message_id);
         if self
@@ -5891,6 +5909,14 @@ impl AppState {
             turn.persisting = true;
         }
         let title = self.conversation_title(conversation_id);
+        // A reply the person hid while it was still being typed out has no row yet: the mark
+        // rides along with the write rather than waiting for a row that is not there.
+        let hidden = self
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .and_then(|c| c.messages.iter().find(|m| m.id == message_id))
+            .is_some_and(|m| m.hidden);
         let conversation_id = conversation_id.to_string();
         let message_id = message_id.to_string();
         let run_id = run_id.map(str::to_string);
@@ -5910,6 +5936,7 @@ impl AppState {
                         None,
                         &parts,
                         run_id.as_deref(),
+                        hidden,
                     )
                     .await
                 }
@@ -9328,6 +9355,7 @@ impl AppState {
                         // The person's own message came out of no run. The server's record of a
                         // thread is its runs, and a run is only the coworker's half of a turn.
                         None,
+                        false,
                     )
                     .await
                 {
@@ -11277,6 +11305,7 @@ mod tests {
             None,
             &saved_parts(&live),
             Some("run_1"),
+            false,
         )
         .await
         .expect("the turn is saved");
@@ -11632,6 +11661,64 @@ mod tests {
         );
     }
 
+    /// A reply hidden before it was ever written down stays hidden.
+    ///
+    /// A reply has no row until its turn settles, so hiding one that is still being typed out
+    /// had nothing to mark: the write that came afterwards put it on disk unmarked, and the
+    /// next time the thread was opened it was back.
+    #[tokio::test]
+    async fn a_reply_hidden_before_it_was_written_down_is_written_down_hidden() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+
+        // The person hides the bubble while the turn is still going: no row to mark yet.
+        db.hide_message("bubble_1").await.expect("nothing to hide");
+        assert!(
+            db.get_messages("s1").await.expect("empty").is_empty(),
+            "there is no row yet"
+        );
+
+        // The turn settles and the reply is written down, carrying the mark.
+        db.save_message(
+            "bubble_1",
+            "s1",
+            "assistant",
+            "The build is green.",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+            true,
+        )
+        .await
+        .expect("the reply is saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].deleted_at.is_some(), "it stays hidden");
+
+        // A later write of the same reply does not bring it back.
+        db.save_message(
+            "bubble_1",
+            "s1",
+            "assistant",
+            "The build is green, again.",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+            false,
+        )
+        .await
+        .expect("the second write");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert!(
+            rows[0].deleted_at.is_some(),
+            "a write never clears what the person hid"
+        );
+    }
+
     /// What the person hid stays in the thread, unpainted, so the thread keeps its memory.
     ///
     /// The row is the only thing that names the run it came out of. Take it away and the next
@@ -11697,6 +11784,7 @@ mod tests {
             None,
             &[],
             Some("run_1"),
+            false,
         )
         .await
         .expect("the reply is saved");
@@ -11736,6 +11824,7 @@ mod tests {
             None,
             &once,
             Some("run_1"),
+            false,
         )
         .await
         .expect("the first write");
@@ -11749,6 +11838,7 @@ mod tests {
             None,
             &[],
             Some("run_1"),
+            false,
         )
         .await
         .expect("the second write");
@@ -11784,6 +11874,7 @@ mod tests {
             None,
             &[],
             None,
+            false,
         )
         .await
         .expect("the message is saved");

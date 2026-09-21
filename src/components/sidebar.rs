@@ -953,7 +953,8 @@ fn rail_preview(conversation: Option<&Conversation>) -> (String, String) {
         .messages
         .iter()
         .rev()
-        .find(|message| !message.content.trim().is_empty());
+        // What the person hid is not what the sidebar says about the thread.
+        .find(|message| !message.hidden && !message.content.trim().is_empty());
     let preview = last
         .map(|message| rail_preview_text(&message.content))
         .filter(|text| !text.is_empty())
