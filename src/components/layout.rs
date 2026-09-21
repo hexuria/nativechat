@@ -294,6 +294,11 @@ impl Render for Layout {
         let computer_confirm = state
             .computer_confirm
             .map(|action| (action, state.active_bot_name()));
+        let network_policy = state
+            .network_policy_open
+            .then(|| state.egress_policy())
+            .flatten()
+            .map(|current| (current, state.active_bot_name()));
         let recipes_page = state.page == MainPage::Recipes;
         let recipe_delete = state.recipe_delete_prompt();
         let theme = cx.theme().clone();
@@ -470,6 +475,14 @@ impl Render for Layout {
             })
             .when_some(recipe_delete, |this, name| {
                 this.child(recipe_delete_overlay(self.state.clone(), name, &theme))
+            })
+            .when_some(network_policy, |this, (current, name)| {
+                this.child(network_policy_overlay(
+                    self.state.clone(),
+                    current,
+                    name,
+                    &theme,
+                ))
             });
 
         // Title bar + panes. App Settings is a full-window modal (Grok Bot): it
@@ -588,6 +601,139 @@ fn computer_confirm_overlay(
                                 }),
                         )
                         .child(confirm),
+                ),
+        )
+}
+
+/// "Use your network from Vamos's computer" — the three standing answers, the current one
+/// marked, one click to pick. Click outside or Close leaves it as it is.
+fn network_policy_overlay(
+    app: Entity<AppState>,
+    current: crate::opengrok::LocalExecMode,
+    name: String,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    use crate::opengrok::LocalExecMode;
+    let options = [
+        (
+            LocalExecMode::Always,
+            "egress-policy-bypass",
+            "This computer may reach the web through this desktop without asking.",
+        ),
+        (
+            LocalExecMode::Ask,
+            "egress-policy-ask",
+            "A Review-an-action card, once per run, before it leaves for the web.",
+        ),
+        (
+            LocalExecMode::Never,
+            "egress-policy-never",
+            "No web from this computer while its traffic is routed here; its browser tools are switched off and it says why.",
+        ),
+    ];
+    let mut list = v_flex().w_full().gap(px(6.));
+    for (mode, id, detail) in options {
+        let chosen = mode == current;
+        list = list.child(
+            h_flex()
+                .id(id)
+                .w_full()
+                .items_start()
+                .gap(px(10.))
+                .px(px(12.))
+                .py(px(10.))
+                .rounded(px(10.))
+                .border_1()
+                .border_color(if chosen { theme.primary } else { theme.border })
+                .when(chosen, |this| this.bg(theme.primary.opacity(0.08)))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
+                .on_mouse_down(MouseButton::Left, {
+                    let app = app.clone();
+                    move |_, _, cx| {
+                        cx.stop_propagation();
+                        app.update(cx, |state, cx| state.pick_network_policy(mode, cx));
+                    }
+                })
+                .child(
+                    div()
+                        .mt(px(2.))
+                        .size(px(14.))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(if chosen { theme.primary } else { theme.border })
+                        .when(chosen, |this| this.bg(theme.primary)),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(mode.label()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(detail),
+                        ),
+                ),
+        );
+    }
+    div()
+        .id("network-policy-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::black().opacity(0.32))
+        .on_mouse_down(MouseButton::Left, {
+            let app = app.clone();
+            move |_, _, cx| {
+                app.update(cx, |state, cx| state.close_network_policy(cx));
+            }
+        })
+        .child(
+            v_flex()
+                .id("network-policy-dialog")
+                .w(px(440.))
+                .bg(theme.popover)
+                .text_color(theme.foreground)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(14.))
+                .shadow_lg()
+                .px(px(20.))
+                .py(px(18.))
+                .gap(px(10.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Use your network from {name}'s computer")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Applies while traffic from that computer is routed through this desktop. The choice is the computer's and is kept on the server."),
+                )
+                .child(list)
+                .child(
+                    h_flex().w_full().justify_end().pt(px(6.)).child(
+                        Button::new("network-policy-close").label("Close").on_click({
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| state.close_network_policy(cx));
+                            }
+                        }),
+                    ),
                 ),
         )
 }

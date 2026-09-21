@@ -10,7 +10,7 @@ use crate::components::alert_chrome::{
 };
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    BoxHandoffResolution, computer_attention_done_id, computer_attention_id,
+    BoxHandoffResolution, LocalExecMode, computer_attention_done_id, computer_attention_id,
     computer_attention_skip_id,
 };
 use crate::state::{
@@ -339,9 +339,6 @@ impl ComputerPane {
                             .child(error),
                     )
                 })
-                // A task is taught on this screen, so the page that keeps those tasks belongs
-                // next to it: this is the way in from where a recipe is born and used.
-                .child(recipes_entry(muted, app.clone(), theme))
                 .child(if routines.is_empty() {
                     v_flex()
                         .w_full()
@@ -778,42 +775,29 @@ impl ComputerControls {
 }
 
 /// The way from this screen to the tasks taught on it: the Recipes page, in the main slot.
-fn recipes_entry(
-    muted: Hsla,
-    app: Entity<AppState>,
-    theme: &gpui_kit::component::Theme,
-) -> impl IntoElement {
-    h_flex()
+/// A cake in the header row, beside the network chrome, where the pane's actions live.
+fn recipes_icon(app: Entity<AppState>, theme: &gpui_kit::component::Theme) -> impl IntoElement {
+    let color = theme.muted_foreground;
+    div()
         .id("computer-recipes")
-        .w_full()
-        .gap(px(8.))
-        .px(px(10.))
-        .py(px(8.))
-        .rounded(px(10.))
-        .border_1()
-        .border_color(theme.border)
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x777777).opacity(0.1)))
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+        .tooltip(|window, cx| {
+            Tooltip::new("Recipes: tasks taught on this screen").build(window, cx)
+        })
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             app.update(cx, |state, cx| state.open_recipes(cx));
         })
         .child(
             Icon::default()
-                .path("icons/record.svg")
-                .size(px(14.))
-                .text_color(muted),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w(px(0.))
-                .child(div().text_sm().child("Recipes"))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Tasks taught on this screen"),
-                ),
+                .path("icons/cake.svg")
+                .size(px(16.))
+                .text_color(color),
         )
 }
 
@@ -1049,15 +1033,31 @@ fn box_chrome(
     let update_app = app.clone();
     let reset_app = app.clone();
     let show_route = app.read(cx).show_route_traffic_on_bot_pane();
+    let network_policy = app
+        .read(cx)
+        .show_egress_policy_on_bot_pane()
+        .then(|| app.read(cx).egress_policy())
+        .flatten();
     h_flex()
         .id("computer-box-chrome")
         .w_full()
         .items_center()
         .justify_between()
         .gap(px(8.))
-        .child(h_flex().items_center().when(show_route, |this| {
-            this.child(route_traffic_icon(app.clone(), theme, cx))
-        }))
+        .child(
+            h_flex()
+                .items_center()
+                .gap(px(2.))
+                .when(show_route, |this| {
+                    this.child(route_traffic_icon(app.clone(), theme, cx))
+                })
+                .when_some(network_policy, |this, current| {
+                    this.child(network_policy_icon(app.clone(), current, theme))
+                })
+                // A task is taught on this screen, so the page that keeps those tasks belongs
+                // next to it: the cake is the way in from where a recipe is born and used.
+                .child(recipes_icon(app.clone(), theme)),
+        )
         .child(
             h_flex()
                 .gap(px(4.))
@@ -1087,21 +1087,59 @@ fn box_chrome(
         )
 }
 
+/// The shield beside Route traffic: how this bot's own computer may use the person's network.
+/// Opens the dialog that picks it; the badge is tinted when the answer is not "ask".
+fn network_policy_icon(
+    app: Entity<AppState>,
+    current: LocalExecMode,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let color = match current {
+        LocalExecMode::Ask => theme.muted_foreground,
+        LocalExecMode::Always => theme.primary,
+        LocalExecMode::Never => theme.danger,
+    };
+    let tip = format!("Use your network: {}. Click to change.", current.label());
+    div()
+        .id("network-policy")
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .on_mouse_down(MouseButton::Left, {
+            move |_, _, cx| {
+                app.update(cx, |state, cx| state.open_network_policy(cx));
+            }
+        })
+        .child(
+            Icon::default()
+                .path("icons/shield-badge.svg")
+                .size(px(16.))
+                .text_color(color),
+        )
+}
+
 fn route_traffic_icon(
     app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
     cx: &App,
 ) -> impl IntoElement {
+    // Two different pictures, so the state is readable at a glance: the route arrows in green
+    // while traffic is routed through this desktop, a plain globe when it goes out on its own.
     let enabled = app.read(cx).egress_tunnel_enabled;
-    let color = if enabled {
-        theme.primary
+    let (icon, color) = if enabled {
+        ("icons/route-traffic.svg", theme.success)
     } else {
-        theme.muted_foreground
+        ("icons/globe.svg", theme.muted_foreground)
     };
     let tip = if enabled {
-        "Routing traffic through this computer. New connections go out through this desktop."
+        "Routing traffic through this computer. New connections go out through this desktop. Click to stop."
     } else {
-        "Route traffic through this computer. Web traffic from this Bot's computer goes out through this desktop instead of the cloud."
+        "Traffic goes out on its own. Click to route this Bot's computer's web traffic through this desktop instead."
     };
     div()
         .id("route-traffic-this-computer")
@@ -1121,12 +1159,7 @@ fn route_traffic_icon(
                 });
             }
         })
-        .child(
-            Icon::default()
-                .path("icons/route-traffic.svg")
-                .size(px(16.))
-                .text_color(color),
-        )
+        .child(Icon::default().path(icon).size(px(16.)).text_color(color))
 }
 
 fn pane_header(
