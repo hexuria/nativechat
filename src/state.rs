@@ -695,9 +695,7 @@ fn stopped_transcript(
 /// A saved row as the feed paints it, with the pieces the turn was made of, so a thread reopened
 /// shows the bubbles and the pictures it showed live.
 fn restored_message(row: ChatMessage) -> Message {
-    let sent_at = NaiveDateTime::parse_from_str(&row.created_at, "%Y-%m-%d %H:%M:%S")
-        .map(|dt| SystemTime::from(dt.and_utc()))
-        .unwrap_or_else(|_| SystemTime::now());
+    let sent_at = parse_sql_time(&row.created_at).unwrap_or_else(SystemTime::now);
     let content = row.content;
     let parts = restored_parts(&content, row.parts);
     Message {
@@ -931,8 +929,12 @@ fn replayed_ending(
     }
 }
 
+/// A time as a row carries it. Rows written before times were kept to the millisecond have
+/// whole seconds, and both read the same; both sort beside each other, since a whole second
+/// sorts before any fraction of it.
 fn parse_sql_time(value: &str) -> Option<SystemTime> {
-    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.3f")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
         .ok()
         .map(|dt| SystemTime::from(dt.and_utc()))
 }
@@ -5911,12 +5913,15 @@ impl AppState {
         let title = self.conversation_title(conversation_id);
         // A reply the person hid while it was still being typed out has no row yet: the mark
         // rides along with the write rather than waiting for a row that is not there.
-        let hidden = self
+        let bubble = self
             .conversations
             .iter()
             .find(|c| c.id == conversation_id)
-            .and_then(|c| c.messages.iter().find(|m| m.id == message_id))
-            .is_some_and(|m| m.hidden);
+            .and_then(|c| c.messages.iter().find(|m| m.id == message_id));
+        let hidden = bubble.is_some_and(|m| m.hidden);
+        // The turn's own time, so a reply recovered from the server keeps the place it had
+        // rather than landing at the bottom of the thread on the next load.
+        let sent_at = bubble.map_or_else(SystemTime::now, |m| m.sent_at);
         let conversation_id = conversation_id.to_string();
         let message_id = message_id.to_string();
         let run_id = run_id.map(str::to_string);
@@ -5937,6 +5942,7 @@ impl AppState {
                         &parts,
                         run_id.as_deref(),
                         hidden,
+                        sent_at,
                     )
                     .await
                 }
@@ -9292,6 +9298,9 @@ impl AppState {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
 
         let local_id = uuid::Uuid::now_v7().to_string();
+        // The bubble and its row are stamped with one moment, so the thread reads back in the
+        // order it was said in.
+        let said_at = SystemTime::now();
         // The whole reply, not just its preview: the bubble paints the preview, and the quote
         // the coworker is sent is built from the message this one points at.
         let reply = self.reply_to.take();
@@ -9306,7 +9315,7 @@ impl AppState {
                 id: local_id.clone(),
                 sender: "Me".to_string(),
                 content: content.clone(),
-                sent_at: SystemTime::now(),
+                sent_at: said_at,
                 is_me: true,
                 reply_preview: reply.as_ref().map(|r| r.preview.clone()),
                 reply_to_id: reply.as_ref().map(|r| r.message_id.clone()),
@@ -9356,6 +9365,7 @@ impl AppState {
                         // thread is its runs, and a run is only the coworker's half of a turn.
                         None,
                         false,
+                        said_at,
                     )
                     .await
                 {
@@ -10731,9 +10741,9 @@ mod tests {
         TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
         apply_catalogue, apply_reload, bot_status_line, bubble_for_run, graft_reply,
         is_status_line, is_tool_standin, is_unsent_turn_note, missing_replies,
-        overlay_server_cards, reads_as_gateway_unreachable, replayed_ending, reply_from_replay,
-        restored_parts, saved_parts, spec_from_queued, stream_paint_due, stream_part_sig,
-        streaming_message_mut, turn_ending,
+        overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable, replayed_ending,
+        reply_from_replay, restored_message, restored_parts, saved_parts, spec_from_queued,
+        stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -11306,6 +11316,7 @@ mod tests {
             &saved_parts(&live),
             Some("run_1"),
             false,
+            SystemTime::UNIX_EPOCH,
         )
         .await
         .expect("the turn is saved");
@@ -11661,6 +11672,65 @@ mod tests {
         );
     }
 
+    /// A reply recovered from the server keeps the place it had when the thread is reopened.
+    ///
+    /// The recovered reply is put back where it happened in memory, but it used to be written
+    /// down stamped with the moment it was recovered — so the next load, which reads the thread
+    /// in stamped order, dropped it to the bottom, below messages it came before.
+    #[tokio::test]
+    async fn a_recovered_reply_is_still_where_it_happened_after_the_thread_is_reopened() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let ask = SystemTime::UNIX_EPOCH + Duration::from_millis(1_000);
+        let reply = SystemTime::UNIX_EPOCH + Duration::from_millis(2_000);
+        let next = SystemTime::UNIX_EPOCH + Duration::from_millis(3_000);
+
+        // Written down out of order: the person's two messages first, then the reply that
+        // belongs between them, recovered from the server afterwards.
+        for (id, role, content, at) in [
+            ("m_ask", "user", "do it", ask),
+            ("m_next", "user", "and then?", next),
+            ("m_reply", "assistant", "done", reply),
+        ] {
+            db.save_message(
+                id,
+                "s1",
+                role,
+                content,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                at,
+            )
+            .await
+            .expect("saved");
+        }
+
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(
+            ids_of(&rows),
+            vec!["m_ask", "m_reply", "m_next"],
+            "the thread reads back in the order it was said in"
+        );
+        assert_eq!(
+            restored_message(rows[1].clone()).sent_at,
+            reply,
+            "and the reply keeps its own time"
+        );
+    }
+
+    /// Times written before they were kept to the millisecond still read.
+    #[test]
+    fn a_whole_second_stamp_still_reads_beside_a_finer_one() {
+        let second = parse_sql_time("2026-09-21 22:30:01").expect("the old shape reads");
+        let finer = parse_sql_time("2026-09-21 22:30:01.250").expect("the new shape reads");
+        assert!(finer > second, "and sorts after it inside the same second");
+        assert!(parse_sql_time("not a time").is_none());
+    }
+
     /// A reply hidden before it was ever written down stays hidden.
     ///
     /// A reply has no row until its turn settles, so hiding one that is still being typed out
@@ -11690,6 +11760,7 @@ mod tests {
             &[],
             Some("run_1"),
             true,
+            SystemTime::UNIX_EPOCH,
         )
         .await
         .expect("the reply is saved");
@@ -11709,6 +11780,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
+            SystemTime::UNIX_EPOCH,
         )
         .await
         .expect("the second write");
@@ -11785,6 +11857,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
+            SystemTime::UNIX_EPOCH,
         )
         .await
         .expect("the reply is saved");
@@ -11825,6 +11898,7 @@ mod tests {
             &once,
             Some("run_1"),
             false,
+            SystemTime::UNIX_EPOCH,
         )
         .await
         .expect("the first write");
@@ -11839,6 +11913,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
+            SystemTime::UNIX_EPOCH,
         )
         .await
         .expect("the second write");
@@ -11875,6 +11950,7 @@ mod tests {
             &[],
             None,
             false,
+            SystemTime::UNIX_EPOCH,
         )
         .await
         .expect("the message is saved");

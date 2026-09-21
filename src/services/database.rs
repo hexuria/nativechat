@@ -101,6 +101,10 @@ impl DatabaseService {
         parts: &[MessagePart],
         run_id: Option<&str>,
         hidden: bool,
+        // When the message was said, not when it reached the database: a reply recovered from
+        // the server happened before the turns either side of it, and the moment it was
+        // recovered would put it at the bottom of the thread on the next load.
+        sent_at: std::time::SystemTime,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
@@ -113,8 +117,8 @@ impl DatabaseService {
             // write that comes later never clears a mark that is already there. The person
             // can hide a reply while it is still being typed out, and the row for it does not
             // exist until the turn settles.
-            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                content = excluded.content,
                model = excluded.model,
@@ -133,6 +137,9 @@ impl DatabaseService {
         .bind(reply.as_ref().map(|r| i64::from(r.is_me)))
         .bind(run_id)
         .bind(hidden.then(Self::hidden_now))
+        // Only on the way in: a second write of the same message is the same message, said
+        // when it was said.
+        .bind(Self::stamp(sent_at))
         .execute(&mut *tx)
         .await?;
 
@@ -165,6 +172,15 @@ impl DatabaseService {
     /// The stamp a hidden row carries, in the same shape as `created_at`.
     fn hidden_now() -> String {
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    /// A time as a row carries it: to the millisecond, so a turn read back off the server and
+    /// the message it answered do not land in the same second with nothing to order them by.
+    /// It reads the same as the old whole-second stamps and sorts beside them.
+    fn stamp(at: std::time::SystemTime) -> String {
+        chrono::DateTime::<chrono::Utc>::from(at)
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string()
     }
 
     /// Hide a message rather than take it away.
