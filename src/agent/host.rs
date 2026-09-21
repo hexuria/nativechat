@@ -2189,7 +2189,12 @@ impl NativeChatHost {
             .strip_prefix("egress-policy-")
             .and_then(crate::opengrok::LocalExecMode::parse)
         {
-            if self.egress_policy.is_none() {
+            let on_screen = self.egress_policy.is_some()
+                && ((self.agent_settings_open && self.route_traffic_on_bot_pane)
+                    || (self.account_open
+                        && self.computer_tab
+                        && self.route_traffic_in_user_settings));
+            if !on_screen {
                 return Err("no network choice is on screen to click".to_string());
             }
             Command::SetEgressPolicy(mode)

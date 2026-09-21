@@ -2355,7 +2355,7 @@ impl AppState {
         card: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.active_coworker_id.as_deref() == Some(coworker_id.as_str())
+        if self.shows_computer_of(&coworker_id)
             && let Some(computer) = self.coworker_computer.as_mut()
             && computer.egress_policy.is_some()
         {
@@ -2370,7 +2370,10 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let outcome = client.set_egress_policy(&coworker_id, mode).await;
             let _ = this.update(cx, |state, cx| {
-                state.egress_policy_pending = None;
+                // Only this write's hold: a second word picked inside the window has its own.
+                if state.egress_policy_pending.as_ref() == Some(&(coworker_id.clone(), mode)) {
+                    state.egress_policy_pending = None;
+                }
                 if let Err(error) = &outcome {
                     eprintln!(
                         "NativeChat computer: could not set the network policy: {}",
@@ -2385,19 +2388,31 @@ impl AppState {
                     }
                     cx.notify();
                 }
-                if state.active_coworker_id.as_deref() == Some(coworker_id.as_str()) {
-                    state.refresh_coworker_computer_quietly(cx);
+                if state.shows_computer_of(&coworker_id) {
+                    state.refresh_computer_record_of(coworker_id.clone(), cx);
                 }
             });
         })
         .detach();
     }
 
+    /// Whether `coworker_id`'s computer record is the one on screen: the active bot's, or the
+    /// record left behind when a back-navigation cleared the active bot but not the record.
+    fn shows_computer_of(&self, coworker_id: &str) -> bool {
+        self.active_coworker_id.as_deref() == Some(coworker_id)
+            || (self.active_coworker_id.is_none()
+                && self
+                    .coworker_computer
+                    .as_ref()
+                    .is_some_and(|computer| computer.agent_id == coworker_id))
+    }
+
     /// A computer record fetched while a policy write is in flight must not undo the word the
-    /// person just chose; the read-back after the write is what settles it.
-    fn hold_pending_egress_policy(&self, status: &mut CoworkerComputer) {
+    /// person just chose; the read-back after the write is what settles it. Keyed on the bot
+    /// the fetch was issued for, not on the record's own `agentId`, which a server may omit.
+    fn hold_pending_egress_policy(&self, fetched_for: &str, status: &mut CoworkerComputer) {
         if let Some((coworker_id, mode)) = &self.egress_policy_pending
-            && status.agent_id == *coworker_id
+            && coworker_id == fetched_for
             && status.egress_policy.is_some()
         {
             status.egress_policy = Some(*mode);
@@ -2408,10 +2423,15 @@ impl AppState {
     /// Computer pane's refresh heals an absent box; a bot merely switched to must not have a
     /// box provisioned for being looked at.
     pub fn refresh_coworker_computer_quietly(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.opengrok.clone() else {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
             return;
         };
-        let Some(coworker_id) = self.active_coworker_id.clone() else {
+        self.refresh_computer_record_of(coworker_id, cx);
+    }
+
+    /// The same quiet fetch for a named bot, kept only while its record is the one on screen.
+    fn refresh_computer_record_of(&mut self, coworker_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
             return;
         };
         if self.computer_endpoint_missing {
@@ -2420,12 +2440,12 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.coworker_computer(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                if !state.shows_computer_of(&coworker_id) {
                     return;
                 }
                 match result {
                     Ok(mut status) => {
-                        state.hold_pending_egress_policy(&mut status);
+                        state.hold_pending_egress_policy(&coworker_id, &mut status);
                         if state.coworker_computer.as_ref() != Some(&status) {
                             state.coworker_computer = Some(status);
                             cx.notify();
@@ -2435,6 +2455,7 @@ impl AppState {
                     // not on every bot switch.
                     Err(error) if error.status == Some(404) => {
                         state.computer_endpoint_missing = true;
+                        state.computer_poll = None;
                     }
                     Err(_) => {}
                 }
@@ -3081,6 +3102,9 @@ impl AppState {
             // reconnect loop refills it unvisited now, and this is the other half — somebody
             // who opens the pane to see why it is empty gets a fresh answer for opening it.
             self.refresh_models(cx);
+            // A dedicated box's network choice lives on this sidebar and reads the computer
+            // record; opening the sidebar is the moment to make sure it is this bot's and fresh.
+            self.refresh_coworker_computer_quietly(cx);
         }
     }
 
@@ -3180,7 +3204,7 @@ impl AppState {
                 }
                 match result {
                     Ok(mut status) => {
-                        state.hold_pending_egress_policy(&mut status);
+                        state.hold_pending_egress_policy(&coworker_id, &mut status);
                         // A bot with no computer gets one: ask once per visit, and let the
                         // next poll pick up the answer. A recorded error is the server saying
                         // it cannot, so that is left alone.
@@ -3286,7 +3310,8 @@ impl AppState {
                     return;
                 }
                 match result {
-                    Ok(status) => {
+                    Ok(mut status) => {
+                        state.hold_pending_egress_policy(&coworker_id, &mut status);
                         state.coworker_computer = Some(status);
                         cx.notify();
                     }
@@ -3366,7 +3391,8 @@ impl AppState {
                     return;
                 }
                 match result {
-                    Ok(status) => {
+                    Ok(mut status) => {
+                        state.hold_pending_egress_policy(&coworker_id, &mut status);
                         state.coworker_computer = Some(status);
                         state.coworker_screen = None;
                     }
@@ -3860,6 +3886,8 @@ impl AppState {
                         state.open_computer_window(&coworker_id, &url, teach, cx);
                     }
                     if state.active_coworker_id.as_deref() == Some(coworker_id.as_str()) {
+                        let mut status = status;
+                        state.hold_pending_egress_policy(&coworker_id, &mut status);
                         state.coworker_computer = Some(status);
                         cx.notify();
                     }
@@ -4962,6 +4990,13 @@ impl AppState {
         self.computer_view = loc.computer_view;
         self.is_app_settings_open = loc.app_settings_open;
         self.app_settings_tab = loc.app_settings_tab;
+        // Landing on Settings → Computer by navigation bypasses the tab setter, whose fetch of
+        // the computer record is what keeps the Route-traffic and network rows current.
+        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Computer {
+            self.refresh_computers(cx);
+            self.refresh_host_egress(cx);
+            self.refresh_coworker_computer_quietly(cx);
+        }
         // After `select_coworker`, which lands on the chat: the page is where the person was.
         self.page = loc.page;
         if self.page == MainPage::Recipes {
@@ -6500,9 +6535,15 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(_) => {
-                        state
-                            .approval_decisions
-                            .insert(spec.call_id.clone(), decision);
+                        // A standing choice the policy write already failed to keep must not be
+                        // written back over the once-only line that failure left; see
+                        // `settled_decision`.
+                        let current = state.approval_decisions.get(&spec.call_id).cloned();
+                        if let Some(settled) = settled_decision(current.as_ref(), decision) {
+                            state
+                                .approval_decisions
+                                .insert(spec.call_id.clone(), settled);
+                        }
                         // The thread the resumed run belongs to, which is not necessarily the
                         // one being read: a card answered from the notification leaves the
                         // person somewhere else entirely, and the working line belongs where the
@@ -9212,6 +9253,26 @@ impl AppState {
 /// raises cards for reasons of its own — a policy, an auto-review — and says
 /// why in the item, so the card now reads back what the server sent and only
 /// falls through to the old wording for a server that sends neither.
+/// What a card's decision becomes once the run has taken the answer. A standing choice
+/// (Always / Never) whose policy write has already failed was re-marked as once-only by that
+/// failure, and the answer landing later must not promote it back: `None` keeps what is
+/// there. Everything else is written as decided.
+fn settled_decision(
+    current: Option<&ApprovalDecision>,
+    decided: ApprovalDecision,
+) -> Option<ApprovalDecision> {
+    let standing = matches!(decided, ApprovalDecision::Always | ApprovalDecision::Never);
+    let downgraded = matches!(
+        current,
+        Some(ApprovalDecision::AllowOnce | ApprovalDecision::Denied)
+    );
+    if standing && downgraded {
+        None
+    } else {
+        Some(decided)
+    }
+}
+
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
     ApprovalSpec {
         run_id: item.run_id.clone(),
@@ -9614,7 +9675,9 @@ mod tests {
         CredentialRequestResolution, Failure, FormField, FormResolution, FormSpec, LocalExecMode,
         ModelEntry, OpenGrokClient, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
-    use crate::state::{ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave};
+    use crate::state::{
+        ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, settled_decision,
+    };
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -12051,6 +12114,35 @@ mod tests {
             state.route_traffic_surface(),
             RouteTrafficSurface::Hidden,
             "host isEgressTunnelAvailable is not box provisioned"
+        );
+    }
+
+    /// A failed policy write re-marks the card as once-only; the run's answer landing
+    /// afterwards must not promote it back to the standing wording.
+    #[test]
+    fn a_failed_policy_write_keeps_the_once_only_line() {
+        // The failure wrote Denied; the late answer says Never: keep Denied.
+        assert_eq!(
+            settled_decision(Some(&ApprovalDecision::Denied), ApprovalDecision::Never),
+            None
+        );
+        assert_eq!(
+            settled_decision(Some(&ApprovalDecision::AllowOnce), ApprovalDecision::Always),
+            None
+        );
+        // The ordinary order: the answer lands on a Sending card and is written as decided.
+        assert_eq!(
+            settled_decision(Some(&ApprovalDecision::Sending), ApprovalDecision::Never),
+            Some(ApprovalDecision::Never)
+        );
+        assert_eq!(
+            settled_decision(None, ApprovalDecision::Always),
+            Some(ApprovalDecision::Always)
+        );
+        // A once-only answer is never blocked by an earlier once-only line.
+        assert_eq!(
+            settled_decision(Some(&ApprovalDecision::Denied), ApprovalDecision::Denied),
+            Some(ApprovalDecision::Denied)
         );
     }
 
