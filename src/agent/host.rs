@@ -1390,7 +1390,12 @@ impl NativeChatHost {
                 .coworker_computer
                 .as_ref()
                 .and_then(|computer| computer.box_egress_ready()),
-            egress_policy: state.egress_policy(),
+            // Only where a person could see it: a group's or an org's computer has no surface
+            // for the choice yet, so the driver must not be able to set what nobody can.
+            egress_policy: (state.show_egress_policy_on_bot_pane()
+                || state.show_egress_policy_in_user_settings())
+            .then(|| state.egress_policy())
+            .flatten(),
             pending: None,
             compose: None,
         }
@@ -1543,6 +1548,9 @@ impl NativeChatHost {
                     card.states.push(state.clone());
                 }
             }
+            if approval.tunnel {
+                card.states.push("egress-tunnel".to_string());
+            }
             if approval.local || approval.review {
                 card = card.with_child(UiNode::button(format!("{id}-always"), "Always allow"));
             }
@@ -1584,9 +1592,6 @@ impl NativeChatHost {
                 "switch",
                 "Route traffic through this computer",
             ));
-            if let Some(current) = self.egress_policy {
-                computer = computer.with_child(egress_policy_node(current));
-            }
         }
         computer = computer.with_child(UiNode::button(ids::ROUTINE_NEW, "Create routine"));
         for routine in &self.routines {
@@ -1671,6 +1676,14 @@ impl NativeChatHost {
                     .with_value(self.model_count.to_string())
                     .with_visible(self.model_picker_open),
             );
+        // A dedicated box's network choice sits with the bot's other settings, and only while
+        // that sidebar is open.
+        if let Some(current) = self
+            .egress_policy
+            .filter(|_| self.agent_settings_open && self.route_traffic_on_bot_pane)
+        {
+            settings = settings.with_child(egress_policy_node(current));
+        }
         if let Some(note) = &self.model_note {
             // The server's word about why the list is not fuller, under the field, exactly where
             // the person read it. In the tree only while there is one, so its absence is the
@@ -2176,6 +2189,9 @@ impl NativeChatHost {
             .strip_prefix("egress-policy-")
             .and_then(crate::opengrok::LocalExecMode::parse)
         {
+            if self.egress_policy.is_none() {
+                return Err("no network choice is on screen to click".to_string());
+            }
             Command::SetEgressPolicy(mode)
         } else if target == ids::ROUTINE_NEW {
             Command::OpenRoutineEditor(None)
@@ -3918,7 +3934,7 @@ mod tests {
     fn egress_policy_sits_with_route_traffic_and_clicks_are_words() {
         use crate::opengrok::LocalExecMode;
         let mut host = host();
-        host.computer_open = true;
+        host.agent_settings_open = true;
         host.route_traffic_on_bot_pane = true;
         assert!(
             host.snapshot().find("egress-policy-menu").is_none(),
@@ -3932,7 +3948,16 @@ mod tests {
             .is_err(),
             "setting a policy the server does not carry must fail loudly"
         );
+        assert!(
+            host.dispatch(&Op::click("egress-policy-never")).is_err(),
+            "a click on a control that is not there must fail loudly too"
+        );
         host.egress_policy = Some(LocalExecMode::Ask);
+        // A dedicated box: the bot's own Settings sidebar, not its Computer pane.
+        host.agent_settings_open = false;
+        host.computer_open = true;
+        assert!(host.snapshot().find("egress-policy-menu").is_none());
+        host.agent_settings_open = true;
         let tree = host.snapshot();
         assert!(tree.find("egress-policy-menu").is_some());
         assert_eq!(
@@ -3961,14 +3986,24 @@ mod tests {
             .is_err()
         );
 
-        // A shared box: Settings → Computer, not the bot pane.
+        // A shared box: Settings → Computer, not the bot's sidebar — the surface flag is what
+        // moves it, with both places open.
         let mut host = self::host();
         host.egress_policy = Some(LocalExecMode::Never);
-        host.computer_open = true;
-        host.route_traffic_in_user_settings = true;
-        assert!(host.snapshot().find("egress-policy-menu").is_none());
+        host.agent_settings_open = true;
         host.account_open = true;
         host.computer_tab = true;
+        host.route_traffic_on_bot_pane = false;
+        host.route_traffic_in_user_settings = false;
+        assert!(host.snapshot().find("egress-policy-menu").is_none());
+        host.route_traffic_in_user_settings = true;
+        let tree = host.snapshot();
+        let menu = tree
+            .find("egress-policy-menu")
+            .expect("in Settings → Computer");
+        assert_eq!(menu.name, "Never allow");
+        host.route_traffic_in_user_settings = false;
+        host.route_traffic_on_bot_pane = true;
         assert!(host.snapshot().find("egress-policy-menu").is_some());
     }
 

@@ -491,6 +491,15 @@ impl Render for AgentSettings {
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
+        // The bot's own computer's network choice lives here, with the bot's other settings;
+        // a shared computer's lives in Settings → Computer, with Route traffic.
+        let egress_policy = {
+            let state = self.state.read(cx);
+            state
+                .show_egress_policy_on_bot_pane()
+                .then(|| state.egress_policy())
+                .flatten()
+        };
         // Floating over the chat (a narrow window), the pane carries its own header; docked,
         // the title bar shows it over the pane.
         let floats = chrome_floats(f32::from(window.viewport_size().width));
@@ -606,6 +615,41 @@ impl Render for AgentSettings {
                                             .bg(theme.input_background()),
                                     ),
                             )
+                                    .when_some(egress_policy, |this, current| {
+                                        this.child(
+                                            div().pt(px(12.)).child(
+                                                card(card_fill).id("agent-network").child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap(px(12.))
+                                                        .child(
+                                                            v_flex()
+                                                                .min_w(px(0.))
+                                                                .gap(px(2.))
+                                                                .child(
+                                                                    div()
+                                                                        .text_sm()
+                                                                        .child("Use your network"),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(muted)
+                                                                        .child("Whether this Bot's computer may reach the web through this desktop without asking each time. Never allow keeps its browser off while traffic is routed here."),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            crate::components::app_settings::egress_policy_picker(
+                                                                current,
+                                                                app.clone(),
+                                                            ),
+                                                        ),
+                                                ),
+                                            ),
+                                        )
+                                    })
                                     .child(
                                         div().pt(px(12.)).child(
                                             card(card_fill)

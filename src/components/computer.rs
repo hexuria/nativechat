@@ -1049,31 +1049,15 @@ fn box_chrome(
     let update_app = app.clone();
     let reset_app = app.clone();
     let show_route = app.read(cx).show_route_traffic_on_bot_pane();
-    let egress_policy = app
-        .read(cx)
-        .show_egress_policy_on_bot_pane()
-        .then(|| app.read(cx).egress_policy())
-        .flatten();
     h_flex()
         .id("computer-box-chrome")
         .w_full()
         .items_center()
         .justify_between()
         .gap(px(8.))
-        .child(
-            h_flex()
-                .items_center()
-                .gap(px(4.))
-                .when(show_route, |this| {
-                    this.child(route_traffic_icon(app.clone(), theme, cx))
-                })
-                .when_some(egress_policy, |this, current| {
-                    this.child(crate::components::app_settings::egress_policy_picker(
-                        current,
-                        app.clone(),
-                    ))
-                }),
-        )
+        .child(h_flex().items_center().when(show_route, |this| {
+            this.child(route_traffic_icon(app.clone(), theme, cx))
+        }))
         .child(
             h_flex()
                 .gap(px(4.))

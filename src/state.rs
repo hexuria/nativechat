@@ -1473,6 +1473,9 @@ pub struct AppState {
     /// `egressTunnelAvailable` on `GET /ag-ui/host-settings`: host intent AND the open
     /// coworker's box advertising the tunnel.
     pub host_egress_tunnel_available: bool,
+    /// A network-policy write in flight for (bot, word): a computer record fetched meanwhile
+    /// keeps the word the person chose. See `set_egress_policy_for`.
+    pub egress_policy_pending: Option<(String, LocalExecMode)>,
     /// Local/host opt-in for **Route traffic through this computer**. Defaults
     /// ON; host `egressTunnelEnabled` overwrites only when the key is present.
     pub egress_tunnel_enabled: bool,
@@ -1845,6 +1848,7 @@ impl AppState {
             computers: Vec::new(),
             coworker_computer: None,
             host_egress_tunnel_available: false,
+            egress_policy_pending: None,
             egress_tunnel_enabled: true,
             coworker_screen: None,
             last_box_shot: None,
@@ -2323,21 +2327,32 @@ impl AppState {
         self.show_route_traffic_in_user_settings() && self.egress_policy().is_some()
     }
 
-    /// Set the open bot's computer's standing answer.
+    /// Set the open bot's computer's standing answer. The bot is the one whose computer record
+    /// is on screen: after a back-navigation to a frame with no bot chosen the record can
+    /// outlive `active_coworker_id`, and the dropdown must still do what it says.
     pub fn set_egress_policy(&mut self, mode: LocalExecMode, cx: &mut Context<Self>) {
-        let Some(coworker_id) = self.active_coworker_id.clone() else {
+        let Some(coworker_id) = self.active_coworker_id.clone().or_else(|| {
+            self.coworker_computer
+                .as_ref()
+                .map(|computer| computer.agent_id.clone())
+                .filter(|id| !id.is_empty())
+        }) else {
             return;
         };
-        self.set_egress_policy_for(coworker_id, mode, cx);
+        self.set_egress_policy_for(coworker_id, mode, None, cx);
     }
 
     /// Set the standing answer for a named bot's computer — the card's own bot, which is not
-    /// always the one being looked at. The pane's copy is moved at once when it is that bot's,
-    /// and read back from the server afterwards either way.
+    /// always the one being looked at. The pane's copy is moved at once when it is that bot's
+    /// and held against any record fetch already in flight until the write has landed; then
+    /// it is read back from the server. When the write fails, `card` (the answered card, if
+    /// one) is re-marked as a once-only answer, so the transcript does not claim a standing
+    /// choice that was not kept.
     pub fn set_egress_policy_for(
         &mut self,
         coworker_id: String,
         mode: LocalExecMode,
+        card: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if self.active_coworker_id.as_deref() == Some(coworker_id.as_str())
@@ -2345,25 +2360,48 @@ impl AppState {
             && computer.egress_policy.is_some()
         {
             computer.egress_policy = Some(mode);
+            self.egress_policy_pending = Some((coworker_id.clone(), mode));
             cx.notify();
         }
         let Some(client) = self.opengrok.clone() else {
+            self.egress_policy_pending = None;
             return;
         };
         cx.spawn(async move |this, cx| {
-            if let Err(error) = client.set_egress_policy(&coworker_id, mode).await {
-                eprintln!(
-                    "NativeChat computer: could not set the network policy: {}",
-                    error.message
-                );
-            }
+            let outcome = client.set_egress_policy(&coworker_id, mode).await;
             let _ = this.update(cx, |state, cx| {
+                state.egress_policy_pending = None;
+                if let Err(error) = &outcome {
+                    eprintln!(
+                        "NativeChat computer: could not set the network policy: {}",
+                        error.message
+                    );
+                    if let Some(call_id) = card {
+                        let once = match mode {
+                            LocalExecMode::Never => ApprovalDecision::Denied,
+                            _ => ApprovalDecision::AllowOnce,
+                        };
+                        state.approval_decisions.insert(call_id, once);
+                    }
+                    cx.notify();
+                }
                 if state.active_coworker_id.as_deref() == Some(coworker_id.as_str()) {
                     state.refresh_coworker_computer_quietly(cx);
                 }
             });
         })
         .detach();
+    }
+
+    /// A computer record fetched while a policy write is in flight must not undo the word the
+    /// person just chose; the read-back after the write is what settles it.
+    fn hold_pending_egress_policy(&self, status: &mut CoworkerComputer) {
+        if let Some((coworker_id, mode)) = &self.egress_policy_pending
+            && status.agent_id == *coworker_id
+            && status.egress_policy.is_some()
+        {
+            status.egress_policy = Some(*mode);
+        }
     }
 
     /// The open bot's computer record, fetched for its facts alone: no heal, no poll. The
@@ -2380,16 +2418,25 @@ impl AppState {
             return;
         }
         cx.spawn(async move |this, cx| {
-            let Ok(status) = client.coworker_computer(&coworker_id).await else {
-                return;
-            };
+            let result = client.coworker_computer(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
                 if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
                     return;
                 }
-                if state.coworker_computer.as_ref() != Some(&status) {
-                    state.coworker_computer = Some(status);
-                    cx.notify();
+                match result {
+                    Ok(mut status) => {
+                        state.hold_pending_egress_policy(&mut status);
+                        if state.coworker_computer.as_ref() != Some(&status) {
+                            state.coworker_computer = Some(status);
+                            cx.notify();
+                        }
+                    }
+                    // The same latch the pane's refresh sets: an older server is asked once,
+                    // not on every bot switch.
+                    Err(error) if error.status == Some(404) => {
+                        state.computer_endpoint_missing = true;
+                    }
+                    Err(_) => {}
                 }
             });
         })
@@ -2435,6 +2482,11 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let settings = client.host_settings(coworker.as_deref()).await.ok();
             let _ = this.update(cx, |state, cx| {
+                // The answer is about the bot it was asked for; a slow answer for a bot the
+                // person has since left must not paint the next bot's tunnel state.
+                if state.active_coworker_id != coworker {
+                    return;
+                }
                 if let Some(settings) = settings
                     && state.take_host_egress(&settings)
                 {
@@ -3127,7 +3179,8 @@ impl AppState {
                     return;
                 }
                 match result {
-                    Ok(status) => {
+                    Ok(mut status) => {
+                        state.hold_pending_egress_policy(&mut status);
                         // A bot with no computer gets one: ask once per visit, and let the
                         // next poll pick up the answer. A recorded error is the server saying
                         // it cannot, so that is left alone.
@@ -6398,7 +6451,7 @@ impl AppState {
                 _ => None,
             };
             if let (Some(standing), Some(coworker_id)) = (standing, conversation_id.clone()) {
-                self.set_egress_policy_for(coworker_id, standing, cx);
+                self.set_egress_policy_for(coworker_id, standing, Some(spec.call_id.clone()), cx);
             }
         }
         // What the thread says while the answered run finishes. "Running commands" is the
@@ -8774,6 +8827,7 @@ impl AppState {
             self.refresh_host_egress(cx);
             if self.app_settings_tab == AppSettingsTab::Computer {
                 self.refresh_computers(cx);
+                self.refresh_coworker_computer_quietly(cx);
             }
         }
         self.record_nav();

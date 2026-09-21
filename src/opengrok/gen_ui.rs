@@ -168,6 +168,12 @@ pub struct ApprovalSpec {
 /// app's local-exec daemon. Every other tool runs on the coworker's box.
 pub const USER_MACHINE_SHELL: &str = "user_machine_shell";
 
+/// The sentence OpenGrok puts on the egress tunnel's Review-an-action card
+/// (`opengrok_tools::review::EGRESS_TUNNEL_ASK_REASON`), and which its
+/// approvals queue carries for a card rebuilt after a relaunch. Matched whole.
+pub const EGRESS_TUNNEL_ASK_REASON: &str =
+    "This action would use your network through the egress tunnel. Review it before it runs.";
+
 /// The person's answer on a permission card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalExecResolution {
@@ -219,11 +225,15 @@ impl ApprovalSpec {
             )
     }
 
-    /// The Review-an-action card the egress tunnel raises: the server's own sentence names
-    /// the tunnel. Always and Never on THIS card set the computer's standing policy; on a
-    /// judge's card they answer the one call.
+    /// The Review-an-action card the egress tunnel raises: the server's own sentence for it,
+    /// whole — a judge's card whose instructions merely mention the tunnel is not this card.
+    /// Always and Never on THIS card set the computer's standing policy; on a judge's card
+    /// they answer the one call. Never a local-shell card, whose Always/Never move this Mac.
     pub fn is_egress_tunnel(&self) -> bool {
-        self.is_review_an_action() && self.why.to_ascii_lowercase().contains("egress tunnel")
+        self.is_review_an_action()
+            && !self.runs_on_this_mac()
+            && (self.reason.trim().eq_ignore_ascii_case("egress")
+                || self.why.trim() == EGRESS_TUNNEL_ASK_REASON)
     }
 
     /// The centered line this card leaves behind once it is answered, in the
@@ -1343,6 +1353,18 @@ mod tests {
         let judge = review_card("Ask first: the page is a bank.");
         assert!(judge.is_review_an_action());
         assert!(!judge.is_egress_tunnel());
+        // A judge's instruction that mentions the tunnel is still a judge's card.
+        let mentions =
+            review_card("Ask first when a page would reach the web through the egress tunnel.");
+        assert!(!mentions.is_egress_tunnel());
+        // A local-shell card is never the tunnel's, whatever its sentence.
+        let mut local = tunnel.clone();
+        local.tool = USER_MACHINE_SHELL.into();
+        assert!(!local.is_egress_tunnel());
+        // The server may also say it in a word.
+        let mut worded = judge.clone();
+        worded.reason = "egress".into();
+        assert!(worded.is_egress_tunnel());
         assert_eq!(
             judge.outcome("Vamos", LocalExecResolution::AllowOnce),
             "Vamos can run commands on its computer this time."

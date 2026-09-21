@@ -1635,7 +1635,7 @@ impl LocalExecMode {
     /// Exactly one of the three words, or nothing — for a field whose absence means "no such
     /// control", where `from_stored`'s catch-all would invent a Never.
     pub fn parse(mode: &str) -> Option<Self> {
-        match mode.trim() {
+        match mode.trim().to_ascii_lowercase().as_str() {
             "ask" => Some(Self::Ask),
             "bypass" => Some(Self::Always),
             "never" => Some(Self::Never),

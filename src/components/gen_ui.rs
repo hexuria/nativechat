@@ -257,8 +257,10 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
             .child(dismiss_button(spec, app.clone(), theme.muted_foreground)),
     );
     // What the card is about, in the server's words. A Review-an-action card used to show
-    // only its title, so the person could not tell the tunnel's card from a judge's.
-    if spec.is_review_an_action() && !spec.why.trim().is_empty() {
+    // only its title, so the person could not tell the tunnel's card from a judge's. Only on
+    // a card painted AS a review card (the same gate the buttons use), or the sentence would
+    // sit under a plain consent title.
+    if spec.is_review_an_action() && (tunnel || app.is_none()) && !spec.why.trim().is_empty() {
         body = body.child(
             div()
                 .text_xs()
