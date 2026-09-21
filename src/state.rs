@@ -1498,6 +1498,8 @@ pub struct AppState {
     >,
     /// Update / Reset ask first: the dialog over the app, until Confirm or Cancel.
     pub computer_confirm: Option<ComputerAction>,
+    /// The network-permission dialog for the open bot's own computer is on screen.
+    pub network_policy_open: bool,
     /// What the last Update / Reset request said when it was refused; shown under the buttons.
     pub computer_action_error: Option<String>,
     /// The coworker whose absent computer we already asked the server to (re)provision, so a
@@ -1849,6 +1851,7 @@ impl AppState {
             coworker_computer: None,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
+            network_policy_open: false,
             egress_tunnel_enabled: true,
             coworker_screen: None,
             last_box_shot: None,
@@ -3337,6 +3340,29 @@ impl AppState {
         if self.computer_confirm.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// The shield badge on the Computer pane: open the dialog that picks how this bot's own
+    /// computer may use the person's network. Only when there is a choice to make.
+    pub fn open_network_policy(&mut self, cx: &mut Context<Self>) {
+        if !self.show_egress_policy_on_bot_pane() {
+            return;
+        }
+        self.network_policy_open = true;
+        cx.notify();
+    }
+
+    pub fn close_network_policy(&mut self, cx: &mut Context<Self>) {
+        if self.network_policy_open {
+            self.network_policy_open = false;
+            cx.notify();
+        }
+    }
+
+    /// A word picked in the dialog: kept on the server, and the dialog closes.
+    pub fn pick_network_policy(&mut self, mode: LocalExecMode, cx: &mut Context<Self>) {
+        self.set_egress_policy(mode, cx);
+        self.close_network_policy(cx);
     }
 
     /// The dialog's Confirm: do what it asked, then close it.
