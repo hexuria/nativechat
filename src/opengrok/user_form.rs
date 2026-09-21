@@ -663,9 +663,19 @@ pub fn user_form_use_saved_id(card_key: &str, login_id: &str) -> String {
     format!("user-form-use-saved-{card_key}-{login_id}")
 }
 
-/// The line under the buttons while a saved login is being used, or after it was not.
+/// The line under the field while a saved login is being used, or after it was not.
 pub fn user_form_saved_note_id(card_key: &str) -> String {
     format!("user-form-saved-note-{card_key}")
+}
+
+/// The account list under the name field.
+pub fn user_form_saved_list_id(card_key: &str) -> String {
+    format!("user-form-saved-list-{card_key}")
+}
+
+/// "Change" on the locked password row: drop the held password, type instead.
+pub fn user_form_saved_clear_id(card_key: &str) -> String {
+    format!("user-form-saved-clear-{card_key}")
 }
 
 /// A user-form card in the transcript. Field values are not stored on this type.
@@ -816,6 +826,15 @@ impl UserFormSpec {
             .iter()
             .filter(|field| field.required)
             .all(|field| values.filled(field))
+    }
+
+    /// The same, with `held` counted as filled: a password from the keychain is not in the
+    /// card's inputs, it is held for the submit.
+    pub fn required_fields_filled_with(&self, values: &UserFormValues, held: &[&str]) -> bool {
+        self.fields
+            .iter()
+            .filter(|field| field.required)
+            .all(|field| held.contains(&field.id.as_str()) || values.filled(field))
     }
 
     /// Fold a later event for the same card onto this one (resolution, or a

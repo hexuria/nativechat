@@ -36,12 +36,19 @@ pub const KEYCHAIN_SERVICE: &str = "ai.nativechat.site-login";
 /// Fallback file when OS Keychain is not available (Linux/dev). Mode 0600.
 pub const VAULT_FILE: &str = "site-login.vault";
 
-/// Where a "Use saved login" press is, painted on the card until the form settles.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where a pick from the card's account list is, until the form settles.
+#[derive(Clone, PartialEq, Eq)]
 pub enum SavedLoginUse {
     /// The Touch ID sheet is up.
     Confirming { username: String },
-    /// Touch ID passed; the values are on their way to the box.
+    /// Touch ID passed: the name is in its field, the password is held for the submit and
+    /// shown as dots. Log in sends both.
+    Ready {
+        login_id: String,
+        username: String,
+        password: String,
+    },
+    /// Log in was pressed; the values are on their way to the box.
     Filling { username: String },
     /// The person closed the sheet.
     Cancelled { username: String },
@@ -51,12 +58,35 @@ pub enum SavedLoginUse {
     Unavailable { message: String },
 }
 
+impl std::fmt::Debug for SavedLoginUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready {
+                login_id, username, ..
+            } => f
+                .debug_struct("Ready")
+                .field("login_id", login_id)
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Confirming { username } => write!(f, "Confirming({username})"),
+            Self::Filling { username } => write!(f, "Filling({username})"),
+            Self::Cancelled { username } => write!(f, "Cancelled({username})"),
+            Self::Refused { message } => write!(f, "Refused({message})"),
+            Self::Unavailable { message } => write!(f, "Unavailable({message})"),
+        }
+    }
+}
+
 impl SavedLoginUse {
-    /// The line under the buttons.
+    /// The line under the field.
     pub fn note(&self) -> String {
         match self {
             Self::Confirming { username } => {
-                format!("Confirm with Touch ID to log in as {username}.")
+                format!("Confirm with Touch ID to fill in {username}.")
+            }
+            Self::Ready { username, .. } => {
+                format!("Password for {username} from your keychain. Press Log in.")
             }
             Self::Filling { username } => {
                 format!("Logging in as {username}. The password goes straight to the computer.")
@@ -65,6 +95,16 @@ impl SavedLoginUse {
                 format!("Touch ID was cancelled. Try {username} again, or type the login.")
             }
             Self::Refused { message } | Self::Unavailable { message } => message.clone(),
+        }
+    }
+
+    /// The held password, once Touch ID passed.
+    pub fn ready(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Ready {
+                username, password, ..
+            } => Some((username.as_str(), password.as_str())),
+            _ => None,
         }
     }
 

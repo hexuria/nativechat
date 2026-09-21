@@ -21,8 +21,8 @@ use crate::opengrok::{
     UserFormDismissMode, UserFormField, UserFormFieldKind, UserFormSpec, UserFormValues,
     computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
     computer_handoff_takeover_id, continue_enabled, user_form_card_id, user_form_continue_id,
-    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_note_id,
-    user_form_screen_id, user_form_use_saved_id,
+    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_clear_id,
+    user_form_saved_list_id, user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
 };
 use crate::site_login::SavedLoginUse;
 use crate::state::AppState;
@@ -105,18 +105,10 @@ fn render_idle(
     }
     // Live InputState / TextareaState / picks / agent-typed — not a masked stub.
     let live = collect_submit_values(spec, inputs, textareas, &picks, cx);
-    let (saved_rows, saved_use) = app
-        .as_ref()
-        .map(|entity| {
-            let state = entity.read(cx);
-            (
-                state.saved_logins_for_form(spec),
-                state.saved_login_use.get(spec.card_key()).cloned(),
-            )
-        })
-        .unwrap_or_default();
-    let saved_busy = saved_use.as_ref().is_some_and(SavedLoginUse::is_busy);
-    let can_continue = continue_enabled(spec, &live, server_fill) && !saved_busy;
+    let saved = SavedLoginContext::for_card(spec, app.as_ref(), cx);
+    let saved_busy = saved.current.as_ref().is_some_and(SavedLoginUse::is_busy);
+    let held: Vec<&str> = saved.held_password_field().into_iter().collect();
+    let can_continue = can_post && spec.required_fields_filled_with(&live, &held) && !saved_busy;
     let can_post = can_post && !saved_busy;
     let mut body = v_flex()
         .id(ElementId::Name(user_form_card_id(spec.card_key()).into()))
@@ -162,21 +154,12 @@ fn render_idle(
             inputs,
             textareas,
             values,
+            &saved,
             app.clone(),
             cx,
         ));
     }
     let key = spec.card_key().to_string();
-    if !saved_rows.is_empty() || saved_use.is_some() {
-        body = body.child(render_saved_login_offer(
-            &key,
-            &saved_rows,
-            saved_use.as_ref(),
-            can_post,
-            app.clone(),
-            cx,
-        ));
-    }
     let can_dismiss = can_dismiss && !saved_busy;
     body.child(
         h_flex()
@@ -252,70 +235,6 @@ fn render_idle(
             )),
     )
     .into_any_element()
-}
-
-/// "Use saved login" — one button per saved row for this site, and the line that says
-/// where a press is (Touch ID up, filling, cancelled, refused). The password never
-/// appears here: the press goes Touch ID → keychain → the fill channel.
-fn render_saved_login_offer(
-    key: &str,
-    rows: &[crate::site_login::SiteLoginRecord],
-    current: Option<&SavedLoginUse>,
-    can_post: bool,
-    app: Option<Entity<AppState>>,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    let busy = current.is_some_and(SavedLoginUse::is_busy);
-    let mut strip = v_flex().w_full().gap(px(6.));
-    if !rows.is_empty() {
-        let mut row_line = h_flex().w_full().gap(px(8.)).flex_wrap().items_center();
-        row_line = row_line.child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("Saved login"),
-        );
-        for row in rows {
-            let id = user_form_use_saved_id(key, &row.id);
-            let enabled = can_post && !busy;
-            let label = format!("Use {}", row.username);
-            row_line = row_line.child(action_button(
-                id,
-                label,
-                ButtonKind::Secondary,
-                !enabled,
-                !can_post,
-                {
-                    let app = app.clone();
-                    let key = key.to_string();
-                    let login_id = row.id.clone();
-                    enabled.then_some(move |cx: &mut App| {
-                        if let Some(app) = &app {
-                            app.update(cx, |state, cx| {
-                                state.use_saved_login(key.clone(), login_id.clone(), cx);
-                            });
-                        }
-                    })
-                },
-            ));
-        }
-        strip = strip.child(row_line);
-    }
-    if let Some(current) = current {
-        let color = match current {
-            SavedLoginUse::Refused { .. } | SavedLoginUse::Unavailable { .. } => theme.danger,
-            _ => theme.muted_foreground,
-        };
-        strip = strip.child(
-            div()
-                .id(ElementId::Name(user_form_saved_note_id(key).into()))
-                .text_xs()
-                .text_color(color)
-                .child(current.note()),
-        );
-    }
-    strip.into_any_element()
 }
 
 fn render_computer_handoff(
@@ -836,12 +755,74 @@ fn fill_failed_actions(
         .into_any_element()
 }
 
+/// What the card knows about the person's saved logins for its site: the rows to list
+/// under the name field, which fields they go into, and where a pick is.
+#[derive(Default)]
+struct SavedLoginContext {
+    rows: Vec<crate::site_login::SiteLoginRecord>,
+    fields: Option<crate::site_login::LoginFields>,
+    current: Option<SavedLoginUse>,
+}
+
+impl SavedLoginContext {
+    fn for_card(spec: &UserFormSpec, app: Option<&Entity<AppState>>, cx: &App) -> Self {
+        let Some(app) = app else {
+            return Self::default();
+        };
+        let state = app.read(cx);
+        let rows = state.saved_logins_for_form(spec);
+        let current = state.saved_login_use.get(spec.card_key()).cloned();
+        let fields = if rows.is_empty() && current.is_none() {
+            None
+        } else {
+            crate::site_login::login_fields(spec)
+        };
+        Self {
+            rows,
+            fields,
+            current,
+        }
+    }
+
+    fn is_name_field(&self, field_id: &str) -> bool {
+        self.fields
+            .as_ref()
+            .is_some_and(|f| f.username_id == field_id)
+    }
+
+    fn is_password_field(&self, field_id: &str) -> bool {
+        self.fields
+            .as_ref()
+            .is_some_and(|f| f.password_id == field_id)
+    }
+
+    /// The password field id while a picked password is held for the submit.
+    fn held_password_field(&self) -> Option<&str> {
+        let ready = self.current.as_ref()?.ready().is_some();
+        ready
+            .then(|| self.fields.as_ref().map(|f| f.password_id.as_str()))
+            .flatten()
+    }
+
+    /// The account list shows until a pick is under way or held.
+    fn shows_list(&self) -> bool {
+        !self.rows.is_empty()
+            && !matches!(
+                self.current,
+                Some(SavedLoginUse::Confirming { .. })
+                    | Some(SavedLoginUse::Ready { .. })
+                    | Some(SavedLoginUse::Filling { .. })
+            )
+    }
+}
+
 fn render_field(
     spec: &UserFormSpec,
     field: &UserFormField,
     inputs: &UserFormInputMap,
     textareas: &UserFormTextareaMap,
     values: &UserFormValues,
+    saved: &SavedLoginContext,
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
@@ -852,9 +833,12 @@ fn render_field(
         field.label.clone()
     };
     let key = field_key(spec.card_key(), &field.id);
+    if saved.is_password_field(&field.id) && saved.held_password_field().is_some() {
+        return render_locked_password(spec.card_key(), &label, saved, app, cx);
+    }
     let control = match field.kind {
-        UserFormFieldKind::Checkbox => render_checkbox(spec, field, values, app, cx),
-        UserFormFieldKind::Select => render_select(spec, field, values, app, cx),
+        UserFormFieldKind::Checkbox => render_checkbox(spec, field, values, app.clone(), cx),
+        UserFormFieldKind::Select => render_select(spec, field, values, app.clone(), cx),
         UserFormFieldKind::Textarea => {
             if let Some(state) = textareas.get(&key) {
                 Textarea::new(state)
@@ -902,7 +886,7 @@ fn render_field(
         .w_full()
         .child(control);
     let show_label = field.kind != UserFormFieldKind::Checkbox;
-    v_flex()
+    let mut column = v_flex()
         .gap(px(6.))
         .when(show_label, |this| {
             this.child(
@@ -912,7 +896,183 @@ fn render_field(
                     .child(label),
             )
         })
-        .child(control)
+        .child(control);
+    if saved.is_name_field(&field.id) {
+        if saved.shows_list() {
+            column = column.child(render_account_list(spec, saved, inputs, app.clone(), cx));
+        }
+        if let Some(current) = saved.current.as_ref().filter(|c| c.ready().is_none()) {
+            let color = match current {
+                SavedLoginUse::Refused { .. } | SavedLoginUse::Unavailable { .. } => theme.danger,
+                _ => theme.muted_foreground,
+            };
+            column = column.child(
+                div()
+                    .id(ElementId::Name(
+                        user_form_saved_note_id(spec.card_key()).into(),
+                    ))
+                    .text_xs()
+                    .text_color(color)
+                    .child(current.note()),
+            );
+        }
+    }
+    column.into_any_element()
+}
+
+/// The accounts saved for this site, listed under the name field the way a browser's
+/// autofill does: pick one, confirm with Touch ID, and the fields fill. The password never
+/// appears here.
+fn render_account_list(
+    spec: &UserFormSpec,
+    saved: &SavedLoginContext,
+    inputs: &UserFormInputMap,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let card_key = spec.card_key().to_string();
+    let name_input = saved
+        .fields
+        .as_ref()
+        .and_then(|f| inputs.get(&field_key(&card_key, &f.username_id)).cloned());
+    let mut list = v_flex()
+        .id(ElementId::Name(user_form_saved_list_id(&card_key).into()))
+        .w_full()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .overflow_hidden();
+    for (i, row) in saved.rows.iter().enumerate() {
+        if i > 0 {
+            list = list.child(div().h(px(1.)).bg(theme.border));
+        }
+        let id = user_form_use_saved_id(&card_key, &row.id);
+        let app = app.clone();
+        let key = card_key.clone();
+        let login_id = row.id.clone();
+        let username = row.username.clone();
+        let name_input = name_input.clone();
+        list = list.child(
+            h_flex()
+                .id(ElementId::Name(id.into()))
+                .w_full()
+                .items_center()
+                .gap(px(10.))
+                .px(px(10.))
+                .py(px(8.))
+                .cursor_pointer()
+                .hover(|this| this.bg(theme.muted))
+                .child(
+                    Icon::default()
+                        .path("icons/key.svg")
+                        .size(px(14.))
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(div().text_sm().child(row.username.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(row.origin.clone()),
+                        ),
+                )
+                .on_click(move |_, window, cx| {
+                    if let Some(input) = &name_input {
+                        input.update(cx, |input, cx| {
+                            input.set_value(username.clone(), window, cx)
+                        });
+                    }
+                    if let Some(app) = &app {
+                        app.update(cx, |state, cx| {
+                            state.pick_saved_login(key.clone(), login_id.clone(), cx);
+                        });
+                    }
+                }),
+        );
+    }
+    list.child(
+        div()
+            .px(px(10.))
+            .py(px(6.))
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child("Choose an account. Touch ID fills it in."),
+    )
+    .into_any_element()
+}
+
+/// The password field once a saved password is held: dots, a key, and a way to type one
+/// instead. The value itself is not in any input.
+fn render_locked_password(
+    card_key: &str,
+    label: &str,
+    saved: &SavedLoginContext,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let username = saved
+        .current
+        .as_ref()
+        .and_then(SavedLoginUse::ready)
+        .map(|(u, _)| u.to_string())
+        .unwrap_or_default();
+    let key = card_key.to_string();
+    v_flex()
+        .gap(px(6.))
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            h_flex()
+                .id(ElementId::Name(
+                    user_form_field_id(card_key, "password-from-keychain").into(),
+                ))
+                .w_full()
+                .items_center()
+                .gap(px(10.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.muted.opacity(0.4))
+                .child(
+                    Icon::default()
+                        .path("icons/key.svg")
+                        .size(px(14.))
+                        .text_color(theme.muted_foreground),
+                )
+                .child(div().flex_1().text_sm().child("••••••••••"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("From your keychain, for {username}")),
+                )
+                .child(
+                    Button::new(user_form_saved_clear_id(&key))
+                        .label("Change")
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, cx| {
+                            if let Some(app) = &app {
+                                app.update(cx, |state, cx| {
+                                    state.clear_saved_login_pick(key.clone(), cx);
+                                });
+                            }
+                        }),
+                ),
+        )
         .into_any_element()
 }
 

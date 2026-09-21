@@ -7371,9 +7371,10 @@ impl AppState {
     pub fn submit_user_form(
         &mut self,
         card_key: String,
-        values: UserFormValues,
+        mut values: UserFormValues,
         cx: &mut Context<Self>,
     ) {
+        self.fold_held_saved_login(&card_key, &mut values);
         self.dispatch_user_form(card_key, UserFormDispatch::Submit(values), cx);
     }
 
@@ -7473,10 +7474,11 @@ impl AppState {
             .collect()
     }
 
-    /// "Use saved login as …" on a card: Touch ID first, then the password is read from
-    /// this Mac's keychain and sent down the same channel a typed card uses. It is never
-    /// painted, never put in the card's inputs, and the Bot never sees it.
-    pub fn use_saved_login(&mut self, card_key: String, login_id: String, cx: &mut Context<Self>) {
+    /// A pick from the card's account list: Touch ID first, then the password is read from
+    /// this Mac's keychain (or fetched once from the server) and held for Log in. The name
+    /// goes into its field; the password is never painted and never put in an input, and
+    /// the Bot never sees it.
+    pub fn pick_saved_login(&mut self, card_key: String, login_id: String, cx: &mut Context<Self>) {
         let Some(spec) = self.user_form_mut(&card_key).map(|spec| spec.clone()) else {
             return;
         };
@@ -7511,6 +7513,12 @@ impl AppState {
                 username: username.clone(),
             },
         );
+        // The name shows in its field at once (the driver reads it from here; the view sets
+        // its input too).
+        self.user_form_typed
+            .entry(card_key.clone())
+            .or_default()
+            .insert(fields.username_id.clone(), username.clone());
         cx.notify();
         let client = self.opengrok.clone();
         cx.spawn(async move |this, cx| {
@@ -7553,18 +7561,10 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 use crate::site_login::touch_id::TouchIdOutcome;
                 let next = match unlocked {
-                    Ok(Ok(Some(password))) => None.or_else(|| {
-                        let mut values = UserFormValues::default();
-                        values.by_id.insert(fields.username_id.clone(), username.clone());
-                        values.by_id.insert(fields.password_id.clone(), password);
-                        state.saved_login_use.insert(
-                            card_key.clone(),
-                            SavedLoginUse::Filling {
-                                username: username.clone(),
-                            },
-                        );
-                        state.submit_user_form(card_key.clone(), values, cx);
-                        None
+                    Ok(Ok(Some(password))) => Some(SavedLoginUse::Ready {
+                        login_id: row.id.clone(),
+                        username: username.clone(),
+                        password,
                     }),
                     Ok(Ok(None)) => Some(SavedLoginUse::Unavailable {
                         message: format!(
@@ -7591,6 +7591,38 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// "Change" on the locked password row: the held password is dropped; the person types.
+    pub fn clear_saved_login_pick(&mut self, card_key: String, cx: &mut Context<Self>) {
+        self.saved_login_use.remove(&card_key);
+        cx.notify();
+    }
+
+    /// A submit with a held password: the name and the password ride along, and the
+    /// submit is marked as a saved login for the server's own-computer rule.
+    fn fold_held_saved_login(&mut self, card_key: &str, values: &mut UserFormValues) {
+        let Some((username, password)) = self
+            .saved_login_use
+            .get(card_key)
+            .and_then(SavedLoginUse::ready)
+            .map(|(u, p)| (u.to_string(), p.to_string()))
+        else {
+            return;
+        };
+        let Some(fields) = self
+            .user_form_mut(card_key)
+            .and_then(|spec| login_fields(spec))
+        else {
+            return;
+        };
+        values
+            .by_id
+            .entry(fields.username_id)
+            .or_insert(username.clone());
+        values.by_id.insert(fields.password_id, password);
+        self.saved_login_use
+            .insert(card_key.to_string(), SavedLoginUse::Filling { username });
     }
 
     /// A typed submit clears an old Touch ID note; a saved-login submit keeps "Filling".

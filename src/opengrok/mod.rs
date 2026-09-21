@@ -41,8 +41,8 @@ pub use user_form::{
     is_form_entry_missing, is_user_form_awaiting, is_user_form_custom_name, is_user_form_event,
     is_user_form_tool, resolve_handoff_request_body, settle_user_form_http, submit_request_body,
     user_form_action_from_http, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_pill_id, user_form_saved_note_id, user_form_screen_id,
-    user_form_use_saved_id,
+    user_form_field_id, user_form_pill_id, user_form_saved_clear_id, user_form_saved_list_id,
+    user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
 };
 pub use visibility::ImageVisibility;
 

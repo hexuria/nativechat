@@ -314,7 +314,7 @@ impl Command {
             Self::SignInAgain => state.sign_in_again(cx),
             Self::UserFormContinue { card_key } => state.submit_open_user_form(card_key, cx),
             Self::UserFormUseSaved { card_key, login_id } => {
-                state.use_saved_login(card_key, login_id, cx)
+                state.pick_saved_login(card_key, login_id, cx)
             }
             Self::AddSiteLogin {
                 origin,
@@ -697,9 +697,10 @@ struct UserFormSnap {
     pill: Option<String>,
     /// What the primary button says: "Log in" on a one-page login, else "Continue".
     continue_label: &'static str,
-    /// Saved logins the card can take: (login id, username), one button each.
-    saved_logins: Vec<(String, String)>,
-    /// The line under the buttons while a saved login is used, or after it was not.
+    /// The accounts saved for this site: (login id, username, origin), listed under the
+    /// name field.
+    saved_logins: Vec<(String, String, String)>,
+    /// The line under the name field while a pick is under way, or after it was not.
     saved_login_note: Option<String>,
 }
 
@@ -765,10 +766,10 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
         };
         card = card.with_child(node);
     }
-    for (login_id, username) in &form.saved_logins {
-        card = card.with_child(UiNode::button(
+    for (login_id, username, origin) in &form.saved_logins {
+        card = card.with_child(UiNode::listitem(
             user_form_use_saved_id(key, login_id),
-            format!("Use {username}"),
+            format!("{username} · {origin}"),
         ));
     }
     if let Some(note) = &form.saved_login_note {
@@ -1277,7 +1278,7 @@ impl NativeChatHost {
                         state
                             .saved_logins_for_form(&spec)
                             .into_iter()
-                            .map(|row| (row.id, row.username))
+                            .map(|row| (row.id, row.username, row.origin))
                             .collect()
                     };
                     let saved_login_note = state
@@ -1854,7 +1855,7 @@ impl NativeChatHost {
                     card_key: key.clone(),
                 });
             }
-            for (login_id, _) in &form.saved_logins {
+            for (login_id, _, _) in &form.saved_logins {
                 if target == user_form_use_saved_id(key, login_id) {
                     return Some(Command::UserFormUseSaved {
                         card_key: key.clone(),
@@ -2457,7 +2458,7 @@ impl NativeChatHost {
                 let login_id = match invoke_arg_str(args, &["login_id", "loginId", "id"]) {
                     Some(id) => id,
                     None => match form.saved_logins.as_slice() {
-                        [(one, _)] => one.clone(),
+                        [(one, _, _)] => one.clone(),
                         [] => return Err("that card offers no saved login".into()),
                         _ => return Err("user-form.use-saved requires arg login_id".into()),
                     },
@@ -3328,6 +3329,50 @@ mod tests {
             assert_eq!(recipe_row_target(control), None, "{control}");
         }
         assert_eq!(recipe_row_target("recipes-filter-mine"), None);
+    }
+
+    /// The saved accounts for the card's site are rows under the name field, one per
+    /// login; a click or the invoke picks one, and the pick names the login id.
+    #[test]
+    fn the_account_list_is_in_the_tree_and_a_row_picks_it() {
+        let mut host = host();
+        let mut form = google_login_form();
+        form.saved_logins = vec![
+            ("sl_1".into(), "ada@example.com".into(), "google.com".into()),
+            ("sl_2".into(), "bea@example.com".into(), "google.com".into()),
+        ];
+        form.saved_login_note = Some("Confirm with Touch ID to fill in ada@example.com.".into());
+        host.user_forms = vec![form];
+        let tree = host.snapshot();
+        let row = tree
+            .find("user-form-use-saved-e_form-sl_2")
+            .expect("second row");
+        assert_eq!(row.name, "bea@example.com · google.com");
+        assert!(tree.find("user-form-saved-note-e_form").is_some());
+
+        host.dispatch(&Op::click("user-form-use-saved-e_form-sl_1"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormUseSaved { card_key, login_id }) => {
+                assert_eq!(card_key, "e_form");
+                assert_eq!(login_id, "sl_1");
+            }
+            other => panic!("expected a pick, got {other:?}"),
+        }
+        // Two rows: the invoke needs to be told which.
+        assert!(
+            host.invoke("user-form.use-saved", &serde_json::json!({}))
+                .is_err()
+        );
+        host.invoke(
+            "user-form.use-saved",
+            &serde_json::json!({ "login_id": "sl_2" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormUseSaved { login_id, .. }) if login_id == "sl_2"
+        ));
     }
 
     fn google_login_form() -> UserFormSnap {
