@@ -147,6 +147,8 @@ pub enum Command {
     ConfirmComputerAction,
     CancelComputerConfirm,
     SetEgressTunnelEnabled(bool),
+    /// The open bot's computer's standing answer to the tunnel's card.
+    SetEgressPolicy(crate::opengrok::LocalExecMode),
     /// The Recipes page: open it, filter it, open one recipe, answer a share, go back.
     OpenRecipes,
     SetRecipesFilter(crate::state::RecipeFilter),
@@ -276,6 +278,7 @@ impl Command {
             Self::ConfirmComputerAction => state.confirm_computer_action(cx),
             Self::CancelComputerConfirm => state.close_computer_confirm(cx),
             Self::SetEgressTunnelEnabled(enabled) => state.set_egress_tunnel_enabled(enabled, cx),
+            Self::SetEgressPolicy(mode) => state.set_egress_policy(mode, cx),
             Self::OpenRecipes => state.open_recipes(cx),
             Self::SetRecipesFilter(filter) => state.set_recipes_filter(filter, cx),
             Self::OpenRecipe(id) => state.open_recipe(id, cx),
@@ -912,6 +915,14 @@ fn recipe_row_target(target: &str) -> Option<String> {
     rest.starts_with("rcp_").then(|| rest.to_string())
 }
 
+/// The three-way choice as the driver sees it: the current word, and one button per word.
+fn egress_policy_node(current: crate::opengrok::LocalExecMode) -> UiNode {
+    UiNode::new("egress-policy-menu", "menu", current.label())
+        .with_child(UiNode::button("egress-policy-bypass", "Always allow"))
+        .with_child(UiNode::button("egress-policy-ask", "Ask every time"))
+        .with_child(UiNode::button("egress-policy-never", "Never allow"))
+}
+
 /// `approval-<call_id>-<verb>` → the answer it stands for.
 fn approval_target(target: &str) -> Option<(String, LocalExecResolution)> {
     let rest = target.strip_prefix("approval-")?;
@@ -1057,6 +1068,9 @@ pub struct NativeChatHost {
     egress_tunnel_enabled: bool,
     /// Box `egress_tunnel.ready` when the computer JSON exposed it.
     egress_tunnel_ready: Option<bool>,
+    /// The computer's standing answer to the tunnel's card, when the server carries one. The
+    /// control sits where Route traffic sits, and is absent (not merely hidden) without it.
+    egress_policy: Option<crate::opengrok::LocalExecMode>,
     pending: Option<Command>,
     /// Keys the last op asked the window for. The host has no window; the root view presses
     /// them (see [`Self::take_compose`]).
@@ -1372,6 +1386,7 @@ impl NativeChatHost {
                 .coworker_computer
                 .as_ref()
                 .and_then(|computer| computer.box_egress_ready()),
+            egress_policy: state.egress_policy(),
             pending: None,
             compose: None,
         }
@@ -1565,6 +1580,9 @@ impl NativeChatHost {
                 "switch",
                 "Route traffic through this computer",
             ));
+            if let Some(current) = self.egress_policy {
+                computer = computer.with_child(egress_policy_node(current));
+            }
         }
         computer = computer.with_child(UiNode::button(ids::ROUTINE_NEW, "Create routine"));
         for routine in &self.routines {
@@ -1609,6 +1627,9 @@ impl NativeChatHost {
                 "egress_tunnel.ready",
                 if ready { "ready" } else { "not-ready" },
             ));
+        }
+        if let Some(policy) = self.egress_policy {
+            page = page.with_child(UiNode::status("egress_policy", policy.as_stored()));
         }
         if let Some(banner) = &self.update_banner {
             page = page.with_child(UiNode::new("update-banner", "status", banner.clone()));
@@ -1692,6 +1713,9 @@ impl NativeChatHost {
                                 "switch",
                                 "Route traffic through this computer",
                             ));
+                            if let Some(current) = self.egress_policy {
+                                settings = settings.with_child(egress_policy_node(current));
+                            }
                         }
                         settings
                     })
@@ -2144,6 +2168,11 @@ impl NativeChatHost {
             Command::OpenComputerConfirm(crate::state::ComputerAction::Reset)
         } else if target == "route-traffic-this-computer" || target == "egress-tunnel-enabled" {
             Command::SetEgressTunnelEnabled(!self.egress_tunnel_enabled)
+        } else if let Some(mode) = target
+            .strip_prefix("egress-policy-")
+            .and_then(crate::opengrok::LocalExecMode::parse)
+        {
+            Command::SetEgressPolicy(mode)
         } else if target == ids::ROUTINE_NEW {
             Command::OpenRoutineEditor(None)
         } else if let Some(cmd) = self.routine_command(target) {
@@ -2431,6 +2460,23 @@ impl NativeChatHost {
             "computer.reset" => Command::OpenComputerConfirm(crate::state::ComputerAction::Reset),
             "computer.confirm" => Command::ConfirmComputerAction,
             "computer.cancel" => Command::CancelComputerConfirm,
+            "computer.egress_policy" => {
+                let word = args
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "computer.egress_policy requires arg mode".to_string())?;
+                let mode = crate::opengrok::LocalExecMode::parse(word)
+                    .ok_or_else(|| format!("unknown mode `{word}` (bypass, ask, never)"))?;
+                // A no-op on a hidden control is an error, not a silent success: the driver
+                // must be able to tell "set" from "nothing to set".
+                if self.egress_policy.is_none() {
+                    return Err(
+                        "this bot's computer carries no network policy to set (no computer, or an older server)"
+                            .to_string(),
+                    );
+                }
+                Command::SetEgressPolicy(mode)
+            }
             "settings.account" => Command::ToggleAccount,
             "recipes.open" => Command::OpenRecipes,
             "recipes.filter" => {
@@ -3860,6 +3906,66 @@ mod tests {
             host.take_command(),
             Some(Command::SetEgressTunnelEnabled(true))
         ));
+    }
+
+    /// The network choice sits with Route traffic on either surface, only when the server
+    /// carries one, and a click on a word is that word — not a toggle.
+    #[test]
+    fn egress_policy_sits_with_route_traffic_and_clicks_are_words() {
+        use crate::opengrok::LocalExecMode;
+        let mut host = host();
+        host.computer_open = true;
+        host.route_traffic_on_bot_pane = true;
+        assert!(
+            host.snapshot().find("egress-policy-menu").is_none(),
+            "no policy from the server: no control"
+        );
+        assert!(
+            host.invoke(
+                "computer.egress_policy",
+                &serde_json::json!({ "mode": "never" })
+            )
+            .is_err(),
+            "setting a policy the server does not carry must fail loudly"
+        );
+        host.egress_policy = Some(LocalExecMode::Ask);
+        let tree = host.snapshot();
+        assert!(tree.find("egress-policy-menu").is_some());
+        assert_eq!(
+            tree.find("egress_policy").map(|node| node.name.clone()),
+            Some("ask".to_string())
+        );
+        host.dispatch(&Op::click("egress-policy-never")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetEgressPolicy(LocalExecMode::Never))
+        ));
+        host.invoke(
+            "computer.egress_policy",
+            &serde_json::json!({ "mode": "bypass" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetEgressPolicy(LocalExecMode::Always))
+        ));
+        assert!(
+            host.invoke(
+                "computer.egress_policy",
+                &serde_json::json!({ "mode": "sometimes" })
+            )
+            .is_err()
+        );
+
+        // A shared box: Settings → Computer, not the bot pane.
+        let mut host = self::host();
+        host.egress_policy = Some(LocalExecMode::Never);
+        host.computer_open = true;
+        host.route_traffic_in_user_settings = true;
+        assert!(host.snapshot().find("egress-policy-menu").is_none());
+        host.account_open = true;
+        host.computer_tab = true;
+        assert!(host.snapshot().find("egress-policy-menu").is_some());
     }
 
     #[test]

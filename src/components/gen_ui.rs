@@ -256,6 +256,16 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
             )
             .child(dismiss_button(spec, app.clone(), theme.muted_foreground)),
     );
+    // What the card is about, in the server's words. A Review-an-action card used to show
+    // only its title, so the person could not tell the tunnel's card from a judge's.
+    if spec.is_review_an_action() && !spec.why.trim().is_empty() {
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(spec.why.trim().to_string()),
+        );
+    }
     if spec.runs_on_this_mac() {
         if !machine.is_empty() {
             body = body.child(
@@ -342,7 +352,9 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 plain.1,
                 plain.2,
             ));
-        if local && !review {
+        // Never sets a standing policy: this Mac's for the local shell, the computer's for
+        // the tunnel's card. A judge's card has no policy for it to write.
+        if (local && !review) || (review && spec.is_egress_tunnel()) {
             row = row.child(approval_button(
                 spec,
                 "Never",

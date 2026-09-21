@@ -219,13 +219,42 @@ impl ApprovalSpec {
             )
     }
 
+    /// The Review-an-action card the egress tunnel raises: the server's own sentence names
+    /// the tunnel. Always and Never on THIS card set the computer's standing policy; on a
+    /// judge's card they answer the one call.
+    pub fn is_egress_tunnel(&self) -> bool {
+        self.is_review_an_action() && self.why.to_ascii_lowercase().contains("egress tunnel")
+    }
+
     /// The centered line this card leaves behind once it is answered, in the
     /// words its own kind of card uses.
     pub fn outcome(&self, bot: &str, resolution: LocalExecResolution) -> String {
         if self.is_mcp() {
             mcp_call_outcome(bot, resolution, &self.tool)
+        } else if self.is_egress_tunnel() {
+            egress_tunnel_outcome(bot, resolution)
         } else {
             local_exec_outcome(bot, resolution, self.place())
+        }
+    }
+}
+
+/// The line the tunnel's card leaves behind. Always and Never are the computer's standing
+/// choice, so they read as one; the commands wording belongs to the local shell and was a lie
+/// here ("can run commands on its computer" after an Always that wrote nothing, 21 Sep 2026).
+pub fn egress_tunnel_outcome(bot: &str, resolution: LocalExecResolution) -> String {
+    match resolution {
+        LocalExecResolution::Always => {
+            format!("{bot} may use your network from its computer.")
+        }
+        LocalExecResolution::Never => {
+            format!("{bot} may not use your network from its computer.")
+        }
+        LocalExecResolution::AllowOnce => {
+            format!("{bot} may use your network this time.")
+        }
+        LocalExecResolution::DenyOnce => {
+            format!("{bot} was not allowed to use your network this time.")
         }
     }
 }
@@ -1273,6 +1302,51 @@ mod tests {
 
     fn text(delta: &str) -> Value {
         json!({"type":"TEXT_MESSAGE_CONTENT","delta":delta})
+    }
+
+    fn review_card(why: &str) -> ApprovalSpec {
+        ApprovalSpec {
+            run_id: "run_1".into(),
+            thread_id: Some("cw_1".into()),
+            call_id: "call_1".into(),
+            tool: "computer".into(),
+            command: "screenshot".into(),
+            why: why.into(),
+            reason: "auto-review".into(),
+            output: None,
+            ok: None,
+        }
+    }
+
+    /// The tunnel's card is told apart by the server's own sentence, and its Always and Never
+    /// read as the standing choice they are; a judge's card keeps the once-only wording.
+    #[test]
+    fn the_tunnel_card_is_its_own_kind_and_says_so_when_answered() {
+        let tunnel = review_card(
+            "This action would use your network through the egress tunnel. Review it before it runs.",
+        );
+        assert!(tunnel.is_review_an_action());
+        assert!(tunnel.is_egress_tunnel());
+        assert_eq!(
+            tunnel.outcome("Vamos", LocalExecResolution::Always),
+            "Vamos may use your network from its computer."
+        );
+        assert_eq!(
+            tunnel.outcome("Vamos", LocalExecResolution::Never),
+            "Vamos may not use your network from its computer."
+        );
+        assert_eq!(
+            tunnel.outcome("Vamos", LocalExecResolution::DenyOnce),
+            "Vamos was not allowed to use your network this time."
+        );
+
+        let judge = review_card("Ask first: the page is a bank.");
+        assert!(judge.is_review_an_action());
+        assert!(!judge.is_egress_tunnel());
+        assert_eq!(
+            judge.outcome("Vamos", LocalExecResolution::AllowOnce),
+            "Vamos can run commands on its computer this time."
+        );
     }
 
     /// A generative form or chart is saved as the value it was parsed from, so a thread read

@@ -2306,6 +2306,96 @@ impl AppState {
         self.route_traffic_surface() == RouteTrafficSurface::UserSettings
     }
 
+    /// The open bot's computer's standing answer to the tunnel's card, when the server
+    /// carries one. `None` hides the control (an older server, or no computer yet).
+    pub fn egress_policy(&self) -> Option<LocalExecMode> {
+        self.coworker_computer
+            .as_ref()
+            .and_then(|computer| computer.egress_policy)
+    }
+
+    /// The choice sits where Route traffic sits, and only when there is one to show.
+    pub fn show_egress_policy_on_bot_pane(&self) -> bool {
+        self.show_route_traffic_on_bot_pane() && self.egress_policy().is_some()
+    }
+
+    pub fn show_egress_policy_in_user_settings(&self) -> bool {
+        self.show_route_traffic_in_user_settings() && self.egress_policy().is_some()
+    }
+
+    /// Set the open bot's computer's standing answer.
+    pub fn set_egress_policy(&mut self, mode: LocalExecMode, cx: &mut Context<Self>) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.set_egress_policy_for(coworker_id, mode, cx);
+    }
+
+    /// Set the standing answer for a named bot's computer — the card's own bot, which is not
+    /// always the one being looked at. The pane's copy is moved at once when it is that bot's,
+    /// and read back from the server afterwards either way.
+    pub fn set_egress_policy_for(
+        &mut self,
+        coworker_id: String,
+        mode: LocalExecMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_coworker_id.as_deref() == Some(coworker_id.as_str())
+            && let Some(computer) = self.coworker_computer.as_mut()
+            && computer.egress_policy.is_some()
+        {
+            computer.egress_policy = Some(mode);
+            cx.notify();
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = client.set_egress_policy(&coworker_id, mode).await {
+                eprintln!(
+                    "NativeChat computer: could not set the network policy: {}",
+                    error.message
+                );
+            }
+            let _ = this.update(cx, |state, cx| {
+                if state.active_coworker_id.as_deref() == Some(coworker_id.as_str()) {
+                    state.refresh_coworker_computer_quietly(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The open bot's computer record, fetched for its facts alone: no heal, no poll. The
+    /// Computer pane's refresh heals an absent box; a bot merely switched to must not have a
+    /// box provisioned for being looked at.
+    pub fn refresh_coworker_computer_quietly(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        if self.computer_endpoint_missing {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let Ok(status) = client.coworker_computer(&coworker_id).await else {
+                return;
+            };
+            let _ = this.update(cx, |state, cx| {
+                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                    return;
+                }
+                if state.coworker_computer.as_ref() != Some(&status) {
+                    state.coworker_computer = Some(status);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn set_egress_tunnel_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if enabled && !self.box_egress_provisioned() {
             return;
@@ -4752,6 +4842,11 @@ impl AppState {
             );
         }
         self.select_conversation(id, cx);
+        // The tunnel card's chrome and the network choice read this bot's computer record and
+        // the host's answer for this bot; both used to be fetched only while the Computer pane
+        // was open, so a card in a thread opened cold was painted from the last bot's facts.
+        self.refresh_coworker_computer_quietly(cx);
+        self.refresh_host_egress(cx);
         // Routines are the server's schedules for this bot and nobody else's; the ones on
         // screen belong to whoever was open a moment ago.
         self.load_routines(cx);
@@ -6294,6 +6389,18 @@ impl AppState {
         };
         // Only the local-shell tool can move this Mac's policy.
         let mode = mode.filter(|_| spec.runs_on_this_mac());
+        // Always and Never on the tunnel's card are the computer's standing choice, kept on
+        // the server for the card's own bot — which is not always the one being looked at.
+        if spec.is_egress_tunnel() {
+            let standing = match resolution {
+                LocalExecResolution::Always => Some(LocalExecMode::Always),
+                LocalExecResolution::Never => Some(LocalExecMode::Never),
+                _ => None,
+            };
+            if let (Some(standing), Some(coworker_id)) = (standing, conversation_id.clone()) {
+                self.set_egress_policy_for(coworker_id, standing, cx);
+            }
+        }
         // What the thread says while the answered run finishes. "Running commands" is the
         // local shell being let loose; an MCP card is one call being let through, so it says
         // which. A no reads the same either way — it is the same no.
@@ -8680,6 +8787,9 @@ impl AppState {
             if tab == AppSettingsTab::Computer {
                 self.refresh_computers(cx);
                 self.refresh_host_egress(cx);
+                // Route traffic and the network choice for a shared box live on this tab and
+                // read the open bot's computer record, which nothing else on this page fetches.
+                self.refresh_coworker_computer_quietly(cx);
             }
             cx.notify();
         }
@@ -9447,8 +9557,8 @@ mod tests {
         turn_ending,
     };
     use crate::opengrok::{
-        CredentialRequestResolution, Failure, FormField, FormResolution, FormSpec, ModelEntry,
-        OpenGrokClient, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
+        CredentialRequestResolution, Failure, FormField, FormResolution, FormSpec, LocalExecMode,
+        ModelEntry, OpenGrokClient, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
     use crate::state::{ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave};
     use std::str::FromStr;
@@ -11888,6 +11998,57 @@ mod tests {
             RouteTrafficSurface::Hidden,
             "host isEgressTunnelAvailable is not box provisioned"
         );
+    }
+
+    /// The network choice follows Route traffic's surface, and only exists when the server
+    /// sent one.
+    #[test]
+    fn egress_policy_sits_where_route_traffic_sits_and_only_when_sent() {
+        fn computer(extra: serde_json::Value) -> crate::opengrok::CoworkerComputer {
+            let mut body = serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "boxId": "box_1",
+                "egress_tunnel": { "ready": true }
+            });
+            if let (serde_json::Value::Object(map), Some(obj)) = (extra, body.as_object_mut()) {
+                obj.extend(map);
+            }
+            serde_json::from_value(body).unwrap()
+        }
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        state.coworker_computer = Some(computer(serde_json::json!({ "shareScope": "dedicated" })));
+        assert!(state.show_route_traffic_on_bot_pane());
+        assert_eq!(
+            state.egress_policy(),
+            None,
+            "an older server sends no policy"
+        );
+        assert!(!state.show_egress_policy_on_bot_pane());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "dedicated",
+            "egressPolicy": "ask"
+        })));
+        assert_eq!(state.egress_policy(), Some(LocalExecMode::Ask));
+        assert!(state.show_egress_policy_on_bot_pane());
+        assert!(!state.show_egress_policy_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "user",
+            "egressPolicy": "never"
+        })));
+        assert_eq!(state.egress_policy(), Some(LocalExecMode::Never));
+        assert!(!state.show_egress_policy_on_bot_pane());
+        assert!(state.show_egress_policy_in_user_settings());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "org",
+            "egressPolicy": "bypass"
+        })));
+        assert!(!state.show_egress_policy_on_bot_pane());
+        assert!(!state.show_egress_policy_in_user_settings());
     }
 
     #[test]
