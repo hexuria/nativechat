@@ -355,6 +355,14 @@ impl OpenGrokClient {
         OpenGrokError::from_server(Some(status), error_message_from_body(&body))
     }
 
+    /// Nothing on a 2xx, the server's error otherwise. For the doors that answer 204.
+    async fn empty_or_error(response: reqwest::Response) -> Result<(), OpenGrokError> {
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(Self::read_error(response).await)
+    }
+
     /// The body as `T` on a 2xx, the server's error otherwise.
     async fn json_or_error<T: serde::de::DeserializeOwned>(
         response: reqwest::Response,
@@ -1081,6 +1089,18 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// Hide a turn for this account, on every machine it signs in from.
+    ///
+    /// Nothing is destroyed: the run keeps its frames and the coworker keeps its memory of the
+    /// turn. The server simply stops offering it, here and everywhere else.
+    pub async fn hide_run(&self, run_id: &str) -> Result<(), OpenGrokError> {
+        let path = format!("/ag-ui/runs/{run_id}/hide");
+        let response = self
+            .send_json::<()>(reqwest::Method::POST, &path, None)
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
     pub async fn list_approvals(&self) -> Result<Vec<QueuedApproval>, OpenGrokError> {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/ag-ui/approvals", None)
@@ -1653,6 +1673,11 @@ pub struct ThreadReplay {
     /// Oldest first, so the list reads in the order things happened.
     #[serde(default)]
     pub runs: Vec<ThreadRun>,
+    /// The turns this account hid, which the server withheld from `runs`. A thread is cached
+    /// on each machine, so without being told, the machine that did not do the hiding would
+    /// go on painting from its own copy what the person deleted on another.
+    #[serde(rename = "hiddenRunIds", default)]
+    pub hidden_run_ids: Vec<String>,
 }
 
 /// One turn of a thread, as the server kept it.
@@ -3233,6 +3258,57 @@ mod tests {
 
     /// An access token that has expired out of the jar, with the refresh cookie still there.
     ///
+    /// Hiding a turn asks the server to withhold it, and a thread says what it withheld.
+    ///
+    /// The app cannot keep a deleted turn off another machine by itself: a coworker's replies
+    /// are runs the server holds, and every machine reads the thread from there.
+    #[tokio::test]
+    async fn a_hidden_turn_is_asked_for_by_run_and_comes_back_named_in_the_thread() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/runs/run_1/hide"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "hiddenRunIds": ["run_1"],
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client.hide_run("run_1").await.expect("the server takes it");
+
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        assert_eq!(
+            thread.hidden_run_ids,
+            vec!["run_1".to_string()],
+            "so this machine can put its own copy out of sight"
+        );
+        assert!(thread.runs.is_empty(), "and it is not offered again");
+    }
+
+    /// A server that predates hiding says nothing about it, and the thread still reads.
+    #[tokio::test]
+    async fn a_thread_from_a_server_that_does_not_know_about_hiding_still_reads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        assert!(thread.hidden_run_ids.is_empty());
+    }
+
     /// This is today's bug end to end. The app looks signed in, has nothing to put in the
     /// header, and used to send the turn regardless. It now trades the refresh cookie for a
     /// token first and the turn goes out carrying it — no banner, no red line, nobody told.

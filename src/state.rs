@@ -4651,6 +4651,7 @@ impl AppState {
         // already accounted for; without it the next reconcile decides the server knows
         // something this thread does not and grafts the turn back on.
         let mut hidden_shots: Vec<String> = Vec::new();
+        let mut hidden_run: Option<String> = None;
         if let Some(id) = &self.active_conversation_id
             && let Some(conversation) = self.conversations.iter_mut().find(|c| &c.id == id)
             && let Some(message) = conversation
@@ -4659,6 +4660,7 @@ impl AppState {
                 .find(|m| m.id == message_id)
         {
             message.hidden = true;
+            hidden_run = message.run_id.clone();
             hidden_shots = message
                 .parts
                 .iter()
@@ -4697,6 +4699,21 @@ impl AppState {
             cx.spawn(async move |_, _| {
                 if let Err(error) = db.hide_message(&id).await {
                     eprintln!("Failed to hide message: {error}");
+                }
+            })
+            .detach();
+        }
+        // A coworker's reply is a run the server holds, and every machine this person signs in
+        // from reads the thread from there. Hiding it here only puts it out of sight here, so
+        // the server is told as well. It is not what keeps the message hidden on this Mac —
+        // the row already does that — so a server that cannot be reached costs nothing but the
+        // other machines, and the next delete tries again.
+        if let Some(run_id) = hidden_run
+            && let Some(client) = self.opengrok.clone()
+        {
+            cx.spawn(async move |_, _| {
+                if let Err(error) = client.hide_run(&run_id).await {
+                    log::warn!("could not tell the server a turn was hidden: {error}");
                 }
             })
             .detach();
@@ -5537,6 +5554,7 @@ impl AppState {
                 match thread {
                     Ok(thread) => {
                         state.reconciled_threads.insert(conversation_id.clone());
+                        state.hide_withheld_runs(&conversation_id, &thread.hidden_run_ids, cx);
                         state.apply_thread_replay(&conversation_id, &thread, cx);
                         state.overlay_replay_cards(&conversation_id, &thread.runs);
                     }
@@ -5548,6 +5566,58 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// Put out of sight the turns this account hid somewhere else.
+    ///
+    /// Each machine keeps its own copy of a thread, so a turn deleted on one would go on being
+    /// painted by the others from their caches. The server names what it withheld; this is the
+    /// other half of that sentence. The row stays, as it does for a delete made here, so the
+    /// thread still knows it has accounted for that run.
+    fn hide_withheld_runs(
+        &mut self,
+        conversation_id: &str,
+        hidden: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        if hidden.is_empty() {
+            return;
+        }
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+        else {
+            return;
+        };
+        let mut newly_hidden: Vec<String> = Vec::new();
+        for message in conversation.messages.iter_mut() {
+            if message.hidden {
+                continue;
+            }
+            if message
+                .run_id
+                .as_deref()
+                .is_some_and(|run| hidden.iter().any(|id| id == run))
+            {
+                message.hidden = true;
+                newly_hidden.push(message.id.clone());
+            }
+        }
+        if let Some(db) = self.database_service.clone()
+            && !newly_hidden.is_empty()
+        {
+            // The marks go to disk too, so reopening this thread does not paint them again
+            // before the next reconcile has run.
+            cx.spawn(async move |_, _| {
+                for id in newly_hidden {
+                    if let Err(error) = db.hide_message(&id).await {
+                        eprintln!("Failed to hide a message the server withheld: {error}");
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     /// The runs the server has that this thread has not, put back into it.
