@@ -51,10 +51,10 @@ pub use client::{
     NewSchedule, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind,
     RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen,
     RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape,
-    RecipeTapeEvent, RecipeVersion, RunReplay, ScheduleKind, ScheduleRow, StopReply, ThreadReplay,
-    ThreadRun, TurnRecipe, UpdateStatus, WebhookInfo, collapse_computer_roster,
-    collapse_computers_by_machine_id, env_egress_tunnel_enabled, host_egress_tunnel_available,
-    host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
+    RecipeTapeEvent, RecipeVersion, RunReplay, ScheduleKind, ScheduleRow, SiteLoginUpdate,
+    StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, WebhookInfo,
+    collapse_computer_roster, collapse_computers_by_machine_id, env_egress_tunnel_enabled,
+    host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
 pub use types::{

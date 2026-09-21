@@ -19,6 +19,7 @@ pub mod hidden_bots;
 pub mod layout;
 pub mod lightbox;
 pub mod login;
+pub mod logins;
 pub mod message;
 pub mod message_actions;
 pub mod multi_select;

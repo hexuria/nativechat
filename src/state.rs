@@ -32,8 +32,9 @@ use crate::services::database::{ChatMessage, DatabaseService, MessagePart, Reply
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
-    PendingSave, SavedLoginUse, SiteLoginRecord, SiteLoginVault, login_fields,
-    login_matches_request, login_origin, origins_match, registrable_origin, save_candidate,
+    KIND_PASSWORD, PendingSave, SavedLoginUse, SiteLoginFilter, SiteLoginRecord, SiteLoginVault,
+    login_fields, login_matches_request, login_origin, origins_match, registrable_origin,
+    save_candidate,
 };
 use crate::threads::conversation_for_thread;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
@@ -1441,6 +1442,18 @@ pub struct AppState {
     /// What the last Add / Import / sync did, for Settings → Logins.
     pub site_login_notice: Option<String>,
     pub site_login_error: Option<String>,
+    /// Site icons for Settings → Logins, by origin. `None` is a remembered miss: asked once,
+    /// the server had none (or would not say), not asked again this run.
+    pub site_login_icons: HashMap<String, Option<Arc<Image>>>,
+    /// The search field on Settings → Logins. The page draws its own field; this is the copy
+    /// the list filters by, and the one the driver writes.
+    pub site_login_query: String,
+    /// The sidebar tile the list is filtered by.
+    pub site_login_filter: SiteLoginFilter,
+    /// The row the detail pane shows.
+    pub site_login_selected: Option<String>,
+    /// The Add-login sheet is up over the page.
+    pub site_login_add_open: bool,
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
@@ -1817,6 +1830,11 @@ impl AppState {
             site_logins_on_this_mac: HashSet::new(),
             site_login_notice: None,
             site_login_error: None,
+            site_login_icons: HashMap::new(),
+            site_login_query: String::new(),
+            site_login_filter: SiteLoginFilter::All,
+            site_login_selected: None,
+            site_login_add_open: false,
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
@@ -7497,6 +7515,13 @@ impl AppState {
                         // that failed to open must not read as empty: left false, the
                         // card offers nothing and the person types the login instead.
                         state.site_logins_ready = true;
+                        // A row that went away takes its detail pane with it.
+                        if let Some(selected) = &state.site_login_selected
+                            && !state.site_logins.iter().any(|row| &row.id == selected)
+                        {
+                            state.site_login_selected = None;
+                        }
+                        state.fetch_site_login_icons(cx);
                     }
                     Err(err) => state.site_login_error = Some(err.to_string()),
                 }
@@ -7809,13 +7834,16 @@ impl AppState {
                 client.as_ref(),
                 &pending.origin,
                 &pending.username,
+                "",
+                "",
+                KIND_PASSWORD,
                 &pending.password,
             )
             .await;
             drop(pending);
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(notice) => {
+                    Ok((_, notice)) => {
                         state.site_login_error = None;
                         state.site_login_notice = notice;
                         state.reload_site_logins(cx);
@@ -7830,12 +7858,15 @@ impl AppState {
     }
 
     /// Settings → Logins → Add. The origin is reduced to the site the vault keys by. True
-    /// when the values were taken (the form may clear); false with the reason on the page.
+    /// when the values were taken (the sheet closes and its fields clear); false with the
+    /// reason on the page. The new row is the selected one once the list has it.
     pub fn add_site_login(
         &mut self,
         origin: String,
         username: String,
         password: String,
+        label: String,
+        notes: String,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(origin) = registrable_origin(origin.trim()) else {
@@ -7854,17 +7885,29 @@ impl AppState {
             cx.notify();
             return false;
         };
+        let label = label.trim().to_string();
+        let notes = notes.trim_end().to_string();
+        self.site_login_add_open = false;
         let client = self.opengrok.clone();
         cx.spawn(async move |this, cx| {
-            let result =
-                save_site_login_everywhere(&vault, client.as_ref(), &origin, &username, &password)
-                    .await;
+            let result = save_site_login_everywhere(
+                &vault,
+                client.as_ref(),
+                &origin,
+                &username,
+                &label,
+                &notes,
+                KIND_PASSWORD,
+                &password,
+            )
+            .await;
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(notice) => {
+                    Ok((id, notice)) => {
                         state.site_login_error = None;
                         state.site_login_notice =
                             notice.or_else(|| Some(format!("Saved {username} on {origin}.")));
+                        state.site_login_selected = Some(id);
                         state.reload_site_logins(cx);
                     }
                     Err(err) => state.site_login_error = Some(err),
@@ -7873,6 +7916,7 @@ impl AppState {
             });
         })
         .detach();
+        cx.notify();
         true
     }
 
@@ -7918,6 +7962,9 @@ impl AppState {
                     client.as_ref(),
                     &login.origin,
                     &login.username,
+                    "",
+                    "",
+                    KIND_PASSWORD,
                     &login.password,
                 )
                 .await
@@ -8007,6 +8054,9 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         state.site_logins.retain(|row| row.id != id);
+                        if state.site_login_selected.as_deref() == Some(id.as_str()) {
+                            state.site_login_selected = None;
+                        }
                         state.site_login_error = None;
                         state.reload_site_logins(cx);
                     }
@@ -8016,6 +8066,142 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// Settings → Logins: the search field's text, the copy the list filters by.
+    pub fn set_site_login_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.site_login_query != query {
+            self.site_login_query = query;
+            cx.notify();
+        }
+    }
+
+    /// Settings → Logins: the sidebar tile the list is filtered by.
+    pub fn set_site_login_filter(&mut self, filter: SiteLoginFilter, cx: &mut Context<Self>) {
+        if self.site_login_filter != filter {
+            self.site_login_filter = filter;
+            cx.notify();
+        }
+    }
+
+    /// Settings → Logins: the row the detail pane shows. An id the list does not have
+    /// clears it.
+    pub fn select_site_login(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        let id = id.filter(|id| self.site_logins.iter().any(|row| &row.id == id));
+        if self.site_login_selected != id {
+            self.site_login_selected = id;
+            cx.notify();
+        }
+    }
+
+    /// Settings → Logins → Add: the sheet comes up over the page, with a clean slate.
+    pub fn open_site_login_add(&mut self, cx: &mut Context<Self>) {
+        if !self.site_login_add_open {
+            self.site_login_add_open = true;
+            self.site_login_error = None;
+            cx.notify();
+        }
+    }
+
+    pub fn close_site_login_add(&mut self, cx: &mut Context<Self>) {
+        if self.site_login_add_open {
+            self.site_login_add_open = false;
+            cx.notify();
+        }
+    }
+
+    /// The notes on the detail pane, as typed: this Mac's row now, the server's next. Notes
+    /// that did not reach the server stay here with a notice saying so.
+    pub fn update_site_login_notes(&mut self, id: String, notes: String, cx: &mut Context<Self>) {
+        let Some(row) = self.site_logins.iter_mut().find(|row| row.id == id) else {
+            return;
+        };
+        if row.notes == notes {
+            return;
+        }
+        row.notes = notes.clone();
+        let Some(vault) = self.site_login_vault.clone() else {
+            self.site_login_error = Some("Login vault is not ready.".into());
+            cx.notify();
+            return;
+        };
+        let client = self.opengrok.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = match vault.update_notes(&id, &notes).await {
+                Err(error) => Err(error.to_string()),
+                Ok(()) => match client.as_ref() {
+                    None => Ok(Some(
+                        "Notes saved on this Mac. Sign in to keep them on the server too."
+                            .to_string(),
+                    )),
+                    Some(client) => {
+                        let update = crate::opengrok::SiteLoginUpdate {
+                            notes: Some(notes.clone()),
+                            ..Default::default()
+                        };
+                        match client.update_site_login(&id, &update).await {
+                            Ok(_) => Ok(None),
+                            Err(error) => Ok(Some(format!(
+                                "Notes saved on this Mac. The server did not take them yet: {error}"
+                            ))),
+                        }
+                    }
+                },
+            };
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(notice) => {
+                        state.site_login_error = None;
+                        state.site_login_notice = notice;
+                        state.reload_site_logins(cx);
+                    }
+                    Err(err) => state.site_login_error = Some(err),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// One request per site for its icon, remembered either way: a site with none is not
+    /// asked about again this run. Signed out, nothing is asked; the next reload after
+    /// signing in asks.
+    fn fetch_site_login_icons(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let missing: Vec<String> = {
+            let mut seen = HashSet::new();
+            self.site_logins
+                .iter()
+                .map(|row| row.origin.clone())
+                .filter(|origin| {
+                    !self.site_login_icons.contains_key(origin) && seen.insert(origin.clone())
+                })
+                .collect()
+        };
+        for origin in missing {
+            self.site_login_icons.insert(origin.clone(), None);
+            let client = client.clone();
+            cx.spawn(async move |this, cx| {
+                let bytes = match client.site_login_icon(&origin).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        log::debug!("no icon for {origin}: {error}");
+                        None
+                    }
+                };
+                let Some(image) = bytes.and_then(site_login_icon_image) else {
+                    return;
+                };
+                let _ = this.update(cx, |state, cx| {
+                    state.site_login_icons.insert(origin, Some(image));
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     fn dispatch_user_form(
@@ -9249,46 +9435,59 @@ fn settled_option(echo: Option<String>, cleared: bool, before: Option<String>) -
 
 /// Save on the server first, then in this Mac's keychain under the server's id. Without a
 /// reachable server (or one with no vault) the row is saved here only and the notice says
-/// so; the next sync files it on the server.
+/// so; the next sync files it on the server. The row's id comes back with the notice, so
+/// the page can show what was just saved.
+#[allow(clippy::too_many_arguments)]
 async fn save_site_login_everywhere(
     vault: &SiteLoginVault,
     client: Option<&crate::opengrok::OpenGrokClient>,
     origin: &str,
     username: &str,
+    label: &str,
+    notes: &str,
+    kind: &str,
     password: &str,
-) -> Result<Option<String>, String> {
+) -> Result<(String, Option<String>), String> {
     if let Some(client) = client {
-        match client.save_site_login(origin, username, password).await {
+        match client
+            .save_site_login(origin, username, label, notes, kind, password)
+            .await
+        {
             Ok(remote) => {
-                vault
-                    .save_with_id(&remote.id, origin, username, password)
+                let row = vault
+                    .save_with_id(&remote.id, origin, username, label, notes, kind, password)
                     .await
                     .map_err(|error| error.to_string())?;
-                return Ok(None);
+                return Ok((row.id, None));
             }
             Err(error) => {
-                vault
-                    .save(origin, username, password)
+                let row = vault
+                    .save(origin, username, label, notes, kind, password)
                     .await
                     .map_err(|error| error.to_string())?;
-                return Ok(Some(format!(
-                    "Saved on this Mac. The server did not take it yet: {error}"
-                )));
+                return Ok((
+                    row.id,
+                    Some(format!(
+                        "Saved on this Mac. The server did not take it yet: {error}"
+                    )),
+                ));
             }
         }
     }
-    vault
-        .save(origin, username, password)
+    let row = vault
+        .save(origin, username, label, notes, kind, password)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(Some(
-        "Saved on this Mac. Sign in to keep it on the server too.".to_string(),
+    Ok((
+        row.id,
+        Some("Saved on this Mac. Sign in to keep it on the server too.".to_string()),
     ))
 }
 
 /// Bring this Mac and the server to the same list. Rows the server has and this Mac does
 /// not are remembered here without their password; rows this Mac saved before the server
-/// knew them are filed there and take the server's id.
+/// knew them are filed there and take the server's id; a row both have takes the server's
+/// title, notes, kind and last use when the server's copy is the newer one.
 async fn sync_site_logins(
     vault: &SiteLoginVault,
     client: Option<&crate::opengrok::OpenGrokClient>,
@@ -9302,14 +9501,35 @@ async fn sync_site_logins(
         .map_err(|error| error.to_string())?;
     let local = vault.list().await.map_err(|error| error.to_string())?;
     for row in &remote {
-        let known = local.iter().any(|mine| {
+        let known = local.iter().find(|mine| {
             mine.id == row.id || (mine.origin == row.origin && mine.username == row.username)
         });
-        if !known {
-            vault
-                .remember_remote(&row.id, &row.origin, &row.username)
+        match known {
+            None => vault
+                .remember_remote(
+                    &row.id,
+                    &row.origin,
+                    &row.username,
+                    &row.label,
+                    &row.notes,
+                    &row.kind,
+                    row.last_used_at_ms,
+                )
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?,
+            Some(mine) => {
+                vault
+                    .update_from_server(
+                        mine,
+                        &row.label,
+                        &row.notes,
+                        &row.kind,
+                        row.last_used_at_ms,
+                        row.updated_at_ms,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
     }
     for mine in &local {
@@ -9333,7 +9553,14 @@ async fn sync_site_logins(
             continue;
         };
         let filed = client
-            .save_site_login(&mine.origin, &mine.username, &password)
+            .save_site_login(
+                &mine.origin,
+                &mine.username,
+                &mine.label,
+                &mine.notes,
+                &mine.kind,
+                &password,
+            )
             .await
             .map_err(|error| error.to_string())?;
         vault
@@ -9344,8 +9571,69 @@ async fn sync_site_logins(
     Ok(())
 }
 
+/// A site's icon bytes as a picture. A site serves whatever it likes, so the format is
+/// read off the first bytes; bytes that are none of the known pictures are no icon.
+fn site_login_icon_image(bytes: Vec<u8>) -> Option<Arc<Image>> {
+    let format = image_format_of(&bytes)?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+fn image_format_of(bytes: &[u8]) -> Option<ImageFormat> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageFormat::Gif)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        Some(ImageFormat::Ico)
+    } else if bytes.starts_with(b"BM") {
+        Some(ImageFormat::Bmp)
+    } else {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+        let head = head.trim_start();
+        (head.starts_with("<svg") || (head.starts_with("<?xml") && head.contains("<svg")))
+            .then_some(ImageFormat::Svg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A site's icon is whatever the site serves; the first bytes say which picture it is,
+    /// and a page that is not a picture is no icon at all.
+    #[test]
+    fn an_icon_is_read_by_its_first_bytes() {
+        use super::image_format_of;
+        use gpui_kit::ImageFormat;
+        assert_eq!(
+            image_format_of(b"\x89PNG\r\n\x1a\n rest"),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            image_format_of(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(image_format_of(b"GIF89a...."), Some(ImageFormat::Gif));
+        assert_eq!(
+            image_format_of(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(
+            image_format_of(&[0x00, 0x00, 0x01, 0x00, 0x01, 0x00]),
+            Some(ImageFormat::Ico)
+        );
+        assert_eq!(image_format_of(b"BM\x00\x00"), Some(ImageFormat::Bmp));
+        assert_eq!(
+            image_format_of(b"  <?xml version=\"1.0\"?>\n<svg xmlns=\"x\"/>"),
+            Some(ImageFormat::Svg)
+        );
+        assert_eq!(image_format_of(b"<svg/>"), Some(ImageFormat::Svg));
+        assert_eq!(image_format_of(b"<html><body>404</body></html>"), None);
+        assert_eq!(image_format_of(b""), None);
+    }
 
     /// A cron row is the schedule picker again, so the editor opens a routine off the wire
     /// showing the words it was chosen by rather than a line to decipher.

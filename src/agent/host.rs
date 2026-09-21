@@ -17,6 +17,7 @@ use crate::opengrok::{
     user_form_pill_id, user_form_saved_clear_id, user_form_saved_note_id, user_form_screen_id,
     user_form_use_saved_id,
 };
+use crate::site_login::{SiteLoginFilter, SiteLoginRecord, login_title, visible_logins};
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
 pub mod ids {
@@ -205,10 +206,23 @@ pub enum Command {
         origin: String,
         username: String,
         password: RedactedSecret,
+        label: String,
+        notes: String,
     },
     /// Settings → Logins → Import, from a file path the driver gives (no picker).
     ImportSiteLogins {
         path: String,
+    },
+    /// Settings → Logins: the search field's text, a tile, the picked row, the Add sheet,
+    /// and the picked row's notes.
+    SetSiteLoginQuery(String),
+    SetSiteLoginFilter(SiteLoginFilter),
+    SelectSiteLogin(Option<String>),
+    OpenSiteLoginAdd,
+    CloseSiteLoginAdd,
+    SetSiteLoginNotes {
+        id: String,
+        notes: String,
     },
     UserFormDismiss {
         card_key: String,
@@ -336,12 +350,20 @@ impl Command {
                 origin,
                 username,
                 password,
+                label,
+                notes,
             } => {
-                state.add_site_login(origin, username, password.0, cx);
+                state.add_site_login(origin, username, password.0, label, notes, cx);
             }
             Self::ImportSiteLogins { path } => {
                 state.import_site_logins(std::path::PathBuf::from(path), cx)
             }
+            Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),
+            Self::SetSiteLoginFilter(filter) => state.set_site_login_filter(filter, cx),
+            Self::SelectSiteLogin(id) => state.select_site_login(id, cx),
+            Self::OpenSiteLoginAdd => state.open_site_login_add(cx),
+            Self::CloseSiteLoginAdd => state.close_site_login_add(cx),
+            Self::SetSiteLoginNotes { id, notes } => state.update_site_login_notes(id, notes, cx),
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -478,7 +500,8 @@ fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> 
 fn not_editable(target: &str) -> String {
     format!(
         "`{target}` is not editable (composer, login-email, login-password, \
-         user-form-field-*, or \"\" for whatever holds the caret)"
+         user-form-field-*, settings-logins-search, settings-login-notes-*, or \"\" for \
+         whatever holds the caret)"
     )
 }
 
@@ -758,11 +781,11 @@ struct SaveLoginSnap {
     username: String,
 }
 
+/// One saved login as Settings → Logins lists it: the row (id, origin, username, label,
+/// kind, notes, last use — never a password) and where its password is.
 #[derive(Clone, Default)]
 struct SiteLoginSnap {
-    id: String,
-    origin: String,
-    username: String,
+    row: SiteLoginRecord,
     /// The password is in this Mac's keychain (else on the server only).
     on_this_mac: bool,
 }
@@ -923,21 +946,57 @@ fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
     ))
 }
 
-fn site_login_node(login: &SiteLoginSnap) -> UiNode {
-    UiNode::listitem(
-        format!("settings-login-row-{}", login.id),
-        format!("{} · {}", login.username, login.origin),
+/// One row of the list: its title and the name under it. The picked one says so.
+fn site_login_node(row: &SiteLoginRecord, selected: bool) -> UiNode {
+    let mut node = UiNode::listitem(
+        format!("settings-login-row-{}", row.id),
+        format!("{} · {}", login_title(row), row.username),
+    );
+    if selected {
+        node.states.push("selected".to_string());
+    }
+    node
+}
+
+/// The detail pane for the picked row: where the password is, the notes as a field the
+/// driver can read, the last use, and Delete. Never the password.
+fn site_login_detail_node(login: &SiteLoginSnap) -> UiNode {
+    let row = &login.row;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let last_used = row
+        .last_used_at_ms
+        .map(|at| crate::site_login::relative_time(at, now_ms))
+        .unwrap_or_else(|| "Never".to_string());
+    UiNode::dialog(
+        format!("settings-login-detail-{}", row.id),
+        login_title(row).to_string(),
+    )
+    .with_child(
+        UiNode::status(format!("settings-login-username-{}", row.id), "User Name")
+            .with_value(row.username.clone()),
+    )
+    .with_child(
+        UiNode::status(format!("settings-login-website-{}", row.id), "Website")
+            .with_value(row.origin.clone()),
     )
     .with_child(UiNode::status(
-        format!("settings-login-where-{}", login.id),
+        format!("settings-login-where-{}", row.id),
         if login.on_this_mac {
             "Password in this Mac's keychain"
         } else {
             "Password on the server; fetched here on first use"
         },
     ))
+    .with_child(
+        UiNode::textbox(format!("settings-login-notes-{}", row.id), "Notes")
+            .with_value(row.notes.clone()),
+    )
+    .with_child(
+        UiNode::status(format!("settings-login-last-used-{}", row.id), "Last used")
+            .with_value(last_used),
+    )
     .with_child(UiNode::button(
-        format!("settings-login-delete-{}", login.id),
+        format!("settings-login-delete-{}", row.id),
         "Delete",
     ))
 }
@@ -1060,6 +1119,13 @@ pub struct NativeChatHost {
     logins_tab: bool,
     /// What the last Add / Import / sync said on Settings → Logins.
     site_login_notice: Option<String>,
+    site_login_error: Option<String>,
+    /// The search field's text, the tile, the picked row and the Add sheet on Settings →
+    /// Logins, as the page has them.
+    site_login_query: String,
+    site_login_filter: SiteLoginFilter,
+    site_login_selected: Option<String>,
+    site_login_add_open: bool,
     computer_tab: bool,
     updates_tab: bool,
     /// Dedicated provisioned box: Route traffic icon on the Computer pane.
@@ -1366,13 +1432,16 @@ impl NativeChatHost {
                 .iter()
                 .map(|row| SiteLoginSnap {
                     on_this_mac: state.site_logins_on_this_mac.contains(&row.id),
-                    id: row.id.clone(),
-                    origin: row.origin.clone(),
-                    username: row.username.clone(),
+                    row: row.clone(),
                 })
                 .collect(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
             site_login_notice: state.site_login_notice.clone(),
+            site_login_error: state.site_login_error.clone(),
+            site_login_query: state.site_login_query.clone(),
+            site_login_filter: state.site_login_filter,
+            site_login_selected: state.site_login_selected.clone(),
+            site_login_add_open: state.site_login_add_open,
             computer_tab: state.app_settings_tab == AppSettingsTab::Computer,
             updates_tab: state.app_settings_tab == AppSettingsTab::Updates,
             route_traffic_on_bot_pane: state.show_route_traffic_on_bot_pane(),
@@ -1677,27 +1746,7 @@ impl NativeChatHost {
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"));
                         if self.logins_tab {
-                            settings = settings
-                                .with_child(UiNode::button("settings-login-add", "Add"))
-                                .with_child(UiNode::button(
-                                    "settings-login-import",
-                                    "Import a passwords export…",
-                                ));
-                            if let Some(notice) = &self.site_login_notice {
-                                settings = settings.with_child(UiNode::status(
-                                    "settings-logins-notice",
-                                    notice.clone(),
-                                ));
-                            }
-                            if self.site_logins.is_empty() {
-                                settings = settings.with_child(UiNode::status(
-                                    "settings-logins-empty",
-                                    "No saved logins yet.",
-                                ));
-                            }
-                            for login in &self.site_logins {
-                                settings = settings.with_child(site_login_node(login));
-                            }
+                            settings = self.logins_nodes(settings);
                         }
                         if self.updates_tab {
                             settings = settings.with_child(UiNode::button(
@@ -1967,12 +2016,145 @@ impl NativeChatHost {
         None
     }
 
-    fn site_login_delete_target(&self, target: &str) -> Option<String> {
-        let id = target.strip_prefix("settings-login-delete-")?;
+    /// Settings → Logins as the page draws it: the four tiles with their counts, Import… and
+    /// Add, the search field, the notice and error lines, the rows the tile and the search
+    /// leave, the picked row's pane, and the Add sheet while it is up.
+    fn logins_nodes(&self, mut settings: UiNode) -> UiNode {
+        let rows: Vec<SiteLoginRecord> = self
+            .site_logins
+            .iter()
+            .map(|login| login.row.clone())
+            .collect();
+        for filter in SiteLoginFilter::ALL {
+            settings = settings.with_child(
+                UiNode::button(
+                    format!("settings-logins-tile-{}", filter.id()),
+                    filter.title(),
+                )
+                .with_value(filter.count(&rows).to_string())
+                .with_checked(filter == self.site_login_filter),
+            );
+        }
+        settings = settings
+            .with_child(UiNode::button("settings-login-import", "Import…"))
+            .with_child(UiNode::button("settings-login-add", "Add"))
+            .with_child(
+                UiNode::textbox("settings-logins-search", "Search")
+                    .with_value(self.site_login_query.clone()),
+            );
+        if let Some(notice) = &self.site_login_notice {
+            settings =
+                settings.with_child(UiNode::status("settings-logins-notice", notice.clone()));
+        }
+        if let Some(error) = &self.site_login_error {
+            settings = settings.with_child(UiNode::status("settings-logins-error", error.clone()));
+        }
+        let shown = visible_logins(&rows, self.site_login_filter, &self.site_login_query);
+        if shown.is_empty() {
+            settings = settings.with_child(UiNode::status(
+                "settings-logins-empty",
+                if rows.is_empty() {
+                    "No saved logins yet."
+                } else {
+                    "No logins match."
+                },
+            ));
+        }
+        for row in shown {
+            let selected = self.site_login_selected.as_deref() == Some(row.id.as_str());
+            settings = settings.with_child(site_login_node(row, selected));
+        }
+        // The pick stays on the pane even when a tile or a search hides its row.
+        if let Some(picked) = self
+            .site_login_selected
+            .as_ref()
+            .and_then(|id| self.site_logins.iter().find(|login| &login.row.id == id))
+        {
+            settings = settings.with_child(site_login_detail_node(picked));
+        }
+        if self.site_login_add_open {
+            settings = settings.with_child(
+                UiNode::dialog("settings-login-add-sheet", "New Login")
+                    .with_child(UiNode::textbox("settings-login-add-title", "Title"))
+                    .with_child(UiNode::textbox("settings-login-add-username", "User Name"))
+                    .with_child(UiNode::textbox("settings-login-add-password", "Password"))
+                    .with_child(UiNode::textbox("settings-login-add-website", "Website"))
+                    .with_child(UiNode::textbox("settings-login-add-notes", "Notes"))
+                    .with_child(UiNode::button("settings-login-add-cancel", "Cancel"))
+                    .with_child(UiNode::button("settings-login-add-save", "Save")),
+            );
+        }
+        settings
+    }
+
+    fn site_login_id(&self, id: &str) -> Option<String> {
         self.site_logins
             .iter()
-            .find(|login| login.id == id)
-            .map(|login| login.id.clone())
+            .find(|login| login.row.id == id)
+            .map(|login| login.row.id.clone())
+    }
+
+    fn site_login_delete_target(&self, target: &str) -> Option<String> {
+        self.site_login_id(target.strip_prefix("settings-login-delete-")?)
+    }
+
+    /// A row's id, a tile, or one of the sheet's two buttons, from what was clicked.
+    fn site_login_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if let Some(id) = target.strip_prefix("settings-login-row-") {
+            return Some(
+                self.site_login_id(id)
+                    .map(|id| Command::SelectSiteLogin(Some(id)))
+                    .ok_or_else(|| format!("no saved login `{id}`")),
+            );
+        }
+        if let Some(word) = target.strip_prefix("settings-logins-tile-") {
+            return Some(
+                SiteLoginFilter::from_id(word)
+                    .map(Command::SetSiteLoginFilter)
+                    .ok_or_else(|| format!("no tile `{word}` (all, passkeys, codes, security)")),
+            );
+        }
+        match target {
+            "settings-login-add" => Some(Ok(Command::OpenSiteLoginAdd)),
+            "settings-login-add-cancel" => Some(Ok(Command::CloseSiteLoginAdd)),
+            // The sheet's fields are the window's own; the driver hands the values over.
+            "settings-login-add-save" => Some(Err(
+                "`settings-login-add-save` reads the sheet's fields, which the driver cannot \
+                 type into: use `logins.add --arg origin= --arg username= --arg password= \
+                 [--arg label= --arg notes=]`"
+                    .to_string(),
+            )),
+            "settings-login-import" => Some(Err(
+                "`settings-login-import` opens a file picker: use `logins.import --arg path=`"
+                    .to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// The search field on Settings → Logins: the host keeps the copy the list filters by.
+    fn set_site_login_query(&mut self, value: String) -> Result<DispatchResult, String> {
+        self.site_login_query = value.clone();
+        self.pending = Some(Command::SetSiteLoginQuery(value));
+        Ok(DispatchResult::empty())
+    }
+
+    fn set_site_login_notes(
+        &mut self,
+        target: &str,
+        value: &str,
+    ) -> Option<Result<DispatchResult, String>> {
+        let id = target.strip_prefix("settings-login-notes-")?;
+        Some(match self.site_login_id(id) {
+            Some(id) => {
+                self.pending = Some(Command::SetSiteLoginNotes {
+                    id,
+                    notes: value.to_string(),
+                });
+                Ok(DispatchResult::empty())
+            }
+            None => Err(format!("no saved login `{id}`")),
+        })
     }
 
     fn user_form_field(&self, target: &str) -> Option<(String, String, UserFormFieldKind, String)> {
@@ -2159,6 +2341,8 @@ impl NativeChatHost {
             cmd
         } else if let Some(id) = self.site_login_delete_target(target) {
             Command::DeleteSiteLogin { id }
+        } else if let Some(cmd) = self.site_login_command(target) {
+            cmd?
         } else if let Some((card_key, field_id, kind, value)) = self.user_form_field(target) {
             if kind == UserFormFieldKind::Checkbox {
                 let next = if value == "true" { "false" } else { "true" };
@@ -2186,6 +2370,12 @@ impl NativeChatHost {
         if let Some((card_key, field_id, _, _)) = self.user_form_field(target) {
             return self.set_user_form_field(card_key, field_id, value.to_string());
         }
+        if target == "settings-logins-search" {
+            return self.set_site_login_query(value.to_string());
+        }
+        if let Some(result) = self.set_site_login_notes(target, value) {
+            return result;
+        }
         // The target is read before the text, here and in the two below: a wrong address is
         // worth saying before anything about what was going to be typed into it.
         let plan = compose_plan(target, Vec::new())?;
@@ -2206,6 +2396,9 @@ impl NativeChatHost {
         if let Some((card_key, field_id, _, current)) = self.user_form_field(target) {
             return self.set_user_form_field(card_key, field_id, format!("{current}{text}"));
         }
+        if target == "settings-logins-search" {
+            return self.set_site_login_query(format!("{}{text}", self.site_login_query));
+        }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
             keys: text_tokens(text)?,
@@ -2217,6 +2410,20 @@ impl NativeChatHost {
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
             return self.login_key(field, target, key);
+        }
+        if target == "settings-logins-search" {
+            return match key_token(key)?.as_str() {
+                "backspace" => {
+                    let mut value = self.site_login_query.clone();
+                    value.pop();
+                    self.set_site_login_query(value)
+                }
+                // The list filters as the text changes; Enter has nothing left to do.
+                "enter" => Ok(DispatchResult::empty()),
+                other => Err(format!(
+                    "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                )),
+            };
         }
         if let Some((card_key, field_id, _, current)) = self.user_form_field(target) {
             match key_token(key)?.as_str() {
@@ -2483,7 +2690,7 @@ impl NativeChatHost {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
             "AddSiteLogin" | "logins.add" => Command::AddSiteLogin {
-                origin: invoke_arg_str(args, &["origin", "site"])
+                origin: invoke_arg_str(args, &["origin", "site", "website"])
                     .ok_or_else(|| "logins.add requires arg origin".to_string())?,
                 username: invoke_arg_str(args, &["username", "user"])
                     .ok_or_else(|| "logins.add requires arg username".to_string())?,
@@ -2491,7 +2698,53 @@ impl NativeChatHost {
                     invoke_arg_str(args, &["password"])
                         .ok_or_else(|| "logins.add requires arg password".to_string())?,
                 ),
+                label: invoke_arg_str(args, &["label", "title"]).unwrap_or_default(),
+                notes: invoke_arg_str(args, &["notes"]).unwrap_or_default(),
             },
+            // The saved logins as the page lists them, so a driver can find an id without
+            // reading the tree. Never a password: the host never holds one.
+            "logins.list" => {
+                return Ok(DispatchResult::json(serde_json::json!({
+                    "logins": self
+                        .site_logins
+                        .iter()
+                        .map(|login| serde_json::json!({
+                            "id": login.row.id,
+                            "kind": login.row.kind,
+                            "label": login.row.label,
+                            "origin": login.row.origin,
+                            "username": login.row.username,
+                            "on_this_mac": login.on_this_mac,
+                            "last_used_at_ms": login.row.last_used_at_ms,
+                        }))
+                        .collect::<Vec<_>>()
+                })));
+            }
+            // No `q` clears the search.
+            "logins.search" => {
+                let query = invoke_arg_str(args, &["q", "query"]).unwrap_or_default();
+                return self.set_site_login_query(query);
+            }
+            // No `id` clears the pick.
+            "logins.select" => match invoke_arg_str(args, &["id", "login_id"]) {
+                Some(id) => Command::SelectSiteLogin(Some(
+                    self.site_login_id(&id)
+                        .ok_or_else(|| format!("no saved login `{id}`"))?,
+                )),
+                None => Command::SelectSiteLogin(None),
+            },
+            // No `notes` empties them.
+            "logins.notes" => {
+                let id = invoke_arg_str(args, &["id", "login_id"])
+                    .ok_or_else(|| "logins.notes requires arg id".to_string())?;
+                let id = self
+                    .site_login_id(&id)
+                    .ok_or_else(|| format!("no saved login `{id}`"))?;
+                Command::SetSiteLoginNotes {
+                    id,
+                    notes: invoke_arg_str(args, &["notes"]).unwrap_or_default(),
+                }
+            }
             "UserFormClearSaved" | "user-form.clear-saved" => Command::UserFormClearSaved {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
@@ -3794,22 +4047,263 @@ mod tests {
         }
     }
 
+    /// Settings → Logins in the tree: the tiles with their counts, the search field, the
+    /// rows a tile or a search leaves, the picked row's pane with its notes, and the Add
+    /// sheet while it is up. A click, a set-value or an invoke each name the command the
+    /// page would run, and nothing in the tree or in `logins.list` is a password.
     #[test]
-    fn settings_logins_list_username_and_origin_only() {
+    fn settings_logins_tree_has_tiles_search_rows_and_the_picked_pane() {
         let mut host = host();
         host.account_open = true;
         host.logins_tab = true;
-        host.site_logins = vec![SiteLoginSnap {
-            id: "cred-1".into(),
-            origin: "google.com".into(),
-            username: "ada@example.com".into(),
-            on_this_mac: true,
-        }];
+        host.site_logins = vec![
+            SiteLoginSnap {
+                row: SiteLoginRecord {
+                    id: "cred-1".into(),
+                    origin: "google.com".into(),
+                    username: "ada@example.com".into(),
+                    kind: "password".into(),
+                    ..Default::default()
+                },
+                on_this_mac: true,
+            },
+            SiteLoginSnap {
+                row: SiteLoginRecord {
+                    id: "cred-2".into(),
+                    origin: "github.com".into(),
+                    username: "ada".into(),
+                    label: "Work GitHub".into(),
+                    kind: "passkey".into(),
+                    notes: "Security: hardware key".into(),
+                    ..Default::default()
+                },
+                on_this_mac: false,
+            },
+        ];
         let tree = host.snapshot();
+        let tile = |id: &str| tree.find(id).unwrap().value.clone().unwrap();
+        assert_eq!(tile("settings-logins-tile-all"), "2");
+        assert_eq!(tile("settings-logins-tile-passkeys"), "1");
+        assert_eq!(tile("settings-logins-tile-codes"), "0");
+        assert_eq!(tile("settings-logins-tile-security"), "1");
+        assert_eq!(
+            tree.find("settings-logins-tile-all").unwrap().checked,
+            Some(true)
+        );
+        assert_eq!(
+            tree.find("settings-logins-search")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("")
+        );
         let row = tree.find("settings-login-row-cred-1").unwrap();
-        assert!(row.name.contains("ada@example.com"));
-        assert!(row.name.contains("google.com"));
+        assert!(row.name.contains("ada@example.com") && row.name.contains("google.com"));
         assert!(row.value.is_none());
+        assert_eq!(
+            tree.find("settings-login-row-cred-2").unwrap().name,
+            "Work GitHub · ada"
+        );
+        assert!(
+            tree.find("settings-login-detail-cred-1").is_none(),
+            "nothing picked yet"
+        );
+
+        // A row picks; the pane follows with the notes as a field and where the password is.
+        host.dispatch(&Op::click("settings-login-row-cred-2"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SelectSiteLogin(Some(id))) if id == "cred-2"
+        ));
+        host.site_login_selected = Some("cred-2".into());
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("settings-login-detail-cred-2").unwrap().name,
+            "Work GitHub"
+        );
+        assert_eq!(
+            tree.find("settings-login-notes-cred-2")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("Security: hardware key")
+        );
+        assert!(
+            tree.find("settings-login-where-cred-2")
+                .unwrap()
+                .name
+                .contains("server")
+        );
+        assert_eq!(
+            tree.find("settings-login-last-used-cred-2")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("Never")
+        );
+        assert!(
+            tree.find("settings-login-row-cred-2")
+                .unwrap()
+                .states
+                .contains(&"selected".to_string())
+        );
+
+        // A tile filters the rows; the pick stays on the pane.
+        host.dispatch(&Op::click("settings-logins-tile-passkeys"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSiteLoginFilter(SiteLoginFilter::Passkeys))
+        ));
+        host.site_login_filter = SiteLoginFilter::Passkeys;
+        let tree = host.snapshot();
+        assert!(tree.find("settings-login-row-cred-1").is_none());
+        assert!(tree.find("settings-login-row-cred-2").is_some());
+        host.site_login_filter = SiteLoginFilter::Security;
+        host.site_login_selected = Some("cred-1".into());
+        let tree = host.snapshot();
+        assert!(tree.find("settings-login-row-cred-1").is_none());
+        assert!(tree.find("settings-login-detail-cred-1").is_some());
+        host.site_login_filter = SiteLoginFilter::All;
+
+        // The search, by invoke or by set-value, is one command; the tree shows what it leaves.
+        host.invoke("logins.search", &serde_json::json!({ "q": "google" }))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSiteLoginQuery(q)) if q == "google"
+        ));
+        let tree = host.snapshot();
+        assert!(tree.find("settings-login-row-cred-2").is_none());
+        assert!(tree.find("settings-login-row-cred-1").is_some());
+        assert_eq!(
+            tree.find("settings-logins-search")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("google")
+        );
+        host.dispatch(&Op::SetValue {
+            target: "settings-logins-search".into(),
+            value: "nothing here".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSiteLoginQuery(q)) if q == "nothing here"
+        ));
+        assert_eq!(
+            host.snapshot().find("settings-logins-empty").unwrap().name,
+            "No logins match."
+        );
+        host.invoke("logins.search", &serde_json::json!({}))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSiteLoginQuery(q)) if q.is_empty()
+        ));
+
+        // The notes, by invoke or by set-value on the pane's field; an unknown row is refused.
+        host.invoke(
+            "logins.notes",
+            &serde_json::json!({ "id": "cred-2", "notes": "Security: yubikey" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSiteLoginNotes { id, notes })
+                if id == "cred-2" && notes == "Security: yubikey"
+        ));
+        host.dispatch(&Op::SetValue {
+            target: "settings-login-notes-cred-1".into(),
+            value: "plain words".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSiteLoginNotes { id, notes }) if id == "cred-1" && notes == "plain words"
+        ));
+        assert!(
+            host.invoke(
+                "logins.notes",
+                &serde_json::json!({ "id": "nope", "notes": "x" })
+            )
+            .is_err()
+        );
+        assert!(
+            host.invoke("logins.select", &serde_json::json!({ "id": "nope" }))
+                .is_err()
+        );
+
+        // The list answers the rows and never a password.
+        let listed = host
+            .invoke("logins.list", &serde_json::json!({}))
+            .unwrap()
+            .value
+            .unwrap();
+        let logins = listed["logins"].as_array().unwrap();
+        assert_eq!(logins.len(), 2);
+        assert_eq!(logins[1]["id"], "cred-2");
+        assert_eq!(logins[1]["kind"], "passkey");
+        assert_eq!(logins[1]["label"], "Work GitHub");
+        assert_eq!(logins[1]["on_this_mac"], false);
+        assert_eq!(logins[0]["on_this_mac"], true);
+        assert!(logins[0]["last_used_at_ms"].is_null());
+        assert!(
+            logins.iter().all(|login| login.get("password").is_none()),
+            "a kind may be `password`; a field never is"
+        );
+
+        // Add opens the sheet; its fields and buttons are in the tree; Cancel closes it. Save
+        // cannot be clicked from here, because its fields are the window's: the invoke is
+        // the way, and it carries the title and the notes.
+        host.dispatch(&Op::click("settings-login-add")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenSiteLoginAdd)
+        ));
+        assert!(host.snapshot().find("settings-login-add-sheet").is_none());
+        host.site_login_add_open = true;
+        let tree = host.snapshot();
+        for id in [
+            "settings-login-add-title",
+            "settings-login-add-username",
+            "settings-login-add-password",
+            "settings-login-add-website",
+            "settings-login-add-notes",
+            "settings-login-add-save",
+            "settings-login-add-cancel",
+        ] {
+            assert!(tree.find(id).is_some(), "{id}");
+        }
+        assert!(
+            host.dispatch(&Op::click("settings-login-add-save"))
+                .is_err()
+        );
+        host.dispatch(&Op::click("settings-login-add-cancel"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::CloseSiteLoginAdd)
+        ));
+        host.invoke(
+            "logins.add",
+            &serde_json::json!({
+                "origin": "x.com", "username": "a", "password": "hunter2",
+                "label": "X", "notes": "Security: none"
+            }),
+        )
+        .unwrap();
+        match host.take_command() {
+            Some(Command::AddSiteLogin { label, notes, .. }) => {
+                assert_eq!(label, "X");
+                assert_eq!(notes, "Security: none");
+            }
+            other => panic!("expected an add, got {other:?}"),
+        }
+
+        // Delete is still by id, whether or not the row is picked.
         host.dispatch(&Op::click("settings-login-delete-cred-1"))
             .unwrap();
         assert!(matches!(

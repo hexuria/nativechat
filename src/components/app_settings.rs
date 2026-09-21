@@ -1,11 +1,10 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
-use crate::components::fields::field_input;
+use crate::components::logins::LoginsPage;
 use crate::opengrok::LocalExecMode;
 use crate::send_policy::OnSend;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::InputState;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -14,16 +13,8 @@ use gpui_kit::*;
 
 pub struct AppSettings {
     state: Entity<AppState>,
-    /// The Add-login form on Settings → Logins: site, username, password. Made on the first
-    /// render of that page (an input needs a window), emptied after a successful Add.
-    add_login: Option<AddLoginInputs>,
-}
-
-#[derive(Clone)]
-struct AddLoginInputs {
-    origin: Entity<InputState>,
-    username: Entity<InputState>,
-    password: Entity<InputState>,
+    /// Settings → Logins, made on the first render of that tab (its fields need a window).
+    logins: Option<Entity<LoginsPage>>,
 }
 
 impl AppSettings {
@@ -31,35 +22,23 @@ impl AppSettings {
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         Self {
             state,
-            add_login: None,
+            logins: None,
         }
     }
 
-    fn add_login_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AddLoginInputs {
-        if let Some(inputs) = &self.add_login {
-            return inputs.clone();
+    fn logins_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<LoginsPage> {
+        if let Some(page) = &self.logins {
+            return page.clone();
         }
-        let origin =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Site, like facebook.com"));
-        let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username or email"));
-        let password = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Password")
-                .masked(true)
-        });
-        let inputs = AddLoginInputs {
-            origin,
-            username,
-            password,
-        };
-        self.add_login = Some(inputs.clone());
-        inputs
+        let state = self.state.clone();
+        let page = cx.new(|cx| LoginsPage::new(window, state, cx));
+        self.logins = Some(page.clone());
+        page
     }
 }
 
 impl Render for AppSettings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let add_login = self.add_login_inputs(window, cx);
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let (
@@ -93,6 +72,62 @@ impl Render for AppSettings {
         };
         let app = self.state.clone();
 
+        // Every tab but Logins is a titled column of cards. Logins is three panes edge to
+        // edge, like a passwords app: it takes the whole body and each pane scrolls on its own.
+        let cards: Option<AnyElement> = match tab {
+            AppSettingsTab::General => {
+                Some(general_page(chord, on_send, muted, app.clone()).into_any_element())
+            }
+            AppSettingsTab::Profile => Some(
+                profile_page(account_name, account_email, muted, app.clone()).into_any_element(),
+            ),
+            AppSettingsTab::Appearance => Some(
+                appearance_page(&theme_mode, muted, theme.foreground, app.clone())
+                    .into_any_element(),
+            ),
+            AppSettingsTab::Shortcuts => {
+                Some(shortcuts_page(chord, muted, &theme).into_any_element())
+            }
+            AppSettingsTab::Computer => {
+                Some(computer_page(computers, muted, app.clone(), cx).into_any_element())
+            }
+            AppSettingsTab::Updates => Some(
+                updates_page(&bot_name, &controls, muted, app.clone(), &theme).into_any_element(),
+            ),
+            AppSettingsTab::Logins => None,
+        };
+        let body = match cards {
+            Some(page) => div()
+                .id("app-settings-body")
+                .flex_1()
+                .h_full()
+                .min_w(px(0.))
+                .overflow_y_scroll()
+                .px(px(48.))
+                .py(px(36.))
+                .child(
+                    v_flex()
+                        .max_w(px(720.))
+                        .w_full()
+                        .gap(px(20.))
+                        .child(
+                            div()
+                                .text_xl()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(tab_title(tab)),
+                        )
+                        .child(page),
+                )
+                .into_any_element(),
+            None => div()
+                .id("app-settings-body")
+                .flex_1()
+                .h_full()
+                .min_w(px(0.))
+                .child(self.logins_page(window, cx))
+                .into_any_element(),
+        };
+
         h_flex()
             .id("app-settings")
             .key_context("AppSettings")
@@ -110,69 +145,7 @@ impl Render for AppSettings {
                 }
             })
             .child(self.nav(tab, &theme, cx))
-            .child(
-                div()
-                    .id("app-settings-body")
-                    .flex_1()
-                    .h_full()
-                    .min_w(px(0.))
-                    .overflow_y_scroll()
-                    .px(px(48.))
-                    .py(px(36.))
-                    .child(
-                        v_flex()
-                            .max_w(px(720.))
-                            .w_full()
-                            .gap(px(20.))
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(tab_title(tab)),
-                            )
-                            .child(match tab {
-                                AppSettingsTab::General => {
-                                    general_page(chord, on_send, muted, app.clone())
-                                        .into_any_element()
-                                }
-                                AppSettingsTab::Profile => {
-                                    profile_page(account_name, account_email, muted, app.clone())
-                                        .into_any_element()
-                                }
-                                AppSettingsTab::Appearance => appearance_page(
-                                    &theme_mode,
-                                    muted,
-                                    theme.foreground,
-                                    app.clone(),
-                                )
-                                .into_any_element(),
-                                AppSettingsTab::Shortcuts => {
-                                    shortcuts_page(chord, muted, &theme).into_any_element()
-                                }
-                                AppSettingsTab::Computer => {
-                                    computer_page(computers, muted, app.clone(), cx)
-                                        .into_any_element()
-                                }
-                                AppSettingsTab::Updates => {
-                                    updates_page(&bot_name, &controls, muted, app.clone(), &theme)
-                                        .into_any_element()
-                                }
-                                AppSettingsTab::Logins => {
-                                    let state = app.read(cx);
-                                    logins_page(
-                                        &state.site_logins,
-                                        &state.site_logins_on_this_mac,
-                                        state.site_login_error.clone(),
-                                        state.site_login_notice.clone(),
-                                        add_login.clone(),
-                                        muted,
-                                        app.clone(),
-                                    )
-                                    .into_any_element()
-                                }
-                            }),
-                    ),
-            )
+            .child(body)
     }
 }
 
@@ -293,193 +266,8 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
     }
 }
 
-fn logins_page(
-    logins: &[crate::site_login::SiteLoginRecord],
-    on_this_mac: &std::collections::HashSet<String>,
-    error: Option<String>,
-    notice: Option<String>,
-    inputs: AddLoginInputs,
-    muted: Hsla,
-    app: Entity<AppState>,
-) -> impl IntoElement {
-    v_flex()
-        .id("settings-logins")
-        .gap(px(12.))
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child("Your saved site logins. They are kept sealed on the server so they follow you to every Mac, and a copy sits in this Mac's keychain. A login is offered on a login card only for its own site, only on a bot's own computer, and only after Touch ID. Your bot never sees the password."),
-        )
-        .child(add_login_form(inputs, muted, app.clone()))
-        .when_some(notice, |this, notice| {
-            this.child(
-                div()
-                    .id("settings-logins-notice")
-                    .text_xs()
-                    .text_color(muted)
-                    .child(notice),
-            )
-        })
-        .when_some(error, |this, error| {
-            this.child(
-                div()
-                    .id("settings-logins-error")
-                    .text_xs()
-                    .text_color(rgb(0xcc4444))
-                    .child(error),
-            )
-        })
-        .child(if logins.is_empty() {
-            div()
-                .id("settings-logins-empty")
-                .text_sm()
-                .text_color(muted)
-                .child("No saved logins yet.")
-                .into_any_element()
-        } else {
-            let mut list = v_flex()
-                .w_full()
-                .rounded(px(12.))
-                .border_1()
-                .border_color(rgb(0x777777).opacity(0.24))
-                .overflow_hidden();
-            for (i, login) in logins.iter().enumerate() {
-                if i > 0 {
-                    list = list.child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)));
-                }
-                let id = login.id.clone();
-                list = list.child(
-                    h_flex()
-                        .id(format!("settings-login-row-{id}"))
-                        .w_full()
-                        .items_center()
-                        .gap(px(16.))
-                        .px(px(16.))
-                        .py(px(12.))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .gap(px(2.))
-                                .child(div().text_sm().child(login.username.clone()))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(login.origin.clone()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id(format!("settings-login-where-{id}"))
-                                .text_xs()
-                                .text_color(muted)
-                                .child(if on_this_mac.contains(&login.id) {
-                                    "Password in this Mac's keychain"
-                                } else {
-                                    "Password on the server; fetched here on first use"
-                                }),
-                        )
-                        .child(
-                            Button::new(format!("settings-login-delete-{id}"))
-                                .label("Delete")
-                                .ghost()
-                                .on_click({
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        app.update(cx, |state, cx| {
-                                            state.delete_site_login(id.clone(), cx);
-                                        });
-                                    }
-                                }),
-                        ),
-                );
-            }
-            list.into_any_element()
-        })
-}
-
 /// The active bot's computer: Update (keeps files). Reset lives on the
 /// Computer pane next to download — Settings no longer duplicates it.
-/// Add one login by hand, or import a passwords export. The password field is masked and
-/// cleared once Add is pressed.
-fn add_login_form(inputs: AddLoginInputs, muted: Hsla, app: Entity<AppState>) -> impl IntoElement {
-    let AddLoginInputs {
-        origin,
-        username,
-        password,
-    } = inputs;
-    v_flex()
-        .w_full()
-        .rounded(px(12.))
-        .border_1()
-        .border_color(rgb(0x777777).opacity(0.24))
-        .px(px(16.))
-        .py(px(14.))
-        .gap(px(10.))
-        .child(div().text_xs().text_color(muted).child("Add a login"))
-        .child(
-            h_flex()
-                .w_full()
-                .gap(px(8.))
-                .flex_wrap()
-                .child(div().flex_1().min_w(px(160.)).child(field_input(&origin)))
-                .child(div().flex_1().min_w(px(160.)).child(field_input(&username)))
-                .child(div().flex_1().min_w(px(160.)).child(field_input(&password))),
-        )
-        .child(
-            h_flex()
-                .w_full()
-                .gap(px(8.))
-                .flex_wrap()
-                .items_center()
-                .child(
-                    Button::new("settings-login-add")
-                        .label("Add")
-                        .primary()
-                        .on_click({
-                            let app = app.clone();
-                            let origin = origin.clone();
-                            let username = username.clone();
-                            let password = password.clone();
-                            move |_, window, cx| {
-                                let site = origin.read(cx).value().to_string();
-                                let name = username.read(cx).value().to_string();
-                                let secret = password.read(cx).value().to_string();
-                                let taken = app.update(cx, |state, cx| {
-                                    state.add_site_login(site, name, secret, cx)
-                                });
-                                if taken {
-                                    for input in [&origin, &username, &password] {
-                                        input.update(cx, |input, cx| {
-                                            input.set_value("", window, cx)
-                                        });
-                                    }
-                                }
-                            }
-                        }),
-                )
-                .child(
-                    Button::new("settings-login-import")
-                        .label("Import a passwords export…")
-                        .outline()
-                        .on_click({
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                app.update(cx, |state, cx| state.pick_site_logins_import(cx));
-                            }
-                        }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("CSV from the Passwords app, Safari, Chrome or 1Password."),
-                ),
-        )
-}
-
 fn updates_page(
     bot_name: &str,
     controls: &crate::components::computer::ComputerControls,
