@@ -854,8 +854,19 @@ impl UserFormSpec {
         if incoming.instruction.is_some() {
             self.instruction = incoming.instruction;
         }
-        if !incoming.fields.is_empty() {
-            self.fields = incoming.fields;
+        // The card that is already showing owns its field list: a narrower
+        // envelope for the same card (the gateway's send-message copy, which
+        // can omit the secret field) refreshes the fields it names and adds
+        // the ones it brings, but never drops a field the person can see.
+        for field in incoming.fields {
+            match self.fields.iter_mut().find(|mine| mine.id == field.id) {
+                Some(mine) => {
+                    let prefill = field.prefill.clone().or_else(|| mine.prefill.take());
+                    *mine = field;
+                    mine.prefill = prefill;
+                }
+                None => self.fields.push(field),
+            }
         }
         if incoming.domain.is_some() {
             self.domain = incoming.domain;
