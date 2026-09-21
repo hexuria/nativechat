@@ -668,6 +668,9 @@ struct ApprovalSnap {
     /// MCP card from a shell's without reading the title.
     reason: String,
     thread_id: String,
+    /// The egress tunnel's own card: its Always and Never set the computer's standing choice,
+    /// so Never is on offer here and nowhere else among review cards.
+    tunnel: bool,
 }
 
 /// User-form card in the open thread. Idle cards expose fields + Continue /
@@ -1136,6 +1139,7 @@ impl NativeChatHost {
                 .map(|spec| ApprovalSnap {
                     local: spec.runs_on_this_mac(),
                     review: spec.is_review_an_action() && state.egress_tunnel_available(),
+                    tunnel: spec.is_egress_tunnel(),
                     place: spec.place(),
                     reason: spec.reason,
                     thread_id: spec.thread_id.unwrap_or_default(),
@@ -1542,7 +1546,7 @@ impl NativeChatHost {
             if approval.local || approval.review {
                 card = card.with_child(UiNode::button(format!("{id}-always"), "Always allow"));
             }
-            if approval.local && !approval.review {
+            if (approval.local && !approval.review) || (approval.review && approval.tunnel) {
                 card = card.with_child(UiNode::button(format!("{id}-never"), "Never"));
             }
             page = page.with_child(card);
@@ -4036,6 +4040,7 @@ mod tests {
             review: false,
             reason: "policy-approval".into(),
             thread_id: "mcp-cw_1".into(),
+            tunnel: false,
         }];
         let tree = host.snapshot();
         let card = tree.find("approval-call_9").unwrap();
