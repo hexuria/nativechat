@@ -2380,11 +2380,9 @@ impl AppState {
                         error.message
                     );
                     if let Some(call_id) = card {
-                        let once = match mode {
-                            LocalExecMode::Never => ApprovalDecision::Denied,
-                            _ => ApprovalDecision::AllowOnce,
-                        };
-                        state.approval_decisions.insert(call_id, once);
+                        state
+                            .approval_decisions
+                            .insert(call_id, once_only_for(mode));
                     }
                     cx.notify();
                 }
@@ -6518,9 +6516,12 @@ impl AppState {
             if run_id_empty {
                 let _ = this.update(cx, |state, cx| {
                     state.drop_dead_approval(&spec.call_id);
-                    state
-                        .approval_decisions
-                        .insert(spec.call_id.clone(), decision);
+                    let current = state.approval_decisions.get(&spec.call_id).cloned();
+                    if let Some(settled) = settled_decision(current.as_ref(), decision) {
+                        state
+                            .approval_decisions
+                            .insert(spec.call_id.clone(), settled);
+                    }
                     cx.notify();
                 });
                 return;
@@ -9253,6 +9254,15 @@ impl AppState {
 /// raises cards for reasons of its own — a policy, an auto-review — and says
 /// why in the item, so the card now reads back what the server sent and only
 /// falls through to the old wording for a server that sends neither.
+/// The once-only line a standing answer falls back to when its policy write failed: a Never
+/// that was not kept still denied this call; an Always still allowed it.
+fn once_only_for(mode: LocalExecMode) -> ApprovalDecision {
+    match mode {
+        LocalExecMode::Never => ApprovalDecision::Denied,
+        LocalExecMode::Always | LocalExecMode::Ask => ApprovalDecision::AllowOnce,
+    }
+}
+
 /// What a card's decision becomes once the run has taken the answer. A standing choice
 /// (Always / Never) whose policy write has already failed was re-marked as once-only by that
 /// failure, and the answer landing later must not promote it back: `None` keeps what is
@@ -9676,7 +9686,8 @@ mod tests {
         ModelEntry, OpenGrokClient, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
     use crate::state::{
-        ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, settled_decision,
+        ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, once_only_for,
+        settled_decision,
     };
     use std::str::FromStr;
     use std::sync::Arc;
@@ -12143,6 +12154,15 @@ mod tests {
         assert_eq!(
             settled_decision(Some(&ApprovalDecision::Denied), ApprovalDecision::Denied),
             Some(ApprovalDecision::Denied)
+        );
+        // And the fallback itself: a Never not kept still denied this call.
+        assert_eq!(
+            once_only_for(LocalExecMode::Never),
+            ApprovalDecision::Denied
+        );
+        assert_eq!(
+            once_only_for(LocalExecMode::Always),
+            ApprovalDecision::AllowOnce
         );
     }
 
