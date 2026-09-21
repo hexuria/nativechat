@@ -161,7 +161,7 @@ fn render_idle(
             .flex_wrap()
             .child(action_button(
                 user_form_continue_id(&key),
-                "Continue",
+                spec.continue_label(),
                 ButtonKind::Primary,
                 !can_continue,
                 !can_post,

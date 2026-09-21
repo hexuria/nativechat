@@ -690,6 +690,21 @@ impl UserFormSpec {
         self.effective_resolution().map(FormResolution::pill)
     }
 
+    /// The button says what pressing it does. A one-page login (a username next to a
+    /// password) is "Log in", the button the person expects on that page; anything else is
+    /// the generic "Continue".
+    pub fn continue_label(&self) -> &'static str {
+        let has_password = self
+            .fields
+            .iter()
+            .any(|field| field.kind == UserFormFieldKind::Password);
+        if has_password && self.fields.len() > 1 {
+            "Log in"
+        } else {
+            "Continue"
+        }
+    }
+
     pub fn settled_body(&self) -> Option<&'static str> {
         self.effective_resolution().map(FormResolution::body)
     }
@@ -1484,6 +1499,37 @@ pub fn bind_call_peers(specs: &mut [UserFormSpec], call_id: &str, resolution: Fo
 
 #[cfg(test)]
 mod tests {
+
+    /// The card's button names the page's own: a one-page login says Log in; a lone email or
+    /// a code says Continue.
+    #[test]
+    fn the_button_says_log_in_only_for_a_one_page_login() {
+        let login = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Log in", "samePage": true, "fields": [
+                { "id": "email", "label": "Email", "type": "email" },
+                { "id": "password", "label": "Password", "type": "password" }
+            ]}),
+            "c_1",
+        )
+        .expect("spec");
+        assert_eq!(login.continue_label(), "Log in");
+        let email_only = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Email", "fields": [
+                { "id": "email", "label": "Email", "type": "email" }
+            ]}),
+            "c_2",
+        )
+        .expect("spec");
+        assert_eq!(email_only.continue_label(), "Continue");
+        let password_only = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Password", "fields": [
+                { "id": "password", "label": "Password", "type": "password" }
+            ]}),
+            "c_3",
+        )
+        .expect("spec");
+        assert_eq!(password_only.continue_label(), "Continue");
+    }
     use super::*;
     use serde_json::json;
 
