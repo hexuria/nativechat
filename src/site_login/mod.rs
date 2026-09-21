@@ -125,9 +125,13 @@ pub fn matches_query(row: &SiteLoginRecord, query: &str) -> bool {
 /// then by name for two rows with one title. The three kinds are always there — a 0 says
 /// what the kind is — until a search is on, when a section with no match is left out;
 /// Security is there only while some row has a `Security:` note.
+/// `with_code` names the rows that carry an authenticator-code seed beside their password;
+/// they show under Codes as well as under Passwords, so the Codes count is what the person
+/// can fill a code card with.
 pub fn grouped_logins<'a>(
     rows: &'a [SiteLoginRecord],
     query: &str,
+    with_code: &std::collections::HashSet<String>,
 ) -> Vec<(SiteLoginGroup, Vec<&'a SiteLoginRecord>)> {
     let searching = !query.trim().is_empty();
     SiteLoginGroup::ALL
@@ -135,7 +139,11 @@ pub fn grouped_logins<'a>(
         .filter_map(|group| {
             let mut members: Vec<&SiteLoginRecord> = rows
                 .iter()
-                .filter(|row| group.holds(row) && matches_query(row, query))
+                .filter(|row| {
+                    (group.holds(row)
+                        || (group == SiteLoginGroup::Codes && with_code.contains(&row.id)))
+                        && matches_query(row, query)
+                })
                 .collect();
             members.sort_by_cached_key(|row| {
                 (
@@ -376,7 +384,7 @@ mod tests {
             row("5", "e.com", "eve", "", "something-new", ""),
         ];
         assert_eq!(
-            shape(&grouped_logins(&rows, "")),
+            shape(&grouped_logins(&rows, "", &Default::default())),
             [
                 ("passwords", vec!["1", "4", "5"]),
                 ("passkeys", vec!["2"]),
@@ -387,7 +395,7 @@ mod tests {
         // No `Security:` line anywhere: no Security section. The three kinds stay, empty or not.
         let plain = vec![row("1", "a.com", "ada", "", "password", "")];
         assert_eq!(
-            shape(&grouped_logins(&plain, "")),
+            shape(&grouped_logins(&plain, "", &Default::default())),
             [
                 ("passwords", vec!["1"]),
                 ("passkeys", vec![]),
@@ -395,7 +403,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            shape(&grouped_logins(&[], "")),
+            shape(&grouped_logins(&[], "", &Default::default())),
             [
                 ("passwords", vec![]),
                 ("passkeys", vec![]),
@@ -422,7 +430,7 @@ mod tests {
             row("4", "keys.example", "dee", "", "passkey", ""),
         ];
         let passwords = |query: &str| -> Vec<String> {
-            grouped_logins(&rows, query)
+            grouped_logins(&rows, query, &Default::default())
                 .into_iter()
                 .find(|(group, _)| *group == SiteLoginGroup::Passwords)
                 .map(|(_, members)| {
@@ -442,7 +450,7 @@ mod tests {
         assert_eq!(passwords("apple"), ["beta"]);
         assert_eq!(passwords("   ").len(), 3);
         let sections = |query: &str| -> Vec<&str> {
-            grouped_logins(&rows, query)
+            grouped_logins(&rows, query, &Default::default())
                 .iter()
                 .map(|(group, _)| group.id())
                 .collect()

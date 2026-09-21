@@ -159,7 +159,14 @@ impl Render for LoginsPage {
                 state.site_login_add_open,
             )
         };
-        let groups = grouped_logins(&rows, &query);
+        let with_code: std::collections::HashSet<String> = self
+            .state
+            .read(cx)
+            .site_login_codes
+            .keys()
+            .cloned()
+            .collect();
+        let groups = grouped_logins(&rows, &query, &with_code);
         // The pick stays on the pane even when a search hides its row.
         let picked = selected
             .as_ref()

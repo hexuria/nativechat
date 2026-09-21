@@ -796,6 +796,8 @@ struct SiteLoginSnap {
     row: SiteLoginRecord,
     /// The password is in this Mac's keychain (else on the server only).
     on_this_mac: bool,
+    /// An authenticator-code seed is on this Mac: the pane shows a live code.
+    has_code: bool,
 }
 
 fn user_form_node(form: &UserFormSnap) -> UiNode {
@@ -1009,6 +1011,14 @@ fn site_login_detail_node(login: &SiteLoginSnap) -> UiNode {
         UiNode::status(format!("settings-login-last-used-{}", row.id), "Last used")
             .with_value(last_used),
     )
+    .with_child(UiNode::status(
+        format!("settings-login-code-{}", row.id),
+        if login.has_code {
+            "A code is minted here from the seed on this Mac"
+        } else {
+            "No authenticator code for this login"
+        },
+    ))
     .with_child(UiNode::button(
         format!("settings-login-delete-{}", row.id),
         "Delete",
@@ -1448,6 +1458,7 @@ impl NativeChatHost {
                 .iter()
                 .map(|row| SiteLoginSnap {
                     on_this_mac: state.site_logins_on_this_mac.contains(&row.id),
+                    has_code: state.site_login_codes.contains_key(&row.id),
                     row: row.clone(),
                 })
                 .collect(),
@@ -2059,7 +2070,13 @@ impl NativeChatHost {
         if let Some(error) = &self.site_login_error {
             settings = settings.with_child(UiNode::status("settings-logins-error", error.clone()));
         }
-        let groups = grouped_logins(&rows, &self.site_login_query);
+        let with_code: std::collections::HashSet<String> = self
+            .site_logins
+            .iter()
+            .filter(|login| login.has_code)
+            .map(|login| login.row.id.clone())
+            .collect();
+        let groups = grouped_logins(&rows, &self.site_login_query, &with_code);
         if rows.is_empty() {
             settings = settings.with_child(UiNode::status(
                 "settings-logins-empty",
@@ -4088,6 +4105,7 @@ mod tests {
                     ..Default::default()
                 },
                 on_this_mac: true,
+                has_code: false,
             },
             SiteLoginSnap {
                 row: SiteLoginRecord {
@@ -4100,6 +4118,7 @@ mod tests {
                     ..Default::default()
                 },
                 on_this_mac: false,
+                has_code: false,
             },
         ];
         let tree = host.snapshot();

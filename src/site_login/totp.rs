@@ -60,6 +60,13 @@ mod tests {
     }
 
     #[test]
+    fn a_passwords_app_uri_with_an_issuer_and_an_encoded_label_parses() {
+        let uri = "otpauth://totp/AuthenticationTest:user%40authenticationtest.com?secret=I65VU7K5ZQL7WB4E&issuer=AuthenticationTest";
+        let totp = parse(uri).expect("parse");
+        assert_eq!(at(&totp, 0).len(), 6);
+    }
+
+    #[test]
     fn a_seed_near_the_step_edge_waits() {
         let totp = parse("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP").expect("seed");
         let wait = wait_before_minting(&totp);
