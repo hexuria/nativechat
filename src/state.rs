@@ -32,9 +32,8 @@ use crate::services::database::{ChatMessage, DatabaseService, MessagePart, Reply
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
-    KIND_PASSWORD, PendingSave, SavedLoginUse, SiteLoginFilter, SiteLoginRecord, SiteLoginVault,
-    login_fields, login_matches_request, login_origin, origins_match, registrable_origin,
-    save_candidate,
+    KIND_PASSWORD, PendingSave, SavedLoginUse, SiteLoginRecord, SiteLoginVault, login_fields,
+    login_matches_request, login_origin, origins_match, registrable_origin, save_candidate,
 };
 use crate::threads::conversation_for_thread;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
@@ -1448,8 +1447,6 @@ pub struct AppState {
     /// The search field on Settings → Logins. The page draws its own field; this is the copy
     /// the list filters by, and the one the driver writes.
     pub site_login_query: String,
-    /// The sidebar tile the list is filtered by.
-    pub site_login_filter: SiteLoginFilter,
     /// The row the detail pane shows.
     pub site_login_selected: Option<String>,
     /// The Add-login sheet is up over the page.
@@ -1832,7 +1829,6 @@ impl AppState {
             site_login_error: None,
             site_login_icons: HashMap::new(),
             site_login_query: String::new(),
-            site_login_filter: SiteLoginFilter::All,
             site_login_selected: None,
             site_login_add_open: false,
             approval_decisions: HashMap::new(),
@@ -8072,14 +8068,6 @@ impl AppState {
     pub fn set_site_login_query(&mut self, query: String, cx: &mut Context<Self>) {
         if self.site_login_query != query {
             self.site_login_query = query;
-            cx.notify();
-        }
-    }
-
-    /// Settings → Logins: the sidebar tile the list is filtered by.
-    pub fn set_site_login_filter(&mut self, filter: SiteLoginFilter, cx: &mut Context<Self>) {
-        if self.site_login_filter != filter {
-            self.site_login_filter = filter;
             cx.notify();
         }
     }

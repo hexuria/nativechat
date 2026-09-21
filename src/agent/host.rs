@@ -17,7 +17,7 @@ use crate::opengrok::{
     user_form_pill_id, user_form_saved_clear_id, user_form_saved_note_id, user_form_screen_id,
     user_form_use_saved_id,
 };
-use crate::site_login::{SiteLoginFilter, SiteLoginRecord, login_title, visible_logins};
+use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
 pub mod ids {
@@ -213,10 +213,9 @@ pub enum Command {
     ImportSiteLogins {
         path: String,
     },
-    /// Settings → Logins: the search field's text, a tile, the picked row, the Add sheet,
-    /// and the picked row's notes.
+    /// Settings → Logins: the search field's text, the picked row, the Add sheet, and the
+    /// picked row's notes.
     SetSiteLoginQuery(String),
-    SetSiteLoginFilter(SiteLoginFilter),
     SelectSiteLogin(Option<String>),
     OpenSiteLoginAdd,
     CloseSiteLoginAdd,
@@ -359,7 +358,6 @@ impl Command {
                 state.import_site_logins(std::path::PathBuf::from(path), cx)
             }
             Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),
-            Self::SetSiteLoginFilter(filter) => state.set_site_login_filter(filter, cx),
             Self::SelectSiteLogin(id) => state.select_site_login(id, cx),
             Self::OpenSiteLoginAdd => state.open_site_login_add(cx),
             Self::CloseSiteLoginAdd => state.close_site_login_add(cx),
@@ -1120,10 +1118,9 @@ pub struct NativeChatHost {
     /// What the last Add / Import / sync said on Settings → Logins.
     site_login_notice: Option<String>,
     site_login_error: Option<String>,
-    /// The search field's text, the tile, the picked row and the Add sheet on Settings →
-    /// Logins, as the page has them.
+    /// The search field's text, the picked row and the Add sheet on Settings → Logins, as
+    /// the page has them.
     site_login_query: String,
-    site_login_filter: SiteLoginFilter,
     site_login_selected: Option<String>,
     site_login_add_open: bool,
     computer_tab: bool,
@@ -1439,7 +1436,6 @@ impl NativeChatHost {
             site_login_notice: state.site_login_notice.clone(),
             site_login_error: state.site_login_error.clone(),
             site_login_query: state.site_login_query.clone(),
-            site_login_filter: state.site_login_filter,
             site_login_selected: state.site_login_selected.clone(),
             site_login_add_open: state.site_login_add_open,
             computer_tab: state.app_settings_tab == AppSettingsTab::Computer,
@@ -2016,32 +2012,22 @@ impl NativeChatHost {
         None
     }
 
-    /// Settings → Logins as the page draws it: the four tiles with their counts, Import… and
-    /// Add, the search field, the notice and error lines, the rows the tile and the search
-    /// leave, the picked row's pane, and the Add sheet while it is up.
+    /// Settings → Logins as the page draws it: the search field with Add beside it, Import…,
+    /// the notice and error lines, the sections the search leaves with their rows under
+    /// them, the picked row's pane, and the Add sheet while it is up.
     fn logins_nodes(&self, mut settings: UiNode) -> UiNode {
         let rows: Vec<SiteLoginRecord> = self
             .site_logins
             .iter()
             .map(|login| login.row.clone())
             .collect();
-        for filter in SiteLoginFilter::ALL {
-            settings = settings.with_child(
-                UiNode::button(
-                    format!("settings-logins-tile-{}", filter.id()),
-                    filter.title(),
-                )
-                .with_value(filter.count(&rows).to_string())
-                .with_checked(filter == self.site_login_filter),
-            );
-        }
         settings = settings
-            .with_child(UiNode::button("settings-login-import", "Import…"))
-            .with_child(UiNode::button("settings-login-add", "Add"))
             .with_child(
                 UiNode::textbox("settings-logins-search", "Search")
                     .with_value(self.site_login_query.clone()),
-            );
+            )
+            .with_child(UiNode::button("settings-login-add", "Add"))
+            .with_child(UiNode::button("settings-login-import", "Import…"));
         if let Some(notice) = &self.site_login_notice {
             settings =
                 settings.with_child(UiNode::status("settings-logins-notice", notice.clone()));
@@ -2049,22 +2035,32 @@ impl NativeChatHost {
         if let Some(error) = &self.site_login_error {
             settings = settings.with_child(UiNode::status("settings-logins-error", error.clone()));
         }
-        let shown = visible_logins(&rows, self.site_login_filter, &self.site_login_query);
-        if shown.is_empty() {
+        let groups = grouped_logins(&rows, &self.site_login_query);
+        if rows.is_empty() {
             settings = settings.with_child(UiNode::status(
                 "settings-logins-empty",
-                if rows.is_empty() {
-                    "No saved logins yet."
-                } else {
-                    "No logins match."
-                },
+                "No saved logins yet.",
             ));
+        } else if groups.is_empty() {
+            settings =
+                settings.with_child(UiNode::status("settings-logins-empty", "No logins match."));
         }
-        for row in shown {
-            let selected = self.site_login_selected.as_deref() == Some(row.id.as_str());
-            settings = settings.with_child(site_login_node(row, selected));
+        // A row with a `Security:` note is under its kind and under Security: one id, twice,
+        // as on the screen.
+        for (group, members) in groups {
+            let mut node = UiNode::new(
+                format!("settings-logins-group-{}", group.id()),
+                "group",
+                group.title(),
+            )
+            .with_value(members.len().to_string());
+            for row in members {
+                let selected = self.site_login_selected.as_deref() == Some(row.id.as_str());
+                node = node.with_child(site_login_node(row, selected));
+            }
+            settings = settings.with_child(node);
         }
-        // The pick stays on the pane even when a tile or a search hides its row.
+        // The pick stays on the pane even when a search hides its row.
         if let Some(picked) = self
             .site_login_selected
             .as_ref()
@@ -2098,20 +2094,13 @@ impl NativeChatHost {
         self.site_login_id(target.strip_prefix("settings-login-delete-")?)
     }
 
-    /// A row's id, a tile, or one of the sheet's two buttons, from what was clicked.
+    /// A row's id or one of the sheet's two buttons, from what was clicked.
     fn site_login_command(&self, target: &str) -> Option<Result<Command, String>> {
         if let Some(id) = target.strip_prefix("settings-login-row-") {
             return Some(
                 self.site_login_id(id)
                     .map(|id| Command::SelectSiteLogin(Some(id)))
                     .ok_or_else(|| format!("no saved login `{id}`")),
-            );
-        }
-        if let Some(word) = target.strip_prefix("settings-logins-tile-") {
-            return Some(
-                SiteLoginFilter::from_id(word)
-                    .map(Command::SetSiteLoginFilter)
-                    .ok_or_else(|| format!("no tile `{word}` (all, passkeys, codes, security)")),
             );
         }
         match target {
@@ -4047,12 +4036,13 @@ mod tests {
         }
     }
 
-    /// Settings → Logins in the tree: the tiles with their counts, the search field, the
-    /// rows a tile or a search leaves, the picked row's pane with its notes, and the Add
-    /// sheet while it is up. A click, a set-value or an invoke each name the command the
-    /// page would run, and nothing in the tree or in `logins.list` is a password.
+    /// Settings → Logins in the tree: the search field with Add beside it, the sections
+    /// with their counts and the rows the search leaves, the picked row's pane with its
+    /// notes, and the Add sheet while it is up. A click, a set-value or an invoke each name
+    /// the command the page would run, and nothing in the tree or in `logins.list` is a
+    /// password.
     #[test]
-    fn settings_logins_tree_has_tiles_search_rows_and_the_picked_pane() {
+    fn settings_logins_tree_has_search_sections_rows_and_the_picked_pane() {
         let mut host = host();
         host.account_open = true;
         host.logins_tab = true;
@@ -4081,15 +4071,11 @@ mod tests {
             },
         ];
         let tree = host.snapshot();
-        let tile = |id: &str| tree.find(id).unwrap().value.clone().unwrap();
-        assert_eq!(tile("settings-logins-tile-all"), "2");
-        assert_eq!(tile("settings-logins-tile-passkeys"), "1");
-        assert_eq!(tile("settings-logins-tile-codes"), "0");
-        assert_eq!(tile("settings-logins-tile-security"), "1");
-        assert_eq!(
-            tree.find("settings-logins-tile-all").unwrap().checked,
-            Some(true)
-        );
+        let count = |id: &str| tree.find(id).unwrap().value.clone().unwrap();
+        assert_eq!(count("settings-logins-group-passwords"), "1");
+        assert_eq!(count("settings-logins-group-passkeys"), "1");
+        assert_eq!(count("settings-logins-group-codes"), "0");
+        assert_eq!(count("settings-logins-group-security"), "1");
         assert_eq!(
             tree.find("settings-logins-search")
                 .unwrap()
@@ -4097,12 +4083,19 @@ mod tests {
                 .as_deref(),
             Some("")
         );
+        assert!(tree.find("settings-login-add").is_some());
+        assert!(tree.find("settings-login-import").is_some());
         let row = tree.find("settings-login-row-cred-1").unwrap();
         assert!(row.name.contains("ada@example.com") && row.name.contains("google.com"));
         assert!(row.value.is_none());
         assert_eq!(
             tree.find("settings-login-row-cred-2").unwrap().name,
             "Work GitHub · ada"
+        );
+        assert_eq!(
+            tree.find_all("settings-login-row-cred-2").len(),
+            2,
+            "a row with a Security: note is under its kind and under Security"
         );
         assert!(
             tree.find("settings-login-detail-cred-1").is_none(),
@@ -4143,31 +4136,13 @@ mod tests {
             Some("Never")
         );
         assert!(
-            tree.find("settings-login-row-cred-2")
-                .unwrap()
-                .states
-                .contains(&"selected".to_string())
+            tree.find_all("settings-login-row-cred-2")
+                .iter()
+                .all(|row| row.states.contains(&"selected".to_string()))
         );
 
-        // A tile filters the rows; the pick stays on the pane.
-        host.dispatch(&Op::click("settings-logins-tile-passkeys"))
-            .unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetSiteLoginFilter(SiteLoginFilter::Passkeys))
-        ));
-        host.site_login_filter = SiteLoginFilter::Passkeys;
-        let tree = host.snapshot();
-        assert!(tree.find("settings-login-row-cred-1").is_none());
-        assert!(tree.find("settings-login-row-cred-2").is_some());
-        host.site_login_filter = SiteLoginFilter::Security;
-        host.site_login_selected = Some("cred-1".into());
-        let tree = host.snapshot();
-        assert!(tree.find("settings-login-row-cred-1").is_none());
-        assert!(tree.find("settings-login-detail-cred-1").is_some());
-        host.site_login_filter = SiteLoginFilter::All;
-
-        // The search, by invoke or by set-value, is one command; the tree shows what it leaves.
+        // The search, by invoke or by set-value, is one command; the tree shows the sections
+        // it leaves, and the pick stays on the pane.
         host.invoke("logins.search", &serde_json::json!({ "q": "google" }))
             .unwrap();
         assert!(matches!(
@@ -4175,8 +4150,13 @@ mod tests {
             Some(Command::SetSiteLoginQuery(q)) if q == "google"
         ));
         let tree = host.snapshot();
+        assert_eq!(count_in(&tree, "settings-logins-group-passwords"), "1");
+        assert!(tree.find("settings-logins-group-passkeys").is_none());
+        assert!(tree.find("settings-logins-group-codes").is_none());
+        assert!(tree.find("settings-logins-group-security").is_none());
         assert!(tree.find("settings-login-row-cred-2").is_none());
         assert!(tree.find("settings-login-row-cred-1").is_some());
+        assert!(tree.find("settings-login-detail-cred-2").is_some());
         assert_eq!(
             tree.find("settings-logins-search")
                 .unwrap()
@@ -4193,16 +4173,23 @@ mod tests {
             host.take_command(),
             Some(Command::SetSiteLoginQuery(q)) if q == "nothing here"
         ));
+        let tree = host.snapshot();
         assert_eq!(
-            host.snapshot().find("settings-logins-empty").unwrap().name,
+            tree.find("settings-logins-empty").unwrap().name,
             "No logins match."
         );
+        assert!(tree.find("settings-logins-group-passwords").is_none());
         host.invoke("logins.search", &serde_json::json!({}))
             .unwrap();
         assert!(matches!(
             host.take_command(),
             Some(Command::SetSiteLoginQuery(q)) if q.is_empty()
         ));
+        assert!(
+            host.snapshot()
+                .find("settings-logins-group-codes")
+                .is_some()
+        );
 
         // The notes, by invoke or by set-value on the pane's field; an unknown row is refused.
         host.invoke(
@@ -4310,6 +4297,10 @@ mod tests {
             host.take_command(),
             Some(Command::DeleteSiteLogin { id }) if id == "cred-1"
         ));
+    }
+
+    fn count_in(tree: &UiTree, id: &str) -> String {
+        tree.find(id).unwrap().value.clone().unwrap()
     }
 
     #[test]

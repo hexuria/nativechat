@@ -15,11 +15,13 @@
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
 //! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site),
 //! `user-form-saved-note-{key}`, `user-form-saved-clear-{key}`,
-//! `settings-tab-logins`, `settings-logins-tile-all|passkeys|codes|security` (value = count,
-//! checked = the one the list is filtered by), `settings-login-import`, `settings-login-add`,
-//! `settings-logins-search` (value = the query), `settings-logins-notice`,
-//! `settings-logins-error`, `settings-logins-empty`, `settings-login-row-{id}` (the rows the
-//! tile and the search leave; the picked one has state `selected`),
+//! `settings-tab-logins`, `settings-logins-search` (value = the query), `settings-login-add`,
+//! `settings-login-import`, `settings-logins-notice`, `settings-logins-error`,
+//! `settings-logins-empty`, `settings-logins-group-passwords|passkeys|codes|security` (a
+//! section of the list, value = its count; the three kinds are always there until a search
+//! leaves one empty, Security only while a row has a `Security:` note) with its rows
+//! `settings-login-row-{id}` under it (a row with a `Security:` note is under its kind and
+//! under Security, one id twice; the picked one has state `selected`),
 //! `settings-login-detail-{id}` (the picked row's pane: `settings-login-username-{id}`,
 //! `settings-login-website-{id}`, `settings-login-where-{id}`, `settings-login-notes-{id}`
 //! (value = the notes), `settings-login-last-used-{id}`, `settings-login-delete-{id}`),

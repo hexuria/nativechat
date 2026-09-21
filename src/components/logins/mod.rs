@@ -1,6 +1,6 @@
-//! Settings → Logins: the three panes of a passwords app. Tiles at the left pick which
-//! rows the list shows, the list in the middle is searched and picked from, and the pane at
-//! the right is the picked row: who, where, the person's notes, and where the password is.
+//! Settings → Logins: the two panes of a passwords app. The list at the left is searched,
+//! grouped by kind, and picked from; the pane at the right is the picked row: who, where,
+//! the person's notes, and where the password is.
 //!
 //! The password itself is never read here. The pane shows dots and offers no copy; a saved
 //! login is used from a login card, after Touch ID (see [`crate::site_login`]).
@@ -8,11 +8,10 @@
 mod add_sheet;
 mod detail;
 mod list;
-mod sidebar;
 
 use std::sync::Arc;
 
-use crate::site_login::{SiteLoginFilter, SiteLoginRecord, visible_logins};
+use crate::site_login::grouped_logins;
 use crate::state::AppState;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::{ActiveTheme, Theme};
@@ -134,11 +133,10 @@ impl Render for LoginsPage {
         let theme = cx.theme().clone();
         let view = cx.entity();
         let app = self.state.clone();
-        let (rows, filter, query, selected, on_this_mac, icons, notice, error, add_open) = {
+        let (rows, query, selected, on_this_mac, icons, notice, error, add_open) = {
             let state = self.state.read(cx);
             (
                 state.site_logins.clone(),
-                state.site_login_filter,
                 state.site_login_query.clone(),
                 state.site_login_selected.clone(),
                 state.site_logins_on_this_mac.clone(),
@@ -148,12 +146,8 @@ impl Render for LoginsPage {
                 state.site_login_add_open,
             )
         };
-        let counts = SiteLoginFilter::ALL.map(|filter| (filter, filter.count(&rows)));
-        let shown: Vec<SiteLoginRecord> = visible_logins(&rows, filter, &query)
-            .into_iter()
-            .cloned()
-            .collect();
-        // The pick stays on the pane even when a tile or a search hides its row.
+        let groups = grouped_logins(&rows, &query);
+        // The pick stays on the pane even when a search hides its row.
         let picked = selected
             .as_ref()
             .and_then(|id| rows.iter().find(|row| &row.id == id))
@@ -173,10 +167,9 @@ impl Render for LoginsPage {
             .flex_row()
             .size_full()
             .relative()
-            .child(sidebar::render(&counts, filter, &theme, app.clone()))
             .child(list::render(
                 &self.search,
-                &shown,
+                &groups,
                 selected.as_deref(),
                 &icons,
                 notice,

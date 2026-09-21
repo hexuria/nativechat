@@ -46,58 +46,51 @@ pub fn default_label(username: &str, origin: &str) -> String {
     format!("{username} on {origin}")
 }
 
-/// The sidebar's tiles on Settings → Logins: which rows the list shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SiteLoginFilter {
-    #[default]
-    All,
+/// The sections of the list on Settings → Logins, in their order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteLoginGroup {
+    Passwords,
     Passkeys,
     Codes,
-    /// Rows with a `Security:` line in their notes.
+    /// Rows with a `Security:` line in their notes, listed here as well as under their kind.
     Security,
 }
 
-impl SiteLoginFilter {
-    pub const ALL: [Self; 4] = [Self::All, Self::Passkeys, Self::Codes, Self::Security];
+impl SiteLoginGroup {
+    pub const ALL: [Self; 4] = [Self::Passwords, Self::Passkeys, Self::Codes, Self::Security];
 
-    /// The word in the tile's id, `settings-logins-tile-{id}`.
+    /// The word in the header's id, `settings-logins-group-{id}`.
     pub fn id(self) -> &'static str {
         match self {
-            Self::All => "all",
+            Self::Passwords => "passwords",
             Self::Passkeys => "passkeys",
             Self::Codes => "codes",
             Self::Security => "security",
         }
     }
 
-    pub fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|filter| filter.id() == id)
-    }
-
     pub fn title(self) -> &'static str {
         match self {
-            Self::All => "All",
+            Self::Passwords => "Passwords",
             Self::Passkeys => "Passkeys",
             Self::Codes => "Codes",
             Self::Security => "Security",
         }
     }
 
-    pub fn matches(self, row: &SiteLoginRecord) -> bool {
+    /// Whether a row is filed under this section. A kind this app has not heard of files
+    /// under Passwords, so a word from a newer server is still on the list.
+    pub fn holds(self, row: &SiteLoginRecord) -> bool {
         match self {
-            Self::All => true,
+            Self::Passwords => row.kind != KIND_PASSKEY && row.kind != KIND_CODE,
             Self::Passkeys => row.kind == KIND_PASSKEY,
             Self::Codes => row.kind == KIND_CODE,
             Self::Security => has_security_note(row),
         }
     }
-
-    pub fn count(self, rows: &[SiteLoginRecord]) -> usize {
-        rows.iter().filter(|row| self.matches(row)).count()
-    }
 }
 
-/// A line of the notes starting `Security:` files the row under the Security tile.
+/// A line of the notes starting `Security:` files the row under Security as well.
 pub fn has_security_note(row: &SiteLoginRecord) -> bool {
     row.notes
         .lines()
@@ -125,25 +118,36 @@ pub fn matches_query(row: &SiteLoginRecord, query: &str) -> bool {
     .any(|field| field.to_lowercase().contains(&query))
 }
 
-/// The rows the list shows for a tile and a search, in the order it shows them: by title,
-/// then by name for two rows with one title.
-pub fn visible_logins<'a>(
+/// The sections the list shows for a search, each with its rows in list order: by title,
+/// then by name for two rows with one title. The three kinds are always there — a 0 says
+/// what the kind is — until a search is on, when a section with no match is left out;
+/// Security is there only while some row has a `Security:` note.
+pub fn grouped_logins<'a>(
     rows: &'a [SiteLoginRecord],
-    filter: SiteLoginFilter,
     query: &str,
-) -> Vec<&'a SiteLoginRecord> {
-    let mut shown: Vec<&SiteLoginRecord> = rows
-        .iter()
-        .filter(|row| filter.matches(row) && matches_query(row, query))
-        .collect();
-    shown.sort_by_cached_key(|row| {
-        (
-            login_title(row).to_lowercase(),
-            row.username.to_lowercase(),
-            row.id.clone(),
-        )
-    });
-    shown
+) -> Vec<(SiteLoginGroup, Vec<&'a SiteLoginRecord>)> {
+    let searching = !query.trim().is_empty();
+    SiteLoginGroup::ALL
+        .into_iter()
+        .filter_map(|group| {
+            let mut members: Vec<&SiteLoginRecord> = rows
+                .iter()
+                .filter(|row| group.holds(row) && matches_query(row, query))
+                .collect();
+            members.sort_by_cached_key(|row| {
+                (
+                    login_title(row).to_lowercase(),
+                    row.username.to_lowercase(),
+                    row.id.clone(),
+                )
+            });
+            let shown = match group {
+                SiteLoginGroup::Security => !members.is_empty(),
+                _ => !searching || !members.is_empty(),
+            };
+            shown.then_some((group, members))
+        })
+        .collect()
 }
 
 /// A row's stamp as unix milliseconds. The table holds two spellings: `datetime('now')`
@@ -318,10 +322,25 @@ mod tests {
         }
     }
 
-    /// The tiles count what they show: every row, the passkeys, the codes, and the rows
-    /// with a `Security:` line somewhere in their notes.
+    fn shape<'a>(
+        groups: &'a [(SiteLoginGroup, Vec<&SiteLoginRecord>)],
+    ) -> Vec<(&'a str, Vec<&'a str>)> {
+        groups
+            .iter()
+            .map(|(group, members)| {
+                (
+                    group.id(),
+                    members.iter().map(|row| row.id.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The three kinds are always sections, Security only while a row has a `Security:`
+    /// line; a row with one is under Security as well as under its kind, and a kind this
+    /// app has not heard of is a password.
     #[test]
-    fn the_tiles_count_their_rows() {
+    fn the_list_is_grouped_by_kind_and_security_only_when_there_is_one() {
         let rows = vec![
             row("1", "a.com", "ada", "", "password", ""),
             row("2", "b.com", "bea", "", "passkey", "Security: hardware key"),
@@ -341,23 +360,39 @@ mod tests {
                 "password",
                 "Not security: just a note",
             ),
+            row("5", "e.com", "eve", "", "something-new", ""),
         ];
-        assert_eq!(SiteLoginFilter::All.count(&rows), 4);
-        assert_eq!(SiteLoginFilter::Passkeys.count(&rows), 1);
-        assert_eq!(SiteLoginFilter::Codes.count(&rows), 1);
-        assert_eq!(SiteLoginFilter::Security.count(&rows), 2);
         assert_eq!(
-            SiteLoginFilter::from_id("codes"),
-            Some(SiteLoginFilter::Codes)
+            shape(&grouped_logins(&rows, "")),
+            [
+                ("passwords", vec!["1", "4", "5"]),
+                ("passkeys", vec!["2"]),
+                ("codes", vec!["3"]),
+                ("security", vec!["2", "3"]),
+            ]
         );
-        assert_eq!(SiteLoginFilter::from_id("passwords"), None);
-        for filter in SiteLoginFilter::ALL {
-            assert_eq!(SiteLoginFilter::from_id(filter.id()), Some(filter));
-        }
+        // No `Security:` line anywhere: no Security section. The three kinds stay, empty or not.
+        let plain = vec![row("1", "a.com", "ada", "", "password", "")];
+        assert_eq!(
+            shape(&grouped_logins(&plain, "")),
+            [
+                ("passwords", vec!["1"]),
+                ("passkeys", vec![]),
+                ("codes", vec![]),
+            ]
+        );
+        assert_eq!(
+            shape(&grouped_logins(&[], "")),
+            [
+                ("passwords", vec![]),
+                ("passkeys", vec![]),
+                ("codes", vec![])
+            ]
+        );
     }
 
-    /// The list is by title (the site when there is none), any case; the search reads the
-    /// title, the site and the name.
+    /// Rows are by title (the site when there is none), any case; a search reads the title,
+    /// the site and the name, and leaves out a section it empties.
     #[test]
     fn the_list_sorts_by_title_and_the_search_reads_three_fields() {
         let rows = vec![
@@ -370,25 +405,38 @@ mod tests {
                 "password",
                 "",
             ),
-            row("3", "apple.com", "cy", "beta", "passkey", ""),
+            row("3", "apple.com", "cy", "beta", "password", ""),
+            row("4", "keys.example", "dee", "", "passkey", ""),
         ];
-        let titles: Vec<&str> = visible_logins(&rows, SiteLoginFilter::All, "")
-            .into_iter()
-            .map(login_title)
-            .collect();
-        assert_eq!(titles, ["beta", "Work GitHub", "zeta.com"]);
-        let by_name: Vec<&str> = visible_logins(&rows, SiteLoginFilter::All, "WORK")
-            .into_iter()
-            .map(|row| row.id.as_str())
-            .collect();
-        assert_eq!(by_name, ["2"], "the title and the name both say work");
-        let by_site: Vec<&str> = visible_logins(&rows, SiteLoginFilter::All, "apple")
-            .into_iter()
-            .map(|row| row.id.as_str())
-            .collect();
-        assert_eq!(by_site, ["3"]);
-        assert!(visible_logins(&rows, SiteLoginFilter::Passkeys, "zeta").is_empty());
-        assert_eq!(visible_logins(&rows, SiteLoginFilter::All, "   ").len(), 3);
+        let passwords = |query: &str| -> Vec<String> {
+            grouped_logins(&rows, query)
+                .into_iter()
+                .find(|(group, _)| *group == SiteLoginGroup::Passwords)
+                .map(|(_, members)| {
+                    members
+                        .into_iter()
+                        .map(|row| login_title(row).to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(passwords(""), ["beta", "Work GitHub", "zeta.com"]);
+        assert_eq!(
+            passwords("WORK"),
+            ["Work GitHub"],
+            "the title and the name both say work"
+        );
+        assert_eq!(passwords("apple"), ["beta"]);
+        assert_eq!(passwords("   ").len(), 3);
+        let sections = |query: &str| -> Vec<&str> {
+            grouped_logins(&rows, query)
+                .iter()
+                .map(|(group, _)| group.id())
+                .collect()
+        };
+        assert_eq!(sections("zeta"), ["passwords"]);
+        assert_eq!(sections("keys"), ["passkeys"]);
+        assert!(sections("nothing here").is_empty());
     }
 
     /// Both spellings the table holds read as the same moment; words for a distance.
