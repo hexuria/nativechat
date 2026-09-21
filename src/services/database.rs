@@ -79,8 +79,19 @@ impl DatabaseService {
     /// `run_id` is the run a coworker's reply came out of, and is what lets a thread be
     /// reconciled against the server without saying everything twice. The person's own messages
     /// came out of no run and carry none.
+    /// Write a message down under the name its bubble already has.
+    ///
+    /// The id comes from the caller, and that is the whole point: a bubble whose row is filed
+    /// under some other name cannot be deleted, edited or found again — the statement runs, no
+    /// row matches, and the next reload paints the message straight back. The caller has an id
+    /// from the moment the bubble exists, so there is nothing to mint here and nothing to hand
+    /// back. Writing the same message twice is the same row twice, not two rows: a run that is
+    /// settled by two paths at once (the live stream and the watcher) must not say everything
+    /// twice.
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_message(
         &self,
+        id: &str,
         session_id: &str,
         role: &str,
         content: &str,
@@ -89,18 +100,23 @@ impl DatabaseService {
         reply: Option<ReplyRef>,
         parts: &[MessagePart],
         run_id: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
 
-        let id = uuid::Uuid::now_v7().to_string();
         sqlx::query(
-            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               content = excluded.content,
+               model = excluded.model,
+               provider = excluded.provider,
+               run_id = excluded.run_id",
         )
-        .bind(&id)
+        .bind(id)
         .bind(session_id)
         .bind(role)
         .bind(content)
@@ -113,11 +129,18 @@ impl DatabaseService {
         .execute(&mut *tx)
         .await?;
 
+        // A second write of the same message brings the whole of its pieces, so the first
+        // write's are cleared rather than left to pile up beside them.
+        sqlx::query("DELETE FROM chat_message_parts WHERE message_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
         for (ord, part) in parts.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO chat_message_parts (message_id, ord, kind, text, call_id, image, width, height) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(&id)
+            .bind(id)
             .bind(ord as i64)
             .bind(part.kind())
             .bind(part.text())
@@ -129,7 +152,7 @@ impl DatabaseService {
             .await?;
         }
         tx.commit().await?;
-        Ok(id)
+        Ok(())
     }
 
     pub async fn delete_message(&self, id: &str) -> Result<()> {

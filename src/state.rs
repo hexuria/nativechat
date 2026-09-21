@@ -5505,7 +5505,8 @@ impl AppState {
             else {
                 return;
             };
-            let message_id = graft_reply(&mut conversation.messages, &reply);
+            let grafted_id = graft_reply(&mut conversation.messages, &reply);
+            let message_id = grafted_id.clone();
             if reply.live {
                 // Whatever stopped watching this run, the run did not stop. Registering it makes
                 // the thread hold still for it again, and following it brings the rest of the
@@ -5523,6 +5524,7 @@ impl AppState {
             } else {
                 self.persist_assistant_reply(
                     conversation_id,
+                    &grafted_id,
                     reply.content,
                     &reply.parts,
                     Some(&reply.run_id),
@@ -5710,6 +5712,7 @@ impl AppState {
                 {
                     self.persist_assistant_reply(
                         conversation_id,
+                        &turn.message_id,
                         plain,
                         &parts,
                         Some(&turn.run_id),
@@ -5802,9 +5805,11 @@ impl AppState {
     /// reach the database, so the thread is let go at once; a reply on its way down is let go
     /// when the write lands, so that switching away in the moment between deciding and writing
     /// cannot lose it either.
+    #[allow(clippy::too_many_arguments)]
     fn persist_assistant_reply(
         &mut self,
         conversation_id: &str,
+        message_id: &str,
         content: String,
         parts: &[ChatPart],
         run_id: Option<&str>,
@@ -5832,12 +5837,16 @@ impl AppState {
         }
         let title = self.conversation_title(conversation_id);
         let conversation_id = conversation_id.to_string();
+        let message_id = message_id.to_string();
         let run_id = run_id.map(str::to_string);
         let parts = saved_parts(parts);
         cx.spawn(async move |this, cx| {
             let saved = match db.ensure_session(&conversation_id, &title).await {
-                Ok(()) => db
-                    .save_message(
+                // The row is the bubble's, by its own name. Two paths settling one run write
+                // the same row twice rather than two rows that say the same thing.
+                Ok(()) => {
+                    db.save_message(
+                        &message_id,
                         &conversation_id,
                         "assistant",
                         &content,
@@ -5848,7 +5857,7 @@ impl AppState {
                         run_id.as_deref(),
                     )
                     .await
-                    .map(|_| ()),
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = saved {
@@ -6174,6 +6183,7 @@ impl AppState {
                     if let Some((content, parts)) = reply {
                         state.persist_assistant_reply(
                             &conversation_id,
+                            &reply_id,
                             content,
                             &parts,
                             Some(&run_id),
@@ -6364,7 +6374,14 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if let Some((content, parts)) = self.end_stopped_turn(conversation_id, turn) {
-            self.persist_assistant_reply(conversation_id, content, &parts, Some(&turn.run_id), cx);
+            self.persist_assistant_reply(
+                conversation_id,
+                &turn.message_id,
+                content,
+                &parts,
+                Some(&turn.run_id),
+                cx,
+            );
         }
         cx.notify();
     }
@@ -6719,6 +6736,9 @@ impl AppState {
                                 let target = conversation_id.as_ref().and_then(|id| {
                                     state.live_turns.get(id).map(|turn| turn.message_id.clone())
                                 });
+                                // The bubble this actually painted into, so the row it is
+                                // written down as is that bubble and not a new one.
+                                let mut painted: Option<String> = None;
                                 if let Some(conversation_id) = conversation_id.as_ref()
                                     && let Some(conversation) = state
                                         .conversations
@@ -6735,6 +6755,7 @@ impl AppState {
                                             .find(|m| !m.is_me),
                                     }
                                 {
+                                    painted = Some(last.id.clone());
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
                                     if let Some(shot) =
@@ -6775,9 +6796,16 @@ impl AppState {
                                                     conversation_id.as_deref(),
                                                     false,
                                                 );
-                                                if !state.has_open_approval(id) {
+                                                // Only when there is a bubble to write down.
+                                                // Without one there is nothing on screen this
+                                                // row would belong to, and minting an id here
+                                                // would overwrite some other run's row.
+                                                if !state.has_open_approval(id)
+                                                    && let Some(painted) = painted.as_deref()
+                                                {
                                                     state.persist_assistant_reply(
                                                         id,
+                                                        painted,
                                                         plain.clone(),
                                                         &parts,
                                                         Some(&run_id),
@@ -9230,8 +9258,12 @@ impl AppState {
                     eprintln!("Failed to save user message: {}", e);
                     return;
                 }
-                match db
+                // The row is filed under the bubble's own id, so nothing has to be swapped
+                // afterwards: what is on screen and what is on disk answer to the same name
+                // from the first moment, and a delete in the meantime finds its row.
+                if let Err(e) = db
                     .save_message(
+                        &local_id,
                         &conversation_id_clone,
                         "user",
                         &content_clone,
@@ -9245,35 +9277,7 @@ impl AppState {
                     )
                     .await
                 {
-                    Ok(id) => {
-                        this.update(cx, |state, cx| {
-                            // A held message follows its bubble to the saved id, or the
-                            // "Queued" pill would come off the moment the save landed.
-                            if let Some(queue) = state.queued_sends.get_mut(&conversation_id_clone)
-                            {
-                                for queued in queue.iter_mut().filter(|q| q.message_id == local_id)
-                                {
-                                    queued.message_id = id.clone();
-                                }
-                            }
-                            if let Some(conversation) = state
-                                .conversations
-                                .iter_mut()
-                                .find(|c| c.id == conversation_id_clone)
-                            {
-                                if let Some(msg) = conversation
-                                    .messages
-                                    .iter_mut()
-                                    .rev()
-                                    .find(|m| m.id == local_id)
-                                {
-                                    msg.id = id;
-                                }
-                            }
-                        })
-                        .ok();
-                    }
-                    Err(e) => eprintln!("Failed to save user message: {}", e),
+                    eprintln!("Failed to save user message: {}", e);
                 }
             })
             .detach();
@@ -11204,6 +11208,7 @@ mod tests {
             saved_parts(&live)
         );
         db.save_message(
+            "m1",
             "s1",
             "assistant",
             content,
@@ -11526,11 +11531,100 @@ mod tests {
     /// A row written before pieces were kept has none of them — which is also every row the
     /// build in the person's hands is writing right now. It must still open, as the one bubble
     /// its words always were.
+    /// A bubble and its row answer to one name, so the delete finds it.
+    ///
+    /// The row used to be filed under an id the database minted, which nothing on screen had:
+    /// deleting a reply ran a statement that matched nothing, and the next time the thread was
+    /// opened the message came straight back off disk.
+    #[tokio::test]
+    async fn a_reply_is_deleted_by_the_name_its_bubble_already_has() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        db.save_message(
+            "bubble_1",
+            "s1",
+            "assistant",
+            "The build is green.",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+        )
+        .await
+        .expect("the reply is saved");
+
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(ids_of(&rows), vec!["bubble_1"], "the row is the bubble's");
+
+        db.delete_message("bubble_1").await.expect("deleted");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert!(rows.is_empty(), "it stays deleted: {:?}", ids_of(&rows));
+    }
+
+    /// Two paths can settle one run — the live stream and the watcher that outlives it. Both
+    /// write the same bubble, so the thread says it once.
+    #[tokio::test]
+    async fn a_turn_written_down_twice_is_still_one_row() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let once = vec![MessagePart::Screenshot {
+            call_id: "c1".to_string(),
+            image: vec![1, 2, 3],
+            width: 2,
+            height: 1,
+            caption: String::new(),
+        }];
+        db.save_message(
+            "bubble_1",
+            "s1",
+            "assistant",
+            "Working",
+            None,
+            None,
+            None,
+            &once,
+            Some("run_1"),
+        )
+        .await
+        .expect("the first write");
+        db.save_message(
+            "bubble_1",
+            "s1",
+            "assistant",
+            "The build is green.",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+        )
+        .await
+        .expect("the second write");
+
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows.len(), 1, "one row, not two: {:?}", ids_of(&rows));
+        assert_eq!(
+            rows[0].content, "The build is green.",
+            "the later ending is the one that stands"
+        );
+        assert!(
+            rows[0].parts.is_empty(),
+            "the first write's pieces went with it: {:?}",
+            rows[0].parts
+        );
+    }
+
+    fn ids_of(rows: &[crate::services::database::ChatMessage]) -> Vec<String> {
+        rows.iter().map(|row| row.id.clone()).collect()
+    }
+
     #[tokio::test]
     async fn a_row_with_only_words_still_loads_as_a_single_bubble() {
         let db = test_db().await;
         db.ensure_session("s1", "Old").await.expect("a session");
         db.save_message(
+            "m1",
             "s1",
             "assistant",
             "The build is green.",
