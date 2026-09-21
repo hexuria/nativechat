@@ -38,7 +38,8 @@ pub struct ImportReport {
 /// site is reduced to its registrable origin, so `https://www.facebook.com/login` files
 /// under `facebook.com`.
 pub fn parse_export(text: &str) -> Result<ImportReport, String> {
-    let rows = parse_csv(text);
+    // A file re-saved by a spreadsheet may start with a byte-order mark; it is not a column.
+    let rows = parse_csv(text.strip_prefix('\u{FEFF}').unwrap_or(text));
     let mut rows = rows.into_iter();
     let header = rows.next().ok_or_else(|| "the file is empty".to_string())?;
     let find = |names: &[&str]| {
@@ -57,7 +58,8 @@ pub fn parse_export(text: &str) -> Result<ImportReport, String> {
         let cell = |i: usize| row.get(i).map(|s| s.trim()).unwrap_or("");
         let origin = registrable_origin(cell(url));
         let username = cell(user);
-        let password = cell(pass);
+        // A password is taken as written: a space at either end is part of it.
+        let password = row.get(pass).map(String::as_str).unwrap_or("");
         match origin {
             Some(origin) if !username.is_empty() && !password.is_empty() => {
                 report.logins.push(ImportedLogin {
@@ -128,6 +130,14 @@ mod tests {
         assert_eq!(report.logins[0].password, "p,w\"x");
         assert_eq!(report.skipped, 2);
         assert!(!format!("{report:?}").contains("p,w"));
+    }
+
+    #[test]
+    fn a_bom_is_not_a_column_and_a_password_keeps_its_spaces() {
+        let text = "\u{FEFF}url,username,password\nhttps://x.com, ada , p w \n";
+        let report = parse_export(text).expect("parse");
+        assert_eq!(report.logins[0].username, "ada");
+        assert_eq!(report.logins[0].password, " p w ");
     }
 
     #[test]

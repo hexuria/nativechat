@@ -447,10 +447,16 @@ fn add_login_form(inputs: AddLoginInputs, muted: Hsla, app: Entity<AppState>) ->
                                 let site = origin.read(cx).value().to_string();
                                 let name = username.read(cx).value().to_string();
                                 let secret = password.read(cx).value().to_string();
-                                app.update(cx, |state, cx| {
-                                    state.add_site_login(site, name, secret, cx);
+                                let taken = app.update(cx, |state, cx| {
+                                    state.add_site_login(site, name, secret, cx)
                                 });
-                                password.update(cx, |input, cx| input.set_value("", window, cx));
+                                if taken {
+                                    for input in [&origin, &username, &password] {
+                                        input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx)
+                                        });
+                                    }
+                                }
                             }
                         }),
                 )

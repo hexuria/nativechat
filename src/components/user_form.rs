@@ -160,6 +160,9 @@ fn render_idle(
         ));
     }
     let key = spec.card_key().to_string();
+    if let Some(current) = saved.current.as_ref().filter(|c| c.ready().is_none()) {
+        body = body.child(render_saved_login_note(&key, current, cx));
+    }
     let can_dismiss = can_dismiss && !saved_busy;
     body.child(
         h_flex()
@@ -833,8 +836,13 @@ fn render_field(
         field.label.clone()
     };
     let key = field_key(spec.card_key(), &field.id);
-    if saved.is_password_field(&field.id) && saved.held_password_field().is_some() {
-        return render_locked_password(spec.card_key(), &label, saved, app, cx);
+    if saved.held_password_field().is_some() {
+        if saved.is_password_field(&field.id) {
+            return render_locked_password(spec.card_key(), &label, saved, app, cx);
+        }
+        if saved.is_name_field(&field.id) {
+            return render_locked_name(spec.card_key(), &field.id, &label, saved, cx);
+        }
     }
     let control = match field.kind {
         UserFormFieldKind::Checkbox => render_checkbox(spec, field, values, app.clone(), cx),
@@ -897,27 +905,76 @@ fn render_field(
             )
         })
         .child(control);
-    if saved.is_name_field(&field.id) {
-        if saved.shows_list() {
-            column = column.child(render_account_list(spec, saved, inputs, app.clone(), cx));
-        }
-        if let Some(current) = saved.current.as_ref().filter(|c| c.ready().is_none()) {
-            let color = match current {
-                SavedLoginUse::Refused { .. } | SavedLoginUse::Unavailable { .. } => theme.danger,
-                _ => theme.muted_foreground,
-            };
-            column = column.child(
-                div()
-                    .id(ElementId::Name(
-                        user_form_saved_note_id(spec.card_key()).into(),
-                    ))
-                    .text_xs()
-                    .text_color(color)
-                    .child(current.note()),
-            );
-        }
+    if saved.is_name_field(&field.id) && saved.shows_list() {
+        column = column.child(render_account_list(spec, saved, inputs, app.clone(), cx));
     }
     column.into_any_element()
+}
+
+/// The name field once a saved password is held: the picked name, read-only, so the name
+/// that is sent is the one the password belongs to. Change (on the password row) frees both.
+fn render_locked_name(
+    card_key: &str,
+    field_id: &str,
+    label: &str,
+    saved: &SavedLoginContext,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let username = saved
+        .current
+        .as_ref()
+        .and_then(SavedLoginUse::ready)
+        .map(|(u, _)| u.to_string())
+        .unwrap_or_default();
+    v_flex()
+        .gap(px(6.))
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            h_flex()
+                .id(ElementId::Name(
+                    user_form_field_id(card_key, field_id).into(),
+                ))
+                .w_full()
+                .items_center()
+                .gap(px(10.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.muted.opacity(0.4))
+                .child(
+                    Icon::default()
+                        .path("icons/key.svg")
+                        .size(px(14.))
+                        .text_color(theme.muted_foreground),
+                )
+                .child(div().flex_1().text_sm().child(username)),
+        )
+        .into_any_element()
+}
+
+/// The line under the fields while a pick is under way, or after one did not go through
+/// (Touch ID cancelled, the keychain empty, the server's refusal). At card level so a
+/// refusal shows on any card, not only one with a name field.
+fn render_saved_login_note(card_key: &str, current: &SavedLoginUse, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let color = match current {
+        SavedLoginUse::Refused { .. } | SavedLoginUse::Unavailable { .. } => theme.danger,
+        _ => theme.muted_foreground,
+    };
+    div()
+        .id(ElementId::Name(user_form_saved_note_id(card_key).into()))
+        .text_xs()
+        .text_color(color)
+        .child(current.note())
+        .into_any_element()
 }
 
 /// The accounts saved for this site, listed under the name field the way a browser's

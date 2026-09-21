@@ -33,7 +33,7 @@ use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
     PendingSave, SavedLoginUse, SiteLoginRecord, SiteLoginVault, login_fields,
-    login_matches_request, login_origin, registrable_origin, save_candidate,
+    login_matches_request, login_origin, origins_match, registrable_origin, save_candidate,
 };
 use crate::threads::conversation_for_thread;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
@@ -2197,6 +2197,14 @@ impl AppState {
     }
 
     pub fn submit_open_user_form(&mut self, card_key: String, cx: &mut Context<Self>) {
+        // The button waits while the Touch ID sheet is up; so does this.
+        if self
+            .saved_login_use
+            .get(&card_key)
+            .is_some_and(SavedLoginUse::is_busy)
+        {
+            return;
+        }
         let values = self.user_form_submit_values(&card_key);
         self.submit_user_form(card_key, values, cx);
     }
@@ -2505,6 +2513,7 @@ impl AppState {
             }
         }
         for (card_key, handoff) in forms {
+            self.saved_login_use.remove(&card_key);
             self.paint_user_form_resolution(&card_key, FormResolution::Superseded);
             if handoff {
                 self.set_computer_handoff(&card_key, ComputerHandoffStatus::Skipped);
@@ -2572,6 +2581,10 @@ impl AppState {
                         // The one thing that clears a session the server had stopped
                         // recognising, and the reason the banner asks for it by name.
                         state.session.signed_in();
+                        // The vault syncs with the server the moment there is a person to
+                        // sync for.
+                        state.site_login_notice = None;
+                        state.reload_site_logins(cx);
                         state.note_server_answered(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
@@ -2597,6 +2610,8 @@ impl AppState {
         let client = self.opengrok.clone();
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
+        self.saved_login_use.clear();
+        self.pending_save.clear();
         self.auth_error = None;
         // A person who has just signed out is not somebody who needs telling they are signed
         // out. The banner is for the case where the app believed otherwise.
@@ -7285,6 +7300,27 @@ impl AppState {
         if resolution != FormResolution::Sending {
             self.user_form_resolutions
                 .insert(card_key.to_string(), resolution);
+            // A settled card holds nothing: a picked password does not outlive the card
+            // it was picked for.
+            if resolution != FormResolution::FillFailed {
+                self.saved_login_use.remove(card_key);
+            }
+        }
+    }
+
+    /// Log in was pressed with a picked password on this card.
+    fn saved_login_in_flight(&self, card_key: &str) -> bool {
+        matches!(
+            self.saved_login_use.get(card_key),
+            Some(SavedLoginUse::Filling { .. })
+        )
+    }
+
+    /// A fill that did not end in Submitted forgets the picked password: the card is back
+    /// to idle (or Not filled), and a new pick asks Touch ID again.
+    fn drop_saved_login_fill(&mut self, card_key: &str) {
+        if self.saved_login_in_flight(card_key) {
+            self.saved_login_use.remove(card_key);
         }
     }
 
@@ -7432,14 +7468,29 @@ impl AppState {
                     vault.list().await
                 }
             };
+            // Which rows have their password on this Mac is a keychain question per row;
+            // it is answered off the UI thread.
+            let list = match list {
+                Ok(rows) => {
+                    let vault = vault.clone();
+                    Ok(cx
+                        .background_executor()
+                        .spawn(async move {
+                            let here: HashSet<String> = rows
+                                .iter()
+                                .filter(|row| vault.secret_present(&row.id))
+                                .map(|row| row.id.clone())
+                                .collect();
+                            (rows, here)
+                        })
+                        .await)
+                }
+                Err(error) => Err(error),
+            };
             let _ = this.update(cx, |state, cx| {
                 match list {
-                    Ok(rows) => {
-                        state.site_logins_on_this_mac = rows
-                            .iter()
-                            .filter(|row| vault.secret_present(&row.id))
-                            .map(|row| row.id.clone())
-                            .collect();
+                    Ok((rows, here)) => {
+                        state.site_logins_on_this_mac = here;
                         state.site_logins = rows;
                         state.site_login_error = None;
                         // Only a successful read makes the vault readable. A vault
@@ -7545,8 +7596,15 @@ impl AppState {
                 Ok(Ok(None)) => match client.as_ref() {
                     Some(client) => match client.reveal_site_login(&row.id).await {
                         Ok(password) => {
-                            if let Err(error) = vault.cache_secret(&row.id, &password) {
-                                log::warn!("could not cache a revealed site login: {error}");
+                            match vault.cache_secret(&row.id, &password) {
+                                Ok(()) => {
+                                    let _ = this.update(cx, |state, _| {
+                                        state.site_logins_on_this_mac.insert(row.id.clone());
+                                    });
+                                }
+                                Err(error) => {
+                                    log::warn!("could not cache a revealed site login: {error}");
+                                }
                             }
                             Ok(Ok(Some(password)))
                         }
@@ -7560,6 +7618,19 @@ impl AppState {
             };
             let _ = this.update(cx, |state, cx| {
                 use crate::site_login::touch_id::TouchIdOutcome;
+                // The card may have settled or been dismissed while the sheet was up; a
+                // password for a card that is gone is not kept.
+                let still_waiting = matches!(
+                    state.saved_login_use.get(&card_key),
+                    Some(SavedLoginUse::Confirming { .. })
+                ) && state
+                    .user_form_mut(&card_key)
+                    .is_some_and(|spec| spec.effective_resolution().is_none());
+                if !still_waiting {
+                    state.saved_login_use.remove(&card_key);
+                    cx.notify();
+                    return;
+                }
                 let next = match unlocked {
                     Ok(Ok(Some(password))) => Some(SavedLoginUse::Ready {
                         login_id: row.id.clone(),
@@ -7616,10 +7687,9 @@ impl AppState {
         else {
             return;
         };
-        values
-            .by_id
-            .entry(fields.username_id)
-            .or_insert(username.clone());
+        // Both fields are locked on the card while a pick is held, so the picked name is the
+        // name that goes with the picked password.
+        values.by_id.insert(fields.username_id, username.clone());
         values.by_id.insert(fields.password_id, password);
         self.saved_login_use
             .insert(card_key.to_string(), SavedLoginUse::Filling { username });
@@ -7639,7 +7709,7 @@ impl AppState {
     fn already_saved_login(&self, origin: &str, username: &str) -> bool {
         self.site_logins
             .iter()
-            .any(|row| row.origin == origin && row.username == username)
+            .any(|row| origins_match(&row.origin, origin) && row.username == username)
     }
 
     fn stash_save_candidate(&mut self, card_key: &str, values: &UserFormValues) {
@@ -7759,29 +7829,30 @@ impl AppState {
         cx.notify();
     }
 
-    /// Settings → Logins → Add. The origin is reduced to the site the vault keys by.
+    /// Settings → Logins → Add. The origin is reduced to the site the vault keys by. True
+    /// when the values were taken (the form may clear); false with the reason on the page.
     pub fn add_site_login(
         &mut self,
         origin: String,
         username: String,
         password: String,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(origin) = registrable_origin(origin.trim()) else {
             self.site_login_error = Some("Enter the site, like facebook.com.".into());
             cx.notify();
-            return;
+            return false;
         };
         let username = username.trim().to_string();
         if username.is_empty() || password.is_empty() {
             self.site_login_error = Some("A username and a password are both needed.".into());
             cx.notify();
-            return;
+            return false;
         }
         let Some(vault) = self.site_login_vault.clone() else {
             self.site_login_error = Some("Login vault is not ready.".into());
             cx.notify();
-            return;
+            return false;
         };
         let client = self.opengrok.clone();
         cx.spawn(async move |this, cx| {
@@ -7802,6 +7873,7 @@ impl AppState {
             });
         })
         .detach();
+        true
     }
 
     /// Settings → Logins → Import: a passwords export (CSV) from the Passwords app or a
@@ -7814,10 +7886,20 @@ impl AppState {
         };
         let client = self.opengrok.clone();
         cx.spawn(async move |this, cx| {
-            let report = match std::fs::read_to_string(&path) {
-                Ok(text) => crate::site_login::import::parse_export(&text),
-                Err(error) => Err(format!("could not read {}: {error}", path.display())),
-            };
+            let report = cx
+                .background_executor()
+                .spawn({
+                    let path = path.clone();
+                    async move {
+                        match std::fs::read_to_string(&path) {
+                            Ok(text) => crate::site_login::import::parse_export(&text),
+                            Err(error) => {
+                                Err(format!("could not read {}: {error}", path.display()))
+                            }
+                        }
+                    }
+                })
+                .await;
             let report = match report {
                 Ok(report) => report,
                 Err(error) => {
@@ -7959,7 +8041,11 @@ impl AppState {
         }
         match &action {
             UserFormDispatch::Submit(values) => {
-                self.stash_save_candidate(&card_key, values);
+                // A login that came from the vault is not offered to the vault again, and
+                // its password is not kept on the side for a save that will not happen.
+                if !self.saved_login_in_flight(&card_key) {
+                    self.stash_save_candidate(&card_key, values);
+                }
                 self.paint_user_form_resolution(&card_key, FormResolution::Sending);
                 self.user_form_saved_login_note_only_when_idle(&card_key);
                 if self
@@ -8050,13 +8136,11 @@ impl AppState {
         }
         let Some(client) = self.opengrok.clone() else {
             self.restore_user_form(&card_key);
+            self.drop_saved_login_fill(&card_key);
             self.settle_chrome_and_drain(&conversation_id, cx);
             return;
         };
-        let saved_login = matches!(
-            self.saved_login_use.get(&card_key),
-            Some(SavedLoginUse::Filling { .. })
-        );
+        let saved_login = self.saved_login_in_flight(&card_key);
         cx.spawn(async move |this, cx| {
             let verb = match &action {
                 UserFormDispatch::Submit(_) => UserFormVerb::Submit,
@@ -8142,6 +8226,7 @@ impl AppState {
                             UserFormHttpSettle::Paint(resolution) => {
                                 // After Sending: Not filled on 200-null / 404.
                                 // Submitted only from a body formResolution (Merge).
+                                state.drop_saved_login_fill(&card_key);
                                 state.paint_user_form_resolution(&card_key, resolution);
                                 state.user_form_restore.remove(&card_key);
                                 if resolution != FormResolution::FillFailed {
@@ -8164,6 +8249,7 @@ impl AppState {
                             }
                             UserFormHttpSettle::Restore => {
                                 state.restore_user_form(&card_key);
+                                state.drop_saved_login_fill(&card_key);
                             }
                             UserFormHttpSettle::Refused(message) => {
                                 // Nothing was typed; the fields come back, with the reason.
@@ -8177,6 +8263,7 @@ impl AppState {
                     Err(error) => {
                         match verb {
                             UserFormVerb::Submit => {
+                                state.drop_saved_login_fill(&card_key);
                                 state.paint_user_form_resolution(
                                     &card_key,
                                     FormResolution::FillFailed,
@@ -9226,10 +9313,19 @@ async fn sync_site_logins(
         }
     }
     for mine in &local {
-        let on_server = remote.iter().any(|row| {
-            row.id == mine.id || (row.origin == mine.origin && row.username == mine.username)
-        });
-        if on_server {
+        if remote.iter().any(|row| row.id == mine.id) {
+            continue;
+        }
+        // The same login under another id: the server's id wins, and the keychain item
+        // moves with it, so a later delete reaches both.
+        if let Some(twin) = remote
+            .iter()
+            .find(|row| row.origin == mine.origin && row.username == mine.username)
+        {
+            vault
+                .adopt_id(&mine.id, &twin.id)
+                .await
+                .map_err(|error| error.to_string())?;
             continue;
         }
         // Only a row with its password here can be filed on the server.

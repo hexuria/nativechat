@@ -48,12 +48,15 @@ pub struct LoginFields {
 /// email field, else one named like one (email, user, login, phone), else the first plain
 /// text or phone field. An OTP-only or password-only card takes none.
 pub fn login_fields(spec: &UserFormSpec) -> Option<LoginFields> {
-    let password_id = spec
+    // Two password fields is a sign-up or a change, not a login.
+    let mut passwords = spec
         .fields
         .iter()
-        .find(|field| field.kind == UserFormFieldKind::Password)?
-        .id
-        .clone();
+        .filter(|field| field.kind == UserFormFieldKind::Password);
+    let password_id = passwords.next()?.id.clone();
+    if passwords.next().is_some() {
+        return None;
+    }
     let candidates = spec.fields.iter().filter(|field| {
         matches!(
             field.kind,
@@ -265,6 +268,16 @@ mod tests {
             login_fields(&spec).map(|f| f.username_id).as_deref(),
             Some("email")
         );
+    }
+
+    #[test]
+    fn a_sign_up_card_with_two_password_fields_takes_no_saved_login() {
+        let spec = card_with(vec![
+            field("email", UserFormFieldKind::Email),
+            field("password", UserFormFieldKind::Password),
+            field("confirm", UserFormFieldKind::Password),
+        ]);
+        assert_eq!(login_fields(&spec), None);
     }
 
     #[test]

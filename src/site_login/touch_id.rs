@@ -12,6 +12,7 @@
 //! in the keychain, so it protects against a distracted person and a curious bystander, not
 //! against code running as the same user.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -25,6 +26,9 @@ const DEVICE_OWNER_AUTHENTICATION: i64 = 2;
 
 /// How long the sheet may stay up before we give up on it (the person walked away).
 const SHEET_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One sheet at a time: a second ask while one is up would stack two system dialogs.
+static SHEET_UP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TouchIdOutcome {
@@ -43,7 +47,12 @@ pub enum TouchIdOutcome {
 /// thread, never from the UI thread.
 pub fn confirm_use(origin: &str, username: &str) -> TouchIdOutcome {
     let reason = format!("use the saved login for {origin} as {username}");
-    prompt(&reason)
+    if SHEET_UP.swap(true, Ordering::SeqCst) {
+        return TouchIdOutcome::Unavailable("another Touch ID sheet is already up".to_string());
+    }
+    let outcome = objc::rc::autoreleasepool(|| prompt(&reason));
+    SHEET_UP.store(false, Ordering::SeqCst);
+    outcome
 }
 
 fn prompt(reason: &str) -> TouchIdOutcome {
@@ -75,6 +84,8 @@ fn prompt(reason: &str) -> TouchIdOutcome {
         .copy();
         let ns_reason = NSString::alloc(nil).init_str(reason);
         let _: () = msg_send![context, evaluatePolicy: DEVICE_OWNER_AUTHENTICATION localizedReason: ns_reason reply: &*reply];
+        // LAContext copies the reason; ours is released here.
+        let _: () = msg_send![ns_reason, release];
         let outcome = match rx.recv_timeout(SHEET_TIMEOUT) {
             Ok((true, _)) => TouchIdOutcome::Verified,
             Ok((false, why)) if is_cancel(&why) => TouchIdOutcome::Cancelled,

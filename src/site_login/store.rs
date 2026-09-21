@@ -121,6 +121,13 @@ impl SiteLoginVault {
     ) -> Result<SiteLoginRecord, StoreError> {
         let now = chrono::Utc::now().to_rfc3339();
         let label = format!("{username} on {origin}");
+        // A row already here under another id moves to this one, keychain item included,
+        // so no copy is left behind under an id nothing points at.
+        if let Some(existing) = self.find(origin, Some(username)).await?
+            && existing.id != id
+        {
+            self.adopt_id(&existing.id, id).await?;
+        }
         self.secrets.set(id, password)?;
         sqlx::query(
             "INSERT INTO site_logins (id, origin, username, label, created_at, updated_at)
@@ -348,5 +355,27 @@ mod tests {
             .await
             .expect("save with id");
         assert_eq!(saved.id, "sl_new");
+        // The same login saved under the server's id later: one row, one keychain item.
+        let local = vault.save("y.com", "cy", "pw1").await.expect("save");
+        let moved = vault
+            .save_with_id("sl_y", "y.com", "cy", "pw2")
+            .await
+            .expect("save with id");
+        assert_eq!(moved.id, "sl_y");
+        assert!(!vault.secret_present(&local.id), "the old item moved");
+        assert_eq!(
+            vault.secret_for_fill("sl_y").expect("get").as_deref(),
+            Some("pw2")
+        );
+        assert_eq!(
+            vault
+                .list()
+                .await
+                .expect("list")
+                .iter()
+                .filter(|r| r.origin == "y.com")
+                .count(),
+            1
+        );
     }
 }

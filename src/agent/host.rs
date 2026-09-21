@@ -14,7 +14,8 @@ use crate::opengrok::{
     computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
     computer_window_attention_skip_id, save_login_card_id, save_login_save_id, save_login_skip_id,
     user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
-    user_form_pill_id, user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
+    user_form_pill_id, user_form_saved_clear_id, user_form_saved_note_id, user_form_screen_id,
+    user_form_use_saved_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -115,6 +116,16 @@ pub mod ids {
     }
 }
 
+/// A value the driver hands the app that must not show up in any `{:?}` of a command.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedactedSecret(pub String);
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     NewChat,
@@ -185,11 +196,15 @@ pub enum Command {
         card_key: String,
         login_id: String,
     },
+    /// "Change" on a locked card: the held password is dropped.
+    UserFormClearSaved {
+        card_key: String,
+    },
     /// Settings → Logins → Add, with the values the driver gives.
     AddSiteLogin {
         origin: String,
         username: String,
-        password: String,
+        password: RedactedSecret,
     },
     /// Settings → Logins → Import, from a file path the driver gives (no picker).
     ImportSiteLogins {
@@ -316,11 +331,14 @@ impl Command {
             Self::UserFormUseSaved { card_key, login_id } => {
                 state.pick_saved_login(card_key, login_id, cx)
             }
+            Self::UserFormClearSaved { card_key } => state.clear_saved_login_pick(card_key, cx),
             Self::AddSiteLogin {
                 origin,
                 username,
                 password,
-            } => state.add_site_login(origin, username, password, cx),
+            } => {
+                state.add_site_login(origin, username, password.0, cx);
+            }
             Self::ImportSiteLogins { path } => {
                 state.import_site_logins(std::path::PathBuf::from(path), cx)
             }
@@ -702,6 +720,8 @@ struct UserFormSnap {
     saved_logins: Vec<(String, String, String)>,
     /// The line under the name field while a pick is under way, or after it was not.
     saved_login_note: Option<String>,
+    /// A picked password is held: the fields are locked and Change frees them.
+    saved_login_held: bool,
 }
 
 #[derive(Clone)]
@@ -774,6 +794,9 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
     }
     if let Some(note) = &form.saved_login_note {
         card = card.with_child(UiNode::status(user_form_saved_note_id(key), note.clone()));
+    }
+    if form.saved_login_held {
+        card = card.with_child(UiNode::button(user_form_saved_clear_id(key), "Change"));
     }
     card.with_child(UiNode::button(
         user_form_continue_id(key),
@@ -1035,6 +1058,8 @@ pub struct NativeChatHost {
     save_logins: Vec<SaveLoginSnap>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
+    /// What the last Add / Import / sync said on Settings → Logins.
+    site_login_notice: Option<String>,
     computer_tab: bool,
     updates_tab: bool,
     /// Dedicated provisioned box: Route traffic icon on the Computer pane.
@@ -1272,7 +1297,11 @@ impl NativeChatHost {
                             })
                             .collect()
                     };
-                    let saved_logins = if pill.is_some() {
+                    let current = state.saved_login_use.get(&key);
+                    // The list shows until a pick is under way or held, as on screen.
+                    let list_shows =
+                        !current.is_some_and(|use_| use_.is_busy() || use_.ready().is_some());
+                    let saved_logins = if pill.is_some() || !list_shows {
                         Vec::new()
                     } else {
                         state
@@ -1281,10 +1310,8 @@ impl NativeChatHost {
                             .map(|row| (row.id, row.username, row.origin))
                             .collect()
                     };
-                    let saved_login_note = state
-                        .saved_login_use
-                        .get(&key)
-                        .map(crate::site_login::SavedLoginUse::note);
+                    let saved_login_note = current.map(crate::site_login::SavedLoginUse::note);
+                    let saved_login_held = current.is_some_and(|use_| use_.ready().is_some());
                     UserFormSnap {
                         title: if spec.title.is_empty() {
                             "Form".into()
@@ -1294,6 +1321,7 @@ impl NativeChatHost {
                         fields,
                         saved_logins,
                         saved_login_note,
+                        saved_login_held,
                         card_key: key,
                         pill,
                         continue_label: spec.continue_label(),
@@ -1344,6 +1372,7 @@ impl NativeChatHost {
                 })
                 .collect(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
+            site_login_notice: state.site_login_notice.clone(),
             computer_tab: state.app_settings_tab == AppSettingsTab::Computer,
             updates_tab: state.app_settings_tab == AppSettingsTab::Updates,
             route_traffic_on_bot_pane: state.show_route_traffic_on_bot_pane(),
@@ -1648,6 +1677,18 @@ impl NativeChatHost {
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"));
                         if self.logins_tab {
+                            settings = settings
+                                .with_child(UiNode::button("settings-login-add", "Add"))
+                                .with_child(UiNode::button(
+                                    "settings-login-import",
+                                    "Import a passwords export…",
+                                ));
+                            if let Some(notice) = &self.site_login_notice {
+                                settings = settings.with_child(UiNode::status(
+                                    "settings-logins-notice",
+                                    notice.clone(),
+                                ));
+                            }
                             if self.site_logins.is_empty() {
                                 settings = settings.with_child(UiNode::status(
                                     "settings-logins-empty",
@@ -1862,6 +1903,11 @@ impl NativeChatHost {
                         login_id: login_id.clone(),
                     });
                 }
+            }
+            if form.saved_login_held && target == user_form_saved_clear_id(key) {
+                return Some(Command::UserFormClearSaved {
+                    card_key: key.clone(),
+                });
             }
             if target == user_form_dismiss_id(key) {
                 return Some(Command::UserFormDismiss {
@@ -2441,8 +2487,13 @@ impl NativeChatHost {
                     .ok_or_else(|| "logins.add requires arg origin".to_string())?,
                 username: invoke_arg_str(args, &["username", "user"])
                     .ok_or_else(|| "logins.add requires arg username".to_string())?,
-                password: invoke_arg_str(args, &["password"])
-                    .ok_or_else(|| "logins.add requires arg password".to_string())?,
+                password: RedactedSecret(
+                    invoke_arg_str(args, &["password"])
+                        .ok_or_else(|| "logins.add requires arg password".to_string())?,
+                ),
+            },
+            "UserFormClearSaved" | "user-form.clear-saved" => Command::UserFormClearSaved {
+                card_key: self.invoke_user_form_card_key(args)?,
             },
             "ImportSiteLogins" | "logins.import" => Command::ImportSiteLogins {
                 path: invoke_arg_str(args, &["path", "file"])
@@ -3373,6 +3424,29 @@ mod tests {
             host.take_command(),
             Some(Command::UserFormUseSaved { login_id, .. }) if login_id == "sl_2"
         ));
+        // A held password: the rows are gone, Change is there, and a click frees the card.
+        host.user_forms[0].saved_logins.clear();
+        host.user_forms[0].saved_login_held = true;
+        let tree = host.snapshot();
+        assert!(tree.find("user-form-use-saved-e_form-sl_1").is_none());
+        assert!(tree.find("user-form-saved-clear-e_form").is_some());
+        host.dispatch(&Op::click("user-form-saved-clear-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormClearSaved { card_key }) if card_key == "e_form"
+        ));
+        // The password the driver hands over never shows in a command's Debug.
+        host.invoke(
+            "logins.add",
+            &serde_json::json!({ "origin": "x.com", "username": "a", "password": "hunter2" }),
+        )
+        .unwrap();
+        let shown = format!("{:?}", host.take_command());
+        assert!(
+            shown.contains("AddSiteLogin") && !shown.contains("hunter2"),
+            "{shown}"
+        );
     }
 
     fn google_login_form() -> UserFormSnap {
@@ -3381,6 +3455,7 @@ mod tests {
             continue_label: "Continue",
             saved_logins: Vec::new(),
             saved_login_note: None,
+            saved_login_held: false,
             title: "Google account".into(),
             fields: vec![
                 UserFormFieldSnap {
@@ -3481,6 +3556,7 @@ mod tests {
             continue_label: "Continue",
             saved_logins: Vec::new(),
             saved_login_note: None,
+            saved_login_held: false,
             title: "Website login".into(),
             fields: vec![UserFormFieldSnap {
                 id: "email".into(),
@@ -3612,6 +3688,7 @@ mod tests {
             continue_label: "Continue",
             saved_logins: Vec::new(),
             saved_login_note: None,
+            saved_login_held: false,
             title: "Google account".into(),
             fields: Vec::new(),
             pill: Some("Dismissed".into()),
