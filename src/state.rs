@@ -2286,8 +2286,9 @@ impl AppState {
         self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
     }
 
-    /// Dedicated → bot Computer pane header icon. User (or unknown + shared
-    /// `boxId`) → Settings → Computer. Group/org → hide. Unprovisioned → hide.
+    /// Dedicated or group → the Computer pane header (a group's computer is the group's
+    /// own, like a bot's). User or org (or unknown + shared `boxId`) → Settings → Computer
+    /// (an org's is set by its admin; members see it). Unprovisioned → hide.
     pub fn route_traffic_surface(&self) -> RouteTrafficSurface {
         if !self.box_egress_provisioned() {
             return RouteTrafficSurface::Hidden;
@@ -2297,9 +2298,12 @@ impl AppState {
             .as_ref()
             .and_then(|computer| computer.share_scope)
         {
-            Some(BoxShareScope::Dedicated) => RouteTrafficSurface::BotPane,
-            Some(BoxShareScope::User) => RouteTrafficSurface::UserSettings,
-            Some(BoxShareScope::Group) | Some(BoxShareScope::Org) => RouteTrafficSurface::Hidden,
+            Some(BoxShareScope::Dedicated) | Some(BoxShareScope::Group) => {
+                RouteTrafficSurface::BotPane
+            }
+            Some(BoxShareScope::User) | Some(BoxShareScope::Org) => {
+                RouteTrafficSurface::UserSettings
+            }
             None if self.box_shared_among_coworkers() => RouteTrafficSurface::UserSettings,
             None => RouteTrafficSurface::BotPane,
         }
@@ -2319,6 +2323,15 @@ impl AppState {
         self.coworker_computer
             .as_ref()
             .and_then(|computer| computer.egress_policy)
+    }
+
+    /// The open bot's computer is the organization's: its network choice is the admin's to
+    /// set, and the row says so.
+    pub fn computer_is_org_shared(&self) -> bool {
+        self.coworker_computer
+            .as_ref()
+            .and_then(|computer| computer.share_scope)
+            == Some(BoxShareScope::Org)
     }
 
     /// The choice sits where Route traffic sits, and only when there is one to show.
@@ -12240,6 +12253,12 @@ mod tests {
             "egressPolicy": "bypass"
         })));
         assert!(!state.show_egress_policy_on_bot_pane());
+        assert!(state.show_egress_policy_in_user_settings());
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "group",
+            "egressPolicy": "ask"
+        })));
+        assert!(state.show_egress_policy_on_bot_pane());
         assert!(!state.show_egress_policy_in_user_settings());
     }
 
@@ -12287,12 +12306,21 @@ mod tests {
             "shareScope": "group",
             "groupId": "grp_1"
         })));
-        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::BotPane,
+            "a group's computer is the group's own: its pane"
+        );
 
         state.coworker_computer = Some(computer(serde_json::json!({
             "shareScope": "org"
         })));
-        assert_eq!(state.route_traffic_surface(), RouteTrafficSurface::Hidden);
+        assert_eq!(
+            state.route_traffic_surface(),
+            RouteTrafficSurface::UserSettings,
+            "an org's computer is shared: Settings → Computer"
+        );
+        assert!(state.computer_is_org_shared());
 
         state.coworker_computer = Some(computer(serde_json::json!({})));
         state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_1")];

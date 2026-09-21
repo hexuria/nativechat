@@ -700,7 +700,8 @@ fn computer_page(
             this.child(settings_route_traffic_row(app.clone(), muted, cx))
         })
         .when_some(egress_policy, |this, current| {
-            this.child(settings_egress_policy_row(app.clone(), current, muted))
+            let org = app.read(cx).computer_is_org_shared();
+            this.child(settings_egress_policy_row(app.clone(), current, org, muted))
         })
         .child(div().text_xs().text_color(muted).child("This Mac"))
         .child(
@@ -784,8 +785,20 @@ fn settings_route_traffic_row(app: Entity<AppState>, muted: Hsla, cx: &App) -> i
 fn settings_egress_policy_row(
     app: Entity<AppState>,
     current: LocalExecMode,
+    org: bool,
     muted: Hsla,
 ) -> impl IntoElement {
+    let (title, description) = if org {
+        (
+            "Use your network from the organization's computer",
+            "Whether Bots on the organization's shared computer may reach the web through this desktop without asking each time. Set by the organization's admin for every member.",
+        )
+    } else {
+        (
+            "Use your network from this computer",
+            "Whether Bots on this computer may reach the web through this desktop without asking each time. Never allow keeps their browser off while traffic is routed here.",
+        )
+    };
     h_flex()
         .id("egress-policy-row")
         .w_full()
@@ -802,10 +815,8 @@ fn settings_egress_policy_row(
                 .flex_1()
                 .min_w(px(0.))
                 .gap(px(2.))
-                .child(div().text_sm().child("Use your network from this computer"))
-                .child(div().text_xs().text_color(muted).child(
-                    "Whether Bots on this computer may reach the web through this desktop without asking each time. Never allow keeps their browser off while traffic is routed here.",
-                )),
+                .child(div().text_sm().child(title))
+                .child(div().text_xs().text_color(muted).child(description)),
         )
         .child(egress_policy_picker(current, app))
 }
