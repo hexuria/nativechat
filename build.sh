@@ -9,8 +9,19 @@ cd "$ROOT"
 # shellcheck source=scripts/stop-nativechat-for-codesign.sh
 source "$ROOT/scripts/stop-nativechat-for-codesign.sh"
 
-BUNDLE_ID="dev.hexuria.nativechat"
+BUNDLE_ID="dev.goldcoders.nativechat"
 APP="target/release/bundle/osx/NativeChat.app"
+
+# The keychain records an item's permission against a signature, so an ad-hoc one — a fresh
+# hash on every build — makes the app a stranger to its own saved logins each time it is
+# rebuilt. The team's Developer ID keeps that permission from build to build, and it is the
+# same identity the dev binary carries (scripts/sign-dev.sh). NATIVECHAT_SIGN_ID overrides;
+# "-" goes back to ad-hoc.
+SIGN_ID="${NATIVECHAT_SIGN_ID:-Developer ID Application: Goldcoders Corp (5KZ8MD34QW)}"
+if [ "$SIGN_ID" != "-" ] && ! security find-identity -v -p codesigning | grep -qF "$SIGN_ID"; then
+  echo "warning: no identity called \"$SIGN_ID\"; signing ad-hoc, the keychain will ask again after every build" >&2
+  SIGN_ID="-"
+fi
 
 echo "🚀 Building NativeChat with microphone permissions..."
 echo ""
@@ -36,7 +47,7 @@ plutil -replace NSMicrophoneUsageDescription -string "NativeChat needs access to
 # breaks Screen Recording TCC continuity across remasures.
 echo "✍️  Step 3/3: Re-signing with entitlements..."
 stop_nativechat_for_codesign
-codesign --force --deep --sign - --identifier "$BUNDLE_ID" \
+codesign --force --deep --sign "$SIGN_ID" --identifier "$BUNDLE_ID" \
   --entitlements ./nativechat.entitlements \
   "$APP"
 

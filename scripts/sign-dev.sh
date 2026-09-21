@@ -17,7 +17,7 @@ set -euo pipefail
 
 BIN="${1:-target/debug/nativechat}"
 IDENTITY="${NATIVECHAT_SIGN_ID:-Developer ID Application: Goldcoders Corp (5KZ8MD34QW)}"
-BUNDLE_ID="${NATIVECHAT_BUNDLE_ID:-dev.hexuria.nativechat}"
+BUNDLE_ID="${NATIVECHAT_BUNDLE_ID:-dev.goldcoders.nativechat}"
 
 if [[ "$(uname -s)" != Darwin ]]; then
   exit 0

@@ -18,6 +18,8 @@ anyhow = "1.0"
 name = "nativechat"
 version = "0.1.0"
 edition = "2024"
+# `cargo bundle` will not build the .app without it.
+description = "Chat with bots that work on their own computers."
 
 [features]
 default = []
@@ -64,7 +66,7 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 
 [package.metadata.bundle]
 name = "NativeChat"
-identifier = "dev.hexuria.nativechat"
+identifier = "dev.goldcoders.nativechat"
 short_description = "A native chat application."
 resources = ["themes/", "assets/"]
 macOS_entitlements_path = "./nativechat.entitlements"
