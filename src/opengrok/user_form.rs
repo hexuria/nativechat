@@ -711,8 +711,9 @@ impl UserFormSpec {
             )
         });
         // A login card is a username beside a password on one page that submits: only then
-        // does "Log in" promise what pressing it does. A stepped card, a password change or
-        // a sign-up keeps "Continue".
+        // does "Log in" promise what pressing it does. A stepped card or a password change
+        // keeps "Continue". (A sign-up with a name, an email and a password on one page reads
+        // as a login too; the server treats it the same, and the button still submits it.)
         if has_password && has_username && (self.same_page || self.submit) {
             "Log in"
         } else {
@@ -838,6 +839,10 @@ impl UserFormSpec {
         }
         self.computer_handoff =
             ComputerHandoffStatus::fold(self.computer_handoff, incoming.computer_handoff);
+        // The one-page marks are facts about the form, not the event: whichever event
+        // carried them wins, and a handoff card that arrived first cannot unset them.
+        self.same_page |= incoming.same_page;
+        self.submit |= incoming.submit;
         if incoming.resolution == Some(FormResolution::Skipped)
             || incoming.resolution == Some(FormResolution::Submitted)
             || incoming.resolution == Some(FormResolution::FillFailed)
