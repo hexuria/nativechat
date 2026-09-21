@@ -68,6 +68,9 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 name = "NativeChat"
 identifier = "dev.goldcoders.nativechat"
 short_description = "A native chat application."
+# The app's own mark, the cyan blob it wears in its sidebar. Without this the .app has no
+# icon at all and the Dock, Finder and every launcher show the blank sheet of paper.
+icon = ["assets/appicon/AppIcon.icns"]
 resources = ["themes/", "assets/"]
 macOS_entitlements_path = "./nativechat.entitlements"
 NSMicrophoneUsageDescription = "NativeChat needs access to your microphone for voice input."
