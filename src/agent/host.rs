@@ -677,6 +677,8 @@ struct UserFormSnap {
     fields: Vec<UserFormFieldSnap>,
     /// None = idle (fields still on screen).
     pill: Option<String>,
+    /// What the primary button says: "Log in" on a one-page login, else "Continue".
+    continue_label: &'static str,
 }
 
 #[derive(Clone)]
@@ -748,9 +750,12 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
         };
         card = card.with_child(node);
     }
-    card.with_child(UiNode::button(user_form_continue_id(key), "Continue"))
-        .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
-        .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
+    card.with_child(UiNode::button(
+        user_form_continue_id(key),
+        form.continue_label,
+    ))
+    .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
+    .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
 }
 
 fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
@@ -1294,6 +1299,7 @@ impl NativeChatHost {
                         fields,
                         card_key: key,
                         pill,
+                        continue_label: spec.continue_label(),
                     }
                 })
                 .collect(),
@@ -3387,6 +3393,7 @@ mod tests {
     fn google_login_form() -> UserFormSnap {
         UserFormSnap {
             card_key: "e_form".into(),
+            continue_label: "Continue",
             title: "Google account".into(),
             fields: vec![
                 UserFormFieldSnap {
@@ -3484,6 +3491,7 @@ mod tests {
         let mut host = host();
         host.user_forms = vec![UserFormSnap {
             card_key: "call-9".into(),
+            continue_label: "Continue",
             title: "Website login".into(),
             fields: vec![UserFormFieldSnap {
                 id: "email".into(),
@@ -3612,6 +3620,7 @@ mod tests {
 
         host.user_forms = vec![UserFormSnap {
             card_key: "e_form".into(),
+            continue_label: "Continue",
             title: "Google account".into(),
             fields: Vec::new(),
             pill: Some("Dismissed".into()),

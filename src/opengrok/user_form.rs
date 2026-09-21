@@ -613,6 +613,8 @@ impl ComputerHandoffSpec {
             fields: Vec::new(),
             domain: None,
             live_host: None,
+            same_page: false,
+            submit: false,
             resolution: None,
             widget_dismissed: false,
             handoff_entry_id: self.handoff_entry_id.clone(),
@@ -662,6 +664,10 @@ pub struct UserFormSpec {
     pub fields: Vec<UserFormField>,
     pub domain: Option<String>,
     pub live_host: Option<String>,
+    /// The fields share one page (`samePage` on the wire); with `submit`, the fill presses
+    /// the page's own Log in. Together they say whether this card IS a login.
+    pub same_page: bool,
+    pub submit: bool,
     pub resolution: Option<FormResolution>,
     pub widget_dismissed: bool,
     /// HTTP convenience from dismiss `mode: escalated`. Not the form card id.
@@ -698,7 +704,16 @@ impl UserFormSpec {
             .fields
             .iter()
             .any(|field| field.kind == UserFormFieldKind::Password);
-        if has_password && self.fields.len() > 1 {
+        let has_username = self.fields.iter().any(|field| {
+            matches!(
+                field.kind,
+                UserFormFieldKind::Email | UserFormFieldKind::Text | UserFormFieldKind::Tel
+            )
+        });
+        // A login card is a username beside a password on one page that submits: only then
+        // does "Log in" promise what pressing it does. A stepped card, a password change or
+        // a sign-up keeps "Continue".
+        if has_password && has_username && (self.same_page || self.submit) {
             "Log in"
         } else {
             "Continue"
@@ -934,6 +949,14 @@ impl UserFormSpec {
                     string_field(req, "liveHost").or_else(|| string_field(req, "live_host"))
                 })
                 .or_else(|| string_field(value, "liveHost")),
+            same_page: request
+                .and_then(|req| bool_at(req, "samePage"))
+                .or_else(|| bool_at(value, "samePage"))
+                .unwrap_or(false),
+            submit: request
+                .and_then(|req| bool_at(req, "submit"))
+                .or_else(|| bool_at(value, "submit"))
+                .unwrap_or(false),
             resolution,
             widget_dismissed,
             handoff_entry_id: parse_handoff_entry_id(value)
@@ -1499,13 +1522,15 @@ pub fn bind_call_peers(specs: &mut [UserFormSpec], call_id: &str, resolution: Fo
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde_json::json;
 
     /// The card's button names the page's own: a one-page login says Log in; a lone email or
     /// a code says Continue.
     #[test]
     fn the_button_says_log_in_only_for_a_one_page_login() {
         let login = UserFormSpec::from_tool_args(
-            &serde_json::json!({ "title": "Log in", "samePage": true, "fields": [
+            &serde_json::json!({ "title": "Log in", "samePage": true, "submit": true, "fields": [
                 { "id": "email", "label": "Email", "type": "email" },
                 { "id": "password", "label": "Password", "type": "password" }
             ]}),
@@ -1529,9 +1554,17 @@ mod tests {
         )
         .expect("spec");
         assert_eq!(password_only.continue_label(), "Continue");
+        // Two fields with a password but no page to submit: still Continue.
+        let stepped = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Sign in", "fields": [
+                { "id": "email", "label": "Email", "type": "email" },
+                { "id": "password", "label": "Password", "type": "password" }
+            ]}),
+            "c_4",
+        )
+        .expect("spec");
+        assert_eq!(stepped.continue_label(), "Continue");
     }
-    use super::*;
-    use serde_json::json;
 
     fn google_email_request() -> Value {
         json!({
