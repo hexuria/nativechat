@@ -16,9 +16,14 @@ One pane on the left: a search field and a "+" (the Add sheet: Title, User Name,
 
 Knowing which rows the keychain holds — a password, a code seed — is asked by name, which
 needs no unlocking; the secret itself is read only when the person opens that row or after
-Touch ID on a card. That is why the list and the page paint without a keychain sheet. A
-development build is a differently signed program each time it is rebuilt, so macOS asks
-again for the first read after every build; a signed build ends that.
+Touch ID on a card. That is why the list and the page paint without a keychain sheet.
+
+The keychain trusts a program by its signature, not its path, so an unsigned build is a
+stranger to it after every compile and the first read puts the OS password sheet up
+whatever Touch ID just said. `scripts/sign-dev.sh` signs the dev binary with the team's
+Developer ID — the same identity the shipped app uses — so the permission given once
+carries from build to build and on to the shipped app. `just run` does it as part of the
+loop; a build launched some other way should be signed the same way.
 
 Site icons come from the server's `GET /site-logins/icon/{origin}`, one request per site, misses remembered; a site with none shows its first letter.
 
