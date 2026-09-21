@@ -1454,7 +1454,7 @@ impl NativeChatHost {
                 .iter()
                 .map(|row| SiteLoginSnap {
                     on_this_mac: state.site_logins_on_this_mac.contains(&row.id),
-                    has_code: state.site_login_codes.contains_key(&row.id),
+                    has_code: state.site_logins_with_code.contains(&row.id),
                     row: row.clone(),
                 })
                 .collect(),

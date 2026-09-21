@@ -782,6 +782,9 @@ struct SavedLoginContext {
     rows: Vec<crate::site_login::SiteLoginRecord>,
     target: Option<crate::site_login::CardTarget>,
     current: Option<SavedLoginUse>,
+    /// The list is up: the person put the cursor in the field it belongs to. A card that
+    /// has just arrived has it down.
+    open: bool,
 }
 
 impl SavedLoginContext {
@@ -792,6 +795,7 @@ impl SavedLoginContext {
         let state = app.read(cx);
         let rows = state.saved_logins_for_form(spec);
         let current = state.saved_login_use.get(spec.card_key()).cloned();
+        let open = state.user_form_list_open.contains(spec.card_key());
         let target = crate::site_login::card_target(spec);
         let target = if rows.is_empty()
             && current.is_none()
@@ -805,6 +809,7 @@ impl SavedLoginContext {
             rows,
             target,
             current,
+            open,
         }
     }
 
@@ -875,7 +880,8 @@ impl SavedLoginContext {
 
     /// The account list shows until a pick is under way or held.
     fn shows_list(&self) -> bool {
-        !self.rows.is_empty()
+        self.open
+            && !self.rows.is_empty()
             && !matches!(
                 self.current,
                 Some(SavedLoginUse::Confirming { .. })
@@ -955,10 +961,24 @@ fn render_field(
         }
     };
     let field_el = user_form_field_id(spec.card_key(), &field.id);
-    let control = div()
+    let mut control = div()
         .id(ElementId::Name(field_el.into()))
         .w_full()
         .child(control);
+    // A click in the field the accounts belong to brings the list up, whether or not the
+    // cursor was already there. The focus event covers tabbing into it.
+    if saved.list_field() == Some(field.id.as_str()) && !saved.shows_list() {
+        let app = app.clone();
+        let card_key = spec.card_key().to_string();
+        let field_id = field.id.clone();
+        control = control.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            if let Some(app) = &app {
+                app.update(cx, |state, cx| {
+                    state.open_saved_login_list(card_key.clone(), &field_id, cx);
+                });
+            }
+        });
+    }
     let show_label = field.kind != UserFormFieldKind::Checkbox;
     let mut column = v_flex()
         .gap(px(6.))
@@ -972,7 +992,7 @@ fn render_field(
         })
         .child(control);
     if saved.list_field() == Some(field.id.as_str()) && saved.shows_list() {
-        column = column.child(render_account_list(spec, saved, inputs, app.clone(), cx));
+        column = column.child(floating_account_list(spec, saved, inputs, app.clone(), cx));
     }
     column.into_any_element()
 }
@@ -1230,6 +1250,68 @@ fn render_saved_login_note(card_key: &str, current: &SavedLoginUse, cx: &App) ->
         .into_any_element()
 }
 
+/// How wide the floating list is. It floats free of the card's own column, so it carries
+/// its own width the way a menu does rather than stretching to the field.
+const LIST_WIDTH: f32 = 300.;
+
+/// The room the list keeps under itself. It does two things at once: the turn is decided
+/// on the list plus this, so the list turns over while the composer's height still lies
+/// between it and the window's edge; and once it has turned over, this is what lifts it
+/// clear of the field it belongs to instead of leaving it sitting on top of it.
+const FIELD_CLEARANCE: f32 = 64.;
+
+/// The account list, floating over the card instead of pushing the password field and the
+/// buttons down it. It hangs under the name field while there is room and turns over above
+/// it when there is not — a card sitting near the composer, say. `anchored` makes that
+/// choice itself, from the window's own edge, and the element left behind in the column has
+/// no height, so nothing moves either way.
+fn floating_account_list(
+    spec: &UserFormSpec,
+    saved: &SavedLoginContext,
+    inputs: &UserFormInputMap,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    let card_key = spec.card_key().to_string();
+    let away = app.clone();
+    let list = render_account_list(spec, saved, inputs, app, cx);
+    div()
+        .relative()
+        .w_full()
+        .h(px(0.))
+        .child(
+            deferred(
+                anchored()
+                    .position_mode(AnchoredPositionMode::Local)
+                    .position(point(px(0.), px(0.)))
+                    .child(
+                        // The tail is empty room, and it is what makes the turn land right:
+                        // the right way up it keeps the list off the composer, and turned
+                        // over it holds the list above the field rather than over it.
+                        v_flex()
+                            .w(px(LIST_WIDTH))
+                            .child(list)
+                            .child(div().w_full().h(px(FIELD_CLEARANCE)))
+                            // A click anywhere else is not a choice: the list goes away and
+                            // the field is free to type in. The cursor back in that field
+                            // brings it back.
+                            .on_mouse_down_out(move |_, window, cx| {
+                                // The field lets go too, so putting the cursor back in it
+                                // is a fresh focus and the list comes up again.
+                                window.blur(cx);
+                                if let Some(app) = &away {
+                                    app.update(cx, |state, cx| {
+                                        state.close_saved_login_list(card_key.clone(), cx);
+                                    });
+                                }
+                            }),
+                    ),
+            )
+            .with_priority(4),
+        )
+        .into_any_element()
+}
+
 /// The accounts saved for this site, listed under the name field the way a browser's
 /// autofill does: pick one, confirm with Touch ID, and the fields fill. The password never
 /// appears here.
@@ -1249,10 +1331,15 @@ fn render_account_list(
     let mut list = v_flex()
         .id(ElementId::Name(user_form_saved_list_id(&card_key).into()))
         .w_full()
+        .mt(px(4.))
         .rounded(px(8.))
         .border_1()
         .border_color(theme.border)
-        .bg(theme.background)
+        .bg(theme.popover)
+        .text_color(theme.popover_foreground)
+        .shadow_lg()
+        // It floats over the card: a click on it is for it, not for what lies under.
+        .occlude()
         .overflow_hidden();
     for (i, row) in saved.rows.iter().enumerate() {
         if i > 0 {

@@ -14,6 +14,12 @@ A save never changes what a row is: an import that carries only a code for a log
 
 One pane on the left: a search field and a "+" (the Add sheet: Title, User Name, Password, Website, Notes), then Passwords, Passkeys and Codes as sections with a count badge and their rows (icon, title, account), Security only when a row carries a `Security:` note, and Import… at the bottom. The detail pane shows User Name, Password as dots (never read), Website, a live code with its seconds left when the row has a seed, Notes (edited in place), where the password is, when a bot last used it, when it was added, and Delete.
 
+Knowing which rows the keychain holds — a password, a code seed — is asked by name, which
+needs no unlocking; the secret itself is read only when the person opens that row or after
+Touch ID on a card. That is why the list and the page paint without a keychain sheet. A
+development build is a differently signed program each time it is rebuilt, so macOS asks
+again for the first read after every build; a signed build ends that.
+
 Site icons come from the server's `GET /site-logins/icon/{origin}`, one request per site, misses remembered; a site with none shows its first letter.
 
 ## Import
@@ -32,6 +38,13 @@ Site icons come from the server's `GET /site-logins/icon/{origin}`, one request 
 Every row becomes the same item (site, name, password, seed, title, notes); a bare seed becomes an `otpauth://` URI with the usual defaults. The file is read once and not kept. From `pass`, only a line that calls itself a note (`note:`, `notes:`, `comment:`) becomes notes: the rest of an entry was kept encrypted for a reason. An entry in a folder takes the folder it sits in as its site, and the first entry that will not decrypt ends the read rather than putting the same passphrase sheet up for every one after it. Apple's Credential Exchange (in-memory hand-off of passwords, passkeys and codes) needs the signed app with a credential-provider extension; the receiver is in `macos/CredentialExchange/` and is not built into the dev app.
 
 ## The card
+
+The accounts are offered the way a browser's autofill does. A card arrives with nothing
+showing; a click in the name field brings the list up, floating over the card so nothing
+moves, and it opens upward instead when the composer is in the way. A click anywhere else
+puts it away and lets the field go, so clicking the field again brings it back. The driver
+tree lists the accounts whether or not the list is up, since a pick by id does not need it
+painted.
 
 A `request_user_form` card knows what it takes (`site_login::card_target`): a login (name and password fields), a code (one `otp` field), or a passkey (no fields, `challengeKind: "passkey"`). The rows of that kind for the card's site are listed under the field. A pick puts up Touch ID (`site_login::touch_id`, LocalAuthentication, the Mac password as fallback); then:
 

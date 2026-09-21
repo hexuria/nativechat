@@ -177,13 +177,9 @@ impl Render for LoginsPage {
                 state.site_login_add_open,
             )
         };
-        let with_code: std::collections::HashSet<String> = self
-            .state
-            .read(cx)
-            .site_login_codes
-            .keys()
-            .cloned()
-            .collect();
+        // What the keychain says the row holds, not what has been read out of it: the
+        // Codes group is right from the first paint, without opening anything.
+        let with_code = self.state.read(cx).site_logins_with_code.clone();
         let groups = grouped_logins(&rows, &query, &with_code);
         // The pick stays on the pane even when a search hides its row.
         let picked = selected

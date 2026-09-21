@@ -893,9 +893,24 @@ impl ChatTranscript {
                     }
                     state
                 });
-                cx.subscribe(&state, |_, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        cx.notify();
+                let app_state = self.app_state.clone();
+                let field = key.clone();
+                cx.subscribe(&state, move |_, _, event: &InputEvent, cx| {
+                    match event {
+                        InputEvent::Change => cx.notify(),
+                        // Back in the field the accounts belong to: the list the person
+                        // clicked away from comes back, the way autofill does.
+                        InputEvent::Focus => {
+                            if let Some((card_key, field_id)) = field.split_once('\u{1f}') {
+                                let (card_key, field_id) =
+                                    (card_key.to_string(), field_id.to_string());
+                                app_state.update(cx, |state, cx| {
+                                    state.open_saved_login_list(card_key, &field_id, cx);
+                                });
+                            }
+                            cx.notify();
+                        }
+                        _ => {}
                     }
                 })
                 .detach();

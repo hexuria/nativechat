@@ -378,6 +378,11 @@ impl SiteLoginVault {
         self.secrets.set(&Self::code_key(id), otpauth)
     }
 
+    /// Whether a row has a code seed here, asked without reading it: no keychain sheet.
+    pub fn code_present(&self, id: &str) -> bool {
+        self.secrets.contains(&Self::code_key(id))
+    }
+
     /// The seed itself, for minting a code after Touch ID or for the detail pane's ticker.
     pub fn code_for(&self, id: &str) -> Result<Option<String>, StoreError> {
         self.secrets.get(&Self::code_key(id))

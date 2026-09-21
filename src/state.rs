@@ -1439,6 +1439,13 @@ pub struct AppState {
     /// Ids of the saved logins whose password is in this Mac's keychain. The others are on
     /// the server only and are fetched, after Touch ID, the first time they are used here.
     pub site_logins_on_this_mac: HashSet<String>,
+    /// Which rows have a code seed on this Mac. Asked of the keychain by name only, so
+    /// knowing costs nothing; the seed itself is read when a row is opened or picked.
+    pub site_logins_with_code: HashSet<String>,
+    /// Cards whose account list is up. A card arrives without it: the list belongs to the
+    /// field, so it comes up when the person puts the cursor there, the way a browser's
+    /// autofill does, and goes away again on a click anywhere else.
+    pub user_form_list_open: HashSet<String>,
     /// The authenticator-code seeds this Mac holds, parsed, for the detail pane's ticker and
     /// the code card. Read off the keychain on each load.
     pub site_login_codes: HashMap<String, totp_rs::TOTP>,
@@ -1829,6 +1836,8 @@ impl AppState {
             pending_save: HashMap::new(),
             saved_login_use: HashMap::new(),
             site_logins_on_this_mac: HashSet::new(),
+            site_logins_with_code: HashSet::new(),
+            user_form_list_open: HashSet::new(),
             site_login_codes: HashMap::new(),
             site_login_notice: None,
             site_login_error: None,
@@ -7556,21 +7565,21 @@ impl AppState {
                     Ok(cx
                         .background_executor()
                         .spawn(async move {
+                            // Both of these ask the keychain whether an item is there,
+                            // by name; neither opens one. Reading a secret is what makes
+                            // the keychain ask the person to unlock it, and nothing on
+                            // this path needs the secret itself.
                             let here: HashSet<String> = rows
                                 .iter()
                                 .filter(|row| vault.secret_present(&row.id))
                                 .map(|row| row.id.clone())
                                 .collect();
-                            let codes: HashMap<String, totp_rs::TOTP> = rows
+                            let with_code: HashSet<String> = rows
                                 .iter()
-                                .filter_map(|row| {
-                                    let seed = vault.code_for(&row.id).ok().flatten()?;
-                                    crate::site_login::totp::parse(&seed)
-                                        .ok()
-                                        .map(|totp| (row.id.clone(), totp))
-                                })
+                                .filter(|row| vault.code_present(&row.id))
+                                .map(|row| row.id.clone())
                                 .collect();
-                            (rows, here, codes)
+                            (rows, here, with_code)
                         })
                         .await)
                 }
@@ -7578,9 +7587,14 @@ impl AppState {
             };
             let _ = this.update(cx, |state, cx| {
                 match list {
-                    Ok((rows, here, codes)) => {
+                    Ok((rows, here, with_code)) => {
                         state.site_logins_on_this_mac = here;
-                        state.site_login_codes = codes;
+                        // The parsed seeds already in hand are kept; a row whose seed has
+                        // not been read yet is read when the person opens it.
+                        state
+                            .site_login_codes
+                            .retain(|id, _| with_code.contains(id));
+                        state.site_logins_with_code = with_code;
                         state.site_logins = rows;
                         state.site_login_error = None;
                         // Only a successful read makes the vault readable. A vault
@@ -7630,7 +7644,8 @@ impl AppState {
                 // never been used here is not offered — nothing here knows it has one —
                 // and one reveal puts it in `site_login_codes` for every card after that.
                 CardTarget::Code { .. } => {
-                    self.site_login_codes.contains_key(&row.id)
+                    self.site_logins_with_code.contains(&row.id)
+                        || self.site_login_codes.contains_key(&row.id)
                         || row.kind == crate::site_login::KIND_CODE
                 }
                 CardTarget::Passkey { register: false } => {
@@ -7732,6 +7747,8 @@ impl AppState {
                                 if let Ok(totp) = crate::site_login::totp::parse(seed) {
                                     let row_id = row.id.clone();
                                     let _ = this.update(cx, |state, _| {
+                                        state.site_logins_with_code.insert(row_id.clone());
+                                        state.site_logins_with_code.insert(row_id.clone());
                                         state.site_login_codes.insert(row_id, totp);
                                     });
                                 }
@@ -7783,6 +7800,8 @@ impl AppState {
                         if wants == HeldSecret::CodeSeed {
                             match crate::site_login::totp::parse(&secret) {
                                 Ok(totp) => {
+                                    state.site_logins_with_code.insert(row.id.clone());
+                                    state.site_logins_with_code.insert(row.id.clone());
                                     state.site_login_codes.insert(row.id.clone(), totp);
                                 }
                                 // Better to say so now than to send a card with an empty
@@ -8375,6 +8394,40 @@ impl AppState {
         .detach();
     }
 
+    /// A click anywhere else puts the card's account list away. Nothing is chosen and
+    /// nothing is held; the field is free to type in.
+    pub fn close_saved_login_list(&mut self, card_key: String, cx: &mut Context<Self>) {
+        if self.user_form_list_open.remove(&card_key) {
+            cx.notify();
+        }
+    }
+
+    /// The cursor is in the field the accounts belong to, so the list comes up. Only that
+    /// field: the password field is not where an account is chosen, and a card that has
+    /// just arrived shows nothing until the person asks.
+    pub fn open_saved_login_list(
+        &mut self,
+        card_key: String,
+        field_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.user_form_list_open.contains(&card_key) {
+            return;
+        }
+        let belongs = self
+            .user_form_mut_ref(&card_key)
+            .and_then(card_target)
+            .is_some_and(|target| match target {
+                CardTarget::Login(fields) => fields.username_id == field_id,
+                CardTarget::Code { code_id } => code_id == field_id,
+                CardTarget::Passkey { .. } => false,
+            });
+        if belongs {
+            self.user_form_list_open.insert(card_key);
+            cx.notify();
+        }
+    }
+
     /// Settings → Logins: the search field's text, the copy the list filters by.
     pub fn set_site_login_query(&mut self, query: String, cx: &mut Context<Self>) {
         if self.site_login_query != query {
@@ -8388,7 +8441,41 @@ impl AppState {
     pub fn select_site_login(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         let id = id.filter(|id| self.site_logins.iter().any(|row| &row.id == id));
         if self.site_login_selected != id {
-            self.site_login_selected = id;
+            self.site_login_selected = id.clone();
+            // The pane shows a live code for the row that is open, so this is where its
+            // seed is read — one row, when the person asked to see it, and kept after.
+            if let Some(id) = id.filter(|id| {
+                self.site_logins_with_code.contains(id) && !self.site_login_codes.contains_key(id)
+            }) && let Some(vault) = self.site_login_vault.clone()
+            {
+                cx.spawn(async move |this, cx| {
+                    let read = cx
+                        .background_executor()
+                        .spawn({
+                            let id = id.clone();
+                            async move {
+                                let seed = vault.code_for(&id).ok().flatten()?;
+                                crate::site_login::totp::parse(&seed).ok()
+                            }
+                        })
+                        .await;
+                    let _ = this.update(cx, |state, cx| {
+                        match read {
+                            Some(totp) => {
+                                state.site_login_codes.insert(id, totp);
+                            }
+                            // The keychain would not give it up (a cancelled sheet, a
+                            // seed that will not parse): the pane shows no code, and the
+                            // list stops saying it has one.
+                            None => {
+                                state.site_logins_with_code.remove(&id);
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
             cx.notify();
         }
     }

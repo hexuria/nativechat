@@ -175,8 +175,19 @@ impl SecretStore for KeychainSecrets {
         }
     }
 
+    /// Whether the item is there, asked by its attributes alone. Reading a secret is what
+    /// makes the keychain ask the person to unlock it; a search that loads no data does
+    /// not, so the app can know which rows it holds without putting a sheet up for each.
     fn contains(&self, id: &str) -> bool {
-        matches!(self.get(id), Ok(Some(_)))
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        ItemSearchOptions::new()
+            .class(ItemClass::generic_password())
+            .service(KEYCHAIN_SERVICE)
+            .account(id)
+            .load_attributes(true)
+            .limit(Limit::Max(1))
+            .search()
+            .is_ok_and(|found| !found.is_empty())
     }
 }
 
