@@ -625,6 +625,8 @@ impl ComputerHandoffSpec {
             live_host: None,
             same_page: false,
             submit: false,
+            challenge_kind: None,
+            passkey_mode: None,
             resolution: None,
             widget_dismissed: false,
             handoff_entry_id: self.handoff_entry_id.clone(),
@@ -698,6 +700,10 @@ pub struct UserFormSpec {
     /// the page's own Log in. Together they say whether this card IS a login.
     pub same_page: bool,
     pub submit: bool,
+    /// The Bot's hint: `password`, `otp`, `passkey`, `captcha`, `outside_sandbox`.
+    pub challenge_kind: Option<String>,
+    /// With a passkey card: `use` or `register`.
+    pub passkey_mode: Option<String>,
     pub resolution: Option<FormResolution>,
     pub widget_dismissed: bool,
     /// HTTP convenience from dismiss `mode: escalated`. Not the form card id.
@@ -744,10 +750,11 @@ impl UserFormSpec {
         // does "Log in" promise what pressing it does. A stepped card or a password change
         // keeps "Continue". (A sign-up with a name, an email and a password on one page reads
         // as a login too; the server treats it the same, and the button still submits it.)
-        if has_password && has_username && (self.same_page || self.submit) {
-            "Log in"
-        } else {
-            "Continue"
+        match self.challenge_kind.as_deref() {
+            Some("passkey") if self.passkey_mode.as_deref() == Some("register") => "Create passkey",
+            Some("passkey") => "Use passkey",
+            _ if has_password && has_username && (self.same_page || self.submit) => "Log in",
+            _ => "Continue",
         }
     }
 
@@ -881,6 +888,12 @@ impl UserFormSpec {
         // The one-page marks are facts about the form, not the event: whichever event
         // carried them wins, and a handoff card that arrived first cannot unset them.
         self.same_page |= incoming.same_page;
+        if incoming.challenge_kind.is_some() {
+            self.challenge_kind = incoming.challenge_kind.clone();
+        }
+        if incoming.passkey_mode.is_some() {
+            self.passkey_mode = incoming.passkey_mode.clone();
+        }
         self.submit |= incoming.submit;
         if incoming.resolution == Some(FormResolution::Skipped)
             || incoming.resolution == Some(FormResolution::Submitted)
@@ -1001,6 +1014,12 @@ impl UserFormSpec {
                 .and_then(|req| bool_at(req, "submit"))
                 .or_else(|| bool_at(value, "submit"))
                 .unwrap_or(false),
+            challenge_kind: request
+                .and_then(|req| string_field(req, "challengeKind"))
+                .or_else(|| string_field(value, "challengeKind")),
+            passkey_mode: request
+                .and_then(|req| string_field(req, "passkeyMode"))
+                .or_else(|| string_field(value, "passkeyMode")),
             resolution,
             widget_dismissed,
             handoff_entry_id: parse_handoff_entry_id(value)
@@ -1179,6 +1198,18 @@ pub fn submit_request_body(
     values: &UserFormValues,
     saved_login: bool,
 ) -> Value {
+    submit_request_body_for(entry_id, agent_id, values, saved_login, None)
+}
+
+/// The same, naming the saved row the values came from (`savedLoginId`), so the server can
+/// stamp its use or, for a passkey card, open its key.
+pub fn submit_request_body_for(
+    entry_id: &str,
+    agent_id: &str,
+    values: &UserFormValues,
+    saved_login: bool,
+    saved_login_id: Option<&str>,
+) -> Value {
     let mut body = json!({
         "entryId": entry_id,
         "agentId": agent_id,
@@ -1186,6 +1217,9 @@ pub fn submit_request_body(
     });
     if saved_login {
         body["savedLogin"] = Value::Bool(true);
+    }
+    if let Some(id) = saved_login_id.filter(|id| !id.is_empty()) {
+        body["savedLoginId"] = Value::String(id.to_string());
     }
     body
 }
@@ -2811,5 +2845,35 @@ mod tests {
             settle_user_form_http(UserFormVerb::Dismiss, &reply),
             UserFormHttpSettle::Restore
         );
+    }
+
+    #[test]
+    fn a_passkey_card_knows_its_mode_and_names_its_button() {
+        let spec = UserFormSpec::parse(
+            &serde_json::json!({
+                "entryId": "e_pk",
+                "formRequest": { "title": "Passkey", "challengeKind": "passkey", "passkeyMode": "register", "liveHost": "webauthn.io", "fields": [] }
+            }),
+            None,
+        )
+        .expect("spec");
+        assert_eq!(spec.challenge_kind.as_deref(), Some("passkey"));
+        assert_eq!(spec.passkey_mode.as_deref(), Some("register"));
+        assert_eq!(spec.continue_label(), "Create passkey");
+        let mut use_it = spec.clone();
+        use_it.passkey_mode = Some("use".to_string());
+        assert_eq!(use_it.continue_label(), "Use passkey");
+        let body = submit_request_body_for(
+            "e_pk",
+            "cw_1",
+            &UserFormValues::default(),
+            true,
+            Some("sl_1"),
+        );
+        assert_eq!(body["savedLoginId"], "sl_1");
+        assert_eq!(body["savedLogin"], true);
+        let plain =
+            submit_request_body_for("e_pk", "cw_1", &UserFormValues::default(), false, None);
+        assert!(plain.get("savedLoginId").is_none());
     }
 }

@@ -27,7 +27,9 @@ mod store;
 pub mod totp;
 pub mod touch_id;
 
-pub use extract::{LoginFields, PendingSave, login_fields, login_origin, save_candidate};
+pub use extract::{
+    CardTarget, LoginFields, PendingSave, card_target, login_fields, login_origin, save_candidate,
+};
 pub use origin::{login_matches_request, origins_match, registrable_origin};
 pub use store::{SiteLoginRecord, SiteLoginVault};
 
@@ -216,8 +218,9 @@ pub enum SavedLoginUse {
         username: String,
         password: String,
     },
-    /// Log in was pressed; the values are on their way to the box.
-    Filling { username: String },
+    /// Log in was pressed; the values are on their way to the box, named by the row they
+    /// came from so the server can stamp its use.
+    Filling { username: String, login_id: String },
     /// The person closed the sheet.
     Cancelled { username: String },
     /// The server would not put a saved login on this computer (a shared box).
@@ -238,7 +241,7 @@ impl std::fmt::Debug for SavedLoginUse {
                 .field("password", &"<redacted>")
                 .finish(),
             Self::Confirming { username } => write!(f, "Confirming({username})"),
-            Self::Filling { username } => write!(f, "Filling({username})"),
+            Self::Filling { username, .. } => write!(f, "Filling({username})"),
             Self::Cancelled { username } => write!(f, "Cancelled({username})"),
             Self::Refused { message } => write!(f, "Refused({message})"),
             Self::Unavailable { message } => write!(f, "Unavailable({message})"),
@@ -256,7 +259,7 @@ impl SavedLoginUse {
             Self::Ready { username, .. } => {
                 format!("Password for {username} from your keychain. Press Log in.")
             }
-            Self::Filling { username } => {
+            Self::Filling { username, .. } => {
                 format!("Logging in as {username}. The password goes straight to the computer.")
             }
             Self::Cancelled { username } => {
@@ -266,7 +269,16 @@ impl SavedLoginUse {
         }
     }
 
-    /// The held password, once Touch ID passed.
+    /// The row in flight, once Log in was pressed.
+    pub fn filling_id(&self) -> Option<&str> {
+        match self {
+            Self::Filling { login_id, .. } => Some(login_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The held secret (a password, a code seed, or nothing for a passkey), once Touch ID
+    /// passed.
     pub fn ready(&self) -> Option<(&str, &str)> {
         match self {
             Self::Ready {

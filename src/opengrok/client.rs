@@ -887,11 +887,18 @@ impl OpenGrokClient {
         agent_id: &str,
         values: &super::user_form::UserFormValues,
         saved_login: bool,
+        saved_login_id: Option<&str>,
     ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
         if entry_id.trim().is_empty() {
             return Ok(super::user_form::UserFormActionReply::MissingEntryId);
         }
-        let body = super::user_form::submit_request_body(entry_id, agent_id, values, saved_login);
+        let body = super::user_form::submit_request_body_for(
+            entry_id,
+            agent_id,
+            values,
+            saved_login,
+            saved_login_id,
+        );
         let response = self
             .send_json(
                 reqwest::Method::POST,
@@ -3967,7 +3974,7 @@ mod tests {
             .insert("email".into(), "ada@example.com".into());
         values.by_id.insert("password".into(), "s3cret-pass".into());
         let reply = client
-            .submit_user_form("e_form", "cw_1", &values, false)
+            .submit_user_form("e_form", "cw_1", &values, false, None)
             .await
             .unwrap();
         match reply {
@@ -4002,7 +4009,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default(), false)
+            .submit_user_form("e_form", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingEntry);
@@ -4023,7 +4030,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default(), false)
+            .submit_user_form("e_form", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingRoute);
@@ -4043,7 +4050,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default(), false)
+            .submit_user_form("e_form", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::Empty);
@@ -4063,7 +4070,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("", "cw_1", &Default::default(), false)
+            .submit_user_form("", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingEntryId);

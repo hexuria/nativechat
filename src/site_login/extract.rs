@@ -44,6 +44,40 @@ pub struct LoginFields {
     pub password_id: String,
 }
 
+/// What a card can take from the vault: a login (name and password), an authenticator code
+/// (one otp field), or a passkey (no fields at all, marked by the Bot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardTarget {
+    Login(LoginFields),
+    Code { code_id: String },
+    Passkey { register: bool },
+}
+
+pub fn card_target(spec: &UserFormSpec) -> Option<CardTarget> {
+    if spec.challenge_kind.as_deref() == Some("passkey") {
+        return Some(CardTarget::Passkey {
+            register: spec.passkey_mode.as_deref() == Some("register"),
+        });
+    }
+    if let Some(fields) = login_fields(spec) {
+        return Some(CardTarget::Login(fields));
+    }
+    let mut otp = spec
+        .fields
+        .iter()
+        .filter(|field| field.kind == UserFormFieldKind::Otp);
+    let code_id = otp.next()?.id.clone();
+    if otp.next().is_some()
+        || spec
+            .fields
+            .iter()
+            .any(|field| field.kind == UserFormFieldKind::Password)
+    {
+        return None;
+    }
+    Some(CardTarget::Code { code_id })
+}
+
 /// A card takes a saved login when it has a password field and a field for the name: an
 /// email field, else one named like one (email, user, login, phone), else the first plain
 /// text or phone field. An OTP-only or password-only card takes none.
@@ -278,6 +312,33 @@ mod tests {
             field("confirm", UserFormFieldKind::Password),
         ]);
         assert_eq!(login_fields(&spec), None);
+    }
+
+    #[test]
+    fn a_code_card_and_a_passkey_card_have_their_own_targets() {
+        let code = card_with(vec![field("code", UserFormFieldKind::Otp)]);
+        assert_eq!(
+            card_target(&code),
+            Some(CardTarget::Code {
+                code_id: "code".to_string()
+            })
+        );
+        let mut passkey = card_with(vec![]);
+        passkey.challenge_kind = Some("passkey".to_string());
+        passkey.passkey_mode = Some("register".to_string());
+        assert_eq!(
+            card_target(&passkey),
+            Some(CardTarget::Passkey { register: true })
+        );
+        let login = card_with(vec![
+            field("username", UserFormFieldKind::Text),
+            field("password", UserFormFieldKind::Password),
+        ]);
+        assert!(matches!(card_target(&login), Some(CardTarget::Login(_))));
+        assert_eq!(
+            card_target(&card_with(vec![field("note", UserFormFieldKind::Text)])),
+            None
+        );
     }
 
     #[test]

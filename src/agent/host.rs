@@ -201,6 +201,11 @@ pub enum Command {
     UserFormClearSaved {
         card_key: String,
     },
+    /// A register-mode passkey card: the person confirms with Touch ID that the site may
+    /// make a passkey.
+    UserFormRegisterPasskey {
+        card_key: String,
+    },
     /// Settings → Logins → Add, with the values the driver gives.
     AddSiteLogin {
         origin: String,
@@ -345,6 +350,9 @@ impl Command {
                 state.pick_saved_login(card_key, login_id, cx)
             }
             Self::UserFormClearSaved { card_key } => state.clear_saved_login_pick(card_key, cx),
+            Self::UserFormRegisterPasskey { card_key } => {
+                state.confirm_passkey_register(card_key, cx)
+            }
             Self::AddSiteLogin {
                 origin,
                 username,
@@ -743,6 +751,8 @@ struct UserFormSnap {
     saved_login_note: Option<String>,
     /// A picked password is held: the fields are locked and Change frees them.
     saved_login_held: bool,
+    /// A passkey card in register mode: one row to confirm instead of a list.
+    passkey_register: bool,
 }
 
 #[derive(Clone)]
@@ -818,6 +828,12 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
     }
     if form.saved_login_held {
         card = card.with_child(UiNode::button(user_form_saved_clear_id(key), "Change"));
+    }
+    if form.passkey_register && !form.saved_login_held {
+        card = card.with_child(UiNode::button(
+            format!("user-form-passkey-register-{key}"),
+            "Create a passkey",
+        ));
     }
     card.with_child(UiNode::button(
         user_form_continue_id(key),
@@ -1375,6 +1391,8 @@ impl NativeChatHost {
                     };
                     let saved_login_note = current.map(crate::site_login::SavedLoginUse::note);
                     let saved_login_held = current.is_some_and(|use_| use_.ready().is_some());
+                    let passkey_register = spec.challenge_kind.as_deref() == Some("passkey")
+                        && spec.passkey_mode.as_deref() == Some("register");
                     UserFormSnap {
                         title: if spec.title.is_empty() {
                             "Form".into()
@@ -1385,6 +1403,7 @@ impl NativeChatHost {
                         saved_logins,
                         saved_login_note,
                         saved_login_held,
+                        passkey_register,
                         card_key: key,
                         pill,
                         continue_label: spec.continue_label(),
@@ -1951,6 +1970,11 @@ impl NativeChatHost {
             }
             if form.saved_login_held && target == user_form_saved_clear_id(key) {
                 return Some(Command::UserFormClearSaved {
+                    card_key: key.clone(),
+                });
+            }
+            if form.passkey_register && target == format!("user-form-passkey-register-{key}") {
+                return Some(Command::UserFormRegisterPasskey {
                     card_key: key.clone(),
                 });
             }
@@ -2737,6 +2761,11 @@ impl NativeChatHost {
             "UserFormClearSaved" | "user-form.clear-saved" => Command::UserFormClearSaved {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
+            "UserFormRegisterPasskey" | "user-form.register-passkey" => {
+                Command::UserFormRegisterPasskey {
+                    card_key: self.invoke_user_form_card_key(args)?,
+                }
+            }
             "ImportSiteLogins" | "logins.import" => Command::ImportSiteLogins {
                 path: invoke_arg_str(args, &["path", "file"])
                     .ok_or_else(|| "logins.import requires arg path".to_string())?,
@@ -3698,6 +3727,7 @@ mod tests {
             saved_logins: Vec::new(),
             saved_login_note: None,
             saved_login_held: false,
+            passkey_register: false,
             title: "Google account".into(),
             fields: vec![
                 UserFormFieldSnap {
@@ -3799,6 +3829,7 @@ mod tests {
             saved_logins: Vec::new(),
             saved_login_note: None,
             saved_login_held: false,
+            passkey_register: false,
             title: "Website login".into(),
             fields: vec![UserFormFieldSnap {
                 id: "email".into(),
@@ -3931,6 +3962,7 @@ mod tests {
             saved_logins: Vec::new(),
             saved_login_note: None,
             saved_login_held: false,
+            passkey_register: false,
             title: "Google account".into(),
             fields: Vec::new(),
             pill: Some("Dismissed".into()),
