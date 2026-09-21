@@ -425,6 +425,9 @@ pub enum UserFormActionReply {
     MissingEntry,
     /// No gateway card id — we must not POST `callId` as `entryId`.
     MissingEntryId,
+    /// 403: the server would not do this on that computer (a saved login on a shared box).
+    /// The card stays open; the message is the server's own sentence.
+    Refused(String),
 }
 
 /// Continue vs Dismiss. Hand-back is a different route.
@@ -446,6 +449,9 @@ pub enum UserFormHttpSettle {
     Keep,
     /// No POST, or dismiss 404. Undo the optimistic paint.
     Restore,
+    /// The server refused the submit and nothing was typed: idle fields come back, with
+    /// the server's reason under them.
+    Refused(String),
 }
 
 /// After Continue has painted **Sending**, never restore idle fields.
@@ -459,6 +465,10 @@ pub fn settle_user_form_http(
 ) -> UserFormHttpSettle {
     match (verb, reply) {
         (_, UserFormActionReply::Settled(spec)) => UserFormHttpSettle::Merge(spec.clone()),
+        (UserFormVerb::Submit, UserFormActionReply::Refused(message)) => {
+            UserFormHttpSettle::Refused(message.clone())
+        }
+        (UserFormVerb::Dismiss, UserFormActionReply::Refused(_)) => UserFormHttpSettle::Restore,
         (UserFormVerb::Submit, UserFormActionReply::Empty)
         | (UserFormVerb::Submit, UserFormActionReply::AlreadyAnswered)
         | (UserFormVerb::Submit, UserFormActionReply::MissingRoute)
@@ -613,6 +623,8 @@ impl ComputerHandoffSpec {
             fields: Vec::new(),
             domain: None,
             live_host: None,
+            same_page: false,
+            submit: false,
             resolution: None,
             widget_dismissed: false,
             handoff_entry_id: self.handoff_entry_id.clone(),
@@ -646,6 +658,26 @@ pub fn user_form_field_id(card_key: &str, field_id: &str) -> String {
     format!("user-form-field-{card_key}-{field_id}")
 }
 
+/// One button per saved login the card can take.
+pub fn user_form_use_saved_id(card_key: &str, login_id: &str) -> String {
+    format!("user-form-use-saved-{card_key}-{login_id}")
+}
+
+/// The line under the field while a saved login is being used, or after it was not.
+pub fn user_form_saved_note_id(card_key: &str) -> String {
+    format!("user-form-saved-note-{card_key}")
+}
+
+/// The account list under the name field.
+pub fn user_form_saved_list_id(card_key: &str) -> String {
+    format!("user-form-saved-list-{card_key}")
+}
+
+/// "Change" on the locked password row: drop the held password, type instead.
+pub fn user_form_saved_clear_id(card_key: &str) -> String {
+    format!("user-form-saved-clear-{card_key}")
+}
+
 /// A user-form card in the transcript. Field values are not stored on this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserFormSpec {
@@ -662,6 +694,10 @@ pub struct UserFormSpec {
     pub fields: Vec<UserFormField>,
     pub domain: Option<String>,
     pub live_host: Option<String>,
+    /// The fields share one page (`samePage` on the wire); with `submit`, the fill presses
+    /// the page's own Log in. Together they say whether this card IS a login.
+    pub same_page: bool,
+    pub submit: bool,
     pub resolution: Option<FormResolution>,
     pub widget_dismissed: bool,
     /// HTTP convenience from dismiss `mode: escalated`. Not the form card id.
@@ -688,6 +724,31 @@ impl UserFormSpec {
 
     pub fn pill(&self) -> Option<&'static str> {
         self.effective_resolution().map(FormResolution::pill)
+    }
+
+    /// The button says what pressing it does. A one-page login (a username next to a
+    /// password) is "Log in", the button the person expects on that page; anything else is
+    /// the generic "Continue".
+    pub fn continue_label(&self) -> &'static str {
+        let has_password = self
+            .fields
+            .iter()
+            .any(|field| field.kind == UserFormFieldKind::Password);
+        let has_username = self.fields.iter().any(|field| {
+            matches!(
+                field.kind,
+                UserFormFieldKind::Email | UserFormFieldKind::Text | UserFormFieldKind::Tel
+            )
+        });
+        // A login card is a username beside a password on one page that submits: only then
+        // does "Log in" promise what pressing it does. A stepped card or a password change
+        // keeps "Continue". (A sign-up with a name, an email and a password on one page reads
+        // as a login too; the server treats it the same, and the button still submits it.)
+        if has_password && has_username && (self.same_page || self.submit) {
+            "Log in"
+        } else {
+            "Continue"
+        }
     }
 
     pub fn settled_body(&self) -> Option<&'static str> {
@@ -767,6 +828,15 @@ impl UserFormSpec {
             .all(|field| values.filled(field))
     }
 
+    /// The same, with `held` counted as filled: a password from the keychain is not in the
+    /// card's inputs, it is held for the submit.
+    pub fn required_fields_filled_with(&self, values: &UserFormValues, held: &[&str]) -> bool {
+        self.fields
+            .iter()
+            .filter(|field| field.required)
+            .all(|field| held.contains(&field.id.as_str()) || values.filled(field))
+    }
+
     /// Fold a later event for the same card onto this one (resolution, or a
     /// fuller request). Secret values are not carried.
     pub fn merge(&mut self, incoming: UserFormSpec) {
@@ -808,6 +878,10 @@ impl UserFormSpec {
         }
         self.computer_handoff =
             ComputerHandoffStatus::fold(self.computer_handoff, incoming.computer_handoff);
+        // The one-page marks are facts about the form, not the event: whichever event
+        // carried them wins, and a handoff card that arrived first cannot unset them.
+        self.same_page |= incoming.same_page;
+        self.submit |= incoming.submit;
         if incoming.resolution == Some(FormResolution::Skipped)
             || incoming.resolution == Some(FormResolution::Submitted)
             || incoming.resolution == Some(FormResolution::FillFailed)
@@ -919,6 +993,14 @@ impl UserFormSpec {
                     string_field(req, "liveHost").or_else(|| string_field(req, "live_host"))
                 })
                 .or_else(|| string_field(value, "liveHost")),
+            same_page: request
+                .and_then(|req| bool_at(req, "samePage"))
+                .or_else(|| bool_at(value, "samePage"))
+                .unwrap_or(false),
+            submit: request
+                .and_then(|req| bool_at(req, "submit"))
+                .or_else(|| bool_at(value, "submit"))
+                .unwrap_or(false),
             resolution,
             widget_dismissed,
             handoff_entry_id: parse_handoff_entry_id(value)
@@ -1089,12 +1171,23 @@ pub fn is_user_form_awaiting(event: &Value) -> bool {
     is_user_form_tool(&tool)
 }
 
-pub fn submit_request_body(entry_id: &str, agent_id: &str, values: &UserFormValues) -> Value {
-    json!({
+/// `saved_login` marks values that came from the person's saved logins after Touch ID; the
+/// server puts those only on a computer that is this bot's own.
+pub fn submit_request_body(
+    entry_id: &str,
+    agent_id: &str,
+    values: &UserFormValues,
+    saved_login: bool,
+) -> Value {
+    let mut body = json!({
         "entryId": entry_id,
         "agentId": agent_id,
         "values": values.as_json_object(),
-    })
+    });
+    if saved_login {
+        body["savedLogin"] = Value::Bool(true);
+    }
+    body
 }
 
 pub fn dismiss_request_body(entry_id: &str, agent_id: &str, mode: UserFormDismissMode) -> Value {
@@ -1150,6 +1243,15 @@ pub fn resolve_handoff_request_body(
 /// [`Empty`] — after Continue, [`settle_user_form_http`] paints Not filled.
 /// Prefer a body with `formResolution`.
 pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionReply {
+    if status == 403 {
+        let message = body
+            .get("message")
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("The server would not fill this form on that computer.");
+        return UserFormActionReply::Refused(message.to_string());
+    }
     if status == 404 {
         if is_form_entry_missing(body) {
             return UserFormActionReply::MissingEntry;
@@ -1487,6 +1589,47 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The card's button names the page's own: a one-page login says Log in; a lone email or
+    /// a code says Continue.
+    #[test]
+    fn the_button_says_log_in_only_for_a_one_page_login() {
+        let login = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Log in", "samePage": true, "submit": true, "fields": [
+                { "id": "email", "label": "Email", "type": "email" },
+                { "id": "password", "label": "Password", "type": "password" }
+            ]}),
+            "c_1",
+        )
+        .expect("spec");
+        assert_eq!(login.continue_label(), "Log in");
+        let email_only = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Email", "fields": [
+                { "id": "email", "label": "Email", "type": "email" }
+            ]}),
+            "c_2",
+        )
+        .expect("spec");
+        assert_eq!(email_only.continue_label(), "Continue");
+        let password_only = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Password", "fields": [
+                { "id": "password", "label": "Password", "type": "password" }
+            ]}),
+            "c_3",
+        )
+        .expect("spec");
+        assert_eq!(password_only.continue_label(), "Continue");
+        // Two fields with a password but no page to submit: still Continue.
+        let stepped = UserFormSpec::from_tool_args(
+            &serde_json::json!({ "title": "Sign in", "fields": [
+                { "id": "email", "label": "Email", "type": "email" },
+                { "id": "password", "label": "Password", "type": "password" }
+            ]}),
+            "c_4",
+        )
+        .expect("spec");
+        assert_eq!(stepped.continue_label(), "Continue");
+    }
+
     fn google_email_request() -> Value {
         json!({
             "title": "Google account email",
@@ -1790,7 +1933,7 @@ mod tests {
             spec.can_post(false),
             "a missing-route 404 on another card must not freeze this one"
         );
-        let submit = submit_request_body(&spec.entry_id, "cw_1", &filled);
+        let submit = submit_request_body(&spec.entry_id, "cw_1", &filled, false);
         assert_eq!(submit["entryId"], "e_form");
         assert_ne!(submit["entryId"], spec.call_id);
         assert_eq!(submit["values"]["password"], "s3cret-pass");
@@ -2314,7 +2457,7 @@ mod tests {
             .by_id
             .insert("email".into(), "ada@example.com".into());
         values.by_id.insert("password".into(), "s3cret-pass".into());
-        let body = submit_request_body("e_form", "cw_1", &values);
+        let body = submit_request_body("e_form", "cw_1", &values, false);
         assert_eq!(body["entryId"], "e_form");
         assert_eq!(body["agentId"], "cw_1");
         assert_eq!(body["values"]["password"], "s3cret-pass");
@@ -2640,6 +2783,33 @@ mod tests {
         assert_eq!(
             UserFormSpec::settle_form_from_box(BoxHandoffResolution::Declined),
             FormResolution::Skipped
+        );
+    }
+
+    #[test]
+    fn a_saved_login_submit_says_so_and_a_typed_one_does_not() {
+        let values = UserFormValues::default();
+        let typed = submit_request_body("e_form", "cw_1", &values, false);
+        assert!(typed.get("savedLogin").is_none(), "{typed}");
+        let saved = submit_request_body("e_form", "cw_1", &values, true);
+        assert_eq!(saved["savedLogin"], true, "{saved}");
+    }
+
+    #[test]
+    fn a_403_keeps_the_card_open_with_the_servers_reason() {
+        let body = serde_json::json!({ "error": "shared-computer", "message": "This computer is shared." });
+        let reply = user_form_action_from_http(403, &body);
+        assert_eq!(
+            reply,
+            UserFormActionReply::Refused("This computer is shared.".to_string())
+        );
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Submit, &reply),
+            UserFormHttpSettle::Refused("This computer is shared.".to_string())
+        );
+        assert_eq!(
+            settle_user_form_http(UserFormVerb::Dismiss, &reply),
+            UserFormHttpSettle::Restore
         );
     }
 }

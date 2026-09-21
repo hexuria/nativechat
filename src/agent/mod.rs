@@ -13,10 +13,11 @@
 //! `computer-handoff-takeover-{key}`, `computer-handoff-done-{key}`,
 //! `computer-handoff-skip-{key}`,
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
-//! `credential-request-{id}`, `credential-request-allow-{id}`,
-//! `credential-request-deny-{id}`, `credential-request-pill-{id}`,
-//! `settings-tab-logins`,
-//! `settings-login-row-{id}`, `settings-login-delete-{id}`,
+//! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site),
+//! `user-form-saved-note-{key}`, `user-form-saved-clear-{key}`,
+//! `settings-tab-logins`, `settings-login-add`, `settings-login-import`,
+//! `settings-logins-notice`,
+//! `settings-login-row-{id}`, `settings-login-where-{id}`, `settings-login-delete-{id}`,
 //! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-delete`.
@@ -26,9 +27,11 @@
 //! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
-//! `UserFormOpenScreen`, `AnswerCredentialRequest` (also kebab
+//! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /
-//! `credential.answer`). Click ids above still work.
+//! `user-form.use-saved --arg login_id=…` / `user-form.clear-saved`), `AddSiteLogin`
+//! (`logins.add --arg origin= --arg username= --arg password=`) and `ImportSiteLogins`
+//! (`logins.import --arg path=`). Click ids above still work.
 //!
 //! Routines: `routine.list` (answers with the open bot's rows —
 //! `id, name, kind, cron, active, webhook_url, webhook_key`), `routine.create --arg

@@ -12,10 +12,10 @@ use crate::opengrok::{
     computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
     computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
     computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
-    computer_window_attention_skip_id, credential_request_allow_id, credential_request_card_id,
-    credential_request_deny_id, credential_request_pill_id, save_login_card_id, save_login_save_id,
-    save_login_skip_id, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_pill_id, user_form_screen_id,
+    computer_window_attention_skip_id, save_login_card_id, save_login_save_id, save_login_skip_id,
+    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
+    user_form_pill_id, user_form_saved_clear_id, user_form_saved_note_id, user_form_screen_id,
+    user_form_use_saved_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -116,6 +116,16 @@ pub mod ids {
     }
 }
 
+/// A value the driver hands the app that must not show up in any `{:?}` of a command.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedactedSecret(pub String);
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     NewChat,
@@ -186,6 +196,25 @@ pub enum Command {
     UserFormContinue {
         card_key: String,
     },
+    /// "Use saved login" on an idle card: Touch ID, then the keychain, then the fill.
+    UserFormUseSaved {
+        card_key: String,
+        login_id: String,
+    },
+    /// "Change" on a locked card: the held password is dropped.
+    UserFormClearSaved {
+        card_key: String,
+    },
+    /// Settings → Logins → Add, with the values the driver gives.
+    AddSiteLogin {
+        origin: String,
+        username: String,
+        password: RedactedSecret,
+    },
+    /// Settings → Logins → Import, from a file path the driver gives (no picker).
+    ImportSiteLogins {
+        path: String,
+    },
     UserFormDismiss {
         card_key: String,
     },
@@ -214,10 +243,6 @@ pub enum Command {
     },
     DeleteSiteLogin {
         id: String,
-    },
-    AnswerCredentialRequest {
-        request_id: String,
-        allow: bool,
     },
     SetAppSettingsTab(crate::state::AppSettingsTab),
     CloseAppSettings,
@@ -311,6 +336,20 @@ impl Command {
             Self::Logout => state.logout(cx),
             Self::SignInAgain => state.sign_in_again(cx),
             Self::UserFormContinue { card_key } => state.submit_open_user_form(card_key, cx),
+            Self::UserFormUseSaved { card_key, login_id } => {
+                state.pick_saved_login(card_key, login_id, cx)
+            }
+            Self::UserFormClearSaved { card_key } => state.clear_saved_login_pick(card_key, cx),
+            Self::AddSiteLogin {
+                origin,
+                username,
+                password,
+            } => {
+                state.add_site_login(origin, username, password.0, cx);
+            }
+            Self::ImportSiteLogins { path } => {
+                state.import_site_logins(std::path::PathBuf::from(path), cx)
+            }
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -332,9 +371,6 @@ impl Command {
             Self::SaveLogin { form_entry_id } => state.save_offered_login(form_entry_id, cx),
             Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
             Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
-            Self::AnswerCredentialRequest { request_id, allow } => {
-                state.answer_credential_request(request_id, allow, cx)
-            }
             Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
             Self::CloseAppSettings => {
                 if state.is_app_settings_open {
@@ -688,6 +724,15 @@ struct UserFormSnap {
     fields: Vec<UserFormFieldSnap>,
     /// None = idle (fields still on screen).
     pill: Option<String>,
+    /// What the primary button says: "Log in" on a one-page login, else "Continue".
+    continue_label: &'static str,
+    /// The accounts saved for this site: (login id, username, origin), listed under the
+    /// name field.
+    saved_logins: Vec<(String, String, String)>,
+    /// The line under the name field while a pick is under way, or after it was not.
+    saved_login_note: Option<String>,
+    /// A picked password is held: the fields are locked and Change frees them.
+    saved_login_held: bool,
 }
 
 #[derive(Clone)]
@@ -725,19 +770,12 @@ struct SaveLoginSnap {
 }
 
 #[derive(Clone, Default)]
-struct CredentialRequestSnap {
-    request_id: String,
-    origin: String,
-    username: Option<String>,
-    /// None = idle (Use saved / Not now). Some = folded pill copy.
-    pill: Option<String>,
-}
-
-#[derive(Clone, Default)]
 struct SiteLoginSnap {
     id: String,
     origin: String,
     username: String,
+    /// The password is in this Mac's keychain (else on the server only).
+    on_this_mac: bool,
 }
 
 fn user_form_node(form: &UserFormSnap) -> UiNode {
@@ -759,9 +797,24 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
         };
         card = card.with_child(node);
     }
-    card.with_child(UiNode::button(user_form_continue_id(key), "Continue"))
-        .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
-        .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
+    for (login_id, username, origin) in &form.saved_logins {
+        card = card.with_child(UiNode::listitem(
+            user_form_use_saved_id(key, login_id),
+            format!("{username} · {origin}"),
+        ));
+    }
+    if let Some(note) = &form.saved_login_note {
+        card = card.with_child(UiNode::status(user_form_saved_note_id(key), note.clone()));
+    }
+    if form.saved_login_held {
+        card = card.with_child(UiNode::button(user_form_saved_clear_id(key), "Change"));
+    }
+    card.with_child(UiNode::button(
+        user_form_continue_id(key),
+        form.continue_label,
+    ))
+    .with_child(UiNode::button(user_form_screen_id(key), "Open the screen"))
+    .with_child(UiNode::button(user_form_dismiss_id(key), "Dismiss"))
 }
 
 fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
@@ -881,33 +934,19 @@ fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
     ))
 }
 
-fn credential_request_node(request: &CredentialRequestSnap) -> UiNode {
-    let title = match &request.username {
-        Some(username) => format!("Use saved login for {} as {}?", request.origin, username),
-        None => format!("Use a saved login for {}?", request.origin),
-    };
-    let card = UiNode::dialog(credential_request_card_id(&request.request_id), title);
-    if let Some(pill) = &request.pill {
-        return card.with_child(UiNode::status(
-            credential_request_pill_id(&request.request_id),
-            pill.clone(),
-        ));
-    }
-    card.with_child(UiNode::button(
-        credential_request_allow_id(&request.request_id),
-        "Use saved login",
-    ))
-    .with_child(UiNode::button(
-        credential_request_deny_id(&request.request_id),
-        "Not now",
-    ))
-}
-
 fn site_login_node(login: &SiteLoginSnap) -> UiNode {
     UiNode::listitem(
         format!("settings-login-row-{}", login.id),
         format!("{} · {}", login.username, login.origin),
     )
+    .with_child(UiNode::status(
+        format!("settings-login-where-{}", login.id),
+        if login.on_this_mac {
+            "Password in this Mac's keychain"
+        } else {
+            "Password on the server; fetched here on first use"
+        },
+    ))
     .with_child(UiNode::button(
         format!("settings-login-delete-{}", login.id),
         "Delete",
@@ -955,34 +994,6 @@ fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
-}
-
-fn parse_invoke_allow(args: &serde_json::Value) -> Result<bool, String> {
-    if let Some(value) = args.get("allow") {
-        if let Some(flag) = value.as_bool() {
-            return Ok(flag);
-        }
-        if let Some(word) = value.as_str() {
-            return parse_allow_word(word).ok_or_else(|| format!("unknown allow `{word}`"));
-        }
-        if let Some(n) = value.as_i64() {
-            return Ok(n != 0);
-        }
-    }
-    if let Some(word) = args.get("answer").and_then(|value| value.as_str()) {
-        return parse_allow_word(word).ok_or_else(|| format!("unknown answer `{word}`"));
-    }
-    Err("AnswerCredentialRequest requires arg allow".into())
-}
-
-fn parse_allow_word(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "allow" | "yes" | "use" | "used" | "saved" => Some(true),
-        "false" | "deny" | "no" | "dismiss" | "dismissed" | "not now" | "not-now" | "skip" => {
-            Some(false)
-        }
-        _ => None,
-    }
 }
 
 /// `Default` is the host with nothing in it — signed out, no sessions, no panel. Typing ops
@@ -1064,9 +1075,10 @@ pub struct NativeChatHost {
     /// Open the screen → Grok Computer chrome (Take over / I'm done / Skip).
     computer_handoffs: Vec<ComputerHandoffSnap>,
     save_logins: Vec<SaveLoginSnap>,
-    credential_requests: Vec<CredentialRequestSnap>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
+    /// What the last Add / Import / sync said on Settings → Logins.
+    site_login_notice: Option<String>,
     computer_tab: bool,
     updates_tab: bool,
     /// Dedicated provisioned box: Route traffic icon on the Computer pane.
@@ -1310,6 +1322,21 @@ impl NativeChatHost {
                             })
                             .collect()
                     };
+                    let current = state.saved_login_use.get(&key);
+                    // The list shows until a pick is under way or held, as on screen.
+                    let list_shows =
+                        !current.is_some_and(|use_| use_.is_busy() || use_.ready().is_some());
+                    let saved_logins = if pill.is_some() || !list_shows {
+                        Vec::new()
+                    } else {
+                        state
+                            .saved_logins_for_form(&spec)
+                            .into_iter()
+                            .map(|row| (row.id, row.username, row.origin))
+                            .collect()
+                    };
+                    let saved_login_note = current.map(crate::site_login::SavedLoginUse::note);
+                    let saved_login_held = current.is_some_and(|use_| use_.ready().is_some());
                     UserFormSnap {
                         title: if spec.title.is_empty() {
                             "Form".into()
@@ -1317,8 +1344,12 @@ impl NativeChatHost {
                             spec.title.clone()
                         },
                         fields,
+                        saved_logins,
+                        saved_login_note,
+                        saved_login_held,
                         card_key: key,
                         pill,
+                        continue_label: spec.continue_label(),
                     }
                 })
                 .collect(),
@@ -1355,39 +1386,18 @@ impl NativeChatHost {
                         .collect()
                 })
                 .unwrap_or_default(),
-            credential_requests: state
-                .conversations
-                .iter()
-                .find(|conversation| {
-                    Some(&conversation.id) == state.active_conversation_id.as_ref()
-                })
-                .map(|conversation| {
-                    conversation
-                        .messages
-                        .iter()
-                        .flat_map(|message| message.parts.iter())
-                        .filter_map(|part| match part {
-                            ChatPart::CredentialRequest(spec) => Some(CredentialRequestSnap {
-                                request_id: spec.request_id.clone(),
-                                origin: spec.origin.clone(),
-                                username: spec.username.clone(),
-                                pill: spec.pill().map(str::to_string),
-                            }),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
             site_logins: state
                 .site_logins
                 .iter()
                 .map(|row| SiteLoginSnap {
+                    on_this_mac: state.site_logins_on_this_mac.contains(&row.id),
                     id: row.id.clone(),
                     origin: row.origin.clone(),
                     username: row.username.clone(),
                 })
                 .collect(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
+            site_login_notice: state.site_login_notice.clone(),
             computer_tab: state.app_settings_tab == AppSettingsTab::Computer,
             updates_tab: state.app_settings_tab == AppSettingsTab::Updates,
             route_traffic_on_bot_pane: state.show_route_traffic_on_bot_pane(),
@@ -1576,9 +1586,6 @@ impl NativeChatHost {
         for offer in &self.save_logins {
             page = page.with_child(save_login_node(offer));
         }
-        for request in &self.credential_requests {
-            page = page.with_child(credential_request_node(request));
-        }
         let mut computer = UiNode::new("computer-pane", "dialog", "Computer")
             .with_visible(self.computer_open)
             .with_child(UiNode::new(
@@ -1722,6 +1729,18 @@ impl NativeChatHost {
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"));
                         if self.logins_tab {
+                            settings = settings
+                                .with_child(UiNode::button("settings-login-add", "Add"))
+                                .with_child(UiNode::button(
+                                    "settings-login-import",
+                                    "Import a passwords export…",
+                                ));
+                            if let Some(notice) = &self.site_login_notice {
+                                settings = settings.with_child(UiNode::status(
+                                    "settings-logins-notice",
+                                    notice.clone(),
+                                ));
+                            }
                             if self.site_logins.is_empty() {
                                 settings = settings.with_child(UiNode::status(
                                     "settings-logins-empty",
@@ -1932,6 +1951,19 @@ impl NativeChatHost {
                     card_key: key.clone(),
                 });
             }
+            for (login_id, _, _) in &form.saved_logins {
+                if target == user_form_use_saved_id(key, login_id) {
+                    return Some(Command::UserFormUseSaved {
+                        card_key: key.clone(),
+                        login_id: login_id.clone(),
+                    });
+                }
+            }
+            if form.saved_login_held && target == user_form_saved_clear_id(key) {
+                return Some(Command::UserFormClearSaved {
+                    card_key: key.clone(),
+                });
+            }
             if target == user_form_dismiss_id(key) {
                 return Some(Command::UserFormDismiss {
                     card_key: key.clone(),
@@ -1984,27 +2016,6 @@ impl NativeChatHost {
             if target == save_login_skip_id(&offer.form_entry_id) {
                 return Some(Command::SkipSaveLogin {
                     form_entry_id: offer.form_entry_id.clone(),
-                });
-            }
-        }
-        None
-    }
-
-    fn credential_request_command(&self, target: &str) -> Option<Command> {
-        for request in &self.credential_requests {
-            if request.pill.is_some() {
-                continue;
-            }
-            if target == credential_request_allow_id(&request.request_id) {
-                return Some(Command::AnswerCredentialRequest {
-                    request_id: request.request_id.clone(),
-                    allow: true,
-                });
-            }
-            if target == credential_request_deny_id(&request.request_id) {
-                return Some(Command::AnswerCredentialRequest {
-                    request_id: request.request_id.clone(),
-                    allow: false,
                 });
             }
         }
@@ -2182,8 +2193,6 @@ impl NativeChatHost {
         } else if let Some(cmd) = self.computer_handoff_command(target) {
             cmd
         } else if let Some(cmd) = self.save_login_command(target) {
-            cmd
-        } else if let Some(cmd) = self.credential_request_command(target) {
             cmd
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
@@ -2388,47 +2397,6 @@ impl NativeChatHost {
         }
     }
 
-    fn invoke_credential_answer(&self, args: &serde_json::Value) -> Result<(String, bool), String> {
-        let mut allow = parse_invoke_allow(args).ok();
-        let mut request_id = invoke_arg_str(args, &["request_id", "requestId", "id"]);
-        if let Some(raw) = request_id.clone() {
-            if let Some(id) = raw.strip_prefix("credential-request-allow-") {
-                request_id = Some(id.to_string());
-                allow = Some(true);
-            } else if let Some(id) = raw.strip_prefix("credential-request-deny-") {
-                request_id = Some(id.to_string());
-                allow = Some(false);
-            }
-        }
-        let allow =
-            allow.ok_or_else(|| "AnswerCredentialRequest requires arg allow".to_string())?;
-        let request_id = match request_id {
-            Some(id) => id,
-            None => {
-                let idle: Vec<&CredentialRequestSnap> = self
-                    .credential_requests
-                    .iter()
-                    .filter(|request| request.pill.is_none())
-                    .collect();
-                match idle.as_slice() {
-                    [one] => one.request_id.clone(),
-                    [] => return Err("no open credential.request".into()),
-                    _ => {
-                        return Err("AnswerCredentialRequest requires arg request_id".into());
-                    }
-                }
-            }
-        };
-        if !self
-            .credential_requests
-            .iter()
-            .any(|request| request.request_id == request_id && request.pill.is_none())
-        {
-            return Err(format!("no open credential.request `{request_id}`"));
-        }
-        Ok((request_id, allow))
-    }
-
     /// One of a routine's controls, or `None` for a target that is not a routine's at all.
     ///
     /// The id is the server's and can hold anything, dashes included, so this reads the tail
@@ -2610,16 +2578,46 @@ impl NativeChatHost {
             "UserFormContinue" | "user-form.continue" => Command::UserFormContinue {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
+            "AddSiteLogin" | "logins.add" => Command::AddSiteLogin {
+                origin: invoke_arg_str(args, &["origin", "site"])
+                    .ok_or_else(|| "logins.add requires arg origin".to_string())?,
+                username: invoke_arg_str(args, &["username", "user"])
+                    .ok_or_else(|| "logins.add requires arg username".to_string())?,
+                password: RedactedSecret(
+                    invoke_arg_str(args, &["password"])
+                        .ok_or_else(|| "logins.add requires arg password".to_string())?,
+                ),
+            },
+            "UserFormClearSaved" | "user-form.clear-saved" => Command::UserFormClearSaved {
+                card_key: self.invoke_user_form_card_key(args)?,
+            },
+            "ImportSiteLogins" | "logins.import" => Command::ImportSiteLogins {
+                path: invoke_arg_str(args, &["path", "file"])
+                    .ok_or_else(|| "logins.import requires arg path".to_string())?,
+            },
+            "UserFormUseSaved" | "user-form.use-saved" => {
+                let card_key = self.invoke_user_form_card_key(args)?;
+                let form = self
+                    .user_forms
+                    .iter()
+                    .find(|form| form.card_key == card_key)
+                    .ok_or_else(|| format!("no user-form `{card_key}`"))?;
+                let login_id = match invoke_arg_str(args, &["login_id", "loginId", "id"]) {
+                    Some(id) => id,
+                    None => match form.saved_logins.as_slice() {
+                        [(one, _, _)] => one.clone(),
+                        [] => return Err("that card offers no saved login".into()),
+                        _ => return Err("user-form.use-saved requires arg login_id".into()),
+                    },
+                };
+                Command::UserFormUseSaved { card_key, login_id }
+            }
             "UserFormDismiss" | "user-form.dismiss" => Command::UserFormDismiss {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
             "UserFormOpenScreen" | "user-form.screen" => Command::UserFormOpenScreen {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
-            "AnswerCredentialRequest" | "credential.answer" => {
-                let (request_id, allow) = self.invoke_credential_answer(args)?;
-                Command::AnswerCredentialRequest { request_id, allow }
-            }
             // The open bot's routines as the pane lists them, so a driver can find the id of
             // the one it just made without reading the tree.
             "routine.list" => {
@@ -3480,9 +3478,80 @@ mod tests {
         assert_eq!(recipe_row_target("recipes-filter-mine"), None);
     }
 
+    /// The saved accounts for the card's site are rows under the name field, one per
+    /// login; a click or the invoke picks one, and the pick names the login id.
+    #[test]
+    fn the_account_list_is_in_the_tree_and_a_row_picks_it() {
+        let mut host = host();
+        let mut form = google_login_form();
+        form.saved_logins = vec![
+            ("sl_1".into(), "ada@example.com".into(), "google.com".into()),
+            ("sl_2".into(), "bea@example.com".into(), "google.com".into()),
+        ];
+        form.saved_login_note = Some("Confirm with Touch ID to fill in ada@example.com.".into());
+        host.user_forms = vec![form];
+        let tree = host.snapshot();
+        let row = tree
+            .find("user-form-use-saved-e_form-sl_2")
+            .expect("second row");
+        assert_eq!(row.name, "bea@example.com · google.com");
+        assert!(tree.find("user-form-saved-note-e_form").is_some());
+
+        host.dispatch(&Op::click("user-form-use-saved-e_form-sl_1"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::UserFormUseSaved { card_key, login_id }) => {
+                assert_eq!(card_key, "e_form");
+                assert_eq!(login_id, "sl_1");
+            }
+            other => panic!("expected a pick, got {other:?}"),
+        }
+        // Two rows: the invoke needs to be told which.
+        assert!(
+            host.invoke("user-form.use-saved", &serde_json::json!({}))
+                .is_err()
+        );
+        host.invoke(
+            "user-form.use-saved",
+            &serde_json::json!({ "login_id": "sl_2" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormUseSaved { login_id, .. }) if login_id == "sl_2"
+        ));
+        // A held password: the rows are gone, Change is there, and a click frees the card.
+        host.user_forms[0].saved_logins.clear();
+        host.user_forms[0].saved_login_held = true;
+        let tree = host.snapshot();
+        assert!(tree.find("user-form-use-saved-e_form-sl_1").is_none());
+        assert!(tree.find("user-form-saved-clear-e_form").is_some());
+        host.dispatch(&Op::click("user-form-saved-clear-e_form"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormClearSaved { card_key }) if card_key == "e_form"
+        ));
+        // The password the driver hands over never shows in a command's Debug.
+        host.invoke(
+            "logins.add",
+            &serde_json::json!({ "origin": "x.com", "username": "a", "password": "hunter2" }),
+        )
+        .unwrap();
+        let shown = format!("{:?}", host.take_command());
+        assert!(
+            shown.contains("AddSiteLogin") && !shown.contains("hunter2"),
+            "{shown}"
+        );
+    }
+
     fn google_login_form() -> UserFormSnap {
         UserFormSnap {
             card_key: "e_form".into(),
+            continue_label: "Continue",
+            saved_logins: Vec::new(),
+            saved_login_note: None,
+            saved_login_held: false,
             title: "Google account".into(),
             fields: vec![
                 UserFormFieldSnap {
@@ -3580,6 +3649,10 @@ mod tests {
         let mut host = host();
         host.user_forms = vec![UserFormSnap {
             card_key: "call-9".into(),
+            continue_label: "Continue",
+            saved_logins: Vec::new(),
+            saved_login_note: None,
+            saved_login_held: false,
             title: "Website login".into(),
             fields: vec![UserFormFieldSnap {
                 id: "email".into(),
@@ -3708,6 +3781,10 @@ mod tests {
 
         host.user_forms = vec![UserFormSnap {
             card_key: "e_form".into(),
+            continue_label: "Continue",
+            saved_logins: Vec::new(),
+            saved_login_note: None,
+            saved_login_held: false,
             title: "Google account".into(),
             fields: Vec::new(),
             pill: Some("Dismissed".into()),
@@ -3754,26 +3831,17 @@ mod tests {
     }
 
     #[test]
-    fn save_login_and_credential_request_are_in_the_tree_without_passwords() {
+    fn save_login_is_in_the_tree_without_a_password() {
         let mut host = host();
         host.save_logins = vec![SaveLoginSnap {
             form_entry_id: "e_form".into(),
             origin: "google.com".into(),
             username: "ada@example.com".into(),
         }];
-        host.credential_requests = vec![CredentialRequestSnap {
-            request_id: "req-9".into(),
-            origin: "google.com".into(),
-            username: Some("ada@example.com".into()),
-            pill: None,
-        }];
         let tree = host.snapshot();
         assert!(tree.find("save-login-e_form").is_some());
         assert!(tree.find("save-login-save-e_form").is_some());
         assert!(tree.find("save-login-skip-e_form").is_some());
-        assert!(tree.find("credential-request-req-9").is_some());
-        assert!(tree.find("credential-request-allow-req-9").is_some());
-        assert!(tree.find("credential-request-deny-req-9").is_some());
         let dump = format!("{tree:?}");
         assert!(!dump.contains("s3cret"));
         host.dispatch(&Op::click("save-login-save-e_form")).unwrap();
@@ -3781,62 +3849,11 @@ mod tests {
             host.take_command(),
             Some(Command::SaveLogin { .. })
         ));
-        host.dispatch(&Op::click("credential-request-allow-req-9"))
-            .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest { allow: true, .. }) => {}
-            other => panic!("expected confirm, not a Box fill: {other:?}"),
-        }
-        host.dispatch(&Op::click("credential-request-deny-req-9"))
-            .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest {
-                allow: false,
-                request_id,
-            }) => assert_eq!(request_id, "req-9"),
-            other => panic!("expected Not now via click, got {other:?}"),
-        }
     }
 
     #[test]
-    fn answer_credential_request_is_a_named_invoke() {
+    fn an_unknown_invoke_fails_closed() {
         let mut host = host();
-        host.credential_requests = vec![CredentialRequestSnap {
-            request_id: "req-9".into(),
-            origin: "facebook.com".into(),
-            username: None,
-            pill: None,
-        }];
-        host.dispatch(&Op::Invoke {
-            name: "AnswerCredentialRequest".into(),
-            args: serde_json::json!({ "request_id": "req-9", "allow": true }),
-        })
-        .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest {
-                request_id,
-                allow: true,
-            }) => assert_eq!(request_id, "req-9"),
-            other => panic!("expected Use saved invoke, got {other:?}"),
-        }
-        host.dispatch(&Op::Invoke {
-            name: "AnswerCredentialRequest".into(),
-            args: serde_json::json!({ "allow": false }),
-        })
-        .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest { allow: false, .. }) => {}
-            other => panic!("expected Not now invoke, got {other:?}"),
-        }
-        host.dispatch(&Op::Invoke {
-            name: "credential.answer".into(),
-            args: serde_json::json!({ "requestId": "req-9", "answer": "deny" }),
-        })
-        .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest { allow: false, .. }) => {}
-            other => panic!("expected kebab deny, got {other:?}"),
-        }
         let unknown = host
             .dispatch(&Op::Invoke {
                 name: "NotACommand".into(),
@@ -3874,42 +3891,6 @@ mod tests {
     }
 
     #[test]
-    fn folded_credential_request_exposes_pill_not_buttons() {
-        let mut host = host();
-        host.credential_requests = vec![CredentialRequestSnap {
-            request_id: "req-9".into(),
-            origin: "facebook.com".into(),
-            username: None,
-            pill: Some("Dismissed".into()),
-        }];
-        let tree = host.snapshot();
-        assert!(tree.find("credential-request-req-9").is_some());
-        assert_eq!(
-            tree.find("credential-request-pill-req-9").unwrap().name,
-            "Dismissed"
-        );
-        assert!(tree.find("credential-request-allow-req-9").is_none());
-        assert!(tree.find("credential-request-deny-req-9").is_none());
-        let click = host
-            .dispatch(&Op::click("credential-request-deny-req-9"))
-            .unwrap_err();
-        assert!(
-            click.contains("unknown click target"),
-            "folded Not now must not stay clickable: {click}"
-        );
-        let invoke = host
-            .dispatch(&Op::Invoke {
-                name: "AnswerCredentialRequest".into(),
-                args: serde_json::json!({ "request_id": "req-9", "allow": false }),
-            })
-            .unwrap_err();
-        assert!(
-            invoke.contains("no open credential.request"),
-            "invoke must not fire on a folded card: {invoke}"
-        );
-    }
-
-    #[test]
     fn settings_logins_list_username_and_origin_only() {
         let mut host = host();
         host.account_open = true;
@@ -3918,6 +3899,7 @@ mod tests {
             id: "cred-1".into(),
             origin: "google.com".into(),
             username: "ada@example.com".into(),
+            on_this_mac: true,
         }];
         let tree = host.snapshot();
         let row = tree.find("settings-login-row-cred-1").unwrap();

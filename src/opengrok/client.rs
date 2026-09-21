@@ -525,6 +525,61 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// The person's saved site logins on the server. Never the passwords.
+    pub async fn list_site_logins(&self) -> Result<Vec<RemoteSiteLogin>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/site-logins", None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Save (or replace) one site login on the server. The reply is the row without the
+    /// password; its id is the id the local keychain copy is filed under.
+    pub async fn save_site_login(
+        &self,
+        origin: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<RemoteSiteLogin, OpenGrokError> {
+        let body =
+            serde_json::json!({ "origin": origin, "username": username, "password": password });
+        let response = self
+            .send_json(reqwest::Method::POST, "/site-logins", Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Delete one of the person's site logins on the server. A row the server no longer has
+    /// counts as deleted.
+    pub async fn delete_site_login(&self, id: &str) -> Result<(), OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &format!("/site-logins/{id}"), None)
+            .await?;
+        if response.status().as_u16() == 404 || response.status().is_success() {
+            return Ok(());
+        }
+        Err(Self::read_error(response).await)
+    }
+
+    /// The password of one of the person's own site logins, for a fill on this Mac after
+    /// Touch ID. Cached into the keychain by the caller; never painted.
+    pub async fn reveal_site_login(&self, id: &str) -> Result<String, OpenGrokError> {
+        let response = self
+            .send_json::<()>(
+                reqwest::Method::POST,
+                &format!("/site-logins/{id}/reveal"),
+                None,
+            )
+            .await?;
+        let body: serde_json::Value = Self::json_or_error(response).await?;
+        body.get("password")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                OpenGrokError::from_server(Some(200), "the reveal carried no password".to_string())
+            })
+    }
+
     pub async fn update_profile(&self, update: &ProfileUpdate) -> Result<Account, OpenGrokError> {
         let response = self
             .send_json(reqwest::Method::POST, "/account/profile", Some(update))
@@ -733,11 +788,12 @@ impl OpenGrokClient {
         entry_id: &str,
         agent_id: &str,
         values: &super::user_form::UserFormValues,
+        saved_login: bool,
     ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
         if entry_id.trim().is_empty() {
             return Ok(super::user_form::UserFormActionReply::MissingEntryId);
         }
-        let body = super::user_form::submit_request_body(entry_id, agent_id, values);
+        let body = super::user_form::submit_request_body(entry_id, agent_id, values, saved_login);
         let response = self
             .send_json(
                 reqwest::Method::POST,
@@ -793,41 +849,6 @@ impl OpenGrokClient {
         Self::box_handoff_action_response(response).await
     }
 
-    /// A.0: tell the run what happened for `credential.request`. Never a password.
-    /// `filled` is not posted here — there is no session broker yet.
-    pub async fn post_credential_result(
-        &self,
-        status: super::credential::CredentialResultStatus,
-        request_id: &str,
-        credential_id: Option<&str>,
-        agent_id: &str,
-    ) -> Result<(), OpenGrokError> {
-        if request_id.trim().is_empty() {
-            return Ok(());
-        }
-        let body =
-            super::credential::credential_result_body(status, request_id, credential_id, agent_id);
-        let response = self
-            .send_json(
-                reqwest::Method::POST,
-                super::credential::CREDENTIAL_RESULT_PATH,
-                Some(&body),
-            )
-            .await?;
-        let status_code = response.status().as_u16();
-        if status_code == 404 || (200..300).contains(&status_code) {
-            return Ok(());
-        }
-        let text = response
-            .text()
-            .await
-            .map_err(|e| OpenGrokError::transport(&e))?;
-        Err(OpenGrokError::from_server(
-            Some(status_code),
-            error_message_from_body(&text),
-        ))
-    }
-
     async fn user_form_action_response(
         response: reqwest::Response,
     ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
@@ -841,7 +862,7 @@ impl OpenGrokClient {
         } else {
             serde_json::from_str(&text).unwrap_or(Value::Null)
         };
-        if status == 404 {
+        if status == 404 || status == 403 {
             return Ok(super::user_form::user_form_action_from_http(status, &value));
         }
         if !(200..300).contains(&status) {
@@ -2894,6 +2915,19 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// One saved site login as the server lists it. Never the password.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSiteLogin {
+    pub id: String,
+    pub origin: String,
+    pub username: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::assistant_text_from_sse;
@@ -3704,7 +3738,7 @@ mod tests {
             .insert("email".into(), "ada@example.com".into());
         values.by_id.insert("password".into(), "s3cret-pass".into());
         let reply = client
-            .submit_user_form("e_form", "cw_1", &values)
+            .submit_user_form("e_form", "cw_1", &values, false)
             .await
             .unwrap();
         match reply {
@@ -3739,7 +3773,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default())
+            .submit_user_form("e_form", "cw_1", &Default::default(), false)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingEntry);
@@ -3760,7 +3794,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default())
+            .submit_user_form("e_form", "cw_1", &Default::default(), false)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingRoute);
@@ -3780,7 +3814,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default())
+            .submit_user_form("e_form", "cw_1", &Default::default(), false)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::Empty);
@@ -3800,53 +3834,10 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("", "cw_1", &Default::default())
+            .submit_user_form("", "cw_1", &Default::default(), false)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingEntryId);
-    }
-
-    #[tokio::test]
-    async fn credential_result_posts_status_without_a_password() {
-        use super::super::credential::CredentialResultStatus;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/ag-ui/credential/result"))
-            .and(body_json(json!({
-                "status": "error",
-                "requestId": "req-9",
-                "agentId": "cw_1",
-                "credentialId": "cred-1"
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
-            .mount(&server)
-            .await;
-        let client = OpenGrokClient::new(&server.uri()).unwrap();
-        client
-            .post_credential_result(
-                CredentialResultStatus::Error,
-                "req-9",
-                Some("cred-1"),
-                "cw_1",
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn credential_result_404_is_not_a_failure() {
-        use super::super::credential::CredentialResultStatus;
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/ag-ui/credential/result"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        let client = OpenGrokClient::new(&server.uri()).unwrap();
-        client
-            .post_credential_result(CredentialResultStatus::Missing, "req-9", None, "cw_1")
-            .await
-            .unwrap();
     }
 
     #[tokio::test]

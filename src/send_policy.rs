@@ -41,7 +41,7 @@ pub enum Busy {
     Idle,
     /// A run is in flight and nothing is waiting on the person.
     Running,
-    /// A user-form, credential or approval card is waiting on the person, or
+    /// A user-form or approval card is waiting on the person, or
     /// the chrome still says so.
     Parked,
 }
