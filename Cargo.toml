@@ -18,6 +18,8 @@ anyhow = "1.0"
 name = "nativechat"
 version = "0.1.0"
 edition = "2024"
+# `cargo bundle` will not build the .app without it.
+description = "Chat with bots that work on their own computers."
 
 [features]
 default = []
@@ -53,6 +55,10 @@ chrono = "0.4.42"
 objc = "0.2"
 cocoa = "0.26"
 block = "0.1"
+# Authenticator codes for the code card and the Logins detail pane.
+totp-rs = { version = "6", features = ["otpauth"] }
+# 1Password's 1PUX export is a ZIP with the JSON inside.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -60,7 +66,7 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 
 [package.metadata.bundle]
 name = "NativeChat"
-identifier = "dev.hexuria.nativechat"
+identifier = "dev.goldcoders.nativechat"
 short_description = "A native chat application."
 resources = ["themes/", "assets/"]
 macOS_entitlements_path = "./nativechat.entitlements"

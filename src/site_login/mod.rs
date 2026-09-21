@@ -20,13 +20,16 @@
 //! The LLM `credentials` table and local-exec daemon JSON are not this store.
 
 mod extract;
-pub mod import;
+pub mod importers;
 mod origin;
 mod secrets;
 mod store;
+pub mod totp;
 pub mod touch_id;
 
-pub use extract::{LoginFields, PendingSave, login_fields, login_origin, save_candidate};
+pub use extract::{
+    CardTarget, LoginFields, PendingSave, card_target, login_fields, login_origin, save_candidate,
+};
 pub use origin::{login_matches_request, origins_match, registrable_origin};
 pub use store::{SiteLoginRecord, SiteLoginVault};
 
@@ -36,11 +39,211 @@ pub const KEYCHAIN_SERVICE: &str = "ai.nativechat.site-login";
 /// Fallback file when OS Keychain is not available (Linux/dev). Mode 0600.
 pub const VAULT_FILE: &str = "site-login.vault";
 
+/// The three kinds of row. A word the server adds later still lists under All.
+pub const KIND_PASSWORD: &str = "password";
+pub const KIND_CODE: &str = "code";
+pub const KIND_PASSKEY: &str = "passkey";
+
+/// The title a row gets when the person gave none.
+pub fn default_label(username: &str, origin: &str) -> String {
+    format!("{username} on {origin}")
+}
+
+/// The sections of the list on Settings → Logins, in their order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteLoginGroup {
+    Passwords,
+    Passkeys,
+    Codes,
+    /// Rows with a `Security:` line in their notes, listed here as well as under their kind.
+    Security,
+}
+
+impl SiteLoginGroup {
+    pub const ALL: [Self; 4] = [Self::Passwords, Self::Passkeys, Self::Codes, Self::Security];
+
+    /// The word in the header's id, `settings-logins-group-{id}`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Passwords => "passwords",
+            Self::Passkeys => "passkeys",
+            Self::Codes => "codes",
+            Self::Security => "security",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Passwords => "Passwords",
+            Self::Passkeys => "Passkeys",
+            Self::Codes => "Codes",
+            Self::Security => "Security",
+        }
+    }
+
+    /// Whether a row is filed under this section. A kind this app has not heard of files
+    /// under Passwords, so a word from a newer server is still on the list.
+    pub fn holds(self, row: &SiteLoginRecord) -> bool {
+        match self {
+            Self::Passwords => row.kind != KIND_PASSKEY && row.kind != KIND_CODE,
+            Self::Passkeys => row.kind == KIND_PASSKEY,
+            Self::Codes => row.kind == KIND_CODE,
+            Self::Security => has_security_note(row),
+        }
+    }
+}
+
+/// A line of the notes starting `Security:` files the row under Security as well.
+pub fn has_security_note(row: &SiteLoginRecord) -> bool {
+    row.notes
+        .lines()
+        .any(|line| line.trim_start().starts_with("Security:"))
+}
+
+/// What the list calls a row: its title, or the site when it has none.
+pub fn login_title(row: &SiteLoginRecord) -> &str {
+    let label = row.label.trim();
+    if label.is_empty() { &row.origin } else { label }
+}
+
+/// The search field: title, site or name, any case. Nothing typed matches everything.
+pub fn matches_query(row: &SiteLoginRecord, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    [
+        row.label.as_str(),
+        row.origin.as_str(),
+        row.username.as_str(),
+    ]
+    .iter()
+    .any(|field| field.to_lowercase().contains(&query))
+}
+
+/// The sections the list shows for a search, each with its rows in list order: by title,
+/// then by name for two rows with one title. The three kinds are always there — a 0 says
+/// what the kind is — until a search is on, when a section with no match is left out;
+/// Security is there only while some row has a `Security:` note.
+/// `with_code` names the rows that carry an authenticator-code seed beside their password;
+/// they show under Codes as well as under Passwords, so the Codes count is what the person
+/// can fill a code card with.
+pub fn grouped_logins<'a>(
+    rows: &'a [SiteLoginRecord],
+    query: &str,
+    with_code: &std::collections::HashSet<String>,
+) -> Vec<(SiteLoginGroup, Vec<&'a SiteLoginRecord>)> {
+    let searching = !query.trim().is_empty();
+    SiteLoginGroup::ALL
+        .into_iter()
+        .filter_map(|group| {
+            let mut members: Vec<&SiteLoginRecord> = rows
+                .iter()
+                .filter(|row| {
+                    (group.holds(row)
+                        || (group == SiteLoginGroup::Codes && with_code.contains(&row.id)))
+                        && matches_query(row, query)
+                })
+                .collect();
+            members.sort_by_cached_key(|row| {
+                (
+                    login_title(row).to_lowercase(),
+                    row.username.to_lowercase(),
+                    row.id.clone(),
+                )
+            });
+            let shown = match group {
+                SiteLoginGroup::Security => !members.is_empty(),
+                _ => !searching || !members.is_empty(),
+            };
+            shown.then_some((group, members))
+        })
+        .collect()
+}
+
+/// A row's stamp as unix milliseconds. The table holds two spellings: `datetime('now')`
+/// writes `2026-09-21 10:00:00`, the app writes RFC 3339.
+pub fn timestamp_ms(text: &str) -> Option<i64> {
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(at.timestamp_millis());
+    }
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|at| at.and_utc().timestamp_millis())
+}
+
+/// "Last used" in words, for a stamp against now, both in unix milliseconds.
+pub fn relative_time(at_ms: i64, now_ms: i64) -> String {
+    let secs = (now_ms - at_ms).max(0) / 1000;
+    let plural = |n: i64, unit: &str| {
+        if n == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{n} {unit}s ago")
+        }
+    };
+    if secs < 60 {
+        "Just now".to_string()
+    } else if secs < 3600 {
+        plural(secs / 60, "minute")
+    } else if secs < 86_400 {
+        plural(secs / 3600, "hour")
+    } else if secs < 172_800 {
+        "Yesterday".to_string()
+    } else if secs < 604_800 {
+        plural(secs / 86_400, "day")
+    } else if secs < 2_592_000 {
+        plural(secs / 604_800, "week")
+    } else if secs < 31_536_000 {
+        plural(secs / 2_592_000, "month")
+    } else {
+        plural(secs / 31_536_000, "year")
+    }
+}
+
+/// "Added" as a date, in the person's own time zone; the stamp as written when it does
+/// not parse.
+pub fn added_date(created_at: &str) -> String {
+    match timestamp_ms(created_at).and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+    {
+        Some(at) => at
+            .with_timezone(&chrono::Local)
+            .format("%b %-d, %Y")
+            .to_string(),
+        None => created_at.to_string(),
+    }
+}
+
+/// What the detail pane and the driver tree say a row holds and where it is kept. A
+/// passkey's key is never on this Mac; a code's seed is, or the server has it.
+pub fn where_the_secret_is(kind: &str, on_this_mac: bool) -> &'static str {
+    match (kind, on_this_mac) {
+        (KIND_PASSKEY, _) => "The key stays on the server and is used in the bot's browser",
+        (KIND_CODE, true) => "Code seed in this Mac's keychain",
+        (KIND_CODE, false) => "Code seed on the server; fetched here on first use",
+        (_, true) => "Password in this Mac's keychain",
+        (_, false) => "Password on the server; fetched here on first use",
+    }
+}
+
+/// What the pane shows in place of the secret: dots for a password, nothing to show for a
+/// passkey (its key never comes here).
+pub fn secret_placeholder(kind: &str) -> (&'static str, &'static str) {
+    match kind {
+        KIND_PASSKEY => ("Passkey", "On the server"),
+        KIND_CODE => ("Password", "None saved"),
+        _ => ("Password", "••••••••••"),
+    }
+}
+
 /// Where a pick from the card's account list is, until the form settles.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SavedLoginUse {
     /// The Touch ID sheet is up.
     Confirming { username: String },
+    /// The Touch ID sheet is up for a passkey the site is about to make. There is no name
+    /// yet: the site makes the key for whichever account is signed in there.
+    ConfirmingRegister { site: String },
     /// Touch ID passed: the name is in its field, the password is held for the submit and
     /// shown as dots. Log in sends both.
     Ready {
@@ -48,8 +251,16 @@ pub enum SavedLoginUse {
         username: String,
         password: String,
     },
-    /// Log in was pressed; the values are on their way to the box.
-    Filling { username: String },
+    /// Continue was pressed on a code card whose step is nearly over: the digits are
+    /// minted when the next step starts, and the card's buttons wait until then.
+    Waiting {
+        login_id: String,
+        username: String,
+        password: String,
+    },
+    /// Log in was pressed; the values are on their way to the box, named by the row they
+    /// came from so the server can stamp its use.
+    Filling { username: String, login_id: String },
     /// The person closed the sheet.
     Cancelled { username: String },
     /// The server would not put a saved login on this computer (a shared box).
@@ -69,8 +280,17 @@ impl std::fmt::Debug for SavedLoginUse {
                 .field("username", username)
                 .field("password", &"<redacted>")
                 .finish(),
+            Self::Waiting {
+                login_id, username, ..
+            } => f
+                .debug_struct("Waiting")
+                .field("login_id", login_id)
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
             Self::Confirming { username } => write!(f, "Confirming({username})"),
-            Self::Filling { username } => write!(f, "Filling({username})"),
+            Self::ConfirmingRegister { site } => write!(f, "ConfirmingRegister({site})"),
+            Self::Filling { username, .. } => write!(f, "Filling({username})"),
             Self::Cancelled { username } => write!(f, "Cancelled({username})"),
             Self::Refused { message } => write!(f, "Refused({message})"),
             Self::Unavailable { message } => write!(f, "Unavailable({message})"),
@@ -85,10 +305,18 @@ impl SavedLoginUse {
             Self::Confirming { username } => {
                 format!("Confirm with Touch ID to fill in {username}.")
             }
-            Self::Ready { username, .. } => {
-                format!("Password for {username} from your keychain. Press Log in.")
+            Self::ConfirmingRegister { site } => {
+                format!("Confirm with Touch ID to let {site} create a passkey.")
             }
-            Self::Filling { username } => {
+            Self::Ready {
+                username,
+                password,
+                login_id,
+            } => Self::ready_note(username, password, login_id),
+            Self::Waiting { username, .. } => {
+                format!("The code for {username} is about to change; the next one is sent.")
+            }
+            Self::Filling { username, .. } => {
                 format!("Logging in as {username}. The password goes straight to the computer.")
             }
             Self::Cancelled { username } => {
@@ -98,19 +326,63 @@ impl SavedLoginUse {
         }
     }
 
-    /// The held password, once Touch ID passed.
+    /// What a held pick says it is waiting for. A passkey holds no secret at all, and a
+    /// code seed is not a password, so neither is called one.
+    fn ready_note(username: &str, password: &str, login_id: &str) -> String {
+        if password.is_empty() {
+            if login_id.is_empty() {
+                format!("Touch ID confirmed for {username}. Press Create passkey.")
+            } else {
+                format!("Passkey for {username} ready. Press Use passkey.")
+            }
+        } else if password.starts_with("otpauth://") {
+            format!("The code for {username} is minted when you press Continue.")
+        } else {
+            format!("Password for {username} from your keychain. Press Log in.")
+        }
+    }
+
+    /// The row in flight, once Log in was pressed.
+    pub fn filling_id(&self) -> Option<&str> {
+        match self {
+            Self::Filling { login_id, .. } => Some(login_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The held secret (a password, a code seed, or nothing for a passkey), once Touch ID
+    /// passed.
     pub fn ready(&self) -> Option<(&str, &str)> {
         match self {
             Self::Ready {
+                username, password, ..
+            }
+            | Self::Waiting {
                 username, password, ..
             } => Some((username.as_str(), password.as_str())),
             _ => None,
         }
     }
 
+    /// The row a held pick came from, whether it is still waiting or already ready.
+    pub fn held_id(&self) -> Option<&str> {
+        match self {
+            Self::Ready { login_id, .. } | Self::Waiting { login_id, .. } => {
+                Some(login_id.as_str())
+            }
+            _ => None,
+        }
+    }
+
     /// While the sheet is up or the fill is in flight, the card's own buttons wait.
     pub fn is_busy(&self) -> bool {
-        matches!(self, Self::Confirming { .. } | Self::Filling { .. })
+        matches!(
+            self,
+            Self::Confirming { .. }
+                | Self::ConfirmingRegister { .. }
+                | Self::Waiting { .. }
+                | Self::Filling { .. }
+        )
     }
 }
 
@@ -127,5 +399,231 @@ pub enum StoreError {
 impl From<sqlx::Error> for StoreError {
     fn from(err: sqlx::Error) -> Self {
         Self::Db(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(
+        id: &str,
+        origin: &str,
+        username: &str,
+        label: &str,
+        kind: &str,
+        notes: &str,
+    ) -> SiteLoginRecord {
+        SiteLoginRecord {
+            id: id.into(),
+            origin: origin.into(),
+            username: username.into(),
+            label: label.into(),
+            kind: kind.into(),
+            notes: notes.into(),
+            last_used_at_ms: None,
+            created_at: "2026-09-21T10:00:00+00:00".into(),
+            updated_at: "2026-09-21T10:00:00+00:00".into(),
+        }
+    }
+
+    fn shape<'a>(
+        groups: &'a [(SiteLoginGroup, Vec<&SiteLoginRecord>)],
+    ) -> Vec<(&'a str, Vec<&'a str>)> {
+        groups
+            .iter()
+            .map(|(group, members)| {
+                (
+                    group.id(),
+                    members.iter().map(|row| row.id.as_str()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The three kinds are always sections, Security only while a row has a `Security:`
+    /// line; a row with one is under Security as well as under its kind, and a kind this
+    /// app has not heard of is a password.
+    #[test]
+    fn the_list_is_grouped_by_kind_and_security_only_when_there_is_one() {
+        let rows = vec![
+            row("1", "a.com", "ada", "", "password", ""),
+            row("2", "b.com", "bea", "", "passkey", "Security: hardware key"),
+            row(
+                "3",
+                "c.com",
+                "cy",
+                "",
+                "code",
+                "plain words\n  Security: recovery codes in the safe",
+            ),
+            row(
+                "4",
+                "d.com",
+                "dee",
+                "",
+                "password",
+                "Not security: just a note",
+            ),
+            row("5", "e.com", "eve", "", "something-new", ""),
+        ];
+        assert_eq!(
+            shape(&grouped_logins(&rows, "", &Default::default())),
+            [
+                ("passwords", vec!["1", "4", "5"]),
+                ("passkeys", vec!["2"]),
+                ("codes", vec!["3"]),
+                ("security", vec!["2", "3"]),
+            ]
+        );
+        // No `Security:` line anywhere: no Security section. The three kinds stay, empty or not.
+        let plain = vec![row("1", "a.com", "ada", "", "password", "")];
+        assert_eq!(
+            shape(&grouped_logins(&plain, "", &Default::default())),
+            [
+                ("passwords", vec!["1"]),
+                ("passkeys", vec![]),
+                ("codes", vec![]),
+            ]
+        );
+        assert_eq!(
+            shape(&grouped_logins(&[], "", &Default::default())),
+            [
+                ("passwords", vec![]),
+                ("passkeys", vec![]),
+                ("codes", vec![])
+            ]
+        );
+    }
+
+    /// Rows are by title (the site when there is none), any case; a search reads the title,
+    /// the site and the name, and leaves out a section it empties.
+    #[test]
+    fn the_list_sorts_by_title_and_the_search_reads_three_fields() {
+        let rows = vec![
+            row("1", "zeta.com", "ada", "", "password", ""),
+            row(
+                "2",
+                "github.com",
+                "bea@work.example",
+                "Work GitHub",
+                "password",
+                "",
+            ),
+            row("3", "apple.com", "cy", "beta", "password", ""),
+            row("4", "keys.example", "dee", "", "passkey", ""),
+        ];
+        let passwords = |query: &str| -> Vec<String> {
+            grouped_logins(&rows, query, &Default::default())
+                .into_iter()
+                .find(|(group, _)| *group == SiteLoginGroup::Passwords)
+                .map(|(_, members)| {
+                    members
+                        .into_iter()
+                        .map(|row| login_title(row).to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(passwords(""), ["beta", "Work GitHub", "zeta.com"]);
+        assert_eq!(
+            passwords("WORK"),
+            ["Work GitHub"],
+            "the title and the name both say work"
+        );
+        assert_eq!(passwords("apple"), ["beta"]);
+        assert_eq!(passwords("   ").len(), 3);
+        let sections = |query: &str| -> Vec<&str> {
+            grouped_logins(&rows, query, &Default::default())
+                .iter()
+                .map(|(group, _)| group.id())
+                .collect()
+        };
+        assert_eq!(sections("zeta"), ["passwords"]);
+        assert_eq!(sections("keys"), ["passkeys"]);
+        assert!(sections("nothing here").is_empty());
+    }
+
+    /// Both spellings the table holds read as the same moment; words for a distance.
+    #[test]
+    fn stamps_parse_in_both_spellings_and_read_as_words() {
+        assert_eq!(
+            timestamp_ms("2026-09-21T10:00:00+00:00"),
+            timestamp_ms("2026-09-21 10:00:00")
+        );
+        assert_eq!(timestamp_ms("yesterday-ish"), None);
+        let now = 1_800_000_000_000;
+        assert_eq!(relative_time(now - 5_000, now), "Just now");
+        assert_eq!(relative_time(now - 60_000, now), "1 minute ago");
+        assert_eq!(relative_time(now - 5 * 3_600_000, now), "5 hours ago");
+        assert_eq!(relative_time(now - 30 * 3_600_000, now), "Yesterday");
+        assert_eq!(relative_time(now - 3 * 86_400_000, now), "3 days ago");
+        assert_eq!(relative_time(now - 14 * 86_400_000, now), "2 weeks ago");
+        assert_eq!(relative_time(now - 40 * 86_400_000, now), "1 month ago");
+        assert_eq!(relative_time(now - 800 * 86_400_000, now), "2 years ago");
+        assert_eq!(
+            relative_time(now + 60_000, now),
+            "Just now",
+            "a clock ahead is not the future"
+        );
+        assert!(added_date("2026-09-21 10:00:00").contains("2026"));
+        assert_eq!(added_date("not a date"), "not a date");
+    }
+
+    #[test]
+    fn a_held_pick_is_named_for_what_it_actually_holds() {
+        let password = SavedLoginUse::Ready {
+            login_id: "sl_1".into(),
+            username: "ada".into(),
+            password: "pw".into(),
+        };
+        assert!(password.note().starts_with("Password for ada"));
+        let code = SavedLoginUse::Ready {
+            login_id: "sl_2".into(),
+            username: "ada".into(),
+            password: "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP".into(),
+        };
+        assert!(
+            code.note().contains("code for ada") && !code.note().contains("Password"),
+            "{}",
+            code.note()
+        );
+        let passkey = SavedLoginUse::Ready {
+            login_id: "sl_3".into(),
+            username: "ada".into(),
+            password: String::new(),
+        };
+        assert!(passkey.note().contains("Press Use passkey"), "{}", passkey.note());
+        let register = SavedLoginUse::Ready {
+            login_id: String::new(),
+            username: "webauthn.io".into(),
+            password: String::new(),
+        };
+        assert!(register.note().contains("Press Create passkey"));
+        // A pick waiting for the next code step keeps the card busy, so Continue cannot be
+        // pressed a second time and send an empty field.
+        let waiting = SavedLoginUse::Waiting {
+            login_id: "sl_2".into(),
+            username: "ada".into(),
+            password: "otpauth://totp/X?secret=JBSWY3DPEHPK3PXP".into(),
+        };
+        assert!(waiting.is_busy());
+        assert_eq!(waiting.held_id(), Some("sl_2"));
+        assert!(format!("{waiting:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn a_row_says_where_its_own_secret_is() {
+        assert_eq!(
+            where_the_secret_is(KIND_PASSKEY, false),
+            "The key stays on the server and is used in the bot's browser"
+        );
+        assert_eq!(where_the_secret_is(KIND_CODE, true), "Code seed in this Mac's keychain");
+        assert_eq!(
+            where_the_secret_is(KIND_PASSWORD, false),
+            "Password on the server; fetched here on first use"
+        );
+        assert_eq!(secret_placeholder(KIND_PASSKEY), ("Passkey", "On the server"));
+        assert_eq!(secret_placeholder(KIND_PASSWORD).1, "••••••••••");
     }
 }

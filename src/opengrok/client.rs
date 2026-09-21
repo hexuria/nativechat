@@ -539,14 +539,112 @@ impl OpenGrokClient {
         &self,
         origin: &str,
         username: &str,
+        label: &str,
+        notes: &str,
+        kind: &str,
         password: &str,
     ) -> Result<RemoteSiteLogin, OpenGrokError> {
-        let body =
-            serde_json::json!({ "origin": origin, "username": username, "password": password });
+        self.save_site_login_full(&SiteLoginSave {
+            origin,
+            username,
+            label,
+            notes,
+            kind,
+            password: Some(password),
+            otpauth: None,
+        })
+        .await
+    }
+
+    /// Save a row with what it has: a password, an authenticator-code seed, or both.
+    pub async fn save_site_login_full(
+        &self,
+        save: &SiteLoginSave<'_>,
+    ) -> Result<RemoteSiteLogin, OpenGrokError> {
+        let mut body = serde_json::json!({
+            "origin": save.origin,
+            "username": save.username,
+            "label": save.label,
+            "notes": save.notes,
+            "kind": save.kind,
+        });
+        if let Some(password) = save.password {
+            body["password"] = serde_json::Value::String(password.to_string());
+        }
+        if let Some(otpauth) = save.otpauth {
+            body["otpauth"] = serde_json::Value::String(otpauth.to_string());
+        }
         let response = self
             .send_json(reqwest::Method::POST, "/site-logins", Some(&body))
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// Both secrets of one of the person's own site logins, after Touch ID on this Mac:
+    /// the password and the authenticator-code seed, whichever the row has.
+    pub async fn reveal_site_login_secrets(
+        &self,
+        id: &str,
+    ) -> Result<RevealedSecrets, OpenGrokError> {
+        let response = self
+            .send_json::<()>(
+                reqwest::Method::POST,
+                &format!("/site-logins/{id}/reveal"),
+                None,
+            )
+            .await?;
+        let body: serde_json::Value = Self::json_or_error(response).await?;
+        let text = |key: &str| {
+            body.get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Ok(RevealedSecrets {
+            password: text("password"),
+            otpauth: text("otpauth"),
+        })
+    }
+
+    /// Change the title or the notes of one of the person's site logins. The reply is the
+    /// row as the server now has it.
+    pub async fn update_site_login(
+        &self,
+        id: &str,
+        update: &SiteLoginUpdate,
+    ) -> Result<RemoteSiteLogin, OpenGrokError> {
+        let response = self
+            .send_json(
+                reqwest::Method::PATCH,
+                &format!("/site-logins/{id}"),
+                Some(update),
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// The site's icon for a saved login, as image bytes: `None` when the server has none
+    /// (204), or has no such route (404). The format is whatever the site serves; the
+    /// caller reads the first bytes to tell.
+    pub async fn site_login_icon(&self, origin: &str) -> Result<Option<Vec<u8>>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(
+                reqwest::Method::GET,
+                &format!("/site-logins/icon/{origin}"),
+                None,
+            )
+            .await?;
+        match response.status().as_u16() {
+            204 | 404 => Ok(None),
+            _ if response.status().is_success() => {
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| OpenGrokError::transport(&e))?;
+                Ok((!bytes.is_empty()).then(|| bytes.to_vec()))
+            }
+            _ => Err(Self::read_error(response).await),
+        }
     }
 
     /// Delete one of the person's site logins on the server. A row the server no longer has
@@ -789,11 +887,18 @@ impl OpenGrokClient {
         agent_id: &str,
         values: &super::user_form::UserFormValues,
         saved_login: bool,
+        saved_login_id: Option<&str>,
     ) -> Result<super::user_form::UserFormActionReply, OpenGrokError> {
         if entry_id.trim().is_empty() {
             return Ok(super::user_form::UserFormActionReply::MissingEntryId);
         }
-        let body = super::user_form::submit_request_body(entry_id, agent_id, values, saved_login);
+        let body = super::user_form::submit_request_body_for(
+            entry_id,
+            agent_id,
+            values,
+            saved_login,
+            saved_login_id,
+        );
         let response = self
             .send_json(
                 reqwest::Method::POST,
@@ -2915,6 +3020,44 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// What a save sends. The secrets are redacted in Debug.
+#[derive(Clone)]
+pub struct SiteLoginSave<'a> {
+    pub origin: &'a str,
+    pub username: &'a str,
+    pub label: &'a str,
+    pub notes: &'a str,
+    pub kind: &'a str,
+    pub password: Option<&'a str>,
+    pub otpauth: Option<&'a str>,
+}
+
+impl std::fmt::Debug for SiteLoginSave<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteLoginSave")
+            .field("origin", &self.origin)
+            .field("username", &self.username)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+/// What a reveal gives back. Redacted in Debug.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RevealedSecrets {
+    pub password: Option<String>,
+    pub otpauth: Option<String>,
+}
+
+impl std::fmt::Debug for RevealedSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevealedSecrets")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("otpauth", &self.otpauth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// One saved site login as the server lists it. Never the password.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2924,8 +3067,24 @@ pub struct RemoteSiteLogin {
     pub username: String,
     #[serde(default)]
     pub label: String,
+    /// `password`, `code` or `passkey`. Empty from a server that predates kinds.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub last_used_at_ms: Option<i64>,
     #[serde(default)]
     pub updated_at_ms: i64,
+}
+
+/// What `PATCH /site-logins/{id}` may change. A field left `None` is left as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SiteLoginUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 #[cfg(test)]
@@ -3446,6 +3605,136 @@ mod tests {
         assert_eq!(hired.model, "xai/grok-4.6");
     }
 
+    /// The Add sheet's title, notes and kind ride along with the login; the reply's new
+    /// fields read, and a reply without them still reads.
+    #[tokio::test]
+    async fn save_site_login_sends_label_notes_and_kind() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/site-logins"))
+            .and(body_json(json!({
+                "origin": "github.com",
+                "username": "ada",
+                "label": "Work GitHub",
+                "notes": "Security: hardware key",
+                "kind": "password",
+                "password": "hunter2"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "sl_1",
+                "origin": "github.com",
+                "username": "ada",
+                "label": "Work GitHub",
+                "kind": "password",
+                "notes": "Security: hardware key",
+                "lastUsedAtMs": null,
+                "updatedAtMs": 1700000000000i64
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let saved = client
+            .save_site_login(
+                "github.com",
+                "ada",
+                "Work GitHub",
+                "Security: hardware key",
+                "password",
+                "hunter2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.id, "sl_1");
+        assert_eq!(saved.kind, "password");
+        assert_eq!(saved.notes, "Security: hardware key");
+        assert_eq!(saved.last_used_at_ms, None);
+        assert_eq!(saved.updated_at_ms, 1700000000000);
+
+        let older: RemoteSiteLogin = serde_json::from_value(json!({
+            "id": "sl_2", "origin": "x.com", "username": "bea"
+        }))
+        .unwrap();
+        assert_eq!(older.kind, "");
+        assert_eq!(older.notes, "");
+        assert_eq!(older.last_used_at_ms, None);
+    }
+
+    /// Only the field that changed is sent; the reply is the row as the server now has it.
+    #[tokio::test]
+    async fn update_site_login_patches_the_notes_alone() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/site-logins/sl_1"))
+            .and(body_json(json!({ "notes": "Security: call first" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sl_1",
+                "origin": "github.com",
+                "username": "ada",
+                "label": "Work GitHub",
+                "kind": "password",
+                "notes": "Security: call first",
+                "lastUsedAtMs": 1700000000000i64,
+                "updatedAtMs": 1700000001000i64
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let updated = client
+            .update_site_login(
+                "sl_1",
+                &SiteLoginUpdate {
+                    notes: Some("Security: call first".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.notes, "Security: call first");
+        assert_eq!(updated.last_used_at_ms, Some(1700000000000));
+    }
+
+    /// A site's icon is its bytes on 200 and nothing on 204 (or on a server without the
+    /// route); anything else is the server's own error.
+    #[tokio::test]
+    async fn site_login_icon_reads_bytes_on_200_and_nothing_on_204() {
+        let server = MockServer::start().await;
+        let png = b"\x89PNG\r\n\x1a\nnot really a picture".to_vec();
+        Mock::given(method("GET"))
+            .and(path("/site-logins/icon/github.com"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(png.clone()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/site-logins/icon/nowhere.example"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/site-logins/icon/broken.example"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({ "error": "no" })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert_eq!(
+            client.site_login_icon("github.com").await.unwrap(),
+            Some(png)
+        );
+        assert_eq!(
+            client.site_login_icon("nowhere.example").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            client.site_login_icon("never-asked.example").await.unwrap(),
+            None,
+            "a server without the route is a site without an icon"
+        );
+        assert!(client.site_login_icon("broken.example").await.is_err());
+    }
+
     #[test]
     fn sse_collects_text_deltas() {
         let body = concat!(
@@ -3738,7 +4027,7 @@ mod tests {
             .insert("email".into(), "ada@example.com".into());
         values.by_id.insert("password".into(), "s3cret-pass".into());
         let reply = client
-            .submit_user_form("e_form", "cw_1", &values, false)
+            .submit_user_form("e_form", "cw_1", &values, false, None)
             .await
             .unwrap();
         match reply {
@@ -3773,7 +4062,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default(), false)
+            .submit_user_form("e_form", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingEntry);
@@ -3794,7 +4083,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default(), false)
+            .submit_user_form("e_form", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingRoute);
@@ -3814,7 +4103,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("e_form", "cw_1", &Default::default(), false)
+            .submit_user_form("e_form", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::Empty);
@@ -3834,7 +4123,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let reply = client
-            .submit_user_form("", "cw_1", &Default::default(), false)
+            .submit_user_form("", "cw_1", &Default::default(), false, None)
             .await
             .unwrap();
         assert_eq!(reply, UserFormActionReply::MissingEntryId);

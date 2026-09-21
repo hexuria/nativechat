@@ -15,9 +15,22 @@
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
 //! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site),
 //! `user-form-saved-note-{key}`, `user-form-saved-clear-{key}`,
-//! `settings-tab-logins`, `settings-login-add`, `settings-login-import`,
-//! `settings-logins-notice`,
-//! `settings-login-row-{id}`, `settings-login-where-{id}`, `settings-login-delete-{id}`,
+//! `settings-tab-logins`, `settings-logins-search` (value = the query), `settings-login-add`,
+//! `settings-login-import`, `settings-logins-notice`, `settings-logins-error`,
+//! `settings-logins-empty`, `settings-logins-group-passwords|passkeys|codes|security` (a
+//! section of the list, value = its count; the three kinds are always there until a search
+//! leaves one empty, Security only while a row has a `Security:` note) with its rows
+//! `settings-login-row-{id}` under it (a row with a `Security:` note is under its kind and
+//! under Security, one id twice; the picked one has state `selected`),
+//! `settings-login-code-{id}` (a row's live code and the seconds left, on the pane and in
+//! the list), `settings-login-add-error` while the Add sheet shows one,
+//! `settings-login-notes-save-{id}` (the button that files an edited note),
+//! `settings-login-detail-{id}` (the picked row's pane: `settings-login-username-{id}`,
+//! `settings-login-website-{id}`, `settings-login-where-{id}`, `settings-login-notes-{id}`
+//! (value = the notes), `settings-login-last-used-{id}`, `settings-login-delete-{id}`),
+//! `settings-login-add-sheet` while the Add sheet is up (`settings-login-add-title`,
+//! `settings-login-add-username`, `settings-login-add-password`, `settings-login-add-website`,
+//! `settings-login-add-notes`, `settings-login-add-save`, `settings-login-add-cancel`),
 //! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-delete`.
@@ -30,8 +43,15 @@
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /
 //! `user-form.use-saved --arg login_id=…` / `user-form.clear-saved`), `AddSiteLogin`
-//! (`logins.add --arg origin= --arg username= --arg password=`) and `ImportSiteLogins`
-//! (`logins.import --arg path=`). Click ids above still work.
+//! (`logins.add --arg origin= --arg username= --arg password= [--arg label= --arg notes=]`)
+//! and `ImportSiteLogins` (`logins.import --arg path=`). Click ids above still work.
+//!
+//! Settings → Logins: `logins.list` (answers the rows — `id, kind, label, origin, username,
+//! on_this_mac, last_used_at_ms`; never a password), `logins.search --arg q=…` (no `q`
+//! clears; `set_value` / `type` / `key` on `settings-logins-search` do the same),
+//! `logins.select --arg id=…` (no `id` clears the pick; a click on a row does the same),
+//! `logins.notes --arg id=… --arg notes=…` (or `set_value` on `settings-login-notes-{id}`).
+//! The Add sheet's fields are the window's own: `logins.add` carries the values instead.
 //!
 //! Routines: `routine.list` (answers with the open bot's rows —
 //! `id, name, kind, cron, active, webhook_url, webhook_key`), `routine.create --arg

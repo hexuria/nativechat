@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>dev.hexuria.nativechat</string>
+	<string>dev.goldcoders.nativechat</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>NativeChat needs access to your microphone for voice input.</string>
 </dict>

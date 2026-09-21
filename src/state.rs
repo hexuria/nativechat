@@ -32,8 +32,9 @@ use crate::services::database::{ChatMessage, DatabaseService, MessagePart, Reply
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
-    PendingSave, SavedLoginUse, SiteLoginRecord, SiteLoginVault, login_fields,
-    login_matches_request, login_origin, origins_match, registrable_origin, save_candidate,
+    CardTarget, KIND_PASSWORD, PendingSave, SavedLoginUse, SiteLoginRecord, SiteLoginVault,
+    card_target, login_fields, login_matches_request, login_origin, origins_match,
+    registrable_origin, save_candidate,
 };
 use crate::threads::conversation_for_thread;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
@@ -1438,9 +1439,29 @@ pub struct AppState {
     /// Ids of the saved logins whose password is in this Mac's keychain. The others are on
     /// the server only and are fetched, after Touch ID, the first time they are used here.
     pub site_logins_on_this_mac: HashSet<String>,
+    /// Which rows have a code seed on this Mac. Asked of the keychain by name only, so
+    /// knowing costs nothing; the seed itself is read when a row is opened or picked.
+    pub site_logins_with_code: HashSet<String>,
+    /// Cards whose account list is up. A card arrives without it: the list belongs to the
+    /// field, so it comes up when the person puts the cursor there, the way a browser's
+    /// autofill does, and goes away again on a click anywhere else.
+    pub user_form_list_open: HashSet<String>,
+    /// The authenticator-code seeds this Mac holds, parsed, for the detail pane's ticker and
+    /// the code card. Read off the keychain on each load.
+    pub site_login_codes: HashMap<String, totp_rs::TOTP>,
     /// What the last Add / Import / sync did, for Settings → Logins.
     pub site_login_notice: Option<String>,
     pub site_login_error: Option<String>,
+    /// Site icons for Settings → Logins, by origin. `None` is a remembered miss: asked once,
+    /// the server had none (or would not say), not asked again this run.
+    pub site_login_icons: HashMap<String, Option<Arc<Image>>>,
+    /// The search field on Settings → Logins. The page draws its own field; this is the copy
+    /// the list filters by, and the one the driver writes.
+    pub site_login_query: String,
+    /// The row the detail pane shows.
+    pub site_login_selected: Option<String>,
+    /// The Add-login sheet is up over the page.
+    pub site_login_add_open: bool,
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
@@ -1820,8 +1841,15 @@ impl AppState {
             pending_save: HashMap::new(),
             saved_login_use: HashMap::new(),
             site_logins_on_this_mac: HashSet::new(),
+            site_logins_with_code: HashSet::new(),
+            user_form_list_open: HashSet::new(),
+            site_login_codes: HashMap::new(),
             site_login_notice: None,
             site_login_error: None,
+            site_login_icons: HashMap::new(),
+            site_login_query: String::new(),
+            site_login_selected: None,
+            site_login_add_open: false,
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
@@ -7651,7 +7679,68 @@ impl AppState {
         mut values: UserFormValues,
         cx: &mut Context<Self>,
     ) {
-        self.fold_held_saved_login(&card_key, &mut values);
+        // A card with a sheet up, a code waiting for its next step, or a fill already on
+        // its way, does not take a second press — wherever the press came from.
+        if self
+            .saved_login_use
+            .get(&card_key)
+            .is_some_and(SavedLoginUse::is_busy)
+        {
+            return;
+        }
+        // A held code near the end of its step is minted on the next step instead. The
+        // card is busy meanwhile, so Continue cannot be pressed twice, and the send happens
+        // only if that same pick is still the one on that same open card.
+        if let Some(wait) = self.held_code_wait(&card_key) {
+            let held = self
+                .saved_login_use
+                .get(&card_key)
+                .and_then(SavedLoginUse::ready)
+                .map(|(username, secret)| (username.to_string(), secret.to_string()));
+            let login_id = self
+                .saved_login_use
+                .get(&card_key)
+                .and_then(SavedLoginUse::held_id)
+                .unwrap_or_default()
+                .to_string();
+            let Some((username, password)) = held else {
+                return;
+            };
+            self.saved_login_use.insert(
+                card_key.clone(),
+                SavedLoginUse::Waiting {
+                    login_id: login_id.clone(),
+                    username,
+                    password,
+                },
+            );
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |state, cx| {
+                    let still_ours = matches!(
+                        state.saved_login_use.get(&card_key),
+                        Some(SavedLoginUse::Waiting { login_id: held, .. }) if held == &login_id
+                    ) && state
+                        .user_form_mut(&card_key)
+                        .is_some_and(|spec| spec.effective_resolution().is_none());
+                    if !still_ours {
+                        return;
+                    }
+                    if !state.fold_held_saved_login(&card_key, &mut values) {
+                        cx.notify();
+                        return;
+                    }
+                    state.dispatch_user_form(card_key, UserFormDispatch::Submit(values), cx);
+                });
+            })
+            .detach();
+            return;
+        }
+        if !self.fold_held_saved_login(&card_key, &mut values) {
+            cx.notify();
+            return;
+        }
         self.dispatch_user_form(card_key, UserFormDispatch::Submit(values), cx);
     }
 
@@ -7717,12 +7806,21 @@ impl AppState {
                     Ok(cx
                         .background_executor()
                         .spawn(async move {
+                            // Both of these ask the keychain whether an item is there,
+                            // by name; neither opens one. Reading a secret is what makes
+                            // the keychain ask the person to unlock it, and nothing on
+                            // this path needs the secret itself.
                             let here: HashSet<String> = rows
                                 .iter()
                                 .filter(|row| vault.secret_present(&row.id))
                                 .map(|row| row.id.clone())
                                 .collect();
-                            (rows, here)
+                            let with_code: HashSet<String> = rows
+                                .iter()
+                                .filter(|row| vault.code_present(&row.id))
+                                .map(|row| row.id.clone())
+                                .collect();
+                            (rows, here, with_code)
                         })
                         .await)
                 }
@@ -7730,14 +7828,27 @@ impl AppState {
             };
             let _ = this.update(cx, |state, cx| {
                 match list {
-                    Ok((rows, here)) => {
+                    Ok((rows, here, with_code)) => {
                         state.site_logins_on_this_mac = here;
+                        // The parsed seeds already in hand are kept; a row whose seed has
+                        // not been read yet is read when the person opens it.
+                        state
+                            .site_login_codes
+                            .retain(|id, _| with_code.contains(id));
+                        state.site_logins_with_code = with_code;
                         state.site_logins = rows;
                         state.site_login_error = None;
                         // Only a successful read makes the vault readable. A vault
                         // that failed to open must not read as empty: left false, the
                         // card offers nothing and the person types the login instead.
                         state.site_logins_ready = true;
+                        // A row that went away takes its detail pane with it.
+                        if let Some(selected) = &state.site_login_selected
+                            && !state.site_logins.iter().any(|row| &row.id == selected)
+                        {
+                            state.site_login_selected = None;
+                        }
+                        state.fetch_site_login_icons(cx);
                     }
                     Err(err) => state.site_login_error = Some(err.to_string()),
                 }
@@ -7747,29 +7858,51 @@ impl AppState {
         .detach();
     }
 
-    /// The saved logins a card can take: the vault has loaded, the card has a name field
-    /// and a password field, and the row's site is the card's site.
+    /// The rows a card can take: the vault has loaded, the card has a target (a login, a
+    /// code, a passkey), and the row is of that kind for the card's site.
     pub fn saved_logins_for_form(
         &self,
         spec: &crate::opengrok::UserFormSpec,
     ) -> Vec<SiteLoginRecord> {
-        if !self.site_logins_ready || login_fields(spec).is_none() {
+        if !self.site_logins_ready {
             return Vec::new();
         }
+        let Some(target) = card_target(spec) else {
+            return Vec::new();
+        };
         let Some(origin) = login_origin(spec) else {
             return Vec::new();
         };
         self.site_logins
             .iter()
             .filter(|row| login_matches_request(&row.origin, &row.username, &origin, None))
+            .filter(|row| match &target {
+                CardTarget::Login(_) => row.kind == crate::site_login::KIND_PASSWORD,
+                // A code can sit beside a password or on a row of its own; either way the
+                // seed has to be on this Mac (or the row on the server) to be offered.
+                // Only a row that really carries a code: its seed is on this Mac, or the
+                // row is a code row. A password row whose seed is on the server and has
+                // never been used here is not offered — nothing here knows it has one —
+                // and one reveal puts it in `site_login_codes` for every card after that.
+                CardTarget::Code { .. } => {
+                    self.site_logins_with_code.contains(&row.id)
+                        || self.site_login_codes.contains_key(&row.id)
+                        || row.kind == crate::site_login::KIND_CODE
+                }
+                CardTarget::Passkey { register: false } => {
+                    row.kind == crate::site_login::KIND_PASSKEY
+                }
+                CardTarget::Passkey { register: true } => false,
+            })
             .cloned()
             .collect()
     }
 
-    /// A pick from the card's account list: Touch ID first, then the password is read from
-    /// this Mac's keychain (or fetched once from the server) and held for Log in. The name
-    /// goes into its field; the password is never painted and never put in an input, and
-    /// the Bot never sees it.
+    /// A pick from the card's list: Touch ID first, then what the row holds is fetched for
+    /// the card — the password from this Mac's keychain (or once from the server), the code
+    /// seed the same way, nothing at all for a passkey (its key stays on the server, in the
+    /// box's browser) — and held for the press of the button. The name goes into its field;
+    /// a secret is never painted and never put in an input, and the Bot never sees it.
     pub fn pick_saved_login(&mut self, card_key: String, login_id: String, cx: &mut Context<Self>) {
         let Some(spec) = self.user_form_mut(&card_key).map(|spec| spec.clone()) else {
             return;
@@ -7777,7 +7910,7 @@ impl AppState {
         if spec.effective_resolution().is_some() || !spec.has_gateway_entry_id() {
             return;
         }
-        let (Some(fields), Some(origin)) = (login_fields(&spec), login_origin(&spec)) else {
+        let (Some(target), Some(origin)) = (card_target(&spec), login_origin(&spec)) else {
             return;
         };
         let Some(row) = self
@@ -7805,14 +7938,21 @@ impl AppState {
                 username: username.clone(),
             },
         );
-        // The name shows in its field at once (the driver reads it from here; the view sets
-        // its input too).
-        self.user_form_typed
-            .entry(card_key.clone())
-            .or_default()
-            .insert(fields.username_id.clone(), username.clone());
+        if let CardTarget::Login(fields) = &target {
+            // The name shows in its field at once (the driver reads it from here; the view
+            // sets its input too).
+            self.user_form_typed
+                .entry(card_key.clone())
+                .or_default()
+                .insert(fields.username_id.clone(), username.clone());
+        }
         cx.notify();
         let client = self.opengrok.clone();
+        let wants = match &target {
+            CardTarget::Login(_) => HeldSecret::Password,
+            CardTarget::Code { .. } => HeldSecret::CodeSeed,
+            CardTarget::Passkey { .. } => HeldSecret::None,
+        };
         cx.spawn(async move |this, cx| {
             let unlocked = cx
                 .background_executor()
@@ -7823,9 +7963,11 @@ impl AppState {
                     let vault = vault.clone();
                     async move {
                         match crate::site_login::touch_id::confirm_use(&origin, &username) {
-                            crate::site_login::touch_id::TouchIdOutcome::Verified => {
-                                Ok(vault.secret_for_fill(&row_id))
-                            }
+                            crate::site_login::touch_id::TouchIdOutcome::Verified => Ok(match wants {
+                                HeldSecret::Password => vault.secret_for_fill(&row_id),
+                                HeldSecret::CodeSeed => vault.code_for(&row_id),
+                                HeldSecret::None => Ok(Some(String::new())),
+                            }),
                             other => Err(other),
                         }
                     }
@@ -7835,19 +7977,40 @@ impl AppState {
             // once and keep it in the keychain for next time.
             let unlocked = match unlocked {
                 Ok(Ok(None)) => match client.as_ref() {
-                    Some(client) => match client.reveal_site_login(&row.id).await {
-                        Ok(password) => {
-                            match vault.cache_secret(&row.id, &password) {
-                                Ok(()) => {
+                    Some(client) => match client.reveal_site_login_secrets(&row.id).await {
+                        Ok(secrets) => {
+                            if let Some(seed) = &secrets.otpauth {
+                                if let Err(error) = vault.set_code(&row.id, seed) {
+                                    log::warn!("could not cache a revealed code seed: {error}");
+                                }
+                                // The row can fill a code card from now on, without waiting
+                                // for the next reload to notice.
+                                if let Ok(totp) = crate::site_login::totp::parse(seed) {
+                                    let row_id = row.id.clone();
                                     let _ = this.update(cx, |state, _| {
-                                        state.site_logins_on_this_mac.insert(row.id.clone());
+                                        state.site_logins_with_code.insert(row_id.clone());
+                                        state.site_logins_with_code.insert(row_id.clone());
+                                        state.site_login_codes.insert(row_id, totp);
                                     });
                                 }
-                                Err(error) => {
-                                    log::warn!("could not cache a revealed site login: {error}");
+                            }
+                            if let Some(password) = &secrets.password {
+                                match vault.cache_secret(&row.id, password) {
+                                    Ok(()) => {
+                                        let _ = this.update(cx, |state, _| {
+                                            state.site_logins_on_this_mac.insert(row.id.clone());
+                                        });
+                                    }
+                                    Err(error) => {
+                                        log::warn!("could not cache a revealed site login: {error}");
+                                    }
                                 }
                             }
-                            Ok(Ok(Some(password)))
+                            Ok(Ok(match wants {
+                                HeldSecret::Password => secrets.password,
+                                HeldSecret::CodeSeed => secrets.otpauth,
+                                HeldSecret::None => Some(String::new()),
+                            }))
                         }
                         Err(error) => Ok(Err(crate::site_login::StoreError::Secret(format!(
                             "the server would not reveal it: {error}"
@@ -7860,7 +8023,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 use crate::site_login::touch_id::TouchIdOutcome;
                 // The card may have settled or been dismissed while the sheet was up; a
-                // password for a card that is gone is not kept.
+                // secret for a card that is gone is not kept.
                 let still_waiting = matches!(
                     state.saved_login_use.get(&card_key),
                     Some(SavedLoginUse::Confirming { .. })
@@ -7873,18 +8036,47 @@ impl AppState {
                     return;
                 }
                 let next = match unlocked {
-                    Ok(Ok(Some(password))) => Some(SavedLoginUse::Ready {
-                        login_id: row.id.clone(),
-                        username: username.clone(),
-                        password,
-                    }),
+                    Ok(Ok(Some(secret))) => {
+                        let mut unreadable = false;
+                        if wants == HeldSecret::CodeSeed {
+                            match crate::site_login::totp::parse(&secret) {
+                                Ok(totp) => {
+                                    state.site_logins_with_code.insert(row.id.clone());
+                                    state.site_logins_with_code.insert(row.id.clone());
+                                    state.site_login_codes.insert(row.id.clone(), totp);
+                                }
+                                // Better to say so now than to send a card with an empty
+                                // field and let the person wonder what the box typed.
+                                Err(_) => unreadable = true,
+                            }
+                        }
+                        if unreadable {
+                            Some(SavedLoginUse::Unavailable {
+                                message: format!(
+                                    "The code seed for {username} is not readable. Import it \
+                                     again, or type the code."
+                                ),
+                            })
+                        } else {
+                            Some(SavedLoginUse::Ready {
+                                login_id: row.id.clone(),
+                                username: username.clone(),
+                                password: secret,
+                            })
+                        }
+                    }
                     Ok(Ok(None)) => Some(SavedLoginUse::Unavailable {
-                        message: format!(
-                            "The password for {username} is not in this Mac's keychain. Type it once and save it again."
-                        ),
+                        message: match wants {
+                            HeldSecret::CodeSeed => format!(
+                                "The code seed for {username} is not in this Mac's keychain. Import it again."
+                            ),
+                            _ => format!(
+                                "The password for {username} is not in this Mac's keychain. Type it once and save it again."
+                            ),
+                        },
                     }),
                     Ok(Err(error)) => Some(SavedLoginUse::Unavailable {
-                        message: format!("The keychain would not give up the password: {error}"),
+                        message: format!("The keychain would not give up the secret: {error}"),
                     }),
                     Err(TouchIdOutcome::Cancelled) => Some(SavedLoginUse::Cancelled {
                         username: username.clone(),
@@ -7905,35 +8097,175 @@ impl AppState {
         .detach();
     }
 
+    /// A passkey card in register mode: the person confirms with Touch ID that this site may
+    /// make a passkey for them; the site does the making, in the bot's browser.
+    pub fn confirm_passkey_register(&mut self, card_key: String, cx: &mut Context<Self>) {
+        let Some(spec) = self.user_form_mut(&card_key).map(|spec| spec.clone()) else {
+            return;
+        };
+        if spec.effective_resolution().is_some() || !spec.has_gateway_entry_id() {
+            return;
+        }
+        if card_target(&spec) != Some(CardTarget::Passkey { register: true }) {
+            return;
+        }
+        let Some(origin) = login_origin(&spec) else {
+            return;
+        };
+        if self
+            .saved_login_use
+            .get(&card_key)
+            .is_some_and(SavedLoginUse::is_busy)
+        {
+            return;
+        }
+        // No name here: the site makes the passkey for whichever account is signed in
+        // there, which is not this app's account and may not be a name at all.
+        let username = origin.clone();
+        self.saved_login_use.insert(
+            card_key.clone(),
+            SavedLoginUse::ConfirmingRegister {
+                site: origin.clone(),
+            },
+        );
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn({
+                    let origin = origin.clone();
+                    async move { crate::site_login::touch_id::confirm_register(&origin) }
+                })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                use crate::site_login::touch_id::TouchIdOutcome;
+                let still_waiting = matches!(
+                    state.saved_login_use.get(&card_key),
+                    Some(SavedLoginUse::ConfirmingRegister { .. })
+                );
+                if !still_waiting {
+                    return;
+                }
+                let next = match outcome {
+                    TouchIdOutcome::Verified => SavedLoginUse::Ready {
+                        login_id: String::new(),
+                        username: username.clone(),
+                        password: String::new(),
+                    },
+                    TouchIdOutcome::Cancelled => SavedLoginUse::Cancelled {
+                        username: username.clone(),
+                    },
+                    TouchIdOutcome::Unavailable(why) | TouchIdOutcome::Failed(why) => {
+                        SavedLoginUse::Unavailable {
+                            message: format!("Touch ID did not confirm it: {why}"),
+                        }
+                    }
+                };
+                state.saved_login_use.insert(card_key.clone(), next);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// "Change" on the locked password row: the held password is dropped; the person types.
     pub fn clear_saved_login_pick(&mut self, card_key: String, cx: &mut Context<Self>) {
         self.saved_login_use.remove(&card_key);
         cx.notify();
     }
 
-    /// A submit with a held password: the name and the password ride along, and the
-    /// submit is marked as a saved login for the server's own-computer rule.
-    fn fold_held_saved_login(&mut self, card_key: &str, values: &mut UserFormValues) {
-        let Some((username, password)) = self
+    /// A submit with a held secret: for a login the name and the password ride along; for a
+    /// code the digits are minted now, from the held seed; for a passkey nothing is added,
+    /// the row's id is enough. The submit is marked as a saved login for the server's
+    /// own-computer rule.
+    /// `false` when the card must not be sent: a held code seed this Mac cannot read is
+    /// said so on the card instead of sending an empty field to the box.
+    fn fold_held_saved_login(&mut self, card_key: &str, values: &mut UserFormValues) -> bool {
+        let Some((login_id, username, secret)) =
+            self.saved_login_use
+                .get(card_key)
+                .and_then(|use_| match use_ {
+                    SavedLoginUse::Ready {
+                        login_id,
+                        username,
+                        password,
+                    }
+                    | SavedLoginUse::Waiting {
+                        login_id,
+                        username,
+                        password,
+                    } => Some((login_id.clone(), username.clone(), password.clone())),
+                    _ => None,
+                })
+        else {
+            // Nothing is held: an ordinary typed submit.
+            return true;
+        };
+        let Some(target) = self
+            .user_form_mut(card_key)
+            .and_then(|spec| card_target(spec))
+        else {
+            return true;
+        };
+        match target {
+            CardTarget::Login(fields) => {
+                // Both fields are locked on the card while a pick is held, so the picked name
+                // is the name that goes with the picked password.
+                values.by_id.insert(fields.username_id, username.clone());
+                values.by_id.insert(fields.password_id, secret);
+            }
+            CardTarget::Code { code_id } => {
+                let Ok(totp) = crate::site_login::totp::parse(&secret) else {
+                    self.saved_login_use.insert(
+                        card_key.to_string(),
+                        SavedLoginUse::Unavailable {
+                            message: format!(
+                                "The code seed for {username} is not readable. Import it again, \
+                                 or type the code."
+                            ),
+                        },
+                    );
+                    return false;
+                };
+                values
+                    .by_id
+                    .insert(code_id, totp.generate_current().to_string());
+            }
+            CardTarget::Passkey { .. } => {}
+        }
+        self.saved_login_use.insert(
+            card_key.to_string(),
+            SavedLoginUse::Filling { username, login_id },
+        );
+        true
+    }
+
+    /// How long a submit should wait before minting a held code, so the digits are still
+    /// valid after the trip to the box: nothing, or the rest of a step that is nearly over.
+    fn held_code_wait(&self, card_key: &str) -> Option<std::time::Duration> {
+        let seed = self
             .saved_login_use
             .get(card_key)
             .and_then(SavedLoginUse::ready)
-            .map(|(u, p)| (u.to_string(), p.to_string()))
-        else {
-            return;
-        };
-        let Some(fields) = self
-            .user_form_mut(card_key)
-            .and_then(|spec| login_fields(spec))
-        else {
-            return;
-        };
-        // Both fields are locked on the card while a pick is held, so the picked name is the
-        // name that goes with the picked password.
-        values.by_id.insert(fields.username_id, username.clone());
-        values.by_id.insert(fields.password_id, password);
-        self.saved_login_use
-            .insert(card_key.to_string(), SavedLoginUse::Filling { username });
+            .map(|(_, secret)| secret.to_string())?;
+        let target = self.user_form_mut_ref(card_key).and_then(card_target)?;
+        if !matches!(target, CardTarget::Code { .. }) {
+            return None;
+        }
+        let totp = crate::site_login::totp::parse(&seed).ok()?;
+        let wait = crate::site_login::totp::wait_before_minting(&totp);
+        (wait > 0).then(|| std::time::Duration::from_secs(wait))
+    }
+
+    fn user_form_mut_ref(&self, card_key: &str) -> Option<&crate::opengrok::UserFormSpec> {
+        self.conversations.iter().find_map(|conversation| {
+            conversation.messages.iter().find_map(|message| {
+                message.parts.iter().find_map(|part| match part {
+                    ChatPart::UserForm(spec) if spec.card_key() == card_key => Some(spec),
+                    _ => None,
+                })
+            })
+        })
     }
 
     /// A typed submit clears an old Touch ID note; a saved-login submit keeps "Filling".
@@ -8050,13 +8382,17 @@ impl AppState {
                 client.as_ref(),
                 &pending.origin,
                 &pending.username,
+                "",
+                "",
+                KIND_PASSWORD,
                 &pending.password,
+                None,
             )
             .await;
             drop(pending);
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(notice) => {
+                    Ok((_, notice)) => {
                         state.site_login_error = None;
                         state.site_login_notice = notice;
                         state.reload_site_logins(cx);
@@ -8071,12 +8407,15 @@ impl AppState {
     }
 
     /// Settings → Logins → Add. The origin is reduced to the site the vault keys by. True
-    /// when the values were taken (the form may clear); false with the reason on the page.
+    /// when the values were taken (the sheet closes and its fields clear); false with the
+    /// reason on the page. The new row is the selected one once the list has it.
     pub fn add_site_login(
         &mut self,
         origin: String,
         username: String,
         password: String,
+        label: String,
+        notes: String,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(origin) = registrable_origin(origin.trim()) else {
@@ -8095,17 +8434,30 @@ impl AppState {
             cx.notify();
             return false;
         };
+        let label = label.trim().to_string();
+        let notes = notes.trim_end().to_string();
+        self.site_login_add_open = false;
         let client = self.opengrok.clone();
         cx.spawn(async move |this, cx| {
-            let result =
-                save_site_login_everywhere(&vault, client.as_ref(), &origin, &username, &password)
-                    .await;
+            let result = save_site_login_everywhere(
+                &vault,
+                client.as_ref(),
+                &origin,
+                &username,
+                &label,
+                &notes,
+                KIND_PASSWORD,
+                &password,
+                None,
+            )
+            .await;
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(notice) => {
+                    Ok((id, notice)) => {
                         state.site_login_error = None;
                         state.site_login_notice =
                             notice.or_else(|| Some(format!("Saved {username} on {origin}.")));
+                        state.site_login_selected = Some(id);
                         state.reload_site_logins(cx);
                     }
                     Err(err) => state.site_login_error = Some(err),
@@ -8114,6 +8466,7 @@ impl AppState {
             });
         })
         .detach();
+        cx.notify();
         true
     }
 
@@ -8127,22 +8480,23 @@ impl AppState {
         };
         let client = self.opengrok.clone();
         cx.spawn(async move |this, cx| {
-            let report = cx
+            // A file is one of the exports; a directory is a `pass` store, read through the
+            // `pass` command with the person's own key.
+            let read = cx
                 .background_executor()
                 .spawn({
                     let path = path.clone();
                     async move {
-                        match std::fs::read_to_string(&path) {
-                            Ok(text) => crate::site_login::import::parse_export(&text),
-                            Err(error) => {
-                                Err(format!("could not read {}: {error}", path.display()))
-                            }
+                        if path.is_dir() {
+                            crate::site_login::importers::pass::read_store(&path)
+                        } else {
+                            crate::site_login::importers::read_file(&path).map(|r| (r, None))
                         }
                     }
                 })
                 .await;
-            let report = match report {
-                Ok(report) => report,
+            let (report, first_error) = match read {
+                Ok(read) => read,
                 Err(error) => {
                     let _ = this.update(cx, |state, cx| {
                         state.site_login_error = Some(format!("Import failed: {error}"));
@@ -8153,36 +8507,54 @@ impl AppState {
             };
             let mut saved = 0;
             let mut failed = Vec::new();
-            for login in &report.logins {
+            for item in &report.items {
                 match save_site_login_everywhere(
                     &vault,
                     client.as_ref(),
-                    &login.origin,
-                    &login.username,
-                    &login.password,
+                    &item.origin,
+                    &item.username,
+                    &item.label,
+                    &item.notes,
+                    item.kind,
+                    item.password.as_deref().unwrap_or(""),
+                    item.otpauth.as_deref(),
                 )
                 .await
                 {
                     Ok(_) => saved += 1,
                     Err(error) => {
-                        failed.push(format!("{} on {}: {error}", login.username, login.origin))
+                        failed.push(format!("{} on {}: {error}", item.username, item.origin))
                     }
                 }
             }
             let _ = this.update(cx, |state, cx| {
                 let mut notice = format!(
-                    "Imported {saved} login{}.",
-                    if saved == 1 { "" } else { "s" }
+                    "Imported {saved} login{} from {}.",
+                    if saved == 1 { "" } else { "s" },
+                    report.source
                 );
                 if report.skipped > 0 {
-                    notice.push_str(&format!(
-                        " Skipped {} row{} with no site, name or password.",
-                        report.skipped,
-                        if report.skipped == 1 { "" } else { "s" }
-                    ));
+                    notice.push_str(&match &report.stopped_early {
+                        // A store that stops decrypting stops the read: the rest were not
+                        // looked at, and saying they had nothing in them would be untrue.
+                        Some(entry) => format!(
+                            " Stopped at {entry}: {} row{} were not read.",
+                            report.skipped,
+                            if report.skipped == 1 { "" } else { "s" }
+                        ),
+                        None => format!(
+                            " Skipped {} row{} with no site, name or secret.",
+                            report.skipped,
+                            if report.skipped == 1 { "" } else { "s" }
+                        ),
+                    });
                 }
                 state.site_login_notice = Some(notice);
-                state.site_login_error = (!failed.is_empty()).then(|| failed.join("; "));
+                let mut errors = failed;
+                if let Some(first) = first_error {
+                    errors.insert(0, first);
+                }
+                state.site_login_error = (!errors.is_empty()).then(|| errors.join("; "));
                 state.reload_site_logins(cx);
                 cx.notify();
             });
@@ -8192,9 +8564,10 @@ impl AppState {
 
     /// Settings → Logins → Import…: the file picker, then [`Self::import_site_logins`].
     pub fn pick_site_logins_import(&mut self, cx: &mut Context<Self>) {
+        // A file (an export) or a directory (a `pass` store).
         let answer = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: false,
             prompt: Some("Import".into()),
         });
@@ -8248,6 +8621,9 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         state.site_logins.retain(|row| row.id != id);
+                        if state.site_login_selected.as_deref() == Some(id.as_str()) {
+                            state.site_login_selected = None;
+                        }
                         state.site_login_error = None;
                         state.reload_site_logins(cx);
                     }
@@ -8257,6 +8633,202 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// A click anywhere else puts the card's account list away. Nothing is chosen and
+    /// nothing is held; the field is free to type in.
+    pub fn close_saved_login_list(&mut self, card_key: String, cx: &mut Context<Self>) {
+        if self.user_form_list_open.remove(&card_key) {
+            cx.notify();
+        }
+    }
+
+    /// The cursor is in the field the accounts belong to, so the list comes up. Only that
+    /// field: the password field is not where an account is chosen, and a card that has
+    /// just arrived shows nothing until the person asks.
+    pub fn open_saved_login_list(
+        &mut self,
+        card_key: String,
+        field_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.user_form_list_open.contains(&card_key) {
+            return;
+        }
+        let belongs = self
+            .user_form_mut_ref(&card_key)
+            .and_then(card_target)
+            .is_some_and(|target| match target {
+                CardTarget::Login(fields) => fields.username_id == field_id,
+                CardTarget::Code { code_id } => code_id == field_id,
+                CardTarget::Passkey { .. } => false,
+            });
+        if belongs {
+            self.user_form_list_open.insert(card_key);
+            cx.notify();
+        }
+    }
+
+    /// Settings → Logins: the search field's text, the copy the list filters by.
+    pub fn set_site_login_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.site_login_query != query {
+            self.site_login_query = query;
+            cx.notify();
+        }
+    }
+
+    /// Settings → Logins: the row the detail pane shows. An id the list does not have
+    /// clears it.
+    pub fn select_site_login(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        let id = id.filter(|id| self.site_logins.iter().any(|row| &row.id == id));
+        if self.site_login_selected != id {
+            self.site_login_selected = id.clone();
+            // The pane shows a live code for the row that is open, so this is where its
+            // seed is read — one row, when the person asked to see it, and kept after.
+            if let Some(id) = id.filter(|id| {
+                self.site_logins_with_code.contains(id) && !self.site_login_codes.contains_key(id)
+            }) && let Some(vault) = self.site_login_vault.clone()
+            {
+                cx.spawn(async move |this, cx| {
+                    let read = cx
+                        .background_executor()
+                        .spawn({
+                            let id = id.clone();
+                            async move {
+                                let seed = vault.code_for(&id).ok().flatten()?;
+                                crate::site_login::totp::parse(&seed).ok()
+                            }
+                        })
+                        .await;
+                    let _ = this.update(cx, |state, cx| {
+                        match read {
+                            Some(totp) => {
+                                state.site_login_codes.insert(id, totp);
+                            }
+                            // The keychain would not give it up (a cancelled sheet, a
+                            // seed that will not parse): the pane shows no code, and the
+                            // list stops saying it has one.
+                            None => {
+                                state.site_logins_with_code.remove(&id);
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            cx.notify();
+        }
+    }
+
+    /// Settings → Logins → Add: the sheet comes up over the page, with a clean slate.
+    pub fn open_site_login_add(&mut self, cx: &mut Context<Self>) {
+        if !self.site_login_add_open {
+            self.site_login_add_open = true;
+            self.site_login_error = None;
+            cx.notify();
+        }
+    }
+
+    pub fn close_site_login_add(&mut self, cx: &mut Context<Self>) {
+        if self.site_login_add_open {
+            self.site_login_add_open = false;
+            cx.notify();
+        }
+    }
+
+    /// The notes on the detail pane, as typed: this Mac's row now, the server's next. Notes
+    /// that did not reach the server stay here with a notice saying so.
+    pub fn update_site_login_notes(&mut self, id: String, notes: String, cx: &mut Context<Self>) {
+        let Some(row) = self.site_logins.iter_mut().find(|row| row.id == id) else {
+            return;
+        };
+        if row.notes == notes {
+            return;
+        }
+        row.notes = notes.clone();
+        let Some(vault) = self.site_login_vault.clone() else {
+            self.site_login_error = Some("Login vault is not ready.".into());
+            cx.notify();
+            return;
+        };
+        let client = self.opengrok.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = match vault.update_notes(&id, &notes).await {
+                Err(error) => Err(error.to_string()),
+                Ok(()) => match client.as_ref() {
+                    None => Ok(Some(
+                        "Notes saved on this Mac. Sign in to keep them on the server too."
+                            .to_string(),
+                    )),
+                    Some(client) => {
+                        let update = crate::opengrok::SiteLoginUpdate {
+                            notes: Some(notes.clone()),
+                            ..Default::default()
+                        };
+                        match client.update_site_login(&id, &update).await {
+                            Ok(_) => Ok(None),
+                            Err(error) => Ok(Some(format!(
+                                "Notes saved on this Mac. The server did not take them yet: {error}"
+                            ))),
+                        }
+                    }
+                },
+            };
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(notice) => {
+                        state.site_login_error = None;
+                        state.site_login_notice = notice;
+                        state.reload_site_logins(cx);
+                    }
+                    Err(err) => state.site_login_error = Some(err),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// One request per site for its icon, remembered either way: a site with none is not
+    /// asked about again this run. Signed out, nothing is asked; the next reload after
+    /// signing in asks.
+    fn fetch_site_login_icons(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let missing: Vec<String> = {
+            let mut seen = HashSet::new();
+            self.site_logins
+                .iter()
+                .map(|row| row.origin.clone())
+                .filter(|origin| {
+                    !self.site_login_icons.contains_key(origin) && seen.insert(origin.clone())
+                })
+                .collect()
+        };
+        for origin in missing {
+            self.site_login_icons.insert(origin.clone(), None);
+            let client = client.clone();
+            cx.spawn(async move |this, cx| {
+                let bytes = match client.site_login_icon(&origin).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        log::debug!("no icon for {origin}: {error}");
+                        None
+                    }
+                };
+                let Some(image) = bytes.and_then(site_login_icon_image) else {
+                    return;
+                };
+                let _ = this.update(cx, |state, cx| {
+                    state.site_login_icons.insert(origin, Some(image));
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     fn dispatch_user_form(
@@ -8309,6 +8881,9 @@ impl AppState {
                     }
                 }
                 UserFormDismissMode::Escalated => {
+                    // The person is taking the screen: a held secret (and a code waiting
+                    // for its next step) is not theirs to send any more.
+                    self.saved_login_use.remove(&card_key);
                     let prior = self
                         .user_form_mut(&card_key)
                         .and_then(|spec| spec.computer_handoff);
@@ -8382,6 +8957,11 @@ impl AppState {
             return;
         };
         let saved_login = self.saved_login_in_flight(&card_key);
+        let saved_login_id = self
+            .saved_login_use
+            .get(&card_key)
+            .and_then(SavedLoginUse::filling_id)
+            .map(str::to_string);
         cx.spawn(async move |this, cx| {
             let verb = match &action {
                 UserFormDispatch::Submit(_) => UserFormVerb::Submit,
@@ -8395,7 +8975,13 @@ impl AppState {
             let result = match action {
                 UserFormDispatch::Submit(values) => {
                     client
-                        .submit_user_form(&entry_id, &agent_id, &values, saved_login)
+                        .submit_user_form(
+                            &entry_id,
+                            &agent_id,
+                            &values,
+                            saved_login,
+                            saved_login_id.as_deref(),
+                        )
                         .await
                 }
                 UserFormDispatch::Dismiss(mode) => {
@@ -9521,48 +10107,96 @@ fn settled_option(echo: Option<String>, cleared: bool, before: Option<String>) -
     }
 }
 
+/// What a pick fetches after Touch ID, by the card's target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeldSecret {
+    Password,
+    CodeSeed,
+    None,
+}
+
 /// Save on the server first, then in this Mac's keychain under the server's id. Without a
 /// reachable server (or one with no vault) the row is saved here only and the notice says
-/// so; the next sync files it on the server.
+/// so; the next sync files it on the server. The row's id comes back with the notice, so
+/// the page can show what was just saved.
+#[allow(clippy::too_many_arguments)]
 async fn save_site_login_everywhere(
     vault: &SiteLoginVault,
     client: Option<&crate::opengrok::OpenGrokClient>,
     origin: &str,
     username: &str,
+    label: &str,
+    notes: &str,
+    kind: &str,
     password: &str,
-) -> Result<Option<String>, String> {
+    otpauth: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let save = crate::opengrok::SiteLoginSave {
+        origin,
+        username,
+        label,
+        notes,
+        kind,
+        password: (!password.is_empty()).then_some(password),
+        otpauth,
+    };
+    let keep_code = |row_id: &str| -> Result<(), String> {
+        if let Some(seed) = otpauth {
+            vault.set_code(row_id, seed).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
     if let Some(client) = client {
-        match client.save_site_login(origin, username, password).await {
+        match client.save_site_login_full(&save).await {
             Ok(remote) => {
-                vault
-                    .save_with_id(&remote.id, origin, username, password)
+                // The server's words and stamp, not this Mac's: the row it wrote is the one
+                // every Mac syncs from, and a later local stamp would refuse its corrections.
+                let row = vault
+                    .save_with_id(
+                        &remote.id,
+                        origin,
+                        username,
+                        &remote.label,
+                        &remote.notes,
+                        &remote.kind,
+                        password,
+                        (remote.updated_at_ms > 0).then_some(remote.updated_at_ms),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
-                return Ok(None);
+                keep_code(&row.id)?;
+                return Ok((row.id, None));
             }
             Err(error) => {
-                vault
-                    .save(origin, username, password)
+                let row = vault
+                    .save(origin, username, label, notes, kind, password)
                     .await
                     .map_err(|error| error.to_string())?;
-                return Ok(Some(format!(
-                    "Saved on this Mac. The server did not take it yet: {error}"
-                )));
+                keep_code(&row.id)?;
+                return Ok((
+                    row.id,
+                    Some(format!(
+                        "Saved on this Mac. The server did not take it yet: {error}"
+                    )),
+                ));
             }
         }
     }
-    vault
-        .save(origin, username, password)
+    let row = vault
+        .save(origin, username, label, notes, kind, password)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(Some(
-        "Saved on this Mac. Sign in to keep it on the server too.".to_string(),
+    keep_code(&row.id)?;
+    Ok((
+        row.id,
+        Some("Saved on this Mac. Sign in to keep it on the server too.".to_string()),
     ))
 }
 
 /// Bring this Mac and the server to the same list. Rows the server has and this Mac does
 /// not are remembered here without their password; rows this Mac saved before the server
-/// knew them are filed there and take the server's id.
+/// knew them are filed there and take the server's id; a row both have takes the server's
+/// title, notes, kind and last use when the server's copy is the newer one.
 async fn sync_site_logins(
     vault: &SiteLoginVault,
     client: Option<&crate::opengrok::OpenGrokClient>,
@@ -9576,14 +10210,65 @@ async fn sync_site_logins(
         .map_err(|error| error.to_string())?;
     let local = vault.list().await.map_err(|error| error.to_string())?;
     for row in &remote {
-        let known = local.iter().any(|mine| {
+        let known = local.iter().find(|mine| {
             mine.id == row.id || (mine.origin == row.origin && mine.username == row.username)
         });
-        if !known {
-            vault
-                .remember_remote(&row.id, &row.origin, &row.username)
+        match known {
+            None => vault
+                .remember_remote(
+                    &row.id,
+                    &row.origin,
+                    &row.username,
+                    &row.label,
+                    &row.notes,
+                    &row.kind,
+                    row.last_used_at_ms,
+                )
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?,
+            Some(mine) => {
+                let took = vault
+                    .update_from_server(
+                        mine,
+                        &row.label,
+                        &row.notes,
+                        &row.kind,
+                        row.last_used_at_ms,
+                        row.updated_at_ms,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // This Mac's copy is the newer one and says something else: the words go
+                // up. A notes edit the server refused at the time is filed on the next
+                // sync instead of being lost.
+                if !took
+                    && (mine.label.trim() != row.label.trim() || mine.notes.trim() != row.notes.trim())
+                {
+                    let update = crate::opengrok::SiteLoginUpdate {
+                        label: Some(mine.label.trim().to_string()),
+                        notes: Some(mine.notes.trim().to_string()),
+                    };
+                    match client.update_site_login(&row.id, &update).await {
+                        // The server's reply is the last word, stamp included, so the two
+                        // are level and the next sync sends nothing.
+                        Ok(filed) => {
+                            let _ = vault
+                                .update_from_server(
+                                    mine,
+                                    &filed.label,
+                                    &filed.notes,
+                                    &filed.kind,
+                                    filed.last_used_at_ms,
+                                    filed.updated_at_ms,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            log::warn!("could not send a login's words to the server: {error}")
+                        }
+                    }
+                }
+            }
         }
     }
     for mine in &local {
@@ -9602,12 +10287,28 @@ async fn sync_site_logins(
                 .map_err(|error| error.to_string())?;
             continue;
         }
-        // Only a row with its password here can be filed on the server.
-        let Ok(Some(password)) = vault.secret_for_fill(&mine.id) else {
+        // A row the server can be given: its password, its code seed, or both. A row whose
+        // secret is on another Mac only has nothing to file. A keychain that would not
+        // answer is not the same as a row with no secret: the row waits for the next sync
+        // rather than being filed without what it holds.
+        let (Ok(password), Ok(otpauth)) = (vault.secret_for_fill(&mine.id), vault.code_for(&mine.id))
+        else {
+            log::warn!("the keychain would not answer for a login; leaving it for the next sync");
             continue;
         };
+        if password.is_none() && otpauth.is_none() {
+            continue;
+        }
         let filed = client
-            .save_site_login(&mine.origin, &mine.username, &password)
+            .save_site_login_full(&crate::opengrok::SiteLoginSave {
+                origin: &mine.origin,
+                username: &mine.username,
+                label: &mine.label,
+                notes: &mine.notes,
+                kind: &mine.kind,
+                password: password.as_deref(),
+                otpauth: otpauth.as_deref(),
+            })
             .await
             .map_err(|error| error.to_string())?;
         vault
@@ -9618,8 +10319,69 @@ async fn sync_site_logins(
     Ok(())
 }
 
+/// A site's icon bytes as a picture. A site serves whatever it likes, so the format is
+/// read off the first bytes; bytes that are none of the known pictures are no icon.
+fn site_login_icon_image(bytes: Vec<u8>) -> Option<Arc<Image>> {
+    let format = image_format_of(&bytes)?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+fn image_format_of(bytes: &[u8]) -> Option<ImageFormat> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageFormat::Gif)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        Some(ImageFormat::Ico)
+    } else if bytes.starts_with(b"BM") {
+        Some(ImageFormat::Bmp)
+    } else {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+        let head = head.trim_start();
+        (head.starts_with("<svg") || (head.starts_with("<?xml") && head.contains("<svg")))
+            .then_some(ImageFormat::Svg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A site's icon is whatever the site serves; the first bytes say which picture it is,
+    /// and a page that is not a picture is no icon at all.
+    #[test]
+    fn an_icon_is_read_by_its_first_bytes() {
+        use super::image_format_of;
+        use gpui_kit::ImageFormat;
+        assert_eq!(
+            image_format_of(b"\x89PNG\r\n\x1a\n rest"),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            image_format_of(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(image_format_of(b"GIF89a...."), Some(ImageFormat::Gif));
+        assert_eq!(
+            image_format_of(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(
+            image_format_of(&[0x00, 0x00, 0x01, 0x00, 0x01, 0x00]),
+            Some(ImageFormat::Ico)
+        );
+        assert_eq!(image_format_of(b"BM\x00\x00"), Some(ImageFormat::Bmp));
+        assert_eq!(
+            image_format_of(b"  <?xml version=\"1.0\"?>\n<svg xmlns=\"x\"/>"),
+            Some(ImageFormat::Svg)
+        );
+        assert_eq!(image_format_of(b"<svg/>"), Some(ImageFormat::Svg));
+        assert_eq!(image_format_of(b"<html><body>404</body></html>"), None);
+        assert_eq!(image_format_of(b""), None);
+    }
 
     /// A cron row is the schedule picker again, so the editor opens a routine off the wire
     /// showing the words it was chosen by rather than a line to decipher.

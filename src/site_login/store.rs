@@ -7,16 +7,55 @@ use crate::db::DbPool;
 
 use super::StoreError;
 use super::secrets::{MemorySecrets, SecretStore, open_secrets};
+use super::{default_label, timestamp_ms};
 
 /// Row the Settings list paints. No secret.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
 pub struct SiteLoginRecord {
     pub id: String,
     pub origin: String,
     pub username: String,
     pub label: String,
+    /// What the row holds: `password`, `code` or `passkey`.
+    pub kind: String,
+    /// The person's own words about this login. A line starting `Security:` files the row
+    /// under the Security tile.
+    pub notes: String,
+    /// When the server last saw the login used, in unix milliseconds. None until it has been.
+    pub last_used_at_ms: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Every column the record reads, in its order.
+const SELECT: &str = "SELECT id, origin, username, label, kind, notes, last_used_at_ms, \
+                      created_at, updated_at FROM site_logins";
+
+/// An empty kind is a password: that is what every row was before kinds existed.
+fn kind_or_default(kind: &str) -> &str {
+    let kind = kind.trim();
+    if kind.is_empty() { "password" } else { kind }
+}
+
+/// What a save leaves the row's kind as. An import that carries only a code for a login
+/// this Mac already holds a password for must not turn that row into a code row: the
+/// password is still there, and a login card lists password rows only.
+fn kind_after_save<'a>(
+    existing: Option<&SiteLoginRecord>,
+    incoming: &'a str,
+    password: &str,
+) -> &'a str {
+    let incoming = kind_or_default(incoming);
+    match existing {
+        Some(row)
+            if password.is_empty()
+                && incoming == crate::site_login::KIND_CODE
+                && row.kind == crate::site_login::KIND_PASSWORD =>
+        {
+            crate::site_login::KIND_PASSWORD
+        }
+        _ => incoming,
+    }
 }
 
 #[derive(Clone)]
@@ -41,13 +80,10 @@ impl SiteLoginVault {
     }
 
     pub async fn list(&self) -> Result<Vec<SiteLoginRecord>, StoreError> {
-        let rows = sqlx::query_as::<_, SiteLoginRecord>(
-            "SELECT id, origin, username, label, created_at, updated_at
-             FROM site_logins
-             ORDER BY origin, username",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query_as::<_, SiteLoginRecord>(&format!("{SELECT} ORDER BY origin, username"))
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
@@ -57,31 +93,53 @@ impl SiteLoginVault {
         username: Option<&str>,
     ) -> Result<Option<SiteLoginRecord>, StoreError> {
         if let Some(username) = username.filter(|name| !name.is_empty()) {
-            let row = sqlx::query_as::<_, SiteLoginRecord>(
-                "SELECT id, origin, username, label, created_at, updated_at
-                 FROM site_logins WHERE origin = ? AND username = ?",
-            )
+            let row = sqlx::query_as::<_, SiteLoginRecord>(&format!(
+                "{SELECT} WHERE origin = ? AND username = ?"
+            ))
             .bind(origin)
             .bind(username)
             .fetch_optional(&self.pool)
             .await?;
             return Ok(row);
         }
-        let row = sqlx::query_as::<_, SiteLoginRecord>(
-            "SELECT id, origin, username, label, created_at, updated_at
-             FROM site_logins WHERE origin = ? ORDER BY updated_at DESC LIMIT 1",
-        )
+        let row = sqlx::query_as::<_, SiteLoginRecord>(&format!(
+            "{SELECT} WHERE origin = ? ORDER BY updated_at DESC LIMIT 1"
+        ))
         .bind(origin)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    /// Write password to the secret store, metadata to sqlite. Returns the id.
+    /// The words a saved row keeps when the new ones are blank: a second save of the same
+    /// login (an import, the card's offer) must not wipe a title or notes the person wrote.
+    fn keep_words(
+        existing: Option<&SiteLoginRecord>,
+        origin: &str,
+        username: &str,
+        label: &str,
+        notes: &str,
+    ) -> (String, String) {
+        let label = match (label.trim(), existing) {
+            ("", Some(row)) if !row.label.trim().is_empty() => row.label.clone(),
+            ("", _) => default_label(username, origin),
+            (label, _) => label.to_string(),
+        };
+        let notes = match (notes, existing) {
+            ("", Some(row)) => row.notes.clone(),
+            (notes, _) => notes.to_string(),
+        };
+        (label, notes)
+    }
+
+    /// Write password to the secret store, metadata to sqlite. Returns the row.
     pub async fn save(
         &self,
         origin: &str,
         username: &str,
+        label: &str,
+        notes: &str,
+        kind: &str,
         password: &str,
     ) -> Result<SiteLoginRecord, StoreError> {
         let existing = self.find(origin, Some(username)).await?;
@@ -89,21 +147,29 @@ impl SiteLoginVault {
             .as_ref()
             .map(|row| row.id.clone())
             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-        let label = format!("{username} on {origin}");
-        self.secrets.set(&id, password)?;
+        let (label, notes) = Self::keep_words(existing.as_ref(), origin, username, label, notes);
+        let kind = kind_after_save(existing.as_ref(), kind, password);
+        // A code-only row has no password; nothing empty goes in the keychain.
+        if !password.is_empty() {
+            self.secrets.set(&id, password)?;
+        }
         sqlx::query(
-            "INSERT INTO site_logins (id, origin, username, label, created_at, updated_at)
-             VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+            "INSERT INTO site_logins (id, origin, username, label, kind, notes, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
                 origin = excluded.origin,
                 username = excluded.username,
                 label = excluded.label,
+                kind = excluded.kind,
+                notes = excluded.notes,
                 updated_at = datetime('now')",
         )
         .bind(&id)
         .bind(origin)
         .bind(username)
         .bind(&label)
+        .bind(kind)
+        .bind(&notes)
         .execute(&self.pool)
         .await?;
         self.find(origin, Some(username))
@@ -112,33 +178,57 @@ impl SiteLoginVault {
     }
 
     /// Save under an id the server chose, so the keychain copy and the server row share it.
+    /// The stamp is the server's, when it gave one: a row stamped later here than there
+    /// would never take a correction back from the server.
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_with_id(
         &self,
         id: &str,
         origin: &str,
         username: &str,
+        label: &str,
+        notes: &str,
+        kind: &str,
         password: &str,
+        updated_at_ms: Option<i64>,
     ) -> Result<SiteLoginRecord, StoreError> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let label = format!("{username} on {origin}");
+        let existing = self.find(origin, Some(username)).await?;
+        // The server's stamp, unless this Mac's row is already newer: a stamp that moved
+        // backwards would hide an edit made here that the server has not seen yet.
+        let local_ms = existing
+            .as_ref()
+            .and_then(|row| timestamp_ms(&row.updated_at))
+            .unwrap_or(0);
+        let now = updated_at_ms
+            .filter(|at| *at >= local_ms)
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let (label, notes) = Self::keep_words(existing.as_ref(), origin, username, label, notes);
+        let kind = kind_after_save(existing.as_ref(), kind, password);
         // A row already here under another id moves to this one, keychain item included,
         // so no copy is left behind under an id nothing points at.
-        if let Some(existing) = self.find(origin, Some(username)).await?
+        if let Some(existing) = existing
             && existing.id != id
         {
             self.adopt_id(&existing.id, id).await?;
         }
-        self.secrets.set(id, password)?;
+        if !password.is_empty() {
+            self.secrets.set(id, password)?;
+        }
         sqlx::query(
-            "INSERT INTO site_logins (id, origin, username, label, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+            "INSERT INTO site_logins (id, origin, username, label, kind, notes, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(origin, username) DO UPDATE SET
-               id = excluded.id, label = excluded.label, updated_at = excluded.updated_at",
+               id = excluded.id, label = excluded.label, kind = excluded.kind,
+               notes = excluded.notes, updated_at = excluded.updated_at",
         )
         .bind(id)
         .bind(origin)
         .bind(username)
         .bind(&label)
+        .bind(kind)
+        .bind(&notes)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -150,27 +240,103 @@ impl SiteLoginVault {
 
     /// A row the server has and this Mac does not: metadata only, no secret yet. The
     /// password is fetched after Touch ID the first time it is used here, then cached.
+    #[allow(clippy::too_many_arguments)]
     pub async fn remember_remote(
         &self,
         id: &str,
         origin: &str,
         username: &str,
+        label: &str,
+        notes: &str,
+        kind: &str,
+        last_used_at_ms: Option<i64>,
     ) -> Result<(), StoreError> {
         let now = chrono::Utc::now().to_rfc3339();
-        let label = format!("{username} on {origin}");
+        let label = if label.trim().is_empty() {
+            default_label(username, origin)
+        } else {
+            label.trim().to_string()
+        };
         sqlx::query(
-            "INSERT INTO site_logins (id, origin, username, label, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+            "INSERT INTO site_logins
+               (id, origin, username, label, kind, notes, last_used_at_ms, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(origin, username) DO NOTHING",
         )
         .bind(id)
         .bind(origin)
         .bind(username)
         .bind(&label)
+        .bind(kind_or_default(kind))
+        .bind(notes)
+        .bind(last_used_at_ms)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// The server's words for a row this Mac already has, taken only when the server's copy
+    /// is the newer one: notes typed on another Mac arrive, notes typed here and not yet
+    /// filed there do not get wiped by an older server row. True when something was written.
+    pub async fn update_from_server(
+        &self,
+        row: &SiteLoginRecord,
+        label: &str,
+        notes: &str,
+        kind: &str,
+        last_used_at_ms: Option<i64>,
+        updated_at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let local_ms = timestamp_ms(&row.updated_at).unwrap_or(0);
+        if updated_at_ms <= local_ms {
+            return Ok(false);
+        }
+        let label = if label.trim().is_empty() {
+            row.label.clone()
+        } else {
+            label.trim().to_string()
+        };
+        // The row's stamp becomes the server's, so the next sync sees the two level.
+        let stamp = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(updated_at_ms)
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        // A row this Mac holds a password for is not turned into a code row by the
+        // server's word either: the password is still here, and a login card lists
+        // password rows.
+        let kind = if kind_or_default(kind) == crate::site_login::KIND_CODE
+            && self.secrets.contains(&row.id)
+        {
+            crate::site_login::KIND_PASSWORD
+        } else {
+            kind_or_default(kind)
+        };
+        sqlx::query(
+            "UPDATE site_logins
+             SET label = ?, notes = ?, kind = ?, last_used_at_ms = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&label)
+        .bind(notes)
+        .bind(kind)
+        .bind(last_used_at_ms)
+        .bind(&stamp)
+        .bind(&row.id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// The person's words on the detail pane, as typed.
+    pub async fn update_notes(&self, id: &str, notes: &str) -> Result<(), StoreError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("UPDATE site_logins SET notes = ?, updated_at = ? WHERE id = ?")
+            .bind(notes)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -182,6 +348,10 @@ impl SiteLoginVault {
         }
         if let Some(secret) = self.secrets.get(old_id)? {
             self.secrets.set(new_id, &secret)?;
+        }
+        if let Some(code) = self.secrets.get(&Self::code_key(old_id))? {
+            self.secrets.set(&Self::code_key(new_id), &code)?;
+            self.secrets.delete(&Self::code_key(old_id))?;
         }
         sqlx::query("UPDATE site_logins SET id = ? WHERE id = ?")
             .bind(new_id)
@@ -198,12 +368,33 @@ impl SiteLoginVault {
         self.secrets.set(id, password)
     }
 
+    /// The keychain item that holds a row's authenticator-code seed, beside its password.
+    fn code_key(id: &str) -> String {
+        format!("{id}:otp")
+    }
+
+    /// Keep a row's code seed (an `otpauth://` URI) in this Mac's keychain.
+    pub fn set_code(&self, id: &str, otpauth: &str) -> Result<(), StoreError> {
+        self.secrets.set(&Self::code_key(id), otpauth)
+    }
+
+    /// Whether a row has a code seed here, asked without reading it: no keychain sheet.
+    pub fn code_present(&self, id: &str) -> bool {
+        self.secrets.contains(&Self::code_key(id))
+    }
+
+    /// The seed itself, for minting a code after Touch ID or for the detail pane's ticker.
+    pub fn code_for(&self, id: &str) -> Result<Option<String>, StoreError> {
+        self.secrets.get(&Self::code_key(id))
+    }
+
     pub async fn delete(&self, id: &str) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM site_logins WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
         self.secrets.delete(id)?;
+        self.secrets.delete(&Self::code_key(id))?;
         Ok(())
     }
 
@@ -246,7 +437,7 @@ mod tests {
     async fn save_list_delete_keeps_password_out_of_sqlite() {
         let vault = memory_db().await;
         let saved = vault
-            .save("google.com", "ada@example.com", "s3cret-pass")
+            .save("google.com", "ada@example.com", "", "", "", "s3cret-pass")
             .await
             .expect("save");
         assert_eq!(saved.origin, "google.com");
@@ -267,7 +458,10 @@ mod tests {
                 "username",
                 "label",
                 "created_at",
-                "updated_at"
+                "updated_at",
+                "kind",
+                "notes",
+                "last_used_at_ms",
             ]
         );
         assert!(
@@ -276,8 +470,8 @@ mod tests {
                 .any(|name| name.contains("pass") || name.contains("secret"))
         );
 
-        let blob: Vec<(String, String, String, String)> =
-            sqlx::query_as("SELECT id, origin, username, label FROM site_logins")
+        let blob: Vec<(String, String, String, String, String)> =
+            sqlx::query_as("SELECT id, origin, username, label, notes FROM site_logins")
                 .fetch_all(&vault.pool)
                 .await
                 .expect("rows");
@@ -303,9 +497,12 @@ mod tests {
     #[tokio::test]
     async fn save_same_origin_username_updates_secret() {
         let vault = memory_db().await;
-        let first = vault.save("github.com", "ada", "one").await.expect("first");
+        let first = vault
+            .save("github.com", "ada", "", "", "", "one")
+            .await
+            .expect("first");
         let second = vault
-            .save("github.com", "ada", "two")
+            .save("github.com", "ada", "", "", "", "two")
             .await
             .expect("second");
         assert_eq!(first.id, second.id);
@@ -320,7 +517,7 @@ mod tests {
     async fn a_server_id_is_adopted_and_a_remote_row_waits_for_its_secret() {
         let vault = memory_db().await;
         let local = vault
-            .save("github.com", "ada", "pw-local")
+            .save("github.com", "ada", "", "", "", "pw-local")
             .await
             .expect("save");
         vault.adopt_id(&local.id, "sl_server").await.expect("adopt");
@@ -333,7 +530,7 @@ mod tests {
         assert!(!vault.secret_present(&local.id), "the old item is gone");
 
         vault
-            .remember_remote("sl_other", "gitlab.com", "ada")
+            .remember_remote("sl_other", "gitlab.com", "ada", "", "", "", None)
             .await
             .expect("remember");
         assert!(!vault.secret_present("sl_other"));
@@ -344,21 +541,24 @@ mod tests {
         );
         // Remembering again does not clobber what is there.
         vault
-            .remember_remote("sl_dup", "gitlab.com", "ada")
+            .remember_remote("sl_dup", "gitlab.com", "ada", "", "", "", None)
             .await
             .expect("remember again");
         let rows = vault.list().await.expect("list");
         assert_eq!(rows.iter().filter(|r| r.origin == "gitlab.com").count(), 1);
 
         let saved = vault
-            .save_with_id("sl_new", "x.com", "bea", "pw")
+            .save_with_id("sl_new", "x.com", "bea", "", "", "", "pw", None)
             .await
             .expect("save with id");
         assert_eq!(saved.id, "sl_new");
         // The same login saved under the server's id later: one row, one keychain item.
-        let local = vault.save("y.com", "cy", "pw1").await.expect("save");
+        let local = vault
+            .save("y.com", "cy", "", "", "", "pw1")
+            .await
+            .expect("save");
         let moved = vault
-            .save_with_id("sl_y", "y.com", "cy", "pw2")
+            .save_with_id("sl_y", "y.com", "cy", "", "", "", "pw2", None)
             .await
             .expect("save with id");
         assert_eq!(moved.id, "sl_y");
@@ -377,5 +577,187 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A row saved with nothing but the login gets the plain defaults; one saved with a
+    /// title, notes and a kind keeps them; a remembered server row carries its last use.
+    #[tokio::test]
+    async fn the_new_columns_default_and_are_kept_when_given() {
+        let vault = memory_db().await;
+        let plain = vault
+            .save("x.com", "ada", "", "", "", "pw")
+            .await
+            .expect("save");
+        assert_eq!(plain.label, "ada on x.com");
+        assert_eq!(plain.kind, "password");
+        assert_eq!(plain.notes, "");
+        assert_eq!(plain.last_used_at_ms, None);
+
+        let full = vault
+            .save_with_id(
+                "sl_1",
+                "y.com",
+                "bea",
+                "Work mail",
+                "Security: 2FA on the phone",
+                "passkey",
+                "pw",
+                None,
+            )
+            .await
+            .expect("save with id");
+        assert_eq!(full.label, "Work mail");
+        assert_eq!(full.kind, "passkey");
+        assert_eq!(full.notes, "Security: 2FA on the phone");
+
+        // An import that carries only a code for a login already saved with a password
+        // leaves the row a password row: the password is still there to fill a login card.
+        let with_password = vault
+            .save("code.com", "ada", "", "", "password", "pw")
+            .await
+            .expect("password row");
+        assert_eq!(with_password.kind, "password");
+        let after_code = vault
+            .save("code.com", "ada", "", "", "code", "")
+            .await
+            .expect("code beside it");
+        assert_eq!(after_code.kind, "password", "the row is not turned into a code row");
+        assert_eq!(after_code.id, with_password.id);
+        // A code for a login nothing else knows is a code row.
+        let only_code = vault
+            .save("otp.com", "ada", "", "", "code", "")
+            .await
+            .expect("code row");
+        assert_eq!(only_code.kind, "code");
+
+        vault
+            .remember_remote(
+                "sl_2",
+                "z.com",
+                "cy",
+                "",
+                "",
+                "code",
+                Some(1_700_000_000_000),
+            )
+            .await
+            .expect("remember");
+        let remote = vault
+            .find("z.com", Some("cy"))
+            .await
+            .expect("find")
+            .unwrap();
+        assert_eq!(remote.label, "cy on z.com");
+        assert_eq!(remote.kind, "code");
+        assert_eq!(remote.last_used_at_ms, Some(1_700_000_000_000));
+    }
+
+    /// A second save of the same login with blank words keeps the title and notes the
+    /// person wrote; new words replace them.
+    #[tokio::test]
+    async fn a_resave_with_blank_words_keeps_the_old_ones() {
+        let vault = memory_db().await;
+        vault
+            .save(
+                "x.com",
+                "ada",
+                "Bank",
+                "Security: ask for the card",
+                "",
+                "pw1",
+            )
+            .await
+            .expect("save");
+        let again = vault
+            .save("x.com", "ada", "", "", "", "pw2")
+            .await
+            .expect("resave");
+        assert_eq!(again.label, "Bank");
+        assert_eq!(again.notes, "Security: ask for the card");
+        let renamed = vault
+            .save_with_id("sl_1", "x.com", "ada", "Savings", "", "", "pw3", None)
+            .await
+            .expect("save with id");
+        assert_eq!(renamed.label, "Savings");
+        assert_eq!(renamed.notes, "Security: ask for the card");
+    }
+
+    /// Notes typed here are written with a fresh stamp; the server's words land only when
+    /// its row is newer than this Mac's.
+    #[tokio::test]
+    async fn notes_update_and_a_newer_server_row_wins() {
+        let vault = memory_db().await;
+        let row = vault
+            .save_with_id("sl_1", "x.com", "ada", "", "", "", "pw", None)
+            .await
+            .expect("save");
+        vault
+            .update_notes("sl_1", "Security: call first")
+            .await
+            .expect("notes");
+        let after = vault
+            .find("x.com", Some("ada"))
+            .await
+            .expect("find")
+            .unwrap();
+        assert_eq!(after.notes, "Security: call first");
+        assert!(after.updated_at >= row.updated_at);
+
+        let local_ms = timestamp_ms(&after.updated_at).expect("stamp");
+        let stale = vault
+            .update_from_server(
+                &after,
+                "Old",
+                "old words",
+                "code",
+                Some(5),
+                local_ms - 1_000,
+            )
+            .await
+            .expect("stale");
+        assert!(!stale);
+        let kept = vault
+            .find("x.com", Some("ada"))
+            .await
+            .expect("find")
+            .unwrap();
+        assert_eq!(kept.notes, "Security: call first");
+        assert_eq!(kept.kind, "password");
+
+        let newer = vault
+            .update_from_server(
+                &kept,
+                "From the other Mac",
+                "typed there",
+                "passkey",
+                Some(1_700_000_000_000),
+                local_ms + 60_000,
+            )
+            .await
+            .expect("newer");
+        assert!(newer);
+        let taken = vault
+            .find("x.com", Some("ada"))
+            .await
+            .expect("find")
+            .unwrap();
+        assert_eq!(taken.label, "From the other Mac");
+        assert_eq!(taken.notes, "typed there");
+        assert_eq!(taken.kind, "passkey");
+        assert_eq!(taken.last_used_at_ms, Some(1_700_000_000_000));
+        assert_eq!(timestamp_ms(&taken.updated_at), Some(local_ms + 60_000));
+        // The same server row again is not newer than what it just wrote.
+        let same = vault
+            .update_from_server(
+                &taken,
+                "",
+                "typed there",
+                "passkey",
+                None,
+                local_ms + 60_000,
+            )
+            .await
+            .expect("same");
+        assert!(!same);
     }
 }

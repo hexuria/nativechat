@@ -46,11 +46,21 @@ pub enum TouchIdOutcome {
 /// is used. Blocks the calling thread until the sheet closes; call it from a background
 /// thread, never from the UI thread.
 pub fn confirm_use(origin: &str, username: &str) -> TouchIdOutcome {
-    let reason = format!("use the saved login for {origin} as {username}");
+    ask(&format!("use the saved login for {origin} as {username}"))
+}
+
+/// Ask the person to confirm before `origin` makes a passkey for them. Nothing is used
+/// here and there is no saved login yet, so the sheet says what it really is. Same
+/// threading rule as [`confirm_use`].
+pub fn confirm_register(origin: &str) -> TouchIdOutcome {
+    ask(&format!("let {origin} create a passkey for you"))
+}
+
+fn ask(reason: &str) -> TouchIdOutcome {
     if SHEET_UP.swap(true, Ordering::SeqCst) {
         return TouchIdOutcome::Unavailable("another Touch ID sheet is already up".to_string());
     }
-    let outcome = objc::rc::autoreleasepool(|| prompt(&reason));
+    let outcome = objc::rc::autoreleasepool(|| prompt(reason));
     SHEET_UP.store(false, Ordering::SeqCst);
     outcome
 }

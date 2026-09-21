@@ -40,9 +40,9 @@ pub use user_form::{
     computer_window_attention_skip_id, continue_enabled, dismiss_request_body,
     is_form_entry_missing, is_user_form_awaiting, is_user_form_custom_name, is_user_form_event,
     is_user_form_tool, resolve_handoff_request_body, settle_user_form_http, submit_request_body,
-    user_form_action_from_http, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_pill_id, user_form_saved_clear_id, user_form_saved_list_id,
-    user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
+    submit_request_body_for, user_form_action_from_http, user_form_card_id, user_form_continue_id,
+    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_clear_id,
+    user_form_saved_list_id, user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
 };
 pub use visibility::ImageVisibility;
 
@@ -51,10 +51,11 @@ pub use client::{
     NewSchedule, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind,
     RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen,
     RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape,
-    RecipeTapeEvent, RecipeVersion, RunReplay, ScheduleKind, ScheduleRow, StopReply, ThreadReplay,
-    ThreadRun, TurnRecipe, UpdateStatus, WebhookInfo, collapse_computer_roster,
-    collapse_computers_by_machine_id, env_egress_tunnel_enabled, host_egress_tunnel_available,
-    host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
+    RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunReplay, ScheduleKind, ScheduleRow,
+    SiteLoginSave, SiteLoginUpdate, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus,
+    WebhookInfo, collapse_computer_roster, collapse_computers_by_machine_id,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_enabled,
+    host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
 pub use types::{

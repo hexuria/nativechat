@@ -1,0 +1,5 @@
+<!-- Merge into the app's Info.plist (cargo bundle: [package.metadata.bundle]). -->
+<key>NSUserActivityTypes</key>
+<array>
+	<string>ASCredentialExchangeActivityType</string>
+</array>
