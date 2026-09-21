@@ -15,12 +15,8 @@ pub use activity::{
     activity_from_replay, deeds_from_replay, tool_standin,
 };
 pub use credential::{
-    CREDENTIAL_OFFER_SAVE, CREDENTIAL_REQUEST, CREDENTIAL_RESULT, CREDENTIAL_RESULT_PATH,
-    CredentialRequestResolution, CredentialRequestSpec, CredentialResultStatus, SaveLoginSpec,
-    credential_request_allow_id, credential_request_card_id, credential_request_deny_id,
-    credential_request_pill_id, credential_result_body, fold_credential_answer,
-    keep_credential_request_offer, keep_local_save_offer, result_without_broker,
-    save_login_card_id, save_login_from_local, save_login_save_id, save_login_skip_id,
+    CREDENTIAL_OFFER_SAVE, SaveLoginSpec, keep_local_save_offer, save_login_card_id,
+    save_login_from_local, save_login_save_id, save_login_skip_id,
 };
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, CompletedUiTool, FormField, FormSpec,

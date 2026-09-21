@@ -122,7 +122,7 @@ pub fn origins_match(left: &str, right: &str) -> bool {
     }
 }
 
-/// Settings→Logins row vs `credential.request`. Username `None` means any
+/// Settings→Logins row vs the login card's site. Username `None` means any
 /// row for the origin; a named username must match exactly.
 pub fn login_matches_request(
     row_origin: &str,

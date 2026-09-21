@@ -12,11 +12,9 @@ use crate::opengrok::{
     computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
     computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
     computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
-    computer_window_attention_skip_id, credential_request_allow_id, credential_request_card_id,
-    credential_request_deny_id, credential_request_pill_id, save_login_card_id, save_login_save_id,
-    save_login_skip_id, user_form_card_id, user_form_continue_id, user_form_dismiss_id,
-    user_form_field_id, user_form_pill_id, user_form_saved_note_id, user_form_screen_id,
-    user_form_use_saved_id,
+    computer_window_attention_skip_id, save_login_card_id, save_login_save_id, save_login_skip_id,
+    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
+    user_form_pill_id, user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
 };
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
 
@@ -226,10 +224,6 @@ pub enum Command {
     DeleteSiteLogin {
         id: String,
     },
-    AnswerCredentialRequest {
-        request_id: String,
-        allow: bool,
-    },
     SetAppSettingsTab(crate::state::AppSettingsTab),
     CloseAppSettings,
     /// The Computer pane's routines: open one (or a blank one), give a draft its trigger, ask
@@ -351,9 +345,6 @@ impl Command {
             Self::SaveLogin { form_entry_id } => state.save_offered_login(form_entry_id, cx),
             Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
             Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
-            Self::AnswerCredentialRequest { request_id, allow } => {
-                state.answer_credential_request(request_id, allow, cx)
-            }
             Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
             Self::CloseAppSettings => {
                 if state.is_app_settings_open {
@@ -747,15 +738,6 @@ struct SaveLoginSnap {
 }
 
 #[derive(Clone, Default)]
-struct CredentialRequestSnap {
-    request_id: String,
-    origin: String,
-    username: Option<String>,
-    /// None = idle (Use saved / Not now). Some = folded pill copy.
-    pill: Option<String>,
-}
-
-#[derive(Clone, Default)]
 struct SiteLoginSnap {
     id: String,
     origin: String,
@@ -917,28 +899,6 @@ fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
     ))
 }
 
-fn credential_request_node(request: &CredentialRequestSnap) -> UiNode {
-    let title = match &request.username {
-        Some(username) => format!("Use saved login for {} as {}?", request.origin, username),
-        None => format!("Use a saved login for {}?", request.origin),
-    };
-    let card = UiNode::dialog(credential_request_card_id(&request.request_id), title);
-    if let Some(pill) = &request.pill {
-        return card.with_child(UiNode::status(
-            credential_request_pill_id(&request.request_id),
-            pill.clone(),
-        ));
-    }
-    card.with_child(UiNode::button(
-        credential_request_allow_id(&request.request_id),
-        "Use saved login",
-    ))
-    .with_child(UiNode::button(
-        credential_request_deny_id(&request.request_id),
-        "Not now",
-    ))
-}
-
 fn site_login_node(login: &SiteLoginSnap) -> UiNode {
     UiNode::listitem(
         format!("settings-login-row-{}", login.id),
@@ -991,34 +951,6 @@ fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
-}
-
-fn parse_invoke_allow(args: &serde_json::Value) -> Result<bool, String> {
-    if let Some(value) = args.get("allow") {
-        if let Some(flag) = value.as_bool() {
-            return Ok(flag);
-        }
-        if let Some(word) = value.as_str() {
-            return parse_allow_word(word).ok_or_else(|| format!("unknown allow `{word}`"));
-        }
-        if let Some(n) = value.as_i64() {
-            return Ok(n != 0);
-        }
-    }
-    if let Some(word) = args.get("answer").and_then(|value| value.as_str()) {
-        return parse_allow_word(word).ok_or_else(|| format!("unknown answer `{word}`"));
-    }
-    Err("AnswerCredentialRequest requires arg allow".into())
-}
-
-fn parse_allow_word(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "allow" | "yes" | "use" | "used" | "saved" => Some(true),
-        "false" | "deny" | "no" | "dismiss" | "dismissed" | "not now" | "not-now" | "skip" => {
-            Some(false)
-        }
-        _ => None,
-    }
 }
 
 /// `Default` is the host with nothing in it — signed out, no sessions, no panel. Typing ops
@@ -1100,7 +1032,6 @@ pub struct NativeChatHost {
     /// Open the screen → Grok Computer chrome (Take over / I'm done / Skip).
     computer_handoffs: Vec<ComputerHandoffSnap>,
     save_logins: Vec<SaveLoginSnap>,
-    credential_requests: Vec<CredentialRequestSnap>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
     computer_tab: bool,
@@ -1401,29 +1332,6 @@ impl NativeChatHost {
                         .collect()
                 })
                 .unwrap_or_default(),
-            credential_requests: state
-                .conversations
-                .iter()
-                .find(|conversation| {
-                    Some(&conversation.id) == state.active_conversation_id.as_ref()
-                })
-                .map(|conversation| {
-                    conversation
-                        .messages
-                        .iter()
-                        .flat_map(|message| message.parts.iter())
-                        .filter_map(|part| match part {
-                            ChatPart::CredentialRequest(spec) => Some(CredentialRequestSnap {
-                                request_id: spec.request_id.clone(),
-                                origin: spec.origin.clone(),
-                                username: spec.username.clone(),
-                                pill: spec.pill().map(str::to_string),
-                            }),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
             site_logins: state
                 .site_logins
                 .iter()
@@ -1612,9 +1520,6 @@ impl NativeChatHost {
         }
         for offer in &self.save_logins {
             page = page.with_child(save_login_node(offer));
-        }
-        for request in &self.credential_requests {
-            page = page.with_child(credential_request_node(request));
         }
         let mut computer = UiNode::new("computer-pane", "dialog", "Computer")
             .with_visible(self.computer_open)
@@ -2015,27 +1920,6 @@ impl NativeChatHost {
         None
     }
 
-    fn credential_request_command(&self, target: &str) -> Option<Command> {
-        for request in &self.credential_requests {
-            if request.pill.is_some() {
-                continue;
-            }
-            if target == credential_request_allow_id(&request.request_id) {
-                return Some(Command::AnswerCredentialRequest {
-                    request_id: request.request_id.clone(),
-                    allow: true,
-                });
-            }
-            if target == credential_request_deny_id(&request.request_id) {
-                return Some(Command::AnswerCredentialRequest {
-                    request_id: request.request_id.clone(),
-                    allow: false,
-                });
-            }
-        }
-        None
-    }
-
     fn site_login_delete_target(&self, target: &str) -> Option<String> {
         let id = target.strip_prefix("settings-login-delete-")?;
         self.site_logins
@@ -2207,8 +2091,6 @@ impl NativeChatHost {
         } else if let Some(cmd) = self.computer_handoff_command(target) {
             cmd
         } else if let Some(cmd) = self.save_login_command(target) {
-            cmd
-        } else if let Some(cmd) = self.credential_request_command(target) {
             cmd
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
@@ -2388,47 +2270,6 @@ impl NativeChatHost {
             [] => Err("no idle user-form".into()),
             _ => Err("user-form invoke requires arg card_key".into()),
         }
-    }
-
-    fn invoke_credential_answer(&self, args: &serde_json::Value) -> Result<(String, bool), String> {
-        let mut allow = parse_invoke_allow(args).ok();
-        let mut request_id = invoke_arg_str(args, &["request_id", "requestId", "id"]);
-        if let Some(raw) = request_id.clone() {
-            if let Some(id) = raw.strip_prefix("credential-request-allow-") {
-                request_id = Some(id.to_string());
-                allow = Some(true);
-            } else if let Some(id) = raw.strip_prefix("credential-request-deny-") {
-                request_id = Some(id.to_string());
-                allow = Some(false);
-            }
-        }
-        let allow =
-            allow.ok_or_else(|| "AnswerCredentialRequest requires arg allow".to_string())?;
-        let request_id = match request_id {
-            Some(id) => id,
-            None => {
-                let idle: Vec<&CredentialRequestSnap> = self
-                    .credential_requests
-                    .iter()
-                    .filter(|request| request.pill.is_none())
-                    .collect();
-                match idle.as_slice() {
-                    [one] => one.request_id.clone(),
-                    [] => return Err("no open credential.request".into()),
-                    _ => {
-                        return Err("AnswerCredentialRequest requires arg request_id".into());
-                    }
-                }
-            }
-        };
-        if !self
-            .credential_requests
-            .iter()
-            .any(|request| request.request_id == request_id && request.pill.is_none())
-        {
-            return Err(format!("no open credential.request `{request_id}`"));
-        }
-        Ok((request_id, allow))
     }
 
     /// One of a routine's controls, or `None` for a target that is not a routine's at all.
@@ -2629,10 +2470,6 @@ impl NativeChatHost {
             "UserFormOpenScreen" | "user-form.screen" => Command::UserFormOpenScreen {
                 card_key: self.invoke_user_form_card_key(args)?,
             },
-            "AnswerCredentialRequest" | "credential.answer" => {
-                let (request_id, allow) = self.invoke_credential_answer(args)?;
-                Command::AnswerCredentialRequest { request_id, allow }
-            }
             // The open bot's routines as the pane lists them, so a driver can find the id of
             // the one it just made without reading the tree.
             "routine.list" => {
@@ -3776,26 +3613,17 @@ mod tests {
     }
 
     #[test]
-    fn save_login_and_credential_request_are_in_the_tree_without_passwords() {
+    fn save_login_is_in_the_tree_without_a_password() {
         let mut host = host();
         host.save_logins = vec![SaveLoginSnap {
             form_entry_id: "e_form".into(),
             origin: "google.com".into(),
             username: "ada@example.com".into(),
         }];
-        host.credential_requests = vec![CredentialRequestSnap {
-            request_id: "req-9".into(),
-            origin: "google.com".into(),
-            username: Some("ada@example.com".into()),
-            pill: None,
-        }];
         let tree = host.snapshot();
         assert!(tree.find("save-login-e_form").is_some());
         assert!(tree.find("save-login-save-e_form").is_some());
         assert!(tree.find("save-login-skip-e_form").is_some());
-        assert!(tree.find("credential-request-req-9").is_some());
-        assert!(tree.find("credential-request-allow-req-9").is_some());
-        assert!(tree.find("credential-request-deny-req-9").is_some());
         let dump = format!("{tree:?}");
         assert!(!dump.contains("s3cret"));
         host.dispatch(&Op::click("save-login-save-e_form")).unwrap();
@@ -3803,62 +3631,11 @@ mod tests {
             host.take_command(),
             Some(Command::SaveLogin { .. })
         ));
-        host.dispatch(&Op::click("credential-request-allow-req-9"))
-            .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest { allow: true, .. }) => {}
-            other => panic!("expected confirm, not a Box fill: {other:?}"),
-        }
-        host.dispatch(&Op::click("credential-request-deny-req-9"))
-            .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest {
-                allow: false,
-                request_id,
-            }) => assert_eq!(request_id, "req-9"),
-            other => panic!("expected Not now via click, got {other:?}"),
-        }
     }
 
     #[test]
-    fn answer_credential_request_is_a_named_invoke() {
+    fn an_unknown_invoke_fails_closed() {
         let mut host = host();
-        host.credential_requests = vec![CredentialRequestSnap {
-            request_id: "req-9".into(),
-            origin: "facebook.com".into(),
-            username: None,
-            pill: None,
-        }];
-        host.dispatch(&Op::Invoke {
-            name: "AnswerCredentialRequest".into(),
-            args: serde_json::json!({ "request_id": "req-9", "allow": true }),
-        })
-        .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest {
-                request_id,
-                allow: true,
-            }) => assert_eq!(request_id, "req-9"),
-            other => panic!("expected Use saved invoke, got {other:?}"),
-        }
-        host.dispatch(&Op::Invoke {
-            name: "AnswerCredentialRequest".into(),
-            args: serde_json::json!({ "allow": false }),
-        })
-        .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest { allow: false, .. }) => {}
-            other => panic!("expected Not now invoke, got {other:?}"),
-        }
-        host.dispatch(&Op::Invoke {
-            name: "credential.answer".into(),
-            args: serde_json::json!({ "requestId": "req-9", "answer": "deny" }),
-        })
-        .unwrap();
-        match host.take_command() {
-            Some(Command::AnswerCredentialRequest { allow: false, .. }) => {}
-            other => panic!("expected kebab deny, got {other:?}"),
-        }
         let unknown = host
             .dispatch(&Op::Invoke {
                 name: "NotACommand".into(),
@@ -3893,42 +3670,6 @@ mod tests {
             Some(Command::UserFormDismiss { card_key }) => assert_eq!(card_key, "e_form"),
             other => panic!("expected Dismiss invoke, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn folded_credential_request_exposes_pill_not_buttons() {
-        let mut host = host();
-        host.credential_requests = vec![CredentialRequestSnap {
-            request_id: "req-9".into(),
-            origin: "facebook.com".into(),
-            username: None,
-            pill: Some("Dismissed".into()),
-        }];
-        let tree = host.snapshot();
-        assert!(tree.find("credential-request-req-9").is_some());
-        assert_eq!(
-            tree.find("credential-request-pill-req-9").unwrap().name,
-            "Dismissed"
-        );
-        assert!(tree.find("credential-request-allow-req-9").is_none());
-        assert!(tree.find("credential-request-deny-req-9").is_none());
-        let click = host
-            .dispatch(&Op::click("credential-request-deny-req-9"))
-            .unwrap_err();
-        assert!(
-            click.contains("unknown click target"),
-            "folded Not now must not stay clickable: {click}"
-        );
-        let invoke = host
-            .dispatch(&Op::Invoke {
-                name: "AnswerCredentialRequest".into(),
-                args: serde_json::json!({ "request_id": "req-9", "allow": false }),
-            })
-            .unwrap_err();
-        assert!(
-            invoke.contains("no open credential.request"),
-            "invoke must not fire on a folded card: {invoke}"
-        );
     }
 
     #[test]

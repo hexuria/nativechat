@@ -13,8 +13,6 @@
 //! `computer-handoff-takeover-{key}`, `computer-handoff-done-{key}`,
 //! `computer-handoff-skip-{key}`,
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
-//! `credential-request-{id}`, `credential-request-allow-{id}`,
-//! `credential-request-deny-{id}`, `credential-request-pill-{id}`,
 //! `settings-tab-logins`,
 //! `settings-login-row-{id}`, `settings-login-delete-{id}`,
 //! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
@@ -26,9 +24,8 @@
 //! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
-//! `UserFormOpenScreen`, `AnswerCredentialRequest` (also kebab
-//! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /
-//! `credential.answer`). Click ids above still work.
+//! `UserFormOpenScreen` (also kebab `user-form.continue` / `user-form.dismiss` /
+//! `user-form.screen`). Click ids above still work.
 //!
 //! Routines: `routine.list` (answers with the open bot's rows —
 //! `id, name, kind, cron, active, webhook_url, webhook_key`), `routine.create --arg

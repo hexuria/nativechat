@@ -11,14 +11,14 @@ use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_spec};
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
-use crate::components::save_login::{render_credential_request, render_save_login};
+use crate::components::save_login::render_save_login;
 use crate::components::user_form::{
     UserFormInputMap, UserFormTextareaMap, field_key, render_user_form,
 };
 use crate::find_text::{FindHit, marks_for_row, project_hits};
 use crate::opengrok::{
-    ApprovalSpec, ChatPart, CredentialRequestSpec, SaveLoginSpec, ScreenshotSpec, UiSpec,
-    UserFormSpec, UserFormValues, collapse_open_approvals,
+    ApprovalSpec, ChatPart, SaveLoginSpec, ScreenshotSpec, UiSpec, UserFormSpec, UserFormValues,
+    collapse_open_approvals,
 };
 use crate::state::{
     AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, bot_status_line, is_status_line, is_tool_standin,
@@ -48,7 +48,6 @@ struct ChatFeedRev {
     user_form_verbs: bool,
     user_form_handoffs: Vec<(String, String, bool)>,
     save_logins: Vec<(String, String)>,
-    credential_requests: Vec<(String, String, String)>,
     box_screen: bool,
     is_ai_responding: bool,
     debug_mode: bool,
@@ -184,28 +183,6 @@ impl ChatFeedRev {
                 cards.sort();
                 cards
             },
-            credential_requests: {
-                let mut cards: Vec<(String, String, String)> = conv
-                    .map(|c| {
-                        c.messages
-                            .iter()
-                            .flat_map(|m| m.parts.iter())
-                            .filter_map(|part| match part {
-                                ChatPart::CredentialRequest(spec) => Some((
-                                    spec.request_id.clone(),
-                                    spec.origin.clone(),
-                                    spec.resolution
-                                        .map(|resolution| resolution.as_str().to_string())
-                                        .unwrap_or_else(|| "idle".into()),
-                                )),
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                cards.sort();
-                cards
-            },
             box_screen: state.coworker_screen.is_some() || state.last_box_shot.is_some(),
             is_ai_responding: state.is_active_bot_responding(),
             debug_mode: state.debug_markdown_disabled,
@@ -292,7 +269,6 @@ struct ChatRow {
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
     save_login: Option<SaveLoginSpec>,
-    credential_request: Option<CredentialRequestSpec>,
 }
 
 impl ChatRow {
@@ -328,7 +304,6 @@ impl ChatRow {
             screenshots: Vec::new(),
             user_form: None,
             save_login: None,
-            credential_request: None,
         }
     }
 }
@@ -480,17 +455,6 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     rows.push(ChatRow {
                         save_login: Some(spec),
                         ..ChatRow::slot(format!("{}-save-login-{ui_n}", msg.id), msg.id.clone())
-                    });
-                    ui_n += 1;
-                }
-                ChatPart::CredentialRequest(spec) => {
-                    flush_text(&mut rows, &mut text_buf, &mut text_n);
-                    rows.push(ChatRow {
-                        credential_request: Some(spec),
-                        ..ChatRow::slot(
-                            format!("{}-credential-request-{ui_n}", msg.id),
-                            msg.id.clone(),
-                        )
                     });
                     ui_n += 1;
                 }
@@ -1174,18 +1138,6 @@ impl Render for ChatTranscript {
                                         app_state.clone(),
                                         cx,
                                     )))
-                                    .into_any_element();
-                            }
-                            if let Some(spec) = &row.credential_request {
-                                return div()
-                                    .id(ElementId::Name(row.id.clone().into()))
-                                    .w_full()
-                                    .flex()
-                                    .justify_start()
-                                    .py(px(6.))
-                                    .child(div().w_full().max_w(px(560.)).child(
-                                        render_credential_request(spec, app_state.clone(), cx),
-                                    ))
                                     .into_any_element();
                             }
                             let highlight_color = if row.highlight_range.is_some() {

@@ -1,5 +1,6 @@
 //! Password backend. UI never calls [`SecretStore::get`] to display.
-//! A.0 `credential.request` uses [`SecretStore::contains`] only.
+//! The login card and Settings→Logins ask [`SecretStore::contains`] only; the
+//! password is read once, after Touch ID, on its way to the computer.
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,7 +11,7 @@ use super::{KEYCHAIN_SERVICE, StoreError, VAULT_FILE};
 
 pub trait SecretStore: Send + Sync {
     fn set(&self, id: &str, secret: &str) -> Result<(), StoreError>;
-    /// Tests and A.1 broker only. Never decrypt-for-display.
+    /// After Touch ID, on the way to the computer, and in tests. Never decrypt-for-display.
     fn get(&self, id: &str) -> Result<Option<String>, StoreError>;
     fn delete(&self, id: &str) -> Result<(), StoreError>;
     fn contains(&self, id: &str) -> bool;

@@ -1,24 +1,24 @@
-//! Host site-login vault. Phase A.0: save / list / delete + protocol stubs.
+//! Saved site logins.
 //!
-//! Storage is **local to this NativeChat install**, not OpenGrok:
+//! A login is a row on the person's own server, sealed there, with a copy of
+//! the password in the keychain of each Mac that has used it:
 //! * Metadata (id, origin, username, label, timestamps) → sqlite `site_logins`
 //!   in the app-support DB (`data.db` under [`crate::config::Config::data_dir`]).
+//!   A sync keeps that list level with the server's.
 //! * Password → OS Keychain service [`KEYCHAIN_SERVICE`] (account = row id),
-//!   never a sqlite column, never AG-UI `content`, never a `ChatPart`.
+//!   never a sqlite column, never AG-UI `content`, never a `ChatPart`. A row
+//!   the server has and this Mac does not is fetched after Touch ID the first
+//!   time it is used here, then kept.
 //! * When Keychain is missing (Linux/dev), [`VAULT_FILE`] in that same data
 //!   dir, mode 0600.
 //!
-//! Reinstall with the same bundle id may keep Keychain items; wiping app
-//! support drops sqlite metadata so Settings→Logins looks empty and those
-//! secrets are orphaned. A future server-backed vault is out of scope.
-//!
-//! * `filled` is **not** typing into Box Chromium. It is cookies/profile on Box
-//!   after the **session broker** (A.1). A.0 has no broker; `credential.request`
-//!   confirms then posts `denied` / `missing` / `error`.
+//! A saved login is offered on the login card, and only for the card's own
+//! site. Every use asks for Touch ID first; then the password goes straight to
+//! the computer down the same channel a typed card uses. It is never painted,
+//! never put in the card's inputs, and the Bot never sees it.
 //!
 //! The LLM `credentials` table and local-exec daemon JSON are not this store.
 
-mod broker;
 mod extract;
 pub mod import;
 mod origin;
@@ -26,7 +26,6 @@ mod secrets;
 mod store;
 pub mod touch_id;
 
-pub use broker::SESSION_BROKER_AVAILABLE;
 pub use extract::{LoginFields, PendingSave, login_fields, login_origin, save_candidate};
 pub use origin::{login_matches_request, origins_match, registrable_origin};
 pub use store::{SiteLoginRecord, SiteLoginVault};

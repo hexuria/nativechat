@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 use super::client::LocalExecMode;
-use super::credential::{CredentialRequestSpec, SaveLoginSpec};
+use super::credential::SaveLoginSpec;
 use super::user_form::{
     ComputerHandoffSpec, UserFormSpec, is_user_form_awaiting, is_user_form_tool,
 };
@@ -31,15 +31,10 @@ pub enum ChatPart {
     UserForm(UserFormSpec),
     /// Opt-in save prompt after Continue. Origin + username only — never a password.
     SaveLogin(SaveLoginSpec),
-    /// Confirm-to-reuse a saved login. A.0 answers without typing into Box.
-    CredentialRequest(CredentialRequestSpec),
 }
 
 fn is_hitl_card(part: &ChatPart) -> bool {
-    matches!(
-        part,
-        ChatPart::UserForm(_) | ChatPart::SaveLogin(_) | ChatPart::CredentialRequest(_)
-    )
+    matches!(part, ChatPart::UserForm(_) | ChatPart::SaveLogin(_))
 }
 
 /// Paint HITL cards in the **settled** document slot from the first frame.
@@ -462,9 +457,6 @@ impl TurnAssembler {
                 } else if let Some(spec) = SaveLoginSpec::from_event(event) {
                     self.flush_text();
                     self.push_save_login(spec);
-                } else if let Some(spec) = CredentialRequestSpec::from_event(event) {
-                    self.flush_text();
-                    self.push_credential_request(spec);
                 } else if let Some(spec) = UserFormSpec::from_custom_event(event) {
                     self.flush_text();
                     self.push_user_form(spec);
@@ -519,7 +511,6 @@ impl TurnAssembler {
             ChatPart::UserForm(spec) if spec.is_unresolved() || spec.live_computer_handoff() => {
                 true
             }
-            ChatPart::CredentialRequest(spec) if spec.is_unresolved() => true,
             _ => false,
         })
     }
@@ -680,27 +671,6 @@ impl TurnAssembler {
         place_hitl_cards_in_document_order(&mut self.committed);
     }
 
-    fn push_credential_request(&mut self, spec: CredentialRequestSpec) {
-        if let Some(existing) = self.committed.iter_mut().find_map(|part| match part {
-            ChatPart::CredentialRequest(existing) if existing.request_id == spec.request_id => {
-                Some(existing)
-            }
-            _ => None,
-        }) {
-            if existing.is_settled() {
-                return;
-            }
-            let resolution = existing.resolution;
-            *existing = spec;
-            if existing.resolution.is_none() {
-                existing.resolution = resolution;
-            }
-            return;
-        }
-        self.committed.push(ChatPart::CredentialRequest(spec));
-        place_hitl_cards_in_document_order(&mut self.committed);
-    }
-
     pub fn take_completed_ui_tools(&mut self) -> Vec<CompletedUiTool> {
         std::mem::take(&mut self.completed_ui)
     }
@@ -714,8 +684,7 @@ impl TurnAssembler {
             | ChatPart::Approval(_)
             | ChatPart::Screenshot(_)
             | ChatPart::UserForm(_)
-            | ChatPart::SaveLogin(_)
-            | ChatPart::CredentialRequest(_) => true,
+            | ChatPart::SaveLogin(_) => true,
         });
         self.committed.push(ChatPart::Ui(spec));
         self.completed_ui.retain(|tool| tool.name != name);
@@ -1045,8 +1014,7 @@ fn plain_text(parts: &[ChatPart]) -> String {
             ChatPart::Approval(_)
             | ChatPart::Screenshot(_)
             | ChatPart::UserForm(_)
-            | ChatPart::SaveLogin(_)
-            | ChatPart::CredentialRequest(_) => push_run(&mut out, std::mem::take(&mut run)),
+            | ChatPart::SaveLogin(_) => push_run(&mut out, std::mem::take(&mut run)),
         }
     }
     push_run(&mut out, run);
@@ -2478,7 +2446,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_offer_save_and_request_are_protocol_parts_without_passwords() {
+    fn credential_offer_save_is_a_protocol_part_without_a_password() {
         let mut assembler = TurnAssembler::default();
         assembler.push_event(&json!({
             "type": "CUSTOM",
@@ -2490,27 +2458,16 @@ mod tests {
                 "password": "s3cret-pass"
             }
         }));
-        assembler.push_event(&json!({
-            "type": "CUSTOM",
-            "name": "credential.request",
-            "runId": "run-1",
-            "requestId": "req-9",
-            "value": { "origin": "google.com", "username": "ada@example.com", "password": "nope" }
-        }));
         let (_, parts) = assembler.snapshot();
         match parts.as_slice() {
-            [ChatPart::SaveLogin(offer), ChatPart::CredentialRequest(req)] => {
+            [ChatPart::SaveLogin(offer)] => {
                 assert_eq!(offer.origin, "google.com");
                 assert_eq!(offer.username, "ada@example.com");
-                assert_eq!(req.request_id, "req-9");
-                assert!(req.is_unresolved());
-                assert!(assembler.waiting_user_form());
             }
-            other => panic!("expected save+request, got {other:?}"),
+            other => panic!("expected the save offer, got {other:?}"),
         }
         let dump = format!("{parts:?}");
         assert!(!dump.contains("s3cret-pass"));
-        assert!(!dump.contains("nope"));
     }
 
     #[test]
