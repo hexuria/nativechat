@@ -8,7 +8,8 @@ use crate::chrome::TITLE_BAR_H;
 use crate::opengrok::SkillDetail;
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -16,6 +17,7 @@ pub(super) fn render(
     id: &str,
     detail: Option<&SkillDetail>,
     error: Option<String>,
+    switching: bool,
     theme: &Theme,
     app: Entity<AppState>,
 ) -> AnyElement {
@@ -103,28 +105,68 @@ pub(super) fn render(
                             h_flex()
                                 .gap(px(6.))
                                 .items_center()
-                                // How to use it, or that it cannot be used — see [`use_line`].
-                                //
+                                // The switch, and beside it what its position MEANS: how to use
+                                // the skill, or that nothing can — see [`use_line`]. The two
+                                // belong together, because the line states the thing the switch
+                                // is the answer to.
+                                .child(
+                                    Switch::new(SharedString::from(format!(
+                                        "settings-skill-enabled-{skill_id}"
+                                    )))
+                                    .checked(skill.enabled)
+                                    // Dead while the server is being told: pressed twice, two
+                                    // answers about one flag are in the air and the slower one
+                                    // is the one that stands.
+                                    .disabled(switching)
+                                    .tooltip(if skill.enabled {
+                                        "Switch off: nothing will be able to run it"
+                                    } else {
+                                        "Switch on: your bot will be able to read it"
+                                    })
+                                    .on_click({
+                                        let app = app.clone();
+                                        let id = skill.id.clone();
+                                        move |checked, _, cx| {
+                                            app.update(cx, |state, cx| {
+                                                state.set_skill_enabled(id.clone(), *checked, cx);
+                                            });
+                                        }
+                                    }),
+                                )
                                 // On the slash itself, see the note beside the same promise on
                                 // the list: it is wired by the branch this one stacks under,
                                 // which lands before either reaches a person.
-                                .children(use_line(&skill.name, skill.enabled).map(|line| {
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "settings-skill-use-{skill_id}"
-                                        )))
-                                        .text_xs()
-                                        .text_color(if skill.enabled {
-                                            muted
-                                        } else {
-                                            theme.warning
-                                        })
-                                        .child(line)
-                                }))
+                                .children(
+                                    use_line(&skill.name, skill.enabled, skill.approved_at_ms).map(
+                                        |line| {
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "settings-skill-use-{skill_id}"
+                                                )))
+                                                .text_xs()
+                                                .text_color(if skill.enabled {
+                                                    muted
+                                                } else {
+                                                    theme.warning
+                                                })
+                                                .child(line)
+                                        },
+                                    ),
+                                )
                                 .children(label.map(|(word, tone)| chip(word, tone, theme))),
                         ),
                 ),
         )
+        // A change the server refused, under the control it was refused about. The switch has
+        // already gone back to where it was, so without this the pane would show a switch that
+        // sprang back for no stated reason.
+        .children(error.map(|why| {
+            div()
+                .id("settings-skill-error")
+                .text_xs()
+                .text_color(theme.danger)
+                .child(why)
+        }))
         .when(!skill.description.trim().is_empty(), |this| {
             this.child(
                 div()
@@ -135,10 +177,6 @@ pub(super) fn render(
                     .child(skill.description.clone()),
             )
         })
-        // NOT YET: the server keeps an `enabled` switch on every skill — off means nobody in
-        // the org sees it and nothing may run it — and `update_skill` already sends it. No
-        // control here turns it, so a skill switched off elsewhere can only be read about. A row
-        // on this card with a Switch in it is the whole of what is missing.
         .child(
             card(theme)
                 .child(kv_row("Version", version, theme))

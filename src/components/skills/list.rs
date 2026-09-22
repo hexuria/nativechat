@@ -413,6 +413,7 @@ mod tests {
                 version_count: 1,
                 draft: false,
                 enabled: true,
+                approved_at_ms: None,
             })
             .collect()
     }

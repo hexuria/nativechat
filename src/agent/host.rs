@@ -171,6 +171,12 @@ pub mod ids {
         format!("settings-skill-detail-delete-{id}")
     }
 
+    /// The switch on the open skill's pane: on, and a turn may read it; off, and nothing may
+    /// run it. It carries `checked` so a driver reads where it is rather than what it says.
+    pub fn skill_enabled(id: &str) -> String {
+        format!("settings-skill-enabled-{id}")
+    }
+
     /// The prose itself, on the open skill's pane. It is what `skill.create` wrote down, so it
     /// is the one thing a driver has to be able to read back — and on a draft it is the sentence
     /// the pane shows in its place, with an empty value under it.
@@ -351,6 +357,12 @@ pub enum Command {
     },
     ConfirmSkillDelete,
     CloseSkillDeleteConfirm,
+    /// The switch on the open skill's pane, both ways: on is the review a lesson a model wrote
+    /// is waiting for, off is what somebody does after reading one they do not want used.
+    SetSkillEnabled {
+        id: String,
+        enabled: bool,
+    },
     /// A tape taught on a coworker's screen and written up as a skill: read the lesson, which
     /// is what has to happen before anything may use it, or send a refused tape again.
     ///
@@ -530,6 +542,7 @@ impl Command {
             Self::AskSkillDelete { id } => state.ask_skill_delete(id, cx),
             Self::ConfirmSkillDelete => state.confirm_skill_delete(cx),
             Self::CloseSkillDeleteConfirm => state.close_skill_delete_confirm(cx),
+            Self::SetSkillEnabled { id, enabled } => state.set_skill_enabled(id, enabled, cx),
             Self::OpenTaughtSkill { id } => state.show_skill_in_main_window(Some(id), cx),
             Self::RetryTaughtSkill => state.retry_taught_skill(cx),
             Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),
@@ -905,7 +918,18 @@ struct OpenSkillSnap {
     /// The fetch has answered. Until it has, the pane is the close button and a line saying so.
     arrived: bool,
     updated_at_ms: i64,
-    /// What the fetch said when it was refused. The pane says this instead of "Loading…".
+    /// Where the switch is. Off means nothing may run it — the server refuses a switched-off
+    /// skill even to its owner — and off is where every lesson a model wrote starts.
+    enabled: bool,
+    /// Nobody has ever switched this skill on, which is not the same as its being off now: the
+    /// server stamps the first approval and never unstamps it, so this is what tells a lesson
+    /// waiting to be read from one somebody read and switched off again.
+    unread: bool,
+    /// The switch is with the server. It is dead while it is, both on screen and here.
+    switching: bool,
+    /// What the fetch said when it was refused, or what the switch was refused with. The pane
+    /// says this instead of "Loading…" while there is nothing to draw, and beside the switch
+    /// once there is.
     error: Option<String>,
 }
 
@@ -1261,14 +1285,16 @@ fn skill_detail_node(skill: &OpenSkillSnap) -> UiNode {
     // Refused, still coming, or here — three states the pane has and a driver has to be able to
     // tell apart. "Here" is not "has prose": a draft arrives with none, and reading the empty
     // body as "still coming" left a driver waiting at a pane that was already finished.
-    if let Some(error) = &skill.error {
-        return node
-            .with_child(UiNode::status(ids::SKILL_ERROR, error.clone()))
-            .with_child(UiNode::button(ids::SKILL_CLOSE, "Close"));
-    }
+    //
+    // A refusal with no skill under it is the whole pane. One WITH a skill under it came from
+    // the switch, and goes beside the switch, because that is what it is about.
     if !skill.arrived {
+        let said = match &skill.error {
+            Some(error) => UiNode::status(ids::SKILL_ERROR, error.clone()),
+            None => UiNode::status(ids::SKILL_LOADING, "Loading…"),
+        };
         return node
-            .with_child(UiNode::status(ids::SKILL_LOADING, "Loading…"))
+            .with_child(said)
             .with_child(UiNode::button(ids::SKILL_CLOSE, "Close"));
     }
     let updated = if skill.updated_at_ms > 0 {
@@ -1276,6 +1302,35 @@ fn skill_detail_node(skill: &OpenSkillSnap) -> UiNode {
     } else {
         NEVER_UPDATED.to_string()
     };
+    // The one control on this pane that changes what the skill can do: off means nothing may
+    // run it, and a lesson a model wrote from a recording is born off. Where it stands rides as
+    // `checked`, so an assert does not have to match the sentence beside it, and it is not
+    // enabled while the server is being told — a switch pressed twice sends two answers about
+    // one flag.
+    node = node.with_child(
+        UiNode::new(
+            ids::skill_enabled(&skill.id),
+            "switch",
+            if skill.enabled {
+                "Switched on"
+            } else {
+                "Switched off"
+            },
+        )
+        .with_checked(skill.enabled)
+        .with_enabled(!skill.switching),
+    );
+    if skill.unread {
+        // Never switched on by anybody. A driver checking that a taught lesson has to be read
+        // before anything can use it is checking this, not the switch's position: a skill that
+        // was read and switched off again is also off.
+        if let Some(switch) = node.children.last_mut() {
+            switch.states.push("unread".to_string());
+        }
+    }
+    if let Some(error) = &skill.error {
+        node = node.with_child(UiNode::status(ids::SKILL_ERROR, error.clone()));
+    }
     node = node.with_child(
         // The sentence the pane draws where the prose would be, with nothing under it: a draft
         // is a skill that has none, not a skill whose prose could not be read.
@@ -1837,6 +1892,9 @@ impl NativeChatHost {
                     updated_at_ms: detail
                         .map(|open| open.skill.updated_at_ms)
                         .unwrap_or_default(),
+                    enabled: detail.map(|open| open.skill.enabled).unwrap_or(true),
+                    unread: detail.is_some_and(|open| open.skill.approved_at_ms.is_none()),
+                    switching: state.skill_enabling.as_deref() == Some(id.as_str()),
                     error: state.skill_error.clone(),
                     id,
                 }
@@ -2284,13 +2342,18 @@ impl NativeChatHost {
                 }
                 vec![node]
             }
-            Some(TaughtSkill::Refused(why)) => vec![
-                // The server's sentence, which names which of the things went wrong, and the
-                // one thing that can be done about it: the tape is still in the window that
-                // made it, and this sends the same bytes again.
-                UiNode::status(ids::TEACH_SKILL_ERROR, why.clone()),
-                UiNode::button(ids::TEACH_RETRY, "Try again"),
-            ],
+            Some(TaughtSkill::Refused { why, again }) => {
+                // The server's sentence, which names which of the things went wrong. The tape
+                // is still in the window that made it either way — the server keeps none — but
+                // the button is only here when sending the same bytes could come out
+                // differently: a driver offered a retry for a spend cap would sit in a loop
+                // that the sentence beside it says will never end.
+                let mut nodes = vec![UiNode::status(ids::TEACH_SKILL_ERROR, why.clone())];
+                if *again {
+                    nodes.push(UiNode::button(ids::TEACH_RETRY, "Try again"));
+                }
+                nodes
+            }
         }
     }
 
@@ -2778,6 +2841,25 @@ impl NativeChatHost {
                 return Some(Ok(make(id)));
             }
         }
+        // The switch, which is the open skill's and nobody else's: it toggles, the way it does
+        // under a finger, so what it is now has to be read off the pane rather than guessed.
+        if let Some(id) = target.strip_prefix("settings-skill-enabled-") {
+            return Some(
+                match self.skill_open.as_ref().filter(|open| open.id == id) {
+                    Some(open) if !open.arrived => Err(format!(
+                        "`{target}` is not on the pane yet: skill `{id}` is still being fetched"
+                    )),
+                    Some(open) if open.switching => {
+                        Err("that skill's switch is already being changed".to_string())
+                    }
+                    Some(open) => Ok(Command::SetSkillEnabled {
+                        id: id.to_string(),
+                        enabled: !open.enabled,
+                    }),
+                    None => Err(format!("no skill `{id}` is open to switch")),
+                },
+            );
+        }
         let fixed = match target {
             ids::SKILL_WRITE => Some(Ok(Command::OpenSkillAdd)),
             ids::SKILL_SHEET_CANCEL => Some(Ok(Command::CloseSkillAdd)),
@@ -2840,7 +2922,14 @@ impl NativeChatHost {
                 _ => Err("no taught skill is waiting to be read".to_string()),
             }),
             ids::TEACH_RETRY => Some(match &self.taught_skill {
-                Some(TaughtSkill::Refused(_)) => Ok(Command::RetryTaughtSkill),
+                Some(TaughtSkill::Refused { again: true, .. }) => Ok(Command::RetryTaughtSkill),
+                // Refused for a reason a second identical send cannot change: a spend cap, a
+                // recording nothing can be written from, a name already taken, or a skill that
+                // was written and kept before the failure — where sending again would make a
+                // second one.
+                Some(TaughtSkill::Refused { why, .. }) => Err(format!(
+                    "sending that recording again cannot change the answer: {why}"
+                )),
                 _ => Err("no refused recording is waiting to be sent again".to_string()),
             }),
             _ => None,
@@ -4035,6 +4124,9 @@ mod tests {
             body: "Ask for the receipt first.".into(),
             arrived: true,
             updated_at_ms: 1_700_000_000_000,
+            enabled: true,
+            unread: false,
+            switching: false,
             error: None,
         }
     }
@@ -4573,6 +4665,116 @@ mod tests {
         );
     }
 
+    /// The one control that makes the rest of this mean anything: a lesson a model wrote is off
+    /// until somebody reads it, and this is what they press when they have. It works both ways —
+    /// the server keeps one flag and somebody who reads a lesson they do not want puts it back.
+    #[test]
+    fn the_switch_says_where_it_is_and_turns_a_taught_skill_on() {
+        let mut host = skills_host();
+        let mut open = open_skill("skl_1", "invoice-lookup");
+        open.enabled = false;
+        open.unread = true;
+        host.skill_open = Some(open);
+
+        let switch = host
+            .snapshot()
+            .find(&ids::skill_enabled("skl_1"))
+            .cloned()
+            .expect("the pane draws it, so the tree carries it");
+        assert_eq!(switch.name, "Switched off");
+        assert_eq!(switch.checked, Some(false));
+        assert!(
+            switch.states.contains(&"unread".to_string()),
+            "nobody has ever switched it on: {:?}",
+            switch.states
+        );
+
+        // On. The click toggles, the way a finger does, so what it is now is read off the pane.
+        host.click(&ids::skill_enabled("skl_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillEnabled { id, enabled } if id == "skl_1" && enabled
+        ));
+
+        // And back off, for somebody who read it and did not want it. Once it has been switched
+        // on the stamp stands, so it is no longer waiting to be read.
+        let mut read = open_skill("skl_1", "invoice-lookup");
+        read.enabled = true;
+        read.unread = false;
+        host.skill_open = Some(read);
+        let switch = host
+            .snapshot()
+            .find(&ids::skill_enabled("skl_1"))
+            .cloned()
+            .expect("still there");
+        assert_eq!(switch.name, "Switched on");
+        assert_eq!(switch.checked, Some(true));
+        assert!(!switch.states.contains(&"unread".to_string()));
+        host.click(&ids::skill_enabled("skl_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillEnabled { id, enabled } if id == "skl_1" && !enabled
+        ));
+    }
+
+    /// The switch is the open skill's and nobody else's, it is dead while the server is being
+    /// told, and a refusal is drawn beside it rather than in place of the pane — the pane is
+    /// still there, and so is the skill it is about.
+    #[test]
+    fn the_switch_is_refused_when_there_is_nothing_for_it_to_be_about() {
+        let mut host = skills_host();
+        assert!(
+            host.click(&ids::skill_enabled("skl_1"))
+                .unwrap_err()
+                .contains("no skill `skl_1` is open to switch"),
+            "a pane nobody opened has no switch on it"
+        );
+
+        // Still being fetched: the pane is a line saying so, and there is nothing to press.
+        let mut coming = open_skill("skl_1", "invoice-lookup");
+        coming.arrived = false;
+        host.skill_open = Some(coming);
+        assert!(host.snapshot().find(&ids::skill_enabled("skl_1")).is_none());
+        assert!(
+            host.click(&ids::skill_enabled("skl_1"))
+                .unwrap_err()
+                .contains("still being fetched")
+        );
+
+        // With the server. Pressed twice, two answers about one flag are in the air.
+        let mut switching = open_skill("skl_1", "invoice-lookup");
+        switching.switching = true;
+        host.skill_open = Some(switching);
+        assert_eq!(
+            host.snapshot()
+                .find(&ids::skill_enabled("skl_1"))
+                .unwrap()
+                .enabled,
+            false
+        );
+        assert_eq!(
+            host.click(&ids::skill_enabled("skl_1")).unwrap_err(),
+            "that skill's switch is already being changed"
+        );
+
+        // Refused: the switch has already gone back, and the reason is on the pane with it.
+        let mut refused = open_skill("skl_1", "invoice-lookup");
+        refused.error = Some("Only the owner can switch a skill on.".into());
+        host.skill_open = Some(refused);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::SKILL_ERROR).unwrap().name,
+            "Only the owner can switch a skill on.",
+            "the server's sentence, beside the control it is about"
+        );
+        assert!(
+            tree.find(&ids::skill_enabled("skl_1")).is_some(),
+            "and the pane is still a pane: the skill did not go anywhere"
+        );
+        assert!(tree.find(&ids::skill_body("skl_1")).is_some());
+        assert!(host.take_command().is_none());
+    }
+
     /// A lesson being written from a tape takes a model call and a wait, and it happens in the
     /// coworker's screen window — which has no tree. Without these three nodes a driver sees an
     /// app that does nothing for a minute and then an app that has done nothing.
@@ -4629,20 +4831,20 @@ mod tests {
         );
     }
 
-    /// A refused upload is the server's sentence and one thing to do about it. The tape is not
-    /// gone — the server keeps none — so Try again sends the same bytes rather than asking
-    /// somebody to record minutes of work a second time.
+    /// A refused upload is the server's sentence and, where there is any point, one thing to do
+    /// about it. The tape is not gone — the server keeps none — so Try again sends the same
+    /// bytes rather than asking somebody to record minutes of work a second time.
     #[test]
     fn a_refused_lesson_keeps_the_sentence_and_offers_the_tape_again() {
         let mut host = host();
-        host.taught_skill = Some(TaughtSkill::Refused(
-            "Your bot would not write this one down: the recording shows a password being typed."
-                .into(),
-        ));
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "Your bot hung up on the way back. Nothing was stored.".into(),
+            again: true,
+        });
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::TEACH_SKILL_ERROR).unwrap().name,
-            "Your bot would not write this one down: the recording shows a password being typed.",
+            "Your bot hung up on the way back. Nothing was stored.",
             "the server's own words, which name which of the things went wrong"
         );
         assert_eq!(tree.find(ids::TEACH_RETRY).unwrap().name, "Try again");
@@ -4652,6 +4854,38 @@ mod tests {
             host.take_command().unwrap(),
             Command::RetryTaughtSkill
         ));
+    }
+
+    /// A refusal a second identical send cannot change — a spend cap, a recording nothing can be
+    /// written from — keeps its sentence and loses the button. A driver offered a retry there
+    /// would loop against a machine whose answer is already written above it.
+    #[test]
+    fn a_refusal_a_retry_cannot_change_offers_no_retry() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "This coworker is over its spend limit for the month.".into(),
+            again: false,
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TEACH_SKILL_ERROR).unwrap().name,
+            "This coworker is over its spend limit for the month.",
+            "the sentence is the server's either way, and it is not softened"
+        );
+        assert!(
+            tree.find(ids::TEACH_RETRY).is_none(),
+            "no button under a sentence that says a second try is pointless"
+        );
+        let refused = host.click(ids::TEACH_RETRY).unwrap_err();
+        assert!(
+            refused.contains("cannot change the answer"),
+            "and a driver that clicks it anyway is told why: {refused}"
+        );
+        assert!(
+            refused.contains("spend limit"),
+            "with the server's own reason in it: {refused}"
+        );
+        assert!(host.take_command().is_none());
     }
 
     /// Both controls are refused when there is nothing for them to be about: a driver working

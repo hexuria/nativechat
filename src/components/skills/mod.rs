@@ -98,6 +98,8 @@ impl Render for SkillsPage {
                 open: state.skill_open.clone(),
                 open_id: state.skill_open_id.clone(),
                 open_error: state.skill_error.clone(),
+                switching: state.skill_enabling.as_deref() == state.skill_open_id.as_deref()
+                    && state.skill_enabling.is_some(),
                 add_open: state.skill_add_open,
                 add_error: state.skill_add_error.clone(),
                 saving: state.skill_saving,
@@ -114,6 +116,7 @@ impl Render for SkillsPage {
             open,
             open_id,
             open_error,
+            switching,
             add_open,
             add_error,
             saving,
@@ -150,6 +153,7 @@ impl Render for SkillsPage {
                     &id,
                     open.as_ref(),
                     open_error,
+                    switching,
                     &theme,
                     app.clone(),
                 ))
@@ -181,6 +185,8 @@ struct PageState {
     open: Option<crate::opengrok::SkillDetail>,
     open_id: Option<String>,
     open_error: Option<String>,
+    /// The open skill's switch is with the server. It is dead while it is.
+    switching: bool,
     add_open: bool,
     add_error: Option<String>,
     saving: bool,
@@ -328,11 +334,19 @@ pub(crate) const NEVER_UPDATED: &str = "Never";
 /// off is where every skill a model wrote from a recording starts, because nobody has read it
 /// yet. Reading it is the thing to do about that, and this pane is where it is read.
 ///
+/// OFF IS TWO DIFFERENT SITUATIONS, and `approved_at_ms` is what tells them apart: never
+/// stamped is a lesson nobody has read, stamped is one somebody read and then switched off.
+/// Saying "until somebody reads it" about the second would be asking a person to do again the
+/// thing they did just before they switched it off.
+///
 /// A skill with no name has no slash either, and nothing to say about one: the server will not
 /// make one nameless, but a row from somewhere else still can be.
-pub(crate) fn use_line(name: &str, enabled: bool) -> Option<String> {
+pub(crate) fn use_line(name: &str, enabled: bool, approved_at_ms: Option<i64>) -> Option<String> {
     if !enabled {
-        return Some("Switched off — your bot cannot use it until somebody reads it".to_string());
+        return Some(match approved_at_ms {
+            None => "Switched off — your bot cannot use it until somebody reads it".to_string(),
+            Some(_) => "Switched off — somebody read this one and switched it off".to_string(),
+        });
     }
     (!name.trim().is_empty()).then(|| format!("Type /{name} to use it"))
 }
@@ -385,6 +399,7 @@ mod tests {
             version_count: 1,
             draft: false,
             enabled: true,
+            approved_at_ms: None,
         }
     }
 
@@ -393,32 +408,53 @@ mod tests {
     /// Off is not a detail of the row: it is the reason they were sent there.
     #[test]
     fn a_switched_off_skill_says_so_instead_of_offering_a_slash() {
-        let off = use_line("invoice-lookup", false).expect("off is always worth saying");
+        let unread = use_line("invoice-lookup", false, None).expect("off is always worth saying");
         assert!(
-            off.starts_with("Switched off"),
-            "the first words, because it is the first thing to know: {off:?}"
+            unread.starts_with("Switched off"),
+            "the first words, because it is the first thing to know: {unread:?}"
         );
         assert!(
-            off.contains("reads it"),
-            "and what makes it not off, which is somebody reading it: {off:?}"
+            unread.contains("reads it"),
+            "and what makes it not off, which is somebody reading it: {unread:?}"
         );
         assert!(
-            !off.contains('/'),
-            "no slash is offered for a skill that has none: {off:?}"
+            !unread.contains('/'),
+            "no slash is offered for a skill that has none: {unread:?}"
         );
         assert_eq!(
-            use_line("invoice-lookup", true).as_deref(),
+            use_line("invoice-lookup", true, None).as_deref(),
             Some("Type /invoice-lookup to use it"),
             "a skill that is on is invoked by its name"
         );
         assert_eq!(
-            use_line("  ", true),
+            use_line("  ", true, None),
             None,
             "a nameless skill has no slash to offer and nothing to say about one"
         );
         assert!(
-            use_line("", false).is_some(),
+            use_line("", false, None).is_some(),
             "but a nameless skill that is off is still off"
+        );
+    }
+
+    /// Off twice over: a lesson nobody has read, and one somebody read and switched off. The
+    /// server stamps the reading and never unstamps it, which is the only way to tell them
+    /// apart — and telling somebody to read a skill they switched off after reading it is the
+    /// app arguing with them about something they already decided.
+    #[test]
+    fn a_skill_read_and_switched_off_is_not_a_skill_waiting_to_be_read() {
+        let unread = use_line("invoice-lookup", false, None).expect("off says so");
+        let read = use_line("invoice-lookup", false, Some(1_758_000_000_000)).expect("off says so");
+        assert_ne!(unread, read);
+        assert!(read.starts_with("Switched off"), "{read:?}");
+        assert!(
+            read.contains("read this one") && !read.contains("until"),
+            "it has been read, so nothing is waiting on a reading: {read:?}"
+        );
+        assert_eq!(
+            use_line("invoice-lookup", true, Some(1_758_000_000_000)).as_deref(),
+            Some("Type /invoice-lookup to use it"),
+            "and a skill that is on is a skill that is on, stamped or not"
         );
     }
 

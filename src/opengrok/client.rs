@@ -3305,6 +3305,18 @@ pub struct SkillSummary {
     /// page that offers the switch can draw it in the state it is actually in.
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// When the owner first switched this skill on, and `None` while nobody has.
+    ///
+    /// Approval as a FACT, which is the one thing `enabled` cannot say on its own: a lesson a
+    /// model wrote and nobody has read is off, and a lesson somebody read and deliberately
+    /// switched off is also off. The server stamps this the first time an owner switches a
+    /// skill on and never unsays it, so off-and-never-stamped is "waiting to be read" and
+    /// off-and-stamped is "read, and not wanted".
+    ///
+    /// `None` by default, so a server from before the stamp existed reads as never approved
+    /// rather than as approved at the epoch.
+    #[serde(default)]
+    pub approved_at_ms: Option<i64>,
 }
 
 /// A server that does not send `enabled` is one from before the switch existed, and every skill
@@ -6138,6 +6150,11 @@ mod tests {
             !detail.skill.enabled,
             "born switched off: nobody has read it, so nothing may use it"
         );
+        assert!(
+            detail.skill.approved_at_ms.is_none(),
+            "and never approved, which is what tells it from a skill somebody read and then \
+             switched off"
+        );
         assert_eq!(
             detail.body, "Open the billing tab, then search the invoice number.",
             "the prose is what the model wrote, and it is what comes back"
@@ -6270,7 +6287,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "skl_1", "name": "expense-report", "description": "How we file expenses",
                 "source": "authored", "updatedAtMs": 1717000000000i64, "versionCount": 1,
-                "draft": false, "enabled": false, "version": 1, "body": "Ask first.", "files": []
+                "draft": false, "enabled": false, "approvedAtMs": 1717000000001i64,
+                "version": 1, "body": "Ask first.", "files": []
             })))
             .mount(&server)
             .await;
@@ -6286,6 +6304,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!detail.skill.enabled);
+        assert_eq!(
+            detail.skill.approved_at_ms,
+            Some(1717000000001),
+            "switched off again, and still stamped: the reading happened and is not unsaid"
+        );
         assert_eq!(detail.skill.description, "How we file expenses");
     }
 
@@ -6362,6 +6385,11 @@ mod tests {
         assert_eq!(detail.version, 2);
         assert_eq!(detail.files[0].path, "reference/rates.csv");
         assert!(detail.skill.enabled);
+        assert!(
+            detail.skill.approved_at_ms.is_none(),
+            "a server from before the stamp existed has approved nothing, and must not read as \
+             having approved everything at the epoch"
+        );
     }
 
     /// The chip on a row names where the prose came from, and says nothing at all about one

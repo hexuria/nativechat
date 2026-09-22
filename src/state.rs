@@ -18,15 +18,15 @@ use crate::opengrok::{
     OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
     RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
     SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind,
-    ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillSource, SkillSummary, ThreadReplay,
-    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE,
-    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
-    WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
-    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
-    keep_local_save_offer, place_hitl_cards_in_document_order, policy_answer,
-    reads_as_gateway_unreachable, save_login_from_local, serve_local_exec, stored_machine_id,
-    tool_standin,
+    ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary,
+    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
+    UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
+    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
+    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
+    save_login_from_local, serve_local_exec, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -1333,9 +1333,14 @@ pub enum TaughtSkill {
         enabled: bool,
     },
     /// Why there is no lesson, in the server's own words. Those words name which of the things
-    /// went wrong — a model that would not write one, one that ran over its time, a name
-    /// already taken — and none of that survives being reworded here.
-    Refused(String),
+    /// went wrong — a model that would not write one, one that ran over its time, a spend cap,
+    /// a name already taken — and none of that survives being reworded here.
+    ///
+    /// `again` is whether sending the same tape a second time could come out differently. The
+    /// words do not decide that and neither does this: the screen window works it out from the
+    /// status and passes it on, so that what a driver is offered and what a person is offered
+    /// are the same offer.
+    Refused { why: String, again: bool },
 }
 
 /// Which surface asked for a skill to be made, which is where its refusal is drawn.
@@ -1850,6 +1855,9 @@ pub struct AppState {
     pub skill_add_taken: bool,
     /// Delete asks first: the skill the dialog is about, until Delete or Cancel.
     pub skill_delete_confirm: Option<String>,
+    /// The skill whose switch is being changed on the server. The control is dead while it is,
+    /// because a switch pressed twice sends two answers about one flag and the slower wins.
+    pub skill_enabling: Option<String>,
     /// What became of the last tape that was told to become a skill, which happens in the
     /// screen window and is read here. `None` until somebody teaches one.
     pub taught_skill: Option<TaughtSkill>,
@@ -2237,6 +2245,7 @@ impl AppState {
             skill_saving: false,
             skill_add_taken: false,
             skill_delete_confirm: None,
+            skill_enabling: None,
             taught_skill: None,
             main_window: None,
             #[cfg(target_os = "macos")]
@@ -4833,6 +4842,92 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// The switch on the open skill's pane: on, and a turn may read it and colleagues can find
+    /// it; off, and nothing may run it — the server refuses it even to the person who owns it.
+    ///
+    /// ONE FLAG, BOTH WAYS. The server has a single `enabled` and reusing it as the review gate
+    /// for a lesson a model wrote was the decision, not an accident: a skill written from a
+    /// recording is kept off until somebody has read it, and somebody who reads one and does not
+    /// like it puts it back. A one-way Approve would be a second idea about the same bit.
+    ///
+    /// The switch moves at once, everywhere the row is shown, and the server's answer is what
+    /// it ends up at. A refusal puts it back where it was with the reason on the pane: a switch
+    /// that stayed where it was pushed would say the server took a change it had refused, and
+    /// the person would go on to type a slash that does not work.
+    pub fn set_skill_enabled(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
+        // One at a time. The control is dead while this one is going, so this is for a second
+        // ask that came from somewhere the screen cannot stop — the driver.
+        if self.skill_enabling.is_some() {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            self.skill_error = Some("Sign in to change what is kept on the server.".into());
+            cx.notify();
+            return;
+        };
+        let was = self
+            .skill_open
+            .as_ref()
+            .filter(|open| open.skill.id == id)
+            .map(|open| open.skill.enabled)
+            .unwrap_or(!enabled);
+        self.skill_error = None;
+        self.skill_enabling = Some(id.clone());
+        self.mark_skill_enabled(&id, enabled);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .update_skill(
+                    &id,
+                    &SkillPatch {
+                        enabled: Some(enabled),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.skill_enabling = None;
+                match result {
+                    // Where the server says it is, which is the only authority on it. The row
+                    // rather than the whole detail: a `PUT` answers with what it changed, and
+                    // taking its body for the pane's would be betting the prose came back too.
+                    Ok(detail) => {
+                        state.mark_skill_enabled(&id, detail.skill.enabled);
+                        // The stamp comes back too. It is put on the first time an owner
+                        // switches a skill on and never taken off, and it is the only thing
+                        // that tells a lesson nobody has read from one somebody read and
+                        // switched off again — which is the sentence this pane draws.
+                        if let Some(open) =
+                            state.skill_open.as_mut().filter(|open| open.skill.id == id)
+                        {
+                            open.skill.approved_at_ms = detail.skill.approved_at_ms;
+                        }
+                        state.refresh_skills(cx);
+                    }
+                    Err(error) => {
+                        state.mark_skill_enabled(&id, was);
+                        state.skill_error = Some(error.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Put the switch where it now is on the pane and on both lists that carry the row.
+    ///
+    /// Both, because they are two lists and `/` reads the second one: a skill switched on in
+    /// Settings that still says "switched off, so nothing may run it" under the slash is a
+    /// change somebody will reasonably conclude did not happen.
+    fn mark_skill_enabled(&mut self, id: &str, enabled: bool) {
+        mark_enabled(&mut self.skills, id, enabled);
+        mark_enabled(&mut self.your_skills, id, enabled);
+        if let Some(open) = self.skill_open.as_mut().filter(|open| open.skill.id == id) {
+            open.skill.enabled = enabled;
+        }
     }
 
     /// Teach the active bot a task: its screen, with a tape already running. The same thing the
@@ -11528,6 +11623,17 @@ fn image_format_of(bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// Put the switch where it now is on every row of a listing that carries this skill.
+///
+/// A listing is a copy of what the server said a moment ago, and the switch is the one thing on
+/// it that a person changes from somewhere else on the same screen. Left alone, the copy the
+/// composer offers under `/` goes on saying a skill cannot be run after it has been switched on.
+fn mark_enabled(rows: &mut [SkillSummary], id: &str, enabled: bool) {
+    for row in rows.iter_mut().filter(|row| row.id == id) {
+        row.enabled = enabled;
+    }
+}
+
 /// The one file a skill's instructions live in. Everything else in the folder is a file the
 /// instructions refer to.
 const SKILL_FILE: &str = "SKILL.md";
@@ -11777,6 +11883,41 @@ mod tests {
         assert!(
             upload.skill_add_error.is_none(),
             "there is no sheet on screen to draw it in"
+        );
+    }
+
+    /// Turning a skill on is the moment it becomes typeable, and the list `/` offers is a copy
+    /// of what the server said a moment ago. Left alone it goes on saying "switched off, so
+    /// nothing may run it" about a skill that is now on, and the person concludes the switch
+    /// did not work.
+    #[test]
+    fn the_switch_moves_on_every_list_that_carries_the_row() {
+        let row = |id: &str, enabled: bool| SkillSummary {
+            id: id.into(),
+            name: format!("skill-{id}"),
+            description: String::new(),
+            source: crate::opengrok::SkillSource::Taught,
+            updated_at_ms: 0,
+            version_count: 1,
+            draft: false,
+            enabled,
+            approved_at_ms: None,
+        };
+        let mut rows = vec![row("skl_1", false), row("skl_2", false)];
+        mark_enabled(&mut rows, "skl_1", true);
+        assert!(rows[0].enabled, "the one that was switched");
+        assert!(!rows[1].enabled, "and nothing else on the list");
+
+        mark_enabled(&mut rows, "skl_1", false);
+        assert!(
+            !rows[0].enabled,
+            "and it goes back the same way, for a refusal or a rethink"
+        );
+
+        mark_enabled(&mut rows, "skl_9", true);
+        assert!(
+            rows.iter().all(|row| !row.enabled),
+            "a skill this list does not carry changes nothing on it"
         );
     }
 
@@ -12559,7 +12700,7 @@ mod tests {
         TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS,
         WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue, apply_reload, bot_status_line,
         bubble_for_run, graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin,
-        is_unsent_turn_note, missing_replies, overlay_server_cards, parse_sql_time,
+        is_unsent_turn_note, mark_enabled, missing_replies, overlay_server_cards, parse_sql_time,
         reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_message,
         restored_parts, saved_parts, spec_from_queued, stream_paint_due, stream_part_sig,
         streaming_message_mut, turn_ending, unheard_hidden_runs,
