@@ -98,8 +98,10 @@ impl Render for SkillsPage {
                 open: state.skill_open.clone(),
                 open_id: state.skill_open_id.clone(),
                 open_error: state.skill_error.clone(),
-                switching: state.skill_enabling.is_some()
-                    && state.skill_enabling == state.skill_open_id,
+                // ANY switch, not this skill's: one is allowed in flight at a time, and a
+                // control that stays live while the app will refuse it is a control that moves
+                // under the finger and reports nothing.
+                switching: state.skill_enabling.is_some(),
                 add_open: state.skill_add_open,
                 add_error: state.skill_add_error.clone(),
                 saving: state.skill_saving,
@@ -185,7 +187,7 @@ struct PageState {
     open: Option<crate::opengrok::SkillDetail>,
     open_id: Option<String>,
     open_error: Option<String>,
-    /// The open skill's switch is with the server. It is dead while it is.
+    /// A switch — any skill's — is with the server. Every switch is dead while one is.
     switching: bool,
     add_open: bool,
     add_error: Option<String>,
@@ -343,12 +345,24 @@ pub(crate) const NEVER_UPDATED: &str = "Never";
 /// make one nameless, but a row from somewhere else still can be.
 pub(crate) fn use_line(name: &str, enabled: bool, approved_at_ms: Option<i64>) -> Option<String> {
     if !enabled {
-        return Some(match approved_at_ms {
-            None => "Switched off — your bot cannot use it until somebody reads it".to_string(),
-            Some(_) => "Switched off — somebody read this one and switched it off".to_string(),
+        return Some(if waiting_to_be_read(enabled, approved_at_ms) {
+            "Switched off — your bot cannot use it until somebody reads it".to_string()
+        } else {
+            "Switched off — somebody read this one and switched it off".to_string()
         });
     }
     (!name.trim().is_empty()).then(|| format!("Type /{name} to use it"))
+}
+
+/// Whether this skill is off and has never been switched on by anybody — the state the pane
+/// above says in words, and the one a lesson a model wrote is born in.
+///
+/// SHARED WITH THE DRIVER, which reads it as a state on the switch. The two used to work it out
+/// separately and disagreed: the screen only tells the two kinds of off apart while a skill IS
+/// off, and the tree called every skill on a server that sends no stamp unread, including the
+/// ones that were switched on.
+pub(crate) fn waiting_to_be_read(enabled: bool, approved_at_ms: Option<i64>) -> bool {
+    !enabled && approved_at_ms.is_none()
 }
 
 /// The mark a skill wears wherever it is listed: an open book, which is what a skill is.

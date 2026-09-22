@@ -8,7 +8,7 @@ use crate::components::chat_input::sources::{
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::components::skills::{
     NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
-    short_relative_time, skill_matches,
+    short_relative_time, skill_matches, waiting_to_be_read,
 };
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
@@ -23,7 +23,8 @@ use crate::opengrok::{
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
-    ActiveRecipe, AppSettingsTab, AppState, SkillScope, TaughtSkill, WRITING_A_LESSON,
+    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, SWITCH_IN_FLIGHT, SkillScope,
+    TaughtSkill, WRITING_A_LESSON,
 };
 
 pub mod ids {
@@ -135,8 +136,12 @@ pub mod ids {
     /// — while nobody has read it — the state `off`. Clicking it opens it to be read.
     pub const TEACH_SAVED_SKILL: &str = "teach-saved-skill";
     /// Send the refused tape again. The server keeps no tape, so this is the only thing that
-    /// can: the recording is still in the window that made it.
+    /// can: the recording is still in the window that made it. Only where sending it again
+    /// could come out differently, and only while that window is open.
     pub const TEACH_RETRY: &str = "teach-retry";
+    /// The way to the library for the one refusal nobody can answer: the connection dropped, so
+    /// the skill may have been written and may not, and looking is the only way to find out.
+    pub const TEACH_CHECK_LIBRARY: &str = "teach-check-library";
 
     /// The way back from an open skill to the whole-width list.
     pub const SKILL_CLOSE: &str = "settings-skill-close";
@@ -364,12 +369,13 @@ pub enum Command {
         enabled: bool,
     },
     /// A tape taught on a coworker's screen and written up as a skill: read the lesson, which
-    /// is what has to happen before anything may use it, or send a refused tape again.
+    /// is what has to happen before anything may use it, or send a refused tape again. `None`
+    /// opens the library itself, for the refusal where nobody knows whether a skill was written.
     ///
     /// Both belong to the screen window's sheet and are reached through the app, because that
     /// window has no tree of its own for a driver to work.
     OpenTaughtSkill {
-        id: String,
+        id: Option<String>,
     },
     RetryTaughtSkill,
     /// Settings → Logins: the search field's text, the picked row, the Add sheet, and the
@@ -543,7 +549,7 @@ impl Command {
             Self::ConfirmSkillDelete => state.confirm_skill_delete(cx),
             Self::CloseSkillDeleteConfirm => state.close_skill_delete_confirm(cx),
             Self::SetSkillEnabled { id, enabled } => state.set_skill_enabled(id, enabled, cx),
-            Self::OpenTaughtSkill { id } => state.show_skill_in_main_window(Some(id), cx),
+            Self::OpenTaughtSkill { id } => state.show_skill_in_main_window(id, cx),
             Self::RetryTaughtSkill => state.retry_taught_skill(cx),
             Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),
             Self::SelectSiteLogin(id) => state.select_site_login(id, cx),
@@ -924,10 +930,10 @@ struct OpenSkillSnap {
     /// Where the switch is. Off means nothing may run it — the server refuses a switched-off
     /// skill even to its owner — and off is where every lesson a model wrote starts.
     enabled: bool,
-    /// Nobody has ever switched this skill on, which is not the same as its being off now: the
-    /// server stamps the first approval and never unstamps it, so this is what tells a lesson
-    /// waiting to be read from one somebody read and switched off again.
-    unread: bool,
+    /// When somebody first switched this skill on, and `None` while nobody has. The raw fact,
+    /// not the answer: whether it is waiting to be read is worked out by the screen's own
+    /// function, so the tree and the pane cannot say different things about it.
+    approved_at_ms: Option<i64>,
     /// The switch is with the server. It is dead while it is, both on screen and here.
     switching: bool,
     /// What the fetch said when it was refused, or what the switch was refused with. The pane
@@ -1326,13 +1332,15 @@ fn skill_detail_node(skill: &OpenSkillSnap) -> UiNode {
         .with_checked(skill.enabled)
         .with_enabled(!skill.switching),
     );
-    if skill.unread {
-        // Never switched on by anybody. A driver checking that a taught lesson has to be read
-        // before anything can use it is checking this, not the switch's position: a skill that
-        // was read and switched off again is also off.
-        if let Some(switch) = node.children.last_mut() {
-            switch.states.push("unread".to_string());
-        }
+    // Off and never switched on by anybody, which is not the same as off: a lesson a model
+    // wrote and nobody has read, as against one somebody read and switched off again. The
+    // screen's own function answers it, so the tree and the pane cannot disagree — they did,
+    // because each worked it out for itself and the tree called every skill on a server that
+    // sends no stamp unread, switched on or not.
+    if waiting_to_be_read(skill.enabled, skill.approved_at_ms)
+        && let Some(switch) = node.children.last_mut()
+    {
+        switch.states.push("unread".to_string());
     }
     if let Some(error) = &skill.error {
         node = node.with_child(UiNode::status(ids::SKILL_ERROR, error.clone()));
@@ -1532,6 +1540,9 @@ pub struct NativeChatHost {
     /// A tape being written up as a skill on a coworker's screen, and what became of it. That
     /// window draws its own sheet and this host cannot see into it; the app carries the fact.
     taught_skill: Option<TaughtSkill>,
+    /// The window holding a refused tape is still open, so an offer to send it again is an
+    /// offer something can honour. Closing that window takes the tape with it.
+    taught_tape_in_hand: bool,
     computer_tab: bool,
     updates_tab: bool,
     /// Dedicated provisioned box: Route traffic icon on the Computer pane.
@@ -1900,8 +1911,9 @@ impl NativeChatHost {
                         .map(|open| open.skill.updated_at_ms)
                         .unwrap_or_default(),
                     enabled: detail.map(|open| open.skill.enabled).unwrap_or(true),
-                    unread: detail.is_some_and(|open| open.skill.approved_at_ms.is_none()),
-                    switching: state.skill_enabling.as_deref() == Some(id.as_str()),
+                    approved_at_ms: detail.and_then(|open| open.skill.approved_at_ms),
+                    // Any switch, as on screen: one at a time, whichever skill.
+                    switching: state.skill_enabling.is_some(),
                     error: state.skill_error.clone(),
                     id,
                 }
@@ -1911,6 +1923,7 @@ impl NativeChatHost {
             skill_saving: state.skill_saving,
             skill_delete_confirm: state.skill_delete_prompt(),
             taught_skill: state.taught_skill.clone(),
+            taught_tape_in_hand: state.taught_tape_is_in_hand(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
             site_login_notice: state.site_login_notice.clone(),
             site_login_error: state.site_login_error.clone(),
@@ -2349,15 +2362,21 @@ impl NativeChatHost {
                 }
                 vec![node]
             }
-            Some(TaughtSkill::Refused { why, again }) => {
-                // The server's sentence, which names which of the things went wrong. The tape
-                // is still in the window that made it either way — the server keeps none — but
-                // the button is only here when sending the same bytes could come out
-                // differently: a driver offered a retry for a spend cap would sit in a loop
-                // that the sentence beside it says will never end.
+            Some(TaughtSkill::Refused { why, next, .. }) => {
+                // The server's sentence, which names which of the things went wrong, and then
+                // whichever of the two controls the sheet is drawing beside it. A driver
+                // offered a retry for a spend cap would sit in a loop the sentence above it
+                // has already said will never end; one offered a retry for an answer that
+                // never arrived would write a second skill from one recording.
                 let mut nodes = vec![UiNode::status(ids::TEACH_SKILL_ERROR, why.clone())];
-                if *again {
-                    nodes.push(UiNode::button(ids::TEACH_RETRY, "Try again"));
+                match next {
+                    AfterRefusal::SendAgain if self.taught_tape_in_hand => {
+                        nodes.push(UiNode::button(ids::TEACH_RETRY, "Try again"));
+                    }
+                    AfterRefusal::LookFirst => {
+                        nodes.push(UiNode::button(ids::TEACH_CHECK_LIBRARY, "Check Skills"));
+                    }
+                    AfterRefusal::SendAgain | AfterRefusal::Nothing => {}
                 }
                 nodes
             }
@@ -2923,13 +2942,35 @@ impl NativeChatHost {
     fn taught_skill_command(&self, target: &str) -> Option<Result<Command, String>> {
         match target {
             ids::TEACH_SAVED_SKILL => Some(match &self.taught_skill {
-                Some(TaughtSkill::Written { id, .. }) => {
-                    Ok(Command::OpenTaughtSkill { id: id.clone() })
-                }
+                Some(TaughtSkill::Written { id, .. }) => Ok(Command::OpenTaughtSkill {
+                    id: Some(id.clone()),
+                }),
                 _ => Err("no taught skill is waiting to be read".to_string()),
             }),
             ids::TEACH_RETRY => Some(match &self.taught_skill {
-                Some(TaughtSkill::Refused { again: true, .. }) => Ok(Command::RetryTaughtSkill),
+                Some(TaughtSkill::Refused {
+                    next: AfterRefusal::SendAgain,
+                    ..
+                }) if self.taught_tape_in_hand => Ok(Command::RetryTaughtSkill),
+                // The window that was holding those bytes has been closed, and the sheet went
+                // with it. There is nothing left to send.
+                Some(TaughtSkill::Refused {
+                    next: AfterRefusal::SendAgain,
+                    ..
+                }) => Err(
+                    "the screen window holding that recording has been closed, and the \
+                     recording went with it"
+                        .to_string(),
+                ),
+                // Nothing answered, so the skill may already exist. Look before sending.
+                Some(TaughtSkill::Refused {
+                    next: AfterRefusal::LookFirst,
+                    ..
+                }) => Err(format!(
+                    "nobody knows whether that recording was written: open the library with \
+                     `{}` and look before sending it again",
+                    ids::TEACH_CHECK_LIBRARY
+                )),
                 // Refused for a reason a second identical send cannot change: a spend cap, a
                 // recording nothing can be written from, a name already taken, or a skill that
                 // was written and kept before the failure — where sending again would make a
@@ -2938,6 +2979,10 @@ impl NativeChatHost {
                     "sending that recording again cannot change the answer: {why}"
                 )),
                 _ => Err("no refused recording is waiting to be sent again".to_string()),
+            }),
+            ids::TEACH_CHECK_LIBRARY => Some(match &self.taught_skill {
+                Some(TaughtSkill::Refused { .. }) => Ok(Command::OpenTaughtSkill { id: None }),
+                _ => Err("nothing is waiting to be looked for".to_string()),
             }),
             _ => None,
         }
@@ -4133,7 +4178,7 @@ mod tests {
             arrived: true,
             updated_at_ms: 1_700_000_000_000,
             enabled: true,
-            unread: false,
+            approved_at_ms: Some(1_700_000_000_000),
             switching: false,
             error: None,
         }
@@ -4696,7 +4741,7 @@ mod tests {
         let mut host = skills_host();
         let mut open = open_skill("skl_1", "invoice-lookup");
         open.enabled = false;
-        open.unread = true;
+        open.approved_at_ms = None;
         host.skill_open = Some(open);
 
         let switch = host
@@ -4723,7 +4768,7 @@ mod tests {
         // on the stamp stands, so it is no longer waiting to be read.
         let mut read = open_skill("skl_1", "invoice-lookup");
         read.enabled = true;
-        read.unread = false;
+        read.approved_at_ms = Some(1_758_000_000_000);
         host.skill_open = Some(read);
         let switch = host
             .snapshot()
@@ -4738,6 +4783,41 @@ mod tests {
             host.take_command().unwrap(),
             Command::SetSkillEnabled { id, enabled } if id == "skl_1" && !enabled
         ));
+    }
+
+    /// The pane and the tree draw one fact from one function. They used to work it out
+    /// separately and disagreed: the screen only tells the two kinds of off apart while a skill
+    /// IS off, and the tree called every skill on a server that sends no stamp unread —
+    /// including the ones somebody had switched on.
+    #[test]
+    fn the_tree_and_the_pane_agree_about_which_skills_are_waiting_to_be_read() {
+        let mut host = skills_host();
+        for (enabled, approved_at_ms) in [
+            (false, None),
+            (false, Some(1_758_000_000_000)),
+            (true, None),
+            (true, Some(1_758_000_000_000)),
+        ] {
+            let mut open = open_skill("skl_1", "invoice-lookup");
+            open.enabled = enabled;
+            open.approved_at_ms = approved_at_ms;
+            host.skill_open = Some(open);
+            let unread = host
+                .snapshot()
+                .find(&ids::skill_enabled("skl_1"))
+                .expect("the switch is on the pane")
+                .states
+                .contains(&"unread".to_string());
+            let said =
+                crate::components::skills::use_line("invoice-lookup", enabled, approved_at_ms)
+                    .unwrap_or_default();
+            assert_eq!(
+                unread,
+                said.contains("until somebody reads it"),
+                "enabled={enabled} approved={approved_at_ms:?}: the tree says {unread} and the \
+                 pane says {said:?}"
+            );
+        }
     }
 
     /// The switch is the open skill's and nobody else's, it is dead while the server is being
@@ -4862,8 +4942,10 @@ mod tests {
         let mut host = host();
         host.taught_skill = Some(TaughtSkill::Refused {
             why: "Your bot hung up on the way back. Nothing was stored.".into(),
-            again: true,
+            next: AfterRefusal::SendAgain,
+            coworker: "cw_1".into(),
         });
+        host.taught_tape_in_hand = true;
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::TEACH_SKILL_ERROR).unwrap().name,
@@ -4887,7 +4969,8 @@ mod tests {
         let mut host = host();
         host.taught_skill = Some(TaughtSkill::Refused {
             why: "This coworker is over its spend limit for the month.".into(),
-            again: false,
+            next: AfterRefusal::Nothing,
+            coworker: "cw_1".into(),
         });
         let tree = host.snapshot();
         assert_eq!(
@@ -4909,6 +4992,81 @@ mod tests {
             "with the server's own reason in it: {refused}"
         );
         assert!(host.take_command().is_none());
+    }
+
+    /// The refusal nobody can answer: the connection dropped, so the skill may have been
+    /// written and may not. A Try again there would write a second skill from one recording —
+    /// the route has no idempotency key — so what is offered is the library, and the driver is
+    /// told the same thing in the same words if it reaches for the retry anyway.
+    #[test]
+    fn an_answer_that_never_arrived_offers_the_library_and_not_the_tape() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "The connection dropped before the answer came back, and your bot may have \
+                  written the skill anyway."
+                .into(),
+            next: AfterRefusal::LookFirst,
+            coworker: "cw_1".into(),
+        });
+        host.taught_tape_in_hand = true;
+        let tree = host.snapshot();
+        assert!(
+            tree.find(ids::TEACH_SKILL_ERROR)
+                .unwrap()
+                .name
+                .contains("may have written the skill")
+        );
+        assert!(
+            tree.find(ids::TEACH_RETRY).is_none(),
+            "the tape is in hand and must still not be sent: one recording, one skill"
+        );
+        assert_eq!(
+            tree.find(ids::TEACH_CHECK_LIBRARY).unwrap().name,
+            "Check Skills"
+        );
+
+        let refused = host.click(ids::TEACH_RETRY).unwrap_err();
+        assert!(refused.contains("nobody knows"), "{refused}");
+        assert!(
+            refused.contains(ids::TEACH_CHECK_LIBRARY),
+            "and what to press instead: {refused}"
+        );
+        assert!(host.take_command().is_none());
+
+        host.click(ids::TEACH_CHECK_LIBRARY).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenTaughtSkill { id } if id.is_none()
+        ));
+    }
+
+    /// The tape lives in the screen window, and closing that window takes it with it. The offer
+    /// goes when the tape does: a driver told its click worked, on a window that is not there,
+    /// would wait for a skill nothing is writing.
+    #[test]
+    fn a_retry_goes_when_the_window_holding_the_tape_does() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "Your bot hung up on the way back.".into(),
+            next: AfterRefusal::SendAgain,
+            coworker: "cw_1".into(),
+        });
+        host.taught_tape_in_hand = false;
+        assert!(
+            host.snapshot().find(ids::TEACH_RETRY).is_none(),
+            "no window, no bytes, no button"
+        );
+        let refused = host.click(ids::TEACH_RETRY).unwrap_err();
+        assert!(refused.contains("has been closed"), "{refused}");
+        assert!(host.take_command().is_none());
+
+        host.taught_tape_in_hand = true;
+        assert!(host.snapshot().find(ids::TEACH_RETRY).is_some());
+        host.click(ids::TEACH_RETRY).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::RetryTaughtSkill
+        ));
     }
 
     /// Both controls are refused when there is nothing for them to be about: a driver working
@@ -4943,7 +5101,7 @@ mod tests {
         host.click(ids::TEACH_SAVED_SKILL).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),
-            Command::OpenTaughtSkill { id } if id == "skl_7"
+            Command::OpenTaughtSkill { id } if id.as_deref() == Some("skl_7")
         ));
         assert!(host.click(ids::TEACH_RETRY).is_err());
     }

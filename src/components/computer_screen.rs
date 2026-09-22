@@ -35,11 +35,12 @@ use wry::{
 use crate::actions::{CloseWindow, Hide, Minimize, Quit};
 use crate::components::computer::computer_attention_banner;
 use crate::components::fields::field_input;
+use crate::opengrok::Failure;
 use crate::opengrok::{
     computer_window_attention_done_id, computer_window_attention_id,
     computer_window_attention_skip_id, thin_tape,
 };
-use crate::state::{AppState, TaughtSkill, WRITING_A_LESSON};
+use crate::state::{AfterRefusal, AppState, TaughtSkill, WRITING_A_LESSON};
 
 /// The title bar the window paints for itself: tall enough for the traffic lights and a
 /// button, and the part the person drags the window by.
@@ -241,14 +242,16 @@ impl SavedInto {
 /// Why the last Save did not happen, and what there is to do about it.
 struct SaveRefusal {
     /// What was said. The server's own sentence where the server spoke, never reworded: it is
-    /// the only part that says which of the things went wrong.
+    /// the only part that says which of the things went wrong. Where the server said nothing at
+    /// all — see [`MAY_HAVE_LANDED`] — this is the app's own, because somebody has to say
+    /// something and only the app knows what happened.
     said: String,
-    /// Whether sending the same bytes again could come out differently — see
-    /// [`can_send_again`]. What the words say is the server's business; whether a button that
+    /// What there is to do about it, which decides which control the sheet draws. See
+    /// [`after_refusal`]: what the words say is the server's business, whether a button that
     /// cannot work is put under them is this app's.
-    again: bool,
-    /// The tape went out and was refused there, as against a refusal this app made before
-    /// sending anything. Only the first raises the question "is my recording gone".
+    next: AfterRefusal,
+    /// The tape went out, as against a refusal this app made before sending anything. Only the
+    /// first raises the question "is my recording gone".
     sent: bool,
 }
 
@@ -258,16 +261,21 @@ impl SaveRefusal {
     fn here(said: impl Into<String>) -> Self {
         Self {
             said: said.into(),
-            again: false,
+            next: AfterRefusal::Nothing,
             sent: false,
         }
     }
 
-    /// What the server said about a tape that went out.
-    fn from_server(error: &crate::opengrok::OpenGrokError) -> Self {
+    /// What the server said about a tape that went out, or what the app says for the tape whose
+    /// answer never arrived.
+    fn from_server(outcome: TeachOutcome, error: &crate::opengrok::OpenGrokError) -> Self {
+        let next = after_refusal(error);
         Self {
-            again: can_send_again(error.status, &error.message),
-            said: error.message.clone(),
+            said: match next {
+                AfterRefusal::LookFirst => may_have_landed(outcome),
+                _ => error.message.clone(),
+            },
+            next,
             sent: true,
         }
     }
@@ -280,8 +288,10 @@ impl SaveRefusal {
 struct PendingTape {
     started_at_ms: i64,
     events: Vec<serde_json::Value>,
-    /// "kept at <path>", or why there is no local copy.
-    backup: String,
+    /// Where the copy on this Mac went, or why there is none. Kept apart rather than as one
+    /// sentence, because the two are opposite news and the line that reassures somebody their
+    /// recording survived cannot be the line that tells them it did not.
+    backup: Result<String, String>,
     /// When the tape stopped, which is what the name this sheet writes for itself is dated by.
     /// Kept rather than read off the clock again, so the name does not change under somebody
     /// while they are looking at it.
@@ -345,7 +355,12 @@ impl ComputerScreen {
             cx.spawn(async move |this, cx| {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(app) = app.upgrade() {
-                        this.set_handoff_attention(app.read(cx).computer_window_attention(), cx);
+                        let (attention, taught) = {
+                            let app = app.read(cx);
+                            (app.computer_window_attention(), app.taught_skill.clone())
+                        };
+                        this.set_handoff_attention(attention, cx);
+                        this.follow_taught_skill(taught.as_ref(), cx);
                     }
                     cx.notify();
                 });
@@ -405,6 +420,34 @@ impl ComputerScreen {
             description_input,
             saving: false,
             save_error: None,
+        }
+    }
+
+    /// Keep the line this window is showing about a skill it taught in step with what has
+    /// become of that skill since.
+    ///
+    /// "Switched off until you read it" stops being true the moment somebody reads it and
+    /// switches it on — which happens on a page in ANOTHER window, and this line is the only
+    /// thing left on screen still saying it. The app carries the fact, so this window follows
+    /// it rather than keeping what was true when the lesson landed.
+    fn follow_taught_skill(&mut self, taught: Option<&TaughtSkill>, cx: &mut Context<Self>) {
+        let (
+            Some(SavedTape {
+                line,
+                went: Some(SavedInto::Skill(showing)),
+            }),
+            Some(TaughtSkill::Written { id, name, enabled }),
+        ) = (self.last_saved.as_mut(), taught)
+        else {
+            return;
+        };
+        if showing != id {
+            return;
+        }
+        let said = taught_line(name, *enabled);
+        if *line != said {
+            *line = said;
+            cx.notify();
         }
     }
 
@@ -498,11 +541,8 @@ impl ComputerScreen {
             Some(session) => {
                 self.set_teaching(false);
                 let events = session.events.borrow().clone();
-                // The file is the backup; the upload is what the Recipes page shows.
-                let backup = match save_tape(&self.coworker_id, session.started_at_ms, &events) {
-                    Ok(path) => format!("kept at {path}"),
-                    Err(error) => format!("no local copy: {error}"),
-                };
+                // The file is the backup; the upload is what a page shows.
+                let backup = save_tape(&self.coworker_id, session.started_at_ms, &events);
                 let stopped_at = chrono::Local::now();
                 // Each tape is asked about on its own. A choice left standing from the last one
                 // would decide this one silently, which is the thing the choice exists to stop.
@@ -562,6 +602,27 @@ impl ComputerScreen {
         cx.notify();
     }
 
+    /// Put a refusal on the sheet AND on the app, which is the only way the two surfaces can
+    /// agree about one tape.
+    ///
+    /// Every refusal comes through here. Four of them used to be written straight onto the
+    /// sheet — no name, no session, an outcome nothing can make — leaving the app still showing
+    /// the server's older refusal about the same tape, with its own Try again under it.
+    ///
+    /// Only a SKILL is mirrored, because the app's note is about a lesson; anything else takes
+    /// the note away rather than leaving a stale one standing.
+    fn refuse(&mut self, refusal: SaveRefusal, cx: &mut Context<Self>) {
+        let mirror = (self.outcome == TeachOutcome::Skill).then(|| TaughtSkill::Refused {
+            why: refusal.said.clone(),
+            next: refusal.next,
+            coworker: self.coworker_id.clone(),
+        });
+        self.save_error = Some(refusal);
+        self.app
+            .update(cx, |state, cx| state.set_taught_skill(mirror, cx));
+        cx.notify();
+    }
+
     /// Save, from the sheet's one button: the tape goes up as whichever of the three it was
     /// told to become.
     ///
@@ -573,8 +634,7 @@ impl ComputerScreen {
             return;
         }
         if let Some(why) = self.outcome.blocked() {
-            self.save_error = Some(SaveRefusal::here(why));
-            cx.notify();
+            self.refuse(SaveRefusal::here(why), cx);
             return;
         }
         match self.outcome {
@@ -599,14 +659,11 @@ impl ComputerScreen {
     /// skill that was written and kept and only then failed to come back names its id, and that
     /// tape IS spent. Sending it again writes a second skill from one recording.
     pub fn retry_save(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.saving
-            || self.pending.is_none()
-            || !self
-                .save_error
-                .as_ref()
-                .is_some_and(|refusal| refusal.again)
-            || self.outcome.blocked().is_some()
-        {
+        let sendable = self
+            .save_error
+            .as_ref()
+            .is_some_and(|refusal| refusal.next == AfterRefusal::SendAgain);
+        if self.saving || self.pending.is_none() || !sendable || self.outcome.blocked().is_some() {
             return false;
         }
         self.save(cx);
@@ -621,14 +678,12 @@ impl ComputerScreen {
         };
         let name = self.name_input.read(cx).value().trim().to_string();
         if name.is_empty() {
-            self.save_error = Some(SaveRefusal::here("Give the task a name."));
-            cx.notify();
+            self.refuse(SaveRefusal::here("Give the task a name."), cx);
             return;
         }
         let description = self.description_input.read(cx).value().trim().to_string();
         let Some(client) = self.app.read(cx).opengrok.clone() else {
-            self.save_error = Some(SaveRefusal::here("Not connected to OpenGrok."));
-            cx.notify();
+            self.refuse(SaveRefusal::here("Not connected to OpenGrok."), cx);
             return;
         };
         let raw = upload_tape(&pending.events, pending.started_at_ms);
@@ -657,8 +712,11 @@ impl ComputerScreen {
                         });
                         this.app.update(cx, |state, cx| state.refresh_recipes(cx));
                     }
-                    // The tape stays on the sheet: Try again sends these same bytes.
-                    Err(error) => this.save_error = Some(SaveRefusal::from_server(&error)),
+                    // The tape stays on the sheet, whatever there is to do about it.
+                    Err(error) => {
+                        let refusal = SaveRefusal::from_server(TeachOutcome::Recipe, &error);
+                        this.refuse(refusal, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -685,8 +743,7 @@ impl ComputerScreen {
         let name = self.name_input.read(cx).value().trim().to_string();
         let description = self.description_input.read(cx).value().trim().to_string();
         let Some(client) = self.app.read(cx).opengrok.clone() else {
-            self.save_error = Some(SaveRefusal::here("Not connected to OpenGrok."));
-            cx.notify();
+            self.refuse(SaveRefusal::here("Not connected to OpenGrok."), cx);
             return;
         };
         let coworker_id = self.coworker_id.clone();
@@ -729,18 +786,8 @@ impl ComputerScreen {
                         // The tape stays on the sheet. Nothing about a model that would not
                         // write a lesson makes a recording worth throwing away, and the server
                         // kept no copy of it.
-                        let refusal = SaveRefusal::from_server(&error);
-                        let again = refusal.again;
-                        this.save_error = Some(refusal);
-                        this.app.update(cx, |state, cx| {
-                            state.set_taught_skill(
-                                Some(TaughtSkill::Refused {
-                                    why: error.message,
-                                    again,
-                                }),
-                                cx,
-                            );
-                        });
+                        let refusal = SaveRefusal::from_server(TeachOutcome::Skill, &error);
+                        this.refuse(refusal, cx);
                     }
                 }
                 cx.notify();
@@ -753,7 +800,7 @@ impl ComputerScreen {
     fn discard_tape(&mut self, cx: &mut Context<Self>) {
         if let Some(pending) = self.pending.take() {
             self.last_saved = Some(SavedTape {
-                line: format!("Not saved · {}", pending.backup),
+                line: format!("Not saved · {}", backup_note(&pending.backup)),
                 went: None,
             });
         }
@@ -779,13 +826,12 @@ impl ComputerScreen {
     ) -> AnyElement {
         let saving = self.saving;
         let blocked = self.outcome.blocked();
-        // A refusal about something that could be sent again, as against the sheet's own word
-        // that this outcome cannot be made at all — which sending again will not change.
         // Three different questions: did something go wrong, is the recording still here, and
-        // is there any point pressing anything again.
+        // what — if anything — is worth doing about it.
         let refusal = self.save_error.as_ref();
         let sent = refusal.is_some_and(|refusal| refusal.sent);
-        let again = refusal.is_some_and(|refusal| refusal.again);
+        let next = refusal.map(|refusal| refusal.next);
+        let outcome = self.outcome;
         // What the line under the sheet says, in the order it matters: a refusal from the last
         // Save, then an outcome that cannot be made at all, then what was taped. The chosen
         // outcome's own line goes beside it, because "what is this" and "why can it not be
@@ -798,7 +844,7 @@ impl ComputerScreen {
                     "{} · {} events · {}",
                     self.outcome.summary(),
                     pending.events.len(),
-                    pending.backup
+                    backup_note(&pending.backup)
                 ),
                 theme.muted_foreground,
             ),
@@ -868,7 +914,7 @@ impl ComputerScreen {
             // [`can_send_again`]. Somebody who changed the name presses Save; somebody whose
             // upload met a busy machine presses this. The label promises nothing about the
             // second try, because the sentence beside it is what says how likely it is.
-            .when(again, |this| {
+            .when(next == Some(AfterRefusal::SendAgain), |this| {
                 this.child(
                     Button::new("teach-retry")
                         .small()
@@ -877,6 +923,32 @@ impl ComputerScreen {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.retry_save(cx);
                         })),
+                )
+            })
+            // Nothing answered, so nobody knows whether it was written. The one thing to do is
+            // look, and this is the way to the page it would be on — sending the tape again
+            // before looking is how one recording becomes two skills.
+            .when(next == Some(AfterRefusal::LookFirst), |this| {
+                this.child(
+                    Button::new("teach-check-library")
+                        .small()
+                        .label(match outcome {
+                            TeachOutcome::Skill => "Check Skills",
+                            TeachOutcome::Recipe | TeachOutcome::Workflow => "Check Recipes",
+                        })
+                        .on_click({
+                            let app = self.app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| match outcome {
+                                    TeachOutcome::Skill => {
+                                        state.show_skill_in_main_window(None, cx)
+                                    }
+                                    TeachOutcome::Recipe | TeachOutcome::Workflow => {
+                                        state.show_recipes_in_main_window(None, cx)
+                                    }
+                                });
+                            }
+                        }),
                 )
             })
             .child(
@@ -962,34 +1034,63 @@ fn taught_line(name: &str, enabled: bool) -> String {
     }
 }
 
-/// Whether sending the same tape again could come out differently.
+/// What there is to do about a refused tape, which is not the same question as what went wrong.
 ///
 /// The wording of a refusal is the server's and is never touched. The BUTTON under it is this
-/// app's to offer or withhold, and a Try again that cannot work is worse than none: it tells
-/// somebody to press it again for a spend cap that will refuse them every time, and it
-/// contradicts the sentence right above it.
+/// app's to offer or withhold, and one that cannot work is worse than none: it tells somebody to
+/// press again for a spend cap that will refuse them every time, and it contradicts the sentence
+/// right above it.
 ///
-/// THE RULE IS THE STATUS, not the sentence. Nothing answering at all — a dropped wire, or the
-/// wait here running out — and anything in the 500s is a machine that was not able to:
-/// the provider hiccupped, hung up, or ran long. `429` is the server saying one recording at a
-/// time per account and another is going, which is the one case where trying shortly is exactly
-/// the right thing. Every other `4xx` is a verdict about THIS tape, these words or this account
-/// — a spend cap (`402`), a recording nothing can be written from (`422`), a name already taken
-/// (`409`) — and the same bytes with the same words earn the same verdict.
+/// NOTHING ANSWERED AT ALL is the dangerous one, and it is why this is three answers and not
+/// two. The model call takes most of a minute, so a connection that drops on the way back — a
+/// laptop that slept, a VPN re-key, a body that would not decode — is as likely to be a skill
+/// the server WROTE and could not report as one it never made. There is no idempotency key on
+/// this route, so a second send of a tape that did land writes a second skill from one
+/// recording, and the server cannot collapse them. Until there is a key, the honest answer is
+/// to say so and send nobody back to the library blind.
 ///
-/// ONE EXCEPTION, and it is the only place the sentence is read at all: a skill that was written
-/// and kept, and only then failed to come back, names its own id in the refusal. That tape is
-/// spent. Sending it again would write a second skill from one recording.
-fn can_send_again(status: Option<u16>, said: &str) -> bool {
-    if names_a_skill(said) {
-        return false;
+/// Otherwise it is the kind of failure, not the number. A VERDICT is a decision about this
+/// recording, these words or this account — a model that would not write this one down, a model
+/// that overran, a spend cap, a name already taken — and the same bytes earn the same decision.
+/// OUT OF REACH is a machine that never got to decide: the one status the server uses for
+/// "another recording of yours is already being written" is the exception it carves out by hand,
+/// because shortly is exactly when to try that one again.
+fn after_refusal(error: &crate::opengrok::OpenGrokError) -> AfterRefusal {
+    // A skill the server wrote and kept before it failed: named in the sentence, because the
+    // reply has nowhere else to put it. Delete this and [`names_a_skill`] when the route takes
+    // an idempotency key — that is the real fix, and this stands in for it.
+    if names_a_skill(&error.message) {
+        return AfterRefusal::Nothing;
     }
-    match status {
-        // Nothing decided anything; the wire is what to try again.
-        None => true,
-        Some(429) => true,
-        Some(code) => (500..600).contains(&code),
+    if error.status.is_none() {
+        return AfterRefusal::LookFirst;
     }
+    if error.status == Some(TOO_MANY_RECORDINGS) {
+        return AfterRefusal::SendAgain;
+    }
+    match error.failure() {
+        Failure::OutOfReach(_) => AfterRefusal::SendAgain,
+        Failure::Verdict | Failure::SignedOut => AfterRefusal::Nothing,
+    }
+}
+
+/// One recording at a time per account, and another is already going. The one refusal about
+/// this tape that says nothing about this tape.
+const TOO_MANY_RECORDINGS: u16 = 429;
+
+/// What the app says when nothing answered at all, in place of a sentence the server never got
+/// to write. The transport's own words ("error decoding response body") are for a log.
+fn may_have_landed(outcome: TeachOutcome) -> String {
+    let (it, page) = match outcome {
+        TeachOutcome::Skill => ("your bot may have written the skill", "your skills"),
+        TeachOutcome::Recipe | TeachOutcome::Workflow => {
+            ("the recipe may have been saved", "your recipes")
+        }
+    };
+    format!(
+        "The connection dropped before the answer came back, and {it} anyway. Look at {page} \
+         before you send this recording again."
+    )
 }
 
 /// Whether a refusal names a skill the server has already kept — how it says the tape was used
@@ -997,20 +1098,40 @@ fn can_send_again(status: Option<u16>, said: &str) -> bool {
 ///
 /// The id is what is matched, never the words around it: `skl_` is what the server mints, and it
 /// is the one part of that sentence which cannot be reworded without breaking every other thing
-/// that reads an id.
+/// that reads an id. A name somebody chose cannot set this off — the server takes no underscores
+/// in one — and the cost of a false match is one button, where the cost of a miss is a second
+/// skill. Goes when the route takes an idempotency key.
 fn names_a_skill(said: &str) -> bool {
     said.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .any(|word| word.starts_with("skl_") && word.len() > "skl_".len())
+}
+
+/// Where the copy on this Mac went, in the summary line that lists what the tape holds.
+fn backup_note(backup: &Result<String, String>) -> String {
+    match backup {
+        Ok(path) => format!("kept at {path}"),
+        Err(why) => format!("no local copy: {why}"),
+    }
 }
 
 /// What the sheet says under a refusal, answering the question a refusal raises.
 ///
 /// The recording is not gone. The server takes a tape, makes what it was asked for and keeps
 /// what it made — it stores no tapes — so the only copies are the one this sheet is holding and
-/// the file on this Mac, and both are still here. Somebody who thinks minutes of their work went
-/// with a failed upload records the whole task again.
-fn tape_survived_line(backup: &str) -> String {
-    format!("Your recording is still here · {backup}")
+/// the file on this Mac. Somebody who thinks minutes of their work went with a failed upload
+/// records the whole task again.
+///
+/// TWO SENTENCES WHEN THERE IS NO FILE, because one of them is bad news and the old single line
+/// read "Your recording is still here · no local copy" — which contradicts itself in the one
+/// place written to stop somebody re-recording their work.
+fn tape_survived_line(backup: &Result<String, String>) -> String {
+    match backup {
+        Ok(path) => format!("Your recording is still here · kept at {path}"),
+        Err(why) => format!(
+            "Your recording is still here, and this window is holding the only copy of it. \
+             Nothing could be written to disk: {why}"
+        ),
+    }
 }
 
 /// The tape as it goes up: `at` counted from when teaching started rather than the page's
@@ -1262,9 +1383,10 @@ impl Render for ComputerScreen {
 #[cfg(test)]
 mod tests {
     use super::{
-        TeachOutcome, can_send_again, default_tape_name, saving_label, tape_survived_line,
-        taught_line,
+        AfterRefusal, TeachOutcome, after_refusal, default_tape_name, may_have_landed,
+        saving_label, tape_survived_line, taught_line,
     };
+    use crate::opengrok::OpenGrokError;
 
     /// A fixed moment, so a name dated by the clock can be read in a test.
     fn stopped_at() -> chrono::DateTime<chrono::Utc> {
@@ -1443,34 +1565,80 @@ mod tests {
         );
     }
 
-    /// Four refusals, four different things to do, and the button is the app's answer to "is
-    /// there any point". A Try again under a spend cap contradicts the sentence above it and
-    /// puts somebody in a loop that sentence has already said will not end.
+    /// Refusals differ in what there is to DO about them, and the control under the sentence is
+    /// the app's answer to that. A Try again under a spend cap contradicts the sentence above it
+    /// and puts somebody in a loop that sentence has already said will not end.
     #[test]
-    fn a_retry_is_offered_only_where_the_same_bytes_could_come_out_differently() {
-        // Worth it: a machine that was not able to, and the one that says another recording of
-        // this account's is already going.
-        for status in [None, Some(429), Some(500), Some(502), Some(503), Some(504)] {
-            assert!(
-                can_send_again(status, "the provider hung up"),
-                "{status:?} is a machine that could not, not a verdict about this tape"
-            );
-        }
-        // Not worth it: a verdict about this tape, these words, or this account. The same bytes
-        // with the same words earn the same answer.
-        for status in [
-            Some(400),
-            Some(402),
-            Some(404),
-            Some(409),
-            Some(413),
-            Some(422),
+    fn what_to_do_about_a_refusal_follows_the_kind_of_failure_not_the_number() {
+        // Worth sending again: the one status that says another recording of this account's is
+        // already going, and anything the server reports as a machine it could not reach.
+        assert_eq!(
+            after_refusal(&OpenGrokError::status(429, "one recording at a time")),
+            AfterRefusal::SendAgain
+        );
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(502),
+                "the model gateway could not be reached"
+            )),
+            AfterRefusal::SendAgain,
+            "nothing ran, so the same tape may well go through"
+        );
+
+        // Not worth it: every verdict about this tape, these words or this account — including
+        // the 5xx this route answers itself, which is a decision and not a hop that failed.
+        for (status, said) in [
+            (402, "This coworker is over its spend limit."),
+            (422, "The recording has four actions in it."),
+            (409, "You already have a skill called invoice-lookup."),
+            (
+                400,
+                "A skill's name is lowercase letters, digits and dashes.",
+            ),
+            (413, "That description is 4001 characters."),
+            (
+                502,
+                "Your bot would not write this one down: the recording shows a password.",
+            ),
+            (
+                504,
+                "Your bot did not finish in time. Teach a shorter task.",
+            ),
         ] {
-            assert!(
-                !can_send_again(status, "the recording has four actions in it"),
-                "{status:?} decides about what was sent, and it is unchanged"
+            assert_eq!(
+                after_refusal(&OpenGrokError::status(status, said)),
+                AfterRefusal::Nothing,
+                "{status} decides about what was sent, and it is unchanged"
             );
         }
+    }
+
+    /// The dangerous one. A model call takes most of a minute, so a connection that drops on the
+    /// way back is as likely to be a skill the server WROTE and could not report as one it never
+    /// made — and the route has no idempotency key, so sending the same tape again would write a
+    /// second skill from one recording.
+    #[test]
+    fn an_answer_that_never_arrived_sends_nobody_back_with_the_same_tape() {
+        let dropped = OpenGrokError::message("error decoding response body");
+        assert_eq!(after_refusal(&dropped), AfterRefusal::LookFirst);
+        assert!(
+            dropped.status.is_none(),
+            "the case is the missing status, not the words: a transport failure has no sentence"
+        );
+
+        let said = may_have_landed(TeachOutcome::Skill);
+        assert!(
+            said.contains("may have written the skill"),
+            "it says what nobody knows rather than reporting a failure: {said:?}"
+        );
+        assert!(
+            said.contains("Look at your skills"),
+            "and where to look, because looking is the only thing that answers it: {said:?}"
+        );
+        assert!(
+            may_have_landed(TeachOutcome::Recipe).contains("your recipes"),
+            "the same tape saved as a recipe is on the other page"
+        );
     }
 
     /// The one refusal where the tape is spent: the lesson was written and kept, and only the
@@ -1479,24 +1647,36 @@ mod tests {
     /// the one thing in it worth matching on.
     #[test]
     fn a_refusal_that_names_a_kept_skill_is_not_sent_again() {
-        assert!(
-            !can_send_again(
-                Some(500),
-                "The skill skl_7 was written and kept; reading it back failed. Do not send this \
-                 recording again."
-            ),
-            "a 500 is normally worth another try, and this one is not"
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(502),
+                "The skill skl_7 was written and kept; the gateway could not be reached on the \
+                 way back. Do not send this recording again."
+            )),
+            AfterRefusal::Nothing,
+            "a refusal that would otherwise be worth another try, and is not"
         );
-        assert!(
-            !can_send_again(None, "skl_7 is on the server; the tape is spent"),
-            "and neither is a wire that dropped after the skill was kept"
+        assert_eq!(
+            after_refusal(&OpenGrokError::message(
+                "skl_7 is on the server; the tape is spent"
+            )),
+            AfterRefusal::Nothing,
+            "and a dropped wire that still managed to name what it kept"
         );
-        assert!(
-            can_send_again(Some(502), "your bot said nothing this time"),
-            "a refusal that names no skill leaves nothing behind and is worth another try"
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(503),
+                "the model gateway could not be reached"
+            )),
+            AfterRefusal::SendAgain,
+            "a refusal that names no skill left nothing behind"
         );
-        assert!(
-            can_send_again(Some(502), "skl_ is not an id and nothing was kept"),
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(503),
+                "skl_ is not an id and the gateway could not be reached"
+            )),
+            AfterRefusal::SendAgain,
             "the prefix on its own is not an id"
         );
     }
@@ -1506,11 +1686,25 @@ mod tests {
     /// and the other is named.
     #[test]
     fn a_refusal_says_the_recording_is_still_here() {
-        let line = tape_survived_line("kept at /tmp/teach/cw_1/17.raw.json");
-        assert!(line.starts_with("Your recording is still here"), "{line}");
+        let kept = tape_survived_line(&Ok("/tmp/teach/cw_1/17.raw.json".to_string()));
+        assert!(kept.starts_with("Your recording is still here"), "{kept}");
         assert!(
-            line.contains("/tmp/teach/cw_1/17.raw.json"),
-            "and where the file is, for somebody who closes the window: {line}"
+            kept.contains("/tmp/teach/cw_1/17.raw.json"),
+            "and where the file is, for somebody who closes the window: {kept}"
+        );
+
+        // The line that reassures somebody cannot be the line that tells them there is no copy.
+        // "Your recording is still here · no local copy" contradicted itself in the one place
+        // written to stop them recording the whole task a second time.
+        let only = tape_survived_line(&Err("Permission denied".to_string()));
+        assert!(only.starts_with("Your recording is still here"), "{only}");
+        assert!(
+            only.contains("only copy") && only.contains("Permission denied"),
+            "it says where the one copy is and why there is not a second: {only}"
+        );
+        assert!(
+            !only.contains("· no local copy"),
+            "and never in the same breath as the reassurance: {only}"
         );
     }
 }

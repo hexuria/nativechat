@@ -1305,6 +1305,11 @@ impl SkillScope {
     }
 }
 
+/// What a second switch is told while the first is still going. The person cannot ask twice —
+/// every switch on the page is dead — so this is for the driver, which would otherwise be told
+/// nothing and conclude its change had been taken.
+pub const SWITCH_IN_FLIGHT: &str = "A skill's switch is already being changed.";
+
 /// What the sheet's Save button says while a model is reading a tape into prose, and what the
 /// driver reads for the same fact.
 ///
@@ -1332,15 +1337,39 @@ pub enum TaughtSkill {
         name: String,
         enabled: bool,
     },
-    /// Why there is no lesson, in the server's own words. Those words name which of the things
-    /// went wrong — a model that would not write one, one that ran over its time, a spend cap,
-    /// a name already taken — and none of that survives being reworded here.
+    /// Why there is no lesson, in the server's own words — or in the app's own, for the one
+    /// case where the server never got to say anything. Those words name which of the things
+    /// went wrong, and none of that survives being reworded here.
     ///
-    /// `again` is whether sending the same tape a second time could come out differently. The
-    /// words do not decide that and neither does this: the screen window works it out from the
-    /// status and passes it on, so that what a driver is offered and what a person is offered
-    /// are the same offer.
-    Refused { why: String, again: bool },
+    /// `next` is what there is to do about it, worked out by the window that sent the tape and
+    /// carried here so that what a driver is offered and what a person is offered are the same
+    /// offer. `coworker` is whose screen the tape is sitting on, because Try again has to reach
+    /// THAT window: with two screens open, a global slot sent one coworker's recording to the
+    /// other one.
+    Refused {
+        why: String,
+        next: AfterRefusal,
+        coworker: String,
+    },
+}
+
+/// What there is to do about a refused tape, which is not the same question as what went wrong.
+///
+/// The words are the server's and are never touched. This is the app's own answer to "and now
+/// what", and it decides which control is drawn — a button that cannot work is worse than no
+/// button, because it contradicts the sentence above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterRefusal {
+    /// Read it, and change something. The same bytes with the same words earn the same answer:
+    /// a spend cap, a recording nothing can be written from, a name already taken, a model that
+    /// would not write this one down.
+    Nothing,
+    /// Send the same tape again. Something was busy or out of reach and nothing was decided.
+    SendAgain,
+    /// Look before sending anything: nothing answered, so nobody knows whether the skill was
+    /// written. See [`crate::components::computer_screen`] — the route has no idempotency key,
+    /// so a second send of a tape that did land writes a second skill from one recording.
+    LookFirst,
 }
 
 /// Which surface asked for a skill to be made, which is where its refusal is drawn.
@@ -1855,9 +1884,11 @@ pub struct AppState {
     pub skill_add_taken: bool,
     /// Delete asks first: the skill the dialog is about, until Delete or Cancel.
     pub skill_delete_confirm: Option<String>,
-    /// The skill whose switch is being changed on the server. The control is dead while it is,
-    /// because a switch pressed twice sends two answers about one flag and the slower wins.
-    pub skill_enabling: Option<String>,
+    /// The skill whose switch is being changed on the server, and where it was moved to. Every
+    /// switch in the app is dead while one is in flight: two answers about two flags land in
+    /// either order, and the mover is kept so a listing already on the wire cannot land the old
+    /// value on top of it.
+    pub skill_enabling: Option<(String, bool)>,
     /// What became of the last tape that was told to become a skill, which happens in the
     /// screen window and is read here. `None` until somebody teaches one.
     pub taught_skill: Option<TaughtSkill>,
@@ -4393,6 +4424,8 @@ impl AppState {
                     SkillScope::Yours => yours,
                     SkillScope::Discover => discover,
                 };
+                // A switch moved while this listing was on the wire is newer than the listing.
+                self.reapply_pending_switch();
             }
             (Err(error), _) | (_, Err(error)) => {
                 // The rows are the ones that could not be refreshed, so they go with the
@@ -4479,6 +4512,9 @@ impl AppState {
         self.your_skills = rows;
         self.your_skills_loading = false;
         self.your_skills_error = None;
+        // Same as above: what this app has just done to a switch outlives a listing that was
+        // asked for before it happened.
+        self.reapply_pending_switch();
     }
 
     /// What the screen window's sheet is doing with a tape it was told to turn into a skill.
@@ -4503,34 +4539,66 @@ impl AppState {
         cx.notify();
     }
 
-    /// Send the last refused tape again, from the window that is still holding it.
+    /// Send the last refused tape again, from the window that is holding it.
     ///
-    /// The tape belongs to the screen window — the server keeps none — so this is a way through
-    /// to it for everything that cannot see that window: the driver, which only ever sees this
-    /// one. The first window with a refused tape sends it; the rest are left alone.
+    /// THAT window and no other. The tape belongs to one coworker's screen — the server keeps
+    /// none — and the slot here is the app's one note about the last tape taught anywhere, so a
+    /// retry that took whichever window answered first would send one coworker's recording to
+    /// another coworker's screen the moment two are open.
+    ///
+    /// A window that has been closed took the tape with it and there is nothing left to send:
+    /// the note goes, which takes the offer off the tree as well as off the screen.
     ///
     /// On a spawn, because the window's save reads THIS state for its client and writes to it
     /// when the answer lands, and this runs inside an update of it. A nested update of the
     /// entity already leased is `double_lease_panic`.
     pub fn retry_taught_skill(&mut self, cx: &mut Context<Self>) {
+        let Some(TaughtSkill::Refused { coworker, .. }) = self.taught_skill.clone() else {
+            return;
+        };
         #[cfg(target_os = "macos")]
         {
-            let handles: Vec<_> = self.computer_windows.values().copied().collect();
-            cx.spawn(async move |_, cx| {
-                for handle in handles {
-                    if handle
-                        .update(cx, |screen, _, cx| screen.retry_save(cx))
-                        .unwrap_or(false)
-                    {
-                        break;
-                    }
+            let Some(handle) = self.computer_windows.get(&coworker).copied() else {
+                self.set_taught_skill(None, cx);
+                return;
+            };
+            cx.spawn(async move |this, cx| {
+                let sent = handle
+                    .update(cx, |screen, _, cx| screen.retry_save(cx))
+                    .unwrap_or(false);
+                if !sent {
+                    // The window went, or it is no longer holding a tape that can be sent
+                    // again. Either way there is nothing here to offer.
+                    let _ = this.update(cx, |state, cx| state.set_taught_skill(None, cx));
                 }
             })
             .detach();
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = cx;
+            let _ = coworker;
+            self.set_taught_skill(None, cx);
+        }
+    }
+
+    /// Whether the window holding the refused tape is still open, so that the offer to send it
+    /// again is an offer something can honour.
+    ///
+    /// Asked before the button is drawn rather than after it is pressed: the sheet goes with the
+    /// window, so a person cannot press it once that window is shut, and a driver reading a tree
+    /// that still carried it would be told its click had worked.
+    pub fn taught_tape_is_in_hand(&self) -> bool {
+        let Some(TaughtSkill::Refused { coworker, .. }) = &self.taught_skill else {
+            return false;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            self.computer_windows.contains_key(coworker)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = coworker;
+            false
         }
     }
 
@@ -4857,25 +4925,19 @@ impl AppState {
     /// that stayed where it was pushed would say the server took a change it had refused, and
     /// the person would go on to type a slash that does not work.
     pub fn set_skill_enabled(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
-        // One at a time. The control is dead while this one is going, so this is for a second
-        // ask that came from somewhere the screen cannot stop — the driver.
-        if self.skill_enabling.is_some() {
-            return;
-        }
         let Some(client) = self.opengrok.clone() else {
             self.skill_error = Some("Sign in to change what is kept on the server.".into());
             cx.notify();
             return;
         };
-        let was = self
-            .skill_open
-            .as_ref()
-            .filter(|open| open.skill.id == id)
-            .map(|open| open.skill.enabled)
-            .unwrap_or(!enabled);
-        self.skill_error = None;
-        self.skill_enabling = Some(id.clone());
-        self.mark_skill_enabled(&id, enabled);
+        let Some(was) = self.begin_switch(&id, enabled) else {
+            // Not silence. The control is dead on screen while one is going, so anything that
+            // reached here came from somewhere the screen cannot stop — the driver — and a
+            // click that reports success and does nothing is the worst of the three answers.
+            self.skill_error = Some(SWITCH_IN_FLIGHT.into());
+            cx.notify();
+            return;
+        };
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client
@@ -4888,28 +4950,12 @@ impl AppState {
                 )
                 .await;
             let _ = this.update(cx, |state, cx| {
-                state.skill_enabling = None;
                 match result {
-                    // Where the server says it is, which is the only authority on it. The row
-                    // rather than the whole detail: a `PUT` answers with what it changed, and
-                    // taking its body for the pane's would be betting the prose came back too.
                     Ok(detail) => {
-                        state.mark_skill_enabled(&id, detail.skill.enabled);
-                        // The stamp comes back too. It is put on the first time an owner
-                        // switches a skill on and never taken off, and it is the only thing
-                        // that tells a lesson nobody has read from one somebody read and
-                        // switched off again — which is the sentence this pane draws.
-                        if let Some(open) =
-                            state.skill_open.as_mut().filter(|open| open.skill.id == id)
-                        {
-                            open.skill.approved_at_ms = detail.skill.approved_at_ms;
-                        }
+                        state.take_switch_answer(&id, enabled, &detail.skill);
                         state.refresh_skills(cx);
                     }
-                    Err(error) => {
-                        state.mark_skill_enabled(&id, was);
-                        state.skill_error = Some(error.message);
-                    }
+                    Err(error) => state.take_switch_refusal(&id, was, error.message),
                 }
                 cx.notify();
             });
@@ -4917,17 +4963,95 @@ impl AppState {
         .detach();
     }
 
-    /// Put the switch where it now is on the pane and on both lists that carry the row.
+    /// Move the switch and remember where it was, or `None` when one is already in flight.
     ///
-    /// Both, because they are two lists and `/` reads the second one: a skill switched on in
-    /// Settings that still says "switched off, so nothing may run it" under the slash is a
-    /// change somebody will reasonably conclude did not happen.
+    /// ONE AT A TIME, whichever skill: two answers about two flags land in either order, and
+    /// the guard used to be global while the control it disabled was per-skill — so a second
+    /// skill's switch stayed live, moved under the finger, and came back saying nothing.
+    ///
+    /// The pending move is kept, not just the id: a listing that was already on the wire when
+    /// the switch moved carries the old value, and landing it would put the switch back.
+    pub(crate) fn begin_switch(&mut self, id: &str, enabled: bool) -> Option<bool> {
+        if self.skill_enabling.is_some() {
+            return None;
+        }
+        let was = self
+            .skill_open
+            .as_ref()
+            .filter(|open| open.skill.id == id)
+            .map(|open| open.skill.enabled)
+            .unwrap_or(!enabled);
+        self.skill_error = None;
+        self.skill_enabling = Some((id.to_string(), enabled));
+        self.mark_skill_enabled(id, enabled);
+        Some(was)
+    }
+
+    /// Take what a switch's answer is worth taking.
+    ///
+    /// WHAT WAS SENT is where the switch ends up, not what the reply echoes: a `PUT` answers
+    /// with what it changed, and a field it leaves out must not be read as a value — `enabled`
+    /// in particular reads as ON when absent, which would turn a successful switch-off into a
+    /// switch-on. The stamp is the one thing only the server can know, and it is taken only
+    /// when there IS one: `None` there is "not mentioned", and writing it would unsay a
+    /// reading that did happen.
+    pub(crate) fn take_switch_answer(&mut self, id: &str, sent: bool, reply: &SkillSummary) {
+        self.skill_enabling = None;
+        self.mark_skill_enabled(id, sent);
+        if let Some(stamped) = reply.approved_at_ms
+            && let Some(open) = self.skill_open.as_mut().filter(|open| open.skill.id == id)
+        {
+            open.skill.approved_at_ms = Some(stamped);
+        }
+    }
+
+    /// Put the switch back where it was, and say why where the person who moved it is looking.
+    ///
+    /// The sentence is drawn on the pane, so it is only written while the pane is still on this
+    /// skill: a refusal about A landing after somebody has opened B is drawn as the reason B
+    /// could not be fetched. The switch itself goes back either way — the row is the row
+    /// wherever it is shown.
+    pub(crate) fn take_switch_refusal(&mut self, id: &str, was: bool, why: String) {
+        self.skill_enabling = None;
+        self.mark_skill_enabled(id, was);
+        if self.skill_open_id.as_deref() == Some(id) {
+            self.skill_error = Some(why);
+        }
+    }
+
+    /// Put the switch where it now is on the pane, on both lists that carry the row, and on the
+    /// note the screen window is keeping about a skill it has just taught.
+    ///
+    /// All four, because they are four places one fact is drawn: `/` reads the second list, and
+    /// a skill switched on in Settings that still says "switched off, so nothing may run it"
+    /// under the slash is a change somebody will reasonably conclude did not happen. The taught
+    /// note is the one that goes stale unseen — it travels beside the name rather than being
+    /// read off a row, which is the whole reason it needs telling.
     fn mark_skill_enabled(&mut self, id: &str, enabled: bool) {
         mark_enabled(&mut self.skills, id, enabled);
         mark_enabled(&mut self.your_skills, id, enabled);
         if let Some(open) = self.skill_open.as_mut().filter(|open| open.skill.id == id) {
             open.skill.enabled = enabled;
         }
+        if let Some(TaughtSkill::Written {
+            id: taught,
+            enabled: note,
+            ..
+        }) = self.taught_skill.as_mut()
+            && taught == id
+        {
+            *note = enabled;
+        }
+    }
+
+    /// Put a switch this app has moved back on top of a listing that was already on the wire
+    /// when it moved. Nothing to do when none is pending.
+    fn reapply_pending_switch(&mut self) {
+        let Some((id, enabled)) = self.skill_enabling.clone() else {
+            return;
+        };
+        mark_enabled(&mut self.skills, &id, enabled);
+        mark_enabled(&mut self.your_skills, &id, enabled);
     }
 
     /// Teach the active bot a task: its screen, with a tape already running. The same thing the
@@ -11886,6 +12010,234 @@ mod tests {
         );
     }
 
+    fn skill_row(id: &str, enabled: bool) -> SkillSummary {
+        SkillSummary {
+            id: id.into(),
+            name: format!("skill-{id}"),
+            description: String::new(),
+            source: crate::opengrok::SkillSource::Taught,
+            updated_at_ms: 0,
+            version_count: 1,
+            draft: false,
+            enabled,
+            approved_at_ms: None,
+        }
+    }
+
+    /// A state with two taught skills, both off: one of them open on the pane, both on the
+    /// library's list and on the list `/` offers, and the one the screen window is still showing
+    /// a line about.
+    fn library_with_a_taught_skill() -> AppState {
+        let mut state = AppState::new();
+        state.skills = vec![skill_row("skl_1", false), skill_row("skl_2", false)];
+        state.your_skills = state.skills.clone();
+        state.skill_open_id = Some("skl_1".into());
+        state.skill_open = Some(crate::opengrok::SkillDetail {
+            skill: skill_row("skl_1", false),
+            body: "Open the billing tab.".into(),
+            version: 1,
+            files: Vec::new(),
+        });
+        state.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_1".into(),
+            name: "skill-skl_1".into(),
+            enabled: false,
+        });
+        state
+    }
+
+    /// The flag is drawn in four places and the one that goes stale unseen is the note the
+    /// screen window keeps about a skill it has just taught: it travels beside the name rather
+    /// than being read off a row, so nothing else puts it right. Left behind, the title bar goes
+    /// on saying "switched off until you read it" about a skill that was read and switched on.
+    #[test]
+    fn a_switch_moves_on_every_surface_that_draws_it() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+
+        assert!(state.skills[0].enabled, "the library's list");
+        assert!(state.your_skills[0].enabled, "and the list `/` offers");
+        assert!(
+            state
+                .skill_open
+                .as_ref()
+                .is_some_and(|open| open.skill.enabled),
+            "and the pane the switch is on"
+        );
+        assert_eq!(
+            state.taught_skill,
+            Some(TaughtSkill::Written {
+                id: "skl_1".into(),
+                name: "skill-skl_1".into(),
+                enabled: true,
+            }),
+            "and the note the screen window is drawing from"
+        );
+        assert!(!state.skills[1].enabled, "and nothing else in the library");
+    }
+
+    /// One switch at a time, whichever skill. The guard was global while the control it dimmed
+    /// was per-skill, so a second skill's switch stayed live, moved under the finger and came
+    /// back with nothing said.
+    #[test]
+    fn a_second_switch_is_refused_while_one_is_in_flight() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        assert_eq!(
+            state.begin_switch("skl_2", true),
+            None,
+            "another skill's switch is still a switch"
+        );
+        assert!(
+            !state.skills[1].enabled,
+            "and it did not move it on the way to saying no"
+        );
+        state.take_switch_answer("skl_1", true, &skill_row("skl_1", true));
+        assert_eq!(
+            state.begin_switch("skl_2", true),
+            Some(false),
+            "and the next one is free once the first has answered"
+        );
+    }
+
+    /// What was SENT is where the switch ends up. A `PUT` answers with what it changed, and
+    /// `enabled` reads as ON when it is absent — so taking the reply's word for it turned a
+    /// switch-off the server had accepted into a switch-on.
+    #[test]
+    fn a_switch_takes_what_it_sent_and_a_stamp_only_when_one_came() {
+        let mut state = library_with_a_taught_skill();
+        state.skills[0].enabled = true;
+        state.your_skills[0].enabled = true;
+        if let Some(open) = state.skill_open.as_mut() {
+            open.skill.enabled = true;
+            open.skill.approved_at_ms = Some(1_758_000_000_000);
+        }
+        assert_eq!(state.begin_switch("skl_1", false), Some(true));
+
+        // A reply that echoes only what it changed says nothing about `enabled` — which reads
+        // as on — and nothing about the stamp.
+        let mut echo = skill_row("skl_1", true);
+        echo.approved_at_ms = None;
+        state.take_switch_answer("skl_1", false, &echo);
+        assert!(
+            !state.skills[0].enabled,
+            "off is what was sent, and off it is"
+        );
+        assert!(!state.your_skills[0].enabled);
+        assert_eq!(
+            state
+                .skill_open
+                .as_ref()
+                .and_then(|open| open.skill.approved_at_ms),
+            Some(1_758_000_000_000),
+            "a stamp not mentioned is not a stamp taken back: the reading did happen"
+        );
+        assert!(state.skill_enabling.is_none());
+
+        // A reply that does carry one is the only authority on it.
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        let mut stamped = skill_row("skl_1", true);
+        stamped.approved_at_ms = Some(1_759_000_000_000);
+        state.take_switch_answer("skl_1", true, &stamped);
+        assert_eq!(
+            state
+                .skill_open
+                .as_ref()
+                .and_then(|open| open.skill.approved_at_ms),
+            Some(1_759_000_000_000)
+        );
+    }
+
+    /// A refusal puts the switch back wherever the row is drawn, but the sentence is drawn on
+    /// one pane: landing it without looking drew A's refusal as the reason B could not be
+    /// fetched, and the pane said "refused" where the person was still waiting on "loading".
+    #[test]
+    fn a_refused_switch_goes_back_and_says_why_only_on_its_own_pane() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        state.take_switch_refusal(
+            "skl_1",
+            false,
+            "Only the owner can switch a skill on.".into(),
+        );
+        assert!(!state.skills[0].enabled, "back where it was");
+        assert!(!state.your_skills[0].enabled);
+        assert_eq!(
+            state.skill_error.as_deref(),
+            Some("Only the owner can switch a skill on."),
+            "and the reason, on the pane it was moved on"
+        );
+
+        // The same answer for a skill the person has since left.
+        state.skill_error = None;
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        state.skill_open_id = Some("skl_2".into());
+        state.skill_open = None;
+        state.take_switch_refusal(
+            "skl_1",
+            false,
+            "Only the owner can switch a skill on.".into(),
+        );
+        assert!(!state.skills[0].enabled, "the row still goes back");
+        assert_eq!(
+            state.skill_error, None,
+            "but the pane is about another skill now, and this is not what is wrong with it"
+        );
+    }
+
+    /// A listing asked for before the switch moved carries the old value. Landing it put the
+    /// switch back under the person's finger for as long as the round trip took.
+    #[test]
+    fn a_listing_already_on_the_wire_cannot_put_a_moved_switch_back() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        state.take_your_skills(vec![skill_row("skl_1", false), skill_row("skl_2", false)]);
+        assert!(
+            state.your_skills[0].enabled,
+            "what this app has just done outlives a listing asked for before it happened"
+        );
+        assert!(!state.your_skills[1].enabled, "and only that row");
+
+        state.take_switch_answer("skl_1", true, &skill_row("skl_1", true));
+        state.take_your_skills(vec![skill_row("skl_1", false)]);
+        assert!(
+            !state.your_skills[0].enabled,
+            "once the server has answered, the server's listing is the truth again"
+        );
+    }
+
+    /// Try again sends the tape from the window that is holding it, and a window that has been
+    /// closed took the tape with it. Asked before the button is drawn, because a button that
+    /// reports success and does nothing is the worst of the three answers.
+    #[test]
+    fn a_refused_tape_is_only_in_hand_while_its_window_is_open() {
+        let mut state = AppState::new();
+        assert!(
+            !state.taught_tape_is_in_hand(),
+            "nothing taught, nothing held"
+        );
+
+        state.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_1".into(),
+            name: "invoice-lookup".into(),
+            enabled: false,
+        });
+        assert!(
+            !state.taught_tape_is_in_hand(),
+            "a lesson that was written is not a tape waiting to go again"
+        );
+
+        state.taught_skill = Some(TaughtSkill::Refused {
+            why: "Your bot hung up on the way back.".into(),
+            next: AfterRefusal::SendAgain,
+            coworker: "cw_1".into(),
+        });
+        assert!(
+            !state.taught_tape_is_in_hand(),
+            "no window open for that coworker: the sheet went, and the bytes with it"
+        );
+    }
+
     /// Turning a skill on is the moment it becomes typeable, and the list `/` offers is a copy
     /// of what the server said a moment ago. Left alone it goes on saying "switched off, so
     /// nothing may run it" about a skill that is now on, and the person concludes the switch
@@ -12693,17 +13045,18 @@ mod tests {
 
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        ActiveRecipe, ActivityTick, AppState, BotActivity, ChatMessage, ChatPart, Conversation,
-        DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
-        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
-        STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE,
-        TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS,
-        WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue, apply_reload, bot_status_line,
-        bubble_for_run, graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin,
-        is_unsent_turn_note, mark_enabled, missing_replies, overlay_server_cards, parse_sql_time,
-        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_message,
-        restored_parts, saved_parts, spec_from_queued, stream_paint_due, stream_part_sig,
-        streaming_message_mut, turn_ending, unheard_hidden_runs,
+        ActiveRecipe, ActivityTick, AfterRefusal, AppState, BotActivity, ChatMessage, ChatPart,
+        Conversation, DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue,
+        PickedKind, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply,
+        RouteTrafficSurface, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SkillScope, SkillSummary,
+        TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun, TurnAssembler,
+        TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
+        apply_catalogue, apply_reload, bot_status_line, bubble_for_run, graft_reply,
+        hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note, mark_enabled,
+        missing_replies, overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable,
+        replayed_ending, reply_from_replay, restored_message, restored_parts, saved_parts,
+        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
+        unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.

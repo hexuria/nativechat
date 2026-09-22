@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::error::OpenGrokError;
+use super::error::{OpenGrokError, reads_as_gateway_unreachable};
 use super::types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate,
     error_message_from_body,
@@ -1513,7 +1513,9 @@ impl OpenGrokClient {
     ///
     /// Every refusal is the server's own sentence and reaches the caller as written — including
     /// the `502` it answers when the model wrote nothing that can be kept, which is a verdict
-    /// about a model and not a hop that could not be reached.
+    /// about a model and not a hop that could not be reached. See [`Self::tape_error`]: this
+    /// route's failures are told apart here, where the route is known, because their status
+    /// lines mean something different here than anywhere else in this client.
     pub async fn create_skill_from_tape(
         &self,
         coworker_id: &str,
@@ -1540,7 +1542,37 @@ impl OpenGrokClient {
                 Some(SKILL_FROM_TAPE_TIMEOUT),
             )
             .await?;
-        Self::json_or_error(response).await
+        if !response.status().is_success() {
+            return Err(Self::tape_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))
+    }
+
+    /// What a refusal from `/skills/from-tape` IS, which its status line does not say on its own.
+    ///
+    /// [`Self::read_error`] reads any `502`-`504` as something standing in front of OpenGrok
+    /// that could not reach it — true everywhere else, because nothing this app talks to answers
+    /// those itself. THIS ROUTE DOES. A `502` here is OpenGrok saying the model ran and produced
+    /// nothing that can be kept (it refused, said nothing, wrote something unfenced, or overran
+    /// the cap), and a `504` is that model overrunning the server's own sixty seconds. Both are
+    /// decisions about this recording, and the same bytes earn the same decision — which is
+    /// exactly what a caller needs to know before it offers to send them again.
+    ///
+    /// Told apart here for the same reason a `401` is: only the caller that knows the route can
+    /// know what the number meant. What is still out of reach is out of reach — OpenGrok saying
+    /// it could not get to the model gateway is a state, nothing ran, and that one keeps its
+    /// kind.
+    async fn tape_error(response: reqwest::Response) -> OpenGrokError {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let message = error_message_from_body(&body);
+        if reads_as_gateway_unreachable(&message) {
+            return OpenGrokError::from_server(Some(status), message);
+        }
+        OpenGrokError::status(status, message)
     }
 
     pub async fn skill(&self, id: &str) -> Result<SkillDetail, OpenGrokError> {
