@@ -60,7 +60,10 @@ pub use client::{
     host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
-pub use pending::{PendingList, PendingMutation, PendingUserMessage, PendingWrite};
+pub use pending::{
+    CUSTOM_NAME, PAYLOAD_V, PendingCustom, PendingList, PendingMutation, PendingOp,
+    PendingUserMessage, PendingWrite,
+};
 pub use types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
     ReplyQuote, assistant_text_from_sse,
