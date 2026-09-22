@@ -6,6 +6,7 @@
 use super::SkillsPage;
 use crate::components::fields::field_input;
 use crate::state::AppState;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::{Theme, h_flex, v_flex};
@@ -46,16 +47,25 @@ impl AddSheetInputs {
             .update(cx, |input, cx| input.set_value("", window, cx));
     }
 
-    /// Cancel, or the dimmed background: the sheet goes, and the page empties the fields on the
-    /// paint after it.
+    /// The dimmed background: the sheet goes and the fields keep what is in them.
+    ///
+    /// A click that lands wide of a sheet is not a decision to throw work away — it is most
+    /// often a click that missed. Cancel is the decision, and Cancel empties them.
     fn close(&self, app: &Entity<AppState>, cx: &mut App) {
         app.update(cx, |state, cx| state.close_skill_add(cx));
+    }
+
+    /// Cancel: said plainly, so the words go with the sheet.
+    fn cancel(&self, app: &Entity<AppState>, window: &mut Window, cx: &mut App) {
+        self.clear(window, cx);
+        self.close(app, cx);
     }
 }
 
 pub(super) fn render(
     inputs: AddSheetInputs,
     error: Option<String>,
+    saving: bool,
     app: Entity<AppState>,
     theme: &Theme,
 ) -> impl IntoElement {
@@ -142,16 +152,22 @@ pub(super) fn render(
                         .child(
                             Button::new("settings-skill-add-cancel")
                                 .label("Cancel")
+                                .disabled(saving)
                                 .on_click({
                                     let inputs = inputs.clone();
                                     let app = app.clone();
-                                    move |_, _, cx| inputs.close(&app, cx)
+                                    move |_, window, cx| inputs.cancel(&app, window, cx)
                                 }),
                         )
                         .child(
+                            // Dead while the create is in flight. Pressed twice, the second
+                            // try is a name the server has just taken, and the sheet would show
+                            // "you already have a skill called that" about the skill it had
+                            // itself just made.
                             Button::new("settings-skill-add-save")
-                                .label("Save")
+                                .label(if saving { "Saving…" } else { "Save" })
                                 .primary()
+                                .disabled(saving)
                                 .on_click(move |_, _, cx| {
                                     let name = inputs.name.read(cx).value().to_string();
                                     let description =

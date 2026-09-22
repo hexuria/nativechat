@@ -1506,15 +1506,20 @@ impl OpenGrokClient {
     /// New prose for a skill that already exists. The files ride along because they are kept per
     /// version: what is not sent here is not beside this body, so a version that dropped a
     /// reference sheet does not go on finding the old one.
+    ///
+    /// `source` is sent rather than left to the server to work out. Left off, the server reads a
+    /// version with no files beside it as hand-authored — so an upload whose whole bundle is one
+    /// `SKILL.md` would be recorded as something somebody typed here.
     pub async fn add_skill_version(
         &self,
         id: &str,
         body: &str,
         note: &str,
+        source: SkillSource,
         files: &[SkillFile],
     ) -> Result<SkillVersion, OpenGrokError> {
         let path = format!("/skills/{id}/versions");
-        let mut payload = json!({ "body": body });
+        let mut payload = json!({ "body": body, "kind": source.word() });
         if !note.trim().is_empty() {
             payload["note"] = json!(note);
         }
@@ -5962,32 +5967,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_version_is_the_prose_and_the_note_on_it() {
+    async fn a_new_version_is_the_prose_the_note_and_where_it_came_from() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/skills/skl_1/versions"))
             .and(body_json(json!({
                 "body": "Ask for the receipt first, then the date.",
+                "kind": "uploaded",
                 "note": "the date too",
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "version": 2, "kind": "authored", "createdAtMs": 1717000000000i64,
+                "version": 2, "kind": "uploaded", "createdAtMs": 1717000000000i64,
                 "note": "the date too"
             })))
             .mount(&server)
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
+        // The word goes up with it: left off, a bundle that is one lone SKILL.md comes back
+        // recorded as something somebody typed here.
         let version = client
             .add_skill_version(
                 "skl_1",
                 "Ask for the receipt first, then the date.",
                 "the date too",
+                SkillSource::Uploaded,
                 &[],
             )
             .await
             .unwrap();
         assert_eq!(version.version, 2);
-        assert_eq!(version.kind, SkillSource::Authored);
+        assert_eq!(version.kind, SkillSource::Uploaded);
         assert_eq!(version.note, "the date too");
     }
 

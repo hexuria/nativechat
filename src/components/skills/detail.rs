@@ -15,6 +15,7 @@ use gpui_kit::*;
 pub(super) fn render(
     id: &str,
     detail: Option<&SkillDetail>,
+    error: Option<String>,
     theme: &Theme,
     app: Entity<AppState>,
 ) -> AnyElement {
@@ -32,18 +33,31 @@ pub(super) fn render(
         .pb(px(24.))
         .gap(px(16.));
     let Some(detail) = detail else {
-        // The row is on screen and its prose is not here yet. Saying so keeps the pane from
-        // reading as a skill with nothing in it.
-        return pane
-            .child(close_row(muted, app))
-            .child(
-                div()
-                    .id("settings-skill-loading")
-                    .text_sm()
-                    .text_color(muted)
-                    .child("Loading…"),
-            )
-            .into_any_element();
+        // The row is on screen and its prose is not here yet — or it is not coming, and the
+        // pane says which. A pane that waits forever at a request that was refused is a pane
+        // nobody can tell from a slow one.
+        return match error {
+            Some(error) => pane
+                .child(close_row(muted, app))
+                .child(
+                    div()
+                        .id("settings-skill-error")
+                        .text_sm()
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+                .into_any_element(),
+            None => pane
+                .child(close_row(muted, app))
+                .child(
+                    div()
+                        .id("settings-skill-loading")
+                        .text_sm()
+                        .text_color(muted)
+                        .child("Loading…"),
+                )
+                .into_any_element(),
+        };
     };
     let skill = &detail.skill;
     let skill_id = skill.id.clone();
@@ -89,12 +103,17 @@ pub(super) fn render(
                             h_flex()
                                 .gap(px(6.))
                                 .items_center()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(format!("Type /{} to use it", skill.name)),
-                                )
+                                // A skill with no name has no slash to type, and "Type / to use
+                                // it" is an instruction nobody can follow. The server will not
+                                // make one nameless; a row from somewhere else still can be.
+                                .when(!skill.name.trim().is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(format!("Type /{} to use it", skill.name)),
+                                    )
+                                })
                                 .children(label.map(|(word, tone)| chip(word, tone, theme))),
                         ),
                 ),
@@ -109,12 +128,25 @@ pub(super) fn render(
                     .child(skill.description.clone()),
             )
         })
+        // NOT YET: the server keeps an `enabled` switch on every skill — off means nobody in
+        // the org sees it and nothing may run it — and `update_skill` already sends it. No
+        // control here turns it, so a skill switched off elsewhere can only be read about. A row
+        // on this card with a Switch in it is the whole of what is missing.
         .child(
             card(theme)
                 .child(kv_row("Version", version, theme))
                 .child(divider(theme))
-                .child(kv_row("Updated", updated, theme))
+                .child(
+                    kv_row("Updated", updated, theme).id(SharedString::from(format!(
+                        "settings-skill-updated-{skill_id}"
+                    ))),
+                )
                 .child(divider(theme))
+                // NOT YET: these are names, and reading them costs the whole bundle. The
+                // detail route answers with every file's bytes base64 — there is no per-file
+                // read route and no listing that stops at the names — so opening a skill with a
+                // 256 KB bundle downloads 256 KB to print two lines. A `?files=names` on the
+                // server, or a separate listing, is what would fix it.
                 .child(kv_row(
                     "Files",
                     if detail.files.is_empty() {
@@ -146,9 +178,10 @@ pub(super) fn render(
                         .px(px(12.))
                         .py(px(10.))
                         .text_sm()
-                        // The prose is shown as it is kept, newlines and all, because it is
-                        // Markdown a person wrote and reads back to check.
-                        .whitespace_normal()
+                        // NOT YET: this is the Markdown as it is kept, drawn as one run of
+                        // text. Its headings and lists are not rendered — nothing here renders
+                        // Markdown — and its line breaks fall where the column ends rather than
+                        // where they were typed.
                         .map(|this| {
                             if detail.body.trim().is_empty() {
                                 return this.text_color(muted).child(
@@ -162,14 +195,16 @@ pub(super) fn render(
         )
         .child(
             h_flex().child(
+                // Its own id, not the row menu's: two elements answering to one name is one
+                // name a driver cannot use to say which of them it meant.
                 Button::new(SharedString::from(format!(
-                    "settings-skill-delete-{skill_id}"
+                    "settings-skill-detail-delete-{skill_id}"
                 )))
                 .label("Delete")
                 .danger()
                 .small()
                 .on_click(move |_, _, cx| {
-                    app.update(cx, |state, cx| state.delete_skill(skill_id.clone(), cx));
+                    app.update(cx, |state, cx| state.ask_skill_delete(skill_id.clone(), cx));
                 }),
             ),
         )

@@ -1730,9 +1730,18 @@ pub struct AppState {
     /// would otherwise be a blank where a number belongs.
     pub skills_counts: SkillCounts,
     pub skills_loading: bool,
-    /// What the last skills request said when it was refused — the server's own sentence,
-    /// including the one naming the 8000-character cap on a body.
+    /// What the LIST's last request said when it was refused: a refresh, a picker, a delete.
+    ///
+    /// Three error slots rather than one, the way the recipes page keeps its list's and its
+    /// detail's apart. They are three places on screen, and one slot for all three put a delete
+    /// that the server refused inside the "New skill" sheet, where it read as a verdict on what
+    /// somebody had just typed.
     pub skills_error: Option<String>,
+    /// What the OPEN SKILL's fetch said when it was refused, shown on its pane.
+    pub skill_error: Option<String>,
+    /// What the CREATE said when it was refused — the server's own sentence, including the one
+    /// naming the 8000-character cap on a body. Shown in the sheet, over the fields it is about.
+    pub skill_add_error: Option<String>,
     /// Bumped per refresh, so a late answer for an earlier scope is dropped.
     skills_epoch: u64,
     /// The skill the detail pane shows, once it has loaded, and the one it is on from the
@@ -1741,6 +1750,16 @@ pub struct AppState {
     pub skill_open_id: Option<String>,
     /// Create a skill: the sheet over the page, until Cancel or Save.
     pub skill_add_open: bool,
+    /// A create is in flight. Save is dead while it is: pressed twice, the second try is a name
+    /// the server has just taken, and the sheet would show "you already have a skill called
+    /// that" about the skill it had itself just made.
+    pub skill_saving: bool,
+    /// The server took the last create, so the sheet's fields may be emptied. The page turns
+    /// this off once it has. Cancel empties them too; a click on the dimmed background does
+    /// not, because a click landing wide of a sheet is not a decision to throw work away.
+    pub skill_add_taken: bool,
+    /// Delete asks first: the skill the dialog is about, until Delete or Cancel.
+    pub skill_delete_confirm: Option<String>,
     /// The window the app's pages live in. A second window — a coworker's screen — has no
     /// page of its own: it asks this one to show the Recipes page and brings it forward.
     main_window: Option<AnyWindowHandle>,
@@ -2098,10 +2117,15 @@ impl AppState {
             skills_counts: SkillCounts::default(),
             skills_loading: false,
             skills_error: None,
+            skill_error: None,
+            skill_add_error: None,
             skills_epoch: 0,
             skill_open: None,
             skill_open_id: None,
             skill_add_open: false,
+            skill_saving: false,
+            skill_add_taken: false,
+            skill_delete_confirm: None,
             main_window: None,
             #[cfg(target_os = "macos")]
             computer_windows: std::collections::HashMap::new(),
@@ -4147,12 +4171,27 @@ impl AppState {
     }
 
     pub fn set_skills_scope(&mut self, scope: SkillScope, cx: &mut Context<Self>) {
-        if self.skills_scope == scope {
+        if !self.take_skills_scope(scope) {
             return;
         }
-        self.skills_scope = scope;
         self.refresh_skills(cx);
         cx.notify();
+    }
+
+    /// Move the toggle, and take the rows off the page while the new side is on its way.
+    ///
+    /// The rows on screen are the rows of the side that was open, so they go the moment that
+    /// side does. Left there they would sit under the other side's name until the fetch landed
+    /// — and for as long as the app ran if it never did.
+    ///
+    /// `false` when the toggle was already there and nothing moved.
+    fn take_skills_scope(&mut self, scope: SkillScope) -> bool {
+        if self.skills_scope == scope {
+            return false;
+        }
+        self.skills_scope = scope;
+        self.skills.clear();
+        true
     }
 
     /// Settings → Skills: the search field's text, the copy the list filters by.
@@ -4173,6 +4212,13 @@ impl AppState {
     /// side's rows under the other side's name.
     pub fn refresh_skills(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
+            // Signed out there is no library to ask for, which is not the same as a library
+            // with nothing in it — and "No skills yet" is what an empty list says.
+            self.skills.clear();
+            self.skills_counts = SkillCounts::default();
+            self.skills_loading = false;
+            self.skills_error = Some("Sign in to see the skills kept on the server.".into());
+            cx.notify();
             return;
         };
         self.skills_epoch += 1;
@@ -4187,39 +4233,59 @@ impl AppState {
             )
             .await;
             let _ = this.update(cx, |state, cx| {
-                if state.skills_epoch != epoch {
-                    return;
+                if state.take_skills(epoch, scope, yours, discover) {
+                    cx.notify();
                 }
-                state.skills_loading = false;
-                match (yours, discover) {
-                    (Ok(yours), Ok(discover)) => {
-                        state.skills_counts = SkillCounts {
-                            yours: yours.len(),
-                            discover: discover.len(),
-                        };
-                        state.skills = match scope {
-                            SkillScope::Yours => yours,
-                            SkillScope::Discover => discover,
-                        };
-                    }
-                    // Either half failing is the library failing: the counts and the rows come
-                    // from the same pair of answers, and half a pair would put a number on the
-                    // toggle that the list beneath it disagrees with.
-                    (Err(error), _) | (_, Err(error)) => {
-                        state.skills_error = Some(error.message);
-                    }
-                }
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Take a pair of listings, unless the page has moved on. `false` when the answer was for a
+    /// refresh that has been overtaken, and nothing was touched.
+    ///
+    /// Either half failing is the library failing: the counts and the rows come from the same
+    /// pair of answers, and half a pair would put a number on the toggle that the list beneath
+    /// it disagrees with.
+    fn take_skills(
+        &mut self,
+        epoch: u64,
+        scope: SkillScope,
+        yours: Result<Vec<SkillSummary>, OpenGrokError>,
+        discover: Result<Vec<SkillSummary>, OpenGrokError>,
+    ) -> bool {
+        if self.skills_epoch != epoch {
+            return false;
+        }
+        self.skills_loading = false;
+        match (yours, discover) {
+            (Ok(yours), Ok(discover)) => {
+                self.skills_counts = SkillCounts {
+                    yours: yours.len(),
+                    discover: discover.len(),
+                };
+                self.skills = match scope {
+                    SkillScope::Yours => yours,
+                    SkillScope::Discover => discover,
+                };
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                // The rows are the ones that could not be refreshed, so they go with the
+                // counts: a list left on screen under a red line is a list somebody reads as
+                // current.
+                self.skills.clear();
+                self.skills_counts = SkillCounts::default();
+                self.skills_error = Some(error.message);
+            }
+        }
+        true
     }
 
     /// The detail pane for one skill. The prose is not on the listing, so it is fetched.
     pub fn open_skill(&mut self, id: String, cx: &mut Context<Self>) {
         self.skill_open = None;
         self.skill_open_id = Some(id);
-        self.skills_error = None;
+        self.skill_error = None;
         self.load_open_skill(cx);
         cx.notify();
     }
@@ -4240,7 +4306,10 @@ impl AppState {
                 }
                 match result {
                     Ok(detail) => state.skill_open = Some(detail),
-                    Err(error) => state.skills_error = Some(error.message),
+                    // On the pane, where the person is waiting for it. In the list's slot it
+                    // would be a sentence about the library, and the pane would go on saying
+                    // "Loading…" at something that is never going to arrive.
+                    Err(error) => state.skill_error = Some(error.message),
                 }
                 cx.notify();
             });
@@ -4254,14 +4323,15 @@ impl AppState {
         }
         self.skill_open = None;
         self.skill_open_id = None;
+        self.skill_error = None;
         cx.notify();
     }
 
-    /// Create a skill → the sheet over the page, with a clean slate.
+    /// Create a skill → the sheet over the page.
     pub fn open_skill_add(&mut self, cx: &mut Context<Self>) {
         if !self.skill_add_open {
             self.skill_add_open = true;
-            self.skills_error = None;
+            self.skill_add_error = None;
             cx.notify();
         }
     }
@@ -4269,8 +4339,16 @@ impl AppState {
     pub fn close_skill_add(&mut self, cx: &mut Context<Self>) {
         if self.skill_add_open {
             self.skill_add_open = false;
+            // The refusal was about what was in the sheet. With the sheet gone there is nothing
+            // for it to be about, and left behind it reads as a verdict on the library.
+            self.skill_add_error = None;
             cx.notify();
         }
+    }
+
+    /// The page has emptied the sheet's fields after a create the server took.
+    pub fn skill_add_fields_cleared(&mut self) {
+        self.skill_add_taken = false;
     }
 
     /// Write one down: the prose as typed, with the name and the description beside it.
@@ -4287,9 +4365,12 @@ impl AppState {
         body: String,
         cx: &mut Context<Self>,
     ) {
+        if self.skill_saving {
+            return;
+        }
         let name = name.trim().to_string();
         if name.is_empty() {
-            self.skills_error =
+            self.skill_add_error =
                 Some("A skill needs a name — it is what you type after the slash.".into());
             cx.notify();
             return;
@@ -4342,8 +4423,11 @@ impl AppState {
     /// and the server reads it from there. Making somebody retype it is how a skill's file and
     /// its row come to disagree about what the thing is called.
     pub fn upload_skill(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        if self.skill_saving {
+            return;
+        }
         self.skills_error = None;
-        self.skills_loading = true;
+        self.skill_saving = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let read = cx
@@ -4362,8 +4446,10 @@ impl AppState {
                         },
                         cx,
                     ),
+                    // What was picked is the list's business: the Upload button is on the
+                    // list, and nothing was typed for this to be a verdict on.
                     Err(why) => {
-                        state.skills_loading = false;
+                        state.skill_saving = false;
                         state.skills_error = Some(why);
                     }
                 }
@@ -4377,30 +4463,34 @@ impl AppState {
     /// sent, the library reloads, and the one that was just made is the one on the pane.
     fn send_new_skill(&mut self, new: NewSkill, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
-            self.skills_loading = false;
-            self.skills_error = Some("Sign in to keep a skill on the server.".into());
+            self.skill_saving = false;
+            self.skill_add_error = Some("Sign in to keep a skill on the server.".into());
             cx.notify();
             return;
         };
-        self.skills_loading = true;
-        self.skills_error = None;
+        self.skill_saving = true;
+        self.skill_add_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.create_skill(&new).await;
             let _ = this.update(cx, |state, cx| {
-                state.skills_loading = false;
+                state.skill_saving = false;
                 match result {
                     Ok(detail) => {
-                        // Taken: the sheet may go, and with it the words that are now kept.
+                        // Taken: the sheet may go, and the words in its fields are now kept
+                        // somewhere, so the page may empty them.
                         state.skill_add_open = false;
+                        state.skill_add_error = None;
+                        state.skill_add_taken = true;
                         let id = detail.skill.id.clone();
                         state.skill_open_id = Some(id);
+                        state.skill_error = None;
                         state.skill_open = Some(detail);
                         // A new skill is one of the person's own, whichever side was open.
-                        state.skills_scope = SkillScope::Yours;
+                        state.take_skills_scope(SkillScope::Yours);
                         state.refresh_skills(cx);
                     }
-                    Err(error) => state.skills_error = Some(error.message),
+                    Err(error) => state.skill_add_error = Some(error.message),
                 }
                 cx.notify();
             });
@@ -4408,8 +4498,46 @@ impl AppState {
         .detach();
     }
 
-    pub fn delete_skill(&mut self, id: String, cx: &mut Context<Self>) {
+    /// Delete asks first, the way every recipe does: the dialog over the page, naming the skill
+    /// it is about. A skill is prose somebody wrote, and it sits one row under Open in a menu
+    /// that opens under the pointer.
+    pub fn ask_skill_delete(&mut self, id: String, cx: &mut Context<Self>) {
+        self.skill_delete_confirm = Some(id);
+        self.skills_error = None;
+        cx.notify();
+    }
+
+    pub fn close_skill_delete_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.skill_delete_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The name of the skill the delete dialog asks about, while it is open. An id with no row
+    /// to put a name to is still a skill to ask about, so the id stands in for the name.
+    pub fn skill_delete_prompt(&self) -> Option<String> {
+        let id = self.skill_delete_confirm.as_ref()?;
+        Some(
+            self.skills
+                .iter()
+                .find(|skill| &skill.id == id)
+                .map(|skill| skill.name.clone())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| id.clone()),
+        )
+    }
+
+    pub fn confirm_skill_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.skill_delete_confirm.take() else {
+            return;
+        };
+        self.delete_skill(id, cx);
+    }
+
+    fn delete_skill(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
+            self.skills_error = Some("Sign in to change what is kept on the server.".into());
+            cx.notify();
             return;
         };
         self.skills_error = None;
@@ -5622,6 +5750,12 @@ impl AppState {
             self.refresh_computers(cx);
             self.refresh_host_egress(cx);
             self.refresh_coworker_computer_quietly(cx);
+        }
+        // And landing on Settings → Skills the same way: the library is the account's, nothing
+        // else fetches it, and a page that arrived here through back or forward would say "No
+        // skills yet" about a library nobody had asked for.
+        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills {
+            self.refresh_skills(cx);
         }
         // After `select_coworker`, which lands on the chat: the page is where the person was.
         self.page = loc.page;
@@ -11051,19 +11185,45 @@ fn read_skill_upload(path: &std::path::Path) -> Result<(String, Vec<SkillFile>),
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
-    match std::fs::read(path) {
-        Ok(bytes) => String::from_utf8(bytes)
-            .map(|body| (body, Vec::new()))
-            .map_err(|_| format!("{name} is not text, so it cannot be a skill's instructions.")),
-        Err(error) => Err(format!("{name} could not be read: {error}")),
+    // What it weighs before what it holds. A 500 MB file picked by mistake is half a gigabyte
+    // allocated to find out it was a mistake, and the sentence that came back was about a
+    // request body rather than about the file somebody chose.
+    let size = std::fs::metadata(path)
+        .map_err(|error| format!("{name} could not be read: {error}"))?
+        .len();
+    if let Some(why) = too_heavy(&name, size) {
+        return Err(why);
     }
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("{name} could not be read: {error}"))?;
+    String::from_utf8(bytes)
+        .map(|body| (body, Vec::new()))
+        .map_err(|_| format!("{name} is not text, so it cannot be a skill's instructions."))
+}
+
+/// The words for one file that is too heavy to be part of a skill, or `None` when it is not.
+///
+/// Asked of what the filesystem says a file weighs, before it is opened. The server has the real
+/// limits — 8000 characters of instructions, [`SKILL_BUNDLE_LIMIT`] of files — and words its own
+/// refusals; this one is about this Mac's memory, and a file it refuses is over every one of
+/// them anyway.
+fn too_heavy(name: &str, bytes: u64) -> Option<String> {
+    (bytes > SKILL_BUNDLE_LIMIT as u64).then(|| {
+        format!(
+            "{name} is {:.1} MB. A skill is instructions and the small files they refer to — at \
+             most {} KB of them.",
+            bytes as f64 / (1024. * 1024.),
+            SKILL_BUNDLE_LIMIT / 1024
+        )
+    })
 }
 
 /// The words for a bundle over the size cap.
 ///
 /// Said in two places — the walk over a picked folder stops on it, and the bundle built from
 /// that walk refuses on it — so a folder that was stopped part-way through is refused in the
-/// same words as one that was read to the end.
+/// same words as one that was read to the end. Both count the same thing: the files BESIDE the
+/// instructions, which is what the server caps.
 fn bundle_too_big() -> String {
     format!(
         "A skill's files come to at most {} KB together. Leave out what the instructions do not \
@@ -11072,19 +11232,46 @@ fn bundle_too_big() -> String {
     )
 }
 
+/// The words for a bundle with too many files in it, said in the same two places and for the
+/// same reason.
+///
+/// It names the cap and not what arrived: the walk stops counting the moment it is past, so a
+/// number from there would mean "at least this many" while reading as a fact.
+fn bundle_too_many() -> String {
+    format!(
+        "A skill carries at most {SKILL_BUNDLE_FILES} files beside its {SKILL_FILE}. Leave out \
+         what the instructions do not refer to."
+    )
+}
+
 /// Every file under a picked folder, as (path relative to it, bytes).
 ///
-/// Dot entries are left where they are: a `.git` is not part of a skill, and a folder somebody
-/// picked by mistake is mostly dot entries. The walk stops the moment it is past the size cap,
-/// so a folder that is not a skill at all — a checkout, a downloads directory — is refused
-/// rather than read into memory whole.
+/// Nothing is read until the filesystem has been asked what it weighs, and the walk stops the
+/// moment the bundle is past either cap. A folder somebody picked by mistake — a checkout, a
+/// downloads directory, a mail store — is refused on what it says it is, rather than read into
+/// memory and refused afterwards.
+///
+/// Dot entries are left where they are: a `.git` is not part of a skill, and a mis-picked folder
+/// is mostly dot entries. So are symlinks, and everything that is neither a file nor a folder:
+/// what a link points at is not inside the bundle, and copying it onto a computer would be
+/// copying something the person never picked.
+///
+/// A subfolder that will not open is stepped over rather than taken as the end of the upload,
+/// the way an entry that will not stat is. The folder the person actually picked is different:
+/// if THAT cannot be read there is nothing to upload, and it says so.
 fn read_skill_folder(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut beside = 0usize;
     let mut total = 0usize;
     let mut stack = vec![(dir.to_path_buf(), String::new())];
     while let Some((at, prefix)) = stack.pop() {
-        let entries = std::fs::read_dir(&at)
-            .map_err(|error| format!("{} could not be read: {error}", at.display()))?;
+        let entries = match std::fs::read_dir(&at) {
+            Ok(entries) => entries,
+            Err(error) if prefix.is_empty() => {
+                return Err(format!("{} could not be read: {error}", at.display()));
+            }
+            Err(_) => continue,
+        };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') {
@@ -11102,19 +11289,31 @@ fn read_skill_folder(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>, St
                 stack.push((entry.path(), path));
                 continue;
             }
-            // Symlinks and everything that is neither a file nor a folder are left alone: what
-            // a link points at is not inside the bundle, and copying it onto a computer would
-            // be copying something the person never picked.
             if !kind.is_file() {
                 continue;
             }
+            let Ok(size) = entry.metadata().map(|meta| meta.len()) else {
+                continue;
+            };
+            if let Some(why) = too_heavy(&path, size) {
+                return Err(why);
+            }
+            // The instructions are capped by the server on their own, in characters, and are
+            // not part of what a bundle may weigh — so they are weighed here only as one file,
+            // above, which is what keeps a six-gigabyte SKILL.md from being read.
+            if !path.eq_ignore_ascii_case(SKILL_FILE) {
+                beside += 1;
+                if beside > SKILL_BUNDLE_FILES {
+                    return Err(bundle_too_many());
+                }
+                total = total.saturating_add(size as usize);
+                if total > SKILL_BUNDLE_LIMIT {
+                    return Err(bundle_too_big());
+                }
+            }
             let bytes = std::fs::read(entry.path())
                 .map_err(|error| format!("{path} could not be read: {error}"))?;
-            total += bytes.len();
             found.push((path, bytes));
-            if total > SKILL_BUNDLE_LIMIT {
-                return Err(bundle_too_big());
-            }
         }
     }
     Ok(found)
@@ -11124,7 +11323,9 @@ fn read_skill_folder(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>, St
 /// that goes with them, base64 as the server takes it.
 ///
 /// The caps are the server's and are checked here too, because a bundle refused after it has
-/// been uploaded is a refusal that cost the person the upload.
+/// been uploaded is a refusal that cost the person the upload. They are counted the way the walk
+/// counts them — the files BESIDE the instructions — and refused in the same words, so a folder
+/// stopped part-way through and one read to the end say the same thing.
 fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>), String> {
     use base64::Engine as _;
     let mut body: Option<String> = None;
@@ -11149,11 +11350,7 @@ fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>
         ));
     };
     if files.len() > SKILL_BUNDLE_FILES {
-        return Err(format!(
-            "A skill carries at most {SKILL_BUNDLE_FILES} files beside its {SKILL_FILE}; that \
-             folder has {}.",
-            files.len()
-        ));
+        return Err(bundle_too_many());
     }
     if total > SKILL_BUNDLE_LIMIT {
         return Err(bundle_too_big());
@@ -11166,6 +11363,127 @@ fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>
 
 #[cfg(test)]
 mod tests {
+    /// The walk over a real folder: what it takes, what it steps over, and what it refuses
+    /// before opening anything.
+    ///
+    /// The oversized file is unreadable on purpose. If the size check ever moves back below the
+    /// open, this test stops seeing the sentence about megabytes and starts seeing "could not be
+    /// read" — which is the whole difference between refusing a 6 GB file and allocating it.
+    #[test]
+    fn a_folder_is_walked_without_opening_what_it_must_not_send() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("a folder to walk");
+        let at = dir.path();
+        let write = |path: &str, bytes: &[u8]| {
+            let full = at.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let mut file = std::fs::File::create(&full).unwrap();
+            file.write_all(bytes).unwrap();
+            full
+        };
+        write("SKILL.md", b"Ask for the receipt first.");
+        write("reference/rates.csv", b"ok, hi\n");
+        write(".git/config", b"[core]\n");
+        std::os::unix::fs::symlink("/etc/hosts", at.join("hosts")).unwrap();
+
+        let found = super::read_skill_folder(at).expect("a folder with instructions in it");
+        let mut paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["SKILL.md", "reference/rates.csv"],
+            "a dot directory is not part of a skill, and neither is what a link points at"
+        );
+
+        // A file too heavy to be part of a skill, which cannot be opened at all.
+        let big = write("big.bin", b"");
+        std::fs::File::options()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(super::SKILL_BUNDLE_LIMIT as u64 + 1)
+            .unwrap();
+        std::fs::set_permissions(&big, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let why = super::read_skill_folder(at).expect_err("over the cap");
+        assert!(why.contains("MB"), "{why}");
+        assert!(
+            !why.contains("could not be read"),
+            "the size was asked for before the file was opened: {why}"
+        );
+        std::fs::remove_file(&big).unwrap();
+
+        // And one file too many, counted as they are found rather than at the end.
+        for index in 0..=super::SKILL_BUNDLE_FILES {
+            write(&format!("note-{index}.md"), b"x");
+        }
+        let why = super::read_skill_folder(at).expect_err("too many files");
+        assert!(
+            why.contains(&super::SKILL_BUNDLE_FILES.to_string()),
+            "{why}"
+        );
+    }
+
+    /// A folder that will not open has nothing in it to upload, and a subfolder that will not
+    /// open is one corner of a folder that does.
+    #[test]
+    fn a_folder_that_will_not_open_says_so_and_a_subfolder_is_stepped_over() {
+        let dir = tempfile::tempdir().expect("a folder to walk");
+        let at = dir.path();
+        std::fs::write(at.join("SKILL.md"), b"Ask first.").unwrap();
+        let shut = at.join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::write(shut.join("inside.md"), b"x").unwrap();
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let found = super::read_skill_folder(at).expect("one shut corner is not the end of it");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "SKILL.md");
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+
+        let why = super::read_skill_folder(&at.join("nowhere")).expect_err("no such folder");
+        assert!(why.contains("could not be read"), "{why}");
+    }
+
+    /// A picked file is the instructions themselves: read when it is text and small enough to
+    /// be a skill's, and refused on what the filesystem says it weighs before that.
+    #[test]
+    fn a_picked_file_is_the_instructions_when_it_can_be_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("a folder to write in");
+        let at = dir.path();
+
+        let md = at.join("SKILL.md");
+        std::fs::write(&md, b"Ask for the receipt first.").unwrap();
+        let (body, files) = super::read_skill_upload(&md).expect("a file of instructions");
+        assert_eq!(body, "Ask for the receipt first.");
+        assert!(
+            files.is_empty(),
+            "one file is one file, with nothing beside it"
+        );
+
+        let binary = at.join("notes.bin");
+        std::fs::write(&binary, [0xFF, 0xFE, 0x00]).unwrap();
+        let why = super::read_skill_upload(&binary).expect_err("not text");
+        assert!(why.contains("is not text"), "{why}");
+
+        let big = at.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(super::SKILL_BUNDLE_LIMIT as u64 + 1)
+            .unwrap();
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let why = super::read_skill_upload(&big).expect_err("over the cap");
+        assert!(why.contains("MB"), "{why}");
+        assert!(
+            !why.contains("could not be read"),
+            "half a gigabyte is not allocated to find out it was a mistake: {why}"
+        );
+    }
+
     /// The instructions are the `SKILL.md`; everything else in the folder is a file they refer
     /// to, sent base64 and in a settled order so the same folder twice is the same bundle.
     #[test]
@@ -11220,6 +11538,88 @@ mod tests {
         ];
         let why = super::skill_bundle(heavy).expect_err("too many bytes");
         assert!(why.contains("KB"), "{why}");
+    }
+
+    /// The rows on the page and the numbers on the toggle come out of one pair of answers, so
+    /// either half failing takes both: a count that the list under it disagrees with is worse
+    /// than no count at all. A pair for a refresh that has since been overtaken is dropped
+    /// whole, which is what keeps a slow answer for one side of the toggle off the other.
+    #[test]
+    fn a_library_lands_whole_or_not_at_all() {
+        let rows = |ids: &[&str]| -> Vec<crate::opengrok::SkillSummary> {
+            ids.iter()
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({ "id": id, "name": id })).unwrap()
+                })
+                .collect()
+        };
+        let mut state = super::AppState::new();
+        state.skills_epoch = 4;
+
+        assert!(
+            !state.take_skills(
+                3,
+                super::SkillScope::Yours,
+                Ok(rows(&["skl_1"])),
+                Ok(Vec::new())
+            ),
+            "an answer for a refresh that has been overtaken is not this page's answer"
+        );
+        assert!(state.skills.is_empty());
+
+        assert!(state.take_skills(
+            4,
+            super::SkillScope::Discover,
+            Ok(rows(&["skl_1"])),
+            Ok(rows(&["skl_2", "skl_3"])),
+        ));
+        assert_eq!(
+            state.skills.len(),
+            2,
+            "the side that is open is the side shown"
+        );
+        assert_eq!(state.skills[0].id, "skl_2");
+        assert_eq!(
+            state.skills_counts,
+            super::SkillCounts {
+                yours: 1,
+                discover: 2
+            }
+        );
+        assert!(!state.skills_loading);
+
+        state.skills_epoch = 5;
+        assert!(state.take_skills(
+            5,
+            super::SkillScope::Discover,
+            Ok(rows(&["skl_1"])),
+            Err(crate::opengrok::OpenGrokError::message(
+                "the gateway is down"
+            )),
+        ));
+        assert!(
+            state.skills.is_empty(),
+            "rows left under a red line are rows somebody reads as current"
+        );
+        assert_eq!(state.skills_counts, super::SkillCounts::default());
+        assert_eq!(state.skills_error.as_deref(), Some("the gateway is down"));
+    }
+
+    /// The rows on screen belong to the side that was open, so they go the moment it does —
+    /// otherwise they sit under the other side's name until the fetch lands, and for as long as
+    /// the app runs if it never does.
+    #[test]
+    fn moving_the_toggle_takes_the_rows_with_it() {
+        let mut state = super::AppState::new();
+        state.skills =
+            serde_json::from_value(serde_json::json!([{ "id": "skl_1", "name": "a" }])).unwrap();
+        assert!(state.take_skills_scope(super::SkillScope::Discover));
+        assert_eq!(state.skills_scope, super::SkillScope::Discover);
+        assert!(state.skills.is_empty());
+        assert!(
+            !state.take_skills_scope(super::SkillScope::Discover),
+            "the toggle was already there and nothing moved"
+        );
     }
 
     /// The two words on the toggle are the words a driver uses, and they are not the words on

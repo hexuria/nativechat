@@ -14,8 +14,9 @@ mod list;
 
 use crate::opengrok::SkillSummary;
 use crate::state::AppState;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme, Icon, Theme};
+use gpui_kit::component::{ActiveTheme, Icon, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -27,9 +28,6 @@ pub struct SkillsPage {
     search: Entity<InputState>,
     /// The Create sheet's fields, made the first time it opens (an input needs a window).
     add: Option<AddSheetInputs>,
-    /// Whether the sheet was up on the last paint. The fields empty when it goes, and not
-    /// before: a refused name comes back with the prose still in them.
-    sheet_open: bool,
 }
 
 impl SkillsPage {
@@ -50,15 +48,18 @@ impl SkillsPage {
             state,
             search,
             add: None,
-            sheet_open: false,
         }
     }
 
     /// The field follows the state, so a search the driver wrote lands in it.
     fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (query, add_open) = {
+        let (query, add_open, taken) = {
             let state = self.state.read(cx);
-            (state.skills_query.clone(), state.skill_add_open)
+            (
+                state.skills_query.clone(),
+                state.skill_add_open,
+                state.skill_add_taken,
+            )
         };
         if self.search.read(cx).value().as_ref() != query.as_str() {
             self.search
@@ -67,15 +68,16 @@ impl SkillsPage {
         if add_open && self.add.is_none() {
             self.add = Some(AddSheetInputs::new(window, cx));
         }
-        // The sheet has just gone — taken by the server, or cancelled. Either way the next one
-        // opens on a clean slate.
-        if self.sheet_open
-            && !add_open
-            && let Some(add) = &self.add
-        {
-            add.clear(window, cx);
+        // The server took the last create, so what is in the fields is kept somewhere and the
+        // next sheet opens clean. Nothing else empties them: a refusal leaves the words where
+        // they were typed, and so does a click that landed wide of the sheet.
+        if taken {
+            if let Some(add) = &self.add {
+                add.clear(window, cx);
+            }
+            self.state
+                .update(cx, |state, _| state.skill_add_fields_cleared());
         }
-        self.sheet_open = add_open;
     }
 }
 
@@ -84,20 +86,39 @@ impl Render for SkillsPage {
         self.sync_inputs(window, cx);
         let theme = cx.theme().clone();
         let app = self.state.clone();
-        let (skills, query, counts, scope, loading, error, open, open_id, add_open) = {
+        let page = {
             let state = self.state.read(cx);
-            (
-                state.skills.clone(),
-                state.skills_query.clone(),
-                state.skills_counts,
-                state.skills_scope,
-                state.skills_loading,
-                state.skills_error.clone(),
-                state.skill_open.clone(),
-                state.skill_open_id.clone(),
-                state.skill_add_open,
-            )
+            PageState {
+                skills: state.skills.clone(),
+                query: state.skills_query.clone(),
+                counts: state.skills_counts,
+                scope: state.skills_scope,
+                loading: state.skills_loading,
+                error: state.skills_error.clone(),
+                open: state.skill_open.clone(),
+                open_id: state.skill_open_id.clone(),
+                open_error: state.skill_error.clone(),
+                add_open: state.skill_add_open,
+                add_error: state.skill_add_error.clone(),
+                saving: state.skill_saving,
+                delete_confirm: state.skill_delete_prompt(),
+            }
         };
+        let PageState {
+            skills,
+            query,
+            counts,
+            scope,
+            loading,
+            error,
+            open,
+            open_id,
+            open_error,
+            add_open,
+            add_error,
+            saving,
+            delete_confirm,
+        } = page;
         let rows = matching_skills(&skills, &query);
         let sheet = add_open.then(|| self.add.clone()).flatten();
 
@@ -114,20 +135,126 @@ impl Render for SkillsPage {
                 counts,
                 scope,
                 loading,
-                // While the Create sheet is up it shows the error itself; the list does not
-                // repeat it behind the dimmed page.
-                error.clone().filter(|_| !add_open),
+                // The list's own slot: a refresh, a picker, a delete. What the sheet and the
+                // open skill were refused is shown where each of them is.
+                error,
                 open_id.as_deref(),
                 &theme,
                 app.clone(),
             ))
             .when_some(open_id, |this, id| {
-                this.child(detail::render(&id, open.as_ref(), &theme, app.clone()))
+                this.child(detail::render(
+                    &id,
+                    open.as_ref(),
+                    open_error,
+                    &theme,
+                    app.clone(),
+                ))
             })
             .when_some(sheet, |this, inputs| {
-                this.child(add_sheet::render(inputs, error, app, &theme))
+                this.child(add_sheet::render(
+                    inputs,
+                    add_error,
+                    saving,
+                    app.clone(),
+                    &theme,
+                ))
+            })
+            .when_some(delete_confirm, |this, name| {
+                this.child(confirm_delete(name, app, &theme))
             })
     }
+}
+
+/// Everything one paint of the page reads off the state, named, because a tuple of thirteen is
+/// a tuple nobody can add a field to without moving twelve others.
+struct PageState {
+    skills: Vec<SkillSummary>,
+    query: String,
+    counts: crate::state::SkillCounts,
+    scope: crate::state::SkillScope,
+    loading: bool,
+    error: Option<String>,
+    open: Option<crate::opengrok::SkillDetail>,
+    open_id: Option<String>,
+    open_error: Option<String>,
+    add_open: bool,
+    add_error: Option<String>,
+    saving: bool,
+    delete_confirm: Option<String>,
+}
+
+/// Delete asks first. The dialog names the skill, because the menu it was chosen from opens
+/// under the pointer and Delete sits one row under Open.
+fn confirm_delete(name: String, app: Entity<AppState>, theme: &Theme) -> impl IntoElement {
+    div()
+        .id("settings-skill-delete-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::black().opacity(0.32))
+        .on_mouse_down(MouseButton::Left, {
+            let app = app.clone();
+            move |_, _, cx| {
+                app.update(cx, |state, cx| state.close_skill_delete_confirm(cx));
+            }
+        })
+        .child(
+            v_flex()
+                .id("settings-skill-delete-sheet")
+                .w(px(380.))
+                .bg(theme.popover)
+                .text_color(theme.foreground)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(14.))
+                .shadow_lg()
+                .px(px(20.))
+                .py(px(18.))
+                .gap(px(8.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Delete {name}?")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Your bot stops reading it. Runs that used it keep what they read."),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap(px(8.))
+                        .pt(px(6.))
+                        .child(
+                            Button::new("settings-skill-delete-cancel")
+                                .label("Cancel")
+                                .on_click({
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| {
+                                            state.close_skill_delete_confirm(cx)
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("settings-skill-delete-confirm")
+                                .label("Delete")
+                                .danger()
+                                .on_click(move |_, _, cx| {
+                                    app.update(cx, |state, cx| state.confirm_skill_delete(cx));
+                                }),
+                        ),
+                ),
+        )
 }
 
 /// The rows the search leaves.

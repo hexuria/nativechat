@@ -28,6 +28,7 @@ pub(super) fn render(
 ) -> impl IntoElement {
     let muted = theme.muted_foreground;
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let refused = error.is_some();
     v_flex()
         .id("settings-skills-list-pane")
         .flex_1()
@@ -90,15 +91,17 @@ pub(super) fn render(
                 .gap(px(2.))
                 .map(|this| {
                     if rows.is_empty() {
-                        return this.child(
-                            div()
-                                .id("settings-skills-empty")
-                                .px(px(8.))
-                                .py(px(10.))
-                                .text_sm()
-                                .text_color(muted)
-                                .child(empty_line(loading, listed, scope)),
-                        );
+                        return this.children(empty_line(loading, listed, scope, refused).map(
+                            |line| {
+                                div()
+                                    .id("settings-skills-empty")
+                                    .px(px(8.))
+                                    .py(px(10.))
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(line)
+                            },
+                        ));
                     }
                     this.children(rows.iter().map(|skill| {
                         row(skill, open == Some(&skill.id), now_ms, theme, app.clone())
@@ -109,17 +112,29 @@ pub(super) fn render(
 
 /// What the list says when it has nothing to show: still fetching, nothing here at all, or a
 /// search that matched none of what is here. Three different facts, never the same sentence.
-pub(crate) fn empty_line(loading: bool, listed: usize, scope: SkillScope) -> &'static str {
+///
+/// `None` when the library was refused — signed out, or a server that would not answer. There
+/// is a red line on the page saying so, and "No skills yet" under it would be the page telling
+/// somebody their skills are gone.
+pub(crate) fn empty_line(
+    loading: bool,
+    listed: usize,
+    scope: SkillScope,
+    refused: bool,
+) -> Option<&'static str> {
+    if refused {
+        return None;
+    }
     if loading && listed == 0 {
-        return "Loading…";
+        return Some("Loading…");
     }
     if listed > 0 {
-        return "No skills match.";
+        return Some("No skills match.");
     }
-    match scope {
+    Some(match scope {
         SkillScope::Yours => "No skills yet. Add one to teach your bot how something is done.",
         SkillScope::Discover => "Nobody in your org has shared a skill yet.",
-    }
+    })
 }
 
 /// One side of the toggle, with how many skills are on it.
@@ -304,7 +319,9 @@ fn row(
         // this, clicking "…" would open the skill behind the menu it just opened.
         .child(
             div()
-                .id(SharedString::from(format!("settings-skill-menu-cell-{id}")))
+                // Not `settings-skill-menu-…`: that is the button inside it, and two ids one
+                // prefix apart are two ids a driver's error message cannot tell apart.
+                .id(SharedString::from(format!("settings-skill-actions-{id}")))
                 .flex_shrink_0()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(row_menu(&id, app)),
@@ -351,7 +368,7 @@ fn row_menu(id: &str, app: Entity<AppState>) -> impl IntoElement {
                 })
                 .on_click(move |_, _, cx| {
                     let id = delete_id.clone();
-                    delete_app.update(cx, |state, cx| state.delete_skill(id, cx));
+                    delete_app.update(cx, |state, cx| state.ask_skill_delete(id, cx));
                 }),
             )
         })
@@ -384,18 +401,34 @@ mod tests {
     /// somebody comes to believe their skills are gone.
     #[test]
     fn an_empty_list_says_which_kind_of_empty_it_is() {
-        assert_eq!(empty_line(true, 0, SkillScope::Yours), "Loading…");
-        assert!(empty_line(false, 0, SkillScope::Yours).starts_with("No skills yet"));
-        assert!(empty_line(false, 0, SkillScope::Discover).contains("org"));
+        assert_eq!(
+            empty_line(true, 0, SkillScope::Yours, false),
+            Some("Loading…")
+        );
+        assert!(
+            empty_line(false, 0, SkillScope::Yours, false)
+                .unwrap()
+                .starts_with("No skills yet")
+        );
+        assert!(
+            empty_line(false, 0, SkillScope::Discover, false)
+                .unwrap()
+                .contains("org")
+        );
         let listed = rows(3).len();
         assert_eq!(
-            empty_line(false, listed, SkillScope::Yours),
-            "No skills match."
+            empty_line(false, listed, SkillScope::Yours, false),
+            Some("No skills match.")
         );
         assert_eq!(
-            empty_line(true, listed, SkillScope::Yours),
-            "No skills match.",
+            empty_line(true, listed, SkillScope::Yours, false),
+            Some("No skills match."),
             "a refresh over a list that is already there is not an empty library"
+        );
+        assert_eq!(
+            empty_line(false, 0, SkillScope::Yours, true),
+            None,
+            "a library nobody could fetch is not a library with nothing in it"
         );
         // A search that matches nothing leaves no rows, which is what puts the line on screen.
         assert!(matching_skills(&rows(3), "nothing").is_empty());
