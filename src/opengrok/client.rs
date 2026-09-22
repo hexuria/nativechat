@@ -3527,6 +3527,7 @@ pub struct SiteLoginUpdate {
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::{Failure, Unreachable};
     use super::super::types::assistant_text_from_sse;
     use super::*;
     use serde_json::json;
@@ -6268,6 +6269,55 @@ mod tests {
                 "a {status} has to reach the person as the server worded it"
             );
         }
+    }
+
+    /// A `502` from this route is not what a `502` means anywhere else in this client. Nothing
+    /// else the app talks to answers one itself, so `read_error` reads them all as something in
+    /// front of OpenGrok that could not reach it; THIS route answers its own, and what it means
+    /// is that the model ran and produced nothing that can be kept. Read as a hop that failed,
+    /// it would be offered a Try again that waits ninety seconds for the identical answer.
+    #[tokio::test]
+    async fn the_tape_routes_own_five_hundreds_are_verdicts_and_not_a_hop_that_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .respond_with(ResponseTemplate::new(502).set_body_string(
+                "Your bot would not write this one down: the recording shows a password.",
+            ))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client
+            .create_skill_from_tape("cw_1", "", "", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(502));
+        assert_eq!(
+            error.failure(),
+            Failure::Verdict,
+            "a decision about this recording: the same bytes earn it again"
+        );
+
+        // What is genuinely out of reach keeps its kind. OpenGrok saying it could not get to the
+        // model gateway is a state — nothing ran — and that tape is worth sending again.
+        let away = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string("the model gateway is unreachable"),
+            )
+            .mount(&away)
+            .await;
+        let client = OpenGrokClient::new(&away.uri()).unwrap();
+        let error = client
+            .create_skill_from_tape("cw_1", "", "", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure(), Failure::OutOfReach(Unreachable::Gateway));
+        assert_eq!(
+            error.message, "the model gateway is unreachable",
+            "and the sentence is untouched either way"
+        );
     }
 
     /// The one request this client gives a deadline of its own, because it is the one that waits
