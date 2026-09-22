@@ -1305,6 +1305,31 @@ impl SkillScope {
     }
 }
 
+/// What is becoming of a tape that was told to become a skill.
+///
+/// The sheet that starts this is in the coworker's screen window, which draws no pages and
+/// which nothing else can see into. The fact is kept here so the rest of the app has it: the
+/// Skills page reloads on it, and the driver — which only ever sees the main window's tree —
+/// can tell a lesson being written from one that was written, or refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaughtSkill {
+    /// The tape is with the server and a model is reading it into words. Long by the standards
+    /// of everything else the app asks for, which is why it is a state and not a moment.
+    Writing,
+    /// Written down. `enabled` is the whole of the review: a lesson a model wrote is kept
+    /// switched off until a person has read it, and a switched-off skill reaches no turn and no
+    /// colleague — so it travels beside the name rather than being read off a row later.
+    Written {
+        id: String,
+        name: String,
+        enabled: bool,
+    },
+    /// Why there is no lesson, in the server's own words. Those words name which of the things
+    /// went wrong — a model that would not write one, one that ran over its time, a name
+    /// already taken — and none of that survives being reworded here.
+    Refused(String),
+}
+
 /// Which surface asked for a skill to be made, which is where its refusal is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillCreateFrom {
@@ -1817,6 +1842,9 @@ pub struct AppState {
     pub skill_add_taken: bool,
     /// Delete asks first: the skill the dialog is about, until Delete or Cancel.
     pub skill_delete_confirm: Option<String>,
+    /// What became of the last tape that was told to become a skill, which happens in the
+    /// screen window and is read here. `None` until somebody teaches one.
+    pub taught_skill: Option<TaughtSkill>,
     /// The window the app's pages live in. A second window — a coworker's screen — has no
     /// page of its own: it asks this one to show the Recipes page and brings it forward.
     main_window: Option<AnyWindowHandle>,
@@ -2201,6 +2229,7 @@ impl AppState {
             skill_saving: false,
             skill_add_taken: false,
             skill_delete_confirm: None,
+            taught_skill: None,
             main_window: None,
             #[cfg(target_os = "macos")]
             computer_windows: std::collections::HashMap::new(),
@@ -4433,6 +4462,67 @@ impl AppState {
         self.your_skills = rows;
         self.your_skills_loading = false;
         self.your_skills_error = None;
+    }
+
+    /// What the screen window's sheet is doing with a tape it was told to turn into a skill.
+    /// `None` when there is no longer a tape to be doing anything with — it was let go, or a
+    /// new recording has started.
+    ///
+    /// A lesson that was written lands on BOTH skill lists: the Settings page's, which shows
+    /// one side of its toggle, and the composer's own, which is what `/` offers. One refresh
+    /// fills both — it asks for each side for its counts and hands the person's own half to the
+    /// composer — so a skill taught on a screen can be typed after a slash without a restart.
+    pub fn set_taught_skill(&mut self, taught: Option<TaughtSkill>, cx: &mut Context<Self>) {
+        if self.taught_skill.is_none() && taught.is_none() {
+            return;
+        }
+        if matches!(taught, Some(TaughtSkill::Written { .. })) {
+            // Taught on this person's own screen by this person, so it is theirs whichever side
+            // of the toggle was last open.
+            self.take_skills_scope(SkillScope::Yours);
+            self.refresh_skills(cx);
+        }
+        self.taught_skill = taught;
+        cx.notify();
+    }
+
+    /// Send the last refused tape again, from the window that is still holding it.
+    ///
+    /// The tape belongs to the screen window — the server keeps none — so this is a way through
+    /// to it for everything that cannot see that window: the driver, which only ever sees this
+    /// one. `false` when no window has a refused tape waiting.
+    pub fn retry_taught_skill(&mut self, cx: &mut Context<Self>) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let handles: Vec<_> = self.computer_windows.values().copied().collect();
+            for handle in handles {
+                if handle
+                    .update(cx, |screen, _, cx| screen.retry_save(cx))
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+        }
+        false
+    }
+
+    /// Settings → Skills in the main window, on one skill, asked for from another window — the
+    /// way [`Self::show_recipes_in_main_window`] is, and for the same reason: the screen window
+    /// draws no pages, and the lesson it has just had written is read on this one.
+    pub fn show_skill_in_main_window(&mut self, skill: Option<String>, cx: &mut Context<Self>) {
+        cx.activate(true);
+        if let Some(window) = self.main_window {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+        self.open_skills(cx);
+        if let Some(id) = skill {
+            self.open_skill(id, cx);
+        }
     }
 
     /// The detail pane for one skill. The prose is not on the listing, so it is fetched.

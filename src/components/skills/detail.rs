@@ -3,7 +3,7 @@
 //!
 //! The pane is here only while a skill is open. The list is the page; this stands beside it.
 
-use super::{NEVER_UPDATED, NOTHING_WRITTEN_YET, chip, short_relative_time, skill_icon};
+use super::{NEVER_UPDATED, NOTHING_WRITTEN_YET, chip, short_relative_time, skill_icon, use_line};
 use crate::chrome::TITLE_BAR_H;
 use crate::opengrok::SkillDetail;
 use crate::state::AppState;
@@ -103,21 +103,24 @@ pub(super) fn render(
                             h_flex()
                                 .gap(px(6.))
                                 .items_center()
-                                // A skill with no name has no slash to type, and "Type / to use
-                                // it" is an instruction nobody can follow. The server will not
-                                // make one nameless; a row from somewhere else still can be.
+                                // How to use it, or that it cannot be used — see [`use_line`].
                                 //
                                 // On the slash itself, see the note beside the same promise on
                                 // the list: it is wired by the branch this one stacks under,
                                 // which lands before either reaches a person.
-                                .when(!skill.name.trim().is_empty(), |this| {
-                                    this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child(format!("Type /{} to use it", skill.name)),
-                                    )
-                                })
+                                .children(use_line(&skill.name, skill.enabled).map(|line| {
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "settings-skill-use-{skill_id}"
+                                        )))
+                                        .text_xs()
+                                        .text_color(if skill.enabled {
+                                            muted
+                                        } else {
+                                            theme.warning
+                                        })
+                                        .child(line)
+                                }))
                                 .children(label.map(|(word, tone)| chip(word, tone, theme))),
                         ),
                 ),

@@ -321,6 +321,22 @@ pub(crate) const NOTHING_WRITTEN_YET: &str =
 /// tree said "never" while the screen said "—", which is two answers to one question.
 pub(crate) const NEVER_UPDATED: &str = "Never";
 
+/// The line under an open skill's name: how to use it, or why it cannot be used.
+///
+/// A SWITCHED-OFF SKILL HAS NO SLASH. The server refuses one even to the person who owns it, so
+/// "Type /name to use it" over a skill that is off is an instruction that does not work — and
+/// off is where every skill a model wrote from a recording starts, because nobody has read it
+/// yet. Reading it is the thing to do about that, and this pane is where it is read.
+///
+/// A skill with no name has no slash either, and nothing to say about one: the server will not
+/// make one nameless, but a row from somewhere else still can be.
+pub(crate) fn use_line(name: &str, enabled: bool) -> Option<String> {
+    if !enabled {
+        return Some("Switched off — your bot cannot use it until somebody reads it".to_string());
+    }
+    (!name.trim().is_empty()).then(|| format!("Type /{name} to use it"))
+}
+
 /// The mark a skill wears wherever it is listed: an open book, which is what a skill is.
 pub(crate) fn skill_icon(size: f32, theme: &Theme) -> AnyElement {
     div()
@@ -357,7 +373,7 @@ pub(crate) fn chip(label: impl Into<SharedString>, tone: Hsla, theme: &Theme) ->
 mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over the
     // one the test harness wants.
-    use super::{SkillSummary, matching_skills, short_relative_time};
+    use super::{SkillSummary, matching_skills, short_relative_time, use_line};
 
     fn skill(id: &str, name: &str, description: &str) -> SkillSummary {
         SkillSummary {
@@ -370,6 +386,40 @@ mod tests {
             draft: false,
             enabled: true,
         }
+    }
+
+    /// A skill a model wrote from a recording arrives switched off, and the pane somebody is
+    /// sent to in order to read it must not tell them to type a slash that the server refuses.
+    /// Off is not a detail of the row: it is the reason they were sent there.
+    #[test]
+    fn a_switched_off_skill_says_so_instead_of_offering_a_slash() {
+        let off = use_line("invoice-lookup", false).expect("off is always worth saying");
+        assert!(
+            off.starts_with("Switched off"),
+            "the first words, because it is the first thing to know: {off:?}"
+        );
+        assert!(
+            off.contains("reads it"),
+            "and what makes it not off, which is somebody reading it: {off:?}"
+        );
+        assert!(
+            !off.contains('/'),
+            "no slash is offered for a skill that has none: {off:?}"
+        );
+        assert_eq!(
+            use_line("invoice-lookup", true).as_deref(),
+            Some("Type /invoice-lookup to use it"),
+            "a skill that is on is invoked by its name"
+        );
+        assert_eq!(
+            use_line("  ", true),
+            None,
+            "a nameless skill has no slash to offer and nothing to say about one"
+        );
+        assert!(
+            use_line("", false).is_some(),
+            "but a nameless skill that is off is still off"
+        );
     }
 
     /// The search reads the description as well as the name: the name is a slug somebody typed
