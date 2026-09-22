@@ -1305,6 +1305,14 @@ impl SkillScope {
     }
 }
 
+/// What the sheet's Save button says while a model is reading a tape into prose, and what the
+/// driver reads for the same fact.
+///
+/// One sentence in both places. It names who is doing it, because "Saving…" is what an upload
+/// says and this is not an upload: it is a wait on a model, long enough that a button which
+/// looked like an upload read as stuck.
+pub const WRITING_A_LESSON: &str = "Your bot is writing it…";
+
 /// What is becoming of a tape that was told to become a skill.
 ///
 /// The sheet that starts this is in the coworker's screen window, which draws no pages and
@@ -4490,25 +4498,31 @@ impl AppState {
     ///
     /// The tape belongs to the screen window — the server keeps none — so this is a way through
     /// to it for everything that cannot see that window: the driver, which only ever sees this
-    /// one. `false` when no window has a refused tape waiting.
-    pub fn retry_taught_skill(&mut self, cx: &mut Context<Self>) -> bool {
+    /// one. The first window with a refused tape sends it; the rest are left alone.
+    ///
+    /// On a spawn, because the window's save reads THIS state for its client and writes to it
+    /// when the answer lands, and this runs inside an update of it. A nested update of the
+    /// entity already leased is `double_lease_panic`.
+    pub fn retry_taught_skill(&mut self, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         {
             let handles: Vec<_> = self.computer_windows.values().copied().collect();
-            for handle in handles {
-                if handle
-                    .update(cx, |screen, _, cx| screen.retry_save(cx))
-                    .unwrap_or(false)
-                {
-                    return true;
+            cx.spawn(async move |_, cx| {
+                for handle in handles {
+                    if handle
+                        .update(cx, |screen, _, cx| screen.retry_save(cx))
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
                 }
-            }
+            })
+            .detach();
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = cx;
         }
-        false
     }
 
     /// Settings → Skills in the main window, on one skill, asked for from another window — the

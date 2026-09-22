@@ -22,7 +22,9 @@ use crate::opengrok::{
     user_form_use_saved_id,
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
-use crate::state::{ActiveRecipe, AppSettingsTab, AppState, SkillScope};
+use crate::state::{
+    ActiveRecipe, AppSettingsTab, AppState, SkillScope, TaughtSkill, WRITING_A_LESSON,
+};
 
 pub mod ids {
     pub const WINDOW: &str = "app-window";
@@ -121,6 +123,21 @@ pub mod ids {
     pub const SKILL_DELETE_SHEET: &str = "settings-skill-delete-sheet";
     pub const SKILL_DELETE_CONFIRM: &str = "settings-skill-delete-confirm";
     pub const SKILL_DELETE_CANCEL: &str = "settings-skill-delete-cancel";
+    /// A task taught on a coworker's screen, being written up as a skill.
+    ///
+    /// The sheet this happens on is in that screen's own window, which has no tree: these four
+    /// are what a driver has of it. The two that are clicked carry the ids the sheet's own
+    /// controls carry, so a driver presses the button the person presses; the two statuses are
+    /// here only — the screen says the same things as a label and a red line.
+    pub const TEACH_SKILL_WRITING: &str = "teach-skill-writing";
+    pub const TEACH_SKILL_ERROR: &str = "teach-skill-error";
+    /// The lesson that was written, named by the name it must be invoked by, carrying its id and
+    /// — while nobody has read it — the state `off`. Clicking it opens it to be read.
+    pub const TEACH_SAVED_SKILL: &str = "teach-saved-skill";
+    /// Send the refused tape again. The server keeps no tape, so this is the only thing that
+    /// can: the recording is still in the window that made it.
+    pub const TEACH_RETRY: &str = "teach-retry";
+
     /// The way back from an open skill to the whole-width list.
     pub const SKILL_CLOSE: &str = "settings-skill-close";
     /// The open skill's pane while its prose is on its way, and where it says the fetch was
@@ -334,6 +351,15 @@ pub enum Command {
     },
     ConfirmSkillDelete,
     CloseSkillDeleteConfirm,
+    /// A tape taught on a coworker's screen and written up as a skill: read the lesson, which
+    /// is what has to happen before anything may use it, or send a refused tape again.
+    ///
+    /// Both belong to the screen window's sheet and are reached through the app, because that
+    /// window has no tree of its own for a driver to work.
+    OpenTaughtSkill {
+        id: String,
+    },
+    RetryTaughtSkill,
     /// Settings → Logins: the search field's text, the picked row, the Add sheet, and the
     /// picked row's notes.
     SetSiteLoginQuery(String),
@@ -504,6 +530,8 @@ impl Command {
             Self::AskSkillDelete { id } => state.ask_skill_delete(id, cx),
             Self::ConfirmSkillDelete => state.confirm_skill_delete(cx),
             Self::CloseSkillDeleteConfirm => state.close_skill_delete_confirm(cx),
+            Self::OpenTaughtSkill { id } => state.show_skill_in_main_window(Some(id), cx),
+            Self::RetryTaughtSkill => state.retry_taught_skill(cx),
             Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),
             Self::SelectSiteLogin(id) => state.select_site_login(id, cx),
             Self::OpenSiteLoginAdd => state.open_site_login_add(cx),
@@ -1440,6 +1468,9 @@ pub struct NativeChatHost {
     skill_saving: bool,
     /// The skill the delete dialog is about, by name, while it is up.
     skill_delete_confirm: Option<String>,
+    /// A tape being written up as a skill on a coworker's screen, and what became of it. That
+    /// window draws its own sheet and this host cannot see into it; the app carries the fact.
+    taught_skill: Option<TaughtSkill>,
     computer_tab: bool,
     updates_tab: bool,
     /// Dedicated provisioned box: Route traffic icon on the Computer pane.
@@ -1814,6 +1845,7 @@ impl NativeChatHost {
             skill_add_error: state.skill_add_error.clone(),
             skill_saving: state.skill_saving,
             skill_delete_confirm: state.skill_delete_prompt(),
+            taught_skill: state.taught_skill.clone(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
             site_login_notice: state.site_login_notice.clone(),
             site_login_error: state.site_login_error.clone(),
@@ -2085,6 +2117,9 @@ impl NativeChatHost {
             );
         }
         page = page.with_child(computer);
+        for node in self.taught_skill_nodes() {
+            page = page.with_child(node);
+        }
         if let Some(ready) = self.egress_tunnel_ready {
             page = page.with_child(UiNode::status(
                 "egress_tunnel.ready",
@@ -2223,6 +2258,40 @@ impl NativeChatHost {
         // it is plainly not the reconnect pill, which is the confusion that made the bug.
         node.states.push("signed-out".to_string());
         vec![node, UiNode::button("signed-out-sign-in", "Sign in again")]
+    }
+
+    /// A task taught on a coworker's screen while it is being written up as a skill, and what
+    /// came of it. Nothing at all until somebody teaches one.
+    ///
+    /// The sheet is in that screen's own window, which draws no tree: without these a driver
+    /// watching a model write a lesson sees an app doing nothing for a minute, and then an app
+    /// that has done nothing. Three states and they are three nodes, because they are three
+    /// different things to wait for.
+    fn taught_skill_nodes(&self) -> Vec<UiNode> {
+        match &self.taught_skill {
+            None => Vec::new(),
+            Some(TaughtSkill::Writing) => {
+                vec![UiNode::status(ids::TEACH_SKILL_WRITING, WRITING_A_LESSON)]
+            }
+            Some(TaughtSkill::Written { id, name, enabled }) => {
+                // Named by what has to be typed after a slash, carrying the id to open it by,
+                // and switched off as a STATE — off is the fact, and a driver checking that a
+                // lesson has to be read before anything uses it should not be matching copy.
+                let mut node =
+                    UiNode::button(ids::TEACH_SAVED_SKILL, name.clone()).with_value(id.clone());
+                if !enabled {
+                    node.states.push("off".to_string());
+                }
+                vec![node]
+            }
+            Some(TaughtSkill::Refused(why)) => vec![
+                // The server's sentence, which names which of the things went wrong, and the
+                // one thing that can be done about it: the tape is still in the window that
+                // made it, and this sends the same bytes again.
+                UiNode::status(ids::TEACH_SKILL_ERROR, why.clone()),
+                UiNode::button(ids::TEACH_RETRY, "Try again"),
+            ],
+        }
     }
 
     /// The composer's one action button, in whichever of its two states it is in.
@@ -2757,6 +2826,27 @@ impl NativeChatHost {
         None
     }
 
+    /// The two controls a taught skill has, or `None` for a target that is neither.
+    ///
+    /// Both are refused when there is nothing for them to be about, rather than doing nothing:
+    /// a click on a line naming a skill nobody has taught, or a Try again with no refused tape
+    /// behind it, is a driver working from a tree it read before something changed.
+    fn taught_skill_command(&self, target: &str) -> Option<Result<Command, String>> {
+        match target {
+            ids::TEACH_SAVED_SKILL => Some(match &self.taught_skill {
+                Some(TaughtSkill::Written { id, .. }) => {
+                    Ok(Command::OpenTaughtSkill { id: id.clone() })
+                }
+                _ => Err("no taught skill is waiting to be read".to_string()),
+            }),
+            ids::TEACH_RETRY => Some(match &self.taught_skill {
+                Some(TaughtSkill::Refused(_)) => Ok(Command::RetryTaughtSkill),
+                _ => Err("no refused recording is waiting to be sent again".to_string()),
+            }),
+            _ => None,
+        }
+    }
+
     /// The Create sheet's three fields take no keystrokes from here: they are the window's, and
     /// what would be typed into them is what `skill.create` takes as arguments.
     fn skill_sheet_field(&self, target: &str) -> Option<Result<DispatchResult, String>> {
@@ -2997,6 +3087,8 @@ impl NativeChatHost {
         } else if let Some(cmd) = self.save_login_command(target) {
             cmd
         } else if let Some(cmd) = self.skill_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.taught_skill_command(target) {
             cmd?
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
@@ -4479,6 +4571,124 @@ mod tests {
                 .unwrap_err()
                 .contains("no skill `skl_9`")
         );
+    }
+
+    /// A lesson being written from a tape takes a model call and a wait, and it happens in the
+    /// coworker's screen window — which has no tree. Without these three nodes a driver sees an
+    /// app that does nothing for a minute and then an app that has done nothing.
+    #[test]
+    fn the_driver_sees_a_lesson_being_written_and_what_came_of_it() {
+        let mut host = host();
+        assert!(
+            host.snapshot().find(ids::TEACH_SKILL_WRITING).is_none(),
+            "nothing at all until somebody teaches one"
+        );
+
+        host.taught_skill = Some(TaughtSkill::Writing);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TEACH_SKILL_WRITING).unwrap().name,
+            WRITING_A_LESSON,
+            "the sentence the sheet's own button is showing in the other window"
+        );
+        assert!(tree.find(ids::TEACH_SAVED_SKILL).is_none());
+        assert!(tree.find(ids::TEACH_RETRY).is_none());
+
+        host.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_7".into(),
+            name: "invoice-lookup".into(),
+            enabled: false,
+        });
+        let tree = host.snapshot();
+        let written = tree.find(ids::TEACH_SAVED_SKILL).unwrap();
+        assert_eq!(
+            written.name, "invoice-lookup",
+            "named by the word that has to be typed after a slash"
+        );
+        assert_eq!(written.value.as_deref(), Some("skl_7"));
+        assert!(
+            written.states.contains(&"off".to_string()),
+            "born switched off, because nobody has read it: {:?}",
+            written.states
+        );
+        assert!(tree.find(ids::TEACH_SKILL_WRITING).is_none());
+
+        host.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_7".into(),
+            name: "invoice-lookup".into(),
+            enabled: true,
+        });
+        assert!(
+            !host
+                .snapshot()
+                .find(ids::TEACH_SAVED_SKILL)
+                .unwrap()
+                .states
+                .contains(&"off".to_string()),
+            "and not off once it is on"
+        );
+    }
+
+    /// A refused upload is the server's sentence and one thing to do about it. The tape is not
+    /// gone — the server keeps none — so Try again sends the same bytes rather than asking
+    /// somebody to record minutes of work a second time.
+    #[test]
+    fn a_refused_lesson_keeps_the_sentence_and_offers_the_tape_again() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused(
+            "Your bot would not write this one down: the recording shows a password being typed."
+                .into(),
+        ));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TEACH_SKILL_ERROR).unwrap().name,
+            "Your bot would not write this one down: the recording shows a password being typed.",
+            "the server's own words, which name which of the things went wrong"
+        );
+        assert_eq!(tree.find(ids::TEACH_RETRY).unwrap().name, "Try again");
+
+        host.click(ids::TEACH_RETRY).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::RetryTaughtSkill
+        ));
+    }
+
+    /// Both controls are refused when there is nothing for them to be about: a driver working
+    /// from a tree it read a moment ago must not press a button that has since gone.
+    #[test]
+    fn a_taught_skills_controls_are_refused_when_there_is_no_tape() {
+        let mut host = host();
+        assert_eq!(
+            host.click(ids::TEACH_RETRY).unwrap_err(),
+            "no refused recording is waiting to be sent again"
+        );
+        assert_eq!(
+            host.click(ids::TEACH_SAVED_SKILL).unwrap_err(),
+            "no taught skill is waiting to be read"
+        );
+        host.taught_skill = Some(TaughtSkill::Writing);
+        assert!(
+            host.click(ids::TEACH_RETRY).is_err(),
+            "one that is still being written has not been refused"
+        );
+        assert!(
+            host.take_command().is_none(),
+            "nothing was asked of the app"
+        );
+
+        // Written, and the line is the way to the reading it is waiting for.
+        host.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_7".into(),
+            name: "invoice-lookup".into(),
+            enabled: false,
+        });
+        host.click(ids::TEACH_SAVED_SKILL).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenTaughtSkill { id } if id == "skl_7"
+        ));
+        assert!(host.click(ids::TEACH_RETRY).is_err());
     }
 
     /// Typing into the field is typing into the field: the host keeps the copy the list filters

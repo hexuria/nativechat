@@ -39,7 +39,7 @@ use crate::opengrok::{
     computer_window_attention_done_id, computer_window_attention_id,
     computer_window_attention_skip_id, thin_tape,
 };
-use crate::state::{AppState, TaughtSkill};
+use crate::state::{AppState, TaughtSkill, WRITING_A_LESSON};
 
 /// The title bar the window paints for itself: tall enough for the traffic lights and a
 /// button, and the part the person drags the window by.
@@ -441,8 +441,19 @@ impl ComputerScreen {
                 self.last_saved = None;
                 // The app is carrying what became of the LAST tape, for the window that draws
                 // the Skills page. A new recording makes that a stale answer.
-                self.app
-                    .update(cx, |state, cx| state.set_taught_skill(None, cx));
+                //
+                // ON A SPAWN, not here. A tape asked for from the composer starts this from
+                // inside an update of the AppState — `open_computer_window` calls
+                // `start_teaching` while it holds the lease — and touching that entity again
+                // from in here is `double_lease_panic`. The same reason the handoff strip is
+                // refreshed on a spawn in `new`.
+                let app = self.app.downgrade();
+                cx.spawn(async move |_, cx| {
+                    if let Some(app) = app.upgrade() {
+                        let _ = app.update(cx, |state, cx| state.set_taught_skill(None, cx));
+                    }
+                })
+                .detach();
                 self.set_teaching(true);
                 self.teaching = Some(Teaching {
                     started_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -865,7 +876,7 @@ where
 /// instead, and says who is doing it.
 fn saving_label(outcome: TeachOutcome, saving: bool) -> String {
     match (saving, outcome) {
-        (true, TeachOutcome::Skill) => "Your bot is writing it…".to_string(),
+        (true, TeachOutcome::Skill) => WRITING_A_LESSON.to_string(),
         (true, _) => "Saving…".to_string(),
         (false, outcome) => format!("Save as {}", outcome.label().to_lowercase()),
     }
