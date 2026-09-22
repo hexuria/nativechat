@@ -896,6 +896,9 @@ struct SkillSnap {
     description: String,
     /// Named and kept, with no prose in it yet, so there is nothing to invoke.
     draft: bool,
+    /// The switch. Off is drawn on the row as a chip, so it is a state here: after this branch
+    /// most rows in a library are off, because every lesson a model writes starts that way.
+    enabled: bool,
 }
 
 // How stale a skill is has no field here. The row shows it, but as a bare line with no id of
@@ -1267,6 +1270,9 @@ fn skill_node(skill: &SkillSnap, open: bool) -> UiNode {
     node.states.push(skill.source.to_string());
     if skill.draft {
         node.states.push("draft".to_string());
+    }
+    if !skill.enabled {
+        node.states.push("off".to_string());
     }
     if open {
         node.states.push("selected".to_string());
@@ -1867,6 +1873,7 @@ impl NativeChatHost {
                     source: skill.source.word(),
                     description: skill.description.clone(),
                     draft: skill.draft,
+                    enabled: skill.enabled,
                 })
                 .collect(),
             skills_tab: state.app_settings_tab == AppSettingsTab::Skills,
@@ -4114,6 +4121,7 @@ mod tests {
             source: "authored",
             description: description.into(),
             draft: false,
+            enabled: true,
         }
     }
 
@@ -4203,6 +4211,21 @@ mod tests {
         let draft = tree.find(&ids::skill("skl_2")).unwrap();
         assert!(draft.states.contains(&"draft".to_string()));
         assert!(draft.states.contains(&"uploaded".to_string()));
+
+        // And the switch, which the row wears as a chip: after this branch most rows in a
+        // library are off, because every lesson a model writes from a recording starts off.
+        assert!(
+            !draft.states.contains(&"off".to_string()),
+            "a draft is not a skill that was switched off"
+        );
+        host.skills[1].enabled = false;
+        assert!(
+            host.snapshot()
+                .find(&ids::skill("skl_2"))
+                .unwrap()
+                .states
+                .contains(&"off".to_string())
+        );
     }
 
     /// The tree lists the rows the search leaves, exactly the rows the screen has: a driver

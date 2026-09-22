@@ -253,6 +253,27 @@ fn not_yet(id: &'static str, title: &'static str, why: &'static str, muted: Hsla
         .into_any_element()
 }
 
+/// What a row's chips say, in the order they are worn. `true` is the ones drawn in the warning
+/// colour, which are the ones that stop the skill working.
+///
+/// A DRAFT is a skill with no instructions in it yet, so that is what its chip says: where it
+/// came from is not the useful fact about a skill that cannot be used at all. OFF is not
+/// instead of either — it is a second fact, and it is the commonest one there is now, because
+/// every lesson a model writes from a recording starts off. A library where a switched-off
+/// skill looks exactly like a working one cannot be read, let alone reviewed.
+fn row_chips(skill: &SkillSummary) -> Vec<(&'static str, bool)> {
+    let mut chips = Vec::new();
+    if skill.draft {
+        chips.push(("Draft", true));
+    } else if let Some(word) = skill.source.chip() {
+        chips.push((word, false));
+    }
+    if !skill.enabled {
+        chips.push(("Off", true));
+    }
+    chips
+}
+
 /// One skill: its mark, its name and where it came from, what it is for, how stale it is, and
 /// the menu that opens or drops it.
 fn row(
@@ -264,13 +285,6 @@ fn row(
 ) -> impl IntoElement {
     let muted = theme.muted_foreground;
     let id = skill.id.clone();
-    // A draft is a skill with no instructions in it yet, so that is what its chip says: where
-    // it came from is not the useful fact about a skill that cannot be used.
-    let label = if skill.draft {
-        Some(("Draft", theme.warning))
-    } else {
-        skill.source.chip().map(|word| (word, muted))
-    };
     let name = if skill.name.trim().is_empty() {
         "Untitled skill".to_string()
     } else {
@@ -314,7 +328,9 @@ fn row(
                                 .truncate()
                                 .child(name),
                         )
-                        .children(label.map(|(word, tone)| chip(word, tone, theme))),
+                        .children(row_chips(skill).into_iter().map(|(word, warn)| {
+                            chip(word, if warn { theme.warning } else { muted }, theme)
+                        })),
                 )
                 .when(!description.is_empty(), |this| {
                     this.child(
@@ -400,7 +416,7 @@ mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over the
     // one the test harness wants.
     use super::super::matching_skills;
-    use super::{SkillScope, SkillSummary, empty_line};
+    use super::{SkillScope, SkillSummary, empty_line, row_chips};
 
     fn rows(count: usize) -> Vec<SkillSummary> {
         (0..count)
@@ -416,6 +432,42 @@ mod tests {
                 approved_at_ms: None,
             })
             .collect()
+    }
+
+    /// A switched-off skill looks exactly like a working one on a list that says nothing about
+    /// it, and after this branch most rows in a library will be off: every lesson a model writes
+    /// from a recording starts that way. The chip is how somebody scanning the library sees
+    /// which of them their bot can actually use.
+    #[test]
+    fn a_row_says_when_a_skill_cannot_be_used() {
+        let mut skill = rows(1).remove(0);
+        skill.source = crate::opengrok::SkillSource::Taught;
+        assert_eq!(
+            row_chips(&skill),
+            vec![("Taught", false)],
+            "a working skill wears where it came from and nothing else"
+        );
+
+        skill.enabled = false;
+        assert_eq!(
+            row_chips(&skill),
+            vec![("Taught", false), ("Off", true)],
+            "off is a second fact, not instead of the first: a taught skill that is off is both"
+        );
+
+        skill.draft = true;
+        assert_eq!(
+            row_chips(&skill),
+            vec![("Draft", true), ("Off", true)],
+            "and a draft says so rather than where its prose came from, because it has none"
+        );
+
+        let mut plain = rows(1).remove(0);
+        plain.source = crate::opengrok::SkillSource::Authored;
+        assert!(
+            row_chips(&plain).is_empty(),
+            "a skill somebody wrote here, on, is the plainest case and wears nothing"
+        );
     }
 
     /// Three different facts, three different sentences: still fetching, a library with nothing
