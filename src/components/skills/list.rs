@@ -21,6 +21,7 @@ pub(super) fn render(
     counts: SkillCounts,
     scope: SkillScope,
     loading: bool,
+    uploading: bool,
     error: Option<String>,
     open: Option<&str>,
     theme: &Theme,
@@ -53,6 +54,10 @@ pub(super) fn render(
                 .child(add_menu(app.clone())),
         )
         .child(
+            // The slash is not wired on this branch: typing `/name` reaches for a recipe and
+            // finds no skill. It is wired by the branch this one stacks under, which lands
+            // before either reaches a person — so the sentence is true by the time it is read,
+            // and watering it down now would leave a half-sentence to put back later.
             div()
                 .text_sm()
                 .text_color(muted)
@@ -79,6 +84,18 @@ pub(super) fn render(
                     .text_xs()
                     .text_color(theme.danger)
                     .child(error),
+            )
+        })
+        // An upload has no sheet to say it is working in, and reading a folder and sending it
+        // takes long enough that a page which said nothing would read as a click that missed.
+        .when(uploading, |this| {
+            this.child(
+                div()
+                    .id("settings-skills-saving")
+                    .w_full()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Uploading…"),
             )
         })
         .child(

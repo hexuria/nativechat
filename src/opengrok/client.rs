@@ -3298,6 +3298,13 @@ pub struct SkillVersion {
     pub note: String,
 }
 
+/// The most a skill's instructions may be, in characters.
+///
+/// The server owns this limit and words its own refusal when a body is over it, naming both the
+/// cap and what arrived. The copy here is not a second check — nothing refuses a body on it —
+/// it is so that a file far too big to be read at all can be named for what it is not.
+pub const SKILL_BODY_CHARS: usize = 8000;
+
 /// The most a skill's supporting files may weigh once decoded, and how many there may be.
 ///
 /// Both are the server's caps, named again here because the app reads a folder off this Mac

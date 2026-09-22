@@ -150,9 +150,12 @@ pub(super) fn render(
                         .gap(px(8.))
                         .pt(px(6.))
                         .child(
+                            // Live while the create is in flight. It only closes the sheet —
+                            // the request is already out and nothing here can call it back —
+                            // and a Cancel that is dead has nothing to offer somebody whose
+                            // request is never going to answer.
                             Button::new("settings-skill-add-cancel")
                                 .label("Cancel")
-                                .disabled(saving)
                                 .on_click({
                                     let inputs = inputs.clone();
                                     let app = app.clone();

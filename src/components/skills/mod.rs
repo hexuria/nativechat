@@ -135,8 +135,11 @@ impl Render for SkillsPage {
                 counts,
                 scope,
                 loading,
-                // The list's own slot: a refresh, a picker, a delete. What the sheet and the
-                // open skill were refused is shown where each of them is.
+                // Saving with no sheet up is an upload: the sheet's own Save says so while it
+                // is the sheet that is saving.
+                saving && !add_open,
+                // The list's own slot: a refresh, a picker, an upload, a delete. What the sheet
+                // and the open skill were refused is shown where each of them is.
                 error,
                 open_id.as_deref(),
                 &theme,
@@ -307,6 +310,16 @@ pub(crate) fn short_relative_time(at_ms: i64, now_ms: i64) -> String {
     };
     format!("{count}{unit} ago")
 }
+
+/// What the pane says where the prose would be, for a skill that has a name and nothing under
+/// it. Shared with the driver's tree, so a driver reads the sentence the person reads rather
+/// than inferring a draft from an empty string.
+pub(crate) const NOTHING_WRITTEN_YET: &str =
+    "Nothing written yet. This skill is a name with no instructions under it.";
+
+/// What the pane says for a row the server sent no timestamp on. One word in both places: the
+/// tree said "never" while the screen said "—", which is two answers to one question.
+pub(crate) const NEVER_UPDATED: &str = "Never";
 
 /// The mark a skill wears wherever it is listed: an open book, which is what a skill is.
 pub(crate) fn skill_icon(size: f32, theme: &Theme) -> AnyElement {

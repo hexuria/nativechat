@@ -17,11 +17,11 @@ use crate::opengrok::{
     LocalExecMode, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient,
     OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
     RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
-    SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind, ScheduleRow,
-    ScreenshotSpec, SkillDetail, SkillFile, SkillSource, SkillSummary, ThreadReplay, ThreadRun,
-    ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable,
-    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
-    activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind,
+    ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillSource, SkillSummary, ThreadReplay,
+    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE,
+    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
+    WAITING_FOR_YOU, activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
     env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
     keep_local_save_offer, place_hitl_cards_in_document_order, policy_answer,
@@ -1273,6 +1273,15 @@ impl SkillScope {
             Self::Discover => "settings-skills-scope-discover",
         }
     }
+}
+
+/// Which surface asked for a skill to be made, which is where its refusal is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillCreateFrom {
+    /// The New skill sheet, which has a slot of its own over the fields.
+    Sheet,
+    /// A picked file or folder. There is no sheet, so the list's slot is the only one on screen.
+    Upload,
 }
 
 /// How many skills each side of the toggle has, whichever side is open.
@@ -4383,6 +4392,7 @@ impl AppState {
                 source: SkillSource::Authored,
                 files: Vec::new(),
             },
+            SkillCreateFrom::Sheet,
             cx,
         );
     }
@@ -4444,6 +4454,7 @@ impl AppState {
                             source: SkillSource::Uploaded,
                             files,
                         },
+                        SkillCreateFrom::Upload,
                         cx,
                     ),
                     // What was picked is the list's business: the Upload button is on the
@@ -4461,10 +4472,15 @@ impl AppState {
 
     /// The one road to `POST /skills`, taken by both the sheet and an upload: the new skill is
     /// sent, the library reloads, and the one that was just made is the one on the pane.
-    fn send_new_skill(&mut self, new: NewSkill, cx: &mut Context<Self>) {
+    ///
+    /// `from` decides where a refusal is drawn, and it has to be told rather than guessed at.
+    /// The sheet has a slot of its own, over the fields the sentence is about; an upload has no
+    /// sheet, so a sentence put in that slot is a sentence drawn nowhere at all — which is what
+    /// a click on Upload that did nothing looked like.
+    fn send_new_skill(&mut self, new: NewSkill, from: SkillCreateFrom, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             self.skill_saving = false;
-            self.skill_add_error = Some("Sign in to keep a skill on the server.".into());
+            self.refuse_create(from, "Sign in to keep a skill on the server.".into());
             cx.notify();
             return;
         };
@@ -4477,11 +4493,12 @@ impl AppState {
                 state.skill_saving = false;
                 match result {
                     Ok(detail) => {
-                        // Taken: the sheet may go, and the words in its fields are now kept
-                        // somewhere, so the page may empty them.
+                        // Taken: the sheet may go, and the words in ITS fields are now kept
+                        // somewhere, so the page may empty them. An upload that landed says
+                        // nothing about a draft somebody left in the sheet.
                         state.skill_add_open = false;
                         state.skill_add_error = None;
-                        state.skill_add_taken = true;
+                        state.skill_add_taken = from == SkillCreateFrom::Sheet;
                         let id = detail.skill.id.clone();
                         state.skill_open_id = Some(id);
                         state.skill_error = None;
@@ -4490,12 +4507,20 @@ impl AppState {
                         state.take_skills_scope(SkillScope::Yours);
                         state.refresh_skills(cx);
                     }
-                    Err(error) => state.skill_add_error = Some(error.message),
+                    Err(error) => state.refuse_create(from, error.message),
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A create that was refused, put where the person who asked for it is looking.
+    fn refuse_create(&mut self, from: SkillCreateFrom, why: String) {
+        match from {
+            SkillCreateFrom::Sheet => self.skill_add_error = Some(why),
+            SkillCreateFrom::Upload => self.skills_error = Some(why),
+        }
     }
 
     /// Delete asks first, the way every recipe does: the dialog over the page, naming the skill
@@ -11188,10 +11213,16 @@ fn read_skill_upload(path: &std::path::Path) -> Result<(String, Vec<SkillFile>),
     // What it weighs before what it holds. A 500 MB file picked by mistake is half a gigabyte
     // allocated to find out it was a mistake, and the sentence that came back was about a
     // request body rather than about the file somebody chose.
-    let size = std::fs::metadata(path)
-        .map_err(|error| format!("{name} could not be read: {error}"))?
-        .len();
-    if let Some(why) = too_heavy(&name, size) {
+    let about =
+        std::fs::metadata(path).map_err(|error| format!("{name} could not be read: {error}"))?;
+    // A pipe or a device says it is zero bytes long and then reads forever. The walk over a
+    // folder has always asked this of every entry; a picked path is the same question.
+    if !about.is_file() {
+        return Err(format!(
+            "{name} is not a file, so it cannot be a skill's instructions."
+        ));
+    }
+    if let Some(why) = instructions_too_heavy(&name, about.len()) {
         return Err(why);
     }
     let bytes =
@@ -11201,12 +11232,24 @@ fn read_skill_upload(path: &std::path::Path) -> Result<(String, Vec<SkillFile>),
         .map_err(|_| format!("{name} is not text, so it cannot be a skill's instructions."))
 }
 
-/// The words for one file that is too heavy to be part of a skill, or `None` when it is not.
+/// The words for a picked file that cannot be a skill's instructions, or `None` when it could.
 ///
-/// Asked of what the filesystem says a file weighs, before it is opened. The server has the real
-/// limits — 8000 characters of instructions, [`SKILL_BUNDLE_LIMIT`] of files — and words its own
-/// refusals; this one is about this Mac's memory, and a file it refuses is over every one of
-/// them anyway.
+/// The cap it is measured against is the bundle's, which is about this Mac's memory; the cap it
+/// NAMES is the instructions' own, which is the server's and is what the person is up against.
+/// A file this far over it is not a `SKILL.md` that needs trimming, it is the wrong file — and
+/// a refusal that named a bundle would send somebody looking for files they never picked.
+fn instructions_too_heavy(name: &str, bytes: u64) -> Option<String> {
+    (bytes > SKILL_BUNDLE_LIMIT as u64).then(|| {
+        format!(
+            "{name} is {:.1} MB. A skill's instructions are at most {SKILL_BODY_CHARS} \
+             characters — whatever that file is, it is not a SKILL.md.",
+            bytes as f64 / (1024. * 1024.)
+        )
+    })
+}
+
+/// The words for one bundled file that is too heavy to go with a skill, or `None` when it is
+/// not. Asked of what the filesystem says it weighs, before it is opened.
 fn too_heavy(name: &str, bytes: u64) -> Option<String> {
     (bytes > SKILL_BUNDLE_LIMIT as u64).then(|| {
         format!(
@@ -11287,6 +11330,12 @@ fn read_skill_folder(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>, St
             };
             if kind.is_dir() {
                 stack.push((entry.path(), path));
+                // A folder of folders is a folder either way: the file cap on its own lets a
+                // tree of empty directories push paths for as long as there are any, without
+                // one file ever being found to count.
+                if stack.len() > SKILL_BUNDLE_FILES {
+                    return Err(bundle_too_many());
+                }
                 continue;
             }
             if !kind.is_file() {
@@ -11363,6 +11412,42 @@ fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>
 
 #[cfg(test)]
 mod tests {
+    /// Whether `chmod 000` stops this process at all.
+    ///
+    /// It stops everybody but root, so on a root CI container the two refusals below have
+    /// nothing to say — and a guard that silently stops guarding is worse than one that says it
+    /// did not run. Asked by trying it rather than by reading a uid, because what the tests turn
+    /// on is whether the open fails, not who is running them.
+    fn permissions_bind(at: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let probe = at.join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let stopped = std::fs::read(&probe).is_err();
+        std::fs::remove_file(&probe).unwrap();
+        stopped
+    }
+
+    /// Where a refused create is drawn is decided by which surface asked for it, and it has to
+    /// be told rather than guessed at: the sheet has a slot over the fields the sentence is
+    /// about, and an upload has no sheet at all. A sentence put in a slot that is not on screen
+    /// is a click that did nothing.
+    #[test]
+    fn a_refused_create_is_drawn_where_it_was_asked_for() {
+        let mut sheet = super::AppState::new();
+        sheet.refuse_create(super::SkillCreateFrom::Sheet, "that name is taken".into());
+        assert_eq!(sheet.skill_add_error.as_deref(), Some("that name is taken"));
+        assert!(sheet.skills_error.is_none());
+
+        let mut upload = super::AppState::new();
+        upload.refuse_create(super::SkillCreateFrom::Upload, "that name is taken".into());
+        assert_eq!(upload.skills_error.as_deref(), Some("that name is taken"));
+        assert!(
+            upload.skill_add_error.is_none(),
+            "there is no sheet on screen to draw it in"
+        );
+    }
+
     /// The walk over a real folder: what it takes, what it steps over, and what it refuses
     /// before opening anything.
     ///
@@ -11398,6 +11483,7 @@ mod tests {
         );
 
         // A file too heavy to be part of a skill, which cannot be opened at all.
+        let bound = permissions_bind(at);
         let big = write("big.bin", b"");
         std::fs::File::options()
             .write(true)
@@ -11405,14 +11491,18 @@ mod tests {
             .unwrap()
             .set_len(super::SKILL_BUNDLE_LIMIT as u64 + 1)
             .unwrap();
-        std::fs::set_permissions(&big, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-            .unwrap();
+        if bound {
+            std::fs::set_permissions(&big, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+        }
         let why = super::read_skill_folder(at).expect_err("over the cap");
         assert!(why.contains("MB"), "{why}");
-        assert!(
-            !why.contains("could not be read"),
-            "the size was asked for before the file was opened: {why}"
-        );
+        if bound {
+            assert!(
+                !why.contains("could not be read"),
+                "the size was asked for before the file was opened: {why}"
+            );
+        }
         std::fs::remove_file(&big).unwrap();
 
         // And one file too many, counted as they are found rather than at the end.
@@ -11433,16 +11523,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("a folder to walk");
         let at = dir.path();
         std::fs::write(at.join("SKILL.md"), b"Ask first.").unwrap();
-        let shut = at.join("shut");
-        std::fs::create_dir(&shut).unwrap();
-        std::fs::write(shut.join("inside.md"), b"x").unwrap();
-        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
-            .unwrap();
-        let found = super::read_skill_folder(at).expect("one shut corner is not the end of it");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].0, "SKILL.md");
-        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
+        // Nothing is shut to root, so there is no shut corner to step over and nothing here to
+        // check. The refusal below is about a folder that is not there, which binds everybody.
+        if permissions_bind(at) {
+            let shut = at.join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("inside.md"), b"x").unwrap();
+            std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+            let found = super::read_skill_folder(at).expect("one shut corner is not the end of it");
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].0, "SKILL.md");
+            std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+        }
 
         let why = super::read_skill_folder(&at.join("nowhere")).expect_err("no such folder");
         assert!(why.contains("could not be read"), "{why}");
@@ -11470,18 +11564,32 @@ mod tests {
         let why = super::read_skill_upload(&binary).expect_err("not text");
         assert!(why.contains("is not text"), "{why}");
 
+        // A device is not a file: it says it is zero bytes long and then reads forever.
+        let why = super::read_skill_upload(std::path::Path::new("/dev/null"))
+            .expect_err("a device is not a SKILL.md");
+        assert!(why.contains("is not a file"), "{why}");
+
+        let bound = permissions_bind(at);
         let big = at.join("big.bin");
         std::fs::File::create(&big)
             .unwrap()
             .set_len(super::SKILL_BUNDLE_LIMIT as u64 + 1)
             .unwrap();
-        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if bound {
+            std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
         let why = super::read_skill_upload(&big).expect_err("over the cap");
         assert!(why.contains("MB"), "{why}");
         assert!(
-            !why.contains("could not be read"),
-            "half a gigabyte is not allocated to find out it was a mistake: {why}"
+            why.contains(&crate::opengrok::SKILL_BODY_CHARS.to_string()),
+            "the file being refused IS the instructions, so the cap it names is theirs: {why}"
         );
+        if bound {
+            assert!(
+                !why.contains("could not be read"),
+                "half a gigabyte is not allocated to find out it was a mistake: {why}"
+            );
+        }
     }
 
     /// The instructions are the `SKILL.md`; everything else in the folder is a file they refer

@@ -3,7 +3,7 @@
 //!
 //! The pane is here only while a skill is open. The list is the page; this stands beside it.
 
-use super::{chip, short_relative_time, skill_icon};
+use super::{NEVER_UPDATED, NOTHING_WRITTEN_YET, chip, short_relative_time, skill_icon};
 use crate::chrome::TITLE_BAR_H;
 use crate::opengrok::SkillDetail;
 use crate::state::AppState;
@@ -75,7 +75,7 @@ pub(super) fn render(
     let updated = if skill.updated_at_ms > 0 {
         short_relative_time(skill.updated_at_ms, now_ms)
     } else {
-        "—".to_string()
+        NEVER_UPDATED.to_string()
     };
     let version = if detail.version == 0 {
         "None yet".to_string()
@@ -106,6 +106,10 @@ pub(super) fn render(
                                 // A skill with no name has no slash to type, and "Type / to use
                                 // it" is an instruction nobody can follow. The server will not
                                 // make one nameless; a row from somewhere else still can be.
+                                //
+                                // On the slash itself, see the note beside the same promise on
+                                // the list: it is wired by the branch this one stacks under,
+                                // which lands before either reaches a person.
                                 .when(!skill.name.trim().is_empty(), |this| {
                                     this.child(
                                         div()
@@ -184,10 +188,7 @@ pub(super) fn render(
                         // where they were typed.
                         .map(|this| {
                             if detail.body.trim().is_empty() {
-                                return this.text_color(muted).child(
-                                    "Nothing written yet. This skill is a name with no \
-                                     instructions under it.",
-                                );
+                                return this.text_color(muted).child(NOTHING_WRITTEN_YET);
                             }
                             this.child(detail.body.clone())
                         }),
