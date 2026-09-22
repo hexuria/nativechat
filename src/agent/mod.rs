@@ -63,6 +63,13 @@
 //! Typing goes in as GPUI keystrokes. `type`, `key` and `set_value` on the composer are
 //! planned here ([`ComposePlan`]) and pressed by [`RootView`](crate::root::RootView), because
 //! `/` and `@` are keys the composer takes before the text field ever sees them.
+//!
+//! `/` has no verb of its own: a row is taken the way a person takes it, by typing into
+//! `composer-panel-search` and pressing Enter, which is the only path that puts the chip in the
+//! message and the thing on the draft together. Two skills may share a name, and Enter takes
+//! the first selectable row the search leaves: tell them apart by their description, which the
+//! search reads too, or by counting rows under `composer-panel` and arrowing down to the one
+//! wanted. `composer-skill`'s value says which of them was actually taken.
 
 mod host;
 #[cfg(target_os = "macos")]

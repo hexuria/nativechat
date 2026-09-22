@@ -3,7 +3,7 @@ use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::chat_input::PanelMode;
 use crate::components::chat_input::sources::{
-    ParameterSource, SlashSource, ToolSource, ValueSource,
+    ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::components::skills::{
@@ -426,7 +426,11 @@ impl Command {
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
-            Self::SendMessageSteer(text) => state.send_message_with(text, true, cx),
+            // Words of the driver's own, not the composer's: `chat.send` is given its text and
+            // never reads the draft, so nothing off the draft rides out on it. A driver that
+            // wants the draft's skill types into the composer and presses Enter, which is the
+            // person's path and goes through the composer.
+            Self::SendMessageSteer(text) => state.send_message_with(text, true, None, cx),
             Self::StopTurn => state.stop_turn(cx),
             Self::RetryTurn => state.retry_turn(cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
@@ -706,7 +710,7 @@ fn last_screenshot_set(state: &AppState) -> Vec<ScreenshotSpec> {
 fn panel_rows(
     mode: PanelMode,
     recipes: &[RecipeSummary],
-    skills: &[SkillSummary],
+    skills: &SkillLibrary<'_>,
     active: Option<&ActiveRecipe>,
 ) -> Vec<PanelRow> {
     let rows = match mode {
@@ -1615,7 +1619,11 @@ impl NativeChatHost {
                     panel_rows(
                         mode,
                         &state.recipes,
-                        &state.skills,
+                        &SkillLibrary {
+                            skills: &state.your_skills,
+                            loading: state.your_skills_loading,
+                            error: state.your_skills_error.as_deref(),
+                        },
                         state.active_recipe.as_ref(),
                     )
                 })
@@ -4684,7 +4692,7 @@ mod tests {
         // Nothing told yet: the list is everything the recipe needs.
         let untold = recipe(&[]);
         host.composer_panel = Some(PanelMode::Parameters);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &[], Some(&untold));
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &listed(&[]), Some(&untold));
         let tree = host.snapshot();
         let panel = tree.find(ids::COMPOSER_PANEL).unwrap();
         assert!(tree.find(ids::COMPOSER_PANEL_SEARCH).unwrap().focused);
@@ -4701,7 +4709,7 @@ mod tests {
         // parameter leaves this list and lives in the bar above the composer, where it can still
         // be changed. A driver asserting on the panel must read it as the outstanding work.
         let told = recipe(&[("city", "London")]);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &[], Some(&told));
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &listed(&[]), Some(&told));
         let tree = host.snapshot();
         let rows: Vec<&str> = tree
             .find(ids::COMPOSER_PANEL)
@@ -4851,6 +4859,15 @@ mod tests {
         );
     }
 
+    /// A library that has arrived, for a panel that is not waiting on anything.
+    fn listed(skills: &[SkillSummary]) -> SkillLibrary<'_> {
+        SkillLibrary {
+            skills,
+            loading: false,
+            error: None,
+        }
+    }
+
     /// The `/` listing as a driver sees it: two recipes and two skills.
     fn slash_listing() -> (Vec<RecipeSummary>, Vec<SkillSummary>) {
         (
@@ -4880,7 +4897,7 @@ mod tests {
 
         let (listing, skills) = slash_listing();
         host.composer_panel = Some(PanelMode::Slash);
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &skills, None);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&skills), None);
 
         let tree = host.snapshot();
         assert_eq!(
@@ -4908,7 +4925,7 @@ mod tests {
         let mut host = host();
         let (listing, skills) = slash_listing();
         host.composer_panel = Some(PanelMode::Slash);
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &skills, None);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&skills), None);
 
         let tree = host.snapshot();
         let skill = tree.find("composer-panel-row-skill:skl_1").unwrap();
@@ -4924,7 +4941,7 @@ mod tests {
         assert!(draft.states.contains(&"note".to_string()));
 
         // And a library with nothing in it says so under the id that row has always had.
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &[], None);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&[]), None);
         let empty = host.snapshot();
         let none = empty.find("composer-skills-none").unwrap();
         assert!(none.states.contains(&"note".to_string()));

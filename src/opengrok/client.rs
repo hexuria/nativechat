@@ -4313,10 +4313,12 @@ mod tests {
     /// The other half of that contract, and the whole of what `/name` buys: the skill the
     /// person picked travels as its id on `forwardedProps`, where the server reads it.
     ///
-    /// The second turn is the regression guard. A message sent with no skill picked has to be
-    /// the message this client sent before any of this existed — byte for byte, not merely
-    /// "without a skill in it" — because every ordinary chat goes down this path and a stray
-    /// key in the props is a change to every one of them.
+    /// The second turn is the regression guard. Every ordinary chat goes down this path, so a
+    /// send with nothing picked has to be the send this client made before any of this existed:
+    /// the two bodies are compared whole, which catches a key added anywhere in them and not
+    /// only in the props. What it cannot catch is a change to how the body is spelled — both
+    /// sides are read back into `Value` and written out again by this same build — and it does
+    /// not need to: what is on trial here is what the app puts in the body.
     #[tokio::test]
     async fn a_turn_carries_the_chosen_skill_and_a_turn_without_one_is_unchanged() {
         let server = MockServer::start().await;
@@ -4385,7 +4387,7 @@ mod tests {
             "no skill picked leaves the props with nothing in them but the coworker"
         );
 
-        // Byte for byte, once the one thing that is meant to differ — the run id, minted fresh
+        // The whole body, once the one thing that is meant to differ — the run id, minted fresh
         // for every turn — is put back.
         let mut with = with;
         with["forwardedProps"]

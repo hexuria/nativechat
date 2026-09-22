@@ -1464,7 +1464,9 @@ impl ChatView {
                 let state = state.clone();
                 move |text, steer, cx| {
                     state.update(cx, |state, cx| {
-                        state.send_message_with(text, steer, cx);
+                        // The draft's own door: these are the words in the composer, so what
+                        // the composer is holding goes with them and comes off it here.
+                        state.send_draft(text, steer, cx);
                     });
                 }
             })

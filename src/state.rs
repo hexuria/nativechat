@@ -285,6 +285,11 @@ pub const EMPTY_TURN_NOTE: &str = "(OpenGrok returned no assistant text.)";
 /// How a run's failure is spelled in the feed.
 pub const RUN_ERROR_PREFIX: &str = "OpenGrok: ";
 
+/// What stands where a library would be when nobody is signed in. Signed out there is nothing to
+/// ask for, which is not the same as a library with nothing in it — and "No skills yet" is what
+/// an empty one says.
+pub const SKILLS_SIGNED_OUT: &str = "Sign in to see the skills kept on the server.";
+
 /// What the feed says for a turn the person stopped.
 ///
 /// Addressed to the person and about what they did, because that is whose doing it was. It is
@@ -1740,6 +1745,18 @@ pub struct AppState {
     /// rows that arrived; the state keeps the text so the driver can write it too.
     pub skills_query: String,
     pub skills_scope: SkillScope,
+    /// The skills `/` offers, which are the ones this person can invoke.
+    ///
+    /// Kept apart from [`Self::skills`] on purpose. That list is whichever side of the Settings
+    /// toggle was last looked at, and it is emptied the moment the toggle moves: a composer
+    /// reading it offered a colleague's library and none of this person's own, for no reason
+    /// anybody typing `/` could have seen.
+    pub your_skills: Vec<SkillSummary>,
+    /// Whether that listing is on its way, and what the server said if it refused. The `/` panel
+    /// says which of the three it is, because a library that would not load and a library with
+    /// nothing in it read the same on screen and are opposite things to do something about.
+    pub your_skills_loading: bool,
+    pub your_skills_error: Option<String>,
     /// How many rows each side of the toggle has. Both sides are fetched on every refresh
     /// because the toggle carries a count per side, and a count for the scope nobody has opened
     /// would otherwise be a blank where a number belongs.
@@ -2143,6 +2160,9 @@ impl AppState {
             skills: Vec::new(),
             skills_query: String::new(),
             skills_scope: SkillScope::Yours,
+            your_skills: Vec::new(),
+            your_skills_loading: false,
+            your_skills_error: None,
             skills_counts: SkillCounts::default(),
             skills_loading: false,
             skills_error: None,
@@ -4246,7 +4266,7 @@ impl AppState {
             self.skills.clear();
             self.skills_counts = SkillCounts::default();
             self.skills_loading = false;
-            self.skills_error = Some("Sign in to see the skills kept on the server.".into());
+            self.skills_error = Some(SKILLS_SIGNED_OUT.to_string());
             cx.notify();
             return;
         };
@@ -4293,6 +4313,10 @@ impl AppState {
                     yours: yours.len(),
                     discover: discover.len(),
                 };
+                // The page asked for both sides for its counts, and one of the two is the list
+                // `/` offers. Taking it here is what lets a skill written on this page be
+                // invoked in the composer without anybody asking for it a second time.
+                self.take_your_skills(yours.clone());
                 self.skills = match scope {
                     SkillScope::Yours => yours,
                     SkillScope::Discover => discover,
@@ -4308,6 +4332,53 @@ impl AppState {
             }
         }
         true
+    }
+
+    /// The skills `/` offers, asked for by the composer.
+    ///
+    /// One request, where the Settings page makes two: the page needs a count for each side of
+    /// its toggle, and nobody typing `/` is looking at the toggle. A fetch already in flight is
+    /// left to land rather than joined by a second — two answers for one question can only
+    /// disagree by being differently stale.
+    pub fn refresh_your_skills(&mut self, cx: &mut Context<Self>) {
+        if self.your_skills_loading {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            // Signed out there is no library to ask for, which is not the same as a library with
+            // nothing in it.
+            self.your_skills.clear();
+            self.your_skills_error = Some(SKILLS_SIGNED_OUT.to_string());
+            cx.notify();
+            return;
+        };
+        self.your_skills_loading = true;
+        self.your_skills_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let listed = client.list_skills(Some(SkillScope::Yours.query())).await;
+            let _ = this.update(cx, |state, cx| {
+                state.your_skills_loading = false;
+                match listed {
+                    Ok(rows) => state.take_your_skills(rows),
+                    // The rows already there are left where they are, which is the opposite of
+                    // what the Settings page does with its own. A row here is a thing to pick,
+                    // and one that was listed a minute ago is as pickable as it was — the server
+                    // is the authority on an id either way. Emptying the list because a refresh
+                    // failed would take away the one thing the person opened `/` for.
+                    Err(error) => state.your_skills_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Take a listing of this person's skills, from wherever it was asked for.
+    fn take_your_skills(&mut self, rows: Vec<SkillSummary>) {
+        self.your_skills = rows;
+        self.your_skills_loading = false;
+        self.your_skills_error = None;
     }
 
     /// The detail pane for one skill. The prose is not on the listing, so it is fetched.
@@ -5300,7 +5371,9 @@ impl AppState {
     /// The pick itself, apart from the redraw. `false` when the library holds no such id and
     /// the draft was left as it was.
     fn attach_skill(&mut self, id: &str) -> bool {
-        let Some(skill) = self.skills.iter().find(|skill| skill.id == id) else {
+        // The list `/` was built from, which is not the Settings page's: the page shows one side
+        // of a toggle, and a pick has to be findable in the rows it was picked out of.
+        let Some(skill) = self.your_skills.iter().find(|skill| skill.id == id) else {
             return false;
         };
         self.active_skill = Some(ActiveSkill {
@@ -5319,18 +5392,24 @@ impl AppState {
         }
     }
 
-    /// The id of the skill this turn carries, taken off the draft as the turn is built.
+    /// The id of the skill the draft is holding, taken off it as the draft goes.
     ///
-    /// ONE TURN. A skill applies to the message it was sent with and to nothing after it. The
-    /// taking is here, where a turn is made, rather than in the composer, because two of the
-    /// three doors into a send never touch the composer: a held message going out when the
-    /// thread falls idle, and an agent driver's `chat.send`.
+    /// ONE DOOR. Several things reach [`Self::send_message_with`] and only one of them is the
+    /// draft: a retry re-runs a turn that already went, a generative-UI form's answer is the
+    /// card's words, and a driver's `chat.send` carries words of its own. None of those came
+    /// off the composer, so none of them may take what the composer is holding — the turn would
+    /// carry a skill nobody attached to it, and the chip would be left standing over a draft
+    /// with nothing behind it. They pass `None`; [`Self::send_draft`] is the one caller here.
     ///
-    /// The id is not checked against [`Self::skills`] on the way past. That list holds one side
-    /// of the Settings → Skills toggle and is emptied whenever the toggle moves, so a check
-    /// against it would refuse skills that exist; the server knows every id and refuses the ones
-    /// it does not, which is the answer the person is shown.
-    fn take_turn_skill(&mut self) -> Option<String> {
+    /// ONE TURN. A skill applies to the message it was sent with and to nothing after it, which
+    /// is why this takes rather than reads. A message held while the thread is busy keeps it on
+    /// [`QueuedSend`], because that message WAS the draft.
+    ///
+    /// The id is not checked against [`Self::your_skills`] on the way past. That listing is as
+    /// old as the last `/`, and a skill deleted since is not the only way for an id to be
+    /// missing from it; the server knows every id and refuses the ones it does not, which is the
+    /// answer the person is shown.
+    fn take_draft_skill(&mut self) -> Option<String> {
         self.active_skill.take().map(|skill| skill.id)
     }
 
@@ -6774,8 +6853,12 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
-        let skill = self.take_turn_skill();
-        self.send_opengrok_turn_with(conversation_id, content, recipe, skill, None, cx);
+        // No skill. The only caller is "Try again", which re-runs a turn the thread already
+        // has rather than building one out of the draft: the words are the ones that were
+        // sent, and what the composer is holding now belongs to the message still being
+        // written. Taking it here sent somebody's skill on a turn they never attached it to
+        // and left the chip standing over a draft with nothing behind it.
+        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, cx);
     }
 
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
@@ -10063,16 +10146,31 @@ impl AppState {
         self.send_message(body, cx);
     }
 
+    /// Words from somewhere other than the composer: a form's answer, a driver's `chat.send`.
+    /// They go as themselves, with nothing off the draft on them — see [`Self::take_draft_skill`].
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
-        self.send_message_with(content, false, cx);
+        self.send_message_with(content, false, None, cx);
+    }
+
+    /// The composer's draft going out, with what the composer had on it.
+    ///
+    /// The one door that takes the skill off the draft, because it is the one whose words came
+    /// off the draft. It is taken before the guards below rather than after, which is what the
+    /// composer does with the chip: a send the app refuses empties the field and the chip with
+    /// it, so a skill left attached would be one nothing on screen still mentions.
+    pub fn send_draft(&mut self, content: String, force_steer: bool, cx: &mut Context<Self>) {
+        let skill = self.take_draft_skill();
+        self.send_message_with(content, force_steer, skill, cx);
     }
 
     /// `force_steer` is ⌘⇧↩: send now even if a turn is running. What that
-    /// means for each state of the thread is [`plan_send`].
+    /// means for each state of the thread is [`plan_send`]. `skill` is what the draft was
+    /// holding, which only [`Self::send_draft`] has any business supplying.
     pub fn send_message_with(
         &mut self,
         content: String,
         force_steer: bool,
+        skill: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if !self.is_signed_in() {
@@ -10110,10 +10208,6 @@ impl AppState {
         // The recipe as it stands now, not when the turn reaches the wire: the composer clears
         // it the moment the draft is sent, and a held message must still carry it.
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
-        // The skill comes off the draft here rather than being copied off it. Past this line the
-        // message is going — posted now or held for later — and the skill belongs to it and to
-        // nothing after it. Every guard that could refuse the send is above.
-        let skill = self.take_turn_skill();
 
         let local_id = uuid::Uuid::now_v7().to_string();
         // The bubble and its row are stamped with one moment, so the thread reads back in the
@@ -12033,23 +12127,23 @@ mod tests {
     /// ONE TURN. A skill is put on the draft by a pick and comes off as the turn is built, so
     /// the message after it carries nothing unless somebody picked again.
     ///
-    /// The first assertion is the other half of the rule, and the one that cost the least to
-    /// keep: a person who types the words `/expense-report` and sends them has said a sentence.
-    /// Nothing between the field and the wire reads a name back out of what was typed — the id
-    /// comes off the row that was taken, or there is no id — so a draft nobody picked from
-    /// carries nothing however much it looks like an invocation.
+    /// What the first assertion pins is narrow and worth saying out loud: a draft that was never
+    /// picked from has nothing on it. It does NOT pin that the words are unread — nothing in
+    /// this file reads them, and a test can only show that nothing here puts a skill on a draft
+    /// except [`AppState::attach_skill`], which is reached from the panel's pick and from
+    /// nowhere else in the app.
     #[test]
     fn a_picked_skill_goes_with_one_turn_and_a_typed_one_goes_with_none() {
         let mut state = AppState::new();
-        state.skills = serde_json::from_value(serde_json::json!([
+        state.your_skills = serde_json::from_value(serde_json::json!([
             { "id": "skl_1", "name": "expense-report", "description": "File a receipt" },
             { "id": "skl_2", "name": "  ", "description": "Nobody named it" }
         ]))
         .unwrap();
         assert_eq!(
-            state.take_turn_skill(),
+            state.take_draft_skill(),
             None,
-            "the words are the message; there is no `/name` parser anywhere behind them"
+            "nothing was picked, so there is nothing for the turn to carry"
         );
 
         assert!(state.attach_skill("skl_1"));
@@ -12057,9 +12151,9 @@ mod tests {
             state.active_skill.as_ref().map(|skill| skill.name.as_str()),
             Some("expense-report")
         );
-        assert_eq!(state.take_turn_skill().as_deref(), Some("skl_1"));
+        assert_eq!(state.take_draft_skill().as_deref(), Some("skl_1"));
         assert_eq!(
-            state.take_turn_skill(),
+            state.take_draft_skill(),
             None,
             "a skill applies to the message it was sent with and to nothing after it"
         );
@@ -12080,10 +12174,67 @@ mod tests {
         // An id the library does not hold is not a pick, and leaves what was there alone.
         assert!(!state.attach_skill("skl_9"));
         assert_eq!(
-            state.take_turn_skill().as_deref(),
+            state.take_draft_skill().as_deref(),
             Some("skl_2"),
             "the skill on the draft survived a pick that named nothing"
         );
+    }
+
+    /// `/` offers this person's own skills, whatever the Settings page is showing.
+    ///
+    /// The page's list is one side of a toggle and is emptied the moment the toggle moves. A
+    /// composer reading it offered a colleague's library and none of this person's own, to
+    /// somebody who had merely looked at the other tab once and closed it.
+    #[test]
+    fn the_slash_list_is_your_own_skills_and_not_whichever_tab_was_left_open() {
+        let yours: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "expense-report", "description": "File a receipt" }
+        ]))
+        .unwrap();
+        let theirs: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_9", "name": "their-skill", "description": "Ada's" }
+        ]))
+        .unwrap();
+
+        let mut state = AppState::new();
+        state.skills_scope = SkillScope::Discover;
+        assert!(state.take_skills(
+            state.skills_epoch,
+            SkillScope::Discover,
+            Ok(yours.clone()),
+            Ok(theirs.clone())
+        ));
+        assert_eq!(
+            state.skills, theirs,
+            "the page shows the side of the toggle that was asked for"
+        );
+        assert_eq!(
+            state.your_skills, yours,
+            "and `/` has the other half of the same answer, so a skill written on that page \
+             can be used without asking for it again"
+        );
+        assert!(
+            state.attach_skill("skl_1"),
+            "the row `/` offered is the row a pick can find"
+        );
+        assert!(
+            !state.attach_skill("skl_9"),
+            "the Discover side is not what `/` listed, so nothing there is pickable from it"
+        );
+
+        // A listing that failed takes the page's rows down with it, because a list under a red
+        // line reads as current. What `/` already has is left alone: it is still true, and a
+        // panel emptied by somebody else's failed refresh would offer nothing at all.
+        assert!(state.take_skills(
+            state.skills_epoch,
+            SkillScope::Discover,
+            Ok(yours.clone()),
+            Err(OpenGrokError::message(
+                "the server would not say".to_string()
+            ))
+        ));
+        assert!(state.skills.is_empty());
+        assert_eq!(state.your_skills, yours);
     }
 
     /// The declaration the owner hit this on, with an optional parameter declared ahead of a
@@ -12174,20 +12325,20 @@ mod tests {
         ActiveRecipe, ActivityTick, AppState, BotActivity, ChatMessage, ChatPart, Conversation,
         DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
         REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
-        STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
-        TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
-        apply_catalogue, apply_reload, bot_status_line, bubble_for_run, graft_reply,
-        hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note,
-        missing_replies, overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable,
-        replayed_ending, reply_from_replay, restored_message, restored_parts, saved_parts,
-        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
-        unheard_hidden_runs,
+        STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE,
+        TURN_UNREACHED_NOTE, ThreadRun, TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS,
+        WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue, apply_reload, bot_status_line,
+        bubble_for_run, graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin,
+        is_unsent_turn_note, missing_replies, overlay_server_cards, parse_sql_time,
+        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_message,
+        restored_parts, saved_parts, spec_from_queued, stream_paint_due, stream_part_sig,
+        streaming_message_mut, turn_ending, unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
     use crate::opengrok::{
         Failure, FormField, FormResolution, FormSpec, LocalExecMode, ModelEntry, OpenGrokClient,
-        QueuedApproval, USER_MACHINE_SHELL, UiSpec,
+        OpenGrokError, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
     use crate::state::{
         ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, once_only_for,

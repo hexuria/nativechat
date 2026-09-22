@@ -13,7 +13,7 @@ use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
 use crate::opengrok::{RecipeParameter, RecipeParameterKind};
 use crate::state::{ActiveRecipe, AppState, ReplyTo, SubmitChord};
-use sources::{ParameterSource, SlashSource, ToolSource, ValueSource};
+use sources::{ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -113,6 +113,12 @@ pub struct MessageInput {
     caret: usize,
     /// The chips in the message, in the order they appear.
     tokens: Vec<ComposerToken>,
+    /// The message as it stood when the chips were last put where they are.
+    ///
+    /// Every edit is read as the difference between this and what the field holds now. It is
+    /// the only way to tell a chip that MOVED from one that was DELETED while the same words
+    /// sit somewhere else in the draft — see [`remap_tokens`].
+    last_text: String,
     /// The recipe the message runs, cached off [`AppState`] for the sake of drawing. Every
     /// decision reads the state itself, so a value filled in a moment ago is never missed.
     active_recipe: Option<ActiveRecipe>,
@@ -169,6 +175,7 @@ impl MessageInput {
             picks: Vec::new(),
             caret: 0,
             tokens: Vec::new(),
+            last_text: String::new(),
             active_recipe,
             attachments: Vec::new(),
             notice: None,
@@ -212,7 +219,7 @@ impl MessageInput {
             if this.panel_mode == Some(PanelMode::Slash) {
                 let mut rows = {
                     let state = state.read(cx);
-                    SlashSource.rows(&state.recipes, &state.skills)
+                    SlashSource.rows(&state.recipes, &your_skills(state))
                 };
                 apply_shortcuts(&mut rows, window);
                 this.remember_picks(&rows);
@@ -376,10 +383,11 @@ impl MessageInput {
             // The recipe belonged to the message that has just gone, not to the next one.
             self.state
                 .update(cx, |state, cx| state.clear_active_recipe(cx));
-            // The skill did too. The turn took it as it was built (see `take_turn_skill`), so
-            // this is already done in the ordinary case; it is here for the one where the send
-            // was refused before it reached that line, which would otherwise leave a skill on a
-            // draft whose chip has just been cleared away.
+            // The skill did too. The draft's own door takes it as the turn is built (see
+            // `AppState::send_draft`), so this is already done in the ordinary case; it is here
+            // for the one where nothing was sent at all — an empty draft, or a handler that is
+            // not wired — which would otherwise leave a skill on a draft whose chip has just
+            // been cleared away.
             self.state
                 .update(cx, |state, cx| state.clear_active_skill(cx));
             // The images are not on their way anywhere: nothing carries them yet, so saying so
@@ -531,7 +539,8 @@ impl MessageInput {
             PanelMode::Plus,
             rows,
             "Search",
-            "⌘1–9 picks a row. Type @ for the bot's tools, / for its recipes and workflows.",
+            "⌘1–9 picks a row. Type @ for the bot's tools, / for its recipes, workflows and \
+             skills.",
             window,
             cx,
         );
@@ -556,12 +565,16 @@ impl MessageInput {
         if self.state.read(cx).recipes.is_empty() {
             self.state.update(cx, |state, cx| state.refresh_recipes(cx));
         }
-        if self.state.read(cx).skills.is_empty() {
-            self.state.update(cx, |state, cx| state.refresh_skills(cx));
-        }
+        // The skills are asked for every time, not only when the list is empty. One `/` is one
+        // small request, a library changes while the app is open — somebody writes one on
+        // another machine, or a colleague shares one — and a list that was only ever fetched
+        // once is a list that is wrong for the rest of the session. What has already arrived
+        // stays on screen while the answer is on its way, so nothing flickers.
+        self.state
+            .update(cx, |state, cx| state.refresh_your_skills(cx));
         let mut rows = {
             let state = self.state.read(cx);
-            SlashSource.rows(&state.recipes, &state.skills)
+            SlashSource.rows(&state.recipes, &your_skills(state))
         };
         apply_shortcuts(&mut rows, window);
         self.show_panel(
@@ -682,20 +695,26 @@ impl MessageInput {
                 // mode: no bar, no parameters, nothing to be told. The chip is the whole of
                 // what it looks like, and the id behind the chip is what the turn carries.
                 TokenKind::Skill => {
-                    // One skill to a message, because the turn names one id. Picking a second
-                    // takes the first one's chip out rather than leaving a word in the message
-                    // standing for a skill that is not going anywhere.
-                    let replacing = self
-                        .state
-                        .read(cx)
-                        .active_skill
-                        .as_ref()
-                        .is_some_and(|skill| skill.id != id);
-                    if replacing {
-                        self.drop_skill(window, cx);
+                    // Picking the one that is already there again is nothing happening. It is
+                    // already attached and its chip is already in the message, and a second
+                    // word standing for the same skill is one the person would have to delete
+                    // twice to be rid of it.
+                    if skill_chip(&self.tokens, &id).is_some() {
+                        return;
                     }
-                    self.state
-                        .update(cx, |state, cx| state.start_skill(&id, cx));
+                    // One skill to a message, because the turn names one id: whatever was
+                    // there goes, chip and all, rather than leaving a word in the message
+                    // standing for a skill that is not going anywhere.
+                    self.drop_skill(window, cx);
+                    // No chip without something behind it. `start_skill` refuses an id the
+                    // library does not hold, and a chip put in anyway would be a word that
+                    // looks like an invocation and sends nothing.
+                    if !self
+                        .state
+                        .update(cx, |state, cx| state.start_skill(&id, cx))
+                    {
+                        return;
+                    }
                     self.insert_token(kind, id, text, window, cx);
                 }
             },
@@ -846,11 +865,7 @@ impl MessageInput {
         };
         self.state
             .update(cx, |state, cx| state.clear_active_skill(cx));
-        if let Some(index) = self
-            .tokens
-            .iter()
-            .position(|token| token.kind == TokenKind::Skill && token.id == id)
-        {
+        if let Some(index) = skill_chip(&self.tokens, &id) {
             let range = self.tokens.remove(index).range;
             self.remove_text(range, window, cx);
         }
@@ -874,11 +889,7 @@ impl MessageInput {
         else {
             return;
         };
-        if self
-            .tokens
-            .iter()
-            .any(|token| token.kind == TokenKind::Skill && token.id == id)
-        {
+        if skill_chip(&self.tokens, &id).is_some() {
             return;
         }
         self.state
@@ -927,6 +938,11 @@ impl MessageInput {
             // into it, and it keeps the chip a token of its own.
             input.insert(format!("{text} "), window, cx);
         });
+        // The chips already in the message slide along by what was put in front of them. This
+        // is an edit the view made itself, so its shape is known exactly and nothing has to be
+        // guessed from the words — which is what kept a chip from landing on somebody's prose
+        // that happened to read the same.
+        shift_tokens(&mut self.tokens, caret..caret, text.len() + 1);
         let range = caret..caret + text.len();
         let at = self
             .tokens
@@ -942,34 +958,33 @@ impl MessageInput {
                 range,
             },
         );
-        // The chips after this one have moved along by what was inserted.
-        self.resync_tokens(cx);
+        self.remember_text(cx);
         self.focus(window, cx);
         cx.notify();
     }
 
-    /// Put every chip's range back where its text actually is.
+    /// Move every chip through whatever was just done to the message.
     ///
-    /// The field knows nothing about chips, so an edit anywhere moves them without telling
-    /// anyone. Scanning forward in order finds each chip's text after the one before it; a chip
-    /// whose text is no longer there was edited away, and it stops being a chip.
+    /// The field knows nothing about chips and reports no edit, so the edit is worked out as
+    /// the difference between the message as it was and the message as it is.
+    ///
+    /// This used to look for each chip's words in the text instead, taking the first occurrence
+    /// after the chip before it. That reads a chip as a WORD rather than as a PLACE, and the two
+    /// come apart exactly where it matters: delete the chip while the same words sit further
+    /// down the draft and the chip simply moves onto them, so the message still carries the
+    /// skill after the only thing on screen that said so is gone.
     fn resync_tokens(&mut self, cx: &App) {
-        if self.tokens.is_empty() {
+        let text = self.input_state.read(cx).value().to_string();
+        if text == self.last_text {
             return;
         }
-        let text = self.input_state.read(cx).value().to_string();
-        let mut from = 0usize;
-        self.tokens.retain_mut(|token| {
-            match text.get(from..).and_then(|rest| rest.find(&token.text)) {
-                Some(offset) => {
-                    let start = from + offset;
-                    token.range = start..start + token.text.len();
-                    from = token.range.end;
-                    true
-                }
-                None => false,
-            }
-        });
+        remap_tokens(&mut self.tokens, &self.last_text, &text);
+        self.last_text = text;
+    }
+
+    /// Remember the message as it now stands, so the next edit is read against it.
+    fn remember_text(&mut self, cx: &App) {
+        self.last_text = self.input_state.read(cx).value().to_string();
     }
 
     /// Backspace right after a chip takes the whole chip, not one character of it.
@@ -1014,7 +1029,13 @@ impl MessageInput {
             input.set_selected_range(range.start..end, cx);
             input.replace("", window, cx);
         });
-        self.resync_tokens(cx);
+        shift_tokens(&mut self.tokens, range.start..end, 0);
+        // The caret the open panel will put its chip at moves with everything else after the
+        // cut. Picking a second skill takes the first one's chip out and then puts the new one
+        // in, and a caret left where it was would land the new chip that many characters into
+        // whatever follows.
+        self.caret = caret_after_cut(self.caret, range.start..end);
+        self.remember_text(cx);
     }
 
     /// `@` and `/` open the panel instead of being typed.
@@ -1552,6 +1573,103 @@ fn join_names(names: &[&str]) -> String {
         [one] => (*one).to_string(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// The library `/` offers, as the state has it: this person's skills, and how that listing is
+/// getting on. Never [`AppState::skills`], which is whichever side of the Settings toggle was
+/// last looked at.
+fn your_skills(state: &AppState) -> SkillLibrary<'_> {
+    SkillLibrary {
+        skills: &state.your_skills,
+        loading: state.your_skills_loading,
+        error: state.your_skills_error.as_deref(),
+    }
+}
+
+/// Where the chip for one skill sits in the message, if it is still there.
+///
+/// The chip is the whole of what the app says about a skill on the draft, so this is the
+/// question behind both halves of the rule: whether a pick has anything left to do, and whether
+/// an attachment still has something on screen standing for it.
+fn skill_chip(tokens: &[ComposerToken], id: &str) -> Option<usize> {
+    tokens
+        .iter()
+        .position(|token| token.kind == TokenKind::Skill && token.id == id)
+}
+
+/// Where the caret sits once the bytes in `cut` have been taken out: back by as much as was
+/// removed before it, and at the cut itself when it was inside what went.
+fn caret_after_cut(caret: usize, cut: Range<usize>) -> usize {
+    if caret <= cut.start {
+        return caret;
+    }
+    if caret >= cut.end {
+        return caret - (cut.end - cut.start);
+    }
+    cut.start
+}
+
+/// Move the chips through one edit whose shape is known: the bytes in `edited` — where they
+/// were before the edit — became `now` bytes.
+///
+/// A chip wholly before the edit stays where it is, a chip wholly after it slides, and a chip
+/// the edit ran into stops being a chip: the words the person picked are no longer the words
+/// that are there, whatever else the message may say elsewhere.
+fn shift_tokens(tokens: &mut Vec<ComposerToken>, edited: Range<usize>, now: usize) {
+    let delta = now as isize - (edited.end - edited.start) as isize;
+    let slide = |at: usize| (at as isize + delta).max(0) as usize;
+    tokens.retain_mut(|token| {
+        if token.range.end <= edited.start {
+            return true;
+        }
+        if token.range.start >= edited.end {
+            token.range = slide(token.range.start)..slide(token.range.end);
+            return true;
+        }
+        false
+    });
+}
+
+/// Move the chips through an edit nobody described, by reading it off the two texts.
+///
+/// What the person did is taken to be the one stretch between the words both texts start with
+/// and the words they both end with. That is not always what happened — deleting the first of
+/// two identical words cannot be told from deleting the second — but every edit this view makes
+/// itself goes through [`shift_tokens`] with its real shape, so what is guessed at here is only
+/// ever typing, where the guess is the answer.
+fn remap_tokens(tokens: &mut Vec<ComposerToken>, before: &str, after: &str) {
+    let head = common_head(before, after);
+    let tail = common_tail(before, after, head);
+    shift_tokens(tokens, head..before.len() - tail, after.len() - tail - head);
+}
+
+/// How many bytes two texts begin with in common, never splitting a character in half.
+fn common_head(before: &str, after: &str) -> usize {
+    let mut at = 0;
+    let (a, b) = (before.as_bytes(), after.as_bytes());
+    while at < a.len().min(b.len()) && a[at] == b[at] {
+        at += 1;
+    }
+    while at > 0 && !(before.is_char_boundary(at) && after.is_char_boundary(at)) {
+        at -= 1;
+    }
+    at
+}
+
+/// The same from the other end, stopping before `head` so the two cannot claim the same bytes.
+fn common_tail(before: &str, after: &str, head: usize) -> usize {
+    let mut at = 0;
+    let (a, b) = (before.as_bytes(), after.as_bytes());
+    let most = (a.len() - head).min(b.len() - head);
+    while at < most && a[a.len() - 1 - at] == b[b.len() - 1 - at] {
+        at += 1;
+    }
+    while at > 0
+        && !(before.is_char_boundary(before.len() - at) && after.is_char_boundary(after.len() - at))
+    {
+        at -= 1;
+    }
+    at
 }
 
 /// Whether a trigger character sits at the start of a token: the start of the message, or right
@@ -2212,10 +2330,23 @@ fn composer_bot_name(state: &AppState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_image, join_names, missing_note, opens_on_pick, parameters_hint, starts_token};
+    use super::{
+        ComposerToken, TokenKind, is_image, join_names, missing_note, opens_on_pick,
+        parameters_hint, remap_tokens, shift_tokens, skill_chip, starts_token,
+    };
     use crate::opengrok::RecipeSummary;
     use crate::state::ActiveRecipe;
     use std::path::PathBuf;
+
+    /// A chip for a skill, where the words sit in the message.
+    fn chip(id: &str, text: &str, at: usize) -> ComposerToken {
+        ComposerToken {
+            kind: TokenKind::Skill,
+            id: id.to_string(),
+            text: text.to_string(),
+            range: at..at + text.len(),
+        }
+    }
 
     fn picked(declaration: serde_json::Value) -> ActiveRecipe {
         let recipe: RecipeSummary = serde_json::from_value(declaration).unwrap();
@@ -2329,6 +2460,113 @@ mod tests {
             "mid-word, which is where an email address would open the panel"
         );
         assert!(!starts_token("path/to", 7), "mid-word for a path too");
+    }
+
+    /// The bug this rule was rewritten for. A chip is a PLACE in the message, not a word that
+    /// happens to be in it: delete the chip while the same words sit further down the draft and
+    /// the chip must go, because the only thing on screen saying the message carries that skill
+    /// has gone. Reading it as a word moved the chip onto the other copy and sent the skill
+    /// anyway.
+    #[test]
+    fn a_deleted_chip_does_not_move_onto_words_that_read_the_same() {
+        let mut tokens = vec![chip("skl_1", "expense-report", 0)];
+        remap_tokens(
+            &mut tokens,
+            "expense-report and expense-report",
+            " and expense-report",
+        );
+        assert!(tokens.is_empty(), "the chip was deleted, so it is gone");
+        assert_eq!(
+            skill_chip(&tokens, "skl_1"),
+            None,
+            "which is what takes the skill off the draft with it"
+        );
+    }
+
+    /// Typing around a chip moves it; typing into it ends it.
+    #[test]
+    fn a_chip_slides_past_an_edit_before_it_and_dies_inside_one() {
+        let said = "hi expense-report ok";
+        let mut tokens = vec![chip("skl_1", "expense-report", 3)];
+        remap_tokens(&mut tokens, said, "oh hi expense-report ok");
+        assert_eq!(
+            tokens[0].range,
+            6..20,
+            "three more bytes went in front of it"
+        );
+
+        let mut tokens = vec![chip("skl_1", "expense-report", 3)];
+        remap_tokens(&mut tokens, said, "hi expense-report ok!");
+        assert_eq!(
+            tokens[0].range,
+            3..17,
+            "what was typed after it is nothing to do with it"
+        );
+
+        let mut tokens = vec![chip("skl_1", "expense-report", 3)];
+        remap_tokens(&mut tokens, said, "hi expense ok");
+        assert!(
+            tokens.is_empty(),
+            "half the name is not the name: the words the person picked are not there any more"
+        );
+
+        // Two chips, and an edit between them: the first stays, the second slides.
+        let mut tokens = vec![chip("skl_1", "alpha", 0), chip("skl_2", "beta", 6)];
+        remap_tokens(&mut tokens, "alpha beta", "alpha and beta");
+        assert_eq!(tokens[0].range, 0..5);
+        assert_eq!(tokens[1].range, 10..14);
+    }
+
+    /// The caret the panel puts its chip at moves with the text: picking a second skill takes
+    /// the first one's chip out from under it.
+    #[test]
+    fn the_caret_comes_back_by_what_was_taken_out_in_front_of_it() {
+        // "expense-report " out of "expense-report hello", with the caret at the end.
+        assert_eq!(super::caret_after_cut(20, 0..15), 5);
+        assert_eq!(super::caret_after_cut(0, 5..9), 0, "it sat before the cut");
+        assert_eq!(
+            super::caret_after_cut(7, 5..9),
+            5,
+            "it sat inside what went, so it is where that was"
+        );
+    }
+
+    /// An edit this view makes itself is handed over with its real shape rather than guessed at
+    /// from the words, which is why putting a chip in cannot land it on prose that reads the
+    /// same: the new chip goes at the caret and everything after the caret slides.
+    #[test]
+    fn putting_a_chip_in_slides_the_ones_after_it_and_leaves_the_ones_before() {
+        let mut tokens = vec![chip("skl_1", "alpha", 0), chip("skl_2", "beta", 6)];
+        // "gamma " goes in at 6, where `beta` starts.
+        shift_tokens(&mut tokens, 6..6, 6);
+        assert_eq!(tokens[0].range, 0..5, "it sits before the caret");
+        assert_eq!(tokens[1].range, 12..16, "and this one was pushed along");
+
+        // Taking one out again brings the rest back.
+        shift_tokens(&mut tokens, 6..12, 0);
+        assert_eq!(tokens[1].range, 6..10);
+    }
+
+    /// Picking the skill that is already on the draft is nothing happening: the chip is already
+    /// in the message, and a second word for the same skill is one to delete twice.
+    #[test]
+    fn a_skill_already_in_the_message_is_found_before_a_second_chip_goes_in() {
+        let tokens = vec![
+            ComposerToken {
+                kind: TokenKind::Recipe,
+                id: "rcp_1".into(),
+                text: "Weekly report".into(),
+                range: 0..13,
+            },
+            chip("skl_1", "expense-report", 14),
+        ];
+        assert_eq!(skill_chip(&tokens, "skl_1"), Some(1));
+        assert_eq!(
+            skill_chip(&tokens, "rcp_1"),
+            None,
+            "a recipe's chip is not a skill's, whatever the id says"
+        );
+        assert_eq!(skill_chip(&tokens, "skl_2"), None);
     }
 
     #[test]
