@@ -67,6 +67,10 @@ struct ChatFeedRev {
     approvals: Vec<(String, String)>,
     last_output: usize,
     expanded_output: Vec<String>,
+    show_turn_timing: bool,
+    last_finished_ms: Option<u128>,
+    last_timing: bool,
+    timed_count: usize,
 }
 
 impl ChatFeedRev {
@@ -237,6 +241,23 @@ impl ChatFeedRev {
                 ids.sort();
                 ids
             },
+            show_turn_timing: state.show_turn_timing,
+            last_finished_ms: last.and_then(|m| {
+                m.finished_at.and_then(|at| {
+                    at.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_millis())
+                })
+            }),
+            last_timing: last.is_some_and(|m| m.run_timing.is_some()),
+            timed_count: conv
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .filter(|m| m.finished_at.is_some() || m.run_timing.is_some())
+                        .count()
+                })
+                .unwrap_or(0),
         }
     }
 }
@@ -247,6 +268,8 @@ struct ChatRow {
     content: SharedString,
     is_me: bool,
     timestamp: SharedString,
+    duration: SharedString,
+    timing_debug: SharedString,
     is_native_speaking: bool,
     is_native_paused: bool,
     is_native_loading: bool,
@@ -287,6 +310,8 @@ impl ChatRow {
             content: SharedString::from(""),
             is_me: false,
             timestamp: SharedString::from(""),
+            duration: SharedString::from(""),
+            timing_debug: SharedString::from(""),
             is_native_speaking: false,
             is_native_paused: false,
             is_native_loading: false,
@@ -321,6 +346,18 @@ impl ChatRow {
 fn joins_previous_set(rows: &[ChatRow], message_id: &str) -> bool {
     rows.last()
         .is_some_and(|last| !last.screenshots.is_empty() && last.source_id == message_id)
+}
+
+/// Phase lines under an assistant bubble, when Settings → Show turn timing
+/// is on and the harness sent a CUSTOM `run-timing` frame.
+fn timing_debug(state: &AppState, msg: &crate::state::Message) -> String {
+    if msg.is_me || !state.show_turn_timing {
+        return String::new();
+    }
+    msg.run_timing
+        .as_ref()
+        .map(|timing| timing.debug_lines().join("\n"))
+        .unwrap_or_default()
 }
 
 fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
@@ -404,6 +441,8 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 content: SharedString::from(text.clone()),
                 is_me: msg.is_me,
                 timestamp: SharedString::from(msg.formatted_time()),
+                duration: SharedString::from(msg.formatted_duration().unwrap_or_default()),
+                timing_debug: SharedString::from(timing_debug(state, msg)),
                 queued: msg.is_me && state.is_send_queued(&msg.id),
                 is_native_speaking,
                 is_native_paused: state.native_tts.is_paused && is_native_speaking,
@@ -1193,6 +1232,8 @@ impl Render for ChatTranscript {
                                 .bg_color(bg_color)
                                 .text_color(text_color)
                                 .timestamp(row.timestamp.to_string())
+                                .duration(row.duration.to_string())
+                                .timing_debug(row.timing_debug.to_string())
                                 .debug_mode(debug_mode)
                                 .can_read_aloud(can_read_aloud && show_footer)
                                 .is_native_speaking(row.is_native_speaking)

@@ -59,6 +59,7 @@ impl Render for AppSettings {
             tab,
             chord,
             on_send,
+            show_turn_timing,
             theme_mode,
             account_name,
             account_email,
@@ -76,6 +77,7 @@ impl Render for AppSettings {
                 state.app_settings_tab,
                 state.submit_chord,
                 state.on_send,
+                state.show_turn_timing,
                 state.theme_mode.clone(),
                 name,
                 email,
@@ -89,9 +91,10 @@ impl Render for AppSettings {
         // Every tab but Logins and Skills is a titled column of cards. Those two are panes edge
         // to edge, like a passwords app: each takes the whole body and scrolls on its own.
         let cards: Option<AnyElement> = match tab {
-            AppSettingsTab::General => {
-                Some(general_page(chord, on_send, muted, app.clone()).into_any_element())
-            }
+            AppSettingsTab::General => Some(
+                general_page(chord, on_send, show_turn_timing, muted, app.clone())
+                    .into_any_element(),
+            ),
             AppSettingsTab::Profile => Some(
                 profile_page(account_name, account_email, muted, app.clone()).into_any_element(),
             ),
@@ -405,6 +408,7 @@ fn nav_item(
 fn general_page(
     chord: SubmitChord,
     on_send: OnSend,
+    show_turn_timing: bool,
     muted: Hsla,
     app: Entity<AppState>,
 ) -> impl IntoElement {
@@ -482,12 +486,52 @@ fn general_page(
                     "Interrupt and send",
                     "Stops the current turn at its next step, then sends.",
                     on_send == OnSend::Steer,
-                    move |cx| {
-                        app.update(cx, |state, cx| {
-                            state.set_on_send(OnSend::Steer, cx);
-                        });
+                    {
+                        let app = app.clone();
+                        move |cx| {
+                            app.update(cx, |state, cx| {
+                                state.set_on_send(OnSend::Steer, cx);
+                            });
+                        }
                     },
                 )),
+        )
+        .child(div().text_xs().text_color(muted).child("Debug"))
+        .child(
+            card().child(
+                h_flex()
+                    .id("settings-show-turn-timing")
+                    .w_full()
+                    .px(px(16.))
+                    .py(px(14.))
+                    .gap(px(12.))
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(div().text_sm().child("Show turn timing"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x888888))
+                                    .child("Phases of each assistant run: model, each tool, auto-review. Off for demos; the timestamp still shows how long a turn took."),
+                            ),
+                    )
+                    .child(
+                        Switch::new("show-turn-timing")
+                            .checked(show_turn_timing)
+                            .on_click({
+                                let app = app.clone();
+                                move |checked, _, cx| {
+                                    app.update(cx, |state, cx| {
+                                        state.set_show_turn_timing(*checked, cx);
+                                    });
+                                }
+                            }),
+                    ),
+            ),
         )
 }
 
