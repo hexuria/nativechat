@@ -6,6 +6,9 @@ use crate::components::chat_input::sources::{
     ParameterSource, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
+use crate::components::skills::{
+    NOT_YET_RECORDING, NOT_YET_WITH_BOT, empty_line, short_relative_time, skill_matches,
+};
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
     RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode, UserFormFieldKind,
@@ -18,7 +21,7 @@ use crate::opengrok::{
     user_form_use_saved_id,
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
-use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
+use crate::state::{ActiveRecipe, AppSettingsTab, AppState, SkillScope};
 
 pub mod ids {
     pub const WINDOW: &str = "app-window";
@@ -81,6 +84,55 @@ pub mod ids {
     /// `composer-recipe-param-<name>` here, `composer-param-<name>` in the panel.
     pub fn recipe_param(name: &str) -> String {
         format!("composer-recipe-param-{name}")
+    }
+
+    /// Settings → Skills. A SKILL is prose the model reads before it works; a RECIPE is a
+    /// taped replay of clicks. The two are never named by each other's word.
+    pub const SETTINGS_SKILLS: &str = "settings-tab-skills";
+    pub const SKILLS_SEARCH: &str = "settings-skills-search";
+    pub const SKILLS_EMPTY: &str = "settings-skills-empty";
+    pub const SKILLS_ERROR: &str = "settings-skills-error";
+    /// The one button that opens the four ways of making a skill. The four are in the tree
+    /// themselves, so this is not what a driver clicks.
+    pub const SKILL_ADD: &str = "settings-skill-add";
+    pub const SKILL_UPLOAD: &str = "settings-skill-upload";
+    pub const SKILL_WRITE: &str = "settings-skill-write";
+    /// The two nobody has built. They carry the sentence saying what would have to be built, so
+    /// a driver reads the same answer the person reads rather than finding a dead control.
+    pub const SKILL_WITH_BOT: &str = "settings-skill-with-bot";
+    pub const SKILL_RECORD: &str = "settings-skill-record";
+    /// Create a skill: the sheet and its fields.
+    pub const SKILL_SHEET: &str = "settings-skill-add-sheet";
+    pub const SKILL_SHEET_NAME: &str = "settings-skill-add-name";
+    pub const SKILL_SHEET_DESCRIPTION: &str = "settings-skill-add-description";
+    pub const SKILL_SHEET_BODY: &str = "settings-skill-add-body";
+    pub const SKILL_SHEET_CANCEL: &str = "settings-skill-add-cancel";
+    pub const SKILL_SHEET_SAVE: &str = "settings-skill-add-save";
+    /// The way back from an open skill to the whole-width list.
+    pub const SKILL_CLOSE: &str = "settings-skill-close";
+
+    /// One skill's row. The id is the server's, so a driver that made a skill through
+    /// `skill.create` can address the thing it made.
+    pub fn skill(id: &str) -> String {
+        format!("settings-skill-row-{id}")
+    }
+
+    /// Open, on that row's own menu. A second way in to the same pane as the row itself, and
+    /// both are on screen.
+    pub fn skill_open(id: &str) -> String {
+        format!("settings-skill-open-{id}")
+    }
+
+    pub fn skill_delete(id: &str) -> String {
+        format!("settings-skill-delete-{id}")
+    }
+
+    pub fn skill_detail(id: &str) -> String {
+        format!("settings-skill-detail-{id}")
+    }
+
+    pub fn skill_updated(id: &str) -> String {
+        format!("settings-skill-updated-{id}")
     }
 
     /// One routine's row. The id is the schedule's, which is the server's, so a driver that
@@ -222,6 +274,27 @@ pub enum Command {
     /// Settings → Logins → Import, from a file path the driver gives (no picker).
     ImportSiteLogins {
         path: String,
+    },
+    /// Settings → Skills: open the page, pick a side of the toggle, search it, open one skill
+    /// or leave it, write one down, take an upload, drop one.
+    OpenSkills,
+    SetSkillsScope(crate::state::SkillScope),
+    SetSkillsQuery(String),
+    OpenSkill(String),
+    CloseSkill,
+    OpenSkillAdd,
+    CloseSkillAdd,
+    CreateSkill {
+        name: String,
+        description: String,
+        body: String,
+    },
+    /// A `SKILL.md`, or the folder one lives in, by a path the driver gives (no picker).
+    UploadSkill {
+        path: String,
+    },
+    DeleteSkill {
+        id: String,
     },
     /// Settings → Logins: the search field's text, the picked row, the Add sheet, and the
     /// picked row's notes.
@@ -373,6 +446,22 @@ impl Command {
             Self::ImportSiteLogins { path } => {
                 state.import_site_logins(std::path::PathBuf::from(path), cx)
             }
+            Self::OpenSkills => state.open_skills(cx),
+            Self::SetSkillsScope(scope) => state.set_skills_scope(scope, cx),
+            Self::SetSkillsQuery(query) => state.set_skills_query(query, cx),
+            Self::OpenSkill(id) => state.open_skill(id, cx),
+            Self::CloseSkill => state.close_skill(cx),
+            Self::OpenSkillAdd => state.open_skill_add(cx),
+            Self::CloseSkillAdd => state.close_skill_add(cx),
+            Self::CreateSkill {
+                name,
+                description,
+                body,
+            } => {
+                state.create_skill(name, description, body, cx);
+            }
+            Self::UploadSkill { path } => state.upload_skill(std::path::PathBuf::from(path), cx),
+            Self::DeleteSkill { id } => state.delete_skill(id, cx),
             Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),
             Self::SelectSiteLogin(id) => state.select_site_login(id, cx),
             Self::OpenSiteLoginAdd => state.open_site_login_add(cx),
@@ -514,8 +603,8 @@ fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> 
 fn not_editable(target: &str) -> String {
     format!(
         "`{target}` is not editable (composer, login-email, login-password, \
-         user-form-field-*, settings-logins-search, settings-login-notes-*, or \"\" for \
-         whatever holds the caret)"
+         user-form-field-*, settings-logins-search, settings-skills-search, \
+         settings-login-notes-*, or \"\" for whatever holds the caret)"
     )
 }
 
@@ -708,6 +797,22 @@ struct RecipeSnap {
     name: String,
     /// A share waiting on Accept or Decline.
     pending: bool,
+}
+
+/// One row of Settings → Skills. A skill is prose the model reads before it works, which is
+/// why the row carries its description: that sentence is what the model chooses by, and a
+/// driver checking that a skill was written down checks the words, not a count.
+#[derive(Clone)]
+struct SkillSnap {
+    id: String,
+    name: String,
+    /// `authored`, `uploaded` or `taught` — where the prose came from, as a state on the row so
+    /// an assert does not have to match a sentence.
+    source: &'static str,
+    description: String,
+    updated_at_ms: i64,
+    /// Named and kept, with no prose in it yet, so there is nothing to invoke.
+    draft: bool,
 }
 
 /// One routine on the open bot's Computer pane, which is one schedule on the server.
@@ -1032,6 +1137,37 @@ fn site_login_detail_node(login: &SiteLoginSnap) -> UiNode {
     ))
 }
 
+/// One row of the list: what the skill is called and what it is for, with where its prose came
+/// from as a state. A draft says so, because a skill with no prose in it cannot be invoked and
+/// that is the one thing worth knowing about it.
+fn skill_node(skill: &SkillSnap, open: bool) -> UiNode {
+    let mut node = UiNode::listitem(ids::skill(&skill.id), skill.name.clone())
+        .with_value(skill.description.clone());
+    node.states.push(skill.source.to_string());
+    if skill.draft {
+        node.states.push("draft".to_string());
+    }
+    if open {
+        node.states.push("selected".to_string());
+    }
+    node.with_child(UiNode::button(ids::skill_delete(&skill.id), "Delete"))
+}
+
+/// The pane for the open skill: how stale it is, and the way out of it. The prose itself is not
+/// here — it is the row's `value` on the list — so the pane is the controls and the facts.
+fn skill_detail_node(skill: &SkillSnap) -> UiNode {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let updated = if skill.updated_at_ms > 0 {
+        short_relative_time(skill.updated_at_ms, now_ms)
+    } else {
+        "never".to_string()
+    };
+    UiNode::dialog(ids::skill_detail(&skill.id), skill.name.clone())
+        .with_child(UiNode::status(ids::skill_updated(&skill.id), "Updated").with_value(updated))
+        .with_child(UiNode::button(ids::skill_delete(&skill.id), "Delete"))
+        .with_child(UiNode::button(ids::SKILL_CLOSE, "Close"))
+}
+
 /// A recipe row's id, and only a row's. Every control on the recipe page is named
 /// `recipe-<something>` too, so a bare prefix match turned a click on a version tab into a
 /// fetch of a recipe called "version-1" — the page then said "no such recipe" and the driver
@@ -1164,6 +1300,17 @@ pub struct NativeChatHost {
     site_login_query: String,
     site_login_selected: Option<String>,
     site_login_add_open: bool,
+    /// Settings → Skills, as that page has it: the library for the open side of the toggle, a
+    /// count for each side, the search, the skill on the pane and the Create sheet.
+    skills: Vec<SkillSnap>,
+    skills_tab: bool,
+    skills_query: String,
+    skills_scope: crate::state::SkillScope,
+    skills_counts: crate::state::SkillCounts,
+    skills_loading: bool,
+    skills_error: Option<String>,
+    skill_open: Option<String>,
+    skill_add_open: bool,
     computer_tab: bool,
     updates_tab: bool,
     /// Dedicated provisioned box: Route traffic icon on the Computer pane.
@@ -1484,6 +1631,26 @@ impl NativeChatHost {
                     row: row.clone(),
                 })
                 .collect(),
+            skills: state
+                .skills
+                .iter()
+                .map(|skill| SkillSnap {
+                    id: skill.id.clone(),
+                    name: skill.name.clone(),
+                    source: skill.source.word(),
+                    description: skill.description.clone(),
+                    updated_at_ms: skill.updated_at_ms,
+                    draft: skill.draft,
+                })
+                .collect(),
+            skills_tab: state.app_settings_tab == AppSettingsTab::Skills,
+            skills_query: state.skills_query.clone(),
+            skills_scope: state.skills_scope,
+            skills_counts: state.skills_counts,
+            skills_loading: state.skills_loading,
+            skills_error: state.skills_error.clone(),
+            skill_open: state.skill_open_id.clone(),
+            skill_add_open: state.skill_add_open,
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
             site_login_notice: state.site_login_notice.clone(),
             site_login_error: state.site_login_error.clone(),
@@ -1819,9 +1986,13 @@ impl NativeChatHost {
                             .with_child(UiNode::button("app-settings-back", "← Back to app"))
                             .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
-                            .with_child(UiNode::button("settings-tab-logins", "Logins"));
+                            .with_child(UiNode::button("settings-tab-logins", "Logins"))
+                            .with_child(UiNode::button(ids::SETTINGS_SKILLS, "Skills"));
                         if self.logins_tab {
                             settings = self.logins_nodes(settings);
+                        }
+                        if self.skills_tab {
+                            settings = self.skills_nodes(settings);
                         }
                         if self.updates_tab {
                             settings = settings.with_child(UiNode::button(
@@ -2176,6 +2347,153 @@ impl NativeChatHost {
         settings
     }
 
+    /// Settings → Skills as the page draws it: the toggle with a count on each side, the
+    /// search field, Add and the four things it offers, the rows the search leaves, the open
+    /// skill's pane, and the Create sheet while it is up.
+    fn skills_nodes(&self, mut settings: UiNode) -> UiNode {
+        for side in SkillScope::ALL {
+            let mut chip = UiNode::button(
+                side.element_id(),
+                format!("{} {}", side.label(), self.skills_counts.of(side)),
+            );
+            if side == self.skills_scope {
+                chip.states.push("selected".to_string());
+            }
+            settings = settings.with_child(chip);
+        }
+        settings = settings
+            .with_child(
+                UiNode::textbox(ids::SKILLS_SEARCH, "Search skills")
+                    .with_value(self.skills_query.clone()),
+            )
+            .with_child(UiNode::button(ids::SKILL_ADD, "Add"))
+            .with_child(UiNode::button(ids::SKILL_UPLOAD, "Upload skill"))
+            .with_child(UiNode::button(ids::SKILL_WRITE, "Create a skill"))
+            // The two nobody has built are statuses carrying their own sentence, not buttons:
+            // what a driver needs from them is the answer, which is the same answer the person
+            // reads in the menu.
+            .with_child(UiNode::status(ids::SKILL_WITH_BOT, NOT_YET_WITH_BOT))
+            .with_child(UiNode::status(ids::SKILL_RECORD, NOT_YET_RECORDING));
+        if let Some(error) = &self.skills_error {
+            settings = settings.with_child(UiNode::status(ids::SKILLS_ERROR, error.clone()));
+        }
+        let rows: Vec<&SkillSnap> = self
+            .skills
+            .iter()
+            .filter(|skill| skill_matches(&skill.name, &skill.description, &self.skills_query))
+            .collect();
+        if rows.is_empty() {
+            settings = settings.with_child(UiNode::status(
+                ids::SKILLS_EMPTY,
+                empty_line(self.skills_loading, self.skills.len(), self.skills_scope),
+            ));
+        }
+        let mut list = UiNode::list("settings-skills-rows", "Skills");
+        for skill in &rows {
+            list = list.with_child(skill_node(
+                skill,
+                self.skill_open.as_deref() == Some(&skill.id),
+            ));
+        }
+        settings = settings.with_child(list);
+        // The pane stays on the open skill even when a search hides its row.
+        if let Some(open) = self
+            .skill_open
+            .as_ref()
+            .and_then(|id| self.skills.iter().find(|skill| &skill.id == id))
+        {
+            settings = settings.with_child(skill_detail_node(open));
+        }
+        if self.skill_add_open {
+            settings = settings.with_child(
+                UiNode::dialog(ids::SKILL_SHEET, "New skill")
+                    .with_child(UiNode::textbox(ids::SKILL_SHEET_NAME, "Name"))
+                    .with_child(UiNode::textbox(ids::SKILL_SHEET_DESCRIPTION, "Description"))
+                    .with_child(UiNode::textbox(ids::SKILL_SHEET_BODY, "Instructions"))
+                    .with_child(UiNode::button(ids::SKILL_SHEET_CANCEL, "Cancel"))
+                    .with_child(UiNode::button(ids::SKILL_SHEET_SAVE, "Save")),
+            );
+        }
+        settings
+    }
+
+    /// The skill an invoke names, checked against the ones the page has: an id nobody is showing
+    /// is a wrong address, and saying so is better than a call going out under it.
+    fn skill_id(&self, id: &str) -> Option<String> {
+        self.skills
+            .iter()
+            .find(|skill| skill.id == id)
+            .map(|skill| skill.id.clone())
+    }
+
+    fn invoke_skill_id(&self, args: &serde_json::Value, invoke: &str) -> Result<String, String> {
+        let id = invoke_arg_str(args, &["id", "skill_id", "skillId"])
+            .ok_or_else(|| format!("{invoke} requires arg id"))?;
+        self.skill_id(&id)
+            .ok_or_else(|| format!("no skill `{id}` on Settings → Skills"))
+    }
+
+    /// The search field on Settings → Skills: the host keeps the copy the list filters by.
+    fn set_skills_query(&mut self, value: String) -> Result<DispatchResult, String> {
+        self.skills_query = value.clone();
+        self.pending = Some(Command::SetSkillsQuery(value));
+        Ok(DispatchResult::empty())
+    }
+
+    /// One of the Skills page's controls, or `None` for a target that is not one.
+    ///
+    /// Every fixed id is matched whole and the rows are matched on a prefix that ends in a word
+    /// of its own. The section's ids and its rows' differ by one letter — `settings-skills-` and
+    /// `settings-skill-` — so a bare prefix match would read the search field as a row.
+    fn skill_command(&self, target: &str) -> Option<Result<Command, String>> {
+        for side in SkillScope::ALL {
+            if target == side.element_id() {
+                return Some(Ok(Command::SetSkillsScope(side)));
+            }
+        }
+        for prefix in ["settings-skill-row-", "settings-skill-open-"] {
+            if let Some(id) = target.strip_prefix(prefix) {
+                return Some(
+                    self.skill_id(id)
+                        .map(Command::OpenSkill)
+                        .ok_or_else(|| format!("no skill `{id}`")),
+                );
+            }
+        }
+        if let Some(id) = target.strip_prefix("settings-skill-delete-") {
+            return Some(
+                self.skill_id(id)
+                    .map(|id| Command::DeleteSkill { id })
+                    .ok_or_else(|| format!("no skill `{id}`")),
+            );
+        }
+        match target {
+            ids::SETTINGS_SKILLS => Some(Ok(Command::SetAppSettingsTab(AppSettingsTab::Skills))),
+            ids::SKILL_WRITE => Some(Ok(Command::OpenSkillAdd)),
+            ids::SKILL_SHEET_CANCEL => Some(Ok(Command::CloseSkillAdd)),
+            ids::SKILL_CLOSE => Some(Ok(Command::CloseSkill)),
+            ids::SKILL_ADD => Some(Err(
+                "`settings-skill-add` opens a menu: click what you want from it \
+                 (`settings-skill-write`), or use `skill.create` / `skill.upload`"
+                    .to_string(),
+            )),
+            ids::SKILL_UPLOAD => Some(Err(
+                "`settings-skill-upload` opens a file picker: use `skill.upload --arg path=` \
+                 with a SKILL.md or the folder one lives in"
+                    .to_string(),
+            )),
+            // The sheet's fields are the window's own; the driver hands the values over.
+            ids::SKILL_SHEET_SAVE => Some(Err(
+                "`settings-skill-add-save` reads the sheet's fields, which the driver cannot \
+                 type into: use `skill.create --arg name= [--arg description= --arg body=]`"
+                    .to_string(),
+            )),
+            ids::SKILL_WITH_BOT => Some(Err(NOT_YET_WITH_BOT.to_string())),
+            ids::SKILL_RECORD => Some(Err(NOT_YET_RECORDING.to_string())),
+            _ => None,
+        }
+    }
+
     fn site_login_id(&self, id: &str) -> Option<String> {
         self.site_logins
             .iter()
@@ -2403,6 +2721,8 @@ impl NativeChatHost {
             cmd
         } else if let Some(cmd) = self.save_login_command(target) {
             cmd
+        } else if let Some(cmd) = self.skill_command(target) {
+            cmd?
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
         } else if target == "settings-tab-computer" {
@@ -2478,6 +2798,9 @@ impl NativeChatHost {
         if target == "settings-logins-search" {
             return self.set_site_login_query(value.to_string());
         }
+        if target == ids::SKILLS_SEARCH {
+            return self.set_skills_query(value.to_string());
+        }
         if let Some(result) = self.set_site_login_notes(target, value) {
             return result;
         }
@@ -2504,6 +2827,9 @@ impl NativeChatHost {
         if target == "settings-logins-search" {
             return self.set_site_login_query(format!("{}{text}", self.site_login_query));
         }
+        if target == ids::SKILLS_SEARCH {
+            return self.set_skills_query(format!("{}{text}", self.skills_query));
+        }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
             keys: text_tokens(text)?,
@@ -2515,6 +2841,20 @@ impl NativeChatHost {
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
             return self.login_key(field, target, key);
+        }
+        if target == ids::SKILLS_SEARCH {
+            return match key_token(key)?.as_str() {
+                "backspace" => {
+                    let mut value = self.skills_query.clone();
+                    value.pop();
+                    self.set_skills_query(value)
+                }
+                // The list filters as the text changes; Enter has nothing left to do.
+                "enter" => Ok(DispatchResult::empty()),
+                other => Err(format!(
+                    "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                )),
+            };
         }
         if target == "settings-logins-search" {
             return match key_token(key)?.as_str() {
@@ -2950,6 +3290,39 @@ impl NativeChatHost {
                     cron: cron.filter(|_| kind == crate::opengrok::ScheduleKind::Cron),
                 }
             }
+            // Settings → Skills. A skill is prose the model reads before it works; `recipe.*`
+            // is the taped replay of clicks, and the two verbs never cross.
+            "skills.open" => Command::OpenSkills,
+            "skills.scope" => {
+                let word = invoke_arg_str(args, &["scope", "side"])
+                    .ok_or_else(|| "skills.scope requires arg scope".to_string())?;
+                Command::SetSkillsScope(
+                    SkillScope::from_word(&word).ok_or_else(|| {
+                        format!("unknown skills scope `{word}` (yours, discover)")
+                    })?,
+                )
+            }
+            // No `q` clears the search.
+            "skills.search" => {
+                let query = invoke_arg_str(args, &["q", "query"]).unwrap_or_default();
+                return self.set_skills_query(query);
+            }
+            "skill.open" => Command::OpenSkill(self.invoke_skill_id(args, "skill.open")?),
+            "skill.create" => Command::CreateSkill {
+                name: invoke_arg_str(args, &["name"])
+                    .ok_or_else(|| "skill.create requires arg name".to_string())?,
+                description: invoke_arg_str(args, &["description"]).unwrap_or_default(),
+                // No body writes the row and leaves it a draft, which is what the sheet does
+                // with the instructions left empty.
+                body: invoke_arg_str(args, &["body", "instructions"]).unwrap_or_default(),
+            },
+            "skill.upload" => Command::UploadSkill {
+                path: invoke_arg_str(args, &["path", "file", "folder"])
+                    .ok_or_else(|| "skill.upload requires arg path".to_string())?,
+            },
+            "skill.delete" => Command::DeleteSkill {
+                id: self.invoke_skill_id(args, "skill.delete")?,
+            },
             "routine.rotate" => Command::RotateRoutineWebhook {
                 routine_id: self.invoke_routine_id(args, "routine.rotate")?,
             },
@@ -3252,6 +3625,318 @@ mod tests {
             host.take_command().unwrap(),
             Command::CreateRoutine { kind, cron, .. }
                 if kind == crate::opengrok::ScheduleKind::Webhook && cron.is_none()
+        ));
+    }
+
+    fn skill(id: &str, name: &str, description: &str) -> SkillSnap {
+        SkillSnap {
+            id: id.into(),
+            name: name.into(),
+            source: "authored",
+            description: description.into(),
+            updated_at_ms: 1_700_000_000_000,
+            draft: false,
+        }
+    }
+
+    /// A host with Settings open on Skills and two of them listed.
+    fn skills_host() -> NativeChatHost {
+        let mut host = host();
+        host.account_open = true;
+        host.skills_tab = true;
+        host.skills = vec![
+            skill("skl_1", "expense-report", "How we file expenses"),
+            skill(
+                "skl_2",
+                "new-hire",
+                "First week for somebody who just joined",
+            ),
+        ];
+        host.skills_counts = crate::state::SkillCounts {
+            yours: 2,
+            discover: 5,
+        };
+        host
+    }
+
+    /// The tree is the page: both sides of the toggle with their counts, the search field with
+    /// what is in it, and a row per skill carrying what that skill is for.
+    #[test]
+    fn the_skills_tab_reads_as_the_page_reads() {
+        let host = skills_host();
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(SkillScope::Yours.element_id()).unwrap().name,
+            "Yours 2"
+        );
+        let discover = tree.find(SkillScope::Discover.element_id()).unwrap();
+        assert_eq!(discover.name, "Discover 5");
+        assert!(
+            !discover.states.contains(&"selected".to_string()),
+            "the side that is not open is not the one marked"
+        );
+        assert!(
+            tree.find(SkillScope::Yours.element_id())
+                .unwrap()
+                .states
+                .contains(&"selected".to_string())
+        );
+        let row = tree.find(&ids::skill("skl_1")).unwrap();
+        assert_eq!(row.name, "expense-report");
+        assert_eq!(
+            row.value.as_deref(),
+            Some("How we file expenses"),
+            "the description is what the model chooses by, so it is what a driver can assert on"
+        );
+        assert!(row.states.contains(&"authored".to_string()));
+        assert!(tree.find(&ids::skill_delete("skl_1")).is_some());
+        assert!(tree.find(ids::SKILLS_EMPTY).is_none());
+    }
+
+    /// A skill with no prose in it cannot be invoked, and that is the one thing worth knowing
+    /// about it — so it is a state, not something to be worked out from a count.
+    #[test]
+    fn a_draft_says_so_on_its_row() {
+        let mut host = skills_host();
+        host.skills[1].draft = true;
+        host.skills[1].source = "uploaded";
+        let tree = host.snapshot();
+        assert!(
+            !tree
+                .find(&ids::skill("skl_1"))
+                .unwrap()
+                .states
+                .contains(&"draft".to_string())
+        );
+        let draft = tree.find(&ids::skill("skl_2")).unwrap();
+        assert!(draft.states.contains(&"draft".to_string()));
+        assert!(draft.states.contains(&"uploaded".to_string()));
+    }
+
+    /// The tree lists the rows the search leaves, exactly the rows the screen has: a driver
+    /// shown a row nobody can see would click something that is not there.
+    #[test]
+    fn the_search_leaves_the_driver_the_same_rows_it_leaves_the_screen() {
+        let mut host = skills_host();
+        host.dispatch(&Op::Invoke {
+            name: "skills.search".into(),
+            args: serde_json::json!({ "q": "joined" }),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillsQuery(query) if query == "joined"
+        ));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::SKILLS_SEARCH).unwrap().value.as_deref(),
+            Some("joined")
+        );
+        assert!(tree.find(&ids::skill("skl_2")).is_some());
+        assert!(tree.find(&ids::skill("skl_1")).is_none());
+        // Nothing left is a sentence about the search, not about the library.
+        host.skills_query = "payroll".into();
+        assert_eq!(
+            host.snapshot().find(ids::SKILLS_EMPTY).unwrap().name,
+            "No skills match."
+        );
+    }
+
+    /// The pane stays on the open skill even when a search hides its row.
+    #[test]
+    fn the_open_skill_keeps_its_pane_behind_a_search() {
+        let mut host = skills_host();
+        host.skill_open = Some("skl_1".into());
+        host.skills_query = "joined".into();
+        let tree = host.snapshot();
+        assert!(tree.find(&ids::skill("skl_1")).is_none());
+        let pane = tree.find(&ids::skill_detail("skl_1")).unwrap();
+        assert_eq!(pane.name, "expense-report");
+        assert!(tree.find(&ids::skill_updated("skl_1")).is_some());
+        assert!(tree.find(ids::SKILL_CLOSE).is_some());
+    }
+
+    /// Each control goes where it says it goes, and the two that open something the driver
+    /// cannot work say what to use instead rather than opening it.
+    #[test]
+    fn the_skills_controls_go_where_they_say() {
+        let mut host = skills_host();
+        let opened = |host: &mut NativeChatHost, target: &str| {
+            host.click(target).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            opened(&mut host, &ids::skill("skl_2")),
+            Command::OpenSkill(id) if id == "skl_2"
+        ));
+        assert!(matches!(
+            opened(&mut host, &ids::skill_open("skl_2")),
+            Command::OpenSkill(id) if id == "skl_2"
+        ));
+        assert!(matches!(
+            opened(&mut host, &ids::skill_delete("skl_1")),
+            Command::DeleteSkill { id } if id == "skl_1"
+        ));
+        assert!(matches!(
+            opened(&mut host, SkillScope::Discover.element_id()),
+            Command::SetSkillsScope(SkillScope::Discover)
+        ));
+        assert!(matches!(
+            opened(&mut host, ids::SKILL_WRITE),
+            Command::OpenSkillAdd
+        ));
+        assert!(matches!(
+            opened(&mut host, ids::SKILL_CLOSE),
+            Command::CloseSkill
+        ));
+        assert!(matches!(
+            opened(&mut host, ids::SETTINGS_SKILLS),
+            Command::SetAppSettingsTab(AppSettingsTab::Skills)
+        ));
+        // The picker and the sheet's fields belong to the window; the verbs take the values.
+        assert!(
+            host.click(ids::SKILL_UPLOAD)
+                .unwrap_err()
+                .contains("skill.upload")
+        );
+        assert!(
+            host.click(ids::SKILL_SHEET_SAVE)
+                .unwrap_err()
+                .contains("skill.create")
+        );
+        assert!(host.click(ids::SKILL_ADD).unwrap_err().contains("menu"));
+    }
+
+    /// The two ways nobody has built are in the tree with the sentence saying what would have
+    /// to be built, and clicking one answers with that sentence rather than doing nothing.
+    #[test]
+    fn the_ways_nobody_built_say_what_is_missing() {
+        let mut host = skills_host();
+        let tree = host.snapshot();
+        assert!(
+            tree.find(ids::SKILL_WITH_BOT)
+                .unwrap()
+                .name
+                .starts_with("Not yet")
+        );
+        assert!(
+            tree.find(ids::SKILL_RECORD)
+                .unwrap()
+                .name
+                .contains("recipe")
+        );
+        assert!(
+            host.click(ids::SKILL_RECORD)
+                .unwrap_err()
+                .starts_with("Not yet")
+        );
+        assert!(
+            host.take_command().is_none(),
+            "nothing was asked of the app"
+        );
+    }
+
+    /// Every verb parses its args, and a missing one is named rather than guessed at.
+    #[test]
+    fn the_skills_verbs_take_what_they_need() {
+        let mut host = skills_host();
+        let done = |host: &mut NativeChatHost, name: &str, args: serde_json::Value| {
+            host.invoke(name, &args).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            done(&mut host, "skills.open", serde_json::json!({})),
+            Command::OpenSkills
+        ));
+        assert!(matches!(
+            done(
+                &mut host,
+                "skills.scope",
+                serde_json::json!({"scope": "discover"})
+            ),
+            Command::SetSkillsScope(SkillScope::Discover)
+        ));
+        assert!(matches!(
+            done(&mut host, "skill.open", serde_json::json!({"id": "skl_1"})),
+            Command::OpenSkill(id) if id == "skl_1"
+        ));
+        assert!(matches!(
+            done(
+                &mut host,
+                "skill.create",
+                serde_json::json!({"name": "expense-report", "body": "Ask for the receipt."})
+            ),
+            Command::CreateSkill { name, description, body }
+                if name == "expense-report"
+                    && description.is_empty()
+                    && body == "Ask for the receipt."
+        ));
+        assert!(matches!(
+            done(&mut host, "skill.upload", serde_json::json!({"path": "/tmp/skill"})),
+            Command::UploadSkill { path } if path == "/tmp/skill"
+        ));
+        assert!(matches!(
+            done(&mut host, "skill.delete", serde_json::json!({"id": "skl_2"})),
+            Command::DeleteSkill { id } if id == "skl_2"
+        ));
+
+        assert_eq!(
+            host.invoke("skill.create", &serde_json::json!({}))
+                .unwrap_err(),
+            "skill.create requires arg name"
+        );
+        assert_eq!(
+            host.invoke("skill.upload", &serde_json::json!({}))
+                .unwrap_err(),
+            "skill.upload requires arg path"
+        );
+        assert_eq!(
+            host.invoke("skill.delete", &serde_json::json!({}))
+                .unwrap_err(),
+            "skill.delete requires arg id"
+        );
+        assert!(
+            host.invoke("skills.scope", &serde_json::json!({"scope": "mine"}))
+                .unwrap_err()
+                .contains("yours, discover"),
+            "the toggle is named by what it says, not by the word on the wire"
+        );
+    }
+
+    /// An id nobody is showing is a wrong address, and saying so beats sending a delete under
+    /// it.
+    #[test]
+    fn a_skill_the_page_does_not_have_is_not_a_target() {
+        let mut host = skills_host();
+        assert!(host.click(&ids::skill("skl_9")).is_err());
+        assert!(host.click(&ids::skill_delete("skl_9")).is_err());
+        assert!(
+            host.invoke("skill.delete", &serde_json::json!({"id": "skl_9"}))
+                .unwrap_err()
+                .contains("no skill `skl_9`")
+        );
+    }
+
+    /// Typing into the field is typing into the field: the host keeps the copy the list filters
+    /// by, so the tree answers with what was typed without a round trip through the app.
+    #[test]
+    fn the_skills_search_takes_keys_the_way_the_logins_one_does() {
+        let mut host = skills_host();
+        host.dispatch(&Op::type_text(ids::SKILLS_SEARCH, "expen"))
+            .unwrap();
+        assert_eq!(host.skills_query, "expen");
+        host.dispatch(&Op::key(ids::SKILLS_SEARCH, "Backspace"))
+            .unwrap();
+        assert_eq!(host.skills_query, "expe");
+        host.dispatch(&Op::SetValue {
+            target: ids::SKILLS_SEARCH.into(),
+            value: "new".into(),
+        })
+        .unwrap();
+        assert_eq!(host.skills_query, "new");
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillsQuery(query) if query == "new"
         ));
     }
 

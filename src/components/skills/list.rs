@@ -109,7 +109,7 @@ pub(super) fn render(
 
 /// What the list says when it has nothing to show: still fetching, nothing here at all, or a
 /// search that matched none of what is here. Three different facts, never the same sentence.
-fn empty_line(loading: bool, listed: usize, scope: SkillScope) -> &'static str {
+pub(crate) fn empty_line(loading: bool, listed: usize, scope: SkillScope) -> &'static str {
     if loading && listed == 0 {
         return "Loading…";
     }

@@ -20,6 +20,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 pub use add_sheet::AddSheetInputs;
+pub(crate) use list::{NOT_YET_RECORDING, NOT_YET_WITH_BOT, empty_line};
 
 pub struct SkillsPage {
     state: Entity<AppState>,
@@ -125,15 +126,20 @@ pub(crate) fn matching_skills<'a>(
     skills: &'a [SkillSummary],
     query: &str,
 ) -> Vec<&'a SkillSummary> {
-    let needle = query.trim().to_lowercase();
     skills
         .iter()
-        .filter(|skill| {
-            needle.is_empty()
-                || skill.name.to_lowercase().contains(&needle)
-                || skill.description.to_lowercase().contains(&needle)
-        })
+        .filter(|skill| skill_matches(&skill.name, &skill.description, query))
         .collect()
+}
+
+/// Whether one skill is left by the search. The rule itself, apart from the rows, because the
+/// page filters the server's summaries and the driver's tree filters its own snapshots of them
+/// — and a tree that listed a different set of rows than the screen would be worse than none.
+pub(crate) fn skill_matches(name: &str, description: &str, query: &str) -> bool {
+    let needle = query.trim().to_lowercase();
+    needle.is_empty()
+        || name.to_lowercase().contains(&needle)
+        || description.to_lowercase().contains(&needle)
 }
 
 /// "6d ago", for the one-line column at the end of a row.
