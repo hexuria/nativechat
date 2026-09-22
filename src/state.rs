@@ -15,11 +15,11 @@ use crate::opengrok::{
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, ImageVisibility,
     LocalExecMode, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient,
-    OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind,
-    ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary,
-    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    OpenGrokError, PendingUserMessage, PendingWrite, ProfileUpdate, QueuedApproval, RecipeDetail,
+    RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary,
+    ReplyQuote, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
+    ScheduleKind, ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
+    SkillSummary, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
     UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
@@ -539,6 +539,7 @@ fn held_message(
         recipe,
         skill,
         reply,
+        pending_id: None,
     }
 }
 
@@ -557,12 +558,108 @@ pub struct QueuedSend {
     skill: Option<String>,
     /// The message this one answers, for the quote the coworker is sent.
     reply: Option<ReplyTo>,
+    /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
+    /// OpenGrok that has not shipped pending-user-messages yet.
+    pending_id: Option<String>,
 }
 
 /// What a user-message write should put on disk, as memory stands when the write actually runs.
 struct UserMessagePersist {
     content: String,
     hidden: bool,
+}
+
+/// What to do with a `pum_…` after enqueue returns, once memory has had a chance to cancel
+/// or edit in the meantime.
+#[derive(Debug)]
+enum BindPending {
+    Bound,
+    Patch { pending_id: String, content: String },
+    TakeBack { pending_id: String },
+}
+
+#[derive(Default)]
+struct PendingFold {
+    save: Vec<QueuedBubbleSave>,
+    hide: Vec<String>,
+    cancel: Vec<String>,
+}
+
+struct QueuedBubbleSave {
+    id: String,
+    content: String,
+    reply: Option<ReplyTo>,
+    sent_at: SystemTime,
+    insert: bool,
+}
+
+fn reply_json(reply: &ReplyTo) -> serde_json::Value {
+    serde_json::json!({
+        "messageId": reply.message_id,
+        "preview": reply.preview,
+        "isMe": reply.is_me,
+    })
+}
+
+fn reply_from_pending(value: Option<&serde_json::Value>) -> Option<ReplyTo> {
+    let value = value?;
+    if let Some(id) = value.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(ReplyTo {
+            message_id: id.to_string(),
+            preview: String::new(),
+            is_me: false,
+        });
+    }
+    let object = value.as_object()?;
+    let message_id = object
+        .get("messageId")
+        .or_else(|| object.get("message_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    Some(ReplyTo {
+        message_id,
+        preview: object
+            .get("preview")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_me: object
+            .get("isMe")
+            .or_else(|| object.get("is_me"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+fn recipe_from_pending(item: &PendingUserMessage) -> Option<TurnRecipe> {
+    let id = item
+        .recipe_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let values = item
+        .recipe_values
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    Some(TurnRecipe { id, values })
+}
+
+fn bubble_awaits_reply(conversation: &Conversation, message_id: &str) -> bool {
+    let Some(index) = conversation
+        .messages
+        .iter()
+        .position(|message| message.id == message_id)
+    else {
+        return true;
+    };
+    !conversation.messages[index + 1..]
+        .iter()
+        .any(|message| !message.hidden && !message.is_me)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1627,6 +1724,9 @@ pub struct AppState {
     pub on_send: OnSend,
     /// Messages held per thread until it is idle, in the order they were typed.
     queued_sends: HashMap<String, VecDeque<QueuedSend>>,
+    /// Bubble ids this process took off the queue. Hydrate must not put them back: a
+    /// GET that raced the DELETE would otherwise restore a send the person just canceled.
+    canceled_pending: HashSet<String>,
     /// Words Edit on a queued bubble put back in the composer. The composer takes them on
     /// the next paint, once, because the bubble they came from is already gone.
     pending_composer: Option<String>,
@@ -2167,6 +2267,7 @@ impl AppState {
             submit_chord: SubmitChord::Enter,
             on_send: OnSend::default(),
             queued_sends: HashMap::new(),
+            canceled_pending: HashSet::new(),
             pending_composer: None,
             audio_input: None,
             sidebar_collapsed: false,
@@ -3415,6 +3516,9 @@ impl AppState {
         self.reconnect_epoch += 1;
         if self.is_signed_in() {
             self.refresh_coworkers(cx);
+        }
+        if let Some(id) = self.active_conversation_id.clone() {
+            self.hydrate_pending_user_messages(&id, cx);
         }
         cx.notify();
     }
@@ -5819,7 +5923,11 @@ impl AppState {
         // Dequeue first. A held send whose bubble is already gone used to stay in
         // `queued_sends` and still post when the thread went idle; the pop has to happen
         // before this function returns so a drain later in the same tick finds nothing.
-        self.dequeue_send(message_id);
+        let thread = self.thread_holding(message_id);
+        let held = self.dequeue_send(message_id);
+        if let (Some(thread), Some(held)) = (thread, held) {
+            self.drop_server_pending(&thread, &held, cx);
+        }
         if self.native_tts.message_id.as_deref() == Some(message_id) {
             if let Some(service) = &self.tts_service {
                 service.stop_native();
@@ -6742,6 +6850,7 @@ impl AppState {
                         state.hide_withheld_runs(&conversation_id, &thread, cx);
                         state.apply_thread_replay(&conversation_id, &thread, cx);
                         state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        state.apply_pending_from_replay(&conversation_id, &thread, cx);
                     }
                     Err(_) => {
                         state.reconciled_threads.remove(&conversation_id);
@@ -7249,11 +7358,12 @@ impl AppState {
         // sent, and what the composer is holding now belongs to the message still being
         // written. Taking it here sent somebody's skill on a turn they never attached it to
         // and left the chip standing over a draft with nothing behind it.
-        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, cx);
+        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, None, cx);
     }
 
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
-    /// replaces: it is stopped on the wire before the turn is posted.
+    /// replaces: it is stopped on the wire before the turn is posted. `pending_id` is the
+    /// queued row this turn is firing, when it came off `queued_sends`.
     fn send_opengrok_turn_with(
         &mut self,
         conversation_id: String,
@@ -7261,6 +7371,8 @@ impl AppState {
         recipe: Option<TurnRecipe>,
         skill: Option<String>,
         stop_first: Option<String>,
+        pending_id: Option<String>,
+        queued_message_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -7362,6 +7474,7 @@ impl AppState {
                             &history,
                             recipe.as_ref(),
                             skill.as_deref(),
+                            pending_id.as_deref(),
                             |event| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
@@ -7499,6 +7612,38 @@ impl AppState {
                         cx.notify();
                         return;
                     }
+                }
+                if let Err(error) = &result
+                    && (error.is_already_consumed() || error.is_not_pending())
+                {
+                    // Another machine already fired or canceled this hold. The empty
+                    // assistant row this turn minted is not an answer.
+                    if let Some(conversation) = state
+                        .conversations
+                        .iter_mut()
+                        .find(|conversation| conversation.id == conversation_id)
+                    {
+                        conversation
+                            .messages
+                            .retain(|message| message.id != reply_id);
+                        if error.is_not_pending()
+                            && let Some(user_id) = queued_message_id.as_deref()
+                            && let Some(message) = conversation
+                                .messages
+                                .iter_mut()
+                                .find(|message| message.id == user_id)
+                        {
+                            message.hidden = true;
+                        }
+                    }
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    if error.is_already_consumed() {
+                        state.reconcile_thread(&conversation_id, cx);
+                    }
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
                 }
                 if let Some(message) =
                     streaming_message_mut(&mut state.conversations, &conversation_id, &reply_id)
@@ -10696,15 +10841,24 @@ impl AppState {
             // first — the row reads as a message that got no answer, which is what it is.
             SendPlan::Queue => {
                 self.queued_sends
-                    .entry(conversation_id)
+                    .entry(conversation_id.clone())
                     .or_default()
                     .push_back(held_message(
-                        local_id,
-                        content,
-                        recipe,
-                        skill,
-                        reply_for_queue,
+                        local_id.clone(),
+                        content.clone(),
+                        recipe.clone(),
+                        skill.clone(),
+                        reply_for_queue.clone(),
                     ));
+                self.sync_queued_send_to_server(
+                    conversation_id,
+                    local_id,
+                    content,
+                    recipe,
+                    skill,
+                    reply_for_queue,
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -10719,7 +10873,16 @@ impl AppState {
                 }
             }
         }
-        self.send_opengrok_turn_with(conversation_id, content, recipe, skill, stop_first, cx);
+        self.send_opengrok_turn_with(
+            conversation_id,
+            content,
+            recipe,
+            skill,
+            stop_first,
+            None,
+            None,
+            cx,
+        );
     }
 
     /// Post the next held message, if the thread has one and is idle — and is the open
@@ -10792,6 +10955,8 @@ impl AppState {
             next.recipe,
             next.skill,
             None,
+            next.pending_id,
+            Some(next.message_id),
             cx,
         );
     }
@@ -11049,9 +11214,13 @@ impl AppState {
     /// A recipe the hold was carrying is not restored: `TurnRecipe` is not enough to rebuild
     /// the bar. A skill still in `/`'s list is put back on the draft; a reply is too.
     pub fn begin_edit_queued_send(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let thread = self.thread_holding(message_id);
         let Some(held) = self.dequeue_send(message_id) else {
             return;
         };
+        if let Some(thread) = thread {
+            self.drop_server_pending(&thread, &held, cx);
+        }
         self.pending_composer = Some(held.content);
         if let Some(reply) = held.reply {
             self.reply_to = Some(reply);
@@ -11074,8 +11243,12 @@ impl AppState {
 
     /// Change a held send's words in the queue, on the bubble, and on disk. Drain posts these.
     pub fn edit_queued_send(&mut self, message_id: &str, content: String, cx: &mut Context<Self>) {
+        let pending = self.queued_pending_of(message_id);
         if !self.apply_queued_edit(message_id, content.clone()) {
             return;
+        }
+        if let Some((thread_id, pending_id)) = pending {
+            self.spawn_edit_pending(thread_id, pending_id, content.clone(), cx);
         }
         if let Some(db) = self.database_service.clone() {
             let id = message_id.to_string();
@@ -11115,6 +11288,454 @@ impl AppState {
             }
         }
         true
+    }
+
+    fn thread_holding(&self, message_id: &str) -> Option<String> {
+        self.queued_sends
+            .iter()
+            .find_map(|(conversation_id, queue)| {
+                queue
+                    .iter()
+                    .any(|queued| queued.message_id == message_id)
+                    .then(|| conversation_id.clone())
+            })
+    }
+
+    fn queued_pending_of(&self, message_id: &str) -> Option<(String, String)> {
+        for (conversation_id, queue) in &self.queued_sends {
+            if let Some(queued) = queue.iter().find(|queued| queued.message_id == message_id)
+                && let Some(pending_id) = queued.pending_id.clone()
+            {
+                return Some((conversation_id.clone(), pending_id));
+            }
+        }
+        None
+    }
+
+    /// Local cancel/edit already happened (drain-safe). Tell the server, or skip if this
+    /// hold never made it there.
+    fn drop_server_pending(&mut self, thread_id: &str, held: &QueuedSend, cx: &mut Context<Self>) {
+        self.canceled_pending.insert(held.message_id.clone());
+        if let Some(pending_id) = held.pending_id.clone() {
+            self.spawn_cancel_pending(thread_id.to_string(), pending_id, cx);
+        }
+    }
+
+    fn spawn_cancel_pending(&self, thread_id: String, pending_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            match client
+                .cancel_pending_user_message(&thread_id, &pending_id)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) => {
+                    eprintln!("NativeChat: could not cancel a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_edit_pending(
+        &self,
+        thread_id: String,
+        pending_id: String,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            match client
+                .edit_pending_user_message(
+                    &thread_id,
+                    &pending_id,
+                    &PendingWrite::content_patch(content),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error)
+                    if error.is_not_found()
+                        || error.unreachable().is_some()
+                        || error.is_not_pending() => {}
+                Err(error) => {
+                    eprintln!("NativeChat: could not edit a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// POST the hold to OpenGrok while the bubble stays local. 404 / unreachable keep the
+    /// in-memory queue (offline, or a server that has not shipped the store).
+    fn sync_queued_send_to_server(
+        &mut self,
+        thread_id: String,
+        message_id: String,
+        content: String,
+        recipe: Option<TurnRecipe>,
+        skill: Option<String>,
+        reply: Option<ReplyTo>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !self.can_send_turn() {
+            return;
+        }
+        let body = PendingWrite::enqueue(
+            content.clone(),
+            message_id.clone(),
+            reply.as_ref().map(reply_json),
+            recipe.as_ref().map(|recipe| recipe.id.clone()),
+            recipe.map(|recipe| serde_json::Value::Object(recipe.values)),
+            skill,
+        );
+        let posted_content = content;
+        cx.spawn(async move |this, cx| {
+            match client.enqueue_pending_user_message(&thread_id, &body).await {
+                Ok(row) => {
+                    let follow = this.update(cx, |state, _| {
+                        state.bind_pending_id(&message_id, row.id.clone(), &posted_content)
+                    });
+                    match follow {
+                        Ok(BindPending::TakeBack { pending_id }) => {
+                            let _ = client
+                                .cancel_pending_user_message(&thread_id, &pending_id)
+                                .await;
+                        }
+                        Ok(BindPending::Patch {
+                            pending_id,
+                            content,
+                        }) => {
+                            let _ = client
+                                .edit_pending_user_message(
+                                    &thread_id,
+                                    &pending_id,
+                                    &PendingWrite::content_patch(content),
+                                )
+                                .await;
+                        }
+                        Ok(BindPending::Bound) | Err(_) => {}
+                    }
+                }
+                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) if error.is_already_consumed() => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.dequeue_send(&message_id);
+                        state.reconcile_thread(&thread_id, cx);
+                    });
+                }
+                Err(error) => {
+                    eprintln!("NativeChat: could not enqueue a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn bind_pending_id(
+        &mut self,
+        message_id: &str,
+        pending_id: String,
+        posted_content: &str,
+    ) -> BindPending {
+        if self.canceled_pending.contains(message_id) {
+            return BindPending::TakeBack { pending_id };
+        }
+        for queue in self.queued_sends.values_mut() {
+            if let Some(queued) = queue
+                .iter_mut()
+                .find(|queued| queued.message_id == message_id)
+            {
+                queued.pending_id = Some(pending_id.clone());
+                if queued.content != posted_content {
+                    return BindPending::Patch {
+                        pending_id,
+                        content: queued.content.clone(),
+                    };
+                }
+                return BindPending::Bound;
+            }
+        }
+        BindPending::TakeBack { pending_id }
+    }
+
+    fn hydrate_pending_user_messages(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |this, cx| {
+            match client.list_pending_user_messages(&conversation_id).await {
+                Ok(list) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.apply_pending_snapshot(
+                            &conversation_id,
+                            &list.pending_user_messages,
+                            cx,
+                        );
+                        cx.notify();
+                    });
+                }
+                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) if error.is_signed_out() => {
+                    let _ = this.update(cx, |state, cx| state.note_signed_out(cx));
+                }
+                Err(error) => {
+                    eprintln!("NativeChat: could not load pending sends: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_pending_from_replay(
+        &mut self,
+        conversation_id: &str,
+        thread: &ThreadReplay,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = thread.pending_user_messages.as_deref() else {
+            return;
+        };
+        self.apply_pending_snapshot(conversation_id, pending, cx);
+    }
+
+    /// Replace synced holds with the server's live list. Local-only holds (no `pum_…` yet)
+    /// stay, so an enqueue still in flight is not dropped. Tombstoned ids stay gone.
+    fn apply_pending_snapshot(
+        &mut self,
+        conversation_id: &str,
+        pending: &[PendingUserMessage],
+        cx: &mut Context<Self>,
+    ) {
+        let fold = self.fold_pending_snapshot(conversation_id, pending);
+        for pending_id in fold.cancel {
+            self.spawn_cancel_pending(conversation_id.to_string(), pending_id, cx);
+        }
+        for save in fold.save {
+            self.persist_queued_bubble(conversation_id, save, cx);
+        }
+        for message_id in fold.hide {
+            if let Some(db) = self.database_service.clone() {
+                cx.spawn(async move |_, _| {
+                    if let Err(error) = db.hide_message(&message_id).await {
+                        eprintln!("Failed to hide a pending message: {error}");
+                    }
+                })
+                .detach();
+            }
+        }
+        self.drain_queued_send(conversation_id, cx);
+    }
+
+    fn fold_pending_snapshot(
+        &mut self,
+        conversation_id: &str,
+        pending: &[PendingUserMessage],
+    ) -> PendingFold {
+        let server_ids: HashSet<&str> = pending.iter().map(PendingUserMessage::bubble_id).collect();
+        let previous: Vec<QueuedSend> = self
+            .queued_sends
+            .remove(conversation_id)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let local_only: Vec<QueuedSend> = previous
+            .iter()
+            .filter(|queued| queued.pending_id.is_none())
+            .filter(|queued| !self.canceled_pending.contains(&queued.message_id))
+            .cloned()
+            .collect();
+        let disappeared: Vec<QueuedSend> = previous
+            .into_iter()
+            .filter(|queued| queued.pending_id.is_some())
+            .filter(|queued| !server_ids.contains(queued.message_id.as_str()))
+            .collect();
+
+        let mut fold = PendingFold::default();
+        let mut rebuilt = VecDeque::new();
+        for item in pending {
+            let bubble_id = item.bubble_id().to_string();
+            if self.canceled_pending.contains(&bubble_id) {
+                if !item.id.is_empty() {
+                    fold.cancel.push(item.id.clone());
+                }
+                continue;
+            }
+            if let Some(save) = self.upsert_queued_bubble(conversation_id, item) {
+                fold.save.push(save);
+            }
+            rebuilt.push_back(QueuedSend {
+                message_id: bubble_id,
+                content: item.content.clone(),
+                recipe: recipe_from_pending(item),
+                skill: item.skill_id.clone().filter(|id| !id.is_empty()),
+                reply: reply_from_pending(item.reply_to.as_ref()),
+                pending_id: Some(item.id.clone()),
+            });
+        }
+        for leftover in local_only {
+            if rebuilt
+                .iter()
+                .any(|queued| queued.message_id == leftover.message_id)
+            {
+                continue;
+            }
+            rebuilt.push_back(leftover);
+        }
+        if rebuilt.is_empty() {
+            self.queued_sends.remove(conversation_id);
+        } else {
+            self.queued_sends
+                .insert(conversation_id.to_string(), rebuilt);
+        }
+
+        for leftover in disappeared {
+            if self.canceled_pending.contains(&leftover.message_id) {
+                continue;
+            }
+            let unanswered = self
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == conversation_id)
+                .is_none_or(|conversation| bubble_awaits_reply(conversation, &leftover.message_id));
+            if unanswered {
+                if let Some(conversation) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|conversation| conversation.id == conversation_id)
+                    && let Some(message) = conversation
+                        .messages
+                        .iter_mut()
+                        .find(|message| message.id == leftover.message_id)
+                {
+                    message.hidden = true;
+                    fold.hide.push(leftover.message_id);
+                }
+            }
+        }
+        fold
+    }
+
+    fn upsert_queued_bubble(
+        &mut self,
+        conversation_id: &str,
+        item: &PendingUserMessage,
+    ) -> Option<QueuedBubbleSave> {
+        let bubble_id = item.bubble_id().to_string();
+        let reply = reply_from_pending(item.reply_to.as_ref());
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return None;
+        };
+        if let Some(message) = conversation
+            .messages
+            .iter_mut()
+            .find(|message| message.id == bubble_id)
+        {
+            message.hidden = false;
+            message.content = item.content.clone();
+            if let Some(reply) = &reply {
+                message.reply_to_id = Some(reply.message_id.clone());
+                message.reply_preview = Some(reply.preview.clone());
+                message.reply_is_me = reply.is_me;
+            }
+            return Some(QueuedBubbleSave {
+                id: bubble_id,
+                content: item.content.clone(),
+                reply,
+                sent_at: message.sent_at,
+                insert: false,
+            });
+        }
+        let sent_at = if item.created_at_ms > 0 {
+            SystemTime::UNIX_EPOCH + Duration::from_millis(item.created_at_ms as u64)
+        } else {
+            SystemTime::now()
+        };
+        conversation.messages.push(Message {
+            id: bubble_id.clone(),
+            sender: "Me".to_string(),
+            content: item.content.clone(),
+            sent_at,
+            is_me: true,
+            reply_preview: reply.as_ref().map(|reply| reply.preview.clone()),
+            reply_to_id: reply.as_ref().map(|reply| reply.message_id.clone()),
+            reply_is_me: reply.as_ref().is_some_and(|reply| reply.is_me),
+            parts: Vec::new(),
+            run_id: None,
+            hidden: false,
+        });
+        Some(QueuedBubbleSave {
+            id: bubble_id,
+            content: item.content.clone(),
+            reply,
+            sent_at,
+            insert: true,
+        })
+    }
+
+    fn persist_queued_bubble(
+        &self,
+        conversation_id: &str,
+        save: QueuedBubbleSave,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(db) = self.database_service.clone() else {
+            return;
+        };
+        if save.insert {
+            let thread = conversation_id.to_string();
+            let title = self.conversation_title(conversation_id);
+            let reply = save.reply.map(|reply| ReplyRef {
+                message_id: reply.message_id,
+                preview: reply.preview,
+                is_me: reply.is_me,
+            });
+            cx.spawn(async move |_, _| {
+                if db.ensure_session(&thread, &title).await.is_err() {
+                    return;
+                }
+                if let Err(error) = db
+                    .save_message(
+                        &save.id,
+                        &thread,
+                        "user",
+                        &save.content,
+                        None,
+                        None,
+                        reply,
+                        &[],
+                        None,
+                        false,
+                        save.sent_at,
+                    )
+                    .await
+                {
+                    eprintln!("Failed to save pending message: {error}");
+                }
+            })
+            .detach();
+        } else {
+            cx.spawn(async move |_, _| {
+                if let Err(error) = db.update_message_content(&save.id, &save.content).await {
+                    eprintln!("Failed to update queued message: {error}");
+                }
+            })
+            .detach();
+        }
     }
 
     pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -15663,6 +16284,166 @@ mod tests {
             .expect("edited");
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         assert_eq!(rows[0].content, "the new words");
+    }
+
+    fn pending_row(id: &str, bubble: &str, content: &str) -> crate::opengrok::PendingUserMessage {
+        serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "id": id,
+            "threadId": "cw_1",
+            "content": content,
+            "clientMessageId": bubble,
+            "status": "pending",
+            "createdAtMs": 30,
+            "updatedAtMs": 30
+        }))
+        .expect("pending row")
+    }
+
+    /// A follow-up another machine queued shows up here as a held bubble.
+    #[test]
+    fn hydrate_puts_a_server_pending_on_the_queue() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[pending_row("pum_1", "msg_other", "from the laptop")],
+        );
+        assert!(state.is_send_queued("msg_other"));
+        assert_eq!(
+            state
+                .queued_sends
+                .get("cw_1")
+                .and_then(|queue| queue.front())
+                .map(|queued| queued.pending_id.as_deref()),
+            Some(Some("pum_1"))
+        );
+        assert_eq!(bubble(&state, "msg_other").content, "from the laptop");
+        assert!(!bubble(&state, "msg_other").hidden);
+    }
+
+    /// An enqueue that has not landed yet has no `pum_…`. Hydrate must not drop it.
+    #[test]
+    fn hydrate_keeps_a_local_hold_the_server_has_not_heard() {
+        let mut state = holding("m_held", "wait for it");
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(state.is_send_queued("m_held"));
+        assert_eq!(
+            state
+                .queued_sends
+                .get("cw_1")
+                .and_then(|queue| queue.front())
+                .and_then(|queued| queued.pending_id.as_deref()),
+            None
+        );
+    }
+
+    /// A synced hold that vanished from the snapshot was canceled elsewhere: hide it.
+    #[test]
+    fn hydrate_hides_a_synced_hold_the_server_no_longer_has() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(bubble(&state, "m_held").hidden);
+    }
+
+    /// A synced hold that vanished because it drained keeps the bubble: an assistant
+    /// reply already sits after it.
+    #[test]
+    fn hydrate_leaves_a_drained_bubble_when_the_reply_is_already_here() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.conversations[0]
+            .messages
+            .push(at(message("m_reply", false, "done"), 40));
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(
+            !bubble(&state, "m_held").hidden,
+            "the send happened; only the hold is gone"
+        );
+    }
+
+    /// Cancel this process, then a GET that raced the DELETE must not restore the bubble.
+    #[test]
+    fn hydrate_does_not_restore_a_hold_this_process_already_took_back() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.canceled_pending.insert("msg_other".into());
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[pending_row("pum_1", "msg_other", "from the laptop")],
+        );
+        assert!(!state.is_send_queued("msg_other"));
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "msg_other"),
+            "the tombstone skips grafting"
+        );
+    }
+
+    /// Enqueue landed after the person canceled: give the `pum_…` back.
+    #[test]
+    fn bind_after_a_local_cancel_takes_the_row_back() {
+        let mut state = AppState::new();
+        state.canceled_pending.insert("msg_1".into());
+        match state.bind_pending_id("msg_1", "pum_1".into(), "later") {
+            super::BindPending::TakeBack { pending_id } => assert_eq!(pending_id, "pum_1"),
+            other => panic!("expected TakeBack, got a bind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_stores_the_pending_id_on_the_hold() {
+        let mut state = holding("m_held", "wait for it");
+        match state.bind_pending_id("m_held", "pum_1".into(), "wait for it") {
+            super::BindPending::Bound => {}
+            other => panic!("expected Bound, got {other:?}"),
+        }
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0]
+                .pending_id
+                .as_deref(),
+            Some("pum_1")
+        );
+    }
+
+    #[test]
+    fn bind_after_an_edit_asks_for_a_patch() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "instead".into()));
+        match state.bind_pending_id("m_held", "pum_1".into(), "wait for it") {
+            super::BindPending::Patch {
+                pending_id,
+                content,
+            } => {
+                assert_eq!(pending_id, "pum_1");
+                assert_eq!(content, "instead");
+            }
+            other => panic!("expected Patch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reply_and_recipe_read_off_a_pending_row() {
+        let row: crate::opengrok::PendingUserMessage = serde_json::from_value(serde_json::json!({
+            "id": "pum_1",
+            "content": "later",
+            "replyTo": { "messageId": "m1", "preview": "hi", "isMe": true },
+            "recipeId": "rec_1",
+            "recipeValues": { "q": "x" },
+            "skillId": "skl_1",
+            "clientMessageId": "msg_1"
+        }))
+        .unwrap();
+        let reply = super::reply_from_pending(row.reply_to.as_ref()).expect("reply");
+        assert_eq!(reply.message_id, "m1");
+        assert_eq!(reply.preview, "hi");
+        assert!(reply.is_me);
+        let recipe = super::recipe_from_pending(&row).expect("recipe");
+        assert_eq!(recipe.id, "rec_1");
+        assert_eq!(recipe.values.get("q").and_then(|v| v.as_str()), Some("x"));
     }
 
     /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle.

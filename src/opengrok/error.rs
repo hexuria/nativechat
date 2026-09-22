@@ -163,6 +163,23 @@ impl OpenGrokError {
     pub fn is_signed_out(&self) -> bool {
         self.failure == Failure::SignedOut
     }
+
+    /// Nothing at this path, or a thread this account does not own. Pending-user-message
+    /// routes treat both as "keep the local queue": an OpenGrok that has not shipped the
+    /// store yet answers 404 the same way an unknown thread does.
+    pub fn is_not_found(&self) -> bool {
+        self.status == Some(404)
+    }
+
+    /// `POST /ag-ui` (or a retry enqueue) for a follow-up that already became a run.
+    pub fn is_already_consumed(&self) -> bool {
+        self.status == Some(409) && self.message == "already-consumed"
+    }
+
+    /// `POST /ag-ui` named a pending id that was canceled (or never heard of).
+    pub fn is_not_pending(&self) -> bool {
+        self.status == Some(409) && self.message == "not-pending"
+    }
 }
 
 /// The server's own words for the gateway being out of reach.
@@ -275,6 +292,22 @@ mod tests {
         assert_eq!(refused.failure(), Failure::Verdict);
         assert!(!refused.is_signed_out());
         assert_eq!(refused.unreachable(), None);
+    }
+
+    #[test]
+    fn a_pending_conflict_is_a_verdict_about_that_id() {
+        let consumed = OpenGrokError::from_server(Some(409), "already-consumed");
+        assert!(consumed.is_already_consumed());
+        assert!(!consumed.is_not_pending());
+        assert_eq!(consumed.failure(), Failure::Verdict);
+
+        let canceled = OpenGrokError::from_server(Some(409), "not-pending");
+        assert!(canceled.is_not_pending());
+        assert!(!canceled.is_already_consumed());
+
+        let missing = OpenGrokError::from_server(Some(404), "no such thread");
+        assert!(missing.is_not_found());
+        assert!(!missing.is_already_consumed());
     }
 
     #[test]
