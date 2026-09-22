@@ -457,9 +457,7 @@ impl Command {
                 name,
                 description,
                 body,
-            } => {
-                state.create_skill(name, description, body, cx);
-            }
+            } => state.create_skill(name, description, body, cx),
             Self::UploadSkill { path } => state.upload_skill(std::path::PathBuf::from(path), cx),
             Self::DeleteSkill { id } => state.delete_skill(id, cx),
             Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),

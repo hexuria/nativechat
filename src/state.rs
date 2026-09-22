@@ -4273,33 +4273,35 @@ impl AppState {
 
     /// Write one down: the prose as typed, with the name and the description beside it.
     ///
-    /// `true` when it went out and the sheet may empty itself. What a name may be, and how long
-    /// a body may be, are the server's rules and its refusals are shown as it words them — the
-    /// one thing refused here is a skill with no name at all, because there is nothing to send.
+    /// The sheet stays up until the server has taken it. What a name may be, and how long a body
+    /// may be, are the server's rules and its refusals are shown as it words them — and a name
+    /// it will not take is the likeliest thing to go wrong on a first try, so the words somebody
+    /// wrote have to still be in the fields when that sentence arrives. The one thing refused
+    /// here is a skill with no name at all, because there is nothing to send.
     pub fn create_skill(
         &mut self,
         name: String,
         description: String,
         body: String,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         let name = name.trim().to_string();
         if name.is_empty() {
             self.skills_error =
                 Some("A skill needs a name — it is what you type after the slash.".into());
             cx.notify();
-            return false;
+            return;
         }
-        let new = NewSkill {
-            name,
-            description: description.trim().to_string(),
-            body: body.trim().to_string(),
-            source: SkillSource::Authored,
-            files: Vec::new(),
-        };
-        self.skill_add_open = false;
-        self.send_new_skill(new, cx);
-        true
+        self.send_new_skill(
+            NewSkill {
+                name,
+                description: description.trim().to_string(),
+                body: body.trim().to_string(),
+                source: SkillSource::Authored,
+                files: Vec::new(),
+            },
+            cx,
+        );
     }
 
     /// Settings → Skills → Upload skill: the picker, then [`Self::upload_skill`].
@@ -4387,6 +4389,8 @@ impl AppState {
                 state.skills_loading = false;
                 match result {
                     Ok(detail) => {
+                        // Taken: the sheet may go, and with it the words that are now kept.
+                        state.skill_add_open = false;
                         let id = detail.skill.id.clone();
                         state.skill_open_id = Some(id);
                         state.skill_open = Some(detail);

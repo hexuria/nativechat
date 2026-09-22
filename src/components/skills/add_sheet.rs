@@ -36,7 +36,9 @@ impl AddSheetInputs {
         }
     }
 
-    fn clear(&self, window: &mut Window, cx: &mut App) {
+    /// Empty the fields. Called when the sheet goes, never while it is up: what is in them is
+    /// what somebody typed, and a refusal is not a reason to take it away.
+    pub(super) fn clear(&self, window: &mut Window, cx: &mut App) {
         for input in [&self.name, &self.description] {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -44,10 +46,9 @@ impl AddSheetInputs {
             .update(cx, |input, cx| input.set_value("", window, cx));
     }
 
-    /// Cancel, the dimmed background, or a Save that was taken: the fields empty and the sheet
-    /// goes.
-    fn close(&self, app: &Entity<AppState>, window: &mut Window, cx: &mut App) {
-        self.clear(window, cx);
+    /// Cancel, or the dimmed background: the sheet goes, and the page empties the fields on the
+    /// paint after it.
+    fn close(&self, app: &Entity<AppState>, cx: &mut App) {
         app.update(cx, |state, cx| state.close_skill_add(cx));
     }
 }
@@ -70,7 +71,7 @@ pub(super) fn render(
         .on_mouse_down(MouseButton::Left, {
             let inputs = inputs.clone();
             let app = app.clone();
-            move |_, window, cx| inputs.close(&app, window, cx)
+            move |_, _, cx| inputs.close(&app, cx)
         })
         .child(
             v_flex()
@@ -144,25 +145,23 @@ pub(super) fn render(
                                 .on_click({
                                     let inputs = inputs.clone();
                                     let app = app.clone();
-                                    move |_, window, cx| inputs.close(&app, window, cx)
+                                    move |_, _, cx| inputs.close(&app, cx)
                                 }),
                         )
                         .child(
                             Button::new("settings-skill-add-save")
                                 .label("Save")
                                 .primary()
-                                .on_click(move |_, window, cx| {
+                                .on_click(move |_, _, cx| {
                                     let name = inputs.name.read(cx).value().to_string();
                                     let description =
                                         inputs.description.read(cx).value().to_string();
                                     let body = inputs.body.read(cx).value().to_string();
-                                    let taken = app.update(cx, |state, cx| {
+                                    // The sheet stays up until the server has taken it, so a
+                                    // refusal arrives with the words still in the fields.
+                                    app.update(cx, |state, cx| {
                                         state.create_skill(name, description, body, cx)
                                     });
-                                    // The state closed the sheet; the fields follow.
-                                    if taken {
-                                        inputs.clear(window, cx);
-                                    }
                                 }),
                         ),
                 ),

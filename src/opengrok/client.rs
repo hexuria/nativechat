@@ -6013,6 +6013,25 @@ mod tests {
         assert_eq!(error.message, "no such skill");
     }
 
+    /// The detail is the row with the prose and the bundle added to it, read as one object. A
+    /// server from before the switch existed says nothing about `enabled`, and every skill on it
+    /// is on: reading that silence as "off" would switch off a whole library nobody touched.
+    #[test]
+    fn a_detail_is_the_row_and_the_prose_together() {
+        let detail: SkillDetail = serde_json::from_value(json!({
+            "id": "skl_1", "name": "expense-report", "description": "How we file expenses",
+            "source": "uploaded", "updatedAtMs": 1717000000000i64, "versionCount": 2,
+            "draft": false, "version": 2, "body": "Ask for the receipt first.",
+            "files": [{"path": "reference/rates.csv", "bytes": "b2ssIGhpCg=="}]
+        }))
+        .expect("the row and the prose are one object on the wire");
+        assert_eq!(detail.skill.name, "expense-report");
+        assert_eq!(detail.skill.source, SkillSource::Uploaded);
+        assert_eq!(detail.version, 2);
+        assert_eq!(detail.files[0].path, "reference/rates.csv");
+        assert!(detail.skill.enabled);
+    }
+
     /// The chip on a row names where the prose came from, and says nothing at all about one
     /// somebody wrote here: every skill would otherwise wear a label that tells nothing apart.
     #[test]

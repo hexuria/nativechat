@@ -27,6 +27,9 @@ pub struct SkillsPage {
     search: Entity<InputState>,
     /// The Create sheet's fields, made the first time it opens (an input needs a window).
     add: Option<AddSheetInputs>,
+    /// Whether the sheet was up on the last paint. The fields empty when it goes, and not
+    /// before: a refused name comes back with the prose still in them.
+    sheet_open: bool,
 }
 
 impl SkillsPage {
@@ -47,6 +50,7 @@ impl SkillsPage {
             state,
             search,
             add: None,
+            sheet_open: false,
         }
     }
 
@@ -63,6 +67,15 @@ impl SkillsPage {
         if add_open && self.add.is_none() {
             self.add = Some(AddSheetInputs::new(window, cx));
         }
+        // The sheet has just gone — taken by the server, or cancelled. Either way the next one
+        // opens on a clean slate.
+        if self.sheet_open
+            && !add_open
+            && let Some(add) = &self.add
+        {
+            add.clear(window, cx);
+        }
+        self.sheet_open = add_open;
     }
 }
 
