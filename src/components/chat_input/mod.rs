@@ -376,6 +376,12 @@ impl MessageInput {
             // The recipe belonged to the message that has just gone, not to the next one.
             self.state
                 .update(cx, |state, cx| state.clear_active_recipe(cx));
+            // The skill did too. The turn took it as it was built (see `take_turn_skill`), so
+            // this is already done in the ordinary case; it is here for the one where the send
+            // was refused before it reached that line, which would otherwise leave a skill on a
+            // draft whose chip has just been cleared away.
+            self.state
+                .update(cx, |state, cx| state.clear_active_skill(cx));
             // The images are not on their way anywhere: nothing carries them yet, so saying so
             // is better than leaving them over an empty composer as if they had gone with it.
             if !self.attachments.is_empty() {

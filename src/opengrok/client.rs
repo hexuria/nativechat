@@ -770,7 +770,9 @@ impl OpenGrokClient {
     /// NativeChat is a new client: same coworker + transcript, `POST /ag-ui` SSE instead.
     ///
     /// A recipe the person put on this turn goes in `forwardedProps` beside the coworker, with
-    /// the values its parameters were given. The messages are untouched by it.
+    /// the values its parameters were given, and a skill goes there as its id. The messages are
+    /// untouched by either: a parameter value is not prose, and there is no `/name` left in the
+    /// text for the server to read a skill out of — the id is a field or the skill does not go.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
@@ -784,6 +786,7 @@ impl OpenGrokClient {
         run_id: &str,
         messages: &[AguiMessage],
         recipe: Option<&TurnRecipe>,
+        skill: Option<&str>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
@@ -793,6 +796,12 @@ impl OpenGrokClient {
         if let Some(recipe) = recipe {
             forwarded["recipe"] = Value::String(recipe.id.clone());
             forwarded["recipeValues"] = Value::Object(recipe.values.clone());
+        }
+        // The key is only written when there is a skill, so a turn sent without one is the turn
+        // that was sent before any of this existed, byte for byte. An unknown id is the server's
+        // to refuse, and it says so in the frame that ends the run.
+        if let Some(skill) = skill {
+            forwarded["skill"] = Value::String(skill.to_string());
         }
         let body = json!({
             "threadId": thread_id,
@@ -3528,7 +3537,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -3642,7 +3651,7 @@ mod tests {
         // is all that is left, and the app is still showing a roster.
         put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
         client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
             .await
             .expect("the turn goes out, on a token the app fetched for itself");
 
@@ -3678,7 +3687,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -3709,7 +3718,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
             .await
             .unwrap_err();
         assert!(!error.is_signed_out(), "nobody should be asked to sign in");
@@ -4181,6 +4190,7 @@ mod tests {
                     reply_to: None,
                 }],
                 None,
+                None,
                 {
                     let first_at = first_at.clone();
                     move |event| {
@@ -4247,6 +4257,7 @@ mod tests {
                 "run_1",
                 &[message],
                 Some(&recipe),
+                None,
                 |_| {},
             )
             .await
@@ -4286,6 +4297,7 @@ mod tests {
                     reply_to: None,
                 }],
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -4296,6 +4308,96 @@ mod tests {
             .expect("both turns were sent");
         let plain: Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(plain["forwardedProps"], json!({ "coworkerId": "cw_1" }));
+    }
+
+    /// The other half of that contract, and the whole of what `/name` buys: the skill the
+    /// person picked travels as its id on `forwardedProps`, where the server reads it.
+    ///
+    /// The second turn is the regression guard. A message sent with no skill picked has to be
+    /// the message this client sent before any of this existed — byte for byte, not merely
+    /// "without a skill in it" — because every ordinary chat goes down this path and a stray
+    /// key in the props is a change to every one of them.
+    #[tokio::test]
+    async fn a_turn_carries_the_chosen_skill_and_a_turn_without_one_is_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        // The name is in the words as well, the way it is after a pick: the chip is text in the
+        // message. The server must read the id and never the sentence.
+        let said = |id: &str| AguiMessage {
+            id: id.to_string(),
+            role: "user".into(),
+            content: "expense-report file this one".into(),
+            tool_call_id: None,
+            reply_to: None,
+        };
+
+        client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_1",
+                &[said("u1")],
+                None,
+                Some("skl_1"),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_2",
+                &[said("u1")],
+                None,
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.expect("both turns went");
+        let with: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let without: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            with["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "skill": "skl_1" })
+        );
+        assert_eq!(
+            with["messages"][0]["content"], "expense-report file this one",
+            "the message stays exactly what was written: the id is a field, not a word"
+        );
+        assert_eq!(
+            without["forwardedProps"],
+            json!({ "coworkerId": "cw_1" }),
+            "no skill picked leaves the props with nothing in them but the coworker"
+        );
+
+        // Byte for byte, once the one thing that is meant to differ — the run id, minted fresh
+        // for every turn — is put back.
+        let mut with = with;
+        with["forwardedProps"]
+            .as_object_mut()
+            .expect("props are an object")
+            .remove("skill");
+        with["runId"] = without["runId"].clone();
+        assert_eq!(
+            serde_json::to_vec(&with).unwrap(),
+            serde_json::to_vec(&without).unwrap(),
+            "a turn with no skill on it is the turn this client sent before skills existed"
+        );
     }
 
     #[tokio::test]

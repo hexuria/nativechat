@@ -525,6 +525,9 @@ pub struct QueuedSend {
     /// The recipe as it was when the message was typed: the composer clears it the moment
     /// the draft goes, and the turn has to carry what was on the message.
     recipe: Option<TurnRecipe>,
+    /// The skill it was typed with, held for the same reason and taken off the draft at the
+    /// same moment: what waits here is this message's, not the next one's.
+    skill: Option<String>,
     /// The message this one answers, for the quote the coworker is sent.
     reply: Option<ReplyTo>,
 }
@@ -5315,6 +5318,22 @@ impl AppState {
             cx.notify();
         }
     }
+
+    /// The id of the skill this turn carries, taken off the draft as the turn is built.
+    ///
+    /// ONE TURN. A skill applies to the message it was sent with and to nothing after it. The
+    /// taking is here, where a turn is made, rather than in the composer, because two of the
+    /// three doors into a send never touch the composer: a held message going out when the
+    /// thread falls idle, and an agent driver's `chat.send`.
+    ///
+    /// The id is not checked against [`Self::skills`] on the way past. That list holds one side
+    /// of the Settings → Skills toggle and is emptied whenever the toggle moves, so a check
+    /// against it would refuse skills that exist; the server knows every id and refuses the ones
+    /// it does not, which is the answer the person is shown.
+    fn take_turn_skill(&mut self) -> Option<String> {
+        self.active_skill.take().map(|skill| skill.id)
+    }
+
     /// Fill one of the active recipe's parameters in, or take its value away.
     pub fn set_recipe_value(&mut self, name: &str, value: Option<String>, cx: &mut Context<Self>) {
         let Some(recipe) = self.active_recipe.as_mut() else {
@@ -6755,16 +6774,18 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
-        self.send_opengrok_turn_with(conversation_id, content, recipe, None, cx);
+        let skill = self.take_turn_skill();
+        self.send_opengrok_turn_with(conversation_id, content, recipe, skill, None, cx);
     }
 
-    /// `recipe` is the recipe the message was typed with. `stop_first` is a run this turn
+    /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted.
     fn send_opengrok_turn_with(
         &mut self,
         conversation_id: String,
         content: String,
         recipe: Option<TurnRecipe>,
+        skill: Option<String>,
         stop_first: Option<String>,
         cx: &mut Context<Self>,
     ) {
@@ -6866,6 +6887,7 @@ impl AppState {
                             &run_id,
                             &history,
                             recipe.as_ref(),
+                            skill.as_deref(),
                             |event| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
@@ -10088,6 +10110,10 @@ impl AppState {
         // The recipe as it stands now, not when the turn reaches the wire: the composer clears
         // it the moment the draft is sent, and a held message must still carry it.
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
+        // The skill comes off the draft here rather than being copied off it. Past this line the
+        // message is going — posted now or held for later — and the skill belongs to it and to
+        // nothing after it. Every guard that could refuse the send is above.
+        let skill = self.take_turn_skill();
 
         let local_id = uuid::Uuid::now_v7().to_string();
         // The bubble and its row are stamped with one moment, so the thread reads back in the
@@ -10180,6 +10206,7 @@ impl AppState {
                         message_id: local_id,
                         content,
                         recipe,
+                        skill,
                         reply: reply_for_queue,
                     });
                 cx.notify();
@@ -10196,7 +10223,7 @@ impl AppState {
                 }
             }
         }
-        self.send_opengrok_turn_with(conversation_id, content, recipe, stop_first, cx);
+        self.send_opengrok_turn_with(conversation_id, content, recipe, skill, stop_first, cx);
     }
 
     /// Post the next held message, if the thread has one and is idle — and is the open
@@ -10269,6 +10296,7 @@ impl AppState {
             conversation_id.to_string(),
             next.content,
             next.recipe,
+            next.skill,
             None,
             cx,
         );
@@ -12000,6 +12028,62 @@ mod tests {
         active.set_value("search_term", Some("   ".to_string()));
         assert_eq!(active.missing(), vec!["search_term"]);
         assert!(!active.turn().values.contains_key("search_term"));
+    }
+
+    /// ONE TURN. A skill is put on the draft by a pick and comes off as the turn is built, so
+    /// the message after it carries nothing unless somebody picked again.
+    ///
+    /// The first assertion is the other half of the rule, and the one that cost the least to
+    /// keep: a person who types the words `/expense-report` and sends them has said a sentence.
+    /// Nothing between the field and the wire reads a name back out of what was typed — the id
+    /// comes off the row that was taken, or there is no id — so a draft nobody picked from
+    /// carries nothing however much it looks like an invocation.
+    #[test]
+    fn a_picked_skill_goes_with_one_turn_and_a_typed_one_goes_with_none() {
+        let mut state = AppState::new();
+        state.skills = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "expense-report", "description": "File a receipt" },
+            { "id": "skl_2", "name": "  ", "description": "Nobody named it" }
+        ]))
+        .unwrap();
+        assert_eq!(
+            state.take_turn_skill(),
+            None,
+            "the words are the message; there is no `/name` parser anywhere behind them"
+        );
+
+        assert!(state.attach_skill("skl_1"));
+        assert_eq!(
+            state.active_skill.as_ref().map(|skill| skill.name.as_str()),
+            Some("expense-report")
+        );
+        assert_eq!(state.take_turn_skill().as_deref(), Some("skl_1"));
+        assert_eq!(
+            state.take_turn_skill(),
+            None,
+            "a skill applies to the message it was sent with and to nothing after it"
+        );
+
+        // One to a message: the second pick is the one that goes.
+        assert!(state.attach_skill("skl_1"));
+        assert!(state.attach_skill("skl_2"));
+        assert_eq!(
+            state.active_skill.as_ref().map(|skill| skill.id.as_str()),
+            Some("skl_2")
+        );
+        assert_eq!(
+            state.active_skill.as_ref().map(|skill| skill.name.as_str()),
+            Some("Untitled skill"),
+            "the draft calls a nameless skill what the `/` row called it"
+        );
+
+        // An id the library does not hold is not a pick, and leaves what was there alone.
+        assert!(!state.attach_skill("skl_9"));
+        assert_eq!(
+            state.take_turn_skill().as_deref(),
+            Some("skl_2"),
+            "the skill on the draft survived a pick that named nothing"
+        );
     }
 
     /// The declaration the owner hit this on, with an optional parameter declared ahead of a
