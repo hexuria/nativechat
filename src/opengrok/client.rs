@@ -295,6 +295,19 @@ impl OpenGrokClient {
         path: &str,
         body: Option<&T>,
     ) -> Result<reqwest::Response, OpenGrokError> {
+        self.send_json_within(method, path, body, None).await
+    }
+
+    /// [`Self::send_json`] with a deadline of its own, for the one kind of route that is not a
+    /// database read: one that waits on a model. `None` is every other route, which takes the
+    /// client's default and has no deadline of its own.
+    async fn send_json_within<T: Serialize>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&T>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response, OpenGrokError> {
         let url = self.url(path)?;
         self.ensure_fresh_token(path).await;
         let build = |token: Option<String>| {
@@ -304,6 +317,9 @@ impl OpenGrokClient {
             }
             if let Some(body) = body {
                 req = req.json(body);
+            }
+            if let Some(timeout) = timeout {
+                req = req.timeout(timeout);
             }
             req
         };
@@ -1476,6 +1492,53 @@ impl OpenGrokClient {
         }
         let response = self
             .send_json(reqwest::Method::POST, "/skills", Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// A taped task written up as a skill: the raw tape goes to the server, a model reads it,
+    /// and what comes back is a skill whose prose says what was being done.
+    ///
+    /// The tape is the one `POST /recipes` takes — thinned first, see [`thin_tape`] — and this
+    /// is the other thing that can be made of it. A RECIPE replays the clicks; a SKILL is the
+    /// lesson, and the two are made from one recording by two different routes.
+    ///
+    /// Both words are optional and both are left out when blank, because the server has an
+    /// answer for each: a name it mints as `taught-<hex>`, and a description the same model
+    /// writes. Sending `""` would be asking it to keep an empty one.
+    ///
+    /// What comes back is switched off (`enabled: false`). Nobody has read it yet, and the
+    /// server refuses a switched-off skill even to the person who owns it, so the caller has
+    /// something to say to the person rather than a row to file.
+    ///
+    /// Every refusal is the server's own sentence and reaches the caller as written — including
+    /// the `502` it answers when the model wrote nothing that can be kept, which is a verdict
+    /// about a model and not a hop that could not be reached.
+    pub async fn create_skill_from_tape(
+        &self,
+        coworker_id: &str,
+        name: &str,
+        description: &str,
+        raw: &[Value],
+    ) -> Result<SkillDetail, OpenGrokError> {
+        let mut body = json!({
+            "coworkerId": coworker_id,
+            "screen": { "width": RECIPE_SCREEN.0, "height": RECIPE_SCREEN.1 },
+            "raw": raw,
+        });
+        if !name.trim().is_empty() {
+            body["name"] = json!(name);
+        }
+        if !description.trim().is_empty() {
+            body["description"] = json!(description);
+        }
+        let response = self
+            .send_json_within(
+                reqwest::Method::POST,
+                "/skills/from-tape",
+                Some(&body),
+                Some(SKILL_FROM_TAPE_TIMEOUT),
+            )
             .await?;
         Self::json_or_error(response).await
     }
@@ -3306,6 +3369,16 @@ pub struct SkillVersion {
     #[serde(default, deserialize_with = "null_as_default")]
     pub note: String,
 }
+
+/// How long [`OpenGrokClient::create_skill_from_tape`] is given, which is longer than anything
+/// else this client sends.
+///
+/// Every other route is a database read and takes the client's default. This one waits on a
+/// model reading a recording into words, and the server's own bound on that is 60 seconds: a
+/// client that gave up sooner would turn a call the server was about to answer into a transport
+/// failure with none of the server's sentence in it, and the person would be told the machine
+/// could not be reached about a lesson that was written.
+pub const SKILL_FROM_TAPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The most a skill's instructions may be, in characters.
 ///
@@ -6017,6 +6090,145 @@ mod tests {
         assert_eq!(
             detail.files[0].bytes, "b2ssIGhpCg==",
             "the bundle comes back the way it went up, so a person can see what they uploaded"
+        );
+    }
+
+    /// A tape goes up as itself and comes back as prose. The words the sheet was given ride
+    /// with it, and what lands is switched off: a model wrote it and nobody has read it.
+    #[tokio::test]
+    async fn create_skill_from_tape_sends_the_recording_and_reads_a_skill_that_is_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .and(body_json(json!({
+                "coworkerId": "cw_1",
+                "name": "invoice-lookup",
+                "description": "how we find one",
+                "screen": { "width": 1280, "height": 800 },
+                "raw": [{"kind": "down", "button": 0, "x": 4, "y": 9, "at": 0}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_7", "name": "invoice-lookup", "description": "how we find one",
+                "source": "taught", "updatedAtMs": 1717000000000i64, "versionCount": 1,
+                "draft": false, "enabled": false, "version": 1, "files": [],
+                "body": "Open the billing tab, then search the invoice number."
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill_from_tape(
+                "cw_1",
+                "invoice-lookup",
+                "how we find one",
+                &[json!({"kind": "down", "button": 0, "x": 4, "y": 9, "at": 0})],
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.skill.id, "skl_7");
+        assert_eq!(
+            detail.skill.source,
+            SkillSource::Taught,
+            "the server's own word for prose a model wrote from a recording"
+        );
+        assert_eq!(detail.version, 1);
+        assert_eq!(detail.skill.version_count, 1);
+        assert!(!detail.skill.draft, "a lesson with prose in it is no draft");
+        assert!(
+            !detail.skill.enabled,
+            "born switched off: nobody has read it, so nothing may use it"
+        );
+        assert_eq!(
+            detail.body, "Open the billing tab, then search the invoice number.",
+            "the prose is what the model wrote, and it is what comes back"
+        );
+    }
+
+    /// Neither word is required, and neither is sent empty: the server mints a name and writes a
+    /// description itself, and `""` would be asking it to keep an empty one instead.
+    #[tokio::test]
+    async fn create_skill_from_tape_leaves_out_the_words_nobody_typed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .and(body_json(json!({
+                "coworkerId": "cw_1",
+                "screen": { "width": 1280, "height": 800 },
+                "raw": [],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_8", "name": "taught-1a2b3c4d", "description": "What was done here.",
+                "source": "taught", "updatedAtMs": 1717000000000i64, "versionCount": 1,
+                "draft": false, "enabled": false, "version": 1, "files": [], "body": "Steps."
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill_from_tape("cw_1", "   ", "", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.skill.name, "taught-1a2b3c4d",
+            "the name the server minted is the name the person is told"
+        );
+    }
+
+    /// Six ways this one route says no, and every one of them is a sentence written to be read
+    /// by a person. None of them may be swallowed and none may be reworded: the `502` in
+    /// particular names which of four things the model did, and "something went wrong" would
+    /// throw away the only part anybody can act on.
+    #[tokio::test]
+    async fn every_refusal_from_the_tape_route_keeps_the_servers_own_sentence() {
+        for (status, sentence) in [
+            (
+                502,
+                "Your bot would not write this one down: the recording shows a password being \
+                 typed, and it will not keep one in a lesson.",
+            ),
+            (
+                504,
+                "Your bot did not finish reading the recording in time. Teach a shorter task.",
+            ),
+            (409, "You already have a skill called invoice-lookup."),
+            (404, "No coworker cw_9 belongs to you."),
+            (
+                400,
+                "A skill's name is what you type after a slash: lowercase letters, digits and \
+                 dashes.",
+            ),
+            (
+                413,
+                "That description is 4001 characters; 4000 is the most.",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/skills/from-tape"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(sentence))
+                .mount(&server)
+                .await;
+            let client = OpenGrokClient::new(&server.uri()).unwrap();
+            let error = client
+                .create_skill_from_tape("cw_1", "invoice-lookup", "", &[])
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, Some(status));
+            assert_eq!(
+                error.message, sentence,
+                "a {status} has to reach the person as the server worded it"
+            );
+        }
+    }
+
+    /// The one request this client gives a deadline of its own, because it is the one that waits
+    /// on a model rather than on a database. Shorter than the server's own 60 seconds and a call
+    /// the server was about to answer becomes a client-side failure with nothing in it to read.
+    #[test]
+    fn writing_a_lesson_is_given_longer_than_the_servers_own_bound() {
+        assert!(
+            SKILL_FROM_TAPE_TIMEOUT > std::time::Duration::from_secs(60),
+            "the server waits 60 seconds on the model; this must outlast it"
         );
     }
 
