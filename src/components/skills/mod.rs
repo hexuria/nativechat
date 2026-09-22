@@ -98,8 +98,8 @@ impl Render for SkillsPage {
                 open: state.skill_open.clone(),
                 open_id: state.skill_open_id.clone(),
                 open_error: state.skill_error.clone(),
-                switching: state.skill_enabling.as_deref() == state.skill_open_id.as_deref()
-                    && state.skill_enabling.is_some(),
+                switching: state.skill_enabling.is_some()
+                    && state.skill_enabling == state.skill_open_id,
                 add_open: state.skill_add_open,
                 add_error: state.skill_add_error.clone(),
                 saving: state.skill_saving,
