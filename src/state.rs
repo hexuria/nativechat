@@ -4131,14 +4131,16 @@ impl AppState {
     /// Settings → Skills, asked for from anywhere. The page is a settings tab, so this brings
     /// Settings up when it is shut rather than setting a tab nobody can see.
     pub fn open_skills(&mut self, cx: &mut Context<Self>) {
+        // Opening Settings onto this tab fetches the list, and so does moving to it. Exactly one
+        // of those happens here, unless neither does — which is the case this last line is for:
+        // asking again for the tab already on screen, which would otherwise leave whatever was
+        // there when it was last visited.
+        let showing = self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills;
         if !self.is_app_settings_open {
             self.toggle_app_settings(cx);
         }
-        // Moving to the tab fetches the list. Asking for the tab that is already open moves
-        // nothing, and would otherwise leave whatever was there when it was last visited.
-        let already_here = self.app_settings_tab == AppSettingsTab::Skills;
         self.set_app_settings_tab(AppSettingsTab::Skills, cx);
-        if already_here {
+        if showing {
             self.refresh_skills(cx);
         }
         cx.notify();
