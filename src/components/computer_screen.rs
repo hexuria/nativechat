@@ -851,6 +851,9 @@ impl ComputerScreen {
 /// already have a skill called that" about a skill nobody named. A field that is already filled
 /// is also the easiest one to replace, which is the thing to encourage: the name is what this
 /// skill will be invoked by, and the person is the only one who knows what to call it.
+///
+/// The second is in it for that same reason. Two tapes stopped inside one minute are two tapes
+/// with one name, which is the collision this is written to keep clear of.
 fn default_tape_name<Tz: chrono::TimeZone>(
     outcome: TeachOutcome,
     stopped_at: &chrono::DateTime<Tz>,
@@ -860,7 +863,7 @@ where
 {
     match outcome {
         TeachOutcome::Skill => stopped_at
-            .format("taught-%b-%-d-%H%M")
+            .format("taught-%b-%-d-%H%M%S")
             .to_string()
             .to_lowercase(),
         TeachOutcome::Recipe | TeachOutcome::Workflow => {
@@ -1274,7 +1277,11 @@ mod tests {
             "Task taught on Sep 22, 2026"
         );
         let skill = default_tape_name(TeachOutcome::Skill, &at);
-        assert_eq!(skill, "taught-sep-22-1432");
+        assert_eq!(
+            skill, "taught-sep-22-143205",
+            "down to the second, because two tapes stopped inside one minute would otherwise \
+             be two tapes with one name, and the second is refused as a name already taken"
+        );
         assert!(
             skill
                 .chars()
