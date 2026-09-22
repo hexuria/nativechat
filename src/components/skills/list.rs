@@ -300,7 +300,15 @@ fn row(
                     .child(short_relative_time(skill.updated_at_ms, now_ms)),
             )
         })
-        .child(row_menu(&id, app))
+        // The menu sits inside the row, and the whole row is the way into the skill. Without
+        // this, clicking "…" would open the skill behind the menu it just opened.
+        .child(
+            div()
+                .id(SharedString::from(format!("settings-skill-menu-cell-{id}")))
+                .flex_shrink_0()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(row_menu(&id, app)),
+        )
 }
 
 /// The "…" at the end of a row: open it, or drop it.
