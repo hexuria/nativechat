@@ -5475,6 +5475,19 @@ mod tests {
         assert!(matches!(host.take_command(), Some(Command::StopTurn)));
     }
 
+    /// The pill a driver reads for a held send. Cancel has to take it off the tree, which
+    /// is `queued_send_count` going to zero on the next snapshot.
+    #[test]
+    fn composer_queued_is_in_the_tree_only_while_something_is_held() {
+        let mut host = host();
+        assert!(host.snapshot().find(ids::COMPOSER_QUEUED).is_none());
+        host.queued_sends = 2;
+        let node = host.snapshot().find(ids::COMPOSER_QUEUED).cloned().unwrap();
+        assert_eq!(node.name, "2 queued");
+        host.queued_sends = 0;
+        assert!(host.snapshot().find(ids::COMPOSER_QUEUED).is_none());
+    }
+
     #[test]
     fn a_recipe_row_carries_the_id_the_panel_gives_it() {
         let row = ComposerPanelRow::new("recipe:rcp_1", "icons/record.svg", "Weekly", "A task");

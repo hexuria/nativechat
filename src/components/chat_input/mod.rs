@@ -213,6 +213,25 @@ impl MessageInput {
                 }
             }
 
+            // Edit on a queued bubble leaves the held words here. Applied from a read, then
+            // taken off the state after this observer returns, so we do not mutate the entity
+            // we are observing.
+            if let Some(text) = state.read(cx).pending_composer().map(str::to_string) {
+                this.input_state.update(cx, |input, cx| {
+                    input.set_value(text.clone(), window, cx);
+                });
+                this.tokens.clear();
+                this.remember_text(cx);
+                this.focus(window, cx);
+                changed = true;
+                let app = this.state.clone();
+                cx.defer(move |cx| {
+                    app.update(cx, |state, _| {
+                        let _ = state.take_pending_composer();
+                    });
+                });
+            }
+
             // Recipes and skills that were still being fetched when `/` opened the panel land
             // here, each as it arrives: they are two listings from two routes, and the panel
             // fills in twice rather than waiting for the slower of them.

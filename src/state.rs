@@ -559,6 +559,12 @@ pub struct QueuedSend {
     reply: Option<ReplyTo>,
 }
 
+/// What a user-message write should put on disk, as memory stands when the write actually runs.
+struct UserMessagePersist {
+    content: String,
+    hidden: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveTurn {
     /// The id the turn was sent under, so `GET /ag-ui/runs/{run_id}` can be asked what became
@@ -1621,6 +1627,9 @@ pub struct AppState {
     pub on_send: OnSend,
     /// Messages held per thread until it is idle, in the order they were typed.
     queued_sends: HashMap<String, VecDeque<QueuedSend>>,
+    /// Words Edit on a queued bubble put back in the composer. The composer takes them on
+    /// the next paint, once, because the bubble they came from is already gone.
+    pending_composer: Option<String>,
     pub audio_input: Option<AudioInput>,
     pub sidebar_collapsed: bool,
     pub sidebar_hidden: bool,
@@ -2158,6 +2167,7 @@ impl AppState {
             submit_chord: SubmitChord::Enter,
             on_send: OnSend::default(),
             queued_sends: HashMap::new(),
+            pending_composer: None,
             audio_input: None,
             sidebar_collapsed: false,
             sidebar_hidden: false,
@@ -5806,6 +5816,10 @@ impl AppState {
     }
 
     pub fn delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        // Dequeue first. A held send whose bubble is already gone used to stay in
+        // `queued_sends` and still post when the thread went idle; the pop has to happen
+        // before this function returns so a drain later in the same tick finds nothing.
+        self.dequeue_send(message_id);
         if self.native_tts.message_id.as_deref() == Some(message_id) {
             if let Some(service) = &self.tts_service {
                 service.stop_native();
@@ -10637,6 +10651,17 @@ impl AppState {
                     eprintln!("Failed to save user message: {}", e);
                     return;
                 }
+                // What is in memory now, not what was typed: a cancel or edit can land
+                // before this write does, and the row has to be the bubble as it stands
+                // (hidden, or with the new words), not the draft that has already gone.
+                let persist = this
+                    .update(cx, |state, _| state.user_message_persist(&local_id))
+                    .ok()
+                    .flatten()
+                    .unwrap_or(UserMessagePersist {
+                        content: content_clone,
+                        hidden: false,
+                    });
                 // The row is filed under the bubble's own id, so nothing has to be swapped
                 // afterwards: what is on screen and what is on disk answer to the same name
                 // from the first moment, and a delete in the meantime finds its row.
@@ -10645,7 +10670,7 @@ impl AppState {
                         &local_id,
                         &conversation_id_clone,
                         "user",
-                        &content_clone,
+                        &persist.content,
                         None,
                         None,
                         reply,
@@ -10653,7 +10678,7 @@ impl AppState {
                         // The person's own message came out of no run. The server's record of a
                         // thread is its runs, and a run is only the coworker's half of a turn.
                         None,
-                        false,
+                        persist.hidden,
                         said_at,
                     )
                     .await
@@ -10705,16 +10730,7 @@ impl AppState {
     fn drain_queued_send(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
         // Nothing held is the common case, and this runs on every frame: answer it before
         // walking the thread for its busy state.
-        if !self
-            .queued_sends
-            .get(conversation_id)
-            .is_some_and(|queue| !queue.is_empty())
-        {
-            return;
-        }
-        if self.active_conversation_id.as_deref() != Some(conversation_id)
-            || self.busy_state(conversation_id) != Busy::Idle
-        {
+        if !self.queued_send_ready_to_drain(conversation_id) {
             return;
         }
         // A turn that cannot leave stays held rather than popped and lost: the signed-out
@@ -10722,19 +10738,26 @@ impl AppState {
         if self.opengrok.is_none() || !self.can_send_turn() {
             return;
         }
-        let Some(next) = self
-            .queued_sends
-            .get_mut(conversation_id)
-            .and_then(VecDeque::pop_front)
-        else {
+        let Some(next) = self.pop_queued_send(conversation_id) else {
             return;
         };
-        if self
-            .queued_sends
-            .get(conversation_id)
-            .is_some_and(VecDeque::is_empty)
-        {
-            self.queued_sends.remove(conversation_id);
+        // Hidden means the person already took it back. Delete used to hide the bubble and
+        // leave the hold, so this is the other half of that footgun: even if dequeue missed,
+        // a hidden row does not become a turn.
+        let hidden = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .and_then(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .find(|message| message.id == next.message_id)
+            })
+            .is_some_and(|message| message.hidden);
+        if hidden {
+            self.drain_queued_send(conversation_id, cx);
+            return;
         }
         // The turn is built from the thread as it is in memory. A reload may have replaced the
         // thread from disk meanwhile: the bubble is there under its saved id, or — if the save
@@ -10932,6 +10955,166 @@ impl AppState {
             .as_deref()
             .and_then(|id| self.queued_sends.get(id))
             .map_or(0, VecDeque::len)
+    }
+
+    /// Take a held send off the queue. The bubble is not touched; the caller hides it.
+    fn dequeue_send(&mut self, message_id: &str) -> Option<QueuedSend> {
+        let mut found: Option<(String, usize)> = None;
+        for (conversation_id, queue) in &self.queued_sends {
+            if let Some(index) = queue
+                .iter()
+                .position(|queued| queued.message_id == message_id)
+            {
+                found = Some((conversation_id.clone(), index));
+                break;
+            }
+        }
+        let (conversation_id, index) = found?;
+        let taken = self
+            .queued_sends
+            .get_mut(&conversation_id)
+            .and_then(|queue| queue.remove(index));
+        if self
+            .queued_sends
+            .get(&conversation_id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.queued_sends.remove(&conversation_id);
+        }
+        taken
+    }
+
+    /// The next held send, taken only when this thread is the open one and idle.
+    ///
+    /// [`Self::drain_queued_send`] posts what this returns. Tests pop without a client so
+    /// they can pin the words that would have gone, and pin that a cancel left nothing.
+    fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
+        let next = self
+            .queued_sends
+            .get_mut(conversation_id)
+            .and_then(VecDeque::pop_front)?;
+        if self
+            .queued_sends
+            .get(conversation_id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.queued_sends.remove(conversation_id);
+        }
+        Some(next)
+    }
+
+    fn queued_send_ready_to_drain(&self, conversation_id: &str) -> bool {
+        self.queued_sends
+            .get(conversation_id)
+            .is_some_and(|queue| !queue.is_empty())
+            && self.active_conversation_id.as_deref() == Some(conversation_id)
+            && self.busy_state(conversation_id) == Busy::Idle
+    }
+
+    /// What a user-message write should put on disk, as the bubble and the hold stand now.
+    ///
+    /// The save is spawned when the bubble is created. A cancel or an edit can land before
+    /// that write does, and the row has to match memory: hidden if the person took it back,
+    /// the new words if they changed them.
+    fn user_message_persist(&self, message_id: &str) -> Option<UserMessagePersist> {
+        let queued = self
+            .queued_sends
+            .values()
+            .flatten()
+            .find(|queued| queued.message_id == message_id)
+            .map(|queued| queued.content.clone());
+        let message = self
+            .conversations
+            .iter()
+            .flat_map(|conversation| conversation.messages.iter())
+            .find(|message| message.id == message_id)?;
+        Some(UserMessagePersist {
+            content: queued.unwrap_or_else(|| message.content.clone()),
+            hidden: message.hidden,
+        })
+    }
+
+    /// Take a held send off the queue and hide its bubble. The turn is never posted.
+    pub fn cancel_queued_send(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        if !self.is_send_queued(message_id) {
+            return;
+        }
+        self.delete_message(message_id, cx);
+    }
+
+    /// Put the held words back in the composer and cancel the queue item.
+    ///
+    /// There is no inline editor on a bubble. The composer is where words are typed, so Edit
+    /// takes the hold off, hides the bubble, and leaves the sentence in the field to change.
+    /// A recipe the hold was carrying is not restored: `TurnRecipe` is not enough to rebuild
+    /// the bar. A skill still in `/`'s list is put back on the draft; a reply is too.
+    pub fn begin_edit_queued_send(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(held) = self.dequeue_send(message_id) else {
+            return;
+        };
+        self.pending_composer = Some(held.content);
+        if let Some(reply) = held.reply {
+            self.reply_to = Some(reply);
+        }
+        if let Some(skill) = held.skill.as_deref() {
+            let _ = self.attach_skill(skill);
+        }
+        self.delete_message(message_id, cx);
+    }
+
+    /// Words Edit left for the composer, taken once so a later paint cannot type them again.
+    pub fn take_pending_composer(&mut self) -> Option<String> {
+        self.pending_composer.take()
+    }
+
+    /// The words Edit left for the composer, if it has not taken them yet.
+    pub fn pending_composer(&self) -> Option<&str> {
+        self.pending_composer.as_deref()
+    }
+
+    /// Change a held send's words in the queue, on the bubble, and on disk. Drain posts these.
+    pub fn edit_queued_send(&mut self, message_id: &str, content: String, cx: &mut Context<Self>) {
+        if !self.apply_queued_edit(message_id, content.clone()) {
+            return;
+        }
+        if let Some(db) = self.database_service.clone() {
+            let id = message_id.to_string();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = db.update_message_content(&id, &content).await {
+                    eprintln!("Failed to update queued message: {error}");
+                }
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn apply_queued_edit(&mut self, message_id: &str, content: String) -> bool {
+        let mut found = false;
+        for queue in self.queued_sends.values_mut() {
+            if let Some(queued) = queue
+                .iter_mut()
+                .find(|queued| queued.message_id == message_id)
+            {
+                queued.content = content.clone();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+        for conversation in &mut self.conversations {
+            if let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+            {
+                message.content = content;
+                break;
+            }
+        }
+        true
     }
 
     pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -15298,6 +15481,188 @@ mod tests {
             crate::send_policy::plan_send(Busy::Running, crate::send_policy::OnSend::Queue, false),
             crate::send_policy::SendPlan::Queue
         );
+    }
+
+    /// A working turn with a held send behind it, the way Queue leaves one.
+    fn holding(id: &str, content: &str) -> AppState {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.conversations[0]
+            .messages
+            .push(at(message(id, true, content), 30));
+        state
+            .queued_sends
+            .entry("cw_1".to_string())
+            .or_default()
+            .push_back(super::held_message(
+                id.to_string(),
+                content.to_string(),
+                None,
+                None,
+                None,
+            ));
+        state
+    }
+
+    fn hide_bubble(state: &mut AppState, id: &str) {
+        if let Some(message) = state.conversations[0]
+            .messages
+            .iter_mut()
+            .find(|message| message.id == id)
+        {
+            message.hidden = true;
+        }
+    }
+
+    fn go_idle(state: &mut AppState) {
+        state.release_live_turn("cw_1", "run_1");
+        state.finish_responding(Some("cw_1"), false);
+    }
+
+    fn bubble<'a>(state: &'a AppState, id: &str) -> &'a Message {
+        state.conversations[0]
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .expect("the bubble")
+    }
+
+    /// Cancel takes the hold off and hides the bubble, so going idle cannot post it.
+    #[test]
+    fn cancel_takes_the_hold_off_and_idle_does_not_post_it() {
+        let mut state = holding("m_held", "wait for it");
+        assert_eq!(state.queued_send_count(), 1);
+        assert!(state.is_send_queued("m_held"));
+
+        assert!(state.dequeue_send("m_held").is_some());
+        hide_bubble(&mut state, "m_held");
+
+        assert!(!state.is_send_queued("m_held"));
+        assert_eq!(state.queued_send_count(), 0);
+        assert!(bubble(&state, "m_held").hidden);
+
+        go_idle(&mut state);
+        assert_eq!(state.busy_state("cw_1"), Busy::Idle);
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "drain would post nothing: the hold is gone"
+        );
+    }
+
+    /// Edit changes the hold, the bubble, and what drain would send.
+    #[test]
+    fn edit_then_drain_sends_the_new_words() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "the new words".into()));
+        assert_eq!(bubble(&state, "m_held").content, "the new words");
+        assert_eq!(
+            state.user_message_persist("m_held").map(|row| row.content),
+            Some("the new words".into()),
+            "a save that lands after the edit writes the new words"
+        );
+
+        go_idle(&mut state);
+        let next = state
+            .pop_queued_send("cw_1")
+            .expect("the hold is still there");
+        assert_eq!(next.content, "the new words");
+        assert_eq!(next.message_id, "m_held");
+    }
+
+    /// Delete on a queued bubble is cancel for the queue: dequeue, then hide.
+    #[test]
+    fn delete_while_queued_does_not_post_when_the_thread_goes_idle() {
+        let mut state = holding("m_held", "wait for it");
+        state.dequeue_send("m_held");
+        hide_bubble(&mut state, "m_held");
+        assert_eq!(state.queued_send_count(), 0);
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none());
+    }
+
+    /// Same tick: cancel (dequeue + hide) then the thread goes idle. Drain finds nothing.
+    #[test]
+    fn a_cancel_on_the_same_tick_as_drain_wins() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.dequeue_send("m_held").is_some());
+        hide_bubble(&mut state, "m_held");
+        go_idle(&mut state);
+        assert!(
+            !state.queued_send_ready_to_drain("cw_1"),
+            "the queue is empty before drain would pop"
+        );
+        assert!(state.pop_queued_send("cw_1").is_none());
+    }
+
+    /// The other half of the old footgun: a hidden bubble that is still in the queue
+    /// is not posted. Drain pops it and skips the turn.
+    #[test]
+    fn a_hidden_hold_is_not_posted() {
+        let mut state = holding("m_held", "wait for it");
+        hide_bubble(&mut state, "m_held");
+        go_idle(&mut state);
+        let next = state
+            .pop_queued_send("cw_1")
+            .expect("the old delete left the hold");
+        assert!(
+            bubble(&state, &next.message_id).hidden,
+            "drain sees hidden and does not send_opengrok_turn_with"
+        );
+    }
+
+    /// Edit on a queued bubble puts the words back in the composer and cancels the hold.
+    #[test]
+    fn edit_refills_the_composer_and_cancels_the_hold() {
+        let mut state = holding("m_held", "wait for it");
+        let held = state.dequeue_send("m_held").expect("held");
+        state.pending_composer = Some(held.content);
+        hide_bubble(&mut state, "m_held");
+        assert_eq!(
+            state.take_pending_composer().as_deref(),
+            Some("wait for it")
+        );
+        assert!(state.take_pending_composer().is_none());
+        assert!(!state.is_send_queued("m_held"));
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none());
+    }
+
+    /// A cancel before the sqlite write lands is written down hidden, not as a live row.
+    #[test]
+    fn a_cancel_before_the_row_is_written_is_persisted_hidden() {
+        let mut state = holding("m_held", "wait for it");
+        state.dequeue_send("m_held");
+        hide_bubble(&mut state, "m_held");
+        let persist = state
+            .user_message_persist("m_held")
+            .expect("the bubble is still there");
+        assert!(persist.hidden);
+        assert_eq!(persist.content, "wait for it");
+    }
+
+    #[tokio::test]
+    async fn an_edited_queued_row_reads_back_the_new_words() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        db.save_message(
+            "m_held",
+            "s1",
+            "user",
+            "wait for it",
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            SystemTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("saved");
+        db.update_message_content("m_held", "the new words")
+            .await
+            .expect("edited");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows[0].content, "the new words");
     }
 
     /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle.

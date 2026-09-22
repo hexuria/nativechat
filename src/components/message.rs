@@ -370,6 +370,11 @@ impl RenderOnce for MessageBubble {
         let reaction_bg = cx.theme().background;
         let reaction_border = cx.theme().border;
         let is_me = self.is_me;
+        let source_id = if self.source_id.is_empty() {
+            self.message_id.clone()
+        } else {
+            self.source_id.clone()
+        };
         // The bubble shrink-wraps its text up to its cap; the shrink is a safety net only, for
         // a row narrower than chat_w says. The chip sits on the bubble's bottom edge: half of
         // its 22px is on the fill.
@@ -380,16 +385,26 @@ impl RenderOnce for MessageBubble {
             .when(self.reaction.is_some(), |this| this.mb(px(12.)))
             .child(bubble)
             // Under the bubble rather than in it: the words are the person's, the wait is
-            // the app's, and the line goes the moment the turn is posted.
+            // the app's, and the line goes the moment the turn is posted. Cancel and Edit
+            // sit here so they do not wait on hovering the ⋯.
             .when(self.queued, |this| {
+                let actions = self
+                    .app
+                    .clone()
+                    .map(|app| queued_hold_actions(source_id.clone(), muted, is_me, app));
                 this.child(
-                    div()
+                    v_flex()
                         .mt(px(3.))
                         .pr(px(4.))
-                        .text_xs()
-                        .text_color(muted)
-                        .when(is_me, |this| this.text_right())
-                        .child("Queued — sends when the coworker is free"),
+                        .when(is_me, |this| this.items_end())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .when(is_me, |this| this.text_right())
+                                .child("Queued — sends when the coworker is free"),
+                        )
+                        .when_some(actions, |this, actions| this.child(actions)),
                 )
             })
             .when_some(self.reaction.clone(), |this, emoji| {
@@ -413,11 +428,6 @@ impl RenderOnce for MessageBubble {
                 )
             });
 
-        let source_id = if self.source_id.is_empty() {
-            self.message_id.clone()
-        } else {
-            self.source_id.clone()
-        };
         let toolbar = self.app.clone().and_then(|app| {
             if !self.show_footer {
                 return None;
@@ -425,7 +435,7 @@ impl RenderOnce for MessageBubble {
             let preview = truncate_preview(&self.copy_text, 72);
             let menu_state = menu_state.clone();
             Some(
-                MessageToolbar::new(app, row_key.clone(), source_id)
+                MessageToolbar::new(app, row_key.clone(), source_id.clone())
                     .reading(self.native_speaking, self.native_paused)
                     .message_text(self.copy_text.clone())
                     .preview(preview)
@@ -664,4 +674,50 @@ fn find_highlighted_text(text: &str, marks: &[(std::ops::Range<usize>, bool)]) -
             .into_any_element()
     };
     div().text_sm().child(body).into_any_element()
+}
+
+/// Cancel and Edit under a queued bubble, so they do not wait on hovering the ⋯.
+fn queued_hold_actions(
+    source_id: String,
+    muted: Hsla,
+    is_me: bool,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    let cancel_id = source_id.clone();
+    let edit_id = source_id.clone();
+    let cancel_app = app.clone();
+    h_flex()
+        .mt(px(2.))
+        .gap(px(10.))
+        .when(is_me, |this| this.justify_end())
+        .child(
+            div()
+                .id(ElementId::Name(format!("queued-cancel-{source_id}").into()))
+                .text_xs()
+                .font_medium()
+                .text_color(muted)
+                .cursor_pointer()
+                .child("Cancel")
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    cancel_app.update(cx, |state, cx| {
+                        state.cancel_queued_send(&cancel_id, cx);
+                    });
+                }),
+        )
+        .child(
+            div()
+                .id(ElementId::Name(format!("queued-edit-{source_id}").into()))
+                .text_xs()
+                .font_medium()
+                .text_color(muted)
+                .cursor_pointer()
+                .child("Edit")
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    app.update(cx, |state, cx| {
+                        state.begin_edit_queued_send(&edit_id, cx);
+                    });
+                }),
+        )
 }
