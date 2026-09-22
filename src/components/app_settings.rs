@@ -1,6 +1,7 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
 use crate::components::logins::LoginsPage;
+use crate::components::skills::SkillsPage;
 use crate::opengrok::LocalExecMode;
 use crate::send_policy::OnSend;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
@@ -15,6 +16,8 @@ pub struct AppSettings {
     state: Entity<AppState>,
     /// Settings → Logins, made on the first render of that tab (its fields need a window).
     logins: Option<Entity<LoginsPage>>,
+    /// Settings → Skills, made on the first render of that tab, for the same reason.
+    skills: Option<Entity<SkillsPage>>,
 }
 
 impl AppSettings {
@@ -23,6 +26,7 @@ impl AppSettings {
         Self {
             state,
             logins: None,
+            skills: None,
         }
     }
 
@@ -33,6 +37,16 @@ impl AppSettings {
         let state = self.state.clone();
         let page = cx.new(|cx| LoginsPage::new(window, state, cx));
         self.logins = Some(page.clone());
+        page
+    }
+
+    fn skills_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<SkillsPage> {
+        if let Some(page) = &self.skills {
+            return page.clone();
+        }
+        let state = self.state.clone();
+        let page = cx.new(|cx| SkillsPage::new(window, state, cx));
+        self.skills = Some(page.clone());
         page
     }
 }
@@ -72,8 +86,8 @@ impl Render for AppSettings {
         };
         let app = self.state.clone();
 
-        // Every tab but Logins is a titled column of cards. Logins is three panes edge to
-        // edge, like a passwords app: it takes the whole body and each pane scrolls on its own.
+        // Every tab but Logins and Skills is a titled column of cards. Those two are panes edge
+        // to edge, like a passwords app: each takes the whole body and scrolls on its own.
         let cards: Option<AnyElement> = match tab {
             AppSettingsTab::General => {
                 Some(general_page(chord, on_send, muted, app.clone()).into_any_element())
@@ -94,7 +108,7 @@ impl Render for AppSettings {
             AppSettingsTab::Updates => Some(
                 updates_page(&bot_name, &controls, muted, app.clone(), &theme).into_any_element(),
             ),
-            AppSettingsTab::Logins => None,
+            AppSettingsTab::Logins | AppSettingsTab::Skills => None,
         };
         let body = match cards {
             Some(page) => div()
@@ -119,13 +133,20 @@ impl Render for AppSettings {
                         .child(page),
                 )
                 .into_any_element(),
-            None => div()
-                .id("app-settings-body")
-                .flex_1()
-                .h_full()
-                .min_w(px(0.))
-                .child(self.logins_page(window, cx))
-                .into_any_element(),
+            None => {
+                let pane: AnyElement = if tab == AppSettingsTab::Skills {
+                    self.skills_page(window, cx).into_any_element()
+                } else {
+                    self.logins_page(window, cx).into_any_element()
+                };
+                div()
+                    .id("app-settings-body")
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(0.))
+                    .child(pane)
+                    .into_any_element()
+            }
         };
 
         h_flex()
@@ -251,6 +272,13 @@ impl AppSettings {
                 AppSettingsTab::Logins,
                 cx,
             ))
+            .child(nav_item(
+                "settings-tab-skills",
+                "Skills",
+                tab == AppSettingsTab::Skills,
+                AppSettingsTab::Skills,
+                cx,
+            ))
     }
 }
 
@@ -263,6 +291,7 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Computer => "Computer",
         AppSettingsTab::Updates => "Updates",
         AppSettingsTab::Logins => "Logins",
+        AppSettingsTab::Skills => "Skills",
     }
 }
 

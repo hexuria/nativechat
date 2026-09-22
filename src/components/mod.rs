@@ -28,6 +28,7 @@ pub mod recipes;
 pub mod save_login;
 pub mod sidebar;
 pub mod sidebar_chat_item;
+pub mod skills;
 pub mod title_bar;
 pub mod user_form;
 pub mod voice_mode_modal;
