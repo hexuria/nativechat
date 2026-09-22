@@ -517,8 +517,13 @@ impl ComputerScreen {
             }
         }
         self.outcome = outcome;
-        // The refusal from an earlier Save was about the outcome that was picked then.
-        self.save_error = None;
+        // The refusal from an earlier Save was about the outcome that was picked then. It goes
+        // from the app with it, or the Try again the app is offering elsewhere outlives the one
+        // on this sheet — and points at a refusal nobody is being shown.
+        if self.save_error.take().is_some() {
+            self.app
+                .update(cx, |state, cx| state.set_taught_skill(None, cx));
+        }
         cx.notify();
     }
 
