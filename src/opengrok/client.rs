@@ -1412,6 +1412,121 @@ impl OpenGrokClient {
         }
     }
 
+    // ---- skills ----
+    //
+    // A SKILL is prose the model reads before it works: a `SKILL.md` with a name and a
+    // description in its frontmatter, kept on the server and invoked by typing `/name`. It is
+    // not a RECIPE, which is a taped replay of clicks; the two are different kinds of thing
+    // that happen to share a slash.
+
+    /// The skills the person can see: `mine`, `shared` (with them) or `org`; everything when
+    /// `filter` is `None`.
+    ///
+    /// The answer is the rows themselves, not an object with a key in it — `/skills` differs
+    /// from `/recipes` there, and reading it the other way gets an empty list rather than an
+    /// error.
+    pub async fn list_skills(
+        &self,
+        filter: Option<&str>,
+    ) -> Result<Vec<SkillSummary>, OpenGrokError> {
+        let path = match filter {
+            Some(filter) => format!("/skills?filter={filter}"),
+            None => "/skills".to_string(),
+        };
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Write one down, or take one that was uploaded: one door, and what tells them apart is
+    /// the word on `source` and whether files came with it.
+    ///
+    /// The body is the whole `SKILL.md`, frontmatter and all. The server has the one parser for
+    /// it and reads the name and the description out of the frontmatter when the fields here are
+    /// blank, so a skill's file and its row cannot come to disagree about what it is called.
+    ///
+    /// The 8000-character cap on the body is the server's, and so is the sentence naming it: the
+    /// refusal comes back as the server's own words and goes to the person unchanged, rather
+    /// than through a second copy of the number here that would have to be kept in step.
+    pub async fn create_skill(&self, new: &NewSkill) -> Result<SkillDetail, OpenGrokError> {
+        let mut body = json!({
+            "name": new.name,
+            "source": new.source.word(),
+        });
+        if !new.description.trim().is_empty() {
+            body["description"] = json!(new.description);
+        }
+        // Absent leaves a draft — a row with a name and no prose yet — which is not the same as
+        // a skill whose body is the empty string.
+        if !new.body.trim().is_empty() {
+            body["body"] = json!(new.body);
+        }
+        if !new.files.is_empty() {
+            body["files"] = json!(new.files);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, "/skills", Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    pub async fn skill(&self, id: &str) -> Result<SkillDetail, OpenGrokError> {
+        let path = format!("/skills/{id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Rename it, re-describe it, switch it on or off. A field left `None` is left alone, which
+    /// is what the server reads from a field that is not in the JSON at all.
+    pub async fn update_skill(
+        &self,
+        id: &str,
+        patch: &SkillPatch,
+    ) -> Result<SkillDetail, OpenGrokError> {
+        let path = format!("/skills/{id}");
+        let response = self
+            .send_json(reqwest::Method::PUT, &path, Some(patch))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Drop one. The server keeps the row so a turn that cited this skill can still say what it
+    /// cited; what goes is the person's ability to find it or invoke it.
+    pub async fn delete_skill(&self, id: &str) -> Result<(), OpenGrokError> {
+        let path = format!("/skills/{id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
+    /// New prose for a skill that already exists. The files ride along because they are kept per
+    /// version: what is not sent here is not beside this body, so a version that dropped a
+    /// reference sheet does not go on finding the old one.
+    pub async fn add_skill_version(
+        &self,
+        id: &str,
+        body: &str,
+        note: &str,
+        files: &[SkillFile],
+    ) -> Result<SkillVersion, OpenGrokError> {
+        let path = format!("/skills/{id}/versions");
+        let mut payload = json!({ "body": body });
+        if !note.trim().is_empty() {
+            payload["note"] = json!(note);
+        }
+        if !files.is_empty() {
+            payload["files"] = json!(files);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(&payload))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     /// The coworker's schedules, which is what a routine is on the server.
     ///
     /// The `?coworker=` is the server's filter; the answer is filtered again here on the same
@@ -3039,6 +3154,152 @@ impl RecipeRunResult {
         }
     }
 }
+
+/// Where a skill's prose came from.
+///
+/// `Taught` is the server's own word for a body a turn wrote down from a recording, and it
+/// refuses a client that claims it — so a skill made from this app is `Authored` or `Uploaded`.
+/// Last and the catch-all is `Authored`, because a word this client has no name for is still a
+/// skill somebody has: reading it as written-by-hand keeps the row listable, and the alternative
+/// is one unknown source taking the whole listing down with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillSource {
+    Uploaded,
+    Taught,
+    #[default]
+    #[serde(other)]
+    Authored,
+}
+
+impl SkillSource {
+    /// The word the server sends and takes.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::Uploaded => "uploaded",
+            Self::Taught => "taught",
+        }
+    }
+
+    /// What the row's chip says, or `None` for a skill somebody wrote here — the plainest case,
+    /// which needs no label to tell it from itself.
+    pub fn chip(self) -> Option<&'static str> {
+        match self {
+            Self::Authored => None,
+            Self::Uploaded => Some("Uploaded"),
+            Self::Taught => Some("Taught"),
+        }
+    }
+}
+
+/// One supporting file beside a skill's `SKILL.md`: a reference sheet, a checklist, a short
+/// script. Copied onto the coworker's computer before a turn that invokes the skill.
+///
+/// `bytes` is base64 in both directions, as `/artifacts` does it — a JSON body rather than
+/// multipart, so one shape carries the whole bundle. It is the file's content, never its size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillFile {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub path: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub bytes: String,
+}
+
+/// One row of the Skills list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSummary {
+    pub id: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub name: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub source: SkillSource,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub version_count: u32,
+    /// Named and kept, but with no prose in it yet, so there is nothing to invoke.
+    #[serde(default)]
+    pub draft: bool,
+    /// Off means nobody in the org sees it and nothing may run it. The server sends it so a
+    /// page that offers the switch can draw it in the state it is actually in.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+/// A server that does not send `enabled` is one from before the switch existed, and every skill
+/// on it is on. `false` there would switch off a whole library that nobody turned off.
+fn yes() -> bool {
+    true
+}
+
+/// Everything the detail pane shows about one skill: the row, the newest prose, and the files
+/// that came with that version.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetail {
+    #[serde(flatten)]
+    pub skill: SkillSummary,
+    /// The `SKILL.md` with its frontmatter taken off: what the model reads, and nothing else.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub body: String,
+    /// Which version that prose is. `0` is a draft: a row with no version at all.
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub files: Vec<SkillFile>,
+}
+
+/// What a new skill is made of.
+///
+/// `body` is the whole `SKILL.md`, frontmatter and all: the server reads the name and the
+/// description out of it when the two fields here are blank. Empty leaves a draft.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewSkill {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub source: SkillSource,
+    pub files: Vec<SkillFile>,
+}
+
+/// What a `PUT /skills/{id}` changes. A field left `None` is left alone — which is how the
+/// server reads a field that is not in the JSON at all, so absent here is absent there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// One version of a skill: the prose as it stood, and where that prose came from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillVersion {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub kind: SkillSource,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub note: String,
+}
+
+/// The most a skill's supporting files may weigh once decoded, and how many there may be.
+///
+/// Both are the server's caps, named again here because the app reads a folder off this Mac
+/// before it sends any of it: without them a picked folder that is not a skill at all — a
+/// checkout, a downloads directory — is read into memory whole, and only then refused.
+pub const SKILL_BUNDLE_LIMIT: usize = 256 * 1024;
+pub const SKILL_BUNDLE_FILES: usize = 32;
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -5515,5 +5776,250 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status, Some(403));
         assert_eq!(error.message, "Only the owner can share a recipe.");
+    }
+
+    /// The listing is the rows themselves, and the scope word goes on the query. A `source` this
+    /// client has no name for must leave the row readable rather than fail the whole listing.
+    #[tokio::test]
+    async fn list_skills_sends_the_scope_and_reads_the_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/skills"))
+            .and(wiremock::matchers::query_param("filter", "mine"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "id": "skl_1", "name": "expense-report",
+                    "description": "How we file expenses", "source": "uploaded",
+                    "updatedAtMs": 1717000000000i64, "versionCount": 2, "draft": false,
+                    "enabled": true
+                },
+                {
+                    "id": "skl_2", "name": "new-hire", "description": null,
+                    "source": "a word from the future", "versionCount": 0, "draft": true
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client.list_skills(Some("mine")).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "expense-report");
+        assert_eq!(rows[0].source, SkillSource::Uploaded);
+        assert_eq!(rows[0].version_count, 2);
+        assert!(!rows[0].draft);
+        assert_eq!(rows[1].description, "");
+        assert_eq!(
+            rows[1].source,
+            SkillSource::Authored,
+            "an unknown source is still a skill somebody has"
+        );
+        assert!(rows[1].draft);
+        assert!(
+            rows[1].enabled,
+            "a server that does not mention the switch has not switched anything off"
+        );
+    }
+
+    /// Written here: the prose goes up whole, frontmatter and all, and the word on it says a
+    /// person wrote it rather than a recording.
+    #[tokio::test]
+    async fn create_skill_sends_the_prose_and_says_who_wrote_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills"))
+            .and(body_json(json!({
+                "name": "expense-report",
+                "source": "authored",
+                "description": "How we file expenses",
+                "body": "---\nname: expense-report\n---\n\nAsk for the receipt first.",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_1", "name": "expense-report",
+                "description": "How we file expenses", "source": "authored",
+                "updatedAtMs": 1717000000000i64, "versionCount": 1, "draft": false,
+                "enabled": true, "version": 1, "files": [],
+                "body": "Ask for the receipt first."
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill(&NewSkill {
+                name: "expense-report".into(),
+                description: "How we file expenses".into(),
+                body: "---\nname: expense-report\n---\n\nAsk for the receipt first.".into(),
+                source: SkillSource::Authored,
+                files: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail.skill.id, "skl_1");
+        assert_eq!(detail.version, 1);
+        assert_eq!(
+            detail.body, "Ask for the receipt first.",
+            "the detail carries the prose with its frontmatter taken off"
+        );
+    }
+
+    /// An upload is the same door with the bundle on it: base64 in a JSON body, as `/artifacts`
+    /// does it, and the source says so even when the folder held nothing but a `SKILL.md`.
+    #[tokio::test]
+    async fn upload_skill_sends_its_files_as_base64() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills"))
+            .and(body_json(json!({
+                "name": "expense-report",
+                "source": "uploaded",
+                "body": "Ask for the receipt first.",
+                "files": [{"path": "reference/rates.csv", "bytes": "b2ssIGhpCg=="}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_1", "name": "expense-report", "description": "", "source": "uploaded",
+                "updatedAtMs": 1717000000000i64, "versionCount": 1, "draft": false,
+                "enabled": true, "version": 1, "body": "Ask for the receipt first.",
+                "files": [{"path": "reference/rates.csv", "bytes": "b2ssIGhpCg=="}]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill(&NewSkill {
+                name: "expense-report".into(),
+                description: String::new(),
+                body: "Ask for the receipt first.".into(),
+                source: SkillSource::Uploaded,
+                files: vec![SkillFile {
+                    path: "reference/rates.csv".into(),
+                    bytes: "b2ssIGhpCg==".into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].path, "reference/rates.csv");
+        assert_eq!(
+            detail.files[0].bytes, "b2ssIGhpCg==",
+            "the bundle comes back the way it went up, so a person can see what they uploaded"
+        );
+    }
+
+    /// The body cap is the server's and so is the sentence about it: it names the limit and what
+    /// arrived, and both have to reach the person rather than a word of our own.
+    #[tokio::test]
+    async fn an_over_long_body_comes_back_in_the_servers_own_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills"))
+            .respond_with(ResponseTemplate::new(413).set_body_string(
+                "the skill body is 8007 characters, over the 8000 allowed — a skill shares one \
+                 system message with the coworker's own role",
+            ))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client
+            .create_skill(&NewSkill {
+                name: "too-long".into(),
+                body: "x".repeat(8007),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(413));
+        assert!(error.message.contains("8000"), "{}", error.message);
+        assert!(error.message.contains("8007"), "{}", error.message);
+    }
+
+    /// A field nobody edited is not in the JSON at all, or a blank description field would wipe
+    /// the one the row has.
+    #[tokio::test]
+    async fn update_skill_sends_only_what_changed() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/skills/skl_1"))
+            .and(body_json(json!({ "enabled": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_1", "name": "expense-report", "description": "How we file expenses",
+                "source": "authored", "updatedAtMs": 1717000000000i64, "versionCount": 1,
+                "draft": false, "enabled": false, "version": 1, "body": "Ask first.", "files": []
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .update_skill(
+                "skl_1",
+                &SkillPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!detail.skill.enabled);
+        assert_eq!(detail.skill.description, "How we file expenses");
+    }
+
+    #[tokio::test]
+    async fn a_new_version_is_the_prose_and_the_note_on_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/skl_1/versions"))
+            .and(body_json(json!({
+                "body": "Ask for the receipt first, then the date.",
+                "note": "the date too",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": 2, "kind": "authored", "createdAtMs": 1717000000000i64,
+                "note": "the date too"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let version = client
+            .add_skill_version(
+                "skl_1",
+                "Ask for the receipt first, then the date.",
+                "the date too",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(version.version, 2);
+        assert_eq!(version.kind, SkillSource::Authored);
+        assert_eq!(version.note, "the date too");
+    }
+
+    /// 204 and nothing to read. A skill the server never heard of is the server's sentence, not
+    /// a silent success.
+    #[tokio::test]
+    async fn delete_skill_takes_the_empty_answer_and_keeps_a_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/skills/skl_1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/skills/skl_9"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such skill"))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client.delete_skill("skl_1").await.unwrap();
+        let error = client.delete_skill("skl_9").await.unwrap_err();
+        assert_eq!(error.status, Some(404));
+        assert_eq!(error.message, "no such skill");
+    }
+
+    /// The chip on a row names where the prose came from, and says nothing at all about one
+    /// somebody wrote here: every skill would otherwise wear a label that tells nothing apart.
+    #[test]
+    fn only_a_skill_from_somewhere_else_wears_a_chip() {
+        assert_eq!(SkillSource::Authored.chip(), None);
+        assert_eq!(SkillSource::Uploaded.chip(), Some("Uploaded"));
+        assert_eq!(SkillSource::Taught.chip(), Some("Taught"));
+        assert_eq!(SkillSource::Taught.word(), "taught");
     }
 }
