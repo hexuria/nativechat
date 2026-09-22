@@ -380,6 +380,10 @@ impl MessageInput {
                 state.set_value("".to_string(), window, cx);
             });
             self.tokens.clear();
+            // `set_value` above emits no Change, so this is the only thing that puts the
+            // difference on record: without it the next keystroke would be read against the
+            // message that has just gone.
+            self.remember_text(cx);
             // The recipe belonged to the message that has just gone, not to the next one.
             self.state
                 .update(cx, |state, cx| state.clear_active_recipe(cx));
@@ -436,6 +440,14 @@ impl MessageInput {
         self.input_state.update(cx, |state, cx| {
             state.set_value(mock_text.to_string(), window, cx);
         });
+        // What was in the message went with it. `set_value` writes the field behind its own
+        // back — no Change event — so nothing else here would have noticed: the chips kept the
+        // ranges they had, which are now bytes of the transcription, and the fills painted over
+        // somebody's dictated words while the skill behind them still rode out on the turn.
+        self.tokens.clear();
+        self.remember_text(cx);
+        self.drop_recipe_without_its_chip(window, cx);
+        self.drop_skill_without_its_chip(cx);
     }
 
     // --- The panel -------------------------------------------------------------------------
@@ -702,18 +714,28 @@ impl MessageInput {
                     if skill_chip(&self.tokens, &id).is_some() {
                         return;
                     }
-                    // One skill to a message, because the turn names one id: whatever was
-                    // there goes, chip and all, rather than leaving a word in the message
-                    // standing for a skill that is not going anywhere.
-                    self.drop_skill(window, cx);
-                    // No chip without something behind it. `start_skill` refuses an id the
-                    // library does not hold, and a chip put in anyway would be a word that
-                    // looks like an invocation and sends nothing.
+                    let held = self
+                        .state
+                        .read(cx)
+                        .active_skill
+                        .as_ref()
+                        .map(|skill| skill.id.clone());
+                    // The pick is resolved before anything is taken away. `start_skill` refuses
+                    // an id the library no longer holds — which the refresh on every `/` makes
+                    // reachable, with a listing landing between the rows being built and the
+                    // Enter that takes one — and a draft that had already been emptied for it
+                    // would leave the person with no skill, no chip, and nothing said about it.
                     if !self
                         .state
                         .update(cx, |state, cx| state.start_skill(&id, cx))
                     {
                         return;
+                    }
+                    // One skill to a message, because the turn names one id: the one that was
+                    // there goes, chip and all, rather than leaving a word in the message
+                    // standing for a skill that is not going anywhere.
+                    if let Some(held) = held {
+                        self.remove_skill_chip(&held, window, cx);
                     }
                     self.insert_token(kind, id, text, window, cx);
                 }
@@ -850,25 +872,18 @@ impl MessageInput {
         cx.notify();
     }
 
-    /// Take the skill off the draft and its chip out of the message with it: one pick put both
-    /// there. Picking a second skill is what does this — there is no `×` to press, because a
-    /// skill has no bar, having nothing to be told and nothing to show.
-    fn drop_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self
-            .state
-            .read(cx)
-            .active_skill
-            .as_ref()
-            .map(|skill| skill.id.clone())
-        else {
+    /// Take one skill's chip out of the message, with the space that went in beside it.
+    ///
+    /// Only the draft's own state says which skill is attached, and that is not touched here:
+    /// the one caller replaces the attachment first and then clears away the word standing for
+    /// what it replaced. There is no `×` to press either, because a skill has no bar, having
+    /// nothing to be told and nothing to show.
+    fn remove_skill_chip(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = skill_chip(&self.tokens, id) else {
             return;
         };
-        self.state
-            .update(cx, |state, cx| state.clear_active_skill(cx));
-        if let Some(index) = skill_chip(&self.tokens, &id) {
-            let range = self.tokens.remove(index).range;
-            self.remove_text(range, window, cx);
-        }
+        let range = self.tokens.remove(index).range;
+        self.remove_text(range, window, cx);
         cx.notify();
     }
 
@@ -879,6 +894,13 @@ impl MessageInput {
     /// stronger reason: the chip is the only place the app says this message carries a skill. A
     /// draft that kept the skill after the word was deleted would be sending something with the
     /// message that nothing on screen mentions.
+    ///
+    /// One hole in that, older than skills and not closed here: a chip whose words wrap across a
+    /// line is painted with no fill at all (see [`Self::chip_fills`], which has no one rectangle
+    /// to put there), so a skill whose name straddles a wrap rides out with nothing drawn around
+    /// it. The word is still in the message and the chip is still a chip — it is the paint that
+    /// is missing, not the attachment — but the argument above is weaker there than everywhere
+    /// else, and it is the fill that would have to learn to be two rectangles.
     fn drop_skill_without_its_chip(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self
             .state
@@ -974,11 +996,14 @@ impl MessageInput {
     /// down the draft and the chip simply moves onto them, so the message still carries the
     /// skill after the only thing on screen that said so is gone.
     fn resync_tokens(&mut self, cx: &App) {
-        let text = self.input_state.read(cx).value().to_string();
+        let (text, caret) = {
+            let input = self.input_state.read(cx);
+            (input.value().to_string(), input.cursor())
+        };
         if text == self.last_text {
             return;
         }
-        remap_tokens(&mut self.tokens, &self.last_text, &text);
+        remap_tokens(&mut self.tokens, &self.last_text, &text, caret);
         self.last_text = text;
     }
 
@@ -1010,9 +1035,14 @@ impl MessageInput {
         };
         let range = self.tokens.remove(index).range;
         self.input_state.update(cx, |input, cx| {
-            input.set_selected_range(range, cx);
+            input.set_selected_range(range.clone(), cx);
             input.replace("", window, cx);
         });
+        // Its real shape, like every other edit this view makes: the guess from the two texts
+        // is for the edits only the person knows about.
+        shift_tokens(&mut self.tokens, range.clone(), 0);
+        self.caret = caret_after_cut(self.caret, range);
+        self.remember_text(cx);
         cx.notify();
         true
     }
@@ -1630,17 +1660,30 @@ fn shift_tokens(tokens: &mut Vec<ComposerToken>, edited: Range<usize>, now: usiz
     });
 }
 
-/// Move the chips through an edit nobody described, by reading it off the two texts.
+/// Move the chips through an edit nobody described, by reading it off the two texts and the
+/// caret.
 ///
-/// What the person did is taken to be the one stretch between the words both texts start with
-/// and the words they both end with. That is not always what happened — deleting the first of
-/// two identical words cannot be told from deleting the second — but every edit this view makes
-/// itself goes through [`shift_tokens`] with its real shape, so what is guessed at here is only
-/// ever typing, where the guess is the answer.
-fn remap_tokens(tokens: &mut Vec<ComposerToken>, before: &str, after: &str) {
-    let head = common_head(before, after);
-    let tail = common_tail(before, after, head);
-    shift_tokens(tokens, head..before.len() - tail, after.len() - tail - head);
+/// The caret is what settles it. Comparing the texts alone cannot tell deleting the first of two
+/// identical words from deleting the second, and picking either answer is wrong half the time:
+/// the words a person deleted are the words in front of the caret, so the edit is taken to END
+/// there and the texts are only asked where it began. Select `expense-report ` — a chip, and the
+/// space that came with it — while the same word sits further down the draft, and without the
+/// caret the deletion is read as the later copy's and the chip lives on over somebody's prose,
+/// with the skill still attached to a message that no longer names it.
+///
+/// A caret that is not where the edit was cannot make this unsafe: every range here is clamped
+/// into the text, nothing is sliced, and each surviving chip moves by the difference in length
+/// between the two texts — so a chip's range stays on the character boundaries it was already
+/// on, whatever this decides about which chips survive.
+fn remap_tokens(tokens: &mut Vec<ComposerToken>, before: &str, after: &str, caret: usize) {
+    // Where the edit ended, in each text. The second is the first read backwards through the
+    // change in length, which is what makes the two ends describe one contiguous edit.
+    let grew = after.len() as isize - before.len() as isize;
+    let ends_after = caret.min(after.len());
+    let ends_before = (ends_after as isize - grew).clamp(0, before.len() as isize) as usize;
+    // And where it began: as far in as the two texts agree, but never past either end.
+    let head = common_head(before, after).min(ends_after).min(ends_before);
+    shift_tokens(tokens, head..ends_before, ends_after - head);
 }
 
 /// How many bytes two texts begin with in common, never splitting a character in half.
@@ -1651,22 +1694,6 @@ fn common_head(before: &str, after: &str) -> usize {
         at += 1;
     }
     while at > 0 && !(before.is_char_boundary(at) && after.is_char_boundary(at)) {
-        at -= 1;
-    }
-    at
-}
-
-/// The same from the other end, stopping before `head` so the two cannot claim the same bytes.
-fn common_tail(before: &str, after: &str, head: usize) -> usize {
-    let mut at = 0;
-    let (a, b) = (before.as_bytes(), after.as_bytes());
-    let most = (a.len() - head).min(b.len() - head);
-    while at < most && a[a.len() - 1 - at] == b[b.len() - 1 - at] {
-        at += 1;
-    }
-    while at > 0
-        && !(before.is_char_boundary(before.len() - at) && after.is_char_boundary(after.len() - at))
-    {
         at -= 1;
     }
     at
@@ -2474,6 +2501,8 @@ mod tests {
             &mut tokens,
             "expense-report and expense-report",
             " and expense-report",
+            // The caret is where the words were taken from, which is the start of the message.
+            0,
         );
         assert!(tokens.is_empty(), "the chip was deleted, so it is gone");
         assert_eq!(
@@ -2483,12 +2512,49 @@ mod tests {
         );
     }
 
+    /// The same deletion, in the shape a person actually makes it: the chip and the space that
+    /// came with it, taken out in one go by a double-click-drag or by option-backspace, with the
+    /// very same word typed out further down the draft.
+    ///
+    /// The two texts alone cannot say which copy went — and the answer they give without the
+    /// caret is the wrong one, because the longest common start runs through the copy that is
+    /// left. What settles it is that the words a person deleted are the words in front of the
+    /// caret.
+    #[test]
+    fn deleting_a_chip_and_its_space_is_read_as_the_copy_the_caret_is_at() {
+        let mut tokens = vec![chip("skl_1", "expense-report", 0)];
+        remap_tokens(
+            &mut tokens,
+            "expense-report expense-report",
+            "expense-report",
+            0,
+        );
+        assert!(
+            tokens.is_empty(),
+            "the chip and its space went, so the chip is gone and the skill goes with it"
+        );
+
+        // And the other way round: the typed copy deleted, the chip untouched.
+        let mut tokens = vec![chip("skl_1", "expense-report", 0)];
+        remap_tokens(
+            &mut tokens,
+            "expense-report expense-report",
+            "expense-report",
+            14,
+        );
+        assert_eq!(
+            tokens[0].range,
+            0..14,
+            "the caret was at the end of the chip, so what went was everything after it"
+        );
+    }
+
     /// Typing around a chip moves it; typing into it ends it.
     #[test]
     fn a_chip_slides_past_an_edit_before_it_and_dies_inside_one() {
         let said = "hi expense-report ok";
         let mut tokens = vec![chip("skl_1", "expense-report", 3)];
-        remap_tokens(&mut tokens, said, "oh hi expense-report ok");
+        remap_tokens(&mut tokens, said, "oh hi expense-report ok", 3);
         assert_eq!(
             tokens[0].range,
             6..20,
@@ -2496,7 +2562,7 @@ mod tests {
         );
 
         let mut tokens = vec![chip("skl_1", "expense-report", 3)];
-        remap_tokens(&mut tokens, said, "hi expense-report ok!");
+        remap_tokens(&mut tokens, said, "hi expense-report ok!", 21);
         assert_eq!(
             tokens[0].range,
             3..17,
@@ -2504,7 +2570,7 @@ mod tests {
         );
 
         let mut tokens = vec![chip("skl_1", "expense-report", 3)];
-        remap_tokens(&mut tokens, said, "hi expense ok");
+        remap_tokens(&mut tokens, said, "hi expense ok", 10);
         assert!(
             tokens.is_empty(),
             "half the name is not the name: the words the person picked are not there any more"
@@ -2512,9 +2578,25 @@ mod tests {
 
         // Two chips, and an edit between them: the first stays, the second slides.
         let mut tokens = vec![chip("skl_1", "alpha", 0), chip("skl_2", "beta", 6)];
-        remap_tokens(&mut tokens, "alpha beta", "alpha and beta");
+        remap_tokens(&mut tokens, "alpha beta", "alpha and beta", 10);
         assert_eq!(tokens[0].range, 0..5);
         assert_eq!(tokens[1].range, 10..14);
+    }
+
+    /// A letter typed hard up against the front of a chip belongs to the letter, not to the
+    /// chip: the chip is pushed along rather than ended. The texts alone cannot see that — the
+    /// new letter reads as part of the word — and the caret can.
+    #[test]
+    fn typing_right_in_front_of_a_chip_pushes_it_along() {
+        let mut tokens = vec![chip("skl_1", "expense-report", 0)];
+        remap_tokens(&mut tokens, "expense-report", "eexpense-report", 1);
+        assert_eq!(tokens[0].range, 1..15);
+
+        // And a caret nowhere near the edit — which is not a thing the field does, but is what
+        // an odd one would look like — still leaves every surviving chip on its own words.
+        let mut tokens = vec![chip("skl_1", "expense-report", 0)];
+        remap_tokens(&mut tokens, "expense-report", "expense-report!", 900);
+        assert!(tokens.iter().all(|token| token.range.end <= 15));
     }
 
     /// The caret the panel puts its chip at moves with the text: picking a second skill takes
@@ -2529,6 +2611,75 @@ mod tests {
             5,
             "it sat inside what went, so it is where that was"
         );
+    }
+
+    /// The property under all of the above, over a few thousand edits: a chip that survives one
+    /// covers its own words and nobody else's.
+    ///
+    /// Written down here because the caret went into the rule after it had been fuzzed once
+    /// already, and a rule this quiet is one nobody re-reads. The edits are the shapes a field
+    /// makes — one stretch put in or taken out, with the caret left at the end of it — over an
+    /// alphabet with characters of one, two and four bytes in it, so a boundary walked past
+    /// would show up as a panic rather than as a silent nothing.
+    #[test]
+    fn a_surviving_chip_always_covers_its_own_words() {
+        const WORDS: [&str; 6] = ["a", " ", "é", "😀", "expense-report", "ok"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut roll = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound.max(1) as u64) as usize
+        };
+
+        for _ in 0..3_000 {
+            // A draft with two chips in it, and prose between and around them.
+            let mut before = String::new();
+            let mut tokens: Vec<ComposerToken> = Vec::new();
+            for id in ["skl_1", "skl_2"] {
+                for _ in 0..roll(3) {
+                    before.push_str(WORDS[roll(WORDS.len())]);
+                }
+                let at = before.len();
+                before.push_str(WORDS[4]);
+                before.push(' ');
+                tokens.push(chip(id, WORDS[4], at));
+            }
+            for _ in 0..roll(3) {
+                before.push_str(WORDS[roll(WORDS.len())]);
+            }
+
+            // One edit, of the shape a field makes, with the caret where it left off.
+            let boundary = |text: &str, at: usize| {
+                let mut at = at.min(text.len());
+                while !text.is_char_boundary(at) {
+                    at -= 1;
+                }
+                at
+            };
+            let start = boundary(&before, roll(before.len() + 1));
+            let (after, caret) = if roll(2) == 0 {
+                let end = boundary(&before, start + roll(before.len() - start + 1));
+                (format!("{}{}", &before[..start], &before[end..]), start)
+            } else {
+                let put = WORDS[roll(WORDS.len())];
+                (
+                    format!("{}{put}{}", &before[..start], &before[start..]),
+                    start + put.len(),
+                )
+            };
+
+            remap_tokens(&mut tokens, &before, &after, caret);
+            for token in &tokens {
+                assert_eq!(
+                    after.get(token.range.clone()),
+                    Some(token.text.as_str()),
+                    "a chip that survived {before:?} becoming {after:?} at {caret} is sitting on \
+                     {:?}",
+                    after.get(token.range.clone())
+                );
+            }
+        }
     }
 
     /// An edit this view makes itself is handed over with its real shape rather than guessed at

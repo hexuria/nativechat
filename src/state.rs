@@ -520,6 +520,28 @@ impl Conversation {
 /// with one of these is never refilled from the database, and why the run id has to be kept: the
 /// server has the whole of the run under it, and that is what the thread is reconciled against
 /// instead.
+/// The message being held, with what it was typed with.
+///
+/// A held message WAS the draft, so it keeps what the draft had on it rather than reading the
+/// composer again when the thread finally goes idle — by which time the draft is the next
+/// message somebody is writing. Every part of it travels here, and [`AppState::drain_queued_send`]
+/// hands the turn what this row holds and nothing else.
+fn held_message(
+    message_id: String,
+    content: String,
+    recipe: Option<TurnRecipe>,
+    skill: Option<String>,
+    reply: Option<ReplyTo>,
+) -> QueuedSend {
+    QueuedSend {
+        message_id,
+        content,
+        recipe,
+        skill,
+        reply,
+    }
+}
+
 /// A message held back while its thread is busy. The bubble is already on
 /// screen and on its way to disk; what waits is the turn.
 #[derive(Clone, Debug)]
@@ -1757,6 +1779,9 @@ pub struct AppState {
     /// nothing in it read the same on screen and are opposite things to do something about.
     pub your_skills_loading: bool,
     pub your_skills_error: Option<String>,
+    /// Which refresh of that listing the app is waiting on, so a slow answer cannot land on top
+    /// of a later one. See [`Self::take_your_skills_at`].
+    your_skills_epoch: u64,
     /// How many rows each side of the toggle has. Both sides are fetched on every refresh
     /// because the toggle carries a count per side, and a count for the scope nobody has opened
     /// would otherwise be a blank where a number belongs.
@@ -2163,6 +2188,7 @@ impl AppState {
             your_skills: Vec::new(),
             your_skills_loading: false,
             your_skills_error: None,
+            your_skills_epoch: 0,
             skills_counts: SkillCounts::default(),
             skills_loading: false,
             skills_error: None,
@@ -4341,6 +4367,8 @@ impl AppState {
     /// left to land rather than joined by a second — two answers for one question can only
     /// disagree by being differently stale.
     pub fn refresh_your_skills(&mut self, cx: &mut Context<Self>) {
+        // Politeness rather than correctness: `/` opened twice in a second does not need two
+        // requests. Which answer wins is the epoch's business, not this line's.
         if self.your_skills_loading {
             return;
         }
@@ -4352,30 +4380,56 @@ impl AppState {
             cx.notify();
             return;
         };
+        self.your_skills_epoch += 1;
+        let epoch = self.your_skills_epoch;
         self.your_skills_loading = true;
         self.your_skills_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let listed = client.list_skills(Some(SkillScope::Yours.query())).await;
             let _ = this.update(cx, |state, cx| {
-                state.your_skills_loading = false;
-                match listed {
-                    Ok(rows) => state.take_your_skills(rows),
-                    // The rows already there are left where they are, which is the opposite of
-                    // what the Settings page does with its own. A row here is a thing to pick,
-                    // and one that was listed a minute ago is as pickable as it was — the server
-                    // is the authority on an id either way. Emptying the list because a refresh
-                    // failed would take away the one thing the person opened `/` for.
-                    Err(error) => state.your_skills_error = Some(error.message),
+                if state.take_your_skills_at(epoch, listed) {
+                    cx.notify();
                 }
-                cx.notify();
             });
         })
         .detach();
     }
 
+    /// Take a listing of this person's skills, unless something newer has already answered.
+    ///
+    /// `false` when this answer was overtaken and nothing was touched. A late one landing would
+    /// put back the library as it stood before the skill that was just written — the very thing
+    /// the Settings page's fetch feeding this list is supposed to make impossible — and in the
+    /// other direction it would print "could not be loaded" over a library that loaded fine.
+    fn take_your_skills_at(
+        &mut self,
+        epoch: u64,
+        listed: Result<Vec<SkillSummary>, OpenGrokError>,
+    ) -> bool {
+        if self.your_skills_epoch != epoch {
+            return false;
+        }
+        self.your_skills_loading = false;
+        match listed {
+            Ok(rows) => self.take_your_skills(rows),
+            // The rows already there are left where they are, which is the opposite of what the
+            // Settings page does with its own. A row here is a thing to pick, and one that was
+            // listed a minute ago is as pickable as it was — the server is the authority on an
+            // id either way. Emptying the list because a refresh failed would take away the one
+            // thing the person opened `/` for.
+            Err(error) => self.your_skills_error = Some(error.message),
+        }
+        true
+    }
+
     /// Take a listing of this person's skills, from wherever it was asked for.
+    ///
+    /// The epoch moves: whatever is in flight was asked for before this answer and must not land
+    /// on top of it. That matters most for the caller that has no epoch of its own — the
+    /// Settings page's refresh, which fills this list from the half it fetched for its counts.
     fn take_your_skills(&mut self, rows: Vec<SkillSummary>) {
+        self.your_skills_epoch += 1;
         self.your_skills = rows;
         self.your_skills_loading = false;
         self.your_skills_error = None;
@@ -10296,13 +10350,13 @@ impl AppState {
                 self.queued_sends
                     .entry(conversation_id)
                     .or_default()
-                    .push_back(QueuedSend {
-                        message_id: local_id,
+                    .push_back(held_message(
+                        local_id,
                         content,
                         recipe,
                         skill,
-                        reply: reply_for_queue,
-                    });
+                        reply_for_queue,
+                    ));
                 cx.notify();
                 return;
             }
@@ -12178,6 +12232,78 @@ mod tests {
             Some("skl_2"),
             "the skill on the draft survived a pick that named nothing"
         );
+    }
+
+    /// A slow answer must not land on top of a later one.
+    ///
+    /// Type `/` (one request in flight), write a skill in Settings, whose refresh fills this
+    /// list from the half it fetched for its counts, then type `/` again. The first request is
+    /// still out there, and it was answered before the skill existed: landing it would take the
+    /// new skill back out of `/`, which is the whole of what "invocable at once" was worth.
+    #[test]
+    fn a_listing_that_was_overtaken_does_not_land_on_the_one_that_beat_it() {
+        let old: Vec<SkillSummary> =
+            serde_json::from_value(serde_json::json!([{ "id": "skl_1", "name": "old" }])).unwrap();
+        let new: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "old" },
+            { "id": "skl_2", "name": "just-written" }
+        ]))
+        .unwrap();
+
+        let mut state = AppState::new();
+        // The request `/` sent, which is still in flight.
+        state.your_skills_epoch += 1;
+        let in_flight = state.your_skills_epoch;
+        state.your_skills_loading = true;
+        // The Settings page's refresh lands first, carrying the skill that was just written.
+        state.take_your_skills(new.clone());
+        assert_eq!(state.your_skills, new);
+        assert!(!state.your_skills_loading);
+
+        assert!(
+            !state.take_your_skills_at(in_flight, Ok(old.clone())),
+            "the answer was overtaken, so it is not an answer any more"
+        );
+        assert_eq!(
+            state.your_skills, new,
+            "the skill that was just written is still there"
+        );
+
+        // The same in the other direction: a refusal from a request that has been overtaken
+        // must not print itself over a library that loaded.
+        assert!(!state.take_your_skills_at(
+            in_flight,
+            Err(OpenGrokError::message(
+                "the server would not say".to_string()
+            ))
+        ));
+        assert!(state.your_skills_error.is_none());
+
+        // And the answer to the request that is current does land.
+        state.your_skills_epoch += 1;
+        let current = state.your_skills_epoch;
+        assert!(state.take_your_skills_at(current, Ok(old.clone())));
+        assert_eq!(state.your_skills, old);
+    }
+
+    /// A held message carries what the draft had on it. The pass-through is the point: by the
+    /// time the thread goes idle the draft is the next message somebody is writing, so anything
+    /// not on this row is not this message's.
+    ///
+    /// What this pins is the row's shape — a field dropped on the way in, which is how the skill
+    /// would quietly stop being held — and not which values the one caller hands it.
+    #[test]
+    fn a_held_message_keeps_the_skill_it_was_typed_with() {
+        let held = super::held_message(
+            "m1".to_string(),
+            "do the thing".to_string(),
+            None,
+            Some("skl_1".to_string()),
+            None,
+        );
+        assert_eq!(held.skill.as_deref(), Some("skl_1"));
+        assert_eq!(held.content, "do the thing");
+        assert_eq!(held.message_id, "m1");
     }
 
     /// `/` offers this person's own skills, whatever the Settings page is showing.

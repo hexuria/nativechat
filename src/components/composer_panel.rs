@@ -241,6 +241,12 @@ impl ComposerPanel {
         let query = self.search.read(cx).value().to_string();
         self.apply_filter(&query);
         self.highlighted = held_highlight(&self.shown(), held.as_ref(), self.highlighted);
+        // Into view as well as onto the row. Twenty skills landing above it can push the row
+        // somebody is pointing at below the fold, which is the same complaint the line above
+        // answers, one step quieter.
+        if let Some(position) = self.highlighted {
+            self.scroll.scroll_to_item(position);
+        }
         cx.notify();
     }
 

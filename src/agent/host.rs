@@ -12,14 +12,14 @@ use crate::components::skills::{
 };
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
-    RecipeKind, RecipeSummary, ScreenshotSpec, SkillSummary, UserFormDismissMode,
-    UserFormFieldKind, computer_attention_done_id, computer_attention_id,
-    computer_attention_skip_id, computer_handoff_card_id, computer_handoff_done_id,
-    computer_handoff_skip_id, computer_handoff_takeover_id, computer_window_attention_done_id,
-    computer_window_attention_id, computer_window_attention_skip_id, save_login_card_id,
-    save_login_save_id, save_login_skip_id, user_form_card_id, user_form_continue_id,
-    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_clear_id,
-    user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
+    RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode, UserFormFieldKind,
+    computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
+    computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
+    computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
+    computer_window_attention_skip_id, save_login_card_id, save_login_save_id, save_login_skip_id,
+    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
+    user_form_pill_id, user_form_saved_clear_id, user_form_saved_note_id, user_form_screen_id,
+    user_form_use_saved_id,
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState, SkillScope};
@@ -4858,6 +4858,8 @@ mod tests {
             "composer-param-city"
         );
     }
+
+    use crate::opengrok::SkillSummary;
 
     /// A library that has arrived, for a panel that is not waiting on anything.
     fn listed(skills: &[SkillSummary]) -> SkillLibrary<'_> {
