@@ -2875,9 +2875,9 @@ impl NativeChatHost {
                     Some(open) if !open.arrived => Err(format!(
                         "`{target}` is not on the pane yet: skill `{id}` is still being fetched"
                     )),
-                    Some(open) if open.switching => {
-                        Err("that skill's switch is already being changed".to_string())
-                    }
+                    // One at a time, whichever skill, and in the words the app answers with:
+                    // the driver and the person are told the same thing about the same fact.
+                    Some(open) if open.switching => Err(SWITCH_IN_FLIGHT.to_string()),
                     Some(open) => Ok(Command::SetSkillEnabled {
                         id: id.to_string(),
                         enabled: !open.enabled,
@@ -4857,7 +4857,8 @@ mod tests {
         );
         assert_eq!(
             host.click(&ids::skill_enabled("skl_1")).unwrap_err(),
-            "that skill's switch is already being changed"
+            SWITCH_IN_FLIGHT,
+            "and in the same words the app refuses a second switch with"
         );
 
         // Refused: the switch has already gone back, and the reason is on the pane with it.
