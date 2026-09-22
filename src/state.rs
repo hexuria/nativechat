@@ -1503,6 +1503,9 @@ pub struct AppState {
     /// composer is in recipe mode: `@` offers this recipe's parameters instead of the bot's
     /// tools, because a turn that is already a recipe run has no use for a tool roster.
     pub active_recipe: Option<ActiveRecipe>,
+    /// The skill the next message is sent with, once one has been picked with `/`. One to a
+    /// message, because the turn names one id, and gone again the moment that message goes.
+    pub active_skill: Option<ActiveSkill>,
     /// Which of the composer's lists is open, as the composer publishes it.
     ///
     /// The panel itself lives in the composer's own view and nothing outside that view can read
@@ -1868,6 +1871,19 @@ impl PickedKind {
     }
 }
 
+/// The skill the next message is sent with, picked with `/` in the composer.
+///
+/// A skill is prose the model reads before it works, so nothing about it is asked of the person:
+/// there is no declaration to fill in and no bar over the composer. What the turn carries is the
+/// id; the name is kept beside it for the chip and for anything that has to say which skill is
+/// on the draft, because the library it was picked out of is emptied whenever Settings → Skills
+/// changes sides and a look-up by id later would come back empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveSkill {
+    pub id: String,
+    pub name: String,
+}
+
 /// The recipe or workflow the next message runs, picked with `/` in the composer.
 ///
 /// The parameters are the copy the recipe carried when it was picked rather than a look-up by
@@ -2012,6 +2028,7 @@ impl AppState {
             more_menu_open: false,
             picked_tools: Vec::new(),
             active_recipe: None,
+            active_skill: None,
             composer_panel: None,
             is_app_settings_open: false,
             bot_finder_open: false,
@@ -5263,6 +5280,41 @@ impl AppState {
         }
     }
 
+    /// Put a skill on the next message, from the list the composer picked it out of. An id the
+    /// list does not hold leaves the draft as it was, and says so.
+    ///
+    /// One skill to a message: picking a second replaces the first, because the turn names one
+    /// id and a message carrying two would have to choose one of them somewhere the person
+    /// cannot see.
+    pub fn start_skill(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        if !self.attach_skill(id) {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
+    /// The pick itself, apart from the redraw. `false` when the library holds no such id and
+    /// the draft was left as it was.
+    fn attach_skill(&mut self, id: &str) -> bool {
+        let Some(skill) = self.skills.iter().find(|skill| skill.id == id) else {
+            return false;
+        };
+        self.active_skill = Some(ActiveSkill {
+            id: skill.id.clone(),
+            // The name the `/` row showed, so the chip in the message and anything that reports
+            // what is on the draft cannot come to call one skill two things.
+            name: crate::components::chat_input::sources::skill_name(skill),
+        });
+        true
+    }
+
+    /// Take the skill back off the draft. This is what the chip leaving the message does.
+    pub fn clear_active_skill(&mut self, cx: &mut Context<Self>) {
+        if self.active_skill.take().is_some() {
+            cx.notify();
+        }
+    }
     /// Fill one of the active recipe's parameters in, or take its value away.
     pub fn set_recipe_value(&mut self, name: &str, value: Option<String>, cx: &mut Context<Self>) {
         let Some(recipe) = self.active_recipe.as_mut() else {

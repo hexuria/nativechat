@@ -12,14 +12,14 @@ use crate::components::skills::{
 };
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
-    RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode, UserFormFieldKind,
-    computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
-    computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
-    computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
-    computer_window_attention_skip_id, save_login_card_id, save_login_save_id, save_login_skip_id,
-    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
-    user_form_pill_id, user_form_saved_clear_id, user_form_saved_note_id, user_form_screen_id,
-    user_form_use_saved_id,
+    RecipeKind, RecipeSummary, ScreenshotSpec, SkillSummary, UserFormDismissMode,
+    UserFormFieldKind, computer_attention_done_id, computer_attention_id,
+    computer_attention_skip_id, computer_handoff_card_id, computer_handoff_done_id,
+    computer_handoff_skip_id, computer_handoff_takeover_id, computer_window_attention_done_id,
+    computer_window_attention_id, computer_window_attention_skip_id, save_login_card_id,
+    save_login_save_id, save_login_skip_id, user_form_card_id, user_form_continue_id,
+    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_clear_id,
+    user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{ActiveRecipe, AppSettingsTab, AppState, SkillScope};
@@ -52,6 +52,10 @@ pub mod ids {
     pub const COMPOSER_PANEL_SEARCH: &str = "composer-panel-search";
     /// The line above the field saying which recipe the next message runs.
     pub const COMPOSER_RECIPE_BAR: &str = "composer-recipe-bar";
+    /// The skill the next message is sent with, named by the chip in the draft; in the tree
+    /// only while one is on the draft, so `assert --exists false` is "this message carries no
+    /// skill". Its value is the id the turn will name, because two skills may share a name.
+    pub const COMPOSER_SKILL: &str = "composer-skill";
     pub const LIGHTBOX: &str = "lightbox";
     pub const PAGE_LOGIN: &str = "page-login";
     pub const LOGIN_EMAIL: &str = "login-email";
@@ -702,6 +706,7 @@ fn last_screenshot_set(state: &AppState) -> Vec<ScreenshotSpec> {
 fn panel_rows(
     mode: PanelMode,
     recipes: &[RecipeSummary],
+    skills: &[SkillSummary],
     active: Option<&ActiveRecipe>,
 ) -> Vec<PanelRow> {
     let rows = match mode {
@@ -714,7 +719,7 @@ fn panel_rows(
             ];
         }
         PanelMode::Tools => ToolSource.rows(),
-        PanelMode::Slash => SlashSource.rows(recipes),
+        PanelMode::Slash => SlashSource.rows(recipes, skills),
         PanelMode::Parameters => match active {
             Some(recipe) => ParameterSource.rows(recipe),
             None => Vec::new(),
@@ -750,7 +755,7 @@ fn panel_name(mode: PanelMode, recipe: Option<&RecipeBarSnap>) -> String {
     match mode {
         PanelMode::Plus => "Attach or teach".to_string(),
         PanelMode::Tools => "Tools".to_string(),
-        PanelMode::Slash => "Recipes, workflows and actions".to_string(),
+        PanelMode::Slash => "Recipes, workflows, skills and actions".to_string(),
         PanelMode::Parameters => match recipe {
             Some(recipe) => format!("What {} needs told", recipe.name),
             None => "What the recipe needs told".to_string(),
@@ -1393,6 +1398,8 @@ pub struct NativeChatHost {
     panel_rows: Vec<PanelRow>,
     /// The recipe the next message runs, as the composer's bar shows it.
     recipe_bar: Option<RecipeBarSnap>,
+    /// The skill the next message is sent with, as the chip in the draft names it.
+    composer_skill: Option<crate::state::ActiveSkill>,
     /// The captions of the newest set of pictures in the transcript, in tile order.
     thumbs: Vec<String>,
     /// The picture overlay, while it is open.
@@ -1604,7 +1611,14 @@ impl NativeChatHost {
             composer_panel: state.composer_panel,
             panel_rows: state
                 .composer_panel
-                .map(|mode| panel_rows(mode, &state.recipes, state.active_recipe.as_ref()))
+                .map(|mode| {
+                    panel_rows(
+                        mode,
+                        &state.recipes,
+                        &state.skills,
+                        state.active_recipe.as_ref(),
+                    )
+                })
                 .unwrap_or_default(),
             recipe_bar: state.active_recipe.as_ref().map(|recipe| RecipeBarSnap {
                 name: recipe.name.clone(),
@@ -1619,6 +1633,7 @@ impl NativeChatHost {
                     })
                     .collect(),
             }),
+            composer_skill: state.active_skill.clone(),
             thumbs: last_screenshot_set(state)
                 .iter()
                 .map(|shot| shot.caption.clone())
@@ -1939,6 +1954,9 @@ impl NativeChatHost {
         }
         if let Some(bar) = self.recipe_bar_node() {
             page = page.with_child(bar);
+        }
+        if let Some(skill) = self.composer_skill_node() {
+            page = page.with_child(skill);
         }
         for (index, caption) in self.thumbs.iter().enumerate() {
             page = page.with_child(UiNode::button(ids::image_thumb(index), caption.clone()));
@@ -2276,6 +2294,17 @@ impl NativeChatHost {
             node = node.with_child(chip);
         }
         Some(node)
+    }
+
+    /// The skill the next message is sent with, while one is on the draft.
+    ///
+    /// There is no bar for a skill: the chip in the message is the whole of what is on screen,
+    /// so the node is named after what the chip reads, and the id the turn will carry rides in
+    /// `value` — which is the field a driver can assert on, and the only one of the two that
+    /// tells two skills of one name apart.
+    fn composer_skill_node(&self) -> Option<UiNode> {
+        let skill = self.composer_skill.as_ref()?;
+        Some(UiNode::note(ids::COMPOSER_SKILL, skill.name.clone()).with_value(skill.id.clone()))
     }
 
     /// The picture overlay, while it is open, with the same line the overlay itself prints.
@@ -4655,7 +4684,7 @@ mod tests {
         // Nothing told yet: the list is everything the recipe needs.
         let untold = recipe(&[]);
         host.composer_panel = Some(PanelMode::Parameters);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&untold));
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &[], Some(&untold));
         let tree = host.snapshot();
         let panel = tree.find(ids::COMPOSER_PANEL).unwrap();
         assert!(tree.find(ids::COMPOSER_PANEL_SEARCH).unwrap().focused);
@@ -4672,7 +4701,7 @@ mod tests {
         // parameter leaves this list and lives in the bar above the composer, where it can still
         // be changed. A driver asserting on the panel must read it as the outstanding work.
         let told = recipe(&[("city", "London")]);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&told));
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &[], Some(&told));
         let tree = host.snapshot();
         let rows: Vec<&str> = tree
             .find(ids::COMPOSER_PANEL)
@@ -4822,6 +4851,25 @@ mod tests {
         );
     }
 
+    /// The `/` listing as a driver sees it: two recipes and two skills.
+    fn slash_listing() -> (Vec<RecipeSummary>, Vec<SkillSummary>) {
+        (
+            serde_json::from_value(serde_json::json!([
+                { "id": "rcp_tape", "name": "Weekly report", "kind": "recipe" },
+                { "id": "rcp_tree", "name": "Search and retry", "kind": "workflow" }
+            ]))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!([
+                {
+                    "id": "skl_1", "name": "expense-report",
+                    "description": "File a receipt the way the firm wants it"
+                },
+                { "id": "skl_2", "name": "half-written", "draft": true }
+            ]))
+            .unwrap(),
+        )
+    }
+
     /// What a driver needs to work `/`: the rows are there while the panel is open, and each
     /// one says which of the four kinds it is. Without the word, a workflow row and a recipe
     /// row are the same node under the same id prefix, and "pick the workflow" is a guess.
@@ -4830,19 +4878,15 @@ mod tests {
         let mut host = host();
         assert!(host.snapshot().find(ids::COMPOSER_PANEL).is_none());
 
-        let listing: Vec<RecipeSummary> = serde_json::from_value(serde_json::json!([
-            { "id": "rcp_tape", "name": "Weekly report", "kind": "recipe" },
-            { "id": "rcp_tree", "name": "Search and retry", "kind": "workflow" }
-        ]))
-        .unwrap();
+        let (listing, skills) = slash_listing();
         host.composer_panel = Some(PanelMode::Slash);
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, None);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &skills, None);
 
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::COMPOSER_PANEL).unwrap().name,
-            "Recipes, workflows and actions",
-            "the panel says what is in it, and it is no longer called skills"
+            "Recipes, workflows, skills and actions",
+            "the panel says what is in it, and the four words are kept apart in the saying"
         );
         let tape = tree.find("composer-panel-row-recipe:rcp_tape").unwrap();
         assert_eq!(tape.name, "Weekly report");
@@ -4854,9 +4898,61 @@ mod tests {
             Some("Workflow"),
             "the one assertable field a driver has is where the kind has to be"
         );
-        // Nothing lists a skill yet, and the row that says so must not look pickable.
-        let skill = tree.find("composer-skills-none").unwrap();
-        assert!(skill.states.contains(&"note".to_string()));
+    }
+
+    /// A skill is a row like any other: it is in the list under its own name, which is what a
+    /// driver types into the panel's field to pick it, and it says it is a Skill rather than a
+    /// Recipe — the two are a tape and a lesson, and nothing about the node shape says which.
+    #[test]
+    fn the_slash_list_offers_a_skill_by_name_and_will_not_offer_a_draft() {
+        let mut host = host();
+        let (listing, skills) = slash_listing();
+        host.composer_panel = Some(PanelMode::Slash);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &skills, None);
+
+        let tree = host.snapshot();
+        let skill = tree.find("composer-panel-row-skill:skl_1").unwrap();
+        assert_eq!(skill.name, "expense-report");
+        assert_eq!(skill.value.as_deref(), Some("Skill"));
+        assert!(
+            !skill.states.contains(&"note".to_string()),
+            "this one can be taken, so the arrows must land on it"
+        );
+        // A draft has no prose in it for the bot to read, so the server would refuse it: the
+        // row is shown and stepped over rather than offered and refused a round trip later.
+        let draft = tree.find("composer-panel-row-skill:skl_2").unwrap();
+        assert!(draft.states.contains(&"note".to_string()));
+
+        // And a library with nothing in it says so under the id that row has always had.
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &[], None);
+        let empty = host.snapshot();
+        let none = empty.find("composer-skills-none").unwrap();
+        assert!(none.states.contains(&"note".to_string()));
+        assert!(
+            empty.find("composer-panel-row-skill:skl_1").is_none(),
+            "no skill is listed while none is loaded"
+        );
+    }
+
+    /// Which skill this message will be sent with, for a driver that has just picked one. The
+    /// name is what the chip in the draft reads; the id is what the turn names, and it is the
+    /// id that tells two skills of one name apart.
+    #[test]
+    fn the_composer_says_which_skill_the_next_message_carries() {
+        let mut host = host();
+        assert!(
+            host.snapshot().find(ids::COMPOSER_SKILL).is_none(),
+            "nothing is attached, and the way to say so is not to be there at all"
+        );
+
+        host.composer_skill = Some(crate::state::ActiveSkill {
+            id: "skl_1".into(),
+            name: "expense-report".into(),
+        });
+        let tree = host.snapshot();
+        let attached = tree.find(ids::COMPOSER_SKILL).unwrap();
+        assert_eq!(attached.name, "expense-report");
+        assert_eq!(attached.value.as_deref(), Some("skl_1"));
     }
 
     #[test]

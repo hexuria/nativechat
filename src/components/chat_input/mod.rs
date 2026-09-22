@@ -61,7 +61,8 @@ pub enum PanelMode {
     Plus,
     /// `@` with no recipe on the draft: the bot's tools and apps.
     Tools,
-    /// `/`: the recipes and workflows the bot can be pointed at, and the app's own actions.
+    /// `/`: the recipes, workflows and skills the bot can be pointed at, and the app's own
+    /// actions.
     Slash,
     /// `@` with a recipe on the draft: what that recipe needs told.
     Parameters,
@@ -205,9 +206,14 @@ impl MessageInput {
                 }
             }
 
-            // Recipes that were still being fetched when `/` opened the panel land here.
+            // Recipes and skills that were still being fetched when `/` opened the panel land
+            // here, each as it arrives: they are two listings from two routes, and the panel
+            // fills in twice rather than waiting for the slower of them.
             if this.panel_mode == Some(PanelMode::Slash) {
-                let mut rows = SlashSource.rows(&state.read(cx).recipes);
+                let mut rows = {
+                    let state = state.read(cx);
+                    SlashSource.rows(&state.recipes, &state.skills)
+                };
                 apply_shortcuts(&mut rows, window);
                 this.remember_picks(&rows);
                 let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
@@ -264,6 +270,7 @@ impl MessageInput {
                 InputEvent::Change => {
                     this.resync_tokens(cx);
                     this.drop_recipe_without_its_chip(window, cx);
+                    this.drop_skill_without_its_chip(cx);
                     cx.notify();
                 }
                 _ => {}
@@ -538,16 +545,23 @@ impl MessageInput {
 
     fn open_slash_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An empty list may only mean the recipes have never been fetched in this session; ask
-        // for them, and the observer above fills the open panel when they land.
+        // for them, and the observer above fills the open panel when they land. The skills are
+        // a second route and so a second ask, on the same rule.
         if self.state.read(cx).recipes.is_empty() {
             self.state.update(cx, |state, cx| state.refresh_recipes(cx));
         }
-        let mut rows = SlashSource.rows(&self.state.read(cx).recipes);
+        if self.state.read(cx).skills.is_empty() {
+            self.state.update(cx, |state, cx| state.refresh_skills(cx));
+        }
+        let mut rows = {
+            let state = self.state.read(cx);
+            SlashSource.rows(&state.recipes, &state.skills)
+        };
         apply_shortcuts(&mut rows, window);
         self.show_panel(
             PanelMode::Slash,
             rows,
-            "Search recipes, workflows and actions",
+            "Search recipes, workflows, skills and actions",
             "↑↓ to move, ⌘1–9 to take one straight away, ↵ to run it or put it in the message, esc to close.",
             window,
             cx,
@@ -657,6 +671,26 @@ impl MessageInput {
                     {
                         self.open_parameters_panel(window, cx);
                     }
+                }
+                // A skill is prose the bot reads before it works, so it is not the message's
+                // mode: no bar, no parameters, nothing to be told. The chip is the whole of
+                // what it looks like, and the id behind the chip is what the turn carries.
+                TokenKind::Skill => {
+                    // One skill to a message, because the turn names one id. Picking a second
+                    // takes the first one's chip out rather than leaving a word in the message
+                    // standing for a skill that is not going anywhere.
+                    let replacing = self
+                        .state
+                        .read(cx)
+                        .active_skill
+                        .as_ref()
+                        .is_some_and(|skill| skill.id != id);
+                    if replacing {
+                        self.drop_skill(window, cx);
+                    }
+                    self.state
+                        .update(cx, |state, cx| state.start_skill(&id, cx));
+                    self.insert_token(kind, id, text, window, cx);
                 }
             },
             ComposerPick::Command(command) => self.run_command(command, window, cx),
@@ -788,6 +822,61 @@ impl MessageInput {
         if matches!(self.panel_mode, Some(PanelMode::Value { .. })) {
             self.close_panel(false, window, cx);
         }
+        cx.notify();
+    }
+
+    /// Take the skill off the draft and its chip out of the message with it: one pick put both
+    /// there. Picking a second skill is what does this — there is no `×` to press, because a
+    /// skill has no bar, having nothing to be told and nothing to show.
+    fn drop_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .active_skill
+            .as_ref()
+            .map(|skill| skill.id.clone())
+        else {
+            return;
+        };
+        self.state
+            .update(cx, |state, cx| state.clear_active_skill(cx));
+        if let Some(index) = self
+            .tokens
+            .iter()
+            .position(|token| token.kind == TokenKind::Skill && token.id == id)
+        {
+            let range = self.tokens.remove(index).range;
+            self.remove_text(range, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Take the skill off the draft once its chip is no longer in the message, whether it was
+    /// backspaced over or typed away a letter at a time.
+    ///
+    /// The same rule a recipe follows ([`Self::drop_recipe_without_its_chip`]) and for a
+    /// stronger reason: the chip is the only place the app says this message carries a skill. A
+    /// draft that kept the skill after the word was deleted would be sending something with the
+    /// message that nothing on screen mentions.
+    fn drop_skill_without_its_chip(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .active_skill
+            .as_ref()
+            .map(|skill| skill.id.clone())
+        else {
+            return;
+        };
+        if self
+            .tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::Skill && token.id == id)
+        {
+            return;
+        }
+        self.state
+            .update(cx, |state, cx| state.clear_active_skill(cx));
         cx.notify();
     }
 

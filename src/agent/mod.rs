@@ -7,6 +7,8 @@
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
+//! `composer-skill` (the skill the next message is sent with, value = the id the turn names;
+//! in the tree only while one is on the draft),
 //! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
 //! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
 //! `user-form-pill-{key}`, `computer-handoff-{key}`,

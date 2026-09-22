@@ -102,7 +102,10 @@ impl ComposerPanelRow {
         self
     }
 
-    fn matches(&self, needle: &str) -> bool {
+    /// Whether this row is left by the search. The rule is the panel's own; it is reachable
+    /// from the sources that build the rows so each list can assert that what it wrote in a
+    /// title and a description is what a person typing that word will find.
+    pub(crate) fn matches(&self, needle: &str) -> bool {
         needle.is_empty()
             || self.always
             || self.title.to_lowercase().contains(needle)
