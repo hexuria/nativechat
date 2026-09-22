@@ -232,10 +232,14 @@ fn add_menu(app: Entity<AppState>) -> impl IntoElement {
 pub(crate) const NOT_YET_WITH_BOT: &str = "Not yet — nothing here turns a conversation into a skill. It needs a turn that drafts the \
      instructions and hands them back for you to keep or throw away.";
 
-/// Why a recording cannot become a skill yet. A tape already becomes a recipe; what is missing
-/// is the part that reads one into words.
-pub(crate) const NOT_YET_RECORDING: &str = "Not yet — a recording becomes a recipe, which is a replay of your clicks. Turning one into \
-     instructions needs a model that reads the tape and writes down what was being done.";
+/// Why this page cannot record a screen, and where the thing it is reaching for now lives.
+///
+/// The half of this that used to be missing is built: a task taped on a bot's screen is read
+/// into prose by a model and kept as a skill. What is still missing is this Mac — nothing here
+/// records the screen somebody is sitting in front of — so the sentence stops asking for a model
+/// that exists and names the way that works instead.
+pub(crate) const NOT_YET_RECORDING: &str = "Not yet — nothing here records this Mac. A task taped on your bot's screen can become a \
+     skill: open the screen, press Teach a task, and choose Skill when you stop.";
 
 /// A row of the Add menu that cannot be taken: what it would be, and what would have to be
 /// built for it to work.

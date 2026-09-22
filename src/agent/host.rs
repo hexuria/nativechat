@@ -4474,12 +4474,12 @@ mod tests {
                 .name
                 .starts_with("Not yet")
         );
-        assert!(
-            tree.find(ids::SKILL_RECORD)
-                .unwrap()
-                .name
-                .contains("recipe")
-        );
+        // The half of Record that was missing is built, and the sentence says where it is
+        // rather than asking for a model that now exists: what this page still cannot do is
+        // record the Mac somebody is sitting in front of.
+        let record = &tree.find(ids::SKILL_RECORD).unwrap().name;
+        assert!(record.contains("Teach a task"), "{record}");
+        assert!(record.contains("this Mac"), "{record}");
         assert!(
             host.click(ids::SKILL_RECORD)
                 .unwrap_err()
