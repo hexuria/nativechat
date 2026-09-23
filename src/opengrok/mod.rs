@@ -6,6 +6,8 @@ mod credential;
 mod error;
 mod gen_ui;
 mod local_exec;
+mod pending;
+mod timing;
 mod types;
 mod user_form;
 mod visibility;
@@ -48,16 +50,22 @@ pub use visibility::ImageVisibility;
 
 pub use client::{
     BoxShareScope, ConnectedComputer, CoworkerComputer, EgressTunnel, ImageStatus, LocalExecMode,
-    NewSchedule, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind,
-    RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen,
-    RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape,
-    RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunReplay, ScheduleKind, ScheduleRow,
-    SiteLoginSave, SiteLoginUpdate, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus,
-    WebhookInfo, collapse_computer_roster, collapse_computers_by_machine_id,
-    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_enabled,
-    host_egress_tunnel_flag, thin_tape,
+    NewSchedule, NewSkill, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant,
+    RecipeKind, RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult,
+    RecipeScreen, RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary,
+    RecipeTape, RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunReplay, SKILL_BODY_CHARS,
+    SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, ScheduleKind, ScheduleRow, SiteLoginSave,
+    SiteLoginUpdate, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion,
+    StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, WebhookInfo,
+    collapse_computer_roster, collapse_computers_by_machine_id, env_egress_tunnel_enabled,
+    host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
-pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
+pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable, retry_enqueue};
+pub use pending::{
+    CUSTOM_NAME, PAYLOAD_V, PendingCustom, PendingList, PendingMutation, PendingOp,
+    PendingUserMessage, PendingWrite,
+};
+pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
     ReplyQuote, assistant_text_from_sse,

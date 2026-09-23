@@ -3,9 +3,13 @@ use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::chat_input::PanelMode;
 use crate::components::chat_input::sources::{
-    ParameterSource, SlashSource, ToolSource, ValueSource,
+    ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
+use crate::components::skills::{
+    NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
+    short_relative_time, skill_matches, waiting_to_be_read,
+};
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
     RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode, UserFormFieldKind,
@@ -18,7 +22,10 @@ use crate::opengrok::{
     user_form_use_saved_id,
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
-use crate::state::{ActiveRecipe, AppSettingsTab, AppState};
+use crate::state::{
+    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, SWITCH_IN_FLIGHT, SkillScope,
+    TaughtSkill, WRITING_A_LESSON,
+};
 
 pub mod ids {
     pub const WINDOW: &str = "app-window";
@@ -48,6 +55,10 @@ pub mod ids {
     pub const COMPOSER_PANEL_SEARCH: &str = "composer-panel-search";
     /// The line above the field saying which recipe the next message runs.
     pub const COMPOSER_RECIPE_BAR: &str = "composer-recipe-bar";
+    /// The skill the next message is sent with, named by the chip in the draft; in the tree
+    /// only while one is on the draft, so `assert --exists false` is "this message carries no
+    /// skill". Its value is the id the turn will name, because two skills may share a name.
+    pub const COMPOSER_SKILL: &str = "composer-skill";
     pub const LIGHTBOX: &str = "lightbox";
     pub const PAGE_LOGIN: &str = "page-login";
     pub const LOGIN_EMAIL: &str = "login-email";
@@ -81,6 +92,109 @@ pub mod ids {
     /// `composer-recipe-param-<name>` here, `composer-param-<name>` in the panel.
     pub fn recipe_param(name: &str) -> String {
         format!("composer-recipe-param-{name}")
+    }
+
+    /// Settings → Skills. A SKILL is prose the model reads before it works; a RECIPE is a
+    /// taped replay of clicks. The two are never named by each other's word.
+    pub const SETTINGS_SKILLS: &str = "settings-tab-skills";
+    pub const SKILLS_SEARCH: &str = "settings-skills-search";
+    pub const SKILLS_EMPTY: &str = "settings-skills-empty";
+    pub const SKILLS_ERROR: &str = "settings-skills-error";
+    /// An upload, while it is reading a folder and sending it. The sheet says so itself when it
+    /// is the sheet that is saving, so this is on the list and only for an upload.
+    pub const SKILLS_SAVING: &str = "settings-skills-saving";
+    /// The one button that opens the four ways of making a skill. The four are in the tree
+    /// themselves, so this is not what a driver clicks.
+    pub const SKILL_ADD: &str = "settings-skill-add";
+    pub const SKILL_UPLOAD: &str = "settings-skill-upload";
+    pub const SKILL_WRITE: &str = "settings-skill-write";
+    /// The two nobody has built. They carry the sentence saying what would have to be built, so
+    /// a driver reads the same answer the person reads rather than finding a dead control.
+    pub const SKILL_WITH_BOT: &str = "settings-skill-with-bot";
+    pub const SKILL_RECORD: &str = "settings-skill-record";
+    /// Create a skill: the sheet and its fields.
+    pub const SKILL_SHEET: &str = "settings-skill-add-sheet";
+    pub const SKILL_SHEET_NAME: &str = "settings-skill-add-name";
+    pub const SKILL_SHEET_DESCRIPTION: &str = "settings-skill-add-description";
+    pub const SKILL_SHEET_BODY: &str = "settings-skill-add-body";
+    pub const SKILL_SHEET_CANCEL: &str = "settings-skill-add-cancel";
+    pub const SKILL_SHEET_SAVE: &str = "settings-skill-add-save";
+    pub const SKILL_ADD_ERROR: &str = "settings-skill-add-error";
+    /// Delete asks first: the dialog, and its two answers.
+    pub const SKILL_DELETE_SHEET: &str = "settings-skill-delete-sheet";
+    pub const SKILL_DELETE_CONFIRM: &str = "settings-skill-delete-confirm";
+    pub const SKILL_DELETE_CANCEL: &str = "settings-skill-delete-cancel";
+    /// A task taught on a coworker's screen, being written up as a skill.
+    ///
+    /// The sheet this happens on is in that screen's own window, which has no tree: these four
+    /// are what a driver has of it. The two that are clicked carry the ids the sheet's own
+    /// controls carry, so a driver presses the button the person presses; the two statuses are
+    /// here only — the screen says the same things as a label and a red line.
+    pub const TEACH_SKILL_WRITING: &str = "teach-skill-writing";
+    pub const TEACH_SKILL_ERROR: &str = "teach-skill-error";
+    /// The lesson that was written, named by the name it must be invoked by, carrying its id and
+    /// — while nobody has read it — the state `off`. Clicking it opens it to be read.
+    pub const TEACH_SAVED_SKILL: &str = "teach-saved-skill";
+    /// Send the refused tape again. The server keeps no tape, so this is the only thing that
+    /// can: the recording is still in the window that made it. Only where sending it again
+    /// could come out differently, and only while that window is open.
+    pub const TEACH_RETRY: &str = "teach-retry";
+    /// The way to the library for the one refusal nobody can answer: the connection dropped, so
+    /// the skill may have been written and may not, and looking is the only way to find out.
+    pub const TEACH_CHECK_LIBRARY: &str = "teach-check-library";
+
+    /// The way back from an open skill to the whole-width list.
+    pub const SKILL_CLOSE: &str = "settings-skill-close";
+    /// The open skill's pane while its prose is on its way, and where it says the fetch was
+    /// refused. One or the other, never both, and neither once the pane has what it asked for.
+    ///
+    /// "Has what it asked for" is not "has prose": a skill can arrive with none, which is what a
+    /// draft is. Reading the empty body as "still coming" left a driver waiting at a pane the
+    /// person could see was finished.
+    pub const SKILL_LOADING: &str = "settings-skill-loading";
+    pub const SKILL_ERROR: &str = "settings-skill-error";
+
+    /// One skill's row. The id is the server's, so a driver that made a skill through
+    /// `skill.create` can address the thing it made.
+    pub fn skill(id: &str) -> String {
+        format!("settings-skill-row-{id}")
+    }
+
+    /// Open, on that row's own menu. A second way in to the same pane as the row itself, and
+    /// both are on screen.
+    pub fn skill_open(id: &str) -> String {
+        format!("settings-skill-open-{id}")
+    }
+
+    /// Delete on that row's menu, and Delete on the open skill's pane. Two controls in two
+    /// places, so two ids: one name for both is one name that cannot say which was meant.
+    pub fn skill_delete(id: &str) -> String {
+        format!("settings-skill-delete-{id}")
+    }
+
+    pub fn skill_detail_delete(id: &str) -> String {
+        format!("settings-skill-detail-delete-{id}")
+    }
+
+    /// The switch on the open skill's pane: on, and a turn may read it; off, and nothing may
+    /// run it. It carries `checked` so a driver reads where it is rather than what it says.
+    pub fn skill_enabled(id: &str) -> String {
+        format!("settings-skill-enabled-{id}")
+    }
+
+    /// The prose itself, on the open skill's pane. It is what `skill.create` wrote down, so it
+    /// is the one thing a driver has to be able to read back — and on a draft it is the sentence
+    /// the pane shows in its place, with an empty value under it.
+    pub fn skill_body(id: &str) -> String {
+        format!("settings-skill-body-{id}")
+    }
+
+    pub fn skill_detail(id: &str) -> String {
+        format!("settings-skill-detail-{id}")
+    }
+
+    pub fn skill_updated(id: &str) -> String {
+        format!("settings-skill-updated-{id}")
     }
 
     /// One routine's row. The id is the schedule's, which is the server's, so a driver that
@@ -223,6 +337,47 @@ pub enum Command {
     ImportSiteLogins {
         path: String,
     },
+    /// Settings → Skills: open the page, pick a side of the toggle, search it, open one skill
+    /// or leave it, write one down, take an upload, drop one.
+    OpenSkills,
+    SetSkillsScope(crate::state::SkillScope),
+    SetSkillsQuery(String),
+    OpenSkill(String),
+    CloseSkill,
+    OpenSkillAdd,
+    CloseSkillAdd,
+    CreateSkill {
+        name: String,
+        description: String,
+        body: String,
+    },
+    /// A `SKILL.md`, or the folder one lives in, by a path the driver gives (no picker).
+    UploadSkill {
+        path: String,
+    },
+    /// Delete asks first, as it does for a person: this opens the dialog, and the two below
+    /// answer it.
+    AskSkillDelete {
+        id: String,
+    },
+    ConfirmSkillDelete,
+    CloseSkillDeleteConfirm,
+    /// The switch on the open skill's pane, both ways: on is the review a lesson a model wrote
+    /// is waiting for, off is what somebody does after reading one they do not want used.
+    SetSkillEnabled {
+        id: String,
+        enabled: bool,
+    },
+    /// A tape taught on a coworker's screen and written up as a skill: read the lesson, which
+    /// is what has to happen before anything may use it, or send a refused tape again. `None`
+    /// opens the library itself, for the refusal where nobody knows whether a skill was written.
+    ///
+    /// Both belong to the screen window's sheet and are reached through the app, because that
+    /// window has no tree of its own for a driver to work.
+    OpenTaughtSkill {
+        id: Option<String>,
+    },
+    RetryTaughtSkill,
     /// Settings → Logins: the search field's text, the picked row, the Add sheet, and the
     /// picked row's notes.
     SetSiteLoginQuery(String),
@@ -315,7 +470,11 @@ impl Command {
             Self::SelectSession(id) => state.select_conversation(id, cx),
             Self::SelectCoworker(id) => state.select_coworker(id, cx),
             Self::SendMessage(text) => state.send_message(text, cx),
-            Self::SendMessageSteer(text) => state.send_message_with(text, true, cx),
+            // Words of the driver's own, not the composer's: `chat.send` is given its text and
+            // never reads the draft, so nothing off the draft rides out on it. A driver that
+            // wants the draft's skill types into the composer and presses Enter, which is the
+            // person's path and goes through the composer.
+            Self::SendMessageSteer(text) => state.send_message_with(text, true, None, cx),
             Self::StopTurn => state.stop_turn(cx),
             Self::RetryTurn => state.retry_turn(cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
@@ -373,6 +532,25 @@ impl Command {
             Self::ImportSiteLogins { path } => {
                 state.import_site_logins(std::path::PathBuf::from(path), cx)
             }
+            Self::OpenSkills => state.open_skills(cx),
+            Self::SetSkillsScope(scope) => state.set_skills_scope(scope, cx),
+            Self::SetSkillsQuery(query) => state.set_skills_query(query, cx),
+            Self::OpenSkill(id) => state.open_skill(id, cx),
+            Self::CloseSkill => state.close_skill(cx),
+            Self::OpenSkillAdd => state.open_skill_add(cx),
+            Self::CloseSkillAdd => state.close_skill_add(cx),
+            Self::CreateSkill {
+                name,
+                description,
+                body,
+            } => state.create_skill(name, description, body, cx),
+            Self::UploadSkill { path } => state.upload_skill(std::path::PathBuf::from(path), cx),
+            Self::AskSkillDelete { id } => state.ask_skill_delete(id, cx),
+            Self::ConfirmSkillDelete => state.confirm_skill_delete(cx),
+            Self::CloseSkillDeleteConfirm => state.close_skill_delete_confirm(cx),
+            Self::SetSkillEnabled { id, enabled } => state.set_skill_enabled(id, enabled, cx),
+            Self::OpenTaughtSkill { id } => state.show_skill_in_main_window(id, cx),
+            Self::RetryTaughtSkill => state.retry_taught_skill(cx),
             Self::SetSiteLoginQuery(query) => state.set_site_login_query(query, cx),
             Self::SelectSiteLogin(id) => state.select_site_login(id, cx),
             Self::OpenSiteLoginAdd => state.open_site_login_add(cx),
@@ -514,8 +692,8 @@ fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> 
 fn not_editable(target: &str) -> String {
     format!(
         "`{target}` is not editable (composer, login-email, login-password, \
-         user-form-field-*, settings-logins-search, settings-login-notes-*, or \"\" for \
-         whatever holds the caret)"
+         user-form-field-*, settings-logins-search, settings-skills-search, \
+         settings-login-notes-*, or \"\" for whatever holds the caret)"
     )
 }
 
@@ -579,6 +757,7 @@ fn last_screenshot_set(state: &AppState) -> Vec<ScreenshotSpec> {
 fn panel_rows(
     mode: PanelMode,
     recipes: &[RecipeSummary],
+    skills: &SkillLibrary<'_>,
     active: Option<&ActiveRecipe>,
 ) -> Vec<PanelRow> {
     let rows = match mode {
@@ -591,7 +770,7 @@ fn panel_rows(
             ];
         }
         PanelMode::Tools => ToolSource.rows(),
-        PanelMode::Slash => SlashSource.rows(recipes),
+        PanelMode::Slash => SlashSource.rows(recipes, skills),
         PanelMode::Parameters => match active {
             Some(recipe) => ParameterSource.rows(recipe),
             None => Vec::new(),
@@ -627,7 +806,7 @@ fn panel_name(mode: PanelMode, recipe: Option<&RecipeBarSnap>) -> String {
     match mode {
         PanelMode::Plus => "Attach or teach".to_string(),
         PanelMode::Tools => "Tools".to_string(),
-        PanelMode::Slash => "Recipes, workflows and actions".to_string(),
+        PanelMode::Slash => "Recipes, workflows, skills and actions".to_string(),
         PanelMode::Parameters => match recipe {
             Some(recipe) => format!("What {} needs told", recipe.name),
             None => "What the recipe needs told".to_string(),
@@ -708,6 +887,59 @@ struct RecipeSnap {
     name: String,
     /// A share waiting on Accept or Decline.
     pending: bool,
+}
+
+/// One row of Settings → Skills. A skill is prose the model reads before it works, which is
+/// why the row carries its description: that sentence is what the model chooses by, and a
+/// driver checking that a skill was written down checks the words, not a count.
+#[derive(Clone)]
+struct SkillSnap {
+    id: String,
+    name: String,
+    /// `authored`, `uploaded` or `taught` — where the prose came from, as a state on the row so
+    /// an assert does not have to match a sentence.
+    source: &'static str,
+    description: String,
+    /// Named and kept, with no prose in it yet, so there is nothing to invoke.
+    draft: bool,
+    /// The switch. Off is drawn on the row as a chip, so it is a state here: after this branch
+    /// most rows in a library are off, because every lesson a model writes starts that way.
+    enabled: bool,
+}
+
+// How stale a skill is has no field here. The row shows it, but as a bare line with no id of
+// its own; where the screen gives that fact an element to point at is the open skill's pane,
+// and it is read off [`OpenSkillSnap`] there.
+
+/// The skill on the pane, from the moment it was asked for.
+///
+/// Not read off the list: the list holds one side of the toggle and the pane keeps whatever was
+/// opened, including a skill from the side that is no longer shown. Reading it off the rows put
+/// the driver and the screen out of step exactly there — the person saw the pane, the driver saw
+/// nothing to assert on.
+#[derive(Clone)]
+struct OpenSkillSnap {
+    id: String,
+    name: String,
+    /// The prose. Empty while it is coming, and empty for a draft — which is why `arrived` is
+    /// its own bit rather than something to be worked out from this being empty.
+    body: String,
+    /// The fetch has answered. Until it has, the pane is the close button and a line saying so.
+    arrived: bool,
+    updated_at_ms: i64,
+    /// Where the switch is. Off means nothing may run it — the server refuses a switched-off
+    /// skill even to its owner — and off is where every lesson a model wrote starts.
+    enabled: bool,
+    /// When somebody first switched this skill on, and `None` while nobody has. The raw fact,
+    /// not the answer: whether it is waiting to be read is worked out by the screen's own
+    /// function, so the tree and the pane cannot say different things about it.
+    approved_at_ms: Option<i64>,
+    /// The switch is with the server. It is dead while it is, both on screen and here.
+    switching: bool,
+    /// What the fetch said when it was refused, or what the switch was refused with. The pane
+    /// says this instead of "Loading…" while there is nothing to draw, and beside the switch
+    /// once there is.
+    error: Option<String>,
 }
 
 /// One routine on the open bot's Computer pane, which is one schedule on the server.
@@ -1032,6 +1264,128 @@ fn site_login_detail_node(login: &SiteLoginSnap) -> UiNode {
     ))
 }
 
+/// One row of the list: what the skill is called and what it is FOR — its description, which is
+/// the sentence the model chooses by. What it SAYS is not on the row; that is fetched when the
+/// skill is opened and read off its pane, at [`ids::skill_body`].
+///
+/// Where the prose came from rides as a state, and a draft says so: a skill with no prose in it
+/// cannot be invoked, which is the one thing worth knowing about it.
+fn skill_node(skill: &SkillSnap, open: bool) -> UiNode {
+    let mut node = UiNode::listitem(ids::skill(&skill.id), skill.name.clone())
+        .with_value(skill.description.clone());
+    node.states.push(skill.source.to_string());
+    if skill.draft {
+        node.states.push("draft".to_string());
+    }
+    if !skill.enabled {
+        node.states.push("off".to_string());
+    }
+    if open {
+        node.states.push("selected".to_string());
+    }
+    node.with_child(UiNode::button(ids::skill_delete(&skill.id), "Delete"))
+}
+
+/// The pane for the open skill: the prose, how stale it is, and the way out of it.
+///
+/// The prose is here because this is the only place it is. A row carries what a skill is FOR;
+/// what it SAYS is fetched when it is opened, and a driver that had just written one down could
+/// otherwise not check that a word of it was kept.
+fn skill_detail_node(skill: &OpenSkillSnap) -> UiNode {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut node = UiNode::dialog(ids::skill_detail(&skill.id), skill.name.clone());
+    // Refused, still coming, or here — three states the pane has and a driver has to be able to
+    // tell apart. "Here" is not "has prose": a draft arrives with none, and reading the empty
+    // body as "still coming" left a driver waiting at a pane that was already finished.
+    //
+    // A refusal with no skill under it is the whole pane. One WITH a skill under it came from
+    // the switch, and goes beside the switch, because that is what it is about.
+    if !skill.arrived {
+        let said = match &skill.error {
+            Some(error) => UiNode::status(ids::SKILL_ERROR, error.clone()),
+            None => UiNode::status(ids::SKILL_LOADING, "Loading…"),
+        };
+        return node
+            .with_child(said)
+            .with_child(UiNode::button(ids::SKILL_CLOSE, "Close"));
+    }
+    let updated = if skill.updated_at_ms > 0 {
+        short_relative_time(skill.updated_at_ms, now_ms)
+    } else {
+        NEVER_UPDATED.to_string()
+    };
+    // The one control on this pane that changes what the skill can do: off means nothing may
+    // run it, and a lesson a model wrote from a recording is born off. Where it stands rides as
+    // `checked`, so an assert does not have to match the sentence beside it, and it is not
+    // enabled while the server is being told — a switch pressed twice sends two answers about
+    // one flag.
+    node = node.with_child(
+        UiNode::new(
+            ids::skill_enabled(&skill.id),
+            "switch",
+            if skill.enabled {
+                "Switched on"
+            } else {
+                "Switched off"
+            },
+        )
+        .with_checked(skill.enabled)
+        .with_enabled(!skill.switching),
+    );
+    // Off and never switched on by anybody, which is not the same as off: a lesson a model
+    // wrote and nobody has read, as against one somebody read and switched off again. The
+    // screen's own function answers it, so the tree and the pane cannot disagree — they did,
+    // because each worked it out for itself and the tree called every skill on a server that
+    // sends no stamp unread, switched on or not.
+    if waiting_to_be_read(skill.enabled, skill.approved_at_ms)
+        && let Some(switch) = node.children.last_mut()
+    {
+        switch.states.push("unread".to_string());
+    }
+    if let Some(error) = &skill.error {
+        node = node.with_child(UiNode::status(ids::SKILL_ERROR, error.clone()));
+    }
+    node = node.with_child(
+        // The sentence the pane draws where the prose would be, with nothing under it: a draft
+        // is a skill that has none, not a skill whose prose could not be read.
+        UiNode::status(
+            ids::skill_body(&skill.id),
+            if skill.body.is_empty() {
+                NOTHING_WRITTEN_YET
+            } else {
+                "Instructions"
+            },
+        )
+        .with_value(skill.body.clone()),
+    );
+    node.with_child(UiNode::status(ids::skill_updated(&skill.id), "Updated").with_value(updated))
+        .with_child(UiNode::button(
+            ids::skill_detail_delete(&skill.id),
+            "Delete",
+        ))
+        .with_child(UiNode::button(ids::SKILL_CLOSE, "Close"))
+}
+
+/// What a second create is told while the first is still going.
+///
+/// The person cannot ask twice — Save goes dead and the sheet closes on the way out — so this is
+/// for the driver, which would otherwise be told nothing and conclude its skill was taken.
+const ALREADY_SAVING: &str = "a skill is already being saved";
+
+/// What a control on the Skills page says when the Skills page is not what is on screen.
+fn skills_off_screen(target: &str) -> String {
+    format!(
+        "`{target}` is on Settings → Skills, which is not what is on screen: open it with \
+         `skills.open`"
+    )
+}
+
+/// What to use instead of typing into the Create sheet. One sentence, because the three fields
+/// and the Save button are refused for the same reason, and a driver has to be told the same
+/// thing whichever of the four it reached for.
+const SHEET_IS_NOT_TYPED_INTO: &str = "the New skill sheet's fields belong to the window and the driver cannot type into them: \
+     use `skill.create --arg name= [--arg description= --arg body=]`";
+
 /// A recipe row's id, and only a row's. Every control on the recipe page is named
 /// `recipe-<something>` too, so a bare prefix match turned a click on a version tab into a
 /// fetch of a recipe called "version-1" — the page then said "no such recipe" and the driver
@@ -1145,6 +1499,8 @@ pub struct NativeChatHost {
     panel_rows: Vec<PanelRow>,
     /// The recipe the next message runs, as the composer's bar shows it.
     recipe_bar: Option<RecipeBarSnap>,
+    /// The skill the next message is sent with, as the chip in the draft names it.
+    composer_skill: Option<crate::state::ActiveSkill>,
     /// The captions of the newest set of pictures in the transcript, in tile order.
     thumbs: Vec<String>,
     /// The picture overlay, while it is open.
@@ -1164,6 +1520,29 @@ pub struct NativeChatHost {
     site_login_query: String,
     site_login_selected: Option<String>,
     site_login_add_open: bool,
+    /// Settings → Skills, as that page has it: the library for the open side of the toggle, a
+    /// count for each side, the search, the skill on the pane and the Create sheet.
+    skills: Vec<SkillSnap>,
+    skills_tab: bool,
+    skills_query: String,
+    skills_scope: crate::state::SkillScope,
+    skills_counts: crate::state::SkillCounts,
+    skills_loading: bool,
+    /// The three error slots the page has, kept apart here because they are apart on screen: a
+    /// driver that read the list's slot for the sheet's would read a refusal nobody was shown.
+    skills_error: Option<String>,
+    skill_open: Option<OpenSkillSnap>,
+    skill_add_open: bool,
+    skill_add_error: Option<String>,
+    skill_saving: bool,
+    /// The skill the delete dialog is about, by name, while it is up.
+    skill_delete_confirm: Option<String>,
+    /// A tape being written up as a skill on a coworker's screen, and what became of it. That
+    /// window draws its own sheet and this host cannot see into it; the app carries the fact.
+    taught_skill: Option<TaughtSkill>,
+    /// The window holding a refused tape is still open, so an offer to send it again is an
+    /// offer something can honour. Closing that window takes the tape with it.
+    taught_tape_in_hand: bool,
     computer_tab: bool,
     updates_tab: bool,
     /// Dedicated provisioned box: Route traffic icon on the Computer pane.
@@ -1339,7 +1718,18 @@ impl NativeChatHost {
             composer_panel: state.composer_panel,
             panel_rows: state
                 .composer_panel
-                .map(|mode| panel_rows(mode, &state.recipes, state.active_recipe.as_ref()))
+                .map(|mode| {
+                    panel_rows(
+                        mode,
+                        &state.recipes,
+                        &SkillLibrary {
+                            skills: &state.your_skills,
+                            loading: state.your_skills_loading,
+                            error: state.your_skills_error.as_deref(),
+                        },
+                        state.active_recipe.as_ref(),
+                    )
+                })
                 .unwrap_or_default(),
             recipe_bar: state.active_recipe.as_ref().map(|recipe| RecipeBarSnap {
                 name: recipe.name.clone(),
@@ -1354,6 +1744,7 @@ impl NativeChatHost {
                     })
                     .collect(),
             }),
+            composer_skill: state.active_skill.clone(),
             thumbs: last_screenshot_set(state)
                 .iter()
                 .map(|shot| shot.caption.clone())
@@ -1484,6 +1875,55 @@ impl NativeChatHost {
                     row: row.clone(),
                 })
                 .collect(),
+            skills: state
+                .skills
+                .iter()
+                .map(|skill| SkillSnap {
+                    id: skill.id.clone(),
+                    name: skill.name.clone(),
+                    source: skill.source.word(),
+                    description: skill.description.clone(),
+                    draft: skill.draft,
+                    enabled: skill.enabled,
+                })
+                .collect(),
+            skills_tab: state.app_settings_tab == AppSettingsTab::Skills,
+            skills_query: state.skills_query.clone(),
+            skills_scope: state.skills_scope,
+            skills_counts: state.skills_counts,
+            skills_loading: state.skills_loading,
+            skills_error: state.skills_error.clone(),
+            skill_open: state.skill_open_id.clone().map(|id| {
+                let detail = state.skill_open.as_ref().filter(|open| open.skill.id == id);
+                let row = state.skills.iter().find(|skill| skill.id == id);
+                OpenSkillSnap {
+                    name: detail
+                        .map(|open| open.skill.name.clone())
+                        .or_else(|| row.map(|row| row.name.clone()))
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| id.clone()),
+                    body: detail.map(|open| open.body.clone()).unwrap_or_default(),
+                    arrived: detail.is_some(),
+                    // The detail's and not the row's: the pane draws this row only once the
+                    // fetch has answered, and a timestamp taken off the list would be a fact
+                    // advertised for an element nobody can point at yet.
+                    updated_at_ms: detail
+                        .map(|open| open.skill.updated_at_ms)
+                        .unwrap_or_default(),
+                    enabled: detail.map(|open| open.skill.enabled).unwrap_or(true),
+                    approved_at_ms: detail.and_then(|open| open.skill.approved_at_ms),
+                    // Any switch, as on screen: one at a time, whichever skill.
+                    switching: state.skill_enabling.is_some(),
+                    error: state.skill_error.clone(),
+                    id,
+                }
+            }),
+            skill_add_open: state.skill_add_open,
+            skill_add_error: state.skill_add_error.clone(),
+            skill_saving: state.skill_saving,
+            skill_delete_confirm: state.skill_delete_prompt(),
+            taught_skill: state.taught_skill.clone(),
+            taught_tape_in_hand: state.taught_tape_is_in_hand(),
             logins_tab: state.app_settings_tab == AppSettingsTab::Logins,
             site_login_notice: state.site_login_notice.clone(),
             site_login_error: state.site_login_error.clone(),
@@ -1633,6 +2073,9 @@ impl NativeChatHost {
         if let Some(bar) = self.recipe_bar_node() {
             page = page.with_child(bar);
         }
+        if let Some(skill) = self.composer_skill_node() {
+            page = page.with_child(skill);
+        }
         for (index, caption) in self.thumbs.iter().enumerate() {
             page = page.with_child(UiNode::button(ids::image_thumb(index), caption.clone()));
         }
@@ -1752,6 +2195,9 @@ impl NativeChatHost {
             );
         }
         page = page.with_child(computer);
+        for node in self.taught_skill_nodes() {
+            page = page.with_child(node);
+        }
         if let Some(ready) = self.egress_tunnel_ready {
             page = page.with_child(UiNode::status(
                 "egress_tunnel.ready",
@@ -1819,9 +2265,13 @@ impl NativeChatHost {
                             .with_child(UiNode::button("app-settings-back", "← Back to app"))
                             .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
-                            .with_child(UiNode::button("settings-tab-logins", "Logins"));
+                            .with_child(UiNode::button("settings-tab-logins", "Logins"))
+                            .with_child(UiNode::button(ids::SETTINGS_SKILLS, "Skills"));
                         if self.logins_tab {
                             settings = self.logins_nodes(settings);
+                        }
+                        if self.skills_tab {
+                            settings = self.skills_nodes(settings);
                         }
                         if self.updates_tab {
                             settings = settings.with_child(UiNode::button(
@@ -1886,6 +2336,51 @@ impl NativeChatHost {
         // it is plainly not the reconnect pill, which is the confusion that made the bug.
         node.states.push("signed-out".to_string());
         vec![node, UiNode::button("signed-out-sign-in", "Sign in again")]
+    }
+
+    /// A task taught on a coworker's screen while it is being written up as a skill, and what
+    /// came of it. Nothing at all until somebody teaches one.
+    ///
+    /// The sheet is in that screen's own window, which draws no tree: without these a driver
+    /// watching a model write a lesson sees an app doing nothing for a minute, and then an app
+    /// that has done nothing. Three states and they are three nodes, because they are three
+    /// different things to wait for.
+    fn taught_skill_nodes(&self) -> Vec<UiNode> {
+        match &self.taught_skill {
+            None => Vec::new(),
+            Some(TaughtSkill::Writing) => {
+                vec![UiNode::status(ids::TEACH_SKILL_WRITING, WRITING_A_LESSON)]
+            }
+            Some(TaughtSkill::Written { id, name, enabled }) => {
+                // Named by what has to be typed after a slash, carrying the id to open it by,
+                // and switched off as a STATE — off is the fact, and a driver checking that a
+                // lesson has to be read before anything uses it should not be matching copy.
+                let mut node =
+                    UiNode::button(ids::TEACH_SAVED_SKILL, name.clone()).with_value(id.clone());
+                if !enabled {
+                    node.states.push("off".to_string());
+                }
+                vec![node]
+            }
+            Some(TaughtSkill::Refused { why, next, .. }) => {
+                // The server's sentence, which names which of the things went wrong, and then
+                // whichever of the two controls the sheet is drawing beside it. A driver
+                // offered a retry for a spend cap would sit in a loop the sentence above it
+                // has already said will never end; one offered a retry for an answer that
+                // never arrived would write a second skill from one recording.
+                let mut nodes = vec![UiNode::status(ids::TEACH_SKILL_ERROR, why.clone())];
+                match next {
+                    AfterRefusal::SendAgain if self.taught_tape_in_hand => {
+                        nodes.push(UiNode::button(ids::TEACH_RETRY, "Try again"));
+                    }
+                    AfterRefusal::LookFirst => {
+                        nodes.push(UiNode::button(ids::TEACH_CHECK_LIBRARY, "Check Skills"));
+                    }
+                    AfterRefusal::SendAgain | AfterRefusal::Nothing => {}
+                }
+                nodes
+            }
+        }
     }
 
     /// The composer's one action button, in whichever of its two states it is in.
@@ -1965,6 +2460,17 @@ impl NativeChatHost {
             node = node.with_child(chip);
         }
         Some(node)
+    }
+
+    /// The skill the next message is sent with, while one is on the draft.
+    ///
+    /// There is no bar for a skill: the chip in the message is the whole of what is on screen,
+    /// so the node is named after what the chip reads, and the id the turn will carry rides in
+    /// `value` — which is the field a driver can assert on, and the only one of the two that
+    /// tells two skills of one name apart.
+    fn composer_skill_node(&self) -> Option<UiNode> {
+        let skill = self.composer_skill.as_ref()?;
+        Some(UiNode::note(ids::COMPOSER_SKILL, skill.name.clone()).with_value(skill.id.clone()))
     }
 
     /// The picture overlay, while it is open, with the same line the overlay itself prints.
@@ -2174,6 +2680,324 @@ impl NativeChatHost {
             );
         }
         settings
+    }
+
+    /// Settings → Skills as the page draws it: the toggle with a count on each side, the
+    /// search field, Add and the four things it offers, the rows the search leaves, the open
+    /// skill's pane, and the Create sheet while it is up.
+    fn skills_nodes(&self, mut settings: UiNode) -> UiNode {
+        for side in SkillScope::ALL {
+            let mut chip = UiNode::button(
+                side.element_id(),
+                format!("{} {}", side.label(), self.skills_counts.of(side)),
+            );
+            if side == self.skills_scope {
+                chip.states.push("selected".to_string());
+            }
+            settings = settings.with_child(chip);
+        }
+        settings = settings
+            .with_child(
+                UiNode::textbox(ids::SKILLS_SEARCH, "Search skills")
+                    .with_value(self.skills_query.clone()),
+            )
+            .with_child(UiNode::button(ids::SKILL_ADD, "Add"))
+            .with_child(UiNode::button(ids::SKILL_UPLOAD, "Upload skill"))
+            .with_child(UiNode::button(ids::SKILL_WRITE, "Create a skill"))
+            // The two nobody has built are statuses carrying their own sentence, not buttons:
+            // what a driver needs from them is the answer, which is the same answer the person
+            // reads in the menu.
+            .with_child(UiNode::status(ids::SKILL_WITH_BOT, NOT_YET_WITH_BOT))
+            .with_child(UiNode::status(ids::SKILL_RECORD, NOT_YET_RECORDING));
+        if let Some(error) = &self.skills_error {
+            settings = settings.with_child(UiNode::status(ids::SKILLS_ERROR, error.clone()));
+        }
+        // Saving with no sheet up is an upload, which is the one long thing this page does with
+        // nothing else on screen to say it is going.
+        if self.skill_saving && !self.skill_add_open {
+            settings = settings.with_child(UiNode::status(ids::SKILLS_SAVING, "Uploading…"));
+        }
+        let rows: Vec<&SkillSnap> = self
+            .skills
+            .iter()
+            .filter(|skill| skill_matches(&skill.name, &skill.description, &self.skills_query))
+            .collect();
+        if rows.is_empty()
+            && let Some(line) = empty_line(
+                self.skills_loading,
+                self.skills.len(),
+                self.skills_scope,
+                self.skills_error.is_some(),
+            )
+        {
+            settings = settings.with_child(UiNode::status(ids::SKILLS_EMPTY, line));
+        }
+        let mut list = UiNode::list("settings-skills-rows", "Skills");
+        for skill in &rows {
+            list = list.with_child(skill_node(
+                skill,
+                self.skill_open.as_ref().map(|open| open.id.as_str()) == Some(skill.id.as_str()),
+            ));
+        }
+        settings = settings.with_child(list);
+        // The pane stays on the open skill whatever the list is showing: a search that hides
+        // its row, or a toggle moved to the other side. It is not read off the rows for exactly
+        // that reason.
+        if let Some(open) = &self.skill_open {
+            settings = settings.with_child(skill_detail_node(open));
+        }
+        if self.skill_add_open {
+            let mut sheet = UiNode::dialog(ids::SKILL_SHEET, "New skill")
+                .with_child(UiNode::textbox(ids::SKILL_SHEET_NAME, "Name"))
+                .with_child(UiNode::textbox(ids::SKILL_SHEET_DESCRIPTION, "Description"))
+                .with_child(UiNode::textbox(ids::SKILL_SHEET_BODY, "Instructions"))
+                .with_child(UiNode::button(ids::SKILL_SHEET_CANCEL, "Cancel"))
+                .with_child(UiNode::button(
+                    ids::SKILL_SHEET_SAVE,
+                    // Dead while the create is in flight, and saying so: a Save that is still
+                    // working is not a Save that can be pressed again.
+                    if self.skill_saving {
+                        "Saving…"
+                    } else {
+                        "Save"
+                    },
+                ));
+            // The sheet's own slot, over the fields it is about. What the list was refused is
+            // said in the list's slot, and a driver reading one for the other would read a
+            // refusal from a place nobody was shown one.
+            if let Some(error) = &self.skill_add_error {
+                sheet = sheet.with_child(UiNode::status(ids::SKILL_ADD_ERROR, error.clone()));
+            }
+            settings = settings.with_child(sheet);
+        }
+        if let Some(name) = &self.skill_delete_confirm {
+            settings = settings.with_child(
+                UiNode::dialog(ids::SKILL_DELETE_SHEET, format!("Delete {name}?"))
+                    .with_child(UiNode::button(ids::SKILL_DELETE_CONFIRM, "Delete"))
+                    .with_child(UiNode::button(ids::SKILL_DELETE_CANCEL, "Cancel")),
+            );
+        }
+        settings
+    }
+
+    /// The skill an invoke names, checked against the ones the page has: an id nobody is showing
+    /// is a wrong address, and saying so is better than a call going out under it.
+    fn skill_id(&self, id: &str) -> Option<String> {
+        self.skills
+            .iter()
+            .find(|skill| skill.id == id)
+            .map(|skill| skill.id.clone())
+    }
+
+    fn invoke_skill_id(&self, args: &serde_json::Value, invoke: &str) -> Result<String, String> {
+        let id = invoke_arg_str(args, &["id", "skill_id", "skillId"])
+            .ok_or_else(|| format!("{invoke} requires arg id"))?;
+        self.skill_id(&id)
+            .ok_or_else(|| format!("no skill `{id}` on Settings → Skills"))
+    }
+
+    /// Typing into the search field, which is only there to be typed into while the page it
+    /// belongs to is on screen.
+    ///
+    /// The verb is not held to this: `skills.search` says what the page's search is, the way
+    /// `skills.scope` says which side is open, and neither is a claim about a keystroke landing
+    /// somewhere. A `type` or a `set_value` IS that claim, and this field is not in the tree for
+    /// it to land in until Settings is open on Skills.
+    fn skills_search(&mut self, value: String) -> Result<DispatchResult, String> {
+        if !(self.account_open && self.skills_tab) {
+            return Err(skills_off_screen(ids::SKILLS_SEARCH));
+        }
+        self.set_skills_query(value)
+    }
+
+    /// The search field on Settings → Skills: the host keeps the copy the list filters by.
+    fn set_skills_query(&mut self, value: String) -> Result<DispatchResult, String> {
+        self.skills_query = value.clone();
+        self.pending = Some(Command::SetSkillsQuery(value));
+        Ok(DispatchResult::empty())
+    }
+
+    /// One of the Skills page's controls, or `None` for a target that is not one.
+    ///
+    /// The tab itself answers from anywhere in Settings — it is how the page is reached. Every
+    /// other control here is refused while the page is not the one on screen: these ids sit in
+    /// the tree under a dialog that may be shut, and one of them answering while the person is
+    /// on Settings → Updates would be a click nobody could have made.
+    fn skill_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::SETTINGS_SKILLS {
+            return Some(Ok(Command::SetAppSettingsTab(AppSettingsTab::Skills)));
+        }
+        let found = self.skill_target(target)?;
+        if !(self.account_open && self.skills_tab) {
+            return Some(Err(skills_off_screen(target)));
+        }
+        Some(found)
+    }
+
+    /// What one of the page's controls does, leaving aside whether the page is on screen.
+    ///
+    /// A ROW IS A SKILL THIS PAGE IS SHOWING, and that is tested before anything else is read
+    /// off the target. Stripping `settings-skill-delete-` and calling what is left an id sent
+    /// `settings-skill-delete-confirm` looking for a skill called `confirm`, and the delete
+    /// dialog could not be answered at all; it did the same to `-delete-sheet`, the dialog's own
+    /// container. Membership closes both directions at once.
+    ///
+    /// An id that is shaped like a row's and names nothing on the page still answers with "no
+    /// skill", because that is a wrong address rather than an unknown control — and it is told
+    /// apart by the `skl_` the server mints, the way a recipe row's id is (see
+    /// [`recipe_row_target`]).
+    fn skill_target(&self, target: &str) -> Option<Result<Command, String>> {
+        for side in SkillScope::ALL {
+            if target == side.element_id() {
+                return Some(Ok(Command::SetSkillsScope(side)));
+            }
+        }
+        let row: [(&str, fn(String) -> Command); 4] = [
+            ("settings-skill-row-", Command::OpenSkill),
+            ("settings-skill-open-", Command::OpenSkill),
+            ("settings-skill-detail-delete-", |id| {
+                Command::AskSkillDelete { id }
+            }),
+            ("settings-skill-delete-", |id| Command::AskSkillDelete {
+                id,
+            }),
+        ];
+        for (prefix, make) in row {
+            if let Some(id) = target.strip_prefix(prefix).and_then(|id| self.skill_id(id)) {
+                return Some(Ok(make(id)));
+            }
+        }
+        // The switch, which is the open skill's and nobody else's: it toggles, the way it does
+        // under a finger, so what it is now has to be read off the pane rather than guessed.
+        if let Some(id) = target.strip_prefix("settings-skill-enabled-") {
+            return Some(
+                match self.skill_open.as_ref().filter(|open| open.id == id) {
+                    Some(open) if !open.arrived => Err(format!(
+                        "`{target}` is not on the pane yet: skill `{id}` is still being fetched"
+                    )),
+                    // One at a time, whichever skill, and in the words the app answers with:
+                    // the driver and the person are told the same thing about the same fact.
+                    Some(open) if open.switching => Err(SWITCH_IN_FLIGHT.to_string()),
+                    Some(open) => Ok(Command::SetSkillEnabled {
+                        id: id.to_string(),
+                        enabled: !open.enabled,
+                    }),
+                    None => Err(format!("no skill `{id}` is open to switch")),
+                },
+            );
+        }
+        let fixed = match target {
+            ids::SKILL_WRITE => Some(Ok(Command::OpenSkillAdd)),
+            ids::SKILL_SHEET_CANCEL => Some(Ok(Command::CloseSkillAdd)),
+            ids::SKILL_CLOSE => Some(Ok(Command::CloseSkill)),
+            ids::SKILL_DELETE_CONFIRM => Some(if self.skill_delete_confirm.is_some() {
+                Ok(Command::ConfirmSkillDelete)
+            } else {
+                Err("no delete is waiting to be answered".to_string())
+            }),
+            ids::SKILL_DELETE_CANCEL => Some(Ok(Command::CloseSkillDeleteConfirm)),
+            ids::SKILL_ADD => Some(Err(
+                "`settings-skill-add` opens a menu: click what you want from it                  (`settings-skill-write`), or use `skill.create` / `skill.upload`"
+                    .to_string(),
+            )),
+            ids::SKILL_UPLOAD => Some(Err(
+                "`settings-skill-upload` opens a file picker: use `skill.upload --arg path=`                  with a SKILL.md or the folder one lives in"
+                    .to_string(),
+            )),
+            // The sheet's fields are the window's own; the driver hands the values over.
+            ids::SKILL_SHEET_SAVE => Some(Err(SHEET_IS_NOT_TYPED_INTO.to_string())),
+            ids::SKILL_WITH_BOT => Some(Err(NOT_YET_WITH_BOT.to_string())),
+            ids::SKILL_RECORD => Some(Err(NOT_YET_RECORDING.to_string())),
+            _ => None,
+        };
+        if fixed.is_some() {
+            return fixed;
+        }
+        for (prefix, _) in row {
+            if let Some(id) = target
+                .strip_prefix(prefix)
+                .filter(|id| id.starts_with("skl_"))
+            {
+                return Some(Err(format!("no skill `{id}`")));
+            }
+        }
+        if let Some(id) = target
+            .strip_prefix("settings-skill-menu-")
+            .filter(|id| id.starts_with("skl_"))
+        {
+            return Some(Err(format!(
+                "`{target}` opens that row's menu: click `{}` to open the skill or `{}` to                  delete it",
+                ids::skill_open(id),
+                ids::skill_delete(id)
+            )));
+        }
+        None
+    }
+
+    /// The two controls a taught skill has, or `None` for a target that is neither.
+    ///
+    /// Both are refused when there is nothing for them to be about, rather than doing nothing:
+    /// a click on a line naming a skill nobody has taught, or a Try again with no refused tape
+    /// behind it, is a driver working from a tree it read before something changed.
+    fn taught_skill_command(&self, target: &str) -> Option<Result<Command, String>> {
+        match target {
+            ids::TEACH_SAVED_SKILL => Some(match &self.taught_skill {
+                Some(TaughtSkill::Written { id, .. }) => Ok(Command::OpenTaughtSkill {
+                    id: Some(id.clone()),
+                }),
+                _ => Err("no taught skill is waiting to be read".to_string()),
+            }),
+            ids::TEACH_RETRY => Some(match &self.taught_skill {
+                Some(TaughtSkill::Refused {
+                    next: AfterRefusal::SendAgain,
+                    ..
+                }) if self.taught_tape_in_hand => Ok(Command::RetryTaughtSkill),
+                // The window that was holding those bytes has been closed, and the sheet went
+                // with it. There is nothing left to send.
+                Some(TaughtSkill::Refused {
+                    next: AfterRefusal::SendAgain,
+                    ..
+                }) => Err(
+                    "the screen window holding that recording has been closed, and the \
+                     recording went with it"
+                        .to_string(),
+                ),
+                // Nothing answered, so the skill may already exist. Look before sending.
+                Some(TaughtSkill::Refused {
+                    next: AfterRefusal::LookFirst,
+                    ..
+                }) => Err(format!(
+                    "nobody knows whether that recording was written: open the library with \
+                     `{}` and look before sending it again",
+                    ids::TEACH_CHECK_LIBRARY
+                )),
+                // Refused for a reason a second identical send cannot change: a spend cap, a
+                // recording nothing can be written from, a name already taken, or a skill that
+                // was written and kept before the failure — where sending again would make a
+                // second one.
+                Some(TaughtSkill::Refused { why, .. }) => Err(format!(
+                    "sending that recording again cannot change the answer: {why}"
+                )),
+                _ => Err("no refused recording is waiting to be sent again".to_string()),
+            }),
+            ids::TEACH_CHECK_LIBRARY => Some(match &self.taught_skill {
+                Some(TaughtSkill::Refused { .. }) => Ok(Command::OpenTaughtSkill { id: None }),
+                _ => Err("nothing is waiting to be looked for".to_string()),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The Create sheet's three fields take no keystrokes from here: they are the window's, and
+    /// what would be typed into them is what `skill.create` takes as arguments.
+    fn skill_sheet_field(&self, target: &str) -> Option<Result<DispatchResult, String>> {
+        [
+            ids::SKILL_SHEET_NAME,
+            ids::SKILL_SHEET_DESCRIPTION,
+            ids::SKILL_SHEET_BODY,
+        ]
+        .contains(&target)
+        .then(|| Err(SHEET_IS_NOT_TYPED_INTO.to_string()))
     }
 
     fn site_login_id(&self, id: &str) -> Option<String> {
@@ -2403,6 +3227,10 @@ impl NativeChatHost {
             cmd
         } else if let Some(cmd) = self.save_login_command(target) {
             cmd
+        } else if let Some(cmd) = self.skill_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.taught_skill_command(target) {
+            cmd?
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
         } else if target == "settings-tab-computer" {
@@ -2478,6 +3306,12 @@ impl NativeChatHost {
         if target == "settings-logins-search" {
             return self.set_site_login_query(value.to_string());
         }
+        if target == ids::SKILLS_SEARCH {
+            return self.skills_search(value.to_string());
+        }
+        if let Some(refusal) = self.skill_sheet_field(target) {
+            return refusal;
+        }
         if let Some(result) = self.set_site_login_notes(target, value) {
             return result;
         }
@@ -2504,6 +3338,12 @@ impl NativeChatHost {
         if target == "settings-logins-search" {
             return self.set_site_login_query(format!("{}{text}", self.site_login_query));
         }
+        if target == ids::SKILLS_SEARCH {
+            return self.skills_search(format!("{}{text}", self.skills_query));
+        }
+        if let Some(refusal) = self.skill_sheet_field(target) {
+            return refusal;
+        }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
             keys: text_tokens(text)?,
@@ -2515,6 +3355,26 @@ impl NativeChatHost {
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
             return self.login_key(field, target, key);
+        }
+        if let Some(refusal) = self.skill_sheet_field(target) {
+            return refusal;
+        }
+        if target == ids::SKILLS_SEARCH {
+            return match key_token(key)?.as_str() {
+                "backspace" => {
+                    let mut value = self.skills_query.clone();
+                    value.pop();
+                    self.skills_search(value)
+                }
+                // The list filters as the text changes; Enter has nothing left to do — but a
+                // key pressed at a field that is not on screen did not land, and saying it did
+                // would be the same lie as taking the text.
+                "enter" if self.account_open && self.skills_tab => Ok(DispatchResult::empty()),
+                "enter" => Err(skills_off_screen(target)),
+                other => Err(format!(
+                    "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                )),
+            };
         }
         if target == "settings-logins-search" {
             return match key_token(key)?.as_str() {
@@ -2950,6 +3810,50 @@ impl NativeChatHost {
                     cron: cron.filter(|_| kind == crate::opengrok::ScheduleKind::Cron),
                 }
             }
+            // Settings → Skills. A skill is prose the model reads before it works; `recipe.*`
+            // is the taped replay of clicks, and the two verbs never cross.
+            "skills.open" => Command::OpenSkills,
+            "skills.scope" => {
+                let word = invoke_arg_str(args, &["scope", "side"])
+                    .ok_or_else(|| "skills.scope requires arg scope".to_string())?;
+                Command::SetSkillsScope(
+                    SkillScope::from_word(&word).ok_or_else(|| {
+                        format!("unknown skills scope `{word}` (yours, discover)")
+                    })?,
+                )
+            }
+            // No `q` clears the search.
+            "skills.search" => {
+                let query = invoke_arg_str(args, &["q", "query"]).unwrap_or_default();
+                return self.set_skills_query(query);
+            }
+            "skill.open" => Command::OpenSkill(self.invoke_skill_id(args, "skill.open")?),
+            "skill.create" if self.skill_saving => return Err(ALREADY_SAVING.to_string()),
+            "skill.create" => Command::CreateSkill {
+                name: invoke_arg_str(args, &["name"])
+                    .ok_or_else(|| "skill.create requires arg name".to_string())?,
+                description: invoke_arg_str(args, &["description"]).unwrap_or_default(),
+                // No body writes the row and leaves it a draft, which is what the sheet does
+                // with the instructions left empty.
+                body: invoke_arg_str(args, &["body", "instructions"]).unwrap_or_default(),
+            },
+            "skill.upload" if self.skill_saving => return Err(ALREADY_SAVING.to_string()),
+            "skill.upload" => Command::UploadSkill {
+                path: invoke_arg_str(args, &["path", "file", "folder"])
+                    .ok_or_else(|| "skill.upload requires arg path".to_string())?,
+            },
+            // Delete asks first, as it does for a person: this opens the dialog and the two
+            // below answer it, the way `computer.update` and `computer.confirm` do.
+            "skill.delete" => Command::AskSkillDelete {
+                id: self.invoke_skill_id(args, "skill.delete")?,
+            },
+            "skill.delete.confirm" => {
+                if self.skill_delete_confirm.is_none() {
+                    return Err("no delete is waiting to be answered".to_string());
+                }
+                Command::ConfirmSkillDelete
+            }
+            "skill.delete.cancel" => Command::CloseSkillDeleteConfirm,
             "routine.rotate" => Command::RotateRoutineWebhook {
                 routine_id: self.invoke_routine_id(args, "routine.rotate")?,
             },
@@ -3255,6 +4159,977 @@ mod tests {
         ));
     }
 
+    fn skill(id: &str, name: &str, description: &str) -> SkillSnap {
+        SkillSnap {
+            id: id.into(),
+            name: name.into(),
+            source: "authored",
+            description: description.into(),
+            draft: false,
+            enabled: true,
+        }
+    }
+
+    fn open_skill(id: &str, name: &str) -> OpenSkillSnap {
+        OpenSkillSnap {
+            id: id.into(),
+            name: name.into(),
+            body: "Ask for the receipt first.".into(),
+            arrived: true,
+            updated_at_ms: 1_700_000_000_000,
+            enabled: true,
+            approved_at_ms: Some(1_700_000_000_000),
+            switching: false,
+            error: None,
+        }
+    }
+
+    /// A host with Settings open on Skills and two of them listed.
+    fn skills_host() -> NativeChatHost {
+        let mut host = host();
+        host.account_open = true;
+        host.skills_tab = true;
+        host.skills = vec![
+            skill("skl_1", "expense-report", "How we file expenses"),
+            skill(
+                "skl_2",
+                "new-hire",
+                "First week for somebody who just joined",
+            ),
+        ];
+        host.skills_counts = crate::state::SkillCounts {
+            yours: 2,
+            discover: 5,
+        };
+        host
+    }
+
+    /// The tree is the page: both sides of the toggle with their counts, the search field with
+    /// what is in it, and a row per skill carrying what that skill is for.
+    #[test]
+    fn the_skills_tab_reads_as_the_page_reads() {
+        let host = skills_host();
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(SkillScope::Yours.element_id()).unwrap().name,
+            "Yours 2"
+        );
+        let discover = tree.find(SkillScope::Discover.element_id()).unwrap();
+        assert_eq!(discover.name, "Discover 5");
+        assert!(
+            !discover.states.contains(&"selected".to_string()),
+            "the side that is not open is not the one marked"
+        );
+        assert!(
+            tree.find(SkillScope::Yours.element_id())
+                .unwrap()
+                .states
+                .contains(&"selected".to_string())
+        );
+        let row = tree.find(&ids::skill("skl_1")).unwrap();
+        assert_eq!(row.name, "expense-report");
+        assert_eq!(
+            row.value.as_deref(),
+            Some("How we file expenses"),
+            "the description is what the model chooses by, so it is what a driver can assert on"
+        );
+        assert!(row.states.contains(&"authored".to_string()));
+        assert!(tree.find(&ids::skill_delete("skl_1")).is_some());
+        assert!(tree.find(ids::SKILLS_EMPTY).is_none());
+    }
+
+    /// A skill with no prose in it cannot be invoked, and that is the one thing worth knowing
+    /// about it — so it is a state, not something to be worked out from a count.
+    #[test]
+    fn a_draft_says_so_on_its_row() {
+        let mut host = skills_host();
+        host.skills[1].draft = true;
+        host.skills[1].source = "uploaded";
+        let tree = host.snapshot();
+        assert!(
+            !tree
+                .find(&ids::skill("skl_1"))
+                .unwrap()
+                .states
+                .contains(&"draft".to_string())
+        );
+        let draft = tree.find(&ids::skill("skl_2")).unwrap();
+        assert!(draft.states.contains(&"draft".to_string()));
+        assert!(draft.states.contains(&"uploaded".to_string()));
+
+        // And the switch, which the row wears as a chip: after this branch most rows in a
+        // library are off, because every lesson a model writes from a recording starts off.
+        assert!(
+            !draft.states.contains(&"off".to_string()),
+            "a draft is not a skill that was switched off"
+        );
+        host.skills[1].enabled = false;
+        assert!(
+            host.snapshot()
+                .find(&ids::skill("skl_2"))
+                .unwrap()
+                .states
+                .contains(&"off".to_string())
+        );
+    }
+
+    /// The tree lists the rows the search leaves, exactly the rows the screen has: a driver
+    /// shown a row nobody can see would click something that is not there.
+    #[test]
+    fn the_search_leaves_the_driver_the_same_rows_it_leaves_the_screen() {
+        let mut host = skills_host();
+        host.dispatch(&Op::Invoke {
+            name: "skills.search".into(),
+            args: serde_json::json!({ "q": "joined" }),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillsQuery(query) if query == "joined"
+        ));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::SKILLS_SEARCH).unwrap().value.as_deref(),
+            Some("joined")
+        );
+        assert!(tree.find(&ids::skill("skl_2")).is_some());
+        assert!(tree.find(&ids::skill("skl_1")).is_none());
+        // Nothing left is a sentence about the search, not about the library.
+        host.skills_query = "payroll".into();
+        assert_eq!(
+            host.snapshot().find(ids::SKILLS_EMPTY).unwrap().name,
+            "No skills match."
+        );
+    }
+
+    /// The pane stays on the open skill whatever the list is showing — a search that hides its
+    /// row, and a toggle moved to the side the skill is not on. The screen keeps it on the open
+    /// id alone, and a tree that read it off the rows would go blank where the person sees a
+    /// pane.
+    #[test]
+    fn the_open_skill_keeps_its_pane_whatever_the_list_shows() {
+        let mut host = skills_host();
+        host.skill_open = Some(open_skill("skl_1", "expense-report"));
+        host.skills_query = "joined".into();
+        let tree = host.snapshot();
+        assert!(tree.find(&ids::skill("skl_1")).is_none());
+        let pane = tree.find(&ids::skill_detail("skl_1")).unwrap();
+        assert_eq!(pane.name, "expense-report");
+        assert!(tree.find(&ids::skill_updated("skl_1")).is_some());
+        assert!(tree.find(ids::SKILL_CLOSE).is_some());
+
+        // The other side of the toggle: the open skill is not among the rows at all.
+        host.skills_query = String::new();
+        host.skills.clear();
+        host.skills_scope = SkillScope::Discover;
+        assert!(
+            host.snapshot().find(&ids::skill_detail("skl_1")).is_some(),
+            "the pane is on screen, so it is in the tree"
+        );
+    }
+
+    /// What a skill SAYS is on its pane and nowhere else — a row carries what it is FOR. A
+    /// driver that has just written one down reads it back here or not at all.
+    #[test]
+    fn the_pane_carries_the_prose_and_tells_waiting_from_refused() {
+        let mut host = skills_host();
+        let mut open = open_skill("skl_1", "expense-report");
+        open.body = String::new();
+        open.arrived = false;
+        host.skill_open = Some(open);
+        let tree = host.snapshot();
+        assert_eq!(tree.find(ids::SKILL_LOADING).unwrap().name, "Loading…");
+        assert!(tree.find(&ids::skill_body("skl_1")).is_none());
+        assert!(tree.find(ids::SKILL_ERROR).is_none());
+        assert!(
+            tree.find(&ids::skill_updated("skl_1")).is_none(),
+            "the pane draws that row once the fetch has answered, and not before"
+        );
+
+        host.skill_open = Some(open_skill("skl_1", "expense-report"));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::skill_body("skl_1"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("Ask for the receipt first.")
+        );
+        assert!(tree.find(ids::SKILL_LOADING).is_none());
+
+        // A skill that arrived with no prose in it is a draft, not a fetch that is still
+        // going: the pane says the sentence a person reads, and says it is not waiting.
+        let mut draft = open_skill("skl_1", "expense-report");
+        draft.body = String::new();
+        host.skill_open = Some(draft);
+        let tree = host.snapshot();
+        assert!(tree.find(ids::SKILL_LOADING).is_none());
+        let body = tree.find(&ids::skill_body("skl_1")).unwrap();
+        assert_eq!(body.name, NOTHING_WRITTEN_YET);
+        assert_eq!(body.value.as_deref(), Some(""));
+
+        let mut refused = open_skill("skl_1", "expense-report");
+        refused.body = String::new();
+        refused.arrived = false;
+        refused.error = Some("no such skill".into());
+        host.skill_open = Some(refused);
+        let tree = host.snapshot();
+        assert_eq!(tree.find(ids::SKILL_ERROR).unwrap().name, "no such skill");
+        assert!(
+            tree.find(ids::SKILL_LOADING).is_none(),
+            "a pane that was refused is not a pane that is still coming"
+        );
+        assert!(
+            tree.find(ids::SKILLS_ERROR).is_none(),
+            "the pane's refusal is the pane's; the list was refused nothing"
+        );
+    }
+
+    /// The sheet's refusal is the sheet's, over the fields it is about. The list's slot says
+    /// nothing about a create, and the three fields point at the verb that takes their values.
+    #[test]
+    fn the_sheet_carries_its_own_refusal_and_its_fields_name_the_verb() {
+        let mut host = skills_host();
+        host.skill_add_open = true;
+        host.skill_add_error = Some("that name is taken".into());
+        host.skills_error = Some("the library would not load".into());
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::SKILL_ADD_ERROR).unwrap().name,
+            "that name is taken"
+        );
+        assert_eq!(
+            tree.find(ids::SKILLS_ERROR).unwrap().name,
+            "the library would not load",
+            "two slots, because they are two places on screen"
+        );
+        assert_eq!(tree.find(ids::SKILL_SHEET_SAVE).unwrap().name, "Save");
+
+        for field in [
+            ids::SKILL_SHEET_NAME,
+            ids::SKILL_SHEET_DESCRIPTION,
+            ids::SKILL_SHEET_BODY,
+        ] {
+            let refused = host
+                .dispatch(&Op::type_text(field, "expense-report"))
+                .unwrap_err();
+            assert!(refused.contains("skill.create"), "{refused}");
+        }
+
+        host.skill_saving = true;
+        assert_eq!(
+            host.snapshot().find(ids::SKILL_SHEET_SAVE).unwrap().name,
+            "Saving…",
+            "a Save that is still working is not a Save that can be pressed again"
+        );
+    }
+
+    /// These ids sit in the tree under a dialog that may be shut. One of them answering while
+    /// the person is on another tab is a click nobody could have made.
+    #[test]
+    fn a_skills_control_off_screen_is_refused() {
+        let mut host = skills_host();
+        host.skills_tab = false;
+        host.updates_tab = true;
+        let refused = host.click(ids::SKILL_RECORD).unwrap_err();
+        assert!(refused.contains("skills.open"), "{refused}");
+        assert!(
+            host.click(&ids::skill("skl_1"))
+                .unwrap_err()
+                .contains("skills.open")
+        );
+        // A click is not the only thing that claims to have landed on an element. The search
+        // field is not in the tree while the page is shut, and typing into what is not there
+        // must not quietly become a change to the page.
+        for op in [
+            Op::type_text(ids::SKILLS_SEARCH, "expense"),
+            Op::key(ids::SKILLS_SEARCH, "Backspace"),
+            Op::key(ids::SKILLS_SEARCH, "Enter"),
+            Op::SetValue {
+                target: ids::SKILLS_SEARCH.into(),
+                value: "expense".into(),
+            },
+        ] {
+            let refused = host.dispatch(&op).unwrap_err();
+            assert!(refused.contains("skills.open"), "{refused}");
+        }
+        assert!(host.skills_query.is_empty(), "nothing was typed anywhere");
+        assert!(host.take_command().is_none());
+        // The tab itself is how the page is reached, so it answers from anywhere in Settings.
+        host.click(ids::SETTINGS_SKILLS).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetAppSettingsTab(AppSettingsTab::Skills)
+        ));
+    }
+
+    /// Delete asks first, as every recipe does. The menu it is chosen from opens under the
+    /// pointer with Delete one row under Open.
+    #[test]
+    fn deleting_a_skill_asks_before_it_deletes() {
+        let mut host = skills_host();
+        host.click(&ids::skill_delete("skl_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::AskSkillDelete { id } if id == "skl_1"
+        ));
+        // The pane's Delete is its own control with its own id, and asks the same question.
+        host.click(&ids::skill_detail_delete("skl_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::AskSkillDelete { id } if id == "skl_1"
+        ));
+        assert_ne!(
+            ids::skill_delete("skl_1"),
+            ids::skill_detail_delete("skl_1")
+        );
+
+        // Nothing is deleted until the dialog is answered, and there is no answering a dialog
+        // that is not up.
+        assert!(host.click(ids::SKILL_DELETE_CONFIRM).is_err());
+        assert!(
+            host.invoke("skill.delete.confirm", &serde_json::json!({}))
+                .is_err()
+        );
+        host.skill_delete_confirm = Some("expense-report".into());
+        assert_eq!(
+            host.snapshot().find(ids::SKILL_DELETE_SHEET).unwrap().name,
+            "Delete expense-report?"
+        );
+        host.click(ids::SKILL_DELETE_CONFIRM).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::ConfirmSkillDelete
+        ));
+        host.click(ids::SKILL_DELETE_CANCEL).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::CloseSkillDeleteConfirm
+        ));
+    }
+
+    /// A container is not a row. Stripping `settings-skill-delete-` and calling what is left an
+    /// id sent the delete dialog's own two ids looking for skills called `confirm` and `sheet`,
+    /// and the dialog could not be answered at all.
+    #[test]
+    fn a_dialogs_own_id_is_never_read_as_a_rows() {
+        let mut host = skills_host();
+        for container in [ids::SKILL_DELETE_SHEET, ids::SKILL_SHEET] {
+            let refused = host.click(container).unwrap_err();
+            assert!(
+                !refused.contains("no skill"),
+                "`{container}` is a dialog, not a row: {refused}"
+            );
+        }
+        // And an id that is shaped like a row's and names nothing is still a wrong address,
+        // which is worth saying plainly.
+        assert!(
+            host.click(&ids::skill_delete("skl_9"))
+                .unwrap_err()
+                .contains("no skill `skl_9`")
+        );
+    }
+
+    /// A second create while the first is still going is told so. The person cannot ask twice —
+    /// Save goes dead — but a driver told nothing would conclude its skill was taken.
+    #[test]
+    fn a_create_while_one_is_saving_is_refused() {
+        let mut host = skills_host();
+        host.skill_saving = true;
+        for (verb, args) in [
+            (
+                "skill.create",
+                serde_json::json!({ "name": "expense-report" }),
+            ),
+            ("skill.upload", serde_json::json!({ "path": "/tmp/skill" })),
+        ] {
+            let refused = host.invoke(verb, &args).unwrap_err();
+            assert_eq!(refused, "a skill is already being saved");
+        }
+        assert!(host.take_command().is_none());
+        // And the page says it is going, where an upload has no sheet to say it in.
+        host.skill_add_open = false;
+        assert_eq!(
+            host.snapshot().find(ids::SKILLS_SAVING).unwrap().name,
+            "Uploading…"
+        );
+        host.skill_add_open = true;
+        assert!(
+            host.snapshot().find(ids::SKILLS_SAVING).is_none(),
+            "the sheet's own Save says so while it is the sheet that is saving"
+        );
+    }
+
+    /// The "…" is not in the tree — the row publishes itself and its Delete, and the menu's two
+    /// rows are what a driver clicks. But it is on screen, and an id read off the screen is an
+    /// id a driver will try, so it answers with the two it should have used.
+    #[test]
+    fn a_rows_menu_says_what_to_click_instead() {
+        let mut host = skills_host();
+        let refused = host.click("settings-skill-menu-skl_1").unwrap_err();
+        assert!(refused.contains(&ids::skill_open("skl_1")), "{refused}");
+        assert!(refused.contains(&ids::skill_delete("skl_1")), "{refused}");
+    }
+
+    /// Each control goes where it says it goes, and the two that open something the driver
+    /// cannot work say what to use instead rather than opening it.
+    #[test]
+    fn the_skills_controls_go_where_they_say() {
+        let mut host = skills_host();
+        let opened = |host: &mut NativeChatHost, target: &str| {
+            host.click(target).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            opened(&mut host, &ids::skill("skl_2")),
+            Command::OpenSkill(id) if id == "skl_2"
+        ));
+        assert!(matches!(
+            opened(&mut host, &ids::skill_open("skl_2")),
+            Command::OpenSkill(id) if id == "skl_2"
+        ));
+        assert!(matches!(
+            opened(&mut host, &ids::skill_delete("skl_1")),
+            Command::AskSkillDelete { id } if id == "skl_1"
+        ));
+        assert!(matches!(
+            opened(&mut host, SkillScope::Discover.element_id()),
+            Command::SetSkillsScope(SkillScope::Discover)
+        ));
+        assert!(matches!(
+            opened(&mut host, ids::SKILL_WRITE),
+            Command::OpenSkillAdd
+        ));
+        assert!(matches!(
+            opened(&mut host, ids::SKILL_CLOSE),
+            Command::CloseSkill
+        ));
+        assert!(matches!(
+            opened(&mut host, ids::SETTINGS_SKILLS),
+            Command::SetAppSettingsTab(AppSettingsTab::Skills)
+        ));
+        // The picker and the sheet's fields belong to the window; the verbs take the values.
+        assert!(
+            host.click(ids::SKILL_UPLOAD)
+                .unwrap_err()
+                .contains("skill.upload")
+        );
+        assert!(
+            host.click(ids::SKILL_SHEET_SAVE)
+                .unwrap_err()
+                .contains("skill.create")
+        );
+        assert!(host.click(ids::SKILL_ADD).unwrap_err().contains("menu"));
+    }
+
+    /// The two ways nobody has built are in the tree with the sentence saying what would have
+    /// to be built, and clicking one answers with that sentence rather than doing nothing.
+    #[test]
+    fn the_ways_nobody_built_say_what_is_missing() {
+        let mut host = skills_host();
+        let tree = host.snapshot();
+        assert!(
+            tree.find(ids::SKILL_WITH_BOT)
+                .unwrap()
+                .name
+                .starts_with("Not yet")
+        );
+        // The half of Record that was missing is built, and the sentence says where it is
+        // rather than asking for a model that now exists: what this page still cannot do is
+        // record the Mac somebody is sitting in front of.
+        let record = &tree.find(ids::SKILL_RECORD).unwrap().name;
+        assert!(record.contains("Teach a task"), "{record}");
+        assert!(record.contains("this Mac"), "{record}");
+        assert!(
+            host.click(ids::SKILL_RECORD)
+                .unwrap_err()
+                .starts_with("Not yet")
+        );
+        assert!(
+            host.take_command().is_none(),
+            "nothing was asked of the app"
+        );
+    }
+
+    /// Every verb parses its args, and a missing one is named rather than guessed at.
+    #[test]
+    fn the_skills_verbs_take_what_they_need() {
+        let mut host = skills_host();
+        let done = |host: &mut NativeChatHost, name: &str, args: serde_json::Value| {
+            host.invoke(name, &args).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            done(&mut host, "skills.open", serde_json::json!({})),
+            Command::OpenSkills
+        ));
+        assert!(matches!(
+            done(
+                &mut host,
+                "skills.scope",
+                serde_json::json!({"scope": "discover"})
+            ),
+            Command::SetSkillsScope(SkillScope::Discover)
+        ));
+        assert!(matches!(
+            done(&mut host, "skill.open", serde_json::json!({"id": "skl_1"})),
+            Command::OpenSkill(id) if id == "skl_1"
+        ));
+        assert!(matches!(
+            done(
+                &mut host,
+                "skill.create",
+                serde_json::json!({"name": "expense-report", "body": "Ask for the receipt."})
+            ),
+            Command::CreateSkill { name, description, body }
+                if name == "expense-report"
+                    && description.is_empty()
+                    && body == "Ask for the receipt."
+        ));
+        assert!(matches!(
+            done(&mut host, "skill.upload", serde_json::json!({"path": "/tmp/skill"})),
+            Command::UploadSkill { path } if path == "/tmp/skill"
+        ));
+        // Delete asks: the verb opens the dialog, and answering it is its own step.
+        assert!(matches!(
+            done(&mut host, "skill.delete", serde_json::json!({"id": "skl_2"})),
+            Command::AskSkillDelete { id } if id == "skl_2"
+        ));
+
+        assert_eq!(
+            host.invoke("skill.create", &serde_json::json!({}))
+                .unwrap_err(),
+            "skill.create requires arg name"
+        );
+        assert_eq!(
+            host.invoke("skill.upload", &serde_json::json!({}))
+                .unwrap_err(),
+            "skill.upload requires arg path"
+        );
+        assert_eq!(
+            host.invoke("skill.delete", &serde_json::json!({}))
+                .unwrap_err(),
+            "skill.delete requires arg id"
+        );
+        assert!(
+            host.invoke("skills.scope", &serde_json::json!({"scope": "mine"}))
+                .unwrap_err()
+                .contains("yours, discover"),
+            "the toggle is named by what it says, not by the word on the wire"
+        );
+    }
+
+    /// An id nobody is showing is a wrong address, and saying so beats sending a delete under
+    /// it.
+    #[test]
+    fn a_skill_the_page_does_not_have_is_not_a_target() {
+        let mut host = skills_host();
+        assert!(host.click(&ids::skill("skl_9")).is_err());
+        assert!(host.click(&ids::skill_delete("skl_9")).is_err());
+        assert!(
+            host.invoke("skill.delete", &serde_json::json!({"id": "skl_9"}))
+                .unwrap_err()
+                .contains("no skill `skl_9`")
+        );
+    }
+
+    /// The one control that makes the rest of this mean anything: a lesson a model wrote is off
+    /// until somebody reads it, and this is what they press when they have. It works both ways —
+    /// the server keeps one flag and somebody who reads a lesson they do not want puts it back.
+    #[test]
+    fn the_switch_says_where_it_is_and_turns_a_taught_skill_on() {
+        let mut host = skills_host();
+        let mut open = open_skill("skl_1", "invoice-lookup");
+        open.enabled = false;
+        open.approved_at_ms = None;
+        host.skill_open = Some(open);
+
+        let switch = host
+            .snapshot()
+            .find(&ids::skill_enabled("skl_1"))
+            .cloned()
+            .expect("the pane draws it, so the tree carries it");
+        assert_eq!(switch.name, "Switched off");
+        assert_eq!(switch.checked, Some(false));
+        assert!(
+            switch.states.contains(&"unread".to_string()),
+            "nobody has ever switched it on: {:?}",
+            switch.states
+        );
+
+        // On. The click toggles, the way a finger does, so what it is now is read off the pane.
+        host.click(&ids::skill_enabled("skl_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillEnabled { id, enabled } if id == "skl_1" && enabled
+        ));
+
+        // And back off, for somebody who read it and did not want it. Once it has been switched
+        // on the stamp stands, so it is no longer waiting to be read.
+        let mut read = open_skill("skl_1", "invoice-lookup");
+        read.enabled = true;
+        read.approved_at_ms = Some(1_758_000_000_000);
+        host.skill_open = Some(read);
+        let switch = host
+            .snapshot()
+            .find(&ids::skill_enabled("skl_1"))
+            .cloned()
+            .expect("still there");
+        assert_eq!(switch.name, "Switched on");
+        assert_eq!(switch.checked, Some(true));
+        assert!(!switch.states.contains(&"unread".to_string()));
+        host.click(&ids::skill_enabled("skl_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillEnabled { id, enabled } if id == "skl_1" && !enabled
+        ));
+    }
+
+    /// The pane and the tree draw one fact from one function. They used to work it out
+    /// separately and disagreed: the screen only tells the two kinds of off apart while a skill
+    /// IS off, and the tree called every skill on a server that sends no stamp unread —
+    /// including the ones somebody had switched on.
+    #[test]
+    fn the_tree_and_the_pane_agree_about_which_skills_are_waiting_to_be_read() {
+        let mut host = skills_host();
+        for (enabled, approved_at_ms) in [
+            (false, None),
+            (false, Some(1_758_000_000_000)),
+            (true, None),
+            (true, Some(1_758_000_000_000)),
+        ] {
+            let mut open = open_skill("skl_1", "invoice-lookup");
+            open.enabled = enabled;
+            open.approved_at_ms = approved_at_ms;
+            host.skill_open = Some(open);
+            let unread = host
+                .snapshot()
+                .find(&ids::skill_enabled("skl_1"))
+                .expect("the switch is on the pane")
+                .states
+                .contains(&"unread".to_string());
+            let said =
+                crate::components::skills::use_line("invoice-lookup", enabled, approved_at_ms)
+                    .unwrap_or_default();
+            assert_eq!(
+                unread,
+                said.contains("until somebody reads it"),
+                "enabled={enabled} approved={approved_at_ms:?}: the tree says {unread} and the \
+                 pane says {said:?}"
+            );
+        }
+    }
+
+    /// The switch is the open skill's and nobody else's, it is dead while the server is being
+    /// told, and a refusal is drawn beside it rather than in place of the pane — the pane is
+    /// still there, and so is the skill it is about.
+    #[test]
+    fn the_switch_is_refused_when_there_is_nothing_for_it_to_be_about() {
+        let mut host = skills_host();
+        assert!(
+            host.click(&ids::skill_enabled("skl_1"))
+                .unwrap_err()
+                .contains("no skill `skl_1` is open to switch"),
+            "a pane nobody opened has no switch on it"
+        );
+
+        // Still being fetched: the pane is a line saying so, and there is nothing to press.
+        let mut coming = open_skill("skl_1", "invoice-lookup");
+        coming.arrived = false;
+        host.skill_open = Some(coming);
+        assert!(host.snapshot().find(&ids::skill_enabled("skl_1")).is_none());
+        assert!(
+            host.click(&ids::skill_enabled("skl_1"))
+                .unwrap_err()
+                .contains("still being fetched")
+        );
+
+        // With the server. Pressed twice, two answers about one flag are in the air.
+        let mut switching = open_skill("skl_1", "invoice-lookup");
+        switching.switching = true;
+        host.skill_open = Some(switching);
+        assert_eq!(
+            host.snapshot()
+                .find(&ids::skill_enabled("skl_1"))
+                .unwrap()
+                .enabled,
+            false
+        );
+        assert_eq!(
+            host.click(&ids::skill_enabled("skl_1")).unwrap_err(),
+            SWITCH_IN_FLIGHT,
+            "and in the same words the app refuses a second switch with"
+        );
+
+        // Refused: the switch has already gone back, and the reason is on the pane with it.
+        let mut refused = open_skill("skl_1", "invoice-lookup");
+        refused.error = Some("Only the owner can switch a skill on.".into());
+        host.skill_open = Some(refused);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::SKILL_ERROR).unwrap().name,
+            "Only the owner can switch a skill on.",
+            "the server's sentence, beside the control it is about"
+        );
+        assert!(
+            tree.find(&ids::skill_enabled("skl_1")).is_some(),
+            "and the pane is still a pane: the skill did not go anywhere"
+        );
+        assert!(tree.find(&ids::skill_body("skl_1")).is_some());
+        assert!(host.take_command().is_none());
+    }
+
+    /// A lesson being written from a tape takes a model call and a wait, and it happens in the
+    /// coworker's screen window — which has no tree. Without these three nodes a driver sees an
+    /// app that does nothing for a minute and then an app that has done nothing.
+    #[test]
+    fn the_driver_sees_a_lesson_being_written_and_what_came_of_it() {
+        let mut host = host();
+        assert!(
+            host.snapshot().find(ids::TEACH_SKILL_WRITING).is_none(),
+            "nothing at all until somebody teaches one"
+        );
+
+        host.taught_skill = Some(TaughtSkill::Writing);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TEACH_SKILL_WRITING).unwrap().name,
+            WRITING_A_LESSON,
+            "the sentence the sheet's own button is showing in the other window"
+        );
+        assert!(tree.find(ids::TEACH_SAVED_SKILL).is_none());
+        assert!(tree.find(ids::TEACH_RETRY).is_none());
+
+        host.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_7".into(),
+            name: "invoice-lookup".into(),
+            enabled: false,
+        });
+        let tree = host.snapshot();
+        let written = tree.find(ids::TEACH_SAVED_SKILL).unwrap();
+        assert_eq!(
+            written.name, "invoice-lookup",
+            "named by the word that has to be typed after a slash"
+        );
+        assert_eq!(written.value.as_deref(), Some("skl_7"));
+        assert!(
+            written.states.contains(&"off".to_string()),
+            "born switched off, because nobody has read it: {:?}",
+            written.states
+        );
+        assert!(tree.find(ids::TEACH_SKILL_WRITING).is_none());
+
+        host.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_7".into(),
+            name: "invoice-lookup".into(),
+            enabled: true,
+        });
+        assert!(
+            !host
+                .snapshot()
+                .find(ids::TEACH_SAVED_SKILL)
+                .unwrap()
+                .states
+                .contains(&"off".to_string()),
+            "and not off once it is on"
+        );
+    }
+
+    /// A refused upload is the server's sentence and, where there is any point, one thing to do
+    /// about it. The tape is not gone — the server keeps none — so Try again sends the same
+    /// bytes rather than asking somebody to record minutes of work a second time.
+    #[test]
+    fn a_refused_lesson_keeps_the_sentence_and_offers_the_tape_again() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "Your bot hung up on the way back. Nothing was stored.".into(),
+            next: AfterRefusal::SendAgain,
+            coworker: "cw_1".into(),
+        });
+        host.taught_tape_in_hand = true;
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TEACH_SKILL_ERROR).unwrap().name,
+            "Your bot hung up on the way back. Nothing was stored.",
+            "the server's own words, which name which of the things went wrong"
+        );
+        assert_eq!(tree.find(ids::TEACH_RETRY).unwrap().name, "Try again");
+
+        host.click(ids::TEACH_RETRY).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::RetryTaughtSkill
+        ));
+    }
+
+    /// A refusal a second identical send cannot change — a spend cap, a recording nothing can be
+    /// written from — keeps its sentence and loses the button. A driver offered a retry there
+    /// would loop against a machine whose answer is already written above it.
+    #[test]
+    fn a_refusal_a_retry_cannot_change_offers_no_retry() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "This coworker is over its spend limit for the month.".into(),
+            next: AfterRefusal::Nothing,
+            coworker: "cw_1".into(),
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TEACH_SKILL_ERROR).unwrap().name,
+            "This coworker is over its spend limit for the month.",
+            "the sentence is the server's either way, and it is not softened"
+        );
+        assert!(
+            tree.find(ids::TEACH_RETRY).is_none(),
+            "no button under a sentence that says a second try is pointless"
+        );
+        let refused = host.click(ids::TEACH_RETRY).unwrap_err();
+        assert!(
+            refused.contains("cannot change the answer"),
+            "and a driver that clicks it anyway is told why: {refused}"
+        );
+        assert!(
+            refused.contains("spend limit"),
+            "with the server's own reason in it: {refused}"
+        );
+        assert!(host.take_command().is_none());
+    }
+
+    /// The refusal nobody can answer: the connection dropped, so the skill may have been
+    /// written and may not. A Try again there would write a second skill from one recording —
+    /// the route has no idempotency key — so what is offered is the library, and the driver is
+    /// told the same thing in the same words if it reaches for the retry anyway.
+    #[test]
+    fn an_answer_that_never_arrived_offers_the_library_and_not_the_tape() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "The connection dropped before the answer came back, and your bot may have \
+                  written the skill anyway."
+                .into(),
+            next: AfterRefusal::LookFirst,
+            coworker: "cw_1".into(),
+        });
+        host.taught_tape_in_hand = true;
+        let tree = host.snapshot();
+        assert!(
+            tree.find(ids::TEACH_SKILL_ERROR)
+                .unwrap()
+                .name
+                .contains("may have written the skill")
+        );
+        assert!(
+            tree.find(ids::TEACH_RETRY).is_none(),
+            "the tape is in hand and must still not be sent: one recording, one skill"
+        );
+        assert_eq!(
+            tree.find(ids::TEACH_CHECK_LIBRARY).unwrap().name,
+            "Check Skills"
+        );
+
+        let refused = host.click(ids::TEACH_RETRY).unwrap_err();
+        assert!(refused.contains("nobody knows"), "{refused}");
+        assert!(
+            refused.contains(ids::TEACH_CHECK_LIBRARY),
+            "and what to press instead: {refused}"
+        );
+        assert!(host.take_command().is_none());
+
+        host.click(ids::TEACH_CHECK_LIBRARY).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenTaughtSkill { id } if id.is_none()
+        ));
+    }
+
+    /// The tape lives in the screen window, and closing that window takes it with it. The offer
+    /// goes when the tape does: a driver told its click worked, on a window that is not there,
+    /// would wait for a skill nothing is writing.
+    #[test]
+    fn a_retry_goes_when_the_window_holding_the_tape_does() {
+        let mut host = host();
+        host.taught_skill = Some(TaughtSkill::Refused {
+            why: "Your bot hung up on the way back.".into(),
+            next: AfterRefusal::SendAgain,
+            coworker: "cw_1".into(),
+        });
+        host.taught_tape_in_hand = false;
+        assert!(
+            host.snapshot().find(ids::TEACH_RETRY).is_none(),
+            "no window, no bytes, no button"
+        );
+        let refused = host.click(ids::TEACH_RETRY).unwrap_err();
+        assert!(refused.contains("has been closed"), "{refused}");
+        assert!(host.take_command().is_none());
+
+        host.taught_tape_in_hand = true;
+        assert!(host.snapshot().find(ids::TEACH_RETRY).is_some());
+        host.click(ids::TEACH_RETRY).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::RetryTaughtSkill
+        ));
+    }
+
+    /// Both controls are refused when there is nothing for them to be about: a driver working
+    /// from a tree it read a moment ago must not press a button that has since gone.
+    #[test]
+    fn a_taught_skills_controls_are_refused_when_there_is_no_tape() {
+        let mut host = host();
+        assert_eq!(
+            host.click(ids::TEACH_RETRY).unwrap_err(),
+            "no refused recording is waiting to be sent again"
+        );
+        assert_eq!(
+            host.click(ids::TEACH_SAVED_SKILL).unwrap_err(),
+            "no taught skill is waiting to be read"
+        );
+        host.taught_skill = Some(TaughtSkill::Writing);
+        assert!(
+            host.click(ids::TEACH_RETRY).is_err(),
+            "one that is still being written has not been refused"
+        );
+        assert!(
+            host.take_command().is_none(),
+            "nothing was asked of the app"
+        );
+
+        // Written, and the line is the way to the reading it is waiting for.
+        host.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_7".into(),
+            name: "invoice-lookup".into(),
+            enabled: false,
+        });
+        host.click(ids::TEACH_SAVED_SKILL).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenTaughtSkill { id } if id.as_deref() == Some("skl_7")
+        ));
+        assert!(host.click(ids::TEACH_RETRY).is_err());
+    }
+
+    /// Typing into the field is typing into the field: the host keeps the copy the list filters
+    /// by, so the tree answers with what was typed without a round trip through the app.
+    #[test]
+    fn the_skills_search_takes_keys_the_way_the_logins_one_does() {
+        let mut host = skills_host();
+        host.dispatch(&Op::type_text(ids::SKILLS_SEARCH, "expen"))
+            .unwrap();
+        assert_eq!(host.skills_query, "expen");
+        host.dispatch(&Op::key(ids::SKILLS_SEARCH, "Backspace"))
+            .unwrap();
+        assert_eq!(host.skills_query, "expe");
+        host.dispatch(&Op::SetValue {
+            target: ids::SKILLS_SEARCH.into(),
+            value: "new".into(),
+        })
+        .unwrap();
+        assert_eq!(host.skills_query, "new");
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetSkillsQuery(query) if query == "new"
+        ));
+    }
+
     /// A host with a bot and a session, which is what the chat tree is drawn for.
     fn host() -> NativeChatHost {
         NativeChatHost {
@@ -3443,7 +5318,7 @@ mod tests {
         // Nothing told yet: the list is everything the recipe needs.
         let untold = recipe(&[]);
         host.composer_panel = Some(PanelMode::Parameters);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&untold));
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &listed(&[]), Some(&untold));
         let tree = host.snapshot();
         let panel = tree.find(ids::COMPOSER_PANEL).unwrap();
         assert!(tree.find(ids::COMPOSER_PANEL_SEARCH).unwrap().focused);
@@ -3460,7 +5335,7 @@ mod tests {
         // parameter leaves this list and lives in the bar above the composer, where it can still
         // be changed. A driver asserting on the panel must read it as the outstanding work.
         let told = recipe(&[("city", "London")]);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], Some(&told));
+        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &listed(&[]), Some(&told));
         let tree = host.snapshot();
         let rows: Vec<&str> = tree
             .find(ids::COMPOSER_PANEL)
@@ -3610,6 +5485,36 @@ mod tests {
         );
     }
 
+    use crate::opengrok::SkillSummary;
+
+    /// A library that has arrived, for a panel that is not waiting on anything.
+    fn listed(skills: &[SkillSummary]) -> SkillLibrary<'_> {
+        SkillLibrary {
+            skills,
+            loading: false,
+            error: None,
+        }
+    }
+
+    /// The `/` listing as a driver sees it: two recipes and two skills.
+    fn slash_listing() -> (Vec<RecipeSummary>, Vec<SkillSummary>) {
+        (
+            serde_json::from_value(serde_json::json!([
+                { "id": "rcp_tape", "name": "Weekly report", "kind": "recipe" },
+                { "id": "rcp_tree", "name": "Search and retry", "kind": "workflow" }
+            ]))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!([
+                {
+                    "id": "skl_1", "name": "expense-report",
+                    "description": "File a receipt the way the firm wants it"
+                },
+                { "id": "skl_2", "name": "half-written", "draft": true }
+            ]))
+            .unwrap(),
+        )
+    }
+
     /// What a driver needs to work `/`: the rows are there while the panel is open, and each
     /// one says which of the four kinds it is. Without the word, a workflow row and a recipe
     /// row are the same node under the same id prefix, and "pick the workflow" is a guess.
@@ -3618,19 +5523,15 @@ mod tests {
         let mut host = host();
         assert!(host.snapshot().find(ids::COMPOSER_PANEL).is_none());
 
-        let listing: Vec<RecipeSummary> = serde_json::from_value(serde_json::json!([
-            { "id": "rcp_tape", "name": "Weekly report", "kind": "recipe" },
-            { "id": "rcp_tree", "name": "Search and retry", "kind": "workflow" }
-        ]))
-        .unwrap();
+        let (listing, skills) = slash_listing();
         host.composer_panel = Some(PanelMode::Slash);
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, None);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&skills), None);
 
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::COMPOSER_PANEL).unwrap().name,
-            "Recipes, workflows and actions",
-            "the panel says what is in it, and it is no longer called skills"
+            "Recipes, workflows, skills and actions",
+            "the panel says what is in it, and the four words are kept apart in the saying"
         );
         let tape = tree.find("composer-panel-row-recipe:rcp_tape").unwrap();
         assert_eq!(tape.name, "Weekly report");
@@ -3642,9 +5543,61 @@ mod tests {
             Some("Workflow"),
             "the one assertable field a driver has is where the kind has to be"
         );
-        // Nothing lists a skill yet, and the row that says so must not look pickable.
-        let skill = tree.find("composer-skills-none").unwrap();
-        assert!(skill.states.contains(&"note".to_string()));
+    }
+
+    /// A skill is a row like any other: it is in the list under its own name, which is what a
+    /// driver types into the panel's field to pick it, and it says it is a Skill rather than a
+    /// Recipe — the two are a tape and a lesson, and nothing about the node shape says which.
+    #[test]
+    fn the_slash_list_offers_a_skill_by_name_and_will_not_offer_a_draft() {
+        let mut host = host();
+        let (listing, skills) = slash_listing();
+        host.composer_panel = Some(PanelMode::Slash);
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&skills), None);
+
+        let tree = host.snapshot();
+        let skill = tree.find("composer-panel-row-skill:skl_1").unwrap();
+        assert_eq!(skill.name, "expense-report");
+        assert_eq!(skill.value.as_deref(), Some("Skill"));
+        assert!(
+            !skill.states.contains(&"note".to_string()),
+            "this one can be taken, so the arrows must land on it"
+        );
+        // A draft has no prose in it for the bot to read, so the server would refuse it: the
+        // row is shown and stepped over rather than offered and refused a round trip later.
+        let draft = tree.find("composer-panel-row-skill:skl_2").unwrap();
+        assert!(draft.states.contains(&"note".to_string()));
+
+        // And a library with nothing in it says so under the id that row has always had.
+        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&[]), None);
+        let empty = host.snapshot();
+        let none = empty.find("composer-skills-none").unwrap();
+        assert!(none.states.contains(&"note".to_string()));
+        assert!(
+            empty.find("composer-panel-row-skill:skl_1").is_none(),
+            "no skill is listed while none is loaded"
+        );
+    }
+
+    /// Which skill this message will be sent with, for a driver that has just picked one. The
+    /// name is what the chip in the draft reads; the id is what the turn names, and it is the
+    /// id that tells two skills of one name apart.
+    #[test]
+    fn the_composer_says_which_skill_the_next_message_carries() {
+        let mut host = host();
+        assert!(
+            host.snapshot().find(ids::COMPOSER_SKILL).is_none(),
+            "nothing is attached, and the way to say so is not to be there at all"
+        );
+
+        host.composer_skill = Some(crate::state::ActiveSkill {
+            id: "skl_1".into(),
+            name: "expense-report".into(),
+        });
+        let tree = host.snapshot();
+        let attached = tree.find(ids::COMPOSER_SKILL).unwrap();
+        assert_eq!(attached.name, "expense-report");
+        assert_eq!(attached.value.as_deref(), Some("skl_1"));
     }
 
     #[test]

@@ -14,21 +14,24 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, ImageVisibility,
-    LocalExecMode, LocalExecResolution, ModelCatalogue, NewSchedule, OpenGrokClient, OpenGrokError,
-    ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult,
-    RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SaveLoginSpec,
-    ScheduleKind, ScheduleRow, ScreenshotSpec, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
-    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
-    save_login_from_local, serve_local_exec, stored_machine_id, tool_standin,
+    LocalExecMode, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient,
+    OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
+    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
+    SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind, ScheduleRow, ScreenshotSpec, SkillDetail,
+    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadReplay, ThreadRun, ToolCallTracker,
+    TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable,
+    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
+    activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
+    keep_local_save_offer, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, retry_enqueue, save_login_from_local, serve_local_exec,
+    stamp_duration, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
-use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
+use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef, SaveStamp};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
@@ -49,7 +52,17 @@ pub struct Message {
     pub id: String,
     pub sender: String,
     pub content: String,
+    /// When the run began (or when the person sent the message). History is
+    /// ordered by this, so a long turn that started before a queued message
+    /// still sits before it.
     pub sent_at: SystemTime,
+    /// When the run ended, for a coworker's reply. The peek stamp wears this
+    /// wait as `4:34 PM · 6m12s` rather than claiming the answer landed at
+    /// start. None while the bubble is still being filled in, and on the
+    /// person's own messages.
+    pub finished_at: Option<SystemTime>,
+    /// Harness CUSTOM `run-timing` / `turn-timeline`, when the server sent one.
+    pub run_timing: Option<TurnTiming>,
     pub is_me: bool,
     pub reply_preview: Option<String>,
     /// The message this one answers. The preview is what the bubble paints; this is what the
@@ -96,17 +109,49 @@ impl Message {
     }
 
     /// Clock time on the message row, matching Grok's `12:14 PM` column.
+    ///
+    /// This is when the run *began*. How long it took is [`formatted_duration`]:
+    /// painting the finish clock here would move the column relative to the
+    /// message it answers, and painting nothing would keep lying that a
+    /// six-minute turn landed at 4:34.
     pub fn formatted_time(&self) -> String {
-        let dt = DateTime::<Local>::from(self.sent_at);
-        let (pm, hour) = dt.hour12();
-        let hour = if hour == 0 { 12 } else { hour };
-        format!(
-            "{}:{:02} {}",
-            hour,
-            dt.minute(),
-            if pm { "PM" } else { "AM" }
-        )
+        clock_of(self.sent_at).unwrap_or_default()
     }
+
+    /// `6m12s` once the run has ended and took at least a second. The peek
+    /// column puts this under the clock: `4:34 PM` / `6m12s`.
+    pub fn formatted_duration(&self) -> Option<String> {
+        stamp_duration(self.sent_at, self.finished_at?)
+    }
+
+    fn save_stamp(&self) -> SaveStamp {
+        SaveStamp {
+            sent_at: self.sent_at,
+            finished_at: self.finished_at,
+            timing_json: self.run_timing.as_ref().map(TurnTiming::to_json),
+        }
+    }
+}
+
+/// Grok's `12:14 PM` column, 12-hour clock, no leading zero on the hour.
+/// `None` when the instant is one chrono cannot hold. `DateTime::from(SystemTime)`
+/// panics on those, and `sent_at` can be a server clock.
+fn clock_of(at: SystemTime) -> Option<String> {
+    let since = at.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    let ms = i64::try_from(since.as_millis()).ok()?;
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)?;
+    Some(clock_label(utc.with_timezone(&Local)))
+}
+
+pub fn clock_label(dt: DateTime<Local>) -> String {
+    let (pm, hour) = dt.hour12();
+    let hour = if hour == 0 { 12 } else { hour };
+    format!(
+        "{}:{:02} {}",
+        hour,
+        dt.minute(),
+        if pm { "PM" } else { "AM" }
+    )
 }
 
 /// What is worth keeping of a message the person watched arrive: its words.
@@ -282,6 +327,11 @@ pub const EMPTY_TURN_NOTE: &str = "(OpenGrok returned no assistant text.)";
 
 /// How a run's failure is spelled in the feed.
 pub const RUN_ERROR_PREFIX: &str = "OpenGrok: ";
+
+/// What stands where a library would be when nobody is signed in. Signed out there is nothing to
+/// ask for, which is not the same as a library with nothing in it — and "No skills yet" is what
+/// an empty one says.
+pub const SKILLS_SIGNED_OUT: &str = "Sign in to see the skills kept on the server.";
 
 /// What the feed says for a turn the person stopped.
 ///
@@ -513,6 +563,32 @@ impl Conversation {
 /// with one of these is never refilled from the database, and why the run id has to be kept: the
 /// server has the whole of the run under it, and that is what the thread is reconciled against
 /// instead.
+/// The message being held, with what it was typed with.
+///
+/// A held message WAS the draft, so it keeps what the draft had on it rather than reading the
+/// composer again when the thread finally goes idle — by which time the draft is the next
+/// message somebody is writing. Every part of it travels here, and [`AppState::drain_queued_send`]
+/// hands the turn what this row holds and nothing else.
+fn held_message(
+    message_id: String,
+    content: String,
+    recipe: Option<TurnRecipe>,
+    skill: Option<String>,
+    reply: Option<ReplyTo>,
+) -> QueuedSend {
+    QueuedSend {
+        message_id,
+        content,
+        recipe,
+        skill,
+        reply,
+        pending_id: None,
+        posted: false,
+        stale: StaleRefusal::Fresh,
+        unsynced: false,
+    }
+}
+
 /// A message held back while its thread is busy. The bubble is already on
 /// screen and on its way to disk; what waits is the turn.
 #[derive(Clone, Debug)]
@@ -523,8 +599,247 @@ pub struct QueuedSend {
     /// The recipe as it was when the message was typed: the composer clears it the moment
     /// the draft goes, and the turn has to carry what was on the message.
     recipe: Option<TurnRecipe>,
+    /// The skill it was typed with, held for the same reason and taken off the draft at the
+    /// same moment: what waits here is this message's, not the next one's.
+    skill: Option<String>,
     /// The message this one answers, for the quote the coworker is sent.
     reply: Option<ReplyTo>,
+    /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
+    /// OpenGrok that has not shipped pending-user-messages yet.
+    pending_id: Option<String>,
+    /// POST /pending went out and was not answered 404, so a row may exist before
+    /// `pending_id` is known.
+    posted: bool,
+    stale: StaleRefusal,
+    /// Edited here while the row could not be PATCHed. The row still has the old words, so the
+    /// hold waits for the PATCH `came_back` sends, and a hydrate keeps these words.
+    unsynced: bool,
+}
+
+/// How often OpenGrok has refused this hold as stale. A refused hold is put back with the
+/// server's row and sent once more; refused again, it waits for the thread to be read afresh
+/// instead of being sent in a loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StaleRefusal {
+    #[default]
+    Fresh,
+    Refreshed,
+    Parked,
+}
+
+impl QueuedSend {
+    /// OpenGrok may hold a row for this send, and drains it only when the turn is that row.
+    fn on_server(&self) -> bool {
+        self.pending_id.is_some() || self.posted
+    }
+}
+
+/// Where a hold sat when Edit took it off the queue. Sending it again puts it
+/// back there, behind `after`. No `after` means it was the first hold.
+struct EditSlot {
+    conversation_id: String,
+    after: Option<String>,
+}
+
+/// Put `hold` back immediately after `after`. `after` may have drained while the
+/// words were in the composer, and then this hold is the next one.
+fn insert_held_after(queue: &mut VecDeque<QueuedSend>, hold: QueuedSend, after: Option<&str>) {
+    let index = after
+        .and_then(|id| {
+            queue
+                .iter()
+                .position(|queued| queued.message_id == id)
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    queue.insert(index, hold);
+}
+
+/// What Edit on a held send puts back in the composer.
+pub struct EditRefill {
+    pub content: String,
+    /// The skill now on the draft. Its chip is the composer's to draw, and a skill with no chip
+    /// is dropped on the next keystroke.
+    pub skill: Option<ActiveSkill>,
+    /// What the composer says about the part of the hold it could not put back.
+    pub notice: Option<String>,
+}
+
+/// What a user-message write should put on disk, as memory stands when the write actually runs.
+struct UserMessagePersist {
+    content: String,
+    hidden: bool,
+}
+
+/// What to do with a `pum_…` after enqueue returns, once memory has had a chance to cancel
+/// or edit in the meantime.
+#[derive(Debug)]
+enum BindPending {
+    Bound,
+    Patch { pending_id: String, content: String },
+    TakeBack { pending_id: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OwedPatch {
+    thread_id: String,
+    pending_id: String,
+    message_id: String,
+    content: String,
+}
+
+enum QueuedEdit {
+    /// Another mutation of this hold is in flight, or there is no such hold.
+    Refused,
+    Patch {
+        thread_id: String,
+        pending_id: String,
+        content: String,
+    },
+    Applied {
+        content: String,
+    },
+}
+
+#[derive(Default)]
+struct PendingFold {
+    save: Vec<QueuedBubbleSave>,
+    hide: Vec<String>,
+    cancel: Vec<String>,
+}
+
+struct QueuedBubbleSave {
+    id: String,
+    content: String,
+    reply: Option<ReplyTo>,
+    sent_at: SystemTime,
+    insert: bool,
+}
+
+/// The `replyTo` a hold is saved with and drained with. One shape for both, because OpenGrok
+/// compares the two as JSON and refuses the drain on any difference.
+fn saved_reply(reply: &ReplyTo) -> ReplyQuote {
+    ReplyQuote {
+        message_id: reply.message_id.clone(),
+        preview: reply.preview.clone(),
+        is_me: reply.is_me,
+    }
+}
+
+fn reply_json(reply: &ReplyTo) -> serde_json::Value {
+    serde_json::to_value(saved_reply(reply)).unwrap_or(serde_json::Value::Null)
+}
+
+fn reply_from_pending(value: Option<&serde_json::Value>) -> Option<ReplyTo> {
+    let value = value?;
+    if let Some(id) = value.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(ReplyTo {
+            message_id: id.to_string(),
+            preview: String::new(),
+            is_me: false,
+        });
+    }
+    let object = value.as_object()?;
+    let message_id = object
+        .get("messageId")
+        .or_else(|| object.get("message_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    Some(ReplyTo {
+        message_id,
+        preview: object
+            .get("preview")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_me: object
+            .get("isMe")
+            .or_else(|| object.get("is_me"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+fn recipe_from_pending(item: &PendingUserMessage) -> Option<TurnRecipe> {
+    let id = item
+        .recipe_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let values = item
+        .recipe_values
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    Some(TurnRecipe { id, values })
+}
+
+fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
+    QueuedSend {
+        message_id: item.bubble_id().to_string(),
+        content: item.content.clone(),
+        recipe: recipe_from_pending(item),
+        skill: item.skill_id.clone().filter(|id| !id.is_empty()),
+        reply: reply_from_pending(item.reply_to.as_ref()),
+        pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
+        posted: true,
+        stale: StaleRefusal::Fresh,
+        unsynced: false,
+    }
+}
+
+/// Write a person's bubble to its row. `read` is the bubble as memory has it at the moment it
+/// is called, `None` once memory no longer holds it, when the words as typed are written.
+async fn write_user_row(
+    db: &DatabaseService,
+    id: &str,
+    conversation_id: &str,
+    typed: String,
+    reply: Option<ReplyRef>,
+    said_at: SystemTime,
+    mut read: impl FnMut() -> Option<UserMessagePersist>,
+) -> anyhow::Result<()> {
+    // What is in memory now, not what was typed: a cancel or edit can land before this write
+    // does, and the row has to be the bubble as it stands (hidden, or with the new words), not
+    // the draft that has already gone.
+    let persist = read().unwrap_or(UserMessagePersist {
+        content: typed,
+        hidden: false,
+    });
+    // The row is filed under the bubble's own id, so nothing has to be swapped afterwards:
+    // what is on screen and what is on disk answer to the same name from the first moment,
+    // and a delete in the meantime finds its row.
+    db.save_message(
+        id,
+        conversation_id,
+        "user",
+        &persist.content,
+        None,
+        None,
+        reply,
+        &[],
+        // The person's own message came out of no run. The server's record of a thread is its
+        // runs, and a run is only the coworker's half of a turn.
+        None,
+        persist.hidden,
+        SaveStamp::at(said_at),
+    )
+    .await?;
+    // A cancel or an edit that landed while that write was in flight met no row to change.
+    // One from here on finds the row, so a second look is the last one needed.
+    if let Some(now) = read() {
+        if now.hidden && !persist.hidden {
+            db.hide_message(id).await?;
+        }
+        if now.content != persist.content {
+            db.update_message_content(id, &now.content).await?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -660,6 +975,8 @@ fn status_row(line: &str) -> Message {
         sender: "AI".to_string(),
         content: line.to_string(),
         sent_at: SystemTime::now(),
+        finished_at: None,
+        run_timing: None,
         is_me: false,
         reply_preview: None,
         reply_to_id: None,
@@ -704,6 +1021,8 @@ fn restored_message(row: ChatMessage) -> Message {
         sender: if row.role == "user" { "Me" } else { "AI" }.to_string(),
         content,
         sent_at,
+        finished_at: row.finished_at.as_deref().and_then(parse_sql_time),
+        run_timing: row.run_timing.as_deref().and_then(TurnTiming::from_json),
         is_me: row.role == "user",
         reply_preview: row.reply_preview,
         reply_to_id: row.reply_to_id,
@@ -778,6 +1097,10 @@ struct RecoveredReply {
     live: bool,
     /// When the run started, which is where in the thread its reply belongs.
     started_at: SystemTime,
+    /// When the run ended, for a finished turn. Live runs have none.
+    finished_at: Option<SystemTime>,
+    /// Harness timing CUSTOM, when the journal carried one.
+    run_timing: Option<TurnTiming>,
 }
 
 /// What a thread is missing, told by comparing the runs the server kept against the runs the
@@ -837,6 +1160,8 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                         SystemTime::UNIX_EPOCH + Duration::from_millis(run.started_at_ms as u64)
                     })
                     .unwrap_or_else(SystemTime::now),
+                finished_at: recovered_finished_at(run),
+                run_timing: TurnTiming::from_events(&run.events),
             })
         })
         .collect()
@@ -933,8 +1258,11 @@ fn bubble_for_run(
         content: String::new(),
         // When the run began, not when this machine noticed it: the bubble's time is what the
         // row is stamped with, and a turn recovered after a restart happened before the ones
-        // either side of it.
+        // either side of it. How long it took is `finished_at`, painted later, and never
+        // written over this.
         sent_at: started_at.unwrap_or_else(SystemTime::now),
+        finished_at: None,
+        run_timing: None,
         is_me: false,
         reply_preview: None,
         reply_to_id: None,
@@ -959,6 +1287,8 @@ fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
             sender: "AI".to_string(),
             content: reply.content.clone(),
             sent_at: reply.started_at,
+            finished_at: reply.finished_at,
+            run_timing: reply.run_timing.clone(),
             is_me: false,
             reply_preview: None,
             reply_to_id: None,
@@ -969,6 +1299,57 @@ fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
         },
     );
     id
+}
+
+/// When a recovered run ended, if the server said. Live runs have none.
+///
+/// `updated_at_ms` is the last frame the journal took; for a finished run that
+/// is the end of the wait. The harness `total_ms` alone is not: the harness
+/// starts its clock again after an approval card, so it counts only the half
+/// after the card. The later of the two is the end.
+fn recovered_finished_at(run: &ThreadRun) -> Option<SystemTime> {
+    if run.is_live() {
+        return None;
+    }
+    let at = |ms: i64| {
+        u64::try_from(ms)
+            .ok()
+            .filter(|ms| *ms > 0)
+            .and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+    };
+    let started = at(run.started_at_ms);
+    let harness_end = started
+        .zip(TurnTiming::from_events(&run.events).and_then(|t| t.total_ms))
+        .and_then(|(started, ms)| started.checked_add(Duration::from_millis(ms)));
+    let last_frame = at(run.updated_at_ms).filter(|_| run.updated_at_ms > run.started_at_ms);
+    harness_end.max(last_frame)
+}
+
+/// The run is over: wear when it ended, without moving when it began.
+///
+/// Only an ending may set `finished_at`. The harness sends a timing frame when
+/// it parks on a card too, and its `total_ms` restarts after the card, so the
+/// harness clock can lengthen the observed end but never stand in for it.
+fn stamp_run_finished(message: &mut Message, observed_end: SystemTime) {
+    if message.is_me || is_unsent_turn_note(&message.content) {
+        return;
+    }
+    let harness_end = message
+        .run_timing
+        .as_ref()
+        .and_then(|t| t.total_ms)
+        .and_then(|ms| message.sent_at.checked_add(Duration::from_millis(ms)));
+    let end = message
+        .finished_at
+        .unwrap_or(observed_end)
+        .max(message.sent_at);
+    message.finished_at = Some(harness_end.map_or(end, |harness| end.max(harness)));
+}
+
+/// A harness timing frame landed. It does not end the run: a run parked on a
+/// card sends one too.
+fn apply_timing(message: &mut Message, timing: TurnTiming) {
+    message.run_timing = Some(timing);
 }
 
 /// What the feed says for a turn that is over but said nothing.
@@ -1220,6 +1601,151 @@ impl RecipeFilter {
     }
 }
 
+/// Which half of the Skills library the page is showing.
+///
+/// Two words rather than the server's three: `mine` is what a person has, and `org` is what
+/// their colleagues have put where everybody can find it. `shared` is the same rows as `org`
+/// until a skill can be sent to one person by name, so offering both would be two toggles for
+/// one list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SkillScope {
+    #[default]
+    Yours,
+    Discover,
+}
+
+impl SkillScope {
+    pub const ALL: [Self; 2] = [Self::Yours, Self::Discover];
+
+    /// The `?filter=` word.
+    pub fn query(self) -> &'static str {
+        match self {
+            Self::Yours => "mine",
+            Self::Discover => "org",
+        }
+    }
+
+    /// The word a driver names this side by, which is the word on the screen rather than the
+    /// one on the wire: a person reading the toggle sees "Yours", not "mine".
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Yours => "yours",
+            Self::Discover => "discover",
+        }
+    }
+
+    pub fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|scope| scope.word() == word)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Yours => "Yours",
+            Self::Discover => "Discover",
+        }
+    }
+
+    /// The toggle's element id.
+    pub fn element_id(self) -> &'static str {
+        match self {
+            Self::Yours => "settings-skills-scope-yours",
+            Self::Discover => "settings-skills-scope-discover",
+        }
+    }
+}
+
+/// What a second switch is told while the first is still going. The person cannot ask twice —
+/// every switch on the page is dead — so this is for the driver, which would otherwise be told
+/// nothing and conclude its change had been taken.
+pub const SWITCH_IN_FLIGHT: &str = "A skill's switch is already being changed.";
+
+/// What the sheet's Save button says while a model is reading a tape into prose, and what the
+/// driver reads for the same fact.
+///
+/// One sentence in both places. It names who is doing it, because "Saving…" is what an upload
+/// says and this is not an upload: it is a wait on a model, long enough that a button which
+/// looked like an upload read as stuck.
+pub const WRITING_A_LESSON: &str = "Your bot is writing it…";
+
+/// What is becoming of a tape that was told to become a skill.
+///
+/// The sheet that starts this is in the coworker's screen window, which draws no pages and
+/// which nothing else can see into. The fact is kept here so the rest of the app has it: the
+/// Skills page reloads on it, and the driver — which only ever sees the main window's tree —
+/// can tell a lesson being written from one that was written, or refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaughtSkill {
+    /// The tape is with the server and a model is reading it into words. Long by the standards
+    /// of everything else the app asks for, which is why it is a state and not a moment.
+    Writing,
+    /// Written down. `enabled` is the whole of the review: a lesson a model wrote is kept
+    /// switched off until a person has read it, and a switched-off skill reaches no turn and no
+    /// colleague — so it travels beside the name rather than being read off a row later.
+    Written {
+        id: String,
+        name: String,
+        enabled: bool,
+    },
+    /// Why there is no lesson, in the server's own words — or in the app's own, for the one
+    /// case where the server never got to say anything. Those words name which of the things
+    /// went wrong, and none of that survives being reworded here.
+    ///
+    /// `next` is what there is to do about it, worked out by the window that sent the tape and
+    /// carried here so that what a driver is offered and what a person is offered are the same
+    /// offer. `coworker` is whose screen the tape is sitting on, because Try again has to reach
+    /// THAT window: with two screens open, a global slot sent one coworker's recording to the
+    /// other one.
+    Refused {
+        why: String,
+        next: AfterRefusal,
+        coworker: String,
+    },
+}
+
+/// What there is to do about a refused tape, which is not the same question as what went wrong.
+///
+/// The words are the server's and are never touched. This is the app's own answer to "and now
+/// what", and it decides which control is drawn — a button that cannot work is worse than no
+/// button, because it contradicts the sentence above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterRefusal {
+    /// Read it, and change something. The same bytes with the same words earn the same answer:
+    /// a spend cap, a recording nothing can be written from, a name already taken, a model that
+    /// would not write this one down.
+    Nothing,
+    /// Send the same tape again. Something was busy or out of reach and nothing was decided.
+    SendAgain,
+    /// Look before sending anything: nothing answered, so nobody knows whether the skill was
+    /// written. See [`crate::components::computer_screen`] — the route has no idempotency key,
+    /// so a second send of a tape that did land writes a second skill from one recording.
+    LookFirst,
+}
+
+/// Which surface asked for a skill to be made, which is where its refusal is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillCreateFrom {
+    /// The New skill sheet, which has a slot of its own over the fields.
+    Sheet,
+    /// A picked file or folder. There is no sheet, so the list's slot is the only one on screen.
+    Upload,
+}
+
+/// How many skills each side of the toggle has, whichever side is open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SkillCounts {
+    pub yours: usize,
+    pub discover: usize,
+}
+
+impl SkillCounts {
+    pub fn of(self, scope: SkillScope) -> usize {
+        match scope {
+            SkillScope::Yours => self.yours,
+            SkillScope::Discover => self.discover,
+        }
+    }
+}
+
 /// What a recipe's newest run came to, as far as this session has been told. A detail carries
 /// a recipe's runs and the list's summaries carry none, so a row says what the app has already
 /// been shown and nothing where it has not.
@@ -1309,6 +1835,7 @@ pub enum AppSettingsTab {
     Computer,
     Updates,
     Logins,
+    Skills,
 }
 
 /// Where Route traffic chrome belongs for the active bot's box.
@@ -1422,6 +1949,9 @@ pub struct AppState {
     /// composer is in recipe mode: `@` offers this recipe's parameters instead of the bot's
     /// tools, because a turn that is already a recipe run has no use for a tool roster.
     pub active_recipe: Option<ActiveRecipe>,
+    /// The skill the next message is sent with, once one has been picked with `/`. One to a
+    /// message, because the turn names one id, and gone again the moment that message goes.
+    pub active_skill: Option<ActiveSkill>,
     /// Which of the composer's lists is open, as the composer publishes it.
     ///
     /// The panel itself lives in the composer's own view and nothing outside that view can read
@@ -1438,8 +1968,22 @@ pub struct AppState {
     pub submit_chord: SubmitChord,
     /// What a plain send does while a turn is running. Read from prefs.json at boot.
     pub on_send: OnSend,
+    /// Settings → General: paint the harness phase breakdown under assistant
+    /// bubbles. Off for demos; the peek stamp still wears how long the run took.
+    pub show_turn_timing: bool,
     /// Messages held per thread until it is idle, in the order they were typed.
     queued_sends: HashMap<String, VecDeque<QueuedSend>>,
+    /// Bubble ids this process took off the queue. Hydrate must not put them back: a
+    /// GET that raced the DELETE would otherwise restore a send the person just canceled.
+    canceled_pending: HashSet<String>,
+    /// Holds whose DELETE/PATCH has gone out and whose local `queued_sends` has
+    /// not yet applied the CUSTOM. Drain must not pop these (FIFO), and hydrate
+    /// must not replace them with a snapshot that raced the mutation.
+    pending_inflight: HashSet<String>,
+    /// The held send whose Edit was clicked, until the composer settles it.
+    pending_edit: Option<String>,
+    /// The place in the queue that Edit took a hold from, until that hold is sent again.
+    edit_slot: Option<EditSlot>,
     pub audio_input: Option<AudioInput>,
     pub sidebar_collapsed: bool,
     pub sidebar_hidden: bool,
@@ -1645,6 +2189,72 @@ pub struct AppState {
     /// What each recipe's newest run came to, kept as details are read, so a row in the list
     /// can say what became of that recipe last time.
     pub recipe_last_runs: HashMap<String, RecipeRunNote>,
+    /// Settings → Skills, as that page has it. A skill is prose the model reads before it
+    /// works, and the library is the account's rather than one coworker's — so these are flat
+    /// fields like the recipes above, not a map keyed by bot like the routines.
+    pub skills: Vec<SkillSummary>,
+    /// What the search field holds. The listing takes no query of its own, so this filters the
+    /// rows that arrived; the state keeps the text so the driver can write it too.
+    pub skills_query: String,
+    pub skills_scope: SkillScope,
+    /// The skills `/` offers, which are the ones this person can invoke.
+    ///
+    /// Kept apart from [`Self::skills`] on purpose. That list is whichever side of the Settings
+    /// toggle was last looked at, and it is emptied the moment the toggle moves: a composer
+    /// reading it offered a colleague's library and none of this person's own, for no reason
+    /// anybody typing `/` could have seen.
+    pub your_skills: Vec<SkillSummary>,
+    /// Whether that listing is on its way, and what the server said if it refused. The `/` panel
+    /// says which of the three it is, because a library that would not load and a library with
+    /// nothing in it read the same on screen and are opposite things to do something about.
+    pub your_skills_loading: bool,
+    pub your_skills_error: Option<String>,
+    /// Which refresh of that listing the app is waiting on, so a slow answer cannot land on top
+    /// of a later one. See [`Self::take_your_skills_at`].
+    your_skills_epoch: u64,
+    /// How many rows each side of the toggle has. Both sides are fetched on every refresh
+    /// because the toggle carries a count per side, and a count for the scope nobody has opened
+    /// would otherwise be a blank where a number belongs.
+    pub skills_counts: SkillCounts,
+    pub skills_loading: bool,
+    /// What the LIST's last request said when it was refused: a refresh, a picker, a delete.
+    ///
+    /// Three error slots rather than one, the way the recipes page keeps its list's and its
+    /// detail's apart. They are three places on screen, and one slot for all three put a delete
+    /// that the server refused inside the "New skill" sheet, where it read as a verdict on what
+    /// somebody had just typed.
+    pub skills_error: Option<String>,
+    /// What the OPEN SKILL's fetch said when it was refused, shown on its pane.
+    pub skill_error: Option<String>,
+    /// What the CREATE said when it was refused — the server's own sentence, including the one
+    /// naming the 8000-character cap on a body. Shown in the sheet, over the fields it is about.
+    pub skill_add_error: Option<String>,
+    /// Bumped per refresh, so a late answer for an earlier scope is dropped.
+    skills_epoch: u64,
+    /// The skill the detail pane shows, once it has loaded, and the one it is on from the
+    /// moment it was asked for. A late answer for a skill the person has left is dropped.
+    pub skill_open: Option<SkillDetail>,
+    pub skill_open_id: Option<String>,
+    /// Create a skill: the sheet over the page, until Cancel or Save.
+    pub skill_add_open: bool,
+    /// A create is in flight. Save is dead while it is: pressed twice, the second try is a name
+    /// the server has just taken, and the sheet would show "you already have a skill called
+    /// that" about the skill it had itself just made.
+    pub skill_saving: bool,
+    /// The server took the last create, so the sheet's fields may be emptied. The page turns
+    /// this off once it has. Cancel empties them too; a click on the dimmed background does
+    /// not, because a click landing wide of a sheet is not a decision to throw work away.
+    pub skill_add_taken: bool,
+    /// Delete asks first: the skill the dialog is about, until Delete or Cancel.
+    pub skill_delete_confirm: Option<String>,
+    /// The skill whose switch is being changed on the server, and where it was moved to. Every
+    /// switch in the app is dead while one is in flight: two answers about two flags land in
+    /// either order, and the mover is kept so a listing already on the wire cannot land the old
+    /// value on top of it.
+    pub skill_enabling: Option<(String, bool)>,
+    /// What became of the last tape that was told to become a skill, which happens in the
+    /// screen window and is read here. `None` until somebody teaches one.
+    pub taught_skill: Option<TaughtSkill>,
     /// The window the app's pages live in. A second window — a coworker's screen — has no
     /// page of its own: it asks this one to show the Recipes page and brings it forward.
     main_window: Option<AnyWindowHandle>,
@@ -1742,6 +2352,19 @@ impl PickedKind {
             Self::Tool
         }
     }
+}
+
+/// The skill the next message is sent with, picked with `/` in the composer.
+///
+/// A skill is prose the model reads before it works, so nothing about it is asked of the person:
+/// there is no declaration to fill in and no bar over the composer. What the turn carries is the
+/// id; the name is kept beside it for the chip and for anything that has to say which skill is
+/// on the draft, because the library it was picked out of is emptied whenever Settings → Skills
+/// changes sides and a look-up by id later would come back empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveSkill {
+    pub id: String,
+    pub name: String,
 }
 
 /// The recipe or workflow the next message runs, picked with `/` in the composer.
@@ -1888,6 +2511,7 @@ impl AppState {
             more_menu_open: false,
             picked_tools: Vec::new(),
             active_recipe: None,
+            active_skill: None,
             composer_panel: None,
             is_app_settings_open: false,
             bot_finder_open: false,
@@ -1896,7 +2520,12 @@ impl AppState {
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
             on_send: OnSend::default(),
+            show_turn_timing: false,
             queued_sends: HashMap::new(),
+            canceled_pending: HashSet::new(),
+            pending_inflight: HashSet::new(),
+            pending_edit: None,
+            edit_slot: None,
             audio_input: None,
             sidebar_collapsed: false,
             sidebar_hidden: false,
@@ -1996,6 +2625,27 @@ impl AppState {
             recipe_run_result: None,
             recipe_delete_confirm: false,
             recipe_last_runs: HashMap::new(),
+            skills: Vec::new(),
+            skills_query: String::new(),
+            skills_scope: SkillScope::Yours,
+            your_skills: Vec::new(),
+            your_skills_loading: false,
+            your_skills_error: None,
+            your_skills_epoch: 0,
+            skills_counts: SkillCounts::default(),
+            skills_loading: false,
+            skills_error: None,
+            skill_error: None,
+            skill_add_error: None,
+            skills_epoch: 0,
+            skill_open: None,
+            skill_open_id: None,
+            skill_add_open: false,
+            skill_saving: false,
+            skill_add_taken: false,
+            skill_delete_confirm: None,
+            skill_enabling: None,
+            taught_skill: None,
             main_window: None,
             #[cfg(target_os = "macos")]
             computer_windows: std::collections::HashMap::new(),
@@ -3124,6 +3774,21 @@ impl AppState {
         if self.is_signed_in() {
             self.refresh_coworkers(cx);
         }
+        // Before the hydrate, whose fold drains: each PATCH marks its hold in flight.
+        if self.can_sync_pending() {
+            for owed in self.take_unsynced_edits() {
+                self.spawn_edit_pending(
+                    owed.thread_id,
+                    owed.pending_id,
+                    owed.message_id,
+                    owed.content,
+                    cx,
+                );
+            }
+        }
+        if let Some(id) = self.active_conversation_id.clone() {
+            self.hydrate_pending_user_messages(&id, cx);
+        }
         cx.notify();
     }
 
@@ -4016,6 +4681,762 @@ impl AppState {
             .map(|detail| detail.recipe.name.clone())
     }
 
+    // ---- Settings → Skills ----
+    //
+    // A SKILL is prose the model reads before it works, kept on the server and invoked by
+    // typing `/name`. A RECIPE is a taped replay of clicks. They are two different things that
+    // share a slash, and nothing here calls one by the other's name.
+
+    /// Settings → Skills, asked for from anywhere. The page is a settings tab, so this brings
+    /// Settings up when it is shut rather than setting a tab nobody can see.
+    pub fn open_skills(&mut self, cx: &mut Context<Self>) {
+        // Opening Settings onto this tab fetches the list, and so does moving to it. Exactly one
+        // of those happens here, unless neither does — which is the case this last line is for:
+        // asking again for the tab already on screen, which would otherwise leave whatever was
+        // there when it was last visited.
+        let showing = self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills;
+        if !self.is_app_settings_open {
+            self.toggle_app_settings(cx);
+        }
+        self.set_app_settings_tab(AppSettingsTab::Skills, cx);
+        if showing {
+            self.refresh_skills(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn set_skills_scope(&mut self, scope: SkillScope, cx: &mut Context<Self>) {
+        if !self.take_skills_scope(scope) {
+            return;
+        }
+        self.refresh_skills(cx);
+        cx.notify();
+    }
+
+    /// Move the toggle, and take the rows off the page while the new side is on its way.
+    ///
+    /// The rows on screen are the rows of the side that was open, so they go the moment that
+    /// side does. Left there they would sit under the other side's name until the fetch landed
+    /// — and for as long as the app ran if it never did.
+    ///
+    /// `false` when the toggle was already there and nothing moved.
+    fn take_skills_scope(&mut self, scope: SkillScope) -> bool {
+        if self.skills_scope == scope {
+            return false;
+        }
+        self.skills_scope = scope;
+        self.skills.clear();
+        true
+    }
+
+    /// Settings → Skills: the search field's text, the copy the list filters by.
+    pub fn set_skills_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.skills_query != query {
+            self.skills_query = query;
+            cx.notify();
+        }
+    }
+
+    /// Both sides of the toggle: the open one's rows, and a count for each.
+    ///
+    /// Two requests rather than one, because the row the server sends says nothing about whose
+    /// skill it is — there is no owner on it — so which side a row belongs to is the question
+    /// that was asked, not something that can be worked out afterwards.
+    ///
+    /// A late answer for an earlier scope is dropped, so a toggle worked quickly never shows one
+    /// side's rows under the other side's name.
+    pub fn refresh_skills(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            // Signed out there is no library to ask for, which is not the same as a library
+            // with nothing in it — and "No skills yet" is what an empty list says.
+            self.skills.clear();
+            self.skills_counts = SkillCounts::default();
+            self.skills_loading = false;
+            self.skills_error = Some(SKILLS_SIGNED_OUT.to_string());
+            cx.notify();
+            return;
+        };
+        self.skills_epoch += 1;
+        let epoch = self.skills_epoch;
+        let scope = self.skills_scope;
+        self.skills_loading = true;
+        self.skills_error = None;
+        cx.spawn(async move |this, cx| {
+            let (yours, discover) = futures::future::join(
+                client.list_skills(Some(SkillScope::Yours.query())),
+                client.list_skills(Some(SkillScope::Discover.query())),
+            )
+            .await;
+            let _ = this.update(cx, |state, cx| {
+                if state.take_skills(epoch, scope, yours, discover) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Take a pair of listings, unless the page has moved on. `false` when the answer was for a
+    /// refresh that has been overtaken, and nothing was touched.
+    ///
+    /// Either half failing is the library failing: the counts and the rows come from the same
+    /// pair of answers, and half a pair would put a number on the toggle that the list beneath
+    /// it disagrees with.
+    fn take_skills(
+        &mut self,
+        epoch: u64,
+        scope: SkillScope,
+        yours: Result<Vec<SkillSummary>, OpenGrokError>,
+        discover: Result<Vec<SkillSummary>, OpenGrokError>,
+    ) -> bool {
+        if self.skills_epoch != epoch {
+            return false;
+        }
+        self.skills_loading = false;
+        match (yours, discover) {
+            (Ok(yours), Ok(discover)) => {
+                self.skills_counts = SkillCounts {
+                    yours: yours.len(),
+                    discover: discover.len(),
+                };
+                // The page asked for both sides for its counts, and one of the two is the list
+                // `/` offers. Taking it here is what lets a skill written on this page be
+                // invoked in the composer without anybody asking for it a second time.
+                self.take_your_skills(yours.clone());
+                self.skills = match scope {
+                    SkillScope::Yours => yours,
+                    SkillScope::Discover => discover,
+                };
+                // A switch moved while this listing was on the wire is newer than the listing.
+                self.reapply_pending_switch();
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                // The rows are the ones that could not be refreshed, so they go with the
+                // counts: a list left on screen under a red line is a list somebody reads as
+                // current.
+                self.skills.clear();
+                self.skills_counts = SkillCounts::default();
+                self.skills_error = Some(error.message);
+            }
+        }
+        true
+    }
+
+    /// The skills `/` offers, asked for by the composer.
+    ///
+    /// One request, where the Settings page makes two: the page needs a count for each side of
+    /// its toggle, and nobody typing `/` is looking at the toggle. A fetch already in flight is
+    /// left to land rather than joined by a second — two answers for one question can only
+    /// disagree by being differently stale.
+    pub fn refresh_your_skills(&mut self, cx: &mut Context<Self>) {
+        // Politeness rather than correctness: `/` opened twice in a second does not need two
+        // requests. Which answer wins is the epoch's business, not this line's.
+        if self.your_skills_loading {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            // Signed out there is no library to ask for, which is not the same as a library with
+            // nothing in it.
+            self.your_skills.clear();
+            self.your_skills_error = Some(SKILLS_SIGNED_OUT.to_string());
+            cx.notify();
+            return;
+        };
+        self.your_skills_epoch += 1;
+        let epoch = self.your_skills_epoch;
+        self.your_skills_loading = true;
+        self.your_skills_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let listed = client.list_skills(Some(SkillScope::Yours.query())).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.take_your_skills_at(epoch, listed) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Take a listing of this person's skills, unless something newer has already answered.
+    ///
+    /// `false` when this answer was overtaken and nothing was touched. A late one landing would
+    /// put back the library as it stood before the skill that was just written — the very thing
+    /// the Settings page's fetch feeding this list is supposed to make impossible — and in the
+    /// other direction it would print "could not be loaded" over a library that loaded fine.
+    fn take_your_skills_at(
+        &mut self,
+        epoch: u64,
+        listed: Result<Vec<SkillSummary>, OpenGrokError>,
+    ) -> bool {
+        if self.your_skills_epoch != epoch {
+            return false;
+        }
+        self.your_skills_loading = false;
+        match listed {
+            Ok(rows) => self.take_your_skills(rows),
+            // The rows already there are left where they are, which is the opposite of what the
+            // Settings page does with its own. A row here is a thing to pick, and one that was
+            // listed a minute ago is as pickable as it was — the server is the authority on an
+            // id either way. Emptying the list because a refresh failed would take away the one
+            // thing the person opened `/` for.
+            Err(error) => self.your_skills_error = Some(error.message),
+        }
+        true
+    }
+
+    /// Take a listing of this person's skills, from wherever it was asked for.
+    ///
+    /// The epoch moves: whatever is in flight was asked for before this answer and must not land
+    /// on top of it. That matters most for the caller that has no epoch of its own — the
+    /// Settings page's refresh, which fills this list from the half it fetched for its counts.
+    fn take_your_skills(&mut self, rows: Vec<SkillSummary>) {
+        self.your_skills_epoch += 1;
+        self.your_skills = rows;
+        self.your_skills_loading = false;
+        self.your_skills_error = None;
+        // Same as above: what this app has just done to a switch outlives a listing that was
+        // asked for before it happened.
+        self.reapply_pending_switch();
+    }
+
+    /// What the screen window's sheet is doing with a tape it was told to turn into a skill.
+    /// `None` when there is no longer a tape to be doing anything with — it was let go, or a
+    /// new recording has started.
+    ///
+    /// A lesson that was written lands on BOTH skill lists: the Settings page's, which shows
+    /// one side of its toggle, and the composer's own, which is what `/` offers. One refresh
+    /// fills both — it asks for each side for its counts and hands the person's own half to the
+    /// composer — so a skill taught on a screen can be typed after a slash without a restart.
+    pub fn set_taught_skill(&mut self, taught: Option<TaughtSkill>, cx: &mut Context<Self>) {
+        if self.taught_skill.is_none() && taught.is_none() {
+            return;
+        }
+        if matches!(taught, Some(TaughtSkill::Written { .. })) {
+            // Taught on this person's own screen by this person, so it is theirs whichever side
+            // of the toggle was last open.
+            self.take_skills_scope(SkillScope::Yours);
+            self.refresh_skills(cx);
+        }
+        self.taught_skill = taught;
+        cx.notify();
+    }
+
+    /// Send the last refused tape again, from the window that is holding it.
+    ///
+    /// THAT window and no other. The tape belongs to one coworker's screen — the server keeps
+    /// none — and the slot here is the app's one note about the last tape taught anywhere, so a
+    /// retry that took whichever window answered first would send one coworker's recording to
+    /// another coworker's screen the moment two are open.
+    ///
+    /// A window that has been closed took the tape with it and there is nothing left to send:
+    /// the note goes, which takes the offer off the tree as well as off the screen.
+    ///
+    /// On a spawn, because the window's save reads THIS state for its client and writes to it
+    /// when the answer lands, and this runs inside an update of it. A nested update of the
+    /// entity already leased is `double_lease_panic`.
+    pub fn retry_taught_skill(&mut self, cx: &mut Context<Self>) {
+        let Some(TaughtSkill::Refused { coworker, .. }) = self.taught_skill.clone() else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let Some(handle) = self.computer_windows.get(&coworker).copied() else {
+                self.set_taught_skill(None, cx);
+                return;
+            };
+            cx.spawn(async move |this, cx| {
+                let sent = handle
+                    .update(cx, |screen, _, cx| screen.retry_save(cx))
+                    .unwrap_or(false);
+                if !sent {
+                    // The window went, or it is no longer holding a tape that can be sent
+                    // again. Either way there is nothing here to offer.
+                    let _ = this.update(cx, |state, cx| state.set_taught_skill(None, cx));
+                }
+            })
+            .detach();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = coworker;
+            self.set_taught_skill(None, cx);
+        }
+    }
+
+    /// Whether the window holding the refused tape is still open, so that the offer to send it
+    /// again is an offer something can honour.
+    ///
+    /// Asked before the button is drawn rather than after it is pressed: the sheet goes with the
+    /// window, so a person cannot press it once that window is shut, and a driver reading a tree
+    /// that still carried it would be told its click had worked.
+    pub fn taught_tape_is_in_hand(&self) -> bool {
+        let Some(TaughtSkill::Refused { coworker, .. }) = &self.taught_skill else {
+            return false;
+        };
+        #[cfg(target_os = "macos")]
+        {
+            self.computer_windows.contains_key(coworker)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = coworker;
+            false
+        }
+    }
+
+    /// Settings → Skills in the main window, on one skill, asked for from another window — the
+    /// way [`Self::show_recipes_in_main_window`] is, and for the same reason: the screen window
+    /// draws no pages, and the lesson it has just had written is read on this one.
+    pub fn show_skill_in_main_window(&mut self, skill: Option<String>, cx: &mut Context<Self>) {
+        cx.activate(true);
+        if let Some(window) = self.main_window {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+        self.open_skills(cx);
+        if let Some(id) = skill {
+            self.open_skill(id, cx);
+        }
+    }
+
+    /// The detail pane for one skill. The prose is not on the listing, so it is fetched.
+    pub fn open_skill(&mut self, id: String, cx: &mut Context<Self>) {
+        self.skill_open = None;
+        self.skill_open_id = Some(id);
+        self.skill_error = None;
+        self.load_open_skill(cx);
+        cx.notify();
+    }
+
+    fn load_open_skill(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(id) = self.skill_open_id.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = client.skill(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                // A late answer for a skill the person has since left is stale.
+                if state.skill_open_id.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(detail) => state.skill_open = Some(detail),
+                    // On the pane, where the person is waiting for it. In the list's slot it
+                    // would be a sentence about the library, and the pane would go on saying
+                    // "Loading…" at something that is never going to arrive.
+                    Err(error) => state.skill_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn close_skill(&mut self, cx: &mut Context<Self>) {
+        if self.skill_open_id.is_none() && self.skill_open.is_none() {
+            return;
+        }
+        self.skill_open = None;
+        self.skill_open_id = None;
+        self.skill_error = None;
+        cx.notify();
+    }
+
+    /// Create a skill → the sheet over the page.
+    pub fn open_skill_add(&mut self, cx: &mut Context<Self>) {
+        if !self.skill_add_open {
+            self.skill_add_open = true;
+            self.skill_add_error = None;
+            cx.notify();
+        }
+    }
+
+    pub fn close_skill_add(&mut self, cx: &mut Context<Self>) {
+        if self.skill_add_open {
+            self.skill_add_open = false;
+            // The refusal was about what was in the sheet. With the sheet gone there is nothing
+            // for it to be about, and left behind it reads as a verdict on the library.
+            self.skill_add_error = None;
+            cx.notify();
+        }
+    }
+
+    /// The page has emptied the sheet's fields after a create the server took.
+    pub fn skill_add_fields_cleared(&mut self) {
+        self.skill_add_taken = false;
+    }
+
+    /// Write one down: the prose as typed, with the name and the description beside it.
+    ///
+    /// The sheet stays up until the server has taken it. What a name may be, and how long a body
+    /// may be, are the server's rules and its refusals are shown as it words them — and a name
+    /// it will not take is the likeliest thing to go wrong on a first try, so the words somebody
+    /// wrote have to still be in the fields when that sentence arrives. The one thing refused
+    /// here is a skill with no name at all, because there is nothing to send.
+    pub fn create_skill(
+        &mut self,
+        name: String,
+        description: String,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.skill_saving {
+            return;
+        }
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.skill_add_error =
+                Some("A skill needs a name — it is what you type after the slash.".into());
+            cx.notify();
+            return;
+        }
+        self.send_new_skill(
+            NewSkill {
+                name,
+                description: description.trim().to_string(),
+                body: body.trim().to_string(),
+                source: SkillSource::Authored,
+                files: Vec::new(),
+            },
+            SkillCreateFrom::Sheet,
+            cx,
+        );
+    }
+
+    /// Settings → Skills → Upload skill: the picker, then [`Self::upload_skill`].
+    pub fn pick_skill_upload(&mut self, cx: &mut Context<Self>) {
+        // A file (one `SKILL.md`) or a directory (a `SKILL.md` and what sits beside it).
+        let answer = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: false,
+            prompt: Some("Upload".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let chosen = answer.await;
+            let _ = this.update(cx, |state, cx| {
+                match chosen {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            state.upload_skill(path, cx);
+                        }
+                    }
+                    Ok(Ok(None)) | Err(_) => {}
+                    Ok(Err(error)) => {
+                        state.skills_error =
+                            Some(format!("The file picker would not open: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A picked `SKILL.md`, or the folder one lives in.
+    ///
+    /// The name is left off on purpose: an uploaded `SKILL.md` names itself in its frontmatter,
+    /// and the server reads it from there. Making somebody retype it is how a skill's file and
+    /// its row come to disagree about what the thing is called.
+    pub fn upload_skill(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        if self.skill_saving {
+            return;
+        }
+        self.skills_error = None;
+        self.skill_saving = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { read_skill_upload(&path) })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match read {
+                    Ok((body, files)) => state.send_new_skill(
+                        NewSkill {
+                            name: String::new(),
+                            description: String::new(),
+                            body,
+                            source: SkillSource::Uploaded,
+                            files,
+                        },
+                        SkillCreateFrom::Upload,
+                        cx,
+                    ),
+                    // What was picked is the list's business: the Upload button is on the
+                    // list, and nothing was typed for this to be a verdict on.
+                    Err(why) => {
+                        state.skill_saving = false;
+                        state.skills_error = Some(why);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The one road to `POST /skills`, taken by both the sheet and an upload: the new skill is
+    /// sent, the library reloads, and the one that was just made is the one on the pane.
+    ///
+    /// `from` decides where a refusal is drawn, and it has to be told rather than guessed at.
+    /// The sheet has a slot of its own, over the fields the sentence is about; an upload has no
+    /// sheet, so a sentence put in that slot is a sentence drawn nowhere at all — which is what
+    /// a click on Upload that did nothing looked like.
+    fn send_new_skill(&mut self, new: NewSkill, from: SkillCreateFrom, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            self.skill_saving = false;
+            self.refuse_create(from, "Sign in to keep a skill on the server.".into());
+            cx.notify();
+            return;
+        };
+        self.skill_saving = true;
+        self.skill_add_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.create_skill(&new).await;
+            let _ = this.update(cx, |state, cx| {
+                state.skill_saving = false;
+                match result {
+                    Ok(detail) => {
+                        // Taken: the sheet may go, and the words in ITS fields are now kept
+                        // somewhere, so the page may empty them. An upload that landed says
+                        // nothing about a draft somebody left in the sheet.
+                        state.skill_add_open = false;
+                        state.skill_add_error = None;
+                        state.skill_add_taken = from == SkillCreateFrom::Sheet;
+                        let id = detail.skill.id.clone();
+                        state.skill_open_id = Some(id);
+                        state.skill_error = None;
+                        state.skill_open = Some(detail);
+                        // A new skill is one of the person's own, whichever side was open.
+                        state.take_skills_scope(SkillScope::Yours);
+                        state.refresh_skills(cx);
+                    }
+                    Err(error) => state.refuse_create(from, error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A create that was refused, put where the person who asked for it is looking.
+    fn refuse_create(&mut self, from: SkillCreateFrom, why: String) {
+        match from {
+            SkillCreateFrom::Sheet => self.skill_add_error = Some(why),
+            SkillCreateFrom::Upload => self.skills_error = Some(why),
+        }
+    }
+
+    /// Delete asks first, the way every recipe does: the dialog over the page, naming the skill
+    /// it is about. A skill is prose somebody wrote, and it sits one row under Open in a menu
+    /// that opens under the pointer.
+    pub fn ask_skill_delete(&mut self, id: String, cx: &mut Context<Self>) {
+        self.skill_delete_confirm = Some(id);
+        self.skills_error = None;
+        cx.notify();
+    }
+
+    pub fn close_skill_delete_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.skill_delete_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The name of the skill the delete dialog asks about, while it is open. An id with no row
+    /// to put a name to is still a skill to ask about, so the id stands in for the name.
+    pub fn skill_delete_prompt(&self) -> Option<String> {
+        let id = self.skill_delete_confirm.as_ref()?;
+        Some(
+            self.skills
+                .iter()
+                .find(|skill| &skill.id == id)
+                .map(|skill| skill.name.clone())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| id.clone()),
+        )
+    }
+
+    pub fn confirm_skill_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.skill_delete_confirm.take() else {
+            return;
+        };
+        self.delete_skill(id, cx);
+    }
+
+    fn delete_skill(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            self.skills_error = Some("Sign in to change what is kept on the server.".into());
+            cx.notify();
+            return;
+        };
+        self.skills_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.delete_skill(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(()) => {
+                        // The pane cannot go on showing a skill that is gone.
+                        if state.skill_open_id.as_deref() == Some(id.as_str()) {
+                            state.close_skill(cx);
+                        }
+                        state.refresh_skills(cx);
+                    }
+                    Err(error) => state.skills_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The switch on the open skill's pane: on, and a turn may read it and colleagues can find
+    /// it; off, and nothing may run it — the server refuses it even to the person who owns it.
+    ///
+    /// ONE FLAG, BOTH WAYS. The server has a single `enabled` and reusing it as the review gate
+    /// for a lesson a model wrote was the decision, not an accident: a skill written from a
+    /// recording is kept off until somebody has read it, and somebody who reads one and does not
+    /// like it puts it back. A one-way Approve would be a second idea about the same bit.
+    ///
+    /// The switch moves at once, everywhere the row is shown, and the server's answer is what
+    /// it ends up at. A refusal puts it back where it was with the reason on the pane: a switch
+    /// that stayed where it was pushed would say the server took a change it had refused, and
+    /// the person would go on to type a slash that does not work.
+    pub fn set_skill_enabled(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            self.skill_error = Some("Sign in to change what is kept on the server.".into());
+            cx.notify();
+            return;
+        };
+        let Some(was) = self.begin_switch(&id, enabled) else {
+            // Not silence. The control is dead on screen while one is going, so anything that
+            // reached here came from somewhere the screen cannot stop — the driver — and a
+            // click that reports success and does nothing is the worst of the three answers.
+            self.skill_error = Some(SWITCH_IN_FLIGHT.into());
+            cx.notify();
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .update_skill(
+                    &id,
+                    &SkillPatch {
+                        enabled: Some(enabled),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(detail) => {
+                        state.take_switch_answer(&id, enabled, &detail.skill);
+                        state.refresh_skills(cx);
+                    }
+                    Err(error) => state.take_switch_refusal(&id, was, error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Move the switch and remember where it was, or `None` when one is already in flight.
+    ///
+    /// ONE AT A TIME, whichever skill: two answers about two flags land in either order, and
+    /// the guard used to be global while the control it disabled was per-skill — so a second
+    /// skill's switch stayed live, moved under the finger, and came back saying nothing.
+    ///
+    /// The pending move is kept, not just the id: a listing that was already on the wire when
+    /// the switch moved carries the old value, and landing it would put the switch back.
+    pub(crate) fn begin_switch(&mut self, id: &str, enabled: bool) -> Option<bool> {
+        if self.skill_enabling.is_some() {
+            return None;
+        }
+        let was = self
+            .skill_open
+            .as_ref()
+            .filter(|open| open.skill.id == id)
+            .map(|open| open.skill.enabled)
+            .unwrap_or(!enabled);
+        self.skill_error = None;
+        self.skill_enabling = Some((id.to_string(), enabled));
+        self.mark_skill_enabled(id, enabled);
+        Some(was)
+    }
+
+    /// Take what a switch's answer is worth taking.
+    ///
+    /// WHAT WAS SENT is where the switch ends up, not what the reply echoes: a `PUT` answers
+    /// with what it changed, and a field it leaves out must not be read as a value — `enabled`
+    /// in particular reads as ON when absent, which would turn a successful switch-off into a
+    /// switch-on. The stamp is the one thing only the server can know, and it is taken only
+    /// when there IS one: `None` there is "not mentioned", and writing it would unsay a
+    /// reading that did happen.
+    pub(crate) fn take_switch_answer(&mut self, id: &str, sent: bool, reply: &SkillSummary) {
+        self.skill_enabling = None;
+        self.mark_skill_enabled(id, sent);
+        if let Some(stamped) = reply.approved_at_ms
+            && let Some(open) = self.skill_open.as_mut().filter(|open| open.skill.id == id)
+        {
+            open.skill.approved_at_ms = Some(stamped);
+        }
+    }
+
+    /// Put the switch back where it was, and say why where the person who moved it is looking.
+    ///
+    /// The sentence is drawn on the pane, so it is only written while the pane is still on this
+    /// skill: a refusal about A landing after somebody has opened B is drawn as the reason B
+    /// could not be fetched. The switch itself goes back either way — the row is the row
+    /// wherever it is shown.
+    pub(crate) fn take_switch_refusal(&mut self, id: &str, was: bool, why: String) {
+        self.skill_enabling = None;
+        self.mark_skill_enabled(id, was);
+        if self.skill_open_id.as_deref() == Some(id) {
+            self.skill_error = Some(why);
+        }
+    }
+
+    /// Put the switch where it now is on the pane, on both lists that carry the row, and on the
+    /// note the screen window is keeping about a skill it has just taught.
+    ///
+    /// All four, because they are four places one fact is drawn: `/` reads the second list, and
+    /// a skill switched on in Settings that still says "switched off, so nothing may run it"
+    /// under the slash is a change somebody will reasonably conclude did not happen. The taught
+    /// note is the one that goes stale unseen — it travels beside the name rather than being
+    /// read off a row, which is the whole reason it needs telling.
+    fn mark_skill_enabled(&mut self, id: &str, enabled: bool) {
+        mark_enabled(&mut self.skills, id, enabled);
+        mark_enabled(&mut self.your_skills, id, enabled);
+        if let Some(open) = self.skill_open.as_mut().filter(|open| open.skill.id == id) {
+            open.skill.enabled = enabled;
+        }
+        if let Some(TaughtSkill::Written {
+            id: taught,
+            enabled: note,
+            ..
+        }) = self.taught_skill.as_mut()
+            && taught == id
+        {
+            *note = enabled;
+        }
+    }
+
+    /// Put a switch this app has moved back on top of a listing that was already on the wire
+    /// when it moved. Nothing to do when none is pending.
+    fn reapply_pending_switch(&mut self) {
+        let Some((id, enabled)) = self.skill_enabling.clone() else {
+            return;
+        };
+        mark_enabled(&mut self.skills, &id, enabled);
+        mark_enabled(&mut self.your_skills, &id, enabled);
+    }
+
     /// Teach the active bot a task: its screen, with a tape already running. The same thing the
     /// screen window's own Teach a task button does, asked for from the composer, opening the
     /// window first when there is not one yet.
@@ -4693,6 +6114,65 @@ impl AppState {
         }
     }
 
+    /// Put a skill on the next message, from the list the composer picked it out of. An id the
+    /// list does not hold leaves the draft as it was, and says so.
+    ///
+    /// One skill to a message: picking a second replaces the first, because the turn names one
+    /// id and a message carrying two would have to choose one of them somewhere the person
+    /// cannot see.
+    pub fn start_skill(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        if !self.attach_skill(id) {
+            return false;
+        }
+        cx.notify();
+        true
+    }
+
+    /// The pick itself, apart from the redraw. `false` when the library holds no such id and
+    /// the draft was left as it was.
+    fn attach_skill(&mut self, id: &str) -> bool {
+        // The list `/` was built from, which is not the Settings page's: the page shows one side
+        // of a toggle, and a pick has to be findable in the rows it was picked out of.
+        let Some(skill) = self.your_skills.iter().find(|skill| skill.id == id) else {
+            return false;
+        };
+        self.active_skill = Some(ActiveSkill {
+            id: skill.id.clone(),
+            // The name the `/` row showed, so the chip in the message and anything that reports
+            // what is on the draft cannot come to call one skill two things.
+            name: crate::components::chat_input::sources::skill_name(skill),
+        });
+        true
+    }
+
+    /// Take the skill back off the draft. This is what the chip leaving the message does.
+    pub fn clear_active_skill(&mut self, cx: &mut Context<Self>) {
+        if self.active_skill.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The id of the skill the draft is holding, taken off it as the draft goes.
+    ///
+    /// ONE DOOR. Several things reach [`Self::send_message_with`] and only one of them is the
+    /// draft: a retry re-runs a turn that already went, a generative-UI form's answer is the
+    /// card's words, and a driver's `chat.send` carries words of its own. None of those came
+    /// off the composer, so none of them may take what the composer is holding — the turn would
+    /// carry a skill nobody attached to it, and the chip would be left standing over a draft
+    /// with nothing behind it. They pass `None`; [`Self::send_draft`] is the one caller here.
+    ///
+    /// ONE TURN. A skill applies to the message it was sent with and to nothing after it, which
+    /// is why this takes rather than reads. A message held while the thread is busy keeps it on
+    /// [`QueuedSend`], because that message WAS the draft.
+    ///
+    /// The id is not checked against [`Self::your_skills`] on the way past. That listing is as
+    /// old as the last `/`, and a skill deleted since is not the only way for an id to be
+    /// missing from it; the server knows every id and refuses the ones it does not, which is the
+    /// answer the person is shown.
+    fn take_draft_skill(&mut self) -> Option<String> {
+        self.active_skill.take().map(|skill| skill.id)
+    }
+
     /// Fill one of the active recipe's parameters in, or take its value away.
     pub fn set_recipe_value(&mut self, name: &str, value: Option<String>, cx: &mut Context<Self>) {
         let Some(recipe) = self.active_recipe.as_mut() else {
@@ -4709,6 +6189,21 @@ impl AppState {
     }
 
     pub fn delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        // Online, a held send's DELETE lands before the bubble goes; offline, the hold
+        // comes off before this returns, so a drain later in the same tick finds nothing.
+        if self.is_send_queued(message_id) {
+            self.take_queued_send_back(message_id, cx);
+            return;
+        }
+        self.hide_transcript_message(message_id, cx);
+    }
+
+    /// The half of [`Self::hide_transcript_message`] that is this Mac's memory. Returns the run the
+    /// message came out of, which the server is told about separately.
+    fn hide_message_in_memory(&mut self, message_id: &str) -> Option<String> {
+        // A deleted bubble never becomes a turn, so its hold goes before this returns: a drain
+        // later in the same tick must find nothing to post.
+        self.dequeue_send(message_id);
         if self.native_tts.message_id.as_deref() == Some(message_id) {
             if let Some(service) = &self.tts_service {
                 service.stop_native();
@@ -4762,6 +6257,11 @@ impl AppState {
         {
             self.emoji_picker = None;
         }
+        hidden_run
+    }
+
+    fn hide_transcript_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let hidden_run = self.hide_message_in_memory(message_id);
         if let Some(db) = self.database_service.clone() {
             let id = message_id.to_string();
             cx.spawn(async move |_, _| {
@@ -5206,6 +6706,12 @@ impl AppState {
             self.refresh_host_egress(cx);
             self.refresh_coworker_computer_quietly(cx);
         }
+        // And landing on Settings → Skills the same way: the library is the account's, nothing
+        // else fetches it, and a page that arrived here through back or forward would say "No
+        // skills yet" about a library nobody had asked for.
+        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
         // After `select_coworker`, which lands on the chat: the page is where the person was.
         self.page = loc.page;
         if self.page == MainPage::Recipes {
@@ -5625,6 +7131,7 @@ impl AppState {
                         state.hide_withheld_runs(&conversation_id, &thread, cx);
                         state.apply_thread_replay(&conversation_id, &thread, cx);
                         state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        state.apply_pending_from_replay(&conversation_id, &thread, cx);
                     }
                     Err(_) => {
                         state.reconciled_threads.remove(&conversation_id);
@@ -5773,9 +7280,15 @@ impl AppState {
     /// pinned screenshots from OpenGrok onto rows sqlite already has.
     fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
         let mut grafted: Vec<(String, Vec<ChatPart>)> = Vec::new();
+        let mut clocks: Vec<(String, Option<SystemTime>, Option<TurnTiming>)> = Vec::new();
         for run in runs.iter().filter(|run| !run.run_id.trim().is_empty()) {
             let (_, parts) = reply_from_replay(&run.events, &run.status);
             let parts = self.graft_user_forms(parts);
+            clocks.push((
+                run.run_id.clone(),
+                recovered_finished_at(run),
+                TurnTiming::from_events(&run.events),
+            ));
             grafted.push((run.run_id.clone(), parts));
         }
         let Some(conversation) = self
@@ -5792,6 +7305,22 @@ impl AppState {
                 .find(|message| message.run_id.as_deref() == Some(run_id.as_str()))
             {
                 overlay_server_cards(message, parts);
+            }
+        }
+        for (run_id, finished_at, timing) in clocks {
+            if let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.run_id.as_deref() == Some(run_id.as_str()))
+            {
+                if message.run_timing.is_none()
+                    && let Some(timing) = timing
+                {
+                    apply_timing(message, timing);
+                }
+                if message.finished_at.is_none() {
+                    message.finished_at = finished_at;
+                }
             }
         }
         for (_, parts) in &grafted {
@@ -5824,6 +7353,8 @@ impl AppState {
         // sight, which is the only chance there is to write that ending down.
         self.resync_live_turn(&conversation_id, cx);
         self.sync_pending_approvals(cx);
+        // The live queue on OpenGrok, not only what this process has been holding.
+        self.hydrate_pending_user_messages(&conversation_id, cx);
         // A message held while this thread was out of sight goes now if the thread is idle.
         self.drain_queued_send(&conversation_id, cx);
         cx.notify();
@@ -6078,8 +7609,9 @@ impl AppState {
             .and_then(|c| c.messages.iter().find(|m| m.id == message_id));
         let hidden = bubble.is_some_and(|m| m.hidden);
         // The turn's own time, so a reply recovered from the server keeps the place it had
-        // rather than landing at the bottom of the thread on the next load.
-        let sent_at = bubble.map_or_else(SystemTime::now, |m| m.sent_at);
+        // rather than landing at the bottom of the thread on the next load. Finished-at and
+        // the harness timing JSON ride along; they never move that start clock.
+        let stamp = bubble.map_or_else(|| SaveStamp::at(SystemTime::now()), Message::save_stamp);
         let conversation_id = conversation_id.to_string();
         let message_id = message_id.to_string();
         let run_id = run_id.map(str::to_string);
@@ -6100,7 +7632,7 @@ impl AppState {
                         &parts,
                         run_id.as_deref(),
                         hidden,
-                        sent_at,
+                        stamp,
                     )
                     .await
                 }
@@ -6127,17 +7659,67 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
-        self.send_opengrok_turn_with(conversation_id, content, recipe, None, cx);
+        // No skill. The only caller is "Try again", which re-runs a turn the thread already
+        // has rather than building one out of the draft: the words are the ones that were
+        // sent, and what the composer is holding now belongs to the message still being
+        // written. Taking it here sent somebody's skill on a turn they never attached it to
+        // and left the chip standing over a draft with nothing behind it.
+        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, cx);
     }
 
-    /// `recipe` is the recipe the message was typed with. `stop_first` is a run this turn
-    /// replaces: it is stopped on the wire before the turn is posted.
+    /// The messages a turn posts.
+    ///
+    /// OpenGrok matches a drained hold against the LAST user message, so the hold goes last and
+    /// the holds still queued behind it are left out. Cutting the thread at the hold instead
+    /// would drop the answer to the hold before it, which is painted after this one.
+    ///
+    /// A drained hold OpenGrok may have a row for goes as that row: its words without the
+    /// client's quote line, and `replyTo` as saved. The server refuses the drain on any other
+    /// text or reply, and writes the quote line itself from `replyTo`.
+    fn turn_history(
+        &self,
+        conversation_id: &str,
+        drained: Option<&QueuedSend>,
+    ) -> Vec<AguiMessage> {
+        let mut history = self
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| agui_messages(&c.messages))
+            .unwrap_or_default();
+        let Some(held) = drained else {
+            return history;
+        };
+        let behind: HashSet<&str> = self
+            .queued_sends
+            .get(conversation_id)
+            .into_iter()
+            .flatten()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        history.retain(|m| !behind.contains(m.id.as_str()));
+        if let Some(at) = history.iter().position(|m| m.id == held.message_id) {
+            let mut message = history.remove(at);
+            if held.on_server() {
+                message.content = held.content.clone();
+                message.reply_to = held.reply.as_ref().map(saved_reply);
+            }
+            history.push(message);
+        }
+        history
+    }
+
+    /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
+    /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
+    /// turn is firing, when it came off `queued_sends`.
     fn send_opengrok_turn_with(
         &mut self,
         conversation_id: String,
         content: String,
         recipe: Option<TurnRecipe>,
+        skill: Option<String>,
         stop_first: Option<String>,
+        drained: Option<QueuedSend>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -6154,12 +7736,9 @@ impl AppState {
             return;
         }
         let coworker_id = self.active_coworker_id.clone();
-        let history: Vec<AguiMessage> = self
-            .conversations
-            .iter()
-            .find(|c| c.id == conversation_id)
-            .map(|c| agui_messages(&c.messages))
-            .unwrap_or_default();
+        let history = self.turn_history(&conversation_id, drained.as_ref());
+        let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
+        let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
 
         // Both ids are minted here, before anything is sent. The run id because the server files
         // every frame under it and this is the app's only handle on the run once the stream is
@@ -6177,6 +7756,8 @@ impl AppState {
                 sender: "AI".to_string(),
                 content: String::new(),
                 sent_at: SystemTime::now(),
+                finished_at: None,
+                run_timing: None,
                 is_me: false,
                 reply_preview: None,
                 reply_to_id: None,
@@ -6238,6 +7819,8 @@ impl AppState {
                             &run_id,
                             &history,
                             recipe.as_ref(),
+                            skill.as_deref(),
+                            pending_id.as_deref(),
                             |event| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
@@ -6263,12 +7846,14 @@ impl AppState {
                                     }
                                 }
                                 assembler.push_event(&event);
+                                let timing = TurnTiming::from_event(&event);
                                 let (plain, parts) = assembler.snapshot();
                                 let box_shot = assembler.latest_screenshot().cloned();
                                 let sig = stream_part_sig(&parts);
                                 let now = Instant::now();
                                 let paint =
-                                    stream_paint_due(last_stream_paint, now, last_stream_sig, sig);
+                                    stream_paint_due(last_stream_paint, now, last_stream_sig, sig)
+                                        || timing.is_some();
                                 let _ = this.update(cx, |state, cx| {
                                     // A run the person stopped or sent past has no row any more;
                                     // its late frames must not graft into the turn that replaced it.
@@ -6289,6 +7874,9 @@ impl AppState {
                                     ) {
                                         message.content = plain.clone();
                                         message.parts = grafted;
+                                        if let Some(timing) = timing {
+                                            apply_timing(message, timing);
+                                        }
                                         // Tokens update the row every frame; notify at ~60Hz
                                         // or when a card/picture lands, not on every SSE event.
                                         if paint {
@@ -6376,6 +7964,52 @@ impl AppState {
                         return;
                     }
                 }
+                if let Err(error) = &result
+                    && error.is_stale_pending()
+                    && let Some(held) = drained.clone()
+                    && let Some(custom) = error.pending_custom()
+                {
+                    let message_id = held.message_id.clone();
+                    state.put_back_stale_hold(&conversation_id, &reply_id, held, &custom);
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    state.apply_pending_event(&custom, Some(&message_id), cx);
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
+                }
+                if let Err(error) = &result
+                    && (error.is_already_consumed() || error.is_not_pending())
+                {
+                    // Another machine already fired or canceled this hold. The empty
+                    // assistant row this turn minted is not an answer.
+                    if let Some(conversation) = state
+                        .conversations
+                        .iter_mut()
+                        .find(|conversation| conversation.id == conversation_id)
+                    {
+                        conversation
+                            .messages
+                            .retain(|message| message.id != reply_id);
+                        if error.is_not_pending()
+                            && let Some(user_id) = queued_message_id.as_deref()
+                            && let Some(message) = conversation
+                                .messages
+                                .iter_mut()
+                                .find(|message| message.id == user_id)
+                        {
+                            message.hidden = true;
+                        }
+                    }
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    if error.is_already_consumed() {
+                        state.reconcile_thread(&conversation_id, cx);
+                    }
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
+                }
                 if let Some(message) =
                     streaming_message_mut(&mut state.conversations, &conversation_id, &reply_id)
                 {
@@ -6413,6 +8047,12 @@ impl AppState {
                                 message.content = format!("{RUN_ERROR_PREFIX}{}", error.message)
                             }
                         }
+                    }
+                    if !waiting_approval && !waiting_user_form {
+                        // The start clock stays. This is the other end of the wait, so the
+                        // peek stamp can say `4:34 PM · 6m12s` instead of pretending the
+                        // answer landed when the run began.
+                        stamp_run_finished(message, SystemTime::now());
                     }
                 }
                 if !waiting_approval && !waiting_user_form && result.is_ok() {
@@ -7007,6 +8647,12 @@ impl AppState {
                                     painted = Some(last.id.clone());
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
+                                    if let Some(timing) = TurnTiming::from_events(&replay.events) {
+                                        apply_timing(last, timing);
+                                    }
+                                    if status != "running" && status != "awaiting-approval" {
+                                        stamp_run_finished(last, SystemTime::now());
+                                    }
                                     if let Some(shot) =
                                         parts.iter().rev().find_map(|part| match part {
                                             ChatPart::Screenshot(spec) => Some(spec.clone()),
@@ -7309,6 +8955,8 @@ impl AppState {
             sender: "AI".to_string(),
             content: String::new(),
             sent_at: SystemTime::now(),
+            finished_at: None,
+            run_timing: None,
             is_me: false,
             reply_preview: None,
             reply_to_id: None,
@@ -9413,16 +11061,31 @@ impl AppState {
         self.send_message(body, cx);
     }
 
+    /// Words from somewhere other than the composer: a form's answer, a driver's `chat.send`.
+    /// They go as themselves, with nothing off the draft on them — see [`Self::take_draft_skill`].
     pub fn send_message(&mut self, content: String, cx: &mut Context<Self>) {
-        self.send_message_with(content, false, cx);
+        self.send_message_with(content, false, None, cx);
+    }
+
+    /// The composer's draft going out, with what the composer had on it.
+    ///
+    /// The one door that takes the skill off the draft, because it is the one whose words came
+    /// off the draft. It is taken before the guards below rather than after, which is what the
+    /// composer does with the chip: a send the app refuses empties the field and the chip with
+    /// it, so a skill left attached would be one nothing on screen still mentions.
+    pub fn send_draft(&mut self, content: String, force_steer: bool, cx: &mut Context<Self>) {
+        let skill = self.take_draft_skill();
+        self.send_message_with(content, force_steer, skill, cx);
     }
 
     /// `force_steer` is ⌘⇧↩: send now even if a turn is running. What that
-    /// means for each state of the thread is [`plan_send`].
+    /// means for each state of the thread is [`plan_send`]. `skill` is what the draft was
+    /// holding, which only [`Self::send_draft`] has any business supplying.
     pub fn send_message_with(
         &mut self,
         content: String,
         force_steer: bool,
+        skill: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if !self.is_signed_in() {
@@ -9480,6 +11143,8 @@ impl AppState {
                 sender: "Me".to_string(),
                 content: content.clone(),
                 sent_at: said_at,
+                finished_at: None,
+                run_timing: None,
                 is_me: true,
                 reply_preview: reply.as_ref().map(|r| r.preview.clone()),
                 reply_to_id: reply.as_ref().map(|r| r.message_id.clone()),
@@ -9512,26 +11177,21 @@ impl AppState {
                     eprintln!("Failed to save user message: {}", e);
                     return;
                 }
-                // The row is filed under the bubble's own id, so nothing has to be swapped
-                // afterwards: what is on screen and what is on disk answer to the same name
-                // from the first moment, and a delete in the meantime finds its row.
-                if let Err(e) = db
-                    .save_message(
-                        &local_id,
-                        &conversation_id_clone,
-                        "user",
-                        &content_clone,
-                        None,
-                        None,
-                        reply,
-                        &[],
-                        // The person's own message came out of no run. The server's record of a
-                        // thread is its runs, and a run is only the coworker's half of a turn.
-                        None,
-                        false,
-                        said_at,
-                    )
-                    .await
+                let read = || {
+                    this.update(cx, |state, _| state.user_message_persist(&local_id))
+                        .ok()
+                        .flatten()
+                };
+                if let Err(e) = write_user_row(
+                    &db,
+                    &local_id,
+                    &conversation_id_clone,
+                    content_clone,
+                    reply,
+                    said_at,
+                    read,
+                )
+                .await
                 {
                     eprintln!("Failed to save user message: {}", e);
                 }
@@ -9540,20 +11200,32 @@ impl AppState {
         }
 
         match plan {
-            SendPlan::Post => {}
+            SendPlan::Post => {
+                self.edit_slot = None;
+            }
             // Held until the thread is idle; `drain_queued_send` posts it then. The bubble is
             // on screen and on its way to disk already, so nothing is lost if the app quits
             // first — the row reads as a message that got no answer, which is what it is.
             SendPlan::Queue => {
-                self.queued_sends
-                    .entry(conversation_id)
-                    .or_default()
-                    .push_back(QueuedSend {
-                        message_id: local_id,
-                        content,
-                        recipe,
-                        reply: reply_for_queue,
-                    });
+                self.enqueue_hold(
+                    conversation_id.clone(),
+                    held_message(
+                        local_id.clone(),
+                        content.clone(),
+                        recipe.clone(),
+                        skill.clone(),
+                        reply_for_queue.clone(),
+                    ),
+                );
+                self.sync_queued_send_to_server(
+                    conversation_id,
+                    local_id,
+                    content,
+                    recipe,
+                    skill,
+                    reply_for_queue,
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -9563,12 +11235,21 @@ impl AppState {
             // does it, and this message goes now. Anything already held stays held — the
             // message the person forced ahead goes first, and the rest follow when it ends.
             SendPlan::Steer => {
+                self.edit_slot = None;
                 if busy == Busy::Parked {
                     self.settle_parked_cards(&conversation_id);
                 }
             }
         }
-        self.send_opengrok_turn_with(conversation_id, content, recipe, stop_first, cx);
+        self.send_opengrok_turn_with(
+            conversation_id,
+            content,
+            recipe,
+            skill,
+            stop_first,
+            None,
+            cx,
+        );
     }
 
     /// Post the next held message, if the thread has one and is idle — and is the open
@@ -9579,16 +11260,7 @@ impl AppState {
     fn drain_queued_send(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
         // Nothing held is the common case, and this runs on every frame: answer it before
         // walking the thread for its busy state.
-        if !self
-            .queued_sends
-            .get(conversation_id)
-            .is_some_and(|queue| !queue.is_empty())
-        {
-            return;
-        }
-        if self.active_conversation_id.as_deref() != Some(conversation_id)
-            || self.busy_state(conversation_id) != Busy::Idle
-        {
+        if !self.queued_send_ready_to_drain(conversation_id) {
             return;
         }
         // A turn that cannot leave stays held rather than popped and lost: the signed-out
@@ -9596,20 +11268,9 @@ impl AppState {
         if self.opengrok.is_none() || !self.can_send_turn() {
             return;
         }
-        let Some(next) = self
-            .queued_sends
-            .get_mut(conversation_id)
-            .and_then(VecDeque::pop_front)
-        else {
+        let Some(next) = self.pop_queued_send(conversation_id) else {
             return;
         };
-        if self
-            .queued_sends
-            .get(conversation_id)
-            .is_some_and(VecDeque::is_empty)
-        {
-            self.queued_sends.remove(conversation_id);
-        }
         // The turn is built from the thread as it is in memory. A reload may have replaced the
         // thread from disk meanwhile: the bubble is there under its saved id, or — if the save
         // never landed — not at all, in which case it is put back so the coworker is sent what
@@ -9628,6 +11289,8 @@ impl AppState {
                 sender: "Me".to_string(),
                 content: next.content.clone(),
                 sent_at: SystemTime::now(),
+                finished_at: None,
+                run_timing: None,
                 is_me: true,
                 reply_preview: next.reply.as_ref().map(|r| r.preview.clone()),
                 reply_to_id: next.reply.as_ref().map(|r| r.message_id.clone()),
@@ -9639,9 +11302,11 @@ impl AppState {
         }
         self.send_opengrok_turn_with(
             conversation_id.to_string(),
-            next.content,
-            next.recipe,
+            next.content.clone(),
+            next.recipe.clone(),
+            next.skill.clone(),
             None,
+            Some(next),
             cx,
         );
     }
@@ -9780,6 +11445,7 @@ impl AppState {
 
     pub fn restore_saved_on_send(&mut self) {
         self.on_send = crate::prefs::load_on_send(&Config::data_dir());
+        self.show_turn_timing = crate::prefs::load_show_turn_timing(&Config::data_dir());
     }
 
     pub fn set_on_send(&mut self, on_send: OnSend, cx: &mut Context<Self>) {
@@ -9787,6 +11453,15 @@ impl AppState {
             self.on_send = on_send;
             #[cfg(not(test))]
             crate::prefs::save_on_send(&Config::data_dir(), on_send);
+            cx.notify();
+        }
+    }
+
+    pub fn set_show_turn_timing(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.show_turn_timing != on {
+            self.show_turn_timing = on;
+            #[cfg(not(test))]
+            crate::prefs::save_show_turn_timing(&Config::data_dir(), on);
             cx.notify();
         }
     }
@@ -9799,12 +11474,1219 @@ impl AppState {
             .any(|queued| queued.message_id == message_id)
     }
 
+    fn bubble_hidden(&self, conversation_id: &str, message_id: &str) -> bool {
+        self.conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .and_then(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+            })
+            .is_some_and(|message| message.hidden)
+    }
+
+    fn hold_mut(&mut self, message_id: &str) -> Option<&mut QueuedSend> {
+        self.queued_sends
+            .values_mut()
+            .flatten()
+            .find(|queued| queued.message_id == message_id)
+    }
+
     /// How many messages the open thread is holding back.
     pub fn queued_send_count(&self) -> usize {
         self.active_conversation_id
             .as_deref()
             .and_then(|id| self.queued_sends.get(id))
             .map_or(0, VecDeque::len)
+    }
+
+    /// The place `message_id` occupies, so Edit can put the send back there.
+    fn queue_slot(&self, message_id: &str) -> Option<EditSlot> {
+        self.queued_sends
+            .iter()
+            .find_map(|(conversation_id, queue)| {
+                let index = queue
+                    .iter()
+                    .position(|queued| queued.message_id == message_id)?;
+                Some(EditSlot {
+                    conversation_id: conversation_id.clone(),
+                    after: index
+                        .checked_sub(1)
+                        .and_then(|index| queue.get(index).map(|queued| queued.message_id.clone())),
+                })
+            })
+    }
+
+    /// Queue a hold. One that Edit just took off goes back where it was; any other goes last.
+    fn enqueue_hold(&mut self, conversation_id: String, hold: QueuedSend) {
+        let slot = self
+            .edit_slot
+            .take()
+            .filter(|slot| slot.conversation_id == conversation_id);
+        let queue = self.queued_sends.entry(conversation_id).or_default();
+        match slot {
+            Some(slot) => insert_held_after(queue, hold, slot.after.as_deref()),
+            None => queue.push_back(hold),
+        }
+    }
+
+    /// Take a held send off the queue. The bubble is not touched; the caller hides it.
+    fn dequeue_send(&mut self, message_id: &str) -> Option<QueuedSend> {
+        let mut found: Option<(String, usize)> = None;
+        for (conversation_id, queue) in &self.queued_sends {
+            if let Some(index) = queue
+                .iter()
+                .position(|queued| queued.message_id == message_id)
+            {
+                found = Some((conversation_id.clone(), index));
+                break;
+            }
+        }
+        let (conversation_id, index) = found?;
+        let taken = self
+            .queued_sends
+            .get_mut(&conversation_id)
+            .and_then(|queue| queue.remove(index));
+        if self
+            .queued_sends
+            .get(&conversation_id)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.queued_sends.remove(&conversation_id);
+        }
+        taken
+    }
+
+    /// The next held send to post, which [`Self::drain_queued_send`] turns into a turn.
+    ///
+    /// A hold whose bubble is hidden is dropped, not returned: hidden means the person took it
+    /// back, and a hidden hold never posts, whichever path hid it.
+    fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
+        loop {
+            let front = self.queued_sends.get(conversation_id)?.front()?;
+            if self.pending_inflight.contains(&front.message_id)
+                || front.stale == StaleRefusal::Parked
+                || front.unsynced
+            {
+                return None;
+            }
+            let next = self
+                .queued_sends
+                .get_mut(conversation_id)
+                .and_then(VecDeque::pop_front)?;
+            if self
+                .queued_sends
+                .get(conversation_id)
+                .is_some_and(VecDeque::is_empty)
+            {
+                self.queued_sends.remove(conversation_id);
+            }
+            let hidden = self
+                .conversations
+                .iter()
+                .find(|conversation| conversation.id == conversation_id)
+                .and_then(|conversation| {
+                    conversation
+                        .messages
+                        .iter()
+                        .find(|message| message.id == next.message_id)
+                })
+                .is_some_and(|message| message.hidden);
+            if !hidden {
+                return Some(next);
+            }
+        }
+    }
+
+    fn queued_send_ready_to_drain(&self, conversation_id: &str) -> bool {
+        self.queued_sends
+            .get(conversation_id)
+            .is_some_and(|queue| !queue.is_empty())
+            && self.active_conversation_id.as_deref() == Some(conversation_id)
+            && self.busy_state(conversation_id) == Busy::Idle
+    }
+
+    /// What a user-message write should put on disk, as the bubble and the hold stand now.
+    ///
+    /// The save is spawned when the bubble is created. A cancel or an edit can land before
+    /// that write does, and the row has to match memory: hidden if the person took it back,
+    /// the new words if they changed them.
+    fn user_message_persist(&self, message_id: &str) -> Option<UserMessagePersist> {
+        let queued = self
+            .queued_sends
+            .values()
+            .flatten()
+            .find(|queued| queued.message_id == message_id)
+            .map(|queued| queued.content.clone());
+        let message = self
+            .conversations
+            .iter()
+            .flat_map(|conversation| conversation.messages.iter())
+            .find(|message| message.id == message_id)?;
+        Some(UserMessagePersist {
+            content: queued.unwrap_or_else(|| message.content.clone()),
+            hidden: message.hidden,
+        })
+    }
+
+    /// Take a held send off the queue and hide its bubble. The turn is never posted.
+    ///
+    /// Online with a `pum_…`: DELETE, then apply the `canceled` CUSTOM. Offline /
+    /// no pending id: Phase 1 dequeue in this tick so drain cannot fire it.
+    pub fn cancel_queued_send(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        self.take_queued_send_back(message_id, cx);
+    }
+
+    /// Put the held words back in the composer and cancel the queue item.
+    ///
+    /// There is no inline editor on a bubble. The composer is where words are typed, so Edit
+    /// takes the hold off, hides the bubble, and leaves the sentence in the field to change.
+    /// A recipe the hold was carrying is not restored: `TurnRecipe` is not enough to rebuild
+    /// the bar. A skill still in `/`'s list is put back on the draft; a reply is too. Whatever
+    /// is not put back, the composer's notice says so.
+    ///
+    /// The hold stays queued until the composer settles the Edit with
+    /// [`Self::take_queued_send_for_edit`], because the words already in the composer are the
+    /// one part of the draft this state cannot see.
+    pub fn begin_edit_queued_send(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        if !self.is_send_queued(message_id) {
+            return;
+        }
+        self.pending_edit = Some(message_id.to_string());
+        cx.notify();
+    }
+
+    /// The held send an Edit is waiting on the composer for.
+    pub fn pending_edit(&self) -> Option<&str> {
+        self.pending_edit.as_deref()
+    }
+
+    /// Settle an Edit, given what the composer holds now. `Err` is what to tell the person.
+    pub fn take_queued_send_for_edit(
+        &mut self,
+        message_id: &str,
+        draft: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<EditRefill, String> {
+        let server_row = self.queued_pending_of(message_id);
+        let refill = self.take_hold_for_edit(message_id, draft)?;
+        if let Some((thread_id, pending_id)) = server_row {
+            self.spawn_cancel_pending(thread_id, pending_id, cx);
+        }
+        self.hide_transcript_message(message_id, cx);
+        Ok(refill)
+    }
+
+    /// The draft half of [`Self::take_queued_send_for_edit`]: the hold comes off the queue and
+    /// what it carried goes back on the draft.
+    fn take_hold_for_edit(&mut self, message_id: &str, draft: &str) -> Result<EditRefill, String> {
+        self.pending_edit = None;
+        // Checked before the hold is touched: refusing here leaves both copies of the person's
+        // words where they were, the draft in the field and the held one in its bubble.
+        if !draft.trim().is_empty() {
+            return Err(
+                "The composer already has words in it. Send or clear them, then Edit.".to_string(),
+            );
+        }
+        if self.pending_inflight.contains(message_id) {
+            return Err(
+                "That message is still being updated. Try Edit again in a moment.".to_string(),
+            );
+        }
+        let slot = self.queue_slot(message_id);
+        let Some(held) = self.dequeue_send(message_id) else {
+            return Err("That message has already been sent.".to_string());
+        };
+        self.edit_slot = slot;
+        // A snapshot or bind that raced the DELETE would otherwise queue the words again while
+        // they sit in the composer.
+        self.canceled_pending.insert(message_id.to_string());
+        // Replaced, not added to: the draft becomes the held message, so anything the composer
+        // picked up that the message did not carry would go out with it unasked.
+        self.reply_to = held.reply;
+        self.active_recipe = None;
+        self.active_skill = None;
+        let skill_kept = held.skill.as_deref().is_none_or(|id| self.attach_skill(id));
+        let mut lost = Vec::new();
+        // A `TurnRecipe` is an id and values, not the declaration the bar is drawn from.
+        if held.recipe.is_some() {
+            lost.push("The recipe on that message was not kept.");
+        }
+        if !skill_kept {
+            lost.push("The skill on that message is no longer in your list, so it was not kept.");
+        }
+        let notice = (!lost.is_empty()).then(|| lost.join(" "));
+        Ok(EditRefill {
+            content: held.content,
+            skill: self.active_skill.clone(),
+            notice,
+        })
+    }
+
+    /// Change a held send's words in the queue, on the bubble, and on disk. Drain posts these.
+    ///
+    /// Online with a `pum_…`: PATCH, then apply the `edited` CUSTOM. Offline: the
+    /// Phase 1 in-memory edit is enough, and bind will PATCH once enqueue lands.
+    pub fn edit_queued_send(&mut self, message_id: &str, content: String, cx: &mut Context<Self>) {
+        match self.begin_queued_edit(message_id, content) {
+            QueuedEdit::Refused => {}
+            QueuedEdit::Patch {
+                thread_id,
+                pending_id,
+                content,
+            } => {
+                self.spawn_edit_pending(thread_id, pending_id, message_id.to_string(), content, cx)
+            }
+            QueuedEdit::Applied { content } => {
+                self.save_queued_words(message_id, content, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// What an edit does to memory before anything is sent or saved.
+    fn begin_queued_edit(&mut self, message_id: &str, content: String) -> QueuedEdit {
+        if self.pending_inflight.contains(message_id) {
+            return QueuedEdit::Refused;
+        }
+        if let Some(held) = self.hold_mut(message_id) {
+            held.stale = StaleRefusal::Fresh;
+        }
+        if let Some((thread_id, pending_id)) = self.pending_sync_target(message_id) {
+            self.pending_inflight.insert(message_id.to_string());
+            return QueuedEdit::Patch {
+                thread_id,
+                pending_id,
+                content,
+            };
+        }
+        if !self.apply_queued_edit(message_id, content.clone()) {
+            return QueuedEdit::Refused;
+        }
+        self.mark_unsynced(message_id);
+        QueuedEdit::Applied { content }
+    }
+
+    /// A hold with a row whose words changed here without a PATCH landing.
+    fn mark_unsynced(&mut self, message_id: &str) {
+        if let Some(held) = self.hold_mut(message_id)
+            && held.pending_id.is_some()
+        {
+            held.unsynced = true;
+        }
+    }
+
+    /// The PATCHes offline edits still owe, each marked in flight so drain waits for it.
+    fn take_unsynced_edits(&mut self) -> Vec<OwedPatch> {
+        let owed: Vec<OwedPatch> = self
+            .queued_sends
+            .iter()
+            .flat_map(|(thread_id, queue)| {
+                queue.iter().filter_map(move |held| {
+                    Some(OwedPatch {
+                        thread_id: thread_id.clone(),
+                        pending_id: held.pending_id.clone().filter(|_| held.unsynced)?,
+                        message_id: held.message_id.clone(),
+                        content: held.content.clone(),
+                    })
+                })
+            })
+            .filter(|owed| !self.pending_inflight.contains(&owed.message_id))
+            .collect();
+        for patch in &owed {
+            self.pending_inflight.insert(patch.message_id.clone());
+        }
+        owed
+    }
+
+    fn apply_local_queued_edit(
+        &mut self,
+        message_id: &str,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.apply_queued_edit(message_id, content.clone()) {
+            return;
+        }
+        self.save_queued_words(message_id, content, cx);
+        cx.notify();
+    }
+
+    fn save_queued_words(&self, message_id: &str, content: String, cx: &mut Context<Self>) {
+        if let Some(db) = self.database_service.clone() {
+            let id = message_id.to_string();
+            cx.spawn(async move |_, _| {
+                if let Err(error) = db.update_message_content(&id, &content).await {
+                    eprintln!("Failed to update queued message: {error}");
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn apply_queued_edit(&mut self, message_id: &str, content: String) -> bool {
+        let mut found = false;
+        for queue in self.queued_sends.values_mut() {
+            if let Some(queued) = queue
+                .iter_mut()
+                .find(|queued| queued.message_id == message_id)
+            {
+                queued.content = content.clone();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+        for conversation in &mut self.conversations {
+            if let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.id == message_id)
+            {
+                message.content = content;
+                break;
+            }
+        }
+        true
+    }
+
+    fn thread_holding(&self, message_id: &str) -> Option<String> {
+        self.queued_sends
+            .iter()
+            .find_map(|(conversation_id, queue)| {
+                queue
+                    .iter()
+                    .any(|queued| queued.message_id == message_id)
+                    .then(|| conversation_id.clone())
+            })
+    }
+
+    fn queued_pending_of(&self, message_id: &str) -> Option<(String, String)> {
+        for (conversation_id, queue) in &self.queued_sends {
+            if let Some(queued) = queue.iter().find(|queued| queued.message_id == message_id)
+                && let Some(pending_id) = queued.pending_id.clone()
+            {
+                return Some((conversation_id.clone(), pending_id));
+            }
+        }
+        None
+    }
+
+    fn can_sync_pending(&self) -> bool {
+        self.opengrok.is_some() && self.reachability.is_reachable() && self.can_send_turn()
+    }
+
+    fn pending_sync_target(&self, message_id: &str) -> Option<(String, String)> {
+        if !self.can_sync_pending() {
+            return None;
+        }
+        self.queued_pending_of(message_id)
+    }
+
+    fn take_queued_send_back(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        if self.pending_inflight.contains(message_id) {
+            return;
+        }
+        if !self.is_send_queued(message_id) {
+            return;
+        }
+        if let Some((thread_id, pending_id)) = self.pending_sync_target(message_id) {
+            self.pending_inflight.insert(message_id.to_string());
+            self.spawn_cancel_then_apply(thread_id, pending_id, message_id.to_string(), cx);
+            return;
+        }
+        self.finish_queued_takeback(message_id, cx);
+    }
+
+    /// Offline / no `pum_…`: dequeue now (drain-safe this tick), tombstone, hide.
+    fn finish_queued_takeback(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        self.pending_inflight.remove(message_id);
+        let thread = self.thread_holding(message_id);
+        let held = self.dequeue_send(message_id);
+        if let (Some(thread), Some(held)) = (thread.as_deref(), held.as_ref()) {
+            self.drop_server_pending(thread, held, cx);
+        }
+        self.hide_transcript_message(message_id, cx);
+        if let Some(thread) = thread {
+            self.drain_queued_send(&thread, cx);
+        }
+    }
+
+    /// Local cancel already happened (offline path, or a hydrate tombstone). Tell
+    /// the server when a `pum_…` exists so another machine does not fire it.
+    fn drop_server_pending(&mut self, thread_id: &str, held: &QueuedSend, cx: &mut Context<Self>) {
+        self.canceled_pending.insert(held.message_id.clone());
+        if let Some(pending_id) = held.pending_id.clone() {
+            self.spawn_cancel_pending(thread_id.to_string(), pending_id, cx);
+        }
+    }
+
+    fn spawn_cancel_pending(&self, thread_id: String, pending_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            match client
+                .cancel_pending_user_message(&thread_id, &pending_id)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) => {
+                    eprintln!("NativeChat: could not cancel a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_cancel_then_apply(
+        &self,
+        thread_id: String,
+        pending_id: String,
+        message_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            match client
+                .cancel_pending_user_message(&thread_id, &pending_id)
+                .await
+            {
+                Ok(mutation) => {
+                    let _ = this.update(cx, |state, cx| {
+                        if let Some(custom) = mutation.custom() {
+                            state.apply_pending_event(&custom, Some(&message_id), cx);
+                        } else {
+                            state.finish_queued_takeback(&message_id, cx);
+                        }
+                    });
+                }
+                Err(error)
+                    if error.is_not_found()
+                        || error.unreachable().is_some()
+                        || error.is_not_pending()
+                        || error.is_already_consumed() =>
+                {
+                    let _ = this.update(cx, |state, cx| {
+                        state.finish_queued_takeback(&message_id, cx);
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |state, _| {
+                        state.pending_inflight.remove(&message_id);
+                    });
+                    eprintln!("NativeChat: could not cancel a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_edit_pending(
+        &self,
+        thread_id: String,
+        pending_id: String,
+        message_id: String,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let local_content = content.clone();
+        cx.spawn(async move |this, cx| {
+            match client
+                .edit_pending_user_message(
+                    &thread_id,
+                    &pending_id,
+                    &PendingWrite::content_patch(content),
+                )
+                .await
+            {
+                Ok(mutation) => {
+                    let _ = this.update(cx, |state, cx| {
+                        if let Some(held) = state.hold_mut(&message_id) {
+                            held.unsynced = false;
+                        }
+                        if let Some(custom) = mutation.custom() {
+                            state.apply_pending_event(&custom, Some(&message_id), cx);
+                        } else if let Some(row) = mutation.row() {
+                            state.apply_local_queued_edit(&message_id, row.content, cx);
+                            state.pending_inflight.remove(&message_id);
+                        } else {
+                            state.apply_local_queued_edit(&message_id, local_content, cx);
+                            state.pending_inflight.remove(&message_id);
+                        }
+                        state.drain_queued_send(&thread_id, cx);
+                    });
+                }
+                Err(error) if error.unreachable().is_some() => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.pending_inflight.remove(&message_id);
+                        state.apply_local_queued_edit(&message_id, local_content, cx);
+                        state.mark_unsynced(&message_id);
+                    });
+                }
+                // The row was drained or canceled since: the new words went nowhere, and the
+                // snapshot says what became of the hold.
+                Err(error) if error.is_not_found() || error.is_not_pending() => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.pending_inflight.remove(&message_id);
+                        if let Some(held) = state.hold_mut(&message_id) {
+                            held.unsynced = false;
+                        }
+                        state.hydrate_pending_user_messages(&thread_id, cx);
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.pending_inflight.remove(&message_id);
+                        state.drain_queued_send(&thread_id, cx);
+                    });
+                    eprintln!("NativeChat: could not edit a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// POST the hold to OpenGrok while the bubble stays local. 404 / unreachable keep the
+    /// in-memory queue (offline, or a server that has not shipped the store).
+    fn sync_queued_send_to_server(
+        &mut self,
+        thread_id: String,
+        message_id: String,
+        content: String,
+        recipe: Option<TurnRecipe>,
+        skill: Option<String>,
+        reply: Option<ReplyTo>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !self.can_send_turn() {
+            return;
+        }
+        if let Some(held) = self.hold_mut(&message_id) {
+            held.posted = true;
+        }
+        let body = PendingWrite::enqueue(
+            content.clone(),
+            message_id.clone(),
+            reply.as_ref().map(reply_json),
+            recipe.as_ref().map(|recipe| recipe.id.clone()),
+            recipe.map(|recipe| serde_json::Value::Object(recipe.values)),
+            skill,
+        );
+        let posted_content = content;
+        cx.spawn(async move |this, cx| {
+            let mut attempt = 1;
+            loop {
+                match client.enqueue_pending_user_message(&thread_id, &body).await {
+                    Ok(mutation) => {
+                        let Some(row) = mutation.row() else {
+                            eprintln!(
+                                "NativeChat: the server accepted a pending send and named no row"
+                            );
+                            return;
+                        };
+                        let _ = this.update(cx, |state, cx| {
+                            match state.bind_pending_id(
+                                &message_id,
+                                row.id.clone(),
+                                &posted_content,
+                            ) {
+                                BindPending::TakeBack { pending_id } => {
+                                    state.spawn_cancel_pending(thread_id.clone(), pending_id, cx);
+                                }
+                                BindPending::Patch {
+                                    pending_id,
+                                    content,
+                                } => {
+                                    state.spawn_edit_pending(
+                                        thread_id.clone(),
+                                        pending_id,
+                                        message_id.clone(),
+                                        content,
+                                        cx,
+                                    );
+                                }
+                                BindPending::Bound => {}
+                            }
+                        });
+                    }
+                    Err(error) if retry_enqueue(&error, attempt) => {
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(error) if error.is_not_found() => {
+                        let _ = this.update(cx, |state, _| {
+                            if let Some(held) = state.hold_mut(&message_id) {
+                                held.posted = false;
+                            }
+                        });
+                    }
+                    Err(error) if error.unreachable().is_some() => {}
+                    Err(error) if error.is_already_consumed() => {
+                        let _ = this.update(cx, |state, cx| {
+                            state.dequeue_send(&message_id);
+                            state.reconcile_thread(&thread_id, cx);
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("NativeChat: could not enqueue a pending send: {error}");
+                    }
+                }
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn bind_pending_id(
+        &mut self,
+        message_id: &str,
+        pending_id: String,
+        posted_content: &str,
+    ) -> BindPending {
+        if self.canceled_pending.contains(message_id) {
+            return BindPending::TakeBack { pending_id };
+        }
+        let Some(queued) = self.hold_mut(message_id) else {
+            return BindPending::TakeBack { pending_id };
+        };
+        queued.pending_id = Some(pending_id.clone());
+        if queued.content == posted_content {
+            return BindPending::Bound;
+        }
+        let content = queued.content.clone();
+        self.pending_inflight.insert(message_id.to_string());
+        BindPending::Patch {
+            pending_id,
+            content,
+        }
+    }
+
+    fn hydrate_pending_user_messages(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |this, cx| {
+            match client.list_pending_user_messages(&conversation_id).await {
+                Ok(list) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.apply_pending_snapshot(&conversation_id, &list.live_messages(), cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) if error.is_signed_out() => {
+                    let _ = this.update(cx, |state, cx| state.note_signed_out(cx));
+                }
+                Err(error) => {
+                    eprintln!("NativeChat: could not load pending sends: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_pending_from_replay(
+        &mut self,
+        conversation_id: &str,
+        thread: &ThreadReplay,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = thread.live_pending_messages() else {
+            return;
+        };
+        self.apply_pending_snapshot(conversation_id, &pending, cx);
+    }
+
+    /// Replace synced holds with the server's live list. Local-only holds (no `pum_…` yet)
+    /// stay, so an enqueue still in flight is not dropped. Tombstoned ids stay gone.
+    fn apply_pending_snapshot(
+        &mut self,
+        conversation_id: &str,
+        pending: &[PendingUserMessage],
+        cx: &mut Context<Self>,
+    ) {
+        let fold = self.fold_pending_snapshot(conversation_id, pending);
+        for pending_id in fold.cancel {
+            self.spawn_cancel_pending(conversation_id.to_string(), pending_id, cx);
+        }
+        for save in fold.save {
+            self.persist_queued_bubble(conversation_id, save, cx);
+        }
+        for message_id in fold.hide {
+            if let Some(db) = self.database_service.clone() {
+                cx.spawn(async move |_, _| {
+                    if let Err(error) = db.hide_message(&message_id).await {
+                        eprintln!("Failed to hide a pending message: {error}");
+                    }
+                })
+                .detach();
+            }
+        }
+        self.drain_queued_send(conversation_id, cx);
+    }
+
+    fn fold_pending_snapshot(
+        &mut self,
+        conversation_id: &str,
+        pending: &[PendingUserMessage],
+    ) -> PendingFold {
+        let rows: HashMap<&str, &PendingUserMessage> = pending
+            .iter()
+            .map(|item| (item.bubble_id(), item))
+            .collect();
+        let previous = self
+            .queued_sends
+            .remove(conversation_id)
+            .unwrap_or_default();
+
+        // The local queue first, in the order it was typed; rows only the server has go after.
+        let mut fold = PendingFold::default();
+        let mut rebuilt = VecDeque::new();
+        for mut queued in previous {
+            if self.canceled_pending.contains(&queued.message_id) {
+                continue;
+            }
+            let row = rows.get(queued.message_id.as_str()).copied();
+            if self.pending_inflight.contains(&queued.message_id) {
+                rebuilt.push_back(queued);
+            } else if queued.pending_id.is_none() {
+                // Enqueue has not bound yet, and bind PATCHes whatever these words have
+                // become since the POST; the row's copy would hide that edit from it.
+                if let Some(row) = row.filter(|row| !row.id.is_empty()) {
+                    queued.pending_id = Some(row.id.clone());
+                }
+                rebuilt.push_back(queued);
+            } else if let Some(row) = row {
+                if self.bubble_hidden(conversation_id, &queued.message_id) {
+                    continue;
+                }
+                if queued.unsynced {
+                    rebuilt.push_back(queued);
+                    continue;
+                }
+                if let Some(save) = self.upsert_queued_bubble(conversation_id, row) {
+                    fold.save.push(save);
+                }
+                rebuilt.push_back(hold_from_row(row));
+            }
+            // The row is gone. A drain on another machine and a cancel on another machine
+            // look the same in this list. The hold stays off the queue, so this machine
+            // does not send it. The bubble stays up: hiding it would drop the person's
+            // words when the other machine already drained the send and the answer is
+            // not here yet. A cancel made here hides the bubble on its own path.
+        }
+        for item in pending {
+            let bubble_id = item.bubble_id();
+            if self.pending_inflight.contains(bubble_id)
+                || rebuilt.iter().any(|queued| queued.message_id == bubble_id)
+            {
+                continue;
+            }
+            // A hidden bubble was taken back here, maybe before a restart lost the tombstone
+            // and while the DELETE could not land. Hidden is the person's word; ask again.
+            if self.canceled_pending.contains(bubble_id)
+                || self.bubble_hidden(conversation_id, bubble_id)
+            {
+                self.canceled_pending.insert(bubble_id.to_string());
+                if !item.id.is_empty() {
+                    fold.cancel.push(item.id.clone());
+                }
+                continue;
+            }
+            if let Some(save) = self.upsert_queued_bubble(conversation_id, item) {
+                fold.save.push(save);
+            }
+            rebuilt.push_back(hold_from_row(item));
+        }
+        if rebuilt.is_empty() {
+            self.queued_sends.remove(conversation_id);
+        } else {
+            self.queued_sends
+                .insert(conversation_id.to_string(), rebuilt);
+        }
+
+        let in_this_thread: HashSet<&str> = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .map(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .map(|message| message.id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A tombstone is only needed while the server still has the row. Once the row is
+        // gone, a hidden bubble is what keeps a restart from queueing the send again.
+        self.canceled_pending
+            .retain(|id| !in_this_thread.contains(id.as_str()) || rows.contains_key(id.as_str()));
+        fold
+    }
+
+    /// A drained hold OpenGrok refused as stale. `edited`: the row is still queued, so the hold
+    /// goes back to the front as the server has it; the CUSTOM, applied after, puts the words on
+    /// the bubble. `drained`: another turn spent the row and the hold stays off. The refused
+    /// turn's reply bubble is not an answer either way.
+    fn put_back_stale_hold(
+        &mut self,
+        conversation_id: &str,
+        reply_id: &str,
+        mut held: QueuedSend,
+        custom: &PendingCustom,
+    ) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != reply_id);
+        }
+        let (PendingOp::Edited, Some(row)) = (custom.op, custom.message.as_ref()) else {
+            return;
+        };
+        held.content = row.content.clone();
+        held.reply = reply_from_pending(row.reply_to.as_ref());
+        held.recipe = recipe_from_pending(row);
+        held.skill = row.skill_id.clone().filter(|id| !id.is_empty());
+        if !row.id.is_empty() {
+            held.pending_id = Some(row.id.clone());
+        }
+        held.stale = match held.stale {
+            StaleRefusal::Fresh => StaleRefusal::Refreshed,
+            StaleRefusal::Refreshed | StaleRefusal::Parked => StaleRefusal::Parked,
+        };
+        self.queued_sends
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push_front(held);
+    }
+
+    fn apply_pending_event(
+        &mut self,
+        custom: &PendingCustom,
+        fallback_bubble: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let conversation_id = if custom.thread_id.is_empty() {
+            self.active_conversation_id.clone().unwrap_or_default()
+        } else {
+            custom.thread_id.clone()
+        };
+        let fold = self.apply_pending_custom(custom, fallback_bubble);
+        for pending_id in fold.cancel {
+            self.spawn_cancel_pending(conversation_id.clone(), pending_id, cx);
+        }
+        for save in fold.save {
+            self.persist_queued_bubble(&conversation_id, save, cx);
+        }
+        match custom.op {
+            PendingOp::Canceled => {
+                if let Some(message_id) = self.bubble_id_for_custom(custom, fallback_bubble) {
+                    self.hide_transcript_message(&message_id, cx);
+                }
+                if !conversation_id.is_empty() {
+                    self.drain_queued_send(&conversation_id, cx);
+                }
+            }
+            PendingOp::Drained => {
+                if !conversation_id.is_empty() {
+                    self.drain_queued_send(&conversation_id, cx);
+                }
+            }
+            PendingOp::Created | PendingOp::Edited | PendingOp::Snapshot => {
+                for message_id in fold.hide {
+                    self.hide_transcript_message(&message_id, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Apply one `pending-user-message` CUSTOM to `queued_sends`. Persist is the
+    /// caller's: tests can fold memory without a GPUI context.
+    fn apply_pending_custom(
+        &mut self,
+        custom: &PendingCustom,
+        fallback_bubble: Option<&str>,
+    ) -> PendingFold {
+        let mut fold = PendingFold::default();
+        let conversation_id = if custom.thread_id.is_empty() {
+            match self.active_conversation_id.clone() {
+                Some(id) => id,
+                None => return fold,
+            }
+        } else {
+            custom.thread_id.clone()
+        };
+        match custom.op {
+            PendingOp::Created | PendingOp::Snapshot => {
+                let Some(item) = custom.message.as_ref() else {
+                    return fold;
+                };
+                let bubble_id = item.bubble_id().to_string();
+                self.pending_inflight.remove(&bubble_id);
+                if self.canceled_pending.contains(&bubble_id)
+                    || self.bubble_hidden(&conversation_id, &bubble_id)
+                {
+                    self.canceled_pending.insert(bubble_id);
+                    if !item.id.is_empty() {
+                        fold.cancel.push(item.id.clone());
+                    }
+                    return fold;
+                }
+                if let Some(save) = self.upsert_hold_from_row(&conversation_id, item) {
+                    fold.save.push(save);
+                }
+            }
+            PendingOp::Edited => {
+                let Some(item) = custom.message.as_ref() else {
+                    return fold;
+                };
+                let bubble_id = item.bubble_id().to_string();
+                self.pending_inflight.remove(&bubble_id);
+                if self.apply_queued_edit(&bubble_id, item.content.clone()) {
+                    if let Some(queued) = self
+                        .queued_sends
+                        .values_mut()
+                        .flatten()
+                        .find(|queued| queued.message_id == bubble_id)
+                        && queued.pending_id.is_none()
+                        && !item.id.is_empty()
+                    {
+                        queued.pending_id = Some(item.id.clone());
+                    }
+                    fold.save.push(QueuedBubbleSave {
+                        id: bubble_id,
+                        content: item.content.clone(),
+                        reply: reply_from_pending(item.reply_to.as_ref()),
+                        sent_at: SystemTime::now(),
+                        insert: false,
+                    });
+                }
+            }
+            PendingOp::Canceled => {
+                let Some(bubble_id) = self.bubble_id_for_custom(custom, fallback_bubble) else {
+                    return fold;
+                };
+                self.pending_inflight.remove(&bubble_id);
+                self.canceled_pending.insert(bubble_id.clone());
+                self.dequeue_send(&bubble_id);
+                if self.hide_queued_bubble(&conversation_id, &bubble_id) {
+                    fold.hide.push(bubble_id);
+                }
+            }
+            PendingOp::Drained => {
+                let Some(bubble_id) = self.bubble_id_for_custom(custom, fallback_bubble) else {
+                    return fold;
+                };
+                self.pending_inflight.remove(&bubble_id);
+                self.dequeue_send(&bubble_id);
+            }
+        }
+        fold
+    }
+
+    fn bubble_id_for_custom(
+        &self,
+        custom: &PendingCustom,
+        fallback_bubble: Option<&str>,
+    ) -> Option<String> {
+        if let Some(message) = custom.message.as_ref() {
+            return Some(message.bubble_id().to_string());
+        }
+        if let Some(id) = fallback_bubble.map(str::trim).filter(|id| !id.is_empty()) {
+            return Some(id.to_string());
+        }
+        None
+    }
+
+    fn hide_queued_bubble(&mut self, conversation_id: &str, message_id: &str) -> bool {
+        let mut found = None;
+        for (index, conversation) in self.conversations.iter().enumerate() {
+            if conversation
+                .messages
+                .iter()
+                .any(|message| message.id == message_id)
+            {
+                let prefer = conversation.id == conversation_id
+                    || self.active_conversation_id.as_deref() == Some(conversation.id.as_str());
+                found = Some(index);
+                if prefer {
+                    break;
+                }
+            }
+        }
+        let Some(index) = found else {
+            return false;
+        };
+        if let Some(message) = self.conversations[index]
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            message.hidden = true;
+            return true;
+        }
+        false
+    }
+
+    fn upsert_hold_from_row(
+        &mut self,
+        conversation_id: &str,
+        item: &PendingUserMessage,
+    ) -> Option<QueuedBubbleSave> {
+        let save = self.upsert_queued_bubble(conversation_id, item)?;
+        let hold = hold_from_row(item);
+        let queue = self
+            .queued_sends
+            .entry(conversation_id.to_string())
+            .or_default();
+        if let Some(existing) = queue
+            .iter_mut()
+            .find(|queued| queued.message_id == hold.message_id)
+        {
+            existing.content = hold.content;
+            existing.recipe = hold.recipe;
+            existing.skill = hold.skill;
+            existing.reply = hold.reply;
+            if hold.pending_id.is_some() {
+                existing.pending_id = hold.pending_id;
+            }
+        } else {
+            queue.push_back(hold);
+        }
+        Some(save)
+    }
+
+    fn upsert_queued_bubble(
+        &mut self,
+        conversation_id: &str,
+        item: &PendingUserMessage,
+    ) -> Option<QueuedBubbleSave> {
+        let bubble_id = item.bubble_id().to_string();
+        let reply = reply_from_pending(item.reply_to.as_ref());
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return None;
+        };
+        if let Some(message) = conversation
+            .messages
+            .iter_mut()
+            .find(|message| message.id == bubble_id)
+        {
+            message.content = item.content.clone();
+            if let Some(reply) = &reply {
+                message.reply_to_id = Some(reply.message_id.clone());
+                message.reply_preview = Some(reply.preview.clone());
+                message.reply_is_me = reply.is_me;
+            }
+            return Some(QueuedBubbleSave {
+                id: bubble_id,
+                content: item.content.clone(),
+                reply,
+                sent_at: message.sent_at,
+                insert: false,
+            });
+        }
+        let sent_at = if item.created_at_ms > 0 {
+            SystemTime::UNIX_EPOCH + Duration::from_millis(item.created_at_ms as u64)
+        } else {
+            SystemTime::now()
+        };
+        conversation.messages.push(Message {
+            id: bubble_id.clone(),
+            sender: "Me".to_string(),
+            content: item.content.clone(),
+            sent_at,
+            finished_at: None,
+            run_timing: None,
+            is_me: true,
+            reply_preview: reply.as_ref().map(|reply| reply.preview.clone()),
+            reply_to_id: reply.as_ref().map(|reply| reply.message_id.clone()),
+            reply_is_me: reply.as_ref().is_some_and(|reply| reply.is_me),
+            parts: Vec::new(),
+            run_id: None,
+            hidden: false,
+        });
+        Some(QueuedBubbleSave {
+            id: bubble_id,
+            content: item.content.clone(),
+            reply,
+            sent_at,
+            insert: true,
+        })
+    }
+
+    fn persist_queued_bubble(
+        &self,
+        conversation_id: &str,
+        save: QueuedBubbleSave,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(db) = self.database_service.clone() else {
+            return;
+        };
+        if save.insert {
+            let thread = conversation_id.to_string();
+            let title = self.conversation_title(conversation_id);
+            let reply = save.reply.map(|reply| ReplyRef {
+                message_id: reply.message_id,
+                preview: reply.preview,
+                is_me: reply.is_me,
+            });
+            cx.spawn(async move |_, _| {
+                if db.ensure_session(&thread, &title).await.is_err() {
+                    return;
+                }
+                if let Err(error) = db
+                    .save_message(
+                        &save.id,
+                        &thread,
+                        "user",
+                        &save.content,
+                        None,
+                        None,
+                        reply,
+                        &[],
+                        None,
+                        false,
+                        SaveStamp::at(save.sent_at),
+                    )
+                    .await
+                {
+                    eprintln!("Failed to save pending message: {error}");
+                }
+            })
+            .detach();
+        } else {
+            cx.spawn(async move |_, _| {
+                if let Err(error) = db.update_message_content(&save.id, &save.content).await {
+                    eprintln!("Failed to update queued message: {error}");
+                }
+            })
+            .detach();
+        }
     }
 
     pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -9824,6 +12706,9 @@ impl AppState {
                 self.refresh_computers(cx);
                 self.refresh_coworker_computer_quietly(cx);
             }
+            if self.app_settings_tab == AppSettingsTab::Skills {
+                self.refresh_skills(cx);
+            }
         }
         self.record_nav();
         cx.notify();
@@ -9839,6 +12724,11 @@ impl AppState {
                 // Route traffic and the network choice for a shared box live on this tab and
                 // read the open bot's computer record, which nothing else on this page fetches.
                 self.refresh_coworker_computer_quietly(cx);
+            }
+            // The library is the account's and nothing else fetches it, so arriving on the tab
+            // is when it is asked for.
+            if tab == AppSettingsTab::Skills {
+                self.refresh_skills(cx);
             }
             cx.notify();
         }
@@ -10612,8 +13502,835 @@ fn image_format_of(bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// Put the switch where it now is on every row of a listing that carries this skill.
+///
+/// A listing is a copy of what the server said a moment ago, and the switch is the one thing on
+/// it that a person changes from somewhere else on the same screen. Left alone, the copy the
+/// composer offers under `/` goes on saying a skill cannot be run after it has been switched on.
+fn mark_enabled(rows: &mut [SkillSummary], id: &str, enabled: bool) {
+    for row in rows.iter_mut().filter(|row| row.id == id) {
+        row.enabled = enabled;
+    }
+}
+
+/// The one file a skill's instructions live in. Everything else in the folder is a file the
+/// instructions refer to.
+const SKILL_FILE: &str = "SKILL.md";
+
+/// What an upload sends, from what was picked: a `SKILL.md` on its own, or the folder one lives
+/// in with the files beside it.
+fn read_skill_upload(path: &std::path::Path) -> Result<(String, Vec<SkillFile>), String> {
+    if path.is_dir() {
+        return skill_bundle(read_skill_folder(path)?);
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    // What it weighs before what it holds. A 500 MB file picked by mistake is half a gigabyte
+    // allocated to find out it was a mistake, and the sentence that came back was about a
+    // request body rather than about the file somebody chose.
+    let about =
+        std::fs::metadata(path).map_err(|error| format!("{name} could not be read: {error}"))?;
+    // A pipe or a device says it is zero bytes long and then reads forever. The walk over a
+    // folder has always asked this of every entry; a picked path is the same question.
+    if !about.is_file() {
+        return Err(format!(
+            "{name} is not a file, so it cannot be a skill's instructions."
+        ));
+    }
+    if let Some(why) = instructions_too_heavy(&name, about.len()) {
+        return Err(why);
+    }
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("{name} could not be read: {error}"))?;
+    String::from_utf8(bytes)
+        .map(|body| (body, Vec::new()))
+        .map_err(|_| format!("{name} is not text, so it cannot be a skill's instructions."))
+}
+
+/// The words for a picked file that cannot be a skill's instructions, or `None` when it could.
+///
+/// The cap it is measured against is the bundle's, which is about this Mac's memory; the cap it
+/// NAMES is the instructions' own, which is the server's and is what the person is up against.
+/// A file this far over it is not a `SKILL.md` that needs trimming, it is the wrong file — and
+/// a refusal that named a bundle would send somebody looking for files they never picked.
+fn instructions_too_heavy(name: &str, bytes: u64) -> Option<String> {
+    (bytes > SKILL_BUNDLE_LIMIT as u64).then(|| {
+        format!(
+            "{name} is {:.1} MB. A skill's instructions are at most {SKILL_BODY_CHARS} \
+             characters — whatever that file is, it is not a SKILL.md.",
+            bytes as f64 / (1024. * 1024.)
+        )
+    })
+}
+
+/// The words for one bundled file that is too heavy to go with a skill, or `None` when it is
+/// not. Asked of what the filesystem says it weighs, before it is opened.
+fn too_heavy(name: &str, bytes: u64) -> Option<String> {
+    (bytes > SKILL_BUNDLE_LIMIT as u64).then(|| {
+        format!(
+            "{name} is {:.1} MB. A skill is instructions and the small files they refer to — at \
+             most {} KB of them.",
+            bytes as f64 / (1024. * 1024.),
+            SKILL_BUNDLE_LIMIT / 1024
+        )
+    })
+}
+
+/// The words for a bundle over the size cap.
+///
+/// Said in two places — the walk over a picked folder stops on it, and the bundle built from
+/// that walk refuses on it — so a folder that was stopped part-way through is refused in the
+/// same words as one that was read to the end. Both count the same thing: the files BESIDE the
+/// instructions, which is what the server caps.
+fn bundle_too_big() -> String {
+    format!(
+        "A skill's files come to at most {} KB together. Leave out what the instructions do not \
+         refer to.",
+        SKILL_BUNDLE_LIMIT / 1024
+    )
+}
+
+/// The words for a bundle with too many files in it, said in the same two places and for the
+/// same reason.
+///
+/// It names the cap and not what arrived: the walk stops counting the moment it is past, so a
+/// number from there would mean "at least this many" while reading as a fact.
+fn bundle_too_many() -> String {
+    format!(
+        "A skill carries at most {SKILL_BUNDLE_FILES} files beside its {SKILL_FILE}. Leave out \
+         what the instructions do not refer to."
+    )
+}
+
+/// Every file under a picked folder, as (path relative to it, bytes).
+///
+/// Nothing is read until the filesystem has been asked what it weighs, and the walk stops the
+/// moment the bundle is past either cap. A folder somebody picked by mistake — a checkout, a
+/// downloads directory, a mail store — is refused on what it says it is, rather than read into
+/// memory and refused afterwards.
+///
+/// Dot entries are left where they are: a `.git` is not part of a skill, and a mis-picked folder
+/// is mostly dot entries. So are symlinks, and everything that is neither a file nor a folder:
+/// what a link points at is not inside the bundle, and copying it onto a computer would be
+/// copying something the person never picked.
+///
+/// A subfolder that will not open is stepped over rather than taken as the end of the upload,
+/// the way an entry that will not stat is. The folder the person actually picked is different:
+/// if THAT cannot be read there is nothing to upload, and it says so.
+fn read_skill_folder(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut beside = 0usize;
+    let mut total = 0usize;
+    let mut stack = vec![(dir.to_path_buf(), String::new())];
+    while let Some((at, prefix)) = stack.pop() {
+        let entries = match std::fs::read_dir(&at) {
+            Ok(entries) => entries,
+            Err(error) if prefix.is_empty() => {
+                return Err(format!("{} could not be read: {error}", at.display()));
+            }
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push((entry.path(), path));
+                // A folder of folders is a folder either way: the file cap on its own lets a
+                // tree of empty directories push paths for as long as there are any, without
+                // one file ever being found to count.
+                if stack.len() > SKILL_BUNDLE_FILES {
+                    return Err(bundle_too_many());
+                }
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let Ok(size) = entry.metadata().map(|meta| meta.len()) else {
+                continue;
+            };
+            if let Some(why) = too_heavy(&path, size) {
+                return Err(why);
+            }
+            // The instructions are capped by the server on their own, in characters, and are
+            // not part of what a bundle may weigh — so they are weighed here only as one file,
+            // above, which is what keeps a six-gigabyte SKILL.md from being read.
+            if !path.eq_ignore_ascii_case(SKILL_FILE) {
+                beside += 1;
+                if beside > SKILL_BUNDLE_FILES {
+                    return Err(bundle_too_many());
+                }
+                total = total.saturating_add(size as usize);
+                if total > SKILL_BUNDLE_LIMIT {
+                    return Err(bundle_too_big());
+                }
+            }
+            let bytes = std::fs::read(entry.path())
+                .map_err(|error| format!("{path} could not be read: {error}"))?;
+            found.push((path, bytes));
+        }
+    }
+    Ok(found)
+}
+
+/// A picked folder as a skill: its `SKILL.md` is the instructions, and everything else is a file
+/// that goes with them, base64 as the server takes it.
+///
+/// The caps are the server's and are checked here too, because a bundle refused after it has
+/// been uploaded is a refusal that cost the person the upload. They are counted the way the walk
+/// counts them — the files BESIDE the instructions — and refused in the same words, so a folder
+/// stopped part-way through and one read to the end say the same thing.
+fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>), String> {
+    use base64::Engine as _;
+    let mut body: Option<String> = None;
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for (path, bytes) in found {
+        if path.eq_ignore_ascii_case(SKILL_FILE) {
+            body = Some(String::from_utf8(bytes).map_err(|_| {
+                format!("{SKILL_FILE} is not text, so it cannot be a skill's instructions.")
+            })?);
+            continue;
+        }
+        total += bytes.len();
+        files.push(SkillFile {
+            path,
+            bytes: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        });
+    }
+    let Some(body) = body else {
+        return Err(format!(
+            "That folder has no {SKILL_FILE} in it, which is where a skill's instructions live."
+        ));
+    };
+    if files.len() > SKILL_BUNDLE_FILES {
+        return Err(bundle_too_many());
+    }
+    if total > SKILL_BUNDLE_LIMIT {
+        return Err(bundle_too_big());
+    }
+    // A stack walk comes back in whatever order the filesystem hands the entries over, and the
+    // same folder uploaded twice should send the same bundle.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((body, files))
+}
+
 #[cfg(test)]
 mod tests {
+    /// Whether `chmod 000` stops this process at all.
+    ///
+    /// It stops everybody but root, so on a root CI container the two refusals below have
+    /// nothing to say — and a guard that silently stops guarding is worse than one that says it
+    /// did not run. Asked by trying it rather than by reading a uid, because what the tests turn
+    /// on is whether the open fails, not who is running them.
+    fn permissions_bind(at: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let probe = at.join("probe");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let stopped = std::fs::read(&probe).is_err();
+        std::fs::remove_file(&probe).unwrap();
+        stopped
+    }
+
+    /// Where a refused create is drawn is decided by which surface asked for it, and it has to
+    /// be told rather than guessed at: the sheet has a slot over the fields the sentence is
+    /// about, and an upload has no sheet at all. A sentence put in a slot that is not on screen
+    /// is a click that did nothing.
+    #[test]
+    fn a_refused_create_is_drawn_where_it_was_asked_for() {
+        let mut sheet = super::AppState::new();
+        sheet.refuse_create(super::SkillCreateFrom::Sheet, "that name is taken".into());
+        assert_eq!(sheet.skill_add_error.as_deref(), Some("that name is taken"));
+        assert!(sheet.skills_error.is_none());
+
+        let mut upload = super::AppState::new();
+        upload.refuse_create(super::SkillCreateFrom::Upload, "that name is taken".into());
+        assert_eq!(upload.skills_error.as_deref(), Some("that name is taken"));
+        assert!(
+            upload.skill_add_error.is_none(),
+            "there is no sheet on screen to draw it in"
+        );
+    }
+
+    fn skill_row(id: &str, enabled: bool) -> SkillSummary {
+        SkillSummary {
+            id: id.into(),
+            name: format!("skill-{id}"),
+            description: String::new(),
+            source: crate::opengrok::SkillSource::Taught,
+            updated_at_ms: 0,
+            version_count: 1,
+            draft: false,
+            enabled,
+            approved_at_ms: None,
+        }
+    }
+
+    /// A state with two taught skills, both off: one of them open on the pane, both on the
+    /// library's list and on the list `/` offers, and the one the screen window is still showing
+    /// a line about.
+    fn library_with_a_taught_skill() -> AppState {
+        let mut state = AppState::new();
+        state.skills = vec![skill_row("skl_1", false), skill_row("skl_2", false)];
+        state.your_skills = state.skills.clone();
+        state.skill_open_id = Some("skl_1".into());
+        state.skill_open = Some(crate::opengrok::SkillDetail {
+            skill: skill_row("skl_1", false),
+            body: "Open the billing tab.".into(),
+            version: 1,
+            files: Vec::new(),
+        });
+        state.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_1".into(),
+            name: "skill-skl_1".into(),
+            enabled: false,
+        });
+        state
+    }
+
+    /// The flag is drawn in four places and the one that goes stale unseen is the note the
+    /// screen window keeps about a skill it has just taught: it travels beside the name rather
+    /// than being read off a row, so nothing else puts it right. Left behind, the title bar goes
+    /// on saying "switched off until you read it" about a skill that was read and switched on.
+    #[test]
+    fn a_switch_moves_on_every_surface_that_draws_it() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+
+        assert!(state.skills[0].enabled, "the library's list");
+        assert!(state.your_skills[0].enabled, "and the list `/` offers");
+        assert!(
+            state
+                .skill_open
+                .as_ref()
+                .is_some_and(|open| open.skill.enabled),
+            "and the pane the switch is on"
+        );
+        assert_eq!(
+            state.taught_skill,
+            Some(TaughtSkill::Written {
+                id: "skl_1".into(),
+                name: "skill-skl_1".into(),
+                enabled: true,
+            }),
+            "and the note the screen window is drawing from"
+        );
+        assert!(!state.skills[1].enabled, "and nothing else in the library");
+    }
+
+    /// One switch at a time, whichever skill. The guard was global while the control it dimmed
+    /// was per-skill, so a second skill's switch stayed live, moved under the finger and came
+    /// back with nothing said.
+    #[test]
+    fn a_second_switch_is_refused_while_one_is_in_flight() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        assert_eq!(
+            state.begin_switch("skl_2", true),
+            None,
+            "another skill's switch is still a switch"
+        );
+        assert!(
+            !state.skills[1].enabled,
+            "and it did not move it on the way to saying no"
+        );
+        state.take_switch_answer("skl_1", true, &skill_row("skl_1", true));
+        assert_eq!(
+            state.begin_switch("skl_2", true),
+            Some(false),
+            "and the next one is free once the first has answered"
+        );
+    }
+
+    /// What was SENT is where the switch ends up. A `PUT` answers with what it changed, and
+    /// `enabled` reads as ON when it is absent — so taking the reply's word for it turned a
+    /// switch-off the server had accepted into a switch-on.
+    #[test]
+    fn a_switch_takes_what_it_sent_and_a_stamp_only_when_one_came() {
+        let mut state = library_with_a_taught_skill();
+        state.skills[0].enabled = true;
+        state.your_skills[0].enabled = true;
+        if let Some(open) = state.skill_open.as_mut() {
+            open.skill.enabled = true;
+            open.skill.approved_at_ms = Some(1_758_000_000_000);
+        }
+        assert_eq!(state.begin_switch("skl_1", false), Some(true));
+
+        // A reply that echoes only what it changed says nothing about `enabled` — which reads
+        // as on — and nothing about the stamp.
+        let mut echo = skill_row("skl_1", true);
+        echo.approved_at_ms = None;
+        state.take_switch_answer("skl_1", false, &echo);
+        assert!(
+            !state.skills[0].enabled,
+            "off is what was sent, and off it is"
+        );
+        assert!(!state.your_skills[0].enabled);
+        assert_eq!(
+            state
+                .skill_open
+                .as_ref()
+                .and_then(|open| open.skill.approved_at_ms),
+            Some(1_758_000_000_000),
+            "a stamp not mentioned is not a stamp taken back: the reading did happen"
+        );
+        assert!(state.skill_enabling.is_none());
+
+        // A reply that does carry one is the only authority on it.
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        let mut stamped = skill_row("skl_1", true);
+        stamped.approved_at_ms = Some(1_759_000_000_000);
+        state.take_switch_answer("skl_1", true, &stamped);
+        assert_eq!(
+            state
+                .skill_open
+                .as_ref()
+                .and_then(|open| open.skill.approved_at_ms),
+            Some(1_759_000_000_000)
+        );
+    }
+
+    /// A refusal puts the switch back wherever the row is drawn, but the sentence is drawn on
+    /// one pane: landing it without looking drew A's refusal as the reason B could not be
+    /// fetched, and the pane said "refused" where the person was still waiting on "loading".
+    #[test]
+    fn a_refused_switch_goes_back_and_says_why_only_on_its_own_pane() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        state.take_switch_refusal(
+            "skl_1",
+            false,
+            "Only the owner can switch a skill on.".into(),
+        );
+        assert!(!state.skills[0].enabled, "back where it was");
+        assert!(!state.your_skills[0].enabled);
+        assert_eq!(
+            state.skill_error.as_deref(),
+            Some("Only the owner can switch a skill on."),
+            "and the reason, on the pane it was moved on"
+        );
+
+        // The same answer for a skill the person has since left.
+        state.skill_error = None;
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        state.skill_open_id = Some("skl_2".into());
+        state.skill_open = None;
+        state.take_switch_refusal(
+            "skl_1",
+            false,
+            "Only the owner can switch a skill on.".into(),
+        );
+        assert!(!state.skills[0].enabled, "the row still goes back");
+        assert_eq!(
+            state.skill_error, None,
+            "but the pane is about another skill now, and this is not what is wrong with it"
+        );
+    }
+
+    /// A listing asked for before the switch moved carries the old value. Landing it put the
+    /// switch back under the person's finger for as long as the round trip took.
+    #[test]
+    fn a_listing_already_on_the_wire_cannot_put_a_moved_switch_back() {
+        let mut state = library_with_a_taught_skill();
+        assert_eq!(state.begin_switch("skl_1", true), Some(false));
+        state.take_your_skills(vec![skill_row("skl_1", false), skill_row("skl_2", false)]);
+        assert!(
+            state.your_skills[0].enabled,
+            "what this app has just done outlives a listing asked for before it happened"
+        );
+        assert!(!state.your_skills[1].enabled, "and only that row");
+
+        state.take_switch_answer("skl_1", true, &skill_row("skl_1", true));
+        state.take_your_skills(vec![skill_row("skl_1", false)]);
+        assert!(
+            !state.your_skills[0].enabled,
+            "once the server has answered, the server's listing is the truth again"
+        );
+    }
+
+    /// Try again sends the tape from the window that is holding it, and a window that has been
+    /// closed took the tape with it. Asked before the button is drawn, because a button that
+    /// reports success and does nothing is the worst of the three answers.
+    #[test]
+    fn a_refused_tape_is_only_in_hand_while_its_window_is_open() {
+        let mut state = AppState::new();
+        assert!(
+            !state.taught_tape_is_in_hand(),
+            "nothing taught, nothing held"
+        );
+
+        state.taught_skill = Some(TaughtSkill::Written {
+            id: "skl_1".into(),
+            name: "invoice-lookup".into(),
+            enabled: false,
+        });
+        assert!(
+            !state.taught_tape_is_in_hand(),
+            "a lesson that was written is not a tape waiting to go again"
+        );
+
+        state.taught_skill = Some(TaughtSkill::Refused {
+            why: "Your bot hung up on the way back.".into(),
+            next: AfterRefusal::SendAgain,
+            coworker: "cw_1".into(),
+        });
+        assert!(
+            !state.taught_tape_is_in_hand(),
+            "no window open for that coworker: the sheet went, and the bytes with it"
+        );
+    }
+
+    /// Turning a skill on is the moment it becomes typeable, and the list `/` offers is a copy
+    /// of what the server said a moment ago. Left alone it goes on saying "switched off, so
+    /// nothing may run it" about a skill that is now on, and the person concludes the switch
+    /// did not work.
+    #[test]
+    fn the_switch_moves_on_every_list_that_carries_the_row() {
+        let row = |id: &str, enabled: bool| SkillSummary {
+            id: id.into(),
+            name: format!("skill-{id}"),
+            description: String::new(),
+            source: crate::opengrok::SkillSource::Taught,
+            updated_at_ms: 0,
+            version_count: 1,
+            draft: false,
+            enabled,
+            approved_at_ms: None,
+        };
+        let mut rows = vec![row("skl_1", false), row("skl_2", false)];
+        mark_enabled(&mut rows, "skl_1", true);
+        assert!(rows[0].enabled, "the one that was switched");
+        assert!(!rows[1].enabled, "and nothing else on the list");
+
+        mark_enabled(&mut rows, "skl_1", false);
+        assert!(
+            !rows[0].enabled,
+            "and it goes back the same way, for a refusal or a rethink"
+        );
+
+        mark_enabled(&mut rows, "skl_9", true);
+        assert!(
+            rows.iter().all(|row| !row.enabled),
+            "a skill this list does not carry changes nothing on it"
+        );
+    }
+
+    /// The walk over a real folder: what it takes, what it steps over, and what it refuses
+    /// before opening anything.
+    ///
+    /// The oversized file is unreadable on purpose. If the size check ever moves back below the
+    /// open, this test stops seeing the sentence about megabytes and starts seeing "could not be
+    /// read" — which is the whole difference between refusing a 6 GB file and allocating it.
+    #[test]
+    fn a_folder_is_walked_without_opening_what_it_must_not_send() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("a folder to walk");
+        let at = dir.path();
+        let write = |path: &str, bytes: &[u8]| {
+            let full = at.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let mut file = std::fs::File::create(&full).unwrap();
+            file.write_all(bytes).unwrap();
+            full
+        };
+        write("SKILL.md", b"Ask for the receipt first.");
+        write("reference/rates.csv", b"ok, hi\n");
+        write(".git/config", b"[core]\n");
+        std::os::unix::fs::symlink("/etc/hosts", at.join("hosts")).unwrap();
+
+        let found = super::read_skill_folder(at).expect("a folder with instructions in it");
+        let mut paths: Vec<&str> = found.iter().map(|(path, _)| path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["SKILL.md", "reference/rates.csv"],
+            "a dot directory is not part of a skill, and neither is what a link points at"
+        );
+
+        // A file too heavy to be part of a skill, which cannot be opened at all.
+        let bound = permissions_bind(at);
+        let big = write("big.bin", b"");
+        std::fs::File::options()
+            .write(true)
+            .open(&big)
+            .unwrap()
+            .set_len(super::SKILL_BUNDLE_LIMIT as u64 + 1)
+            .unwrap();
+        if bound {
+            std::fs::set_permissions(&big, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+        }
+        let why = super::read_skill_folder(at).expect_err("over the cap");
+        assert!(why.contains("MB"), "{why}");
+        if bound {
+            assert!(
+                !why.contains("could not be read"),
+                "the size was asked for before the file was opened: {why}"
+            );
+        }
+        std::fs::remove_file(&big).unwrap();
+
+        // And one file too many, counted as they are found rather than at the end.
+        for index in 0..=super::SKILL_BUNDLE_FILES {
+            write(&format!("note-{index}.md"), b"x");
+        }
+        let why = super::read_skill_folder(at).expect_err("too many files");
+        assert!(
+            why.contains(&super::SKILL_BUNDLE_FILES.to_string()),
+            "{why}"
+        );
+    }
+
+    /// A folder that will not open has nothing in it to upload, and a subfolder that will not
+    /// open is one corner of a folder that does.
+    #[test]
+    fn a_folder_that_will_not_open_says_so_and_a_subfolder_is_stepped_over() {
+        let dir = tempfile::tempdir().expect("a folder to walk");
+        let at = dir.path();
+        std::fs::write(at.join("SKILL.md"), b"Ask first.").unwrap();
+        // Nothing is shut to root, so there is no shut corner to step over and nothing here to
+        // check. The refusal below is about a folder that is not there, which binds everybody.
+        if permissions_bind(at) {
+            let shut = at.join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("inside.md"), b"x").unwrap();
+            std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                .unwrap();
+            let found = super::read_skill_folder(at).expect("one shut corner is not the end of it");
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].0, "SKILL.md");
+            std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .unwrap();
+        }
+
+        let why = super::read_skill_folder(&at.join("nowhere")).expect_err("no such folder");
+        assert!(why.contains("could not be read"), "{why}");
+    }
+
+    /// A picked file is the instructions themselves: read when it is text and small enough to
+    /// be a skill's, and refused on what the filesystem says it weighs before that.
+    #[test]
+    fn a_picked_file_is_the_instructions_when_it_can_be_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("a folder to write in");
+        let at = dir.path();
+
+        let md = at.join("SKILL.md");
+        std::fs::write(&md, b"Ask for the receipt first.").unwrap();
+        let (body, files) = super::read_skill_upload(&md).expect("a file of instructions");
+        assert_eq!(body, "Ask for the receipt first.");
+        assert!(
+            files.is_empty(),
+            "one file is one file, with nothing beside it"
+        );
+
+        let binary = at.join("notes.bin");
+        std::fs::write(&binary, [0xFF, 0xFE, 0x00]).unwrap();
+        let why = super::read_skill_upload(&binary).expect_err("not text");
+        assert!(why.contains("is not text"), "{why}");
+
+        // A device is not a file: it says it is zero bytes long and then reads forever.
+        let why = super::read_skill_upload(std::path::Path::new("/dev/null"))
+            .expect_err("a device is not a SKILL.md");
+        assert!(why.contains("is not a file"), "{why}");
+
+        let bound = permissions_bind(at);
+        let big = at.join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(super::SKILL_BUNDLE_LIMIT as u64 + 1)
+            .unwrap();
+        if bound {
+            std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let why = super::read_skill_upload(&big).expect_err("over the cap");
+        assert!(why.contains("MB"), "{why}");
+        assert!(
+            why.contains(&crate::opengrok::SKILL_BODY_CHARS.to_string()),
+            "the file being refused IS the instructions, so the cap it names is theirs: {why}"
+        );
+        if bound {
+            assert!(
+                !why.contains("could not be read"),
+                "half a gigabyte is not allocated to find out it was a mistake: {why}"
+            );
+        }
+    }
+
+    /// The instructions are the `SKILL.md`; everything else in the folder is a file they refer
+    /// to, sent base64 and in a settled order so the same folder twice is the same bundle.
+    #[test]
+    fn a_picked_folder_is_its_instructions_and_the_files_beside_them() {
+        let (body, files) = super::skill_bundle(vec![
+            ("reference/rates.csv".to_string(), b"ok, hi\n".to_vec()),
+            (
+                "SKILL.md".to_string(),
+                b"Ask for the receipt first.".to_vec(),
+            ),
+            ("checklist.md".to_string(), b"one\ntwo\n".to_vec()),
+        ])
+        .expect("a folder with instructions in it");
+        assert_eq!(body, "Ask for the receipt first.");
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, vec!["checklist.md", "reference/rates.csv"]);
+        assert_eq!(
+            files[1].bytes, "b2ssIGhpCg==",
+            "a file travels base64, the way an artifact does"
+        );
+    }
+
+    /// A folder of anything at all is not a skill, and saying which file is missing is the only
+    /// way somebody knows what to add.
+    #[test]
+    fn a_folder_with_no_instructions_says_which_file_is_missing() {
+        let why = super::skill_bundle(vec![("notes.txt".to_string(), b"hello".to_vec())])
+            .expect_err("no SKILL.md");
+        assert!(why.contains("SKILL.md"), "{why}");
+    }
+
+    /// Both caps are the server's, and both are checked before the upload rather than after it:
+    /// a refusal that arrives after the bytes have gone up cost the person the upload.
+    #[test]
+    fn a_bundle_over_a_cap_is_refused_with_the_number_in_it() {
+        let mut many = vec![("SKILL.md".to_string(), b"body".to_vec())];
+        for index in 0..=super::SKILL_BUNDLE_FILES {
+            many.push((format!("file-{index}.md"), b"x".to_vec()));
+        }
+        let why = super::skill_bundle(many).expect_err("too many files");
+        assert!(
+            why.contains(&super::SKILL_BUNDLE_FILES.to_string()),
+            "{why}"
+        );
+
+        let heavy = vec![
+            ("SKILL.md".to_string(), b"body".to_vec()),
+            (
+                "big.bin".to_string(),
+                vec![0u8; super::SKILL_BUNDLE_LIMIT + 1],
+            ),
+        ];
+        let why = super::skill_bundle(heavy).expect_err("too many bytes");
+        assert!(why.contains("KB"), "{why}");
+    }
+
+    /// The rows on the page and the numbers on the toggle come out of one pair of answers, so
+    /// either half failing takes both: a count that the list under it disagrees with is worse
+    /// than no count at all. A pair for a refresh that has since been overtaken is dropped
+    /// whole, which is what keeps a slow answer for one side of the toggle off the other.
+    #[test]
+    fn a_library_lands_whole_or_not_at_all() {
+        let rows = |ids: &[&str]| -> Vec<crate::opengrok::SkillSummary> {
+            ids.iter()
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({ "id": id, "name": id })).unwrap()
+                })
+                .collect()
+        };
+        let mut state = super::AppState::new();
+        state.skills_epoch = 4;
+
+        assert!(
+            !state.take_skills(
+                3,
+                super::SkillScope::Yours,
+                Ok(rows(&["skl_1"])),
+                Ok(Vec::new())
+            ),
+            "an answer for a refresh that has been overtaken is not this page's answer"
+        );
+        assert!(state.skills.is_empty());
+
+        assert!(state.take_skills(
+            4,
+            super::SkillScope::Discover,
+            Ok(rows(&["skl_1"])),
+            Ok(rows(&["skl_2", "skl_3"])),
+        ));
+        assert_eq!(
+            state.skills.len(),
+            2,
+            "the side that is open is the side shown"
+        );
+        assert_eq!(state.skills[0].id, "skl_2");
+        assert_eq!(
+            state.skills_counts,
+            super::SkillCounts {
+                yours: 1,
+                discover: 2
+            }
+        );
+        assert!(!state.skills_loading);
+
+        state.skills_epoch = 5;
+        assert!(state.take_skills(
+            5,
+            super::SkillScope::Discover,
+            Ok(rows(&["skl_1"])),
+            Err(crate::opengrok::OpenGrokError::message(
+                "the gateway is down"
+            )),
+        ));
+        assert!(
+            state.skills.is_empty(),
+            "rows left under a red line are rows somebody reads as current"
+        );
+        assert_eq!(state.skills_counts, super::SkillCounts::default());
+        assert_eq!(state.skills_error.as_deref(), Some("the gateway is down"));
+    }
+
+    /// The rows on screen belong to the side that was open, so they go the moment it does —
+    /// otherwise they sit under the other side's name until the fetch lands, and for as long as
+    /// the app runs if it never does.
+    #[test]
+    fn moving_the_toggle_takes_the_rows_with_it() {
+        let mut state = super::AppState::new();
+        state.skills =
+            serde_json::from_value(serde_json::json!([{ "id": "skl_1", "name": "a" }])).unwrap();
+        assert!(state.take_skills_scope(super::SkillScope::Discover));
+        assert_eq!(state.skills_scope, super::SkillScope::Discover);
+        assert!(state.skills.is_empty());
+        assert!(
+            !state.take_skills_scope(super::SkillScope::Discover),
+            "the toggle was already there and nothing moved"
+        );
+    }
+
+    /// The two words on the toggle are the words a driver uses, and they are not the words on
+    /// the wire: "Yours" asks the server for `mine`.
+    #[test]
+    fn the_skills_toggle_keeps_the_screens_words_and_the_wires_apart() {
+        use super::SkillScope;
+        assert_eq!(SkillScope::from_word("yours"), Some(SkillScope::Yours));
+        assert_eq!(
+            SkillScope::from_word("discover"),
+            Some(SkillScope::Discover)
+        );
+        assert_eq!(SkillScope::from_word("mine"), None);
+        assert_eq!(SkillScope::Yours.query(), "mine");
+        assert_eq!(SkillScope::Discover.query(), "org");
+        assert_eq!(SkillScope::Discover.label(), "Discover");
+        let counts = super::SkillCounts {
+            yours: 3,
+            discover: 11,
+        };
+        assert_eq!(counts.of(SkillScope::Yours), 3);
+        assert_eq!(counts.of(SkillScope::Discover), 11);
+    }
 
     /// A site's icon is whatever the site serves; the first bytes say which picture it is,
     /// and a page that is not a picture is no icon at all.
@@ -10813,6 +14530,191 @@ mod tests {
         assert!(!active.turn().values.contains_key("search_term"));
     }
 
+    /// ONE TURN. A skill is put on the draft by a pick and comes off as the turn is built, so
+    /// the message after it carries nothing unless somebody picked again.
+    ///
+    /// What the first assertion pins is narrow and worth saying out loud: a draft that was never
+    /// picked from has nothing on it. It does NOT pin that the words are unread — nothing in
+    /// this file reads them, and a test can only show that nothing here puts a skill on a draft
+    /// except [`AppState::attach_skill`], which is reached from the panel's pick and from
+    /// nowhere else in the app.
+    #[test]
+    fn a_picked_skill_goes_with_one_turn_and_a_typed_one_goes_with_none() {
+        let mut state = AppState::new();
+        state.your_skills = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "expense-report", "description": "File a receipt" },
+            { "id": "skl_2", "name": "  ", "description": "Nobody named it" }
+        ]))
+        .unwrap();
+        assert_eq!(
+            state.take_draft_skill(),
+            None,
+            "nothing was picked, so there is nothing for the turn to carry"
+        );
+
+        assert!(state.attach_skill("skl_1"));
+        assert_eq!(
+            state.active_skill.as_ref().map(|skill| skill.name.as_str()),
+            Some("expense-report")
+        );
+        assert_eq!(state.take_draft_skill().as_deref(), Some("skl_1"));
+        assert_eq!(
+            state.take_draft_skill(),
+            None,
+            "a skill applies to the message it was sent with and to nothing after it"
+        );
+
+        // One to a message: the second pick is the one that goes.
+        assert!(state.attach_skill("skl_1"));
+        assert!(state.attach_skill("skl_2"));
+        assert_eq!(
+            state.active_skill.as_ref().map(|skill| skill.id.as_str()),
+            Some("skl_2")
+        );
+        assert_eq!(
+            state.active_skill.as_ref().map(|skill| skill.name.as_str()),
+            Some("Untitled skill"),
+            "the draft calls a nameless skill what the `/` row called it"
+        );
+
+        // An id the library does not hold is not a pick, and leaves what was there alone.
+        assert!(!state.attach_skill("skl_9"));
+        assert_eq!(
+            state.take_draft_skill().as_deref(),
+            Some("skl_2"),
+            "the skill on the draft survived a pick that named nothing"
+        );
+    }
+
+    /// A slow answer must not land on top of a later one.
+    ///
+    /// Type `/` (one request in flight), write a skill in Settings, whose refresh fills this
+    /// list from the half it fetched for its counts, then type `/` again. The first request is
+    /// still out there, and it was answered before the skill existed: landing it would take the
+    /// new skill back out of `/`, which is the whole of what "invocable at once" was worth.
+    #[test]
+    fn a_listing_that_was_overtaken_does_not_land_on_the_one_that_beat_it() {
+        let old: Vec<SkillSummary> =
+            serde_json::from_value(serde_json::json!([{ "id": "skl_1", "name": "old" }])).unwrap();
+        let new: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "old" },
+            { "id": "skl_2", "name": "just-written" }
+        ]))
+        .unwrap();
+
+        let mut state = AppState::new();
+        // The request `/` sent, which is still in flight.
+        state.your_skills_epoch += 1;
+        let in_flight = state.your_skills_epoch;
+        state.your_skills_loading = true;
+        // The Settings page's refresh lands first, carrying the skill that was just written.
+        state.take_your_skills(new.clone());
+        assert_eq!(state.your_skills, new);
+        assert!(!state.your_skills_loading);
+
+        assert!(
+            !state.take_your_skills_at(in_flight, Ok(old.clone())),
+            "the answer was overtaken, so it is not an answer any more"
+        );
+        assert_eq!(
+            state.your_skills, new,
+            "the skill that was just written is still there"
+        );
+
+        // The same in the other direction: a refusal from a request that has been overtaken
+        // must not print itself over a library that loaded.
+        assert!(!state.take_your_skills_at(
+            in_flight,
+            Err(OpenGrokError::message(
+                "the server would not say".to_string()
+            ))
+        ));
+        assert!(state.your_skills_error.is_none());
+
+        // And the answer to the request that is current does land.
+        state.your_skills_epoch += 1;
+        let current = state.your_skills_epoch;
+        assert!(state.take_your_skills_at(current, Ok(old.clone())));
+        assert_eq!(state.your_skills, old);
+    }
+
+    /// A held message carries what the draft had on it. The pass-through is the point: by the
+    /// time the thread goes idle the draft is the next message somebody is writing, so anything
+    /// not on this row is not this message's.
+    ///
+    /// What this pins is the row's shape — a field dropped on the way in, which is how the skill
+    /// would quietly stop being held — and not which values the one caller hands it.
+    #[test]
+    fn a_held_message_keeps_the_skill_it_was_typed_with() {
+        let held = super::held_message(
+            "m1".to_string(),
+            "do the thing".to_string(),
+            None,
+            Some("skl_1".to_string()),
+            None,
+        );
+        assert_eq!(held.skill.as_deref(), Some("skl_1"));
+        assert_eq!(held.content, "do the thing");
+        assert_eq!(held.message_id, "m1");
+    }
+
+    /// `/` offers this person's own skills, whatever the Settings page is showing.
+    ///
+    /// The page's list is one side of a toggle and is emptied the moment the toggle moves. A
+    /// composer reading it offered a colleague's library and none of this person's own, to
+    /// somebody who had merely looked at the other tab once and closed it.
+    #[test]
+    fn the_slash_list_is_your_own_skills_and_not_whichever_tab_was_left_open() {
+        let yours: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "expense-report", "description": "File a receipt" }
+        ]))
+        .unwrap();
+        let theirs: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_9", "name": "their-skill", "description": "Ada's" }
+        ]))
+        .unwrap();
+
+        let mut state = AppState::new();
+        state.skills_scope = SkillScope::Discover;
+        assert!(state.take_skills(
+            state.skills_epoch,
+            SkillScope::Discover,
+            Ok(yours.clone()),
+            Ok(theirs.clone())
+        ));
+        assert_eq!(
+            state.skills, theirs,
+            "the page shows the side of the toggle that was asked for"
+        );
+        assert_eq!(
+            state.your_skills, yours,
+            "and `/` has the other half of the same answer, so a skill written on that page \
+             can be used without asking for it again"
+        );
+        assert!(
+            state.attach_skill("skl_1"),
+            "the row `/` offered is the row a pick can find"
+        );
+        assert!(
+            !state.attach_skill("skl_9"),
+            "the Discover side is not what `/` listed, so nothing there is pickable from it"
+        );
+
+        // A listing that failed takes the page's rows down with it, because a list under a red
+        // line reads as current. What `/` already has is left alone: it is still true, and a
+        // panel emptied by somebody else's failed refresh would offer nothing at all.
+        assert!(state.take_skills(
+            state.skills_epoch,
+            SkillScope::Discover,
+            Ok(yours.clone()),
+            Err(OpenGrokError::message(
+                "the server would not say".to_string()
+            ))
+        ));
+        assert!(state.skills.is_empty());
+        assert_eq!(state.your_skills, yours);
+    }
+
     /// The declaration the owner hit this on, with an optional parameter declared ahead of a
     /// required one so the ordering is a claim about the list and not about the JSON.
     fn youtube() -> RecipeSummary {
@@ -10898,28 +14800,30 @@ mod tests {
 
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        ActiveRecipe, ActivityTick, AppState, BotActivity, ChatMessage, ChatPart, Conversation,
-        DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue, PickedKind,
-        REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply, RouteTrafficSurface,
-        STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, ThreadRun,
+        ActiveRecipe, ActivityTick, AfterRefusal, AppState, BotActivity, ChatMessage, ChatPart,
+        Conversation, DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue,
+        PickedKind, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply,
+        RouteTrafficSurface, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SaveStamp, SkillScope,
+        SkillSummary, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun,
         TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
-        apply_catalogue, apply_reload, bot_status_line, bubble_for_run, graft_reply,
-        hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note,
-        missing_replies, overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable,
-        replayed_ending, reply_from_replay, restored_message, restored_parts, saved_parts,
-        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
-        unheard_hidden_runs,
+        apply_catalogue, apply_reload, apply_timing, bot_status_line, bubble_for_run, clock_label,
+        graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note,
+        mark_enabled, missing_replies, overlay_server_cards, parse_sql_time,
+        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_message,
+        restored_parts, saved_parts, spec_from_queued, stamp_run_finished, stream_paint_due,
+        stream_part_sig, streaming_message_mut, turn_ending, unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
     use crate::opengrok::{
         Failure, FormField, FormResolution, FormSpec, LocalExecMode, ModelEntry, OpenGrokClient,
-        QueuedApproval, USER_MACHINE_SHELL, UiSpec,
+        OpenGrokError, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
     use crate::state::{
         ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, once_only_for,
         settled_decision,
     };
+    use chrono::{Local, TimeZone};
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -10930,6 +14834,8 @@ mod tests {
             sender: if is_me { "Me" } else { "AI" }.to_string(),
             content: content.to_string(),
             sent_at: SystemTime::UNIX_EPOCH,
+            finished_at: None,
+            run_timing: None,
             is_me,
             reply_preview: None,
             reply_to_id: None,
@@ -11481,7 +15387,7 @@ mod tests {
             &saved_parts(&live),
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the turn is saved");
@@ -11841,9 +15747,248 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_500),
             "stamped with when the run began, not when it was noticed"
         );
+        assert!(
+            messages[made].finished_at.is_none(),
+            "a bubble made for a run that is still going has no finish clock"
+        );
         assert_eq!(
             messages[1].content, "an older reply",
             "the last thing said before is untouched"
+        );
+    }
+
+    #[test]
+    fn a_sent_time_past_what_a_clock_can_hold_is_blank() {
+        let mut bubble = message("m_far", true, "hi");
+        bubble.sent_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 45);
+        assert_eq!(bubble.formatted_time(), "");
+    }
+
+    #[test]
+    fn clock_label_is_grok_twelve_hour() {
+        let dt = Local
+            .with_ymd_and_hms(2026, 9, 22, 16, 34, 0)
+            .single()
+            .expect("a civil time");
+        assert_eq!(clock_label(dt), "4:34 PM");
+        let morning = Local
+            .with_ymd_and_hms(2026, 9, 22, 9, 5, 0)
+            .single()
+            .expect("a civil time");
+        assert_eq!(clock_label(morning), "9:05 AM");
+    }
+
+    /// Finishing a run wears how long it took. It does not move when it began,
+    /// so a queued message typed mid-wait still sits after the reply.
+    #[test]
+    fn finishing_a_run_keeps_the_start_stamp_and_wears_the_wait() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(16 * 3600 + 34 * 60);
+        let mut bubble = at(
+            message("m_live", false, "done"),
+            16 * 3600 * 1000 + 34 * 60 * 1000,
+        );
+        bubble.sent_at = start;
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(6 * 60 + 12));
+        assert_eq!(bubble.sent_at, start, "history stays where the run began");
+        assert_eq!(
+            bubble.formatted_duration().as_deref(),
+            Some("6m12s"),
+            "the peek stamp can say how long the person waited"
+        );
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(99));
+        assert_eq!(
+            bubble.formatted_duration().as_deref(),
+            Some("6m12s"),
+            "a second ending does not move the finish clock"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_is_never_shorter_than_the_harness_says() {
+        let start = SystemTime::UNIX_EPOCH;
+        let mut bubble = at(message("m_live", false, "listed"), 0);
+        bubble.sent_at = start;
+        apply_timing(
+            &mut bubble,
+            crate::opengrok::TurnTiming::from_value(&serde_json::json!({
+                "v": 1,
+                "total_ms": 372000,
+                "model_ms": 12000,
+                "tools": [{ "name": "profile.list", "ms": 350000 }]
+            }))
+            .unwrap(),
+        );
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(5));
+        assert_eq!(bubble.sent_at, start);
+        assert_eq!(bubble.formatted_duration().as_deref(), Some("6m12s"));
+        assert_eq!(
+            bubble.run_timing.as_ref().unwrap().tools[0].name,
+            "profile.list"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_never_happened_wears_no_wait() {
+        let start = SystemTime::UNIX_EPOCH;
+        for note in [TURN_UNREACHED_NOTE, TURN_SIGNED_OUT_NOTE] {
+            let mut bubble = at(message("m_live", false, note), 0);
+            stamp_run_finished(&mut bubble, start + Duration::from_secs(40));
+            assert_eq!(bubble.formatted_duration(), None, "{note}");
+        }
+    }
+
+    /// The harness sends `run-timing` and `RUN_FINISHED` when it parks on a card, and starts
+    /// its clock again for the half after the card.
+    #[test]
+    fn a_run_parked_on_a_card_wears_no_wait_and_its_end_wears_all_of_it() {
+        let start = SystemTime::UNIX_EPOCH;
+        let mut bubble = at(message("m_live", false, "may I run this?"), 0);
+        bubble.sent_at = start;
+        let timing = |total_ms: u64| {
+            crate::opengrok::TurnTiming::from_value(&serde_json::json!({ "total_ms": total_ms }))
+                .expect("a timing frame")
+        };
+        apply_timing(&mut bubble, timing(4_000));
+        assert_eq!(
+            bubble.formatted_duration(),
+            None,
+            "a run parked on a card has not ended"
+        );
+        apply_timing(&mut bubble, timing(10_000));
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(6 * 60 + 12));
+        assert_eq!(
+            bubble.formatted_duration().as_deref(),
+            Some("6m12s"),
+            "the stamp is the whole wait, not the half after the card"
+        );
+    }
+
+    #[test]
+    fn a_recovered_run_that_waited_on_a_card_wears_the_whole_wait() {
+        let mut frames = turn_frames();
+        for total_ms in [4_000, 10_000] {
+            frames.push(serde_json::json!({
+                "type": "CUSTOM",
+                "name": "run-timing",
+                "value": { "total_ms": total_ms }
+            }));
+        }
+        let mut run = thread_run("run_1", "finished", 2_000, &frames);
+        run.updated_at_ms = 2_000 + 372_000;
+        let recovered = missing_replies(&[at(message("m_ask", true, "run it"), 1_000)], &[run]);
+        assert_eq!(
+            recovered[0].finished_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(2_000 + 372_000)),
+            "the journal's last frame, not the harness clock that restarted after the card"
+        );
+    }
+
+    #[test]
+    fn a_recovered_finished_run_carries_the_wait_without_moving_its_place() {
+        let mut frames = turn_frames();
+        frames.push(serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-timing",
+            "value": { "v": 1, "total_ms": 372000, "tools": [{ "name": "profile.list", "ms": 350000 }] }
+        }));
+        let mut run = thread_run("run_1", "finished", 2_000, &frames);
+        run.updated_at_ms = 2_000 + 5_000;
+        let messages = vec![
+            at(message("m_ask", true, "list profiles"), 1_000),
+            at(message("m_later", true, "and then?"), 10_000),
+        ];
+        let recovered = missing_replies(&messages, &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].started_at,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(2_000)
+        );
+        assert_eq!(
+            recovered[0].finished_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(2_000 + 372_000)),
+            "the wait is start + harness total_ms, not the journal's last frame"
+        );
+        let mut thread = messages.clone();
+        graft_reply(&mut thread, &recovered[0]);
+        assert_eq!(
+            ids(&thread),
+            vec!["m_ask", thread[1].id.as_str(), "m_later"],
+            "a six-minute turn still sits where it started, before the next ask"
+        );
+        assert_eq!(thread[1].formatted_duration().as_deref(), Some("6m12s"));
+    }
+
+    #[tokio::test]
+    async fn a_finish_clock_past_what_a_row_can_hold_is_saved_without_one() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let start = SystemTime::UNIX_EPOCH + Duration::from_millis(2_000);
+        db.save_message(
+            "m_reply",
+            "s1",
+            "assistant",
+            "listed",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+            false,
+            SaveStamp {
+                sent_at: start,
+                finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 45)),
+                timing_json: None,
+            },
+        )
+        .await
+        .expect("saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        let restored = restored_message(rows[0].clone());
+        assert_eq!(restored.sent_at, start);
+        assert_eq!(restored.finished_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_finished_at_survives_a_reload_without_moving_created_at() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let start = SystemTime::UNIX_EPOCH + Duration::from_millis(2_000);
+        let end = start + Duration::from_secs(6 * 60 + 12);
+        db.save_message(
+            "m_reply",
+            "s1",
+            "assistant",
+            "listed",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+            false,
+            SaveStamp {
+                sent_at: start,
+                finished_at: Some(end),
+                timing_json: Some(
+                    crate::opengrok::TurnTiming::from_value(&serde_json::json!({
+                        "v": 1,
+                        "total_ms": 372000,
+                        "tools": [{ "name": "profile.list", "ms": 350000 }]
+                    }))
+                    .unwrap()
+                    .to_json(),
+                ),
+            },
+        )
+        .await
+        .expect("saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        let restored = restored_message(rows[0].clone());
+        assert_eq!(restored.sent_at, start);
+        assert_eq!(restored.finished_at, Some(end));
+        assert_eq!(restored.formatted_duration().as_deref(), Some("6m12s"));
+        assert_eq!(
+            restored.run_timing.as_ref().unwrap().tools[0].name,
+            "profile.list"
         );
     }
 
@@ -11967,7 +16112,7 @@ mod tests {
                 &[],
                 None,
                 false,
-                at,
+                SaveStamp::at(at),
             )
             .await
             .expect("saved");
@@ -12008,7 +16153,7 @@ mod tests {
                 &[],
                 Some("run_1"),
                 false,
-                at,
+                SaveStamp::at(at),
             )
             .await
             .expect("saved");
@@ -12030,9 +16175,21 @@ mod tests {
         let ask = SystemTime::UNIX_EPOCH + Duration::from_millis(4_100);
         let reply = SystemTime::UNIX_EPOCH + Duration::from_millis(4_350);
         for (id, role, at) in [("m_reply", "assistant", reply), ("m_ask", "user", ask)] {
-            db.save_message(id, "s1", role, "x", None, None, None, &[], None, false, at)
-                .await
-                .expect("saved");
+            db.save_message(
+                id,
+                "s1",
+                role,
+                "x",
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                SaveStamp::at(at),
+            )
+            .await
+            .expect("saved");
         }
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         assert_eq!(
@@ -12080,7 +16237,7 @@ mod tests {
             &[],
             Some("run_1"),
             true,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the reply is saved");
@@ -12100,7 +16257,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the second write");
@@ -12177,7 +16334,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the reply is saved");
@@ -12218,7 +16375,7 @@ mod tests {
             &once,
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the first write");
@@ -12233,7 +16390,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the second write");
@@ -12270,7 +16427,7 @@ mod tests {
             &[],
             None,
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the message is saved");
@@ -12487,6 +16644,8 @@ mod tests {
             reply_is_me: None,
             run_id: None,
             deleted_at: None,
+            finished_at: None,
+            run_timing: None,
             parts: Vec::new(),
         }
     }
@@ -12863,6 +17022,8 @@ mod tests {
             parts: vec![ChatPart::Text("Opening.".to_string())],
             live: false,
             started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(2_000),
+            finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(8_000)),
+            run_timing: None,
         };
 
         let id = graft_reply(&mut messages, &reply);
@@ -13149,6 +17310,1062 @@ mod tests {
         assert_eq!(
             crate::send_policy::plan_send(Busy::Running, crate::send_policy::OnSend::Queue, false),
             crate::send_policy::SendPlan::Queue
+        );
+    }
+
+    /// A working turn with a held send behind it, the way Queue leaves one.
+    fn holding(id: &str, content: &str) -> AppState {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.conversations[0]
+            .messages
+            .push(at(message(id, true, content), 30));
+        state
+            .queued_sends
+            .entry("cw_1".to_string())
+            .or_default()
+            .push_back(super::held_message(
+                id.to_string(),
+                content.to_string(),
+                None,
+                None,
+                None,
+            ));
+        state
+    }
+
+    fn hide_bubble(state: &mut AppState, id: &str) {
+        if let Some(message) = state.conversations[0]
+            .messages
+            .iter_mut()
+            .find(|message| message.id == id)
+        {
+            message.hidden = true;
+        }
+    }
+
+    fn go_idle(state: &mut AppState) {
+        state.release_live_turn("cw_1", "run_1");
+        state.finish_responding(Some("cw_1"), false);
+    }
+
+    fn bubble<'a>(state: &'a AppState, id: &str) -> &'a Message {
+        state.conversations[0]
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .expect("the bubble")
+    }
+
+    /// Cancel and Delete both go through `delete_message`: the hold comes off in the same call
+    /// that hides the bubble, so the pill drops and going idle has nothing to post.
+    #[test]
+    fn taking_a_hold_back_leaves_idle_nothing_to_post() {
+        let mut state = holding("m_held", "wait for it");
+        assert_eq!(state.queued_send_count(), 1);
+        assert!(state.is_send_queued("m_held"));
+
+        state.hide_message_in_memory("m_held");
+
+        assert!(!state.is_send_queued("m_held"), "the hold is off the queue");
+        assert_eq!(state.queued_send_count(), 0, "the pill counts nothing");
+        assert!(bubble(&state, "m_held").hidden);
+
+        go_idle(&mut state);
+        assert_eq!(state.busy_state("cw_1"), Busy::Idle);
+        assert!(!state.queued_send_ready_to_drain("cw_1"));
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "drain would post nothing: the hold is gone"
+        );
+    }
+
+    /// Edit changes the hold, the bubble, and what drain would send.
+    #[test]
+    fn edit_then_drain_sends_the_new_words() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "the new words".into()));
+        assert_eq!(bubble(&state, "m_held").content, "the new words");
+        assert_eq!(
+            state.user_message_persist("m_held").map(|row| row.content),
+            Some("the new words".into()),
+            "a save that lands after the edit writes the new words"
+        );
+
+        go_idle(&mut state);
+        let next = state
+            .pop_queued_send("cw_1")
+            .expect("the hold is still there");
+        assert_eq!(next.content, "the new words");
+        assert_eq!(next.message_id, "m_held");
+    }
+
+    /// A hold whose bubble something else hid is still in the queue. Drain skips it and posts
+    /// the one behind it.
+    #[test]
+    fn a_hidden_hold_is_not_posted() {
+        let mut state = holding("m_held", "wait for it");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_next", true, "and then this"), 40));
+        state
+            .queued_sends
+            .entry("cw_1".to_string())
+            .or_default()
+            .push_back(super::held_message(
+                "m_next".to_string(),
+                "and then this".to_string(),
+                None,
+                None,
+                None,
+            ));
+        hide_bubble(&mut state, "m_held");
+        go_idle(&mut state);
+        assert_eq!(
+            state.pop_queued_send("cw_1").map(|next| next.message_id),
+            Some("m_next".to_string()),
+            "the hidden hold is dropped and the visible one behind it goes"
+        );
+        assert!(state.pop_queued_send("cw_1").is_none());
+    }
+
+    /// Edit takes the hold off, and sending it again puts it back where it was, not behind
+    /// everything that was queued after it.
+    #[test]
+    fn editing_a_queued_message_puts_it_back_in_its_place() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        state
+            .queued_sends
+            .get_mut("cw_1")
+            .unwrap()
+            .push_back(super::held_message(
+                "m_b".into(),
+                "second".into(),
+                None,
+                None,
+                None,
+            ));
+        state
+            .take_hold_for_edit("m_a", "")
+            .expect("the first hold comes off");
+        state.enqueue_hold(
+            "cw_1".into(),
+            super::held_message("m_a".into(), "first, edited".into(), None, None, None),
+        );
+        let ids = |state: &AppState| {
+            state.queued_sends["cw_1"]
+                .iter()
+                .map(|queued| queued.message_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&state), ["m_a", "m_b"]);
+
+        state
+            .take_hold_for_edit("m_b", "")
+            .expect("the second hold comes off");
+        state.queued_sends.get_mut("cw_1").unwrap().pop_front();
+        state.enqueue_hold(
+            "cw_1".into(),
+            super::held_message("m_b".into(), "second, edited".into(), None, None, None),
+        );
+        assert_eq!(
+            ids(&state),
+            ["m_b"],
+            "the hold ahead of it drained while it was being edited, so it is next"
+        );
+    }
+
+    /// Edit on a queued bubble puts the words back in the composer and cancels the hold.
+    #[test]
+    fn edit_refills_the_composer_and_cancels_the_hold() {
+        let mut state = holding("m_held", "wait for it");
+        state.pending_edit = Some("m_held".to_string());
+        let refill = state.take_hold_for_edit("m_held", "");
+        assert_eq!(
+            refill.map(|refill| refill.content),
+            Ok("wait for it".to_string())
+        );
+        assert_eq!(state.pending_edit(), None, "the Edit is settled once");
+        assert!(!state.is_send_queued("m_held"));
+        assert_eq!(
+            state
+                .take_hold_for_edit("m_held", "")
+                .map(|refill| refill.content),
+            Err("That message has already been sent.".to_string()),
+            "a second Edit finds nothing held"
+        );
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none());
+    }
+
+    /// Edit never writes over words already in the composer. The hold stays queued and its
+    /// bubble stays up, and the person is told what to do instead.
+    #[test]
+    fn edit_leaves_the_hold_queued_while_the_composer_has_words_in_it() {
+        let mut state = holding("m_held", "wait for it");
+        state.pending_edit = Some("m_held".to_string());
+        assert_eq!(
+            state
+                .take_hold_for_edit("m_held", "half a new thought")
+                .map(|refill| refill.content),
+            Err("The composer already has words in it. Send or clear them, then Edit.".to_string())
+        );
+        assert!(state.is_send_queued("m_held"), "the hold was not taken");
+        assert!(!bubble(&state, "m_held").hidden);
+        assert_eq!(
+            state.pending_edit(),
+            None,
+            "the Edit is answered once, not retried on every paint"
+        );
+        assert_eq!(
+            state
+                .take_hold_for_edit("m_held", " \n ")
+                .map(|refill| refill.content),
+            Ok("wait for it".to_string()),
+            "spaces alone are not somebody's words"
+        );
+    }
+
+    /// The draft after Edit is the held message as it was sent: its reply or none, its skill
+    /// or none, and no recipe the composer had picked up since.
+    #[test]
+    fn edit_puts_back_exactly_the_reply_and_skill_the_hold_had() {
+        use super::{ActiveRecipe, ActiveSkill, ReplyTo};
+        let mut state = holding("m_bare", "wait for it");
+        state.your_skills = vec![skill_row("skl_1", true)];
+        state
+            .queued_sends
+            .entry("cw_1".to_string())
+            .or_default()
+            .push_back(super::held_message(
+                "m_dressed".to_string(),
+                "skill-skl_1 and then this".to_string(),
+                None,
+                Some("skl_1".to_string()),
+                Some(ReplyTo {
+                    message_id: "m_ask".to_string(),
+                    preview: "open youtube".to_string(),
+                    is_me: true,
+                }),
+            ));
+        state.reply_to = Some(ReplyTo {
+            message_id: "m_live".to_string(),
+            preview: "something else".to_string(),
+            is_me: false,
+        });
+        state.active_skill = Some(ActiveSkill {
+            id: "skl_other".to_string(),
+            name: "Other".to_string(),
+        });
+        state.active_recipe = Some(ActiveRecipe::from_summary(
+            &serde_json::from_value(serde_json::json!({ "id": "rcp_1", "name": "youtube" }))
+                .expect("a recipe row"),
+        ));
+
+        assert!(state.take_hold_for_edit("m_bare", "").is_ok());
+        assert_eq!(state.reply_to, None, "the hold had no reply");
+        assert_eq!(state.active_skill, None, "the hold had no skill");
+        assert_eq!(state.active_recipe, None, "the hold had no recipe");
+
+        let refill = state.take_hold_for_edit("m_dressed", "");
+        assert_eq!(
+            state.reply_to.map(|reply| reply.message_id),
+            Some("m_ask".to_string())
+        );
+        let restored = Some(ActiveSkill {
+            id: "skl_1".to_string(),
+            name: "skill-skl_1".to_string(),
+        });
+        assert_eq!(state.active_skill, restored);
+        assert_eq!(
+            refill.map(|refill| refill.skill),
+            Ok(restored),
+            "the composer is handed the skill to chip"
+        );
+    }
+
+    /// What Edit cannot put back it says so about, rather than sending the words on without it.
+    #[test]
+    fn edit_says_what_it_could_not_put_back() {
+        let mut state = holding("m_bare", "wait for it");
+        for (id, recipe, skill) in [
+            (
+                "m_recipe",
+                Some(super::TurnRecipe {
+                    id: "rcp_1".to_string(),
+                    values: serde_json::Map::new(),
+                }),
+                None,
+            ),
+            ("m_skill", None, Some("skl_gone".to_string())),
+        ] {
+            state
+                .queued_sends
+                .entry("cw_1".to_string())
+                .or_default()
+                .push_back(super::held_message(
+                    id.to_string(),
+                    "and then this".to_string(),
+                    recipe,
+                    skill,
+                    None,
+                ));
+        }
+        let notice = |state: &mut AppState, id: &str| {
+            state.take_hold_for_edit(id, "").map(|refill| refill.notice)
+        };
+        assert_eq!(notice(&mut state, "m_bare"), Ok(None));
+        assert_eq!(
+            notice(&mut state, "m_recipe"),
+            Ok(Some("The recipe on that message was not kept.".to_string()))
+        );
+        assert_eq!(
+            notice(&mut state, "m_skill"),
+            Ok(Some(
+                "The skill on that message is no longer in your list, so it was not kept."
+                    .to_string()
+            ))
+        );
+    }
+
+    #[cfg(feature = "agent")]
+    #[test]
+    fn the_queued_pill_leaves_the_tree_when_the_hold_is_taken_back() {
+        use crate::agent::{NativeChatHost, ids};
+        use gpui_agent::prelude::AgentHost;
+        let mut state = holding("m_held", "wait for it");
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.account = serde_json::from_value(serde_json::json!({
+            "id": "acct_1",
+            "email": "ada@example.com"
+        }))
+        .ok();
+        state.coworkers.push(bob());
+        let pill = |state: &AppState| {
+            NativeChatHost::from_app(state)
+                .snapshot()
+                .find(ids::COMPOSER_QUEUED)
+                .map(|node| node.name.clone())
+        };
+        assert_eq!(pill(&state).as_deref(), Some("1 queued"));
+        state.hide_message_in_memory("m_held");
+        assert_eq!(pill(&state), None);
+    }
+
+    /// A cancel before the sqlite write lands is written down hidden, not as a live row.
+    #[test]
+    fn a_cancel_before_the_row_is_written_is_persisted_hidden() {
+        let mut state = holding("m_held", "wait for it");
+        state.hide_message_in_memory("m_held");
+        let persist = state
+            .user_message_persist("m_held")
+            .expect("the bubble is still there");
+        assert!(persist.hidden);
+        assert_eq!(persist.content, "wait for it");
+    }
+
+    /// A Cancel or an Edit that lands while the row is being written meets no row to change.
+    /// Once the write is done the row is the bubble as memory has it, not as it was when the
+    /// write began.
+    #[tokio::test]
+    async fn a_row_written_while_its_hold_is_taken_back_ends_as_memory_does() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let mut reads = 0;
+        super::write_user_row(
+            &db,
+            "m_held",
+            "s1",
+            "wait for it".to_string(),
+            None,
+            SystemTime::UNIX_EPOCH,
+            || {
+                reads += 1;
+                let moved = reads > 1;
+                Some(super::UserMessagePersist {
+                    content: if moved {
+                        "the new words"
+                    } else {
+                        "wait for it"
+                    }
+                    .to_string(),
+                    hidden: moved,
+                })
+            },
+        )
+        .await
+        .expect("written");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows[0].content, "the new words");
+        assert!(
+            rows[0].deleted_at.is_some(),
+            "the row is hidden, as the bubble is"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edited_queued_row_reads_back_the_new_words() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        db.save_message(
+            "m_held",
+            "s1",
+            "user",
+            "wait for it",
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("saved");
+        db.update_message_content("m_held", "the new words")
+            .await
+            .expect("edited");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows[0].content, "the new words");
+    }
+
+    fn pending_row(id: &str, bubble: &str, content: &str) -> crate::opengrok::PendingUserMessage {
+        serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "id": id,
+            "threadId": "cw_1",
+            "content": content,
+            "clientMessageId": bubble,
+            "status": "pending",
+            "createdAtMs": 30,
+            "updatedAtMs": 30
+        }))
+        .expect("pending row")
+    }
+
+    /// A follow-up another machine queued shows up here as a held bubble.
+    #[test]
+    fn hydrate_puts_a_server_pending_on_the_queue() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[pending_row("pum_1", "msg_other", "from the laptop")],
+        );
+        assert!(state.is_send_queued("msg_other"));
+        assert_eq!(
+            state
+                .queued_sends
+                .get("cw_1")
+                .and_then(|queue| queue.front())
+                .map(|queued| queued.pending_id.as_deref()),
+            Some(Some("pum_1"))
+        );
+        assert_eq!(bubble(&state, "msg_other").content, "from the laptop");
+        assert!(!bubble(&state, "msg_other").hidden);
+    }
+
+    /// An enqueue that has not landed yet has no `pum_…`. Hydrate must not drop it.
+    #[test]
+    fn hydrate_keeps_a_local_hold_the_server_has_not_heard() {
+        let mut state = holding("m_held", "wait for it");
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(state.is_send_queued("m_held"));
+        assert_eq!(
+            state
+                .queued_sends
+                .get("cw_1")
+                .and_then(|queue| queue.front())
+                .and_then(|queued| queued.pending_id.as_deref()),
+            None
+        );
+    }
+
+    /// The queue is the order the person typed in. A hold whose enqueue has not landed stays
+    /// where it was, not behind the ones the server already has.
+    #[test]
+    fn hydrate_keeps_the_order_the_holds_were_typed_in() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        let mut b = super::held_message("m_b".into(), "second".into(), None, None, None);
+        b.pending_id = Some("pum_b".into());
+        state.queued_sends.get_mut("cw_1").unwrap().push_back(b);
+
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[
+                pending_row("pum_b", "m_b", "second"),
+                pending_row("pum_x", "m_x", "from the laptop"),
+            ],
+        );
+        let order: Vec<&str> = state.queued_sends["cw_1"]
+            .iter()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        assert_eq!(order, ["m_a", "m_b", "m_x"]);
+    }
+
+    /// A synced hold that vanished from the snapshot left the queue. The bubble stays:
+    /// the row being gone is also what a drain on another machine looks like, and the
+    /// answer may not be in this transcript yet.
+    #[test]
+    fn hydrate_keeps_the_bubble_when_a_synced_hold_vanishes() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(
+            !bubble(&state, "m_held").hidden,
+            "the words stay until the answer arrives"
+        );
+    }
+
+    /// The set of canceled ids only has to remember rows the server still has.
+    #[test]
+    fn a_cancel_tombstone_lasts_only_while_the_server_still_has_the_row() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.canceled_pending.insert("m_held".into());
+        state.canceled_pending.insert("m_elsewhere".into());
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert!(
+            state.canceled_pending.contains("m_held"),
+            "the row is still on the server"
+        );
+        assert!(!state.is_send_queued("m_held"));
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(
+            !state.canceled_pending.contains("m_held"),
+            "the row is gone"
+        );
+        assert!(state.canceled_pending.contains("m_elsewhere"));
+    }
+
+    /// A synced hold that vanished because it drained keeps the bubble: an assistant
+    /// reply already sits after it.
+    #[test]
+    fn hydrate_leaves_a_drained_bubble_when_the_reply_is_already_here() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.conversations[0]
+            .messages
+            .push(at(message("m_reply", false, "done"), 40));
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(
+            !bubble(&state, "m_held").hidden,
+            "the send happened; only the hold is gone"
+        );
+    }
+
+    /// Cancel this process, then a GET that raced the DELETE must not restore the bubble.
+    #[test]
+    fn hydrate_does_not_restore_a_hold_this_process_already_took_back() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.canceled_pending.insert("msg_other".into());
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[pending_row("pum_1", "msg_other", "from the laptop")],
+        );
+        assert!(!state.is_send_queued("msg_other"));
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "msg_other"),
+            "the tombstone skips grafting"
+        );
+    }
+
+    /// Edited offline, a synced hold's row still has the old words. A hydrate must not put them
+    /// back, and drain must not post the new words against that row before a PATCH lands.
+    #[test]
+    fn an_offline_edit_of_a_synced_hold_outlives_a_hydrate() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        assert!(matches!(
+            state.begin_queued_edit("m_held", "the offline words".into()),
+            super::QueuedEdit::Applied { .. }
+        ));
+
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert_eq!(bubble(&state, "m_held").content, "the offline words");
+        assert_eq!(state.queued_sends["cw_1"][0].content, "the offline words");
+        go_idle(&mut state);
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "the row has the old words until the PATCH lands"
+        );
+    }
+
+    /// Reconnecting sends the PATCH an offline edit owes, once, with drain held until it lands.
+    #[test]
+    fn coming_back_owes_the_offline_edit_its_patch() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.begin_queued_edit("m_held", "the offline words".into());
+        assert_eq!(
+            state.take_unsynced_edits(),
+            [super::OwedPatch {
+                thread_id: "cw_1".into(),
+                pending_id: "pum_1".into(),
+                message_id: "m_held".into(),
+                content: "the offline words".into(),
+            }]
+        );
+        assert!(state.pending_inflight.contains("m_held"));
+        assert!(
+            state.take_unsynced_edits().is_empty(),
+            "one PATCH at a time"
+        );
+    }
+
+    /// Canceled offline, then the app restarted: the DELETE never landed and the tombstone was
+    /// memory. The bubble on disk is hidden, and that is the person's word: the hold is not
+    /// put back, and the row is asked to go again.
+    #[test]
+    fn hydrate_does_not_restore_a_send_hidden_before_a_restart() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        let mut canceled = at(message("m_held", true, "wait for it"), 30);
+        canceled.hidden = true;
+        state.conversations[0].messages.push(canceled);
+
+        let fold =
+            state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(bubble(&state, "m_held").hidden);
+        assert_eq!(fold.cancel, ["pum_1"]);
+    }
+
+    /// Enqueue landed after the person canceled: give the `pum_…` back.
+    #[test]
+    fn bind_after_a_local_cancel_takes_the_row_back() {
+        let mut state = AppState::new();
+        state.canceled_pending.insert("msg_1".into());
+        match state.bind_pending_id("msg_1", "pum_1".into(), "later") {
+            super::BindPending::TakeBack { pending_id } => assert_eq!(pending_id, "pum_1"),
+            other => panic!("expected TakeBack, got a bind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_stores_the_pending_id_on_the_hold() {
+        let mut state = holding("m_held", "wait for it");
+        match state.bind_pending_id("m_held", "pum_1".into(), "wait for it") {
+            super::BindPending::Bound => {}
+            other => panic!("expected Bound, got {other:?}"),
+        }
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0]
+                .pending_id
+                .as_deref(),
+            Some("pum_1")
+        );
+    }
+
+    #[test]
+    fn bind_after_an_edit_asks_for_a_patch() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "instead".into()));
+        match state.bind_pending_id("m_held", "pum_1".into(), "wait for it") {
+            super::BindPending::Patch {
+                pending_id,
+                content,
+            } => {
+                assert_eq!(pending_id, "pum_1");
+                assert_eq!(content, "instead");
+            }
+            other => panic!("expected Patch, got {other:?}"),
+        }
+    }
+
+    /// The PATCH bind sends is a mutation like any other: drain must not post the new words
+    /// against the row that still has the old ones.
+    #[test]
+    fn drain_waits_for_the_patch_bind_sends() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "instead".into()));
+        assert!(matches!(
+            state.bind_pending_id("m_held", "pum_1".into(), "wait for it"),
+            super::BindPending::Patch { .. }
+        ));
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none());
+        assert!(state.is_send_queued("m_held"));
+    }
+
+    #[test]
+    fn reply_and_recipe_read_off_a_pending_row() {
+        let row: crate::opengrok::PendingUserMessage = serde_json::from_value(serde_json::json!({
+            "id": "pum_1",
+            "content": "later",
+            "replyTo": { "messageId": "m1", "preview": "hi", "isMe": true },
+            "recipeId": "rec_1",
+            "recipeValues": { "q": "x" },
+            "skillId": "skl_1",
+            "clientMessageId": "msg_1"
+        }))
+        .unwrap();
+        let reply = super::reply_from_pending(row.reply_to.as_ref()).expect("reply");
+        assert_eq!(reply.message_id, "m1");
+        assert_eq!(reply.preview, "hi");
+        assert!(reply.is_me);
+        let recipe = super::recipe_from_pending(&row).expect("recipe");
+        assert_eq!(recipe.id, "rec_1");
+        assert_eq!(recipe.values.get("q").and_then(|v| v.as_str()), Some("x"));
+    }
+
+    fn pending_custom(
+        op: &str,
+        message: Option<serde_json::Value>,
+    ) -> crate::opengrok::PendingCustom {
+        let mut value = serde_json::json!({
+            "v": 1,
+            "op": op,
+            "threadId": "cw_1",
+        });
+        if let Some(message) = message {
+            value["message"] = message;
+        }
+        crate::opengrok::PendingCustom::from_agui(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "pending-user-message",
+            "value": value,
+        }))
+        .expect("custom")
+    }
+
+    /// CUSTOM `created` / `snapshot` put a hold on the queue.
+    #[test]
+    fn a_created_custom_holds_the_bubble() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.apply_pending_custom(
+            &pending_custom(
+                "created",
+                Some(serde_json::json!({
+                    "id": "pum_1",
+                    "threadId": "cw_1",
+                    "content": "from the laptop",
+                    "clientMessageId": "msg_other",
+                })),
+            ),
+            None,
+        );
+        assert!(state.is_send_queued("msg_other"));
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0]
+                .pending_id
+                .as_deref(),
+            Some("pum_1")
+        );
+        assert_eq!(bubble(&state, "msg_other").content, "from the laptop");
+    }
+
+    #[test]
+    fn an_edited_custom_changes_the_hold() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.apply_pending_custom(
+            &pending_custom(
+                "edited",
+                Some(serde_json::json!({
+                    "id": "pum_1",
+                    "content": "the new words",
+                    "clientMessageId": "m_held",
+                })),
+            ),
+            Some("m_held"),
+        );
+        assert_eq!(bubble(&state, "m_held").content, "the new words");
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0].content,
+            "the new words"
+        );
+        assert!(state.pending_inflight.is_empty());
+    }
+
+    #[test]
+    fn a_canceled_custom_without_a_message_still_takes_the_hold_off() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.apply_pending_custom(&pending_custom("canceled", None), Some("m_held"));
+        assert!(!state.is_send_queued("m_held"));
+        assert!(bubble(&state, "m_held").hidden);
+        assert!(state.canceled_pending.contains("m_held"));
+    }
+
+    #[test]
+    fn a_drained_custom_drops_the_hold_and_keeps_the_bubble() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.apply_pending_custom(
+            &pending_custom(
+                "drained",
+                Some(serde_json::json!({
+                    "id": "pum_1",
+                    "content": "wait for it",
+                    "clientMessageId": "m_held",
+                    "status": "drained",
+                })),
+            ),
+            Some("m_held"),
+        );
+        assert!(!state.is_send_queued("m_held"));
+        assert!(!bubble(&state, "m_held").hidden);
+    }
+
+    #[test]
+    fn drain_does_not_pop_a_hold_whose_delete_is_in_flight() {
+        let mut state = holding("m_held", "wait for it");
+        state.pending_inflight.insert("m_held".into());
+        go_idle(&mut state);
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "FIFO: the front hold is being canceled or edited"
+        );
+        assert!(state.is_send_queued("m_held"));
+        state.pending_inflight.remove("m_held");
+        assert_eq!(state.pop_queued_send("cw_1").unwrap().message_id, "m_held");
+    }
+
+    #[test]
+    fn hydrate_keeps_an_inflight_hold_instead_of_replacing_it() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.pending_inflight.insert("m_held".into());
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "stale from GET")]);
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0].content,
+            "wait for it"
+        );
+        assert!(!bubble(&state, "m_held").hidden);
+    }
+
+    #[test]
+    fn hydrate_from_snapshot_events_matches_the_row_list() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        let events = vec![serde_json::json!({
+            "type": "CUSTOM",
+            "name": "pending-user-message",
+            "value": {
+                "v": 1,
+                "op": "snapshot",
+                "threadId": "cw_1",
+                "message": {
+                    "id": "pum_1",
+                    "content": "from the event",
+                    "clientMessageId": "msg_other"
+                }
+            }
+        })];
+        let rows = crate::opengrok::PendingCustom::snapshot_messages(&events);
+        state.fold_pending_snapshot("cw_1", &rows);
+        assert!(state.is_send_queued("msg_other"));
+        assert_eq!(bubble(&state, "msg_other").content, "from the event");
+    }
+
+    /// A queued reply as POST /pending saved it: the toolbar's short preview, and no quote line.
+    fn holding_reply_to_a_long_answer() -> (AppState, super::ReplyTo) {
+        let quoted = "The build is green on main.\nEvery crate compiled, every test passed, \
+                      and the deploy is waiting on you.";
+        let mut state = mid_turn(at(message("m_bot", false, quoted), 20));
+        let reply = super::ReplyTo {
+            message_id: "m_bot".into(),
+            preview: "The build is green on main. Every crate compiled, every test passed, an…"
+                .into(),
+            is_me: false,
+        };
+        let mut held = at(message("m_held", true, "ship it?"), 30);
+        held.reply_to_id = Some(reply.message_id.clone());
+        held.reply_preview = Some(reply.preview.clone());
+        state.conversations[0].messages.push(held);
+        let mut queued = super::held_message(
+            "m_held".into(),
+            "ship it?".into(),
+            None,
+            None,
+            Some(reply.clone()),
+        );
+        queued.pending_id = Some("pum_1".into());
+        state
+            .queued_sends
+            .entry("cw_1".into())
+            .or_default()
+            .push_back(queued);
+        (state, reply)
+    }
+
+    /// 409 stale-pending-message: the row changed since this machine read it, and is still
+    /// queued. The hold goes back to the front with the server's words and is sent once more;
+    /// refused again, it stays queued and is not sent again.
+    #[test]
+    fn a_stale_refusal_puts_the_hold_back_with_the_servers_words() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        go_idle(&mut state);
+        let held = state.pop_queued_send("cw_1").expect("drains");
+        state.conversations[0]
+            .messages
+            .push(at(message("r_1", false, ""), 40));
+        let edited = pending_custom(
+            "edited",
+            Some(serde_json::json!({
+                "id": "pum_1",
+                "content": "the laptop's words",
+                "clientMessageId": "m_held",
+                "status": "pending",
+            })),
+        );
+
+        state.put_back_stale_hold("cw_1", "r_1", held, &edited);
+        state.apply_pending_custom(&edited, Some("m_held"));
+        assert_eq!(bubble(&state, "m_held").content, "the laptop's words");
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "r_1"),
+            "the refused turn leaves no reply bubble to carry an error"
+        );
+        let again = state.pop_queued_send("cw_1").expect("sent once more");
+        assert_eq!(again.content, "the laptop's words");
+        assert_eq!(again.pending_id.as_deref(), Some("pum_1"));
+
+        state.put_back_stale_hold("cw_1", "r_2", again, &edited);
+        state.apply_pending_custom(&edited, Some("m_held"));
+        assert!(
+            state.is_send_queued("m_held"),
+            "refused twice, still queued"
+        );
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "and not sent a third time"
+        );
+    }
+
+    /// Parked means another machine's words were refused twice. Words the person types here
+    /// are theirs, so the hold goes out again.
+    #[test]
+    fn editing_a_parked_hold_sends_it_again() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].stale = super::StaleRefusal::Parked;
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none(), "parked");
+
+        assert!(matches!(
+            state.begin_queued_edit("m_held", "my own words".into()),
+            super::QueuedEdit::Applied { .. }
+        ));
+        let next = state.pop_queued_send("cw_1").expect("unparked by the edit");
+        assert_eq!(next.content, "my own words");
+    }
+
+    /// A stale refusal naming a drained row: this run already spent it, so there is nothing to
+    /// put back.
+    #[test]
+    fn a_stale_refusal_for_a_spent_row_leaves_the_hold_off() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        go_idle(&mut state);
+        let held = state.pop_queued_send("cw_1").expect("drains");
+        let drained = pending_custom(
+            "drained",
+            Some(serde_json::json!({
+                "id": "pum_1",
+                "content": "other words",
+                "clientMessageId": "m_held",
+                "status": "drained",
+            })),
+        );
+        state.put_back_stale_hold("cw_1", "r_1", held, &drained);
+        state.apply_pending_custom(&drained, Some("m_held"));
+        assert!(!state.is_send_queued("m_held"));
+        assert_eq!(bubble(&state, "m_held").content, "wait for it");
+        assert!(!bubble(&state, "m_held").hidden);
+    }
+
+    /// OpenGrok compares the LAST user message with the row it drains. A hold still queued behind
+    /// the one going is not part of its turn, and the one going is last even when its answer
+    /// is painted after a later hold.
+    #[test]
+    fn a_drained_hold_is_the_last_user_message_of_its_turn() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        let queue = state.queued_sends.get_mut("cw_1").unwrap();
+        queue.push_back(super::held_message(
+            "m_b".into(),
+            "second".into(),
+            None,
+            None,
+            None,
+        ));
+        queue[0].pending_id = Some("pum_a".into());
+        queue[1].pending_id = Some("pum_b".into());
+        go_idle(&mut state);
+
+        let a = state.pop_queued_send("cw_1").expect("A drains first");
+        let sent: Vec<String> = state
+            .turn_history("cw_1", Some(&a))
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sent, ["m_ask", "m_a"]);
+
+        state.conversations[0]
+            .messages
+            .push(at(message("r_a", false, "done"), 50));
+        let b = state.pop_queued_send("cw_1").expect("then B");
+        let sent: Vec<String> = state
+            .turn_history("cw_1", Some(&b))
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sent, ["m_ask", "m_a", "r_a", "m_b"]);
+    }
+
+    /// OpenGrok drains a queued send only when the last user message is its row: the saved words
+    /// exactly, and `replyTo` exactly as saved. The quote line is the server's to write.
+    #[test]
+    fn a_drained_reply_is_sent_as_its_pending_row() {
+        let (mut state, reply) = holding_reply_to_a_long_answer();
+        go_idle(&mut state);
+        let next = state.pop_queued_send("cw_1").expect("the hold drains");
+        let history = state.turn_history("cw_1", Some(&next));
+        let sent = serde_json::to_value(history.last().expect("the hold")).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "id": "m_held",
+                "role": "user",
+                "content": "ship it?",
+                "replyTo": {
+                    "messageId": "m_bot",
+                    "preview": "The build is green on main. Every crate compiled, every test passed, an…",
+                    "isMe": false,
+                },
+            })
+        );
+        assert_eq!(
+            sent["replyTo"],
+            super::reply_json(&reply),
+            "the replyTo POST /pending saved"
+        );
+
+        let mut never_posted = next.clone();
+        never_posted.pending_id = None;
+        let history = state.turn_history("cw_1", Some(&never_posted));
+        assert_eq!(
+            history.last().map(|m| m.content.as_str()),
+            Some(
+                "[Replying to your earlier message: \"The build is green on main.\nEvery crate \
+                 compiled, every test passed, and the deploy is waiting on you.\"]\n\nship it?"
+            ),
+            "a hold no server heard of keeps the quote in its words, for a server that reads only those"
         );
     }
 

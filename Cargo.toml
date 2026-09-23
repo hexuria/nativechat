@@ -63,6 +63,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1.36", features = ["full", "test-util"] }
+# A real folder on disk, for the one part of this app that reads the person's own files: a
+# skill upload. What it refuses is about what a folder weighs and how many files are in it,
+# and neither can be tested against a list of made-up paths.
+tempfile = "3"
 
 [package.metadata.bundle]
 name = "NativeChat"

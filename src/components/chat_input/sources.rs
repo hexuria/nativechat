@@ -3,8 +3,8 @@
 //! Every list sits behind one small type, so the rows can come from the server later without
 //! the panel or the composer changing: `ToolSource` answers from a hardcoded roster of the
 //! server's built-in tools until the composer can ask for the real one, and `SlashSource`
-//! answers from the recipes and workflows the app has already loaded, a note standing in for the
-//! skills nothing lists yet, and a fixed roster of the app's own actions.
+//! answers from the recipes, workflows and skills the app has already loaded and a fixed roster
+//! of the app's own actions.
 //!
 //! FOUR WORDS, ONE THING EACH. A RECIPE is a taped sequence, replayed exactly by the box alone.
 //! A WORKFLOW is a decision tree that drives recipes, walked by the server, which asks Jev at
@@ -17,8 +17,10 @@
 //! `ParameterSource` and `ValueSource` are the two the composer shows once a recipe is on the
 //! draft: what that recipe needs told, and what one of those things may be told.
 
+use gpui_kit::SharedString;
+
 use crate::components::composer_panel::ComposerPanelRow;
-use crate::opengrok::{RecipeParameter, RecipeParameterKind, RecipeSummary};
+use crate::opengrok::{RecipeParameter, RecipeParameterKind, RecipeSummary, SkillSummary};
 use crate::state::{ActiveRecipe, AppSettingsTab};
 
 /// What a picked row stands for. The panel only says which row it was; this says what to do
@@ -63,6 +65,10 @@ pub enum TokenKind {
     /// because the chip in the message is read by a person, and a person who picked a tree must
     /// not be shown the word for a tape.
     Workflow,
+    /// Prose the model reads before it works. Not the tape above under an older name: what the
+    /// turn carries for one of these is an id the server reads a lesson out of, and the turn
+    /// still runs whatever the person wrote.
+    Skill,
 }
 
 impl TokenKind {
@@ -70,6 +76,10 @@ impl TokenKind {
     /// recipe and a workflow become the message's mode — one pick puts the chip in the message
     /// and the thing itself on the draft — so everything that keeps those two in step asks this
     /// rather than naming one kind and quietly forgetting the other.
+    ///
+    /// A skill goes on the draft too and is still not a mode: it is read before the work rather
+    /// than being the work, it has nothing to be told, and the bar over the composer — which is
+    /// about what is running and what it is still missing — has nothing to say about one.
     pub fn is_mode(self) -> bool {
         matches!(self, Self::Recipe | Self::Workflow)
     }
@@ -154,7 +164,7 @@ const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// What `/` lists: the recipes and workflows the app has, and the app's own commands.
+/// What `/` lists: the recipes, workflows and skills the app has, and the app's own commands.
 ///
 /// Named after the key that opens it, the way [`crate::components::chat_input::PanelMode::Plus`]
 /// is named after the button, because what it lists is several kinds of thing and no one noun
@@ -164,15 +174,24 @@ const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
 /// `kind` on each row, and they are shown in one panel with one search field over them. Two
 /// fetches would mean two flights in the air while somebody is reading the list, and a panel
 /// that shows recipes now and workflows a moment later reads as a workflow that has gone.
+///
+/// Skills are the exception, and cannot be otherwise: they are a different route on the server
+/// (`/skills`, not `/recipes`) and a different kind of thing, so they arrive on their own. What
+/// the rule still buys here is that both listings are asked for as `/` opens and the panel is
+/// refilled as each lands, rather than the list being held back until both are in.
 pub struct SlashSource;
 
 impl SlashSource {
-    /// Recipes first, because they are what `/` is mostly for, then workflows, then the skills
-    /// notice, then the app's own actions.
+    /// Recipes first, because they are what `/` is mostly for, then workflows, then the skills,
+    /// then the app's own actions.
     ///
     /// Grouped by kind rather than left in the server's order, so a list someone is arrowing
     /// through does not alternate between two things that cost wildly different amounts to run.
-    pub fn rows(&self, recipes: &[RecipeSummary]) -> Vec<(ComposerPanelRow, ComposerPick)> {
+    pub fn rows(
+        &self,
+        recipes: &[RecipeSummary],
+        skills: &SkillLibrary<'_>,
+    ) -> Vec<(ComposerPanelRow, ComposerPick)> {
         let mut rows: Vec<(ComposerPanelRow, ComposerPick)> = recipes
             .iter()
             .filter(|recipe| !recipe.is_workflow())
@@ -199,7 +218,7 @@ impl SlashSource {
                 )
             })
             .collect();
-        rows.push(no_skills_yet());
+        rows.extend(skill_rows(skills));
         rows.extend(
             APP_COMMANDS
                 .iter()
@@ -382,29 +401,139 @@ fn typed_hint(parameter: &RecipeParameter) -> String {
     }
 }
 
-/// The one row standing in for skills, which nothing lists yet.
+/// The skills a person can invoke, and how that listing is getting on.
 ///
-/// It was a made-up `example-skill` that could be picked, and picking it put a chip in the
-/// message that stood for nothing anywhere: no lesson was written, and nothing read one. A row
-/// that can be taken and does nothing is worse than a row that says it is not ready, so this is
-/// a notice — shown, dimmed, never picked — the same as the plugins line above the tools.
+/// The three are one argument because a list with nothing in it means nothing on its own: empty
+/// is "write your first one" while a fetch is in flight and "the server would not say" when one
+/// has failed, and a `/` that reads the first of those out over either of the others sends
+/// somebody off to write a skill they already have.
+pub struct SkillLibrary<'a> {
+    pub skills: &'a [SkillSummary],
+    pub loading: bool,
+    pub error: Option<&'a str>,
+}
+
+/// The skills the library holds, as rows of the `/` list.
 ///
-/// A skill is a lesson: written notes on how a task is done, which the model reads. There is
-/// nowhere to keep one yet (see the teach-a-task sheet, which says the same in its own words),
-/// so what this row promises is a word, not a feature. Delete it the day a lesson has a home.
+/// A skill that cannot be invoked is here and cannot be taken. The server refuses an id it will
+/// not run, so a row that put one in the message would be a chip whose mistake costs a round
+/// trip to find out about; it is a notice instead — shown, dimmed, never picked — the same as
+/// the plugins line above the tools. There are two ways to be one, and the row says both when
+/// both are true, because the ways out are different: a draft has to be written, and a skill
+/// switched off has to be switched back on.
+///
+/// Rows beat news. A library that has arrived is shown while the next fetch runs, rather than
+/// replaced by a line about fetching.
+fn skill_rows(library: &SkillLibrary<'_>) -> Vec<(ComposerPanelRow, ComposerPick)> {
+    if library.skills.is_empty() {
+        return vec![match (library.loading, library.error) {
+            (true, _) => skill_notice("Loading your skills", "One moment"),
+            (false, Some(why)) => skill_notice("Your skills could not be loaded", why),
+            (false, None) => no_skills_yet(),
+        }];
+    }
+    let mut sorted: Vec<&SkillSummary> = library.skills.iter().collect();
+    // By name, not in the order the server listed them. The panel is arrowed through and typed
+    // at, and a list whose order is nobody's is a list that has to be read from the top every
+    // time; the server's order is its own business and has changed under this before.
+    sorted.sort_by_key(|skill| skill_name(skill).to_lowercase());
+    sorted
+        .into_iter()
+        .map(|skill| {
+            let name = skill_name(skill);
+            let row = ComposerPanelRow::new(
+                format!("skill:{}", skill.id),
+                "icons/study.svg",
+                name.clone(),
+                skill_described(skill),
+            )
+            .label("Skill");
+            if why_not(skill).is_some() {
+                return (row.note(), ComposerPick::Nothing);
+            }
+            (
+                row,
+                ComposerPick::Token {
+                    kind: TokenKind::Skill,
+                    // The id, not the name. Two skills may be called the same thing, and the
+                    // turn names one of them; nothing anywhere resolves a name back to an id.
+                    id: skill.id.clone(),
+                    text: name,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The one row a library with nothing in it shows.
+///
+/// A `/` list with no skill in it at all reads as a list that failed to load, and the word is
+/// worth keeping in front of someone who has never written one: `/` is where a skill is used,
+/// and the row says where one is made.
 fn no_skills_yet() -> (ComposerPanelRow, ComposerPick) {
+    skill_notice(
+        "No skills yet",
+        "Prose your bot reads before it works — write one in Settings → Skills",
+    )
+}
+
+/// The one row that stands where the skills would be: nothing yet, nothing so far, or nothing
+/// the server would give. One id, because it is one row in one place and a driver asserting on
+/// it is asking the same question each time; what it says is the answer.
+fn skill_notice(
+    title: &'static str,
+    standing: impl Into<SharedString>,
+) -> (ComposerPanelRow, ComposerPick) {
     (
-        ComposerPanelRow::new(
-            "skill:none",
-            "icons/study.svg",
-            "Skills",
-            "A lesson your bot reads before it works — not written or kept anywhere yet",
-        )
-        .element_id("composer-skills-none")
-        .label("Skill")
-        .note(),
+        ComposerPanelRow::new("skill:none", "icons/study.svg", title, standing)
+            .element_id("composer-skills-none")
+            .label("Skill")
+            .note(),
         ComposerPick::Nothing,
     )
+}
+
+/// A skill with no name still has to be readable in a list, and it is called the same thing
+/// here as on the Skills page.
+///
+/// The run of spaces is collapsed for the same reason a recipe's is: the name becomes a chip in
+/// the message, and a chip is one token.
+pub(crate) fn skill_name(skill: &SkillSummary) -> String {
+    let name = skill.name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        "Untitled skill".to_string()
+    } else {
+        name
+    }
+}
+
+/// The line under a skill's name: why it cannot be taken, if it cannot, and then what it is
+/// for.
+///
+/// Both halves, not one. What the skill is for is the half the search reads, and it is exactly
+/// what somebody hunting for the one they need to go and fix is typing; a row that dropped its
+/// description to make room for its excuse could not be found at all. The excuse comes first
+/// because it is why the row will not take.
+fn skill_described(skill: &SkillSummary) -> String {
+    let said = skill.description.trim();
+    match (why_not(skill), said.is_empty()) {
+        (None, true) => "Prose your bot reads before it works".to_string(),
+        (None, false) => said.to_string(),
+        (Some(why), true) => why.to_string(),
+        (Some(why), false) => format!("{why} — {said}"),
+    }
+}
+
+/// Why this skill cannot be invoked, when it cannot. Both reasons when both hold: writing the
+/// prose into a draft that is also switched off leaves it switched off, and a row that named one
+/// reason would send somebody back a second time.
+fn why_not(skill: &SkillSummary) -> Option<&'static str> {
+    match (skill.draft, skill.enabled) {
+        (true, true) => Some("No prose in it yet"),
+        (true, false) => Some("No prose in it yet, and switched off"),
+        (false, false) => Some("Switched off, so nothing may run it"),
+        (false, true) => None,
+    }
 }
 
 /// A recipe with no name still has to be readable in a list.
@@ -522,9 +651,39 @@ const APP_COMMANDS: &[(&str, &str, &str, &str, AppCommand)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerPick, ParameterSource, SlashSource, TokenKind, ToolSource, ValueSource};
-    use crate::opengrok::{RecipeParameter, RecipeSummary};
+    use super::{
+        ComposerPanelRow, ComposerPick, ParameterSource, SkillLibrary, SlashSource, TokenKind,
+        ToolSource, ValueSource,
+    };
+    use crate::opengrok::{RecipeParameter, RecipeSummary, SkillSummary};
     use crate::state::ActiveRecipe;
+
+    /// A library that has arrived, for a panel waiting on nothing.
+    fn listed(skills: &[SkillSummary]) -> SkillLibrary<'_> {
+        SkillLibrary {
+            skills,
+            loading: false,
+            error: None,
+        }
+    }
+
+    /// A library with one of each thing a row can be: two that can be taken, a draft with no
+    /// prose in it, and one somebody switched off.
+    fn library() -> Vec<SkillSummary> {
+        serde_json::from_value(serde_json::json!([
+            {
+                "id": "skl_1", "name": "expense-report",
+                "description": "File a receipt the way the firm wants it"
+            },
+            {
+                "id": "skl_2", "name": "standup-notes",
+                "description": "Write up what the team said"
+            },
+            { "id": "skl_3", "name": "half-written", "description": "", "draft": true },
+            { "id": "skl_4", "name": "retired", "description": "Was used", "enabled": false }
+        ]))
+        .expect("the listing `/skills` sends")
+    }
 
     /// The recipe the owner hit this on: one required text parameter and nothing else.
     fn youtube() -> ActiveRecipe {
@@ -564,7 +723,7 @@ mod tests {
     /// The whole point of the four words: the one list says which of them each row is.
     #[test]
     fn the_slash_list_calls_a_tape_a_recipe_and_a_tree_a_workflow() {
-        let rows = SlashSource.rows(&one_of_each());
+        let rows = SlashSource.rows(&one_of_each(), &listed(&[]));
         let (tape, tape_pick) = &rows[0];
         let (tree, tree_pick) = &rows[1];
         assert_eq!(tape.title, "Weekly report");
@@ -611,7 +770,7 @@ mod tests {
     fn the_recipes_come_before_the_workflows_whatever_order_they_arrived_in() {
         let mut listing = one_of_each();
         listing.reverse();
-        let rows = SlashSource.rows(&listing);
+        let rows = SlashSource.rows(&listing, &listed(&[]));
         assert_eq!(
             rows.iter()
                 .take(2)
@@ -685,7 +844,7 @@ mod tests {
         let recipe: RecipeSummary =
             serde_json::from_value(serde_json::json!({ "id": "rec_1", "name": "Weekly  report" }))
                 .expect("a recipe needs nothing but an id and a name");
-        let rows = SlashSource.rows(&[recipe]);
+        let rows = SlashSource.rows(&[recipe], &listed(&[]));
         assert_eq!(
             rows[0].1,
             ComposerPick::Token {
@@ -706,7 +865,7 @@ mod tests {
 
     #[test]
     fn the_app_commands_come_after_the_recipes_and_say_so() {
-        let rows = SlashSource.rows(&[]);
+        let rows = SlashSource.rows(&[], &listed(&[]));
         let commands: Vec<_> = rows
             .iter()
             .skip_while(|(row, _)| !row.id.starts_with("action:"))
@@ -874,23 +1033,267 @@ mod tests {
         );
     }
 
-    /// A skill is a lesson the model reads, and nothing writes or keeps one yet. The row that
-    /// used to stand here could be picked and left a chip standing for nothing; a row that does
-    /// nothing has to say so rather than look like a row that works.
+    /// The whole of what this change is for: a skill in the library is a row in `/`, and taking
+    /// it leaves a chip whose id is what the turn will name.
     #[test]
-    fn skills_are_a_notice_rather_than_a_row_that_can_be_taken() {
-        let rows = SlashSource.rows(&[]);
+    fn a_skill_is_a_row_and_picking_it_yields_a_skill_chip() {
+        let rows = SlashSource.rows(&[], &listed(&library()));
+        let (row, pick) = rows
+            .iter()
+            .find(|(row, _)| row.id == "skill:skl_1")
+            .expect("the skill the library holds is offered");
+        assert_eq!(row.title, "expense-report");
+        assert_eq!(row.description, "File a receipt the way the firm wants it");
+        assert_eq!(
+            row.label.as_deref(),
+            Some("Skill"),
+            "prose the bot reads is a Skill; the tape it replays is a Recipe, and the list has \
+             to say which of the two a row is"
+        );
+        assert!(row.selectable);
+        assert_eq!(
+            *pick,
+            ComposerPick::Token {
+                kind: TokenKind::Skill,
+                id: "skl_1".into(),
+                // The `/` that opened the panel is how it was asked for, not part of the name.
+                text: "expense-report".into(),
+            }
+        );
+        let ComposerPick::Token { kind, .. } = pick else {
+            panic!("a skill row is a chip: {pick:?}");
+        };
+        assert!(
+            !kind.is_mode(),
+            "a skill is read before the work, not the work: it must not put itself on the bar \
+             or open the list of what a recipe needs told"
+        );
+    }
+
+    /// Two skills of one name are two rows. Nothing resolves a name back to an id — the pick
+    /// carries the id — so the one that was taken is the one that goes.
+    #[test]
+    fn two_skills_of_one_name_are_two_rows_under_two_ids() {
+        let twins: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "expenses", "description": "Ours" },
+            { "id": "skl_2", "name": "expenses", "description": "The one Ada shared" }
+        ]))
+        .unwrap();
+        let rows = SlashSource.rows(&[], &listed(&twins));
+        let picks: Vec<&ComposerPick> = rows
+            .iter()
+            .filter(|(row, _)| row.id.starts_with("skill:"))
+            .map(|(_, pick)| pick)
+            .collect();
+        assert_eq!(
+            picks,
+            vec![
+                &ComposerPick::Token {
+                    kind: TokenKind::Skill,
+                    id: "skl_1".into(),
+                    text: "expenses".into(),
+                },
+                &ComposerPick::Token {
+                    kind: TokenKind::Skill,
+                    id: "skl_2".into(),
+                    text: "expenses".into(),
+                },
+            ],
+            "both are listed and neither is chosen for the person"
+        );
+    }
+
+    /// The search over `/` reads a row's name and the line under it, and a skill's line is the
+    /// description its author wrote — which is the half somebody who remembers "the expenses
+    /// one" is remembering.
+    #[test]
+    fn a_query_finds_a_skill_by_its_name_or_by_what_it_is_for() {
+        let rows = SlashSource.rows(&[], &listed(&library()));
+        let matching = |needle: &str| -> Vec<&str> {
+            rows.iter()
+                .filter(|(row, _)| row.id.starts_with("skill:") && row.matches(needle))
+                .map(|(row, _)| row.title.as_ref())
+                .collect()
+        };
+        assert_eq!(matching("expense"), vec!["expense-report"]);
+        assert_eq!(
+            matching("receipt"),
+            vec!["expense-report"],
+            "what the skill is for is worth searching, not just what it is called"
+        );
+        assert_eq!(matching("standup"), vec!["standup-notes"]);
+        assert!(matching("nothing like it").is_empty());
+    }
+
+    /// The server refuses an id it will not run, so a row that cannot be run cannot be taken:
+    /// a chip whose mistake only shows up as a refused turn is worse than a row that says now.
+    #[test]
+    fn a_draft_and_a_switched_off_skill_are_shown_and_cannot_be_taken() {
+        let rows = SlashSource.rows(&[], &listed(&library()));
+        let refused = |id: &str| -> &(ComposerPanelRow, ComposerPick) {
+            rows.iter()
+                .find(|(row, _)| row.id == id)
+                .expect("every skill in the library is in the list")
+        };
+        let (draft, draft_pick) = refused("skill:skl_3");
+        assert!(!draft.selectable, "there is no prose in it to read");
+        assert_eq!(*draft_pick, ComposerPick::Nothing);
+        assert!(
+            draft.description.contains("No prose in it yet"),
+            "the row says which of the two ways it cannot be used it is, because writing it \
+             and switching it back on are different things to go and do: {:?}",
+            draft.description
+        );
+        let (off, off_pick) = refused("skill:skl_4");
+        assert!(!off.selectable);
+        assert_eq!(*off_pick, ComposerPick::Nothing);
+        assert!(
+            off.description.contains("Switched off"),
+            "{:?}",
+            off.description
+        );
+    }
+
+    /// A list with nothing in it means nothing on its own. "No skills yet" over a fetch that is
+    /// still running is a lie on the first `/` of every session, and over one that failed it
+    /// sends somebody with twenty skills off to write their first.
+    #[test]
+    fn an_empty_slash_list_says_which_kind_of_empty_it_is() {
+        let notice = |library: SkillLibrary<'_>| -> ComposerPanelRow {
+            SlashSource
+                .rows(&[], &library)
+                .into_iter()
+                .find(|(row, _)| row.id == "skill:none")
+                .expect("the one row that stands where the skills would be")
+                .0
+        };
+        let waiting = notice(SkillLibrary {
+            skills: &[],
+            loading: true,
+            error: None,
+        });
+        assert_eq!(waiting.title, "Loading your skills");
+        let refused = notice(SkillLibrary {
+            skills: &[],
+            loading: false,
+            error: Some("the server would not say"),
+        });
+        assert!(refused.title.contains("could not be loaded"), "{refused:?}");
+        assert_eq!(
+            refused.description, "the server would not say",
+            "the server's own sentence, not a sentence about it"
+        );
+        assert_eq!(notice(listed(&[])).title, "No skills yet");
+
+        // Rows beat news: a library that has arrived is not replaced by a line about fetching.
+        let rows = SlashSource.rows(
+            &[],
+            &SkillLibrary {
+                skills: &library(),
+                loading: true,
+                error: Some("an older refusal"),
+            },
+        );
+        assert!(rows.iter().all(|(row, _)| row.id != "skill:none"));
+        assert!(rows.iter().any(|(row, _)| row.id == "skill:skl_1"));
+    }
+
+    /// Both reasons when both hold, and the description kept either way: what a skill is for is
+    /// the half the search reads, and it is exactly what somebody hunting for the one they have
+    /// to go and fix is typing.
+    #[test]
+    fn a_row_that_will_not_take_says_why_and_still_says_what_it_is_for() {
+        let awkward: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "skl_5", "name": "both", "description": "File a receipt",
+                "draft": true, "enabled": false
+            }
+        ]))
+        .unwrap();
+        let rows = SlashSource.rows(&[], &listed(&awkward));
+        let (row, pick) = rows
+            .iter()
+            .find(|(row, _)| row.id == "skill:skl_5")
+            .expect("the row is listed");
+        assert!(!row.selectable);
+        assert_eq!(*pick, ComposerPick::Nothing);
+        assert!(
+            row.description.contains("No prose in it yet")
+                && row.description.contains("switched off"),
+            "writing the prose would leave it switched off, so one reason is half an answer: \
+             {:?}",
+            row.description
+        );
+        assert!(
+            row.matches("receipt"),
+            "and the search still finds it by what it is for: {:?}",
+            row.description
+        );
+    }
+
+    /// By name, not in whatever order the server listed them: the panel is arrowed through, and
+    /// an order that is nobody's has to be read from the top every time.
+    #[test]
+    fn the_skills_are_listed_by_name() {
+        let jumbled: Vec<SkillSummary> = serde_json::from_value(serde_json::json!([
+            { "id": "skl_1", "name": "zebra" },
+            { "id": "skl_2", "name": "Apple" },
+            { "id": "skl_3", "name": "mango" }
+        ]))
+        .unwrap();
+        let rows = SlashSource.rows(&[], &listed(&jumbled));
+        assert_eq!(
+            rows.iter()
+                .filter(|(row, _)| row.id.starts_with("skill:"))
+                .map(|(row, _)| row.title.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["Apple", "mango", "zebra"],
+            "and the case a name was typed in is not where it belongs in the list"
+        );
+    }
+
+    /// A library with nothing in it says so rather than leaving the word out of the list
+    /// altogether: `/` is where a skill is used, so it is where someone learns there are none.
+    #[test]
+    fn an_empty_library_is_a_notice_rather_than_no_rows_at_all() {
+        let rows = SlashSource.rows(&[], &listed(&[]));
         let (row, pick) = rows
             .iter()
             .find(|(row, _)| row.id == "skill:none")
-            .expect("the `/` list says what a skill is even while nothing lists one");
+            .expect("the `/` list says there are none rather than saying nothing");
         assert_eq!(row.label.as_deref(), Some("Skill"));
         assert!(!row.selectable, "there is nothing there to take");
         assert_eq!(*pick, ComposerPick::Nothing);
         assert!(
-            row.description.to_lowercase().contains("not"),
-            "the row has to read as something that is not ready, and it read {:?}",
+            row.description.contains("Settings → Skills"),
+            "the row has to say where one is written, and it read {:?}",
             row.description
         );
+        assert!(
+            !SlashSource
+                .rows(&[], &listed(&library()))
+                .iter()
+                .any(|(row, _)| row.id == "skill:none"),
+            "a library with something in it has no reason to say it is empty"
+        );
+    }
+
+    /// Skills sit between the workflows and the app's own actions, so the `/` list runs from
+    /// what the bot does to what the app does without doubling back.
+    #[test]
+    fn the_skills_come_after_the_workflows_and_before_the_actions() {
+        let rows = SlashSource.rows(&one_of_each(), &listed(&library()));
+        let kinds: Vec<&str> = rows
+            .iter()
+            .map(|(row, _)| match row.id.split(':').next().unwrap_or("") {
+                "recipe" => "recipe",
+                "skill" => "skill",
+                _ => "action",
+            })
+            .collect();
+        let first_skill = kinds.iter().position(|kind| *kind == "skill").unwrap();
+        let first_action = kinds.iter().position(|kind| *kind == "action").unwrap();
+        let last_recipe = kinds.iter().rposition(|kind| *kind == "recipe").unwrap();
+        assert!(last_recipe < first_skill && first_skill < first_action);
     }
 }

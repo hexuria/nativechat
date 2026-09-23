@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::error::OpenGrokError;
+use super::error::{OpenGrokError, reads_as_gateway_unreachable};
+use super::pending::{
+    PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
+};
 use super::types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate,
     error_message_from_body,
@@ -295,6 +298,19 @@ impl OpenGrokClient {
         path: &str,
         body: Option<&T>,
     ) -> Result<reqwest::Response, OpenGrokError> {
+        self.send_json_within(method, path, body, None).await
+    }
+
+    /// [`Self::send_json`] with a deadline of its own, for the one kind of route that is not a
+    /// database read: one that waits on a model. `None` is every other route, which takes the
+    /// client's default and has no deadline of its own.
+    async fn send_json_within<T: Serialize>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&T>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response, OpenGrokError> {
         let url = self.url(path)?;
         self.ensure_fresh_token(path).await;
         let build = |token: Option<String>| {
@@ -304,6 +320,9 @@ impl OpenGrokClient {
             }
             if let Some(body) = body {
                 req = req.json(body);
+            }
+            if let Some(timeout) = timeout {
+                req = req.timeout(timeout);
             }
             req
         };
@@ -352,7 +371,11 @@ impl OpenGrokClient {
         // `from_server` rather than `status`, because some of what the server refuses with is
         // not a refusal at all: "the gateway could not be reached" is the server reporting a
         // machine it could not get to, which is a state and not a verdict about the request.
+        let event = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|body| body.get("event").cloned());
         OpenGrokError::from_server(Some(status), error_message_from_body(&body))
+            .with_pending_event(event)
     }
 
     /// Nothing on a 2xx, the server's error otherwise. For the doors that answer 204.
@@ -770,7 +793,13 @@ impl OpenGrokClient {
     /// NativeChat is a new client: same coworker + transcript, `POST /ag-ui` SSE instead.
     ///
     /// A recipe the person put on this turn goes in `forwardedProps` beside the coworker, with
-    /// the values its parameters were given. The messages are untouched by it.
+    /// the values its parameters were given, and a skill goes there as its id. The messages are
+    /// untouched by either: a parameter value is not prose, and there is no `/name` left in the
+    /// text for the server to read a skill out of — the id is a field or the skill does not go.
+    ///
+    /// `pending_id` is the `pum_…` row this turn is firing, when the send was queued. The
+    /// server drains that row atomically before the harness starts so two machines cannot both
+    /// post it. Absent, a last user-message id that matches `clientMessageId` still drains.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
@@ -784,6 +813,8 @@ impl OpenGrokClient {
         run_id: &str,
         messages: &[AguiMessage],
         recipe: Option<&TurnRecipe>,
+        skill: Option<&str>,
+        pending_id: Option<&str>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
@@ -793,6 +824,15 @@ impl OpenGrokClient {
         if let Some(recipe) = recipe {
             forwarded["recipe"] = Value::String(recipe.id.clone());
             forwarded["recipeValues"] = Value::Object(recipe.values.clone());
+        }
+        // The key is only written when there is a skill, so a turn sent without one is the turn
+        // that was sent before any of this existed, byte for byte. An unknown id is the server's
+        // to refuse, and it says so in the frame that ends the run.
+        if let Some(skill) = skill {
+            forwarded["skill"] = Value::String(skill.to_string());
+        }
+        if let Some(pending_id) = pending_id.filter(|id| !id.is_empty()) {
+            forwarded["pendingId"] = Value::String(pending_id.to_string());
         }
         let body = json!({
             "threadId": thread_id,
@@ -1087,6 +1127,78 @@ impl OpenGrokClient {
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// Live follow-ups on this thread, oldest first.
+    ///
+    /// A 404 is either an OpenGrok that has not shipped the store yet, or a thread this
+    /// account has never run — same status the server uses so a pending id is not a probe.
+    /// Callers keep the local queue.
+    pub async fn list_pending_user_messages(
+        &self,
+        thread_id: &str,
+    ) -> Result<PendingList, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Hold a follow-up on the server until the thread is idle. Idempotent on
+    /// `clientMessageId`: a retry returns the existing pending row. `409 already-consumed`
+    /// means that bubble already became a run. The CUSTOM is `op: created`.
+    pub async fn enqueue_pending_user_message(
+        &self,
+        thread_id: &str,
+        body: &PendingWrite,
+    ) -> Result<PendingMutation, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending");
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Change a live follow-up's words. `404` means it is no longer this account's pending
+    /// row — drained, canceled, or somebody else's. The CUSTOM is `op: edited`.
+    pub async fn edit_pending_user_message(
+        &self,
+        thread_id: &str,
+        pending_id: &str,
+        body: &PendingWrite,
+    ) -> Result<PendingMutation, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending/{pending_id}");
+        let response = self
+            .send_json(reqwest::Method::PATCH, &path, Some(body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Take a follow-up back so it never becomes a run. Idempotent: drained, already
+    /// canceled, and never-heard-of ids on a thread this account owns are the same 200.
+    /// The CUSTOM is `op: canceled` and omits `message`.
+    pub async fn cancel_pending_user_message(
+        &self,
+        thread_id: &str,
+        pending_id: &str,
+    ) -> Result<PendingMutation, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending/{pending_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        match response.json::<PendingMutation>().await {
+            Ok(mutation) => Ok(mutation),
+            Err(_) => Ok(PendingMutation {
+                v: 1,
+                thread_id: thread_id.to_string(),
+                pending_user_message: None,
+                event: None,
+            }),
+        }
     }
 
     /// Hide a turn for this account, on every machine it signs in from.
@@ -1412,6 +1524,205 @@ impl OpenGrokClient {
         }
     }
 
+    // ---- skills ----
+    //
+    // A SKILL is prose the model reads before it works: a `SKILL.md` with a name and a
+    // description in its frontmatter, kept on the server and invoked by typing `/name`. It is
+    // not a RECIPE, which is a taped replay of clicks; the two are different kinds of thing
+    // that happen to share a slash.
+
+    /// The skills the person can see: `mine`, `shared` (with them) or `org`; everything when
+    /// `filter` is `None`.
+    ///
+    /// The answer is the rows themselves, not an object with a key in it — `/skills` differs
+    /// from `/recipes` there, and reading it the other way gets an empty list rather than an
+    /// error.
+    pub async fn list_skills(
+        &self,
+        filter: Option<&str>,
+    ) -> Result<Vec<SkillSummary>, OpenGrokError> {
+        let path = match filter {
+            Some(filter) => format!("/skills?filter={filter}"),
+            None => "/skills".to_string(),
+        };
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Write one down, or take one that was uploaded: one door, and what tells them apart is
+    /// the word on `source` and whether files came with it.
+    ///
+    /// The body is the whole `SKILL.md`, frontmatter and all. The server has the one parser for
+    /// it and reads the name and the description out of the frontmatter when the fields here are
+    /// blank, so a skill's file and its row cannot come to disagree about what it is called.
+    ///
+    /// The 8000-character cap on the body is the server's, and so is the sentence naming it: the
+    /// refusal comes back as the server's own words and goes to the person unchanged, rather
+    /// than through a second copy of the number here that would have to be kept in step.
+    pub async fn create_skill(&self, new: &NewSkill) -> Result<SkillDetail, OpenGrokError> {
+        let mut body = json!({
+            "name": new.name,
+            "source": new.source.word(),
+        });
+        if !new.description.trim().is_empty() {
+            body["description"] = json!(new.description);
+        }
+        // Absent leaves a draft — a row with a name and no prose yet — which is not the same as
+        // a skill whose body is the empty string.
+        if !new.body.trim().is_empty() {
+            body["body"] = json!(new.body);
+        }
+        if !new.files.is_empty() {
+            body["files"] = json!(new.files);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, "/skills", Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// A taped task written up as a skill: the raw tape goes to the server, a model reads it,
+    /// and what comes back is a skill whose prose says what was being done.
+    ///
+    /// The tape is the one `POST /recipes` takes — thinned first, see [`thin_tape`] — and this
+    /// is the other thing that can be made of it. A RECIPE replays the clicks; a SKILL is the
+    /// lesson, and the two are made from one recording by two different routes.
+    ///
+    /// Both words are optional and both are left out when blank, because the server has an
+    /// answer for each: a name it mints as `taught-<hex>`, and a description the same model
+    /// writes. Sending `""` would be asking it to keep an empty one.
+    ///
+    /// What comes back is switched off (`enabled: false`). Nobody has read it yet, and the
+    /// server refuses a switched-off skill even to the person who owns it, so the caller has
+    /// something to say to the person rather than a row to file.
+    ///
+    /// Every refusal is the server's own sentence and reaches the caller as written — including
+    /// the `502` it answers when the model wrote nothing that can be kept, which is a verdict
+    /// about a model and not a hop that could not be reached. See [`Self::tape_error`]: this
+    /// route's failures are told apart here, where the route is known, because their status
+    /// lines mean something different here than anywhere else in this client.
+    pub async fn create_skill_from_tape(
+        &self,
+        coworker_id: &str,
+        name: &str,
+        description: &str,
+        raw: &[Value],
+    ) -> Result<SkillDetail, OpenGrokError> {
+        let mut body = json!({
+            "coworkerId": coworker_id,
+            "screen": { "width": RECIPE_SCREEN.0, "height": RECIPE_SCREEN.1 },
+            "raw": raw,
+        });
+        if !name.trim().is_empty() {
+            body["name"] = json!(name);
+        }
+        if !description.trim().is_empty() {
+            body["description"] = json!(description);
+        }
+        let response = self
+            .send_json_within(
+                reqwest::Method::POST,
+                "/skills/from-tape",
+                Some(&body),
+                Some(SKILL_FROM_TAPE_TIMEOUT),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::tape_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))
+    }
+
+    /// What a refusal from `/skills/from-tape` IS, which its status line does not say on its own.
+    ///
+    /// [`Self::read_error`] reads any `502`-`504` as something standing in front of OpenGrok
+    /// that could not reach it — true everywhere else, because nothing this app talks to answers
+    /// those itself. THIS ROUTE DOES. A `502` here is OpenGrok saying the model ran and produced
+    /// nothing that can be kept (it refused, said nothing, wrote something unfenced, or overran
+    /// the cap), and a `504` is that model overrunning the server's own sixty seconds. Both are
+    /// decisions about this recording, and the same bytes earn the same decision — which is
+    /// exactly what a caller needs to know before it offers to send them again.
+    ///
+    /// Told apart here for the same reason a `401` is: only the caller that knows the route can
+    /// know what the number meant. What is still out of reach is out of reach — OpenGrok saying
+    /// it could not get to the model gateway is a state, nothing ran, and that one keeps its
+    /// kind.
+    async fn tape_error(response: reqwest::Response) -> OpenGrokError {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let message = error_message_from_body(&body);
+        if reads_as_gateway_unreachable(&message) {
+            return OpenGrokError::from_server(Some(status), message);
+        }
+        OpenGrokError::status(status, message)
+    }
+
+    pub async fn skill(&self, id: &str) -> Result<SkillDetail, OpenGrokError> {
+        let path = format!("/skills/{id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Rename it, re-describe it, switch it on or off. A field left `None` is left alone, which
+    /// is what the server reads from a field that is not in the JSON at all.
+    pub async fn update_skill(
+        &self,
+        id: &str,
+        patch: &SkillPatch,
+    ) -> Result<SkillDetail, OpenGrokError> {
+        let path = format!("/skills/{id}");
+        let response = self
+            .send_json(reqwest::Method::PUT, &path, Some(patch))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Drop one. The server keeps the row so a turn that cited this skill can still say what it
+    /// cited; what goes is the person's ability to find it or invoke it.
+    pub async fn delete_skill(&self, id: &str) -> Result<(), OpenGrokError> {
+        let path = format!("/skills/{id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
+    /// New prose for a skill that already exists. The files ride along because they are kept per
+    /// version: what is not sent here is not beside this body, so a version that dropped a
+    /// reference sheet does not go on finding the old one.
+    ///
+    /// `source` is sent rather than left to the server to work out. Left off, the server reads a
+    /// version with no files beside it as hand-authored — so an upload whose whole bundle is one
+    /// `SKILL.md` would be recorded as something somebody typed here.
+    pub async fn add_skill_version(
+        &self,
+        id: &str,
+        body: &str,
+        note: &str,
+        source: SkillSource,
+        files: &[SkillFile],
+    ) -> Result<SkillVersion, OpenGrokError> {
+        let path = format!("/skills/{id}/versions");
+        let mut payload = json!({ "body": body, "kind": source.word() });
+        if !note.trim().is_empty() {
+            payload["note"] = json!(note);
+        }
+        if !files.is_empty() {
+            payload["files"] = json!(files);
+        }
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(&payload))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     /// The coworker's schedules, which is what a routine is on the server.
     ///
     /// The `?coworker=` is the server's filter; the answer is filtered again here on the same
@@ -1692,6 +2003,28 @@ pub struct ThreadReplay {
     /// go on painting from its own copy what the person deleted on another.
     #[serde(rename = "hiddenRunIds", default, deserialize_with = "list_or_nothing")]
     pub hidden_run_ids: Vec<String>,
+    /// Live follow-ups that have not become a run. `None` when the server has never heard of
+    /// this field (OpenGrok before #171): the local queue is left alone. `Some` is the
+    /// snapshot to replace synced holds with — empty meaning none are pending.
+    #[serde(rename = "pendingUserMessages", default)]
+    pub pending_user_messages: Option<Vec<PendingUserMessage>>,
+    /// CUSTOM `pending-user-message` snapshots for the live queue. `None` on
+    /// OpenGrok before #171; `Some` (even empty) is preferred over
+    /// `pending_user_messages` when hydrating.
+    #[serde(rename = "pendingEvents", default)]
+    pub pending_events: Option<Vec<Value>>,
+}
+
+impl ThreadReplay {
+    /// Live pending rows: snapshot CUSTOMs when `pendingEvents` is present,
+    /// otherwise `pendingUserMessages`. `None` means the server predates the
+    /// field and the local queue must be left alone.
+    pub fn live_pending_messages(&self) -> Option<Vec<PendingUserMessage>> {
+        match &self.pending_events {
+            Some(events) => Some(PendingCustom::snapshot_messages(events)),
+            None => self.pending_user_messages.clone(),
+        }
+    }
 }
 
 /// One turn of a thread, as the server kept it.
@@ -3040,6 +3373,181 @@ impl RecipeRunResult {
     }
 }
 
+/// Where a skill's prose came from.
+///
+/// `Taught` is the server's own word for a body a turn wrote down from a recording, and it
+/// refuses a client that claims it — so a skill made from this app is `Authored` or `Uploaded`.
+/// Last and the catch-all is `Authored`, because a word this client has no name for is still a
+/// skill somebody has: reading it as written-by-hand keeps the row listable, and the alternative
+/// is one unknown source taking the whole listing down with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillSource {
+    Uploaded,
+    Taught,
+    #[default]
+    #[serde(other)]
+    Authored,
+}
+
+impl SkillSource {
+    /// The word the server sends and takes.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::Uploaded => "uploaded",
+            Self::Taught => "taught",
+        }
+    }
+
+    /// What the row's chip says, or `None` for a skill somebody wrote here — the plainest case,
+    /// which needs no label to tell it from itself.
+    pub fn chip(self) -> Option<&'static str> {
+        match self {
+            Self::Authored => None,
+            Self::Uploaded => Some("Uploaded"),
+            Self::Taught => Some("Taught"),
+        }
+    }
+}
+
+/// One supporting file beside a skill's `SKILL.md`: a reference sheet, a checklist, a short
+/// script. Copied onto the coworker's computer before a turn that invokes the skill.
+///
+/// `bytes` is base64 in both directions, as `/artifacts` does it — a JSON body rather than
+/// multipart, so one shape carries the whole bundle. It is the file's content, never its size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillFile {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub path: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub bytes: String,
+}
+
+/// One row of the Skills list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSummary {
+    pub id: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub name: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub source: SkillSource,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub version_count: u32,
+    /// Named and kept, but with no prose in it yet, so there is nothing to invoke.
+    #[serde(default)]
+    pub draft: bool,
+    /// Off means nobody in the org sees it and nothing may run it. The server sends it so a
+    /// page that offers the switch can draw it in the state it is actually in.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// When the owner first switched this skill on, and `None` while nobody has.
+    ///
+    /// Approval as a FACT, which is the one thing `enabled` cannot say on its own: a lesson a
+    /// model wrote and nobody has read is off, and a lesson somebody read and deliberately
+    /// switched off is also off. The server stamps this the first time an owner switches a
+    /// skill on and never unsays it, so off-and-never-stamped is "waiting to be read" and
+    /// off-and-stamped is "read, and not wanted".
+    ///
+    /// `None` by default, so a server from before the stamp existed reads as never approved
+    /// rather than as approved at the epoch.
+    #[serde(default)]
+    pub approved_at_ms: Option<i64>,
+}
+
+/// A server that does not send `enabled` is one from before the switch existed, and every skill
+/// on it is on. `false` there would switch off a whole library that nobody turned off.
+fn yes() -> bool {
+    true
+}
+
+/// Everything the detail pane shows about one skill: the row, the newest prose, and the files
+/// that came with that version.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetail {
+    #[serde(flatten)]
+    pub skill: SkillSummary,
+    /// The `SKILL.md` with its frontmatter taken off: what the model reads, and nothing else.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub body: String,
+    /// Which version that prose is. `0` is a draft: a row with no version at all.
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub files: Vec<SkillFile>,
+}
+
+/// What a new skill is made of.
+///
+/// `body` is the whole `SKILL.md`, frontmatter and all: the server reads the name and the
+/// description out of it when the two fields here are blank. Empty leaves a draft.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewSkill {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub source: SkillSource,
+    pub files: Vec<SkillFile>,
+}
+
+/// What a `PUT /skills/{id}` changes. A field left `None` is left alone — which is how the
+/// server reads a field that is not in the JSON at all, so absent here is absent there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// One version of a skill: the prose as it stood, and where that prose came from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillVersion {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub kind: SkillSource,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub note: String,
+}
+
+/// How long [`OpenGrokClient::create_skill_from_tape`] is given, which is longer than anything
+/// else this client sends.
+///
+/// Every other route is a database read and takes the client's default. This one waits on a
+/// model reading a recording into words, and the server's own bound on that is 60 seconds: a
+/// client that gave up sooner would turn a call the server was about to answer into a transport
+/// failure with none of the server's sentence in it, and the person would be told the machine
+/// could not be reached about a lesson that was written.
+pub const SKILL_FROM_TAPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The most a skill's instructions may be, in characters.
+///
+/// The server owns this limit and words its own refusal when a body is over it, naming both the
+/// cap and what arrived. The copy here is not a second check — nothing refuses a body on it —
+/// it is so that a file far too big to be read at all can be named for what it is not.
+pub const SKILL_BODY_CHARS: usize = 8000;
+
+/// The most a skill's supporting files may weigh once decoded, and how many there may be.
+///
+/// Both are the server's caps, named again here because the app reads a folder off this Mac
+/// before it sends any of it: without them a picked folder that is not a skill at all — a
+/// checkout, a downloads directory — is read into memory whole, and only then refused.
+pub const SKILL_BUNDLE_LIMIT: usize = 256 * 1024;
+pub const SKILL_BUNDLE_FILES: usize = 32;
+
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -3128,6 +3636,7 @@ pub struct SiteLoginUpdate {
 
 #[cfg(test)]
 mod tests {
+    use super::super::error::{Failure, Unreachable};
     use super::super::types::assistant_text_from_sse;
     use super::*;
     use serde_json::json;
@@ -3255,7 +3764,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -3339,6 +3848,379 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let thread = client.replay_thread("th_1", 5).await.expect("the thread");
         assert!(thread.hidden_run_ids.is_empty());
+        assert!(
+            thread.pending_user_messages.is_none(),
+            "a server that predates pending follow-ups must not look like an empty queue"
+        );
+        assert!(
+            thread.pending_events.is_none(),
+            "and pendingEvents is the same omission"
+        );
+        assert!(thread.live_pending_messages().is_none());
+    }
+
+    /// OpenGrok #171: the thread snapshot carries the live queue beside `runs`, never inside them.
+    #[tokio::test]
+    async fn a_thread_names_its_pending_follow_ups_beside_the_runs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "pendingUserMessages": [{
+                    "v": 1,
+                    "id": "pum_1",
+                    "threadId": "th_1",
+                    "content": "send this after the turn",
+                    "clientMessageId": "msg_bubble_1",
+                    "status": "pending",
+                    "createdAtMs": 10,
+                    "updatedAtMs": 10
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        let pending = thread.pending_user_messages.expect("the field is present");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "pum_1");
+        assert_eq!(pending[0].bubble_id(), "msg_bubble_1");
+        assert_eq!(pending[0].content, "send this after the turn");
+    }
+
+    /// Empty array is "none pending", not "the server has never heard of this".
+    #[tokio::test]
+    async fn an_empty_pending_list_on_a_thread_is_none_held() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "pendingUserMessages": [],
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        assert_eq!(
+            thread.pending_user_messages.as_deref(),
+            Some(&[][..]),
+            "so a hydrate can drop synced holds that another machine canceled"
+        );
+        assert!(thread.pending_events.is_none());
+        assert_eq!(thread.live_pending_messages().as_deref(), Some(&[][..]));
+    }
+
+    #[tokio::test]
+    async fn a_thread_prefers_pending_event_snapshots_over_the_row_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "pendingUserMessages": [{
+                    "id": "pum_stale",
+                    "content": "from the row list",
+                    "clientMessageId": "msg_stale"
+                }],
+                "pendingEvents": [{
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": {
+                        "v": 1,
+                        "op": "snapshot",
+                        "threadId": "th_1",
+                        "message": {
+                            "id": "pum_1",
+                            "content": "from the event",
+                            "clientMessageId": "msg_1"
+                        }
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        let live = thread.live_pending_messages().expect("events are present");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].bubble_id(), "msg_1");
+        assert_eq!(live[0].content, "from the event");
+    }
+
+    #[tokio::test]
+    async fn enqueue_edit_cancel_and_list_pending_follow_the_v1_contract() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/threads/th_1/pending"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "pendingUserMessage": {
+                    "v": 1,
+                    "id": "pum_1",
+                    "threadId": "th_1",
+                    "content": "later",
+                    "clientMessageId": "msg_1",
+                    "status": "pending"
+                },
+                "event": {
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": { "v": 1, "op": "created", "threadId": "th_1" }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/ag-ui/threads/th_1/pending/pum_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "pendingUserMessage": {
+                    "v": 1,
+                    "id": "pum_1",
+                    "content": "instead",
+                    "clientMessageId": "msg_1",
+                    "status": "pending"
+                },
+                "event": {
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": {
+                        "v": 1,
+                        "op": "edited",
+                        "threadId": "th_1",
+                        "message": {
+                            "v": 1,
+                            "id": "pum_1",
+                            "content": "instead",
+                            "clientMessageId": "msg_1",
+                            "status": "pending"
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/ag-ui/threads/th_1/pending/pum_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "event": {
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": { "v": 1, "op": "canceled", "threadId": "th_1" }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1/pending"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "pendingUserMessages": [],
+                "pendingEvents": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let created = client
+            .enqueue_pending_user_message(
+                "th_1",
+                &crate::opengrok::PendingWrite::enqueue(
+                    "later".into(),
+                    "msg_1".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("created");
+        let created_row = created.row().expect("created row");
+        assert_eq!(created_row.id, "pum_1");
+        assert_eq!(created_row.bubble_id(), "msg_1");
+        assert_eq!(
+            created.custom().map(|custom| custom.op),
+            Some(crate::opengrok::PendingOp::Created)
+        );
+
+        let edited = client
+            .edit_pending_user_message(
+                "th_1",
+                "pum_1",
+                &crate::opengrok::PendingWrite::content_patch("instead".into()),
+            )
+            .await
+            .expect("edited");
+        assert_eq!(edited.row().expect("edited row").content, "instead");
+        assert_eq!(
+            edited.custom().map(|custom| custom.op),
+            Some(crate::opengrok::PendingOp::Edited)
+        );
+
+        let canceled = client
+            .cancel_pending_user_message("th_1", "pum_1")
+            .await
+            .expect("canceled");
+        assert_eq!(
+            canceled.custom().map(|custom| custom.op),
+            Some(crate::opengrok::PendingOp::Canceled)
+        );
+        assert!(canceled.row().is_none(), "canceled omits the message");
+
+        let listed = client
+            .list_pending_user_messages("th_1")
+            .await
+            .expect("listed");
+        assert_eq!(listed.v, 1);
+        assert!(listed.pending_user_messages.is_empty());
+        assert_eq!(listed.pending_events.as_deref(), Some(&[][..]));
+        assert!(listed.live_messages().is_empty());
+
+        let requests = server.received_requests().await.expect("the four calls");
+        let post: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            post,
+            json!({
+                "v": 1,
+                "content": "later",
+                "clientMessageId": "msg_1",
+            })
+        );
+        let patch: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(patch, json!({ "v": 1, "content": "instead" }));
+        assert_eq!(requests[2].method.as_str(), "DELETE");
+    }
+
+    /// A 404 on the pending routes is not a verdict about the send: keep the local queue.
+    #[tokio::test]
+    async fn a_missing_pending_route_is_a_404_the_caller_can_fall_back_from() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1/pending"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such thread"))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let error = client
+            .list_pending_user_messages("th_1")
+            .await
+            .expect_err("old OpenGrok");
+        assert!(error.is_not_found());
+    }
+
+    /// Drain names the queued send so two machines cannot both fire it.
+    #[tokio::test]
+    async fn a_queued_turn_carries_pending_id_in_forwarded_props() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        client
+            .run_turn(
+                "cw_1",
+                "th_1",
+                "run_1",
+                &[AguiMessage {
+                    id: "msg_1".into(),
+                    role: "user".into(),
+                    content: "later".into(),
+                    tool_call_id: None,
+                    reply_to: None,
+                }],
+                None,
+                None,
+                Some("pum_1"),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.expect("the turn");
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "pendingId": "pum_1" })
+        );
+        assert_eq!(body["messages"][0]["id"], "msg_1");
+    }
+
+    /// OpenGrok's 409 for a queued send whose row changed carries the row as it stands now.
+    #[tokio::test]
+    async fn a_stale_queued_turn_keeps_the_row_the_server_answered_with() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "v": 1,
+                "error": "stale-pending-message",
+                "id": "pum_1",
+                "runId": null,
+                "message": "This queued message changed. Refresh it before sending again.",
+                "event": {
+                    "type": "CUSTOM",
+                    "timestamp": 1710000000000i64,
+                    "name": "pending-user-message",
+                    "value": {
+                        "v": 1,
+                        "op": "edited",
+                        "threadId": "th_1",
+                        "message": {
+                            "v": 1,
+                            "id": "pum_1",
+                            "threadId": "th_1",
+                            "content": "the laptop's words",
+                            "clientMessageId": "msg_1",
+                            "status": "pending",
+                        },
+                    },
+                },
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let error = client
+            .run_turn(
+                "cw_1",
+                "th_1",
+                "run_1",
+                &[],
+                None,
+                None,
+                Some("pum_1"),
+                |_| {},
+            )
+            .await
+            .expect_err("refused");
+        assert!(error.is_stale_pending());
+        let custom = error.pending_custom().expect("the row as it stands");
+        assert_eq!(custom.op, crate::opengrok::PendingOp::Edited);
+        assert_eq!(
+            custom.message.map(|row| row.content).as_deref(),
+            Some("the laptop's words")
+        );
     }
 
     /// This is today's bug end to end. The app looks signed in, has nothing to put in the
@@ -3369,7 +4251,7 @@ mod tests {
         // is all that is left, and the app is still showing a roster.
         put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
         client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .expect("the turn goes out, on a token the app fetched for itself");
 
@@ -3405,7 +4287,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -3436,7 +4318,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(!error.is_signed_out(), "nobody should be asked to sign in");
@@ -3908,6 +4790,8 @@ mod tests {
                     reply_to: None,
                 }],
                 None,
+                None,
+                None,
                 {
                     let first_at = first_at.clone();
                     move |event| {
@@ -3974,6 +4858,8 @@ mod tests {
                 "run_1",
                 &[message],
                 Some(&recipe),
+                None,
+                None,
                 |_| {},
             )
             .await
@@ -4013,6 +4899,8 @@ mod tests {
                     reply_to: None,
                 }],
                 None,
+                None,
+                None,
                 |_| {},
             )
             .await
@@ -4023,6 +4911,100 @@ mod tests {
             .expect("both turns were sent");
         let plain: Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(plain["forwardedProps"], json!({ "coworkerId": "cw_1" }));
+    }
+
+    /// The other half of that contract, and the whole of what `/name` buys: the skill the
+    /// person picked travels as its id on `forwardedProps`, where the server reads it.
+    ///
+    /// The second turn is the regression guard. Every ordinary chat goes down this path, so a
+    /// send with nothing picked has to be the send this client made before any of this existed:
+    /// the two bodies are compared whole, which catches a key added anywhere in them and not
+    /// only in the props. What it cannot catch is a change to how the body is spelled — both
+    /// sides are read back into `Value` and written out again by this same build — and it does
+    /// not need to: what is on trial here is what the app puts in the body.
+    #[tokio::test]
+    async fn a_turn_carries_the_chosen_skill_and_a_turn_without_one_is_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        // The name is in the words as well, the way it is after a pick: the chip is text in the
+        // message. The server must read the id and never the sentence.
+        let said = |id: &str| AguiMessage {
+            id: id.to_string(),
+            role: "user".into(),
+            content: "expense-report file this one".into(),
+            tool_call_id: None,
+            reply_to: None,
+        };
+
+        client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_1",
+                &[said("u1")],
+                None,
+                Some("skl_1"),
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_2",
+                &[said("u1")],
+                None,
+                None,
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.expect("both turns went");
+        let with: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let without: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            with["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "skill": "skl_1" })
+        );
+        assert_eq!(
+            with["messages"][0]["content"], "expense-report file this one",
+            "the message stays exactly what was written: the id is a field, not a word"
+        );
+        assert_eq!(
+            without["forwardedProps"],
+            json!({ "coworkerId": "cw_1" }),
+            "no skill picked leaves the props with nothing in them but the coworker"
+        );
+
+        // The whole body, once the one thing that is meant to differ — the run id, minted fresh
+        // for every turn — is put back.
+        let mut with = with;
+        with["forwardedProps"]
+            .as_object_mut()
+            .expect("props are an object")
+            .remove("skill");
+        with["runId"] = without["runId"].clone();
+        assert_eq!(
+            serde_json::to_vec(&with).unwrap(),
+            serde_json::to_vec(&without).unwrap(),
+            "a turn with no skill on it is the turn this client sent before skills existed"
+        );
     }
 
     #[tokio::test]
@@ -5515,5 +6497,477 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status, Some(403));
         assert_eq!(error.message, "Only the owner can share a recipe.");
+    }
+
+    /// The listing is the rows themselves, and the scope word goes on the query. A `source` this
+    /// client has no name for must leave the row readable rather than fail the whole listing.
+    #[tokio::test]
+    async fn list_skills_sends_the_scope_and_reads_the_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/skills"))
+            .and(wiremock::matchers::query_param("filter", "mine"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "id": "skl_1", "name": "expense-report",
+                    "description": "How we file expenses", "source": "uploaded",
+                    "updatedAtMs": 1717000000000i64, "versionCount": 2, "draft": false,
+                    "enabled": true
+                },
+                {
+                    "id": "skl_2", "name": "new-hire", "description": null,
+                    "source": "a word from the future", "versionCount": 0, "draft": true
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client.list_skills(Some("mine")).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "expense-report");
+        assert_eq!(rows[0].source, SkillSource::Uploaded);
+        assert_eq!(rows[0].version_count, 2);
+        assert!(!rows[0].draft);
+        assert_eq!(rows[1].description, "");
+        assert_eq!(
+            rows[1].source,
+            SkillSource::Authored,
+            "an unknown source is still a skill somebody has"
+        );
+        assert!(rows[1].draft);
+        assert!(
+            rows[1].enabled,
+            "a server that does not mention the switch has not switched anything off"
+        );
+    }
+
+    /// Written here: the prose goes up whole, frontmatter and all, and the word on it says a
+    /// person wrote it rather than a recording.
+    #[tokio::test]
+    async fn create_skill_sends_the_prose_and_says_who_wrote_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills"))
+            .and(body_json(json!({
+                "name": "expense-report",
+                "source": "authored",
+                "description": "How we file expenses",
+                "body": "---\nname: expense-report\n---\n\nAsk for the receipt first.",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_1", "name": "expense-report",
+                "description": "How we file expenses", "source": "authored",
+                "updatedAtMs": 1717000000000i64, "versionCount": 1, "draft": false,
+                "enabled": true, "version": 1, "files": [],
+                "body": "Ask for the receipt first."
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill(&NewSkill {
+                name: "expense-report".into(),
+                description: "How we file expenses".into(),
+                body: "---\nname: expense-report\n---\n\nAsk for the receipt first.".into(),
+                source: SkillSource::Authored,
+                files: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail.skill.id, "skl_1");
+        assert_eq!(detail.version, 1);
+        assert_eq!(
+            detail.body, "Ask for the receipt first.",
+            "the detail carries the prose with its frontmatter taken off"
+        );
+    }
+
+    /// An upload is the same door with the bundle on it: base64 in a JSON body, as `/artifacts`
+    /// does it, and the source says so even when the folder held nothing but a `SKILL.md`.
+    #[tokio::test]
+    async fn upload_skill_sends_its_files_as_base64() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills"))
+            .and(body_json(json!({
+                "name": "expense-report",
+                "source": "uploaded",
+                "body": "Ask for the receipt first.",
+                "files": [{"path": "reference/rates.csv", "bytes": "b2ssIGhpCg=="}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_1", "name": "expense-report", "description": "", "source": "uploaded",
+                "updatedAtMs": 1717000000000i64, "versionCount": 1, "draft": false,
+                "enabled": true, "version": 1, "body": "Ask for the receipt first.",
+                "files": [{"path": "reference/rates.csv", "bytes": "b2ssIGhpCg=="}]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill(&NewSkill {
+                name: "expense-report".into(),
+                description: String::new(),
+                body: "Ask for the receipt first.".into(),
+                source: SkillSource::Uploaded,
+                files: vec![SkillFile {
+                    path: "reference/rates.csv".into(),
+                    bytes: "b2ssIGhpCg==".into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(detail.files.len(), 1);
+        assert_eq!(detail.files[0].path, "reference/rates.csv");
+        assert_eq!(
+            detail.files[0].bytes, "b2ssIGhpCg==",
+            "the bundle comes back the way it went up, so a person can see what they uploaded"
+        );
+    }
+
+    /// A tape goes up as itself and comes back as prose. The words the sheet was given ride
+    /// with it, and what lands is switched off: a model wrote it and nobody has read it.
+    #[tokio::test]
+    async fn create_skill_from_tape_sends_the_recording_and_reads_a_skill_that_is_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .and(body_json(json!({
+                "coworkerId": "cw_1",
+                "name": "invoice-lookup",
+                "description": "how we find one",
+                "screen": { "width": 1280, "height": 800 },
+                "raw": [{"kind": "down", "button": 0, "x": 4, "y": 9, "at": 0}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_7", "name": "invoice-lookup", "description": "how we find one",
+                "source": "taught", "updatedAtMs": 1717000000000i64, "versionCount": 1,
+                "draft": false, "enabled": false, "version": 1, "files": [],
+                "body": "Open the billing tab, then search the invoice number."
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill_from_tape(
+                "cw_1",
+                "invoice-lookup",
+                "how we find one",
+                &[json!({"kind": "down", "button": 0, "x": 4, "y": 9, "at": 0})],
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.skill.id, "skl_7");
+        assert_eq!(
+            detail.skill.source,
+            SkillSource::Taught,
+            "the server's own word for prose a model wrote from a recording"
+        );
+        assert_eq!(detail.version, 1);
+        assert_eq!(detail.skill.version_count, 1);
+        assert!(!detail.skill.draft, "a lesson with prose in it is no draft");
+        assert!(
+            !detail.skill.enabled,
+            "born switched off: nobody has read it, so nothing may use it"
+        );
+        assert!(
+            detail.skill.approved_at_ms.is_none(),
+            "and never approved, which is what tells it from a skill somebody read and then \
+             switched off"
+        );
+        assert_eq!(
+            detail.body, "Open the billing tab, then search the invoice number.",
+            "the prose is what the model wrote, and it is what comes back"
+        );
+    }
+
+    /// Neither word is required, and neither is sent empty: the server mints a name and writes a
+    /// description itself, and `""` would be asking it to keep an empty one instead.
+    #[tokio::test]
+    async fn create_skill_from_tape_leaves_out_the_words_nobody_typed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .and(body_json(json!({
+                "coworkerId": "cw_1",
+                "screen": { "width": 1280, "height": 800 },
+                "raw": [],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_8", "name": "taught-1a2b3c4d", "description": "What was done here.",
+                "source": "taught", "updatedAtMs": 1717000000000i64, "versionCount": 1,
+                "draft": false, "enabled": false, "version": 1, "files": [], "body": "Steps."
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .create_skill_from_tape("cw_1", "   ", "", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.skill.name, "taught-1a2b3c4d",
+            "the name the server minted is the name the person is told"
+        );
+    }
+
+    /// Six ways this one route says no, and every one of them is a sentence written to be read
+    /// by a person. None of them may be swallowed and none may be reworded: the `502` in
+    /// particular names which of four things the model did, and "something went wrong" would
+    /// throw away the only part anybody can act on.
+    #[tokio::test]
+    async fn every_refusal_from_the_tape_route_keeps_the_servers_own_sentence() {
+        for (status, sentence) in [
+            (
+                502,
+                "Your bot would not write this one down: the recording shows a password being \
+                 typed, and it will not keep one in a lesson.",
+            ),
+            (
+                504,
+                "Your bot did not finish reading the recording in time. Teach a shorter task.",
+            ),
+            (409, "You already have a skill called invoice-lookup."),
+            (404, "No coworker cw_9 belongs to you."),
+            (
+                400,
+                "A skill's name is what you type after a slash: lowercase letters, digits and \
+                 dashes.",
+            ),
+            (
+                413,
+                "That description is 4001 characters; 4000 is the most.",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/skills/from-tape"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(sentence))
+                .mount(&server)
+                .await;
+            let client = OpenGrokClient::new(&server.uri()).unwrap();
+            let error = client
+                .create_skill_from_tape("cw_1", "invoice-lookup", "", &[])
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, Some(status));
+            assert_eq!(
+                error.message, sentence,
+                "a {status} has to reach the person as the server worded it"
+            );
+        }
+    }
+
+    /// A `502` from this route is not what a `502` means anywhere else in this client. Nothing
+    /// else the app talks to answers one itself, so `read_error` reads them all as something in
+    /// front of OpenGrok that could not reach it; THIS route answers its own, and what it means
+    /// is that the model ran and produced nothing that can be kept. Read as a hop that failed,
+    /// it would be offered a Try again that waits ninety seconds for the identical answer.
+    #[tokio::test]
+    async fn the_tape_routes_own_five_hundreds_are_verdicts_and_not_a_hop_that_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .respond_with(ResponseTemplate::new(502).set_body_string(
+                "Your bot would not write this one down: the recording shows a password.",
+            ))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client
+            .create_skill_from_tape("cw_1", "", "", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(502));
+        assert_eq!(
+            error.failure(),
+            Failure::Verdict,
+            "a decision about this recording: the same bytes earn it again"
+        );
+
+        // What is genuinely out of reach keeps its kind. OpenGrok saying it could not get to the
+        // model gateway is a state — nothing ran — and that tape is worth sending again.
+        let away = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/from-tape"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string("the model gateway is unreachable"),
+            )
+            .mount(&away)
+            .await;
+        let client = OpenGrokClient::new(&away.uri()).unwrap();
+        let error = client
+            .create_skill_from_tape("cw_1", "", "", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure(), Failure::OutOfReach(Unreachable::Gateway));
+        assert_eq!(
+            error.message, "the model gateway is unreachable",
+            "and the sentence is untouched either way"
+        );
+    }
+
+    /// The one request this client gives a deadline of its own, because it is the one that waits
+    /// on a model rather than on a database. Shorter than the server's own 60 seconds and a call
+    /// the server was about to answer becomes a client-side failure with nothing in it to read.
+    #[test]
+    fn writing_a_lesson_is_given_longer_than_the_servers_own_bound() {
+        assert!(
+            SKILL_FROM_TAPE_TIMEOUT > std::time::Duration::from_secs(60),
+            "the server waits 60 seconds on the model; this must outlast it"
+        );
+    }
+
+    /// The body cap is the server's and so is the sentence about it: it names the limit and what
+    /// arrived, and both have to reach the person rather than a word of our own.
+    #[tokio::test]
+    async fn an_over_long_body_comes_back_in_the_servers_own_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills"))
+            .respond_with(ResponseTemplate::new(413).set_body_string(
+                "the skill body is 8007 characters, over the 8000 allowed — a skill shares one \
+                 system message with the coworker's own role",
+            ))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client
+            .create_skill(&NewSkill {
+                name: "too-long".into(),
+                body: "x".repeat(8007),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(413));
+        assert!(error.message.contains("8000"), "{}", error.message);
+        assert!(error.message.contains("8007"), "{}", error.message);
+    }
+
+    /// A field nobody edited is not in the JSON at all, or a blank description field would wipe
+    /// the one the row has.
+    #[tokio::test]
+    async fn update_skill_sends_only_what_changed() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/skills/skl_1"))
+            .and(body_json(json!({ "enabled": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "skl_1", "name": "expense-report", "description": "How we file expenses",
+                "source": "authored", "updatedAtMs": 1717000000000i64, "versionCount": 1,
+                "draft": false, "enabled": false, "approvedAtMs": 1717000000001i64,
+                "version": 1, "body": "Ask first.", "files": []
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .update_skill(
+                "skl_1",
+                &SkillPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!detail.skill.enabled);
+        assert_eq!(
+            detail.skill.approved_at_ms,
+            Some(1717000000001),
+            "switched off again, and still stamped: the reading happened and is not unsaid"
+        );
+        assert_eq!(detail.skill.description, "How we file expenses");
+    }
+
+    #[tokio::test]
+    async fn a_new_version_is_the_prose_the_note_and_where_it_came_from() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/skills/skl_1/versions"))
+            .and(body_json(json!({
+                "body": "Ask for the receipt first, then the date.",
+                "kind": "uploaded",
+                "note": "the date too",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": 2, "kind": "uploaded", "createdAtMs": 1717000000000i64,
+                "note": "the date too"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        // The word goes up with it: left off, a bundle that is one lone SKILL.md comes back
+        // recorded as something somebody typed here.
+        let version = client
+            .add_skill_version(
+                "skl_1",
+                "Ask for the receipt first, then the date.",
+                "the date too",
+                SkillSource::Uploaded,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(version.version, 2);
+        assert_eq!(version.kind, SkillSource::Uploaded);
+        assert_eq!(version.note, "the date too");
+    }
+
+    /// 204 and nothing to read. A skill the server never heard of is the server's sentence, not
+    /// a silent success.
+    #[tokio::test]
+    async fn delete_skill_takes_the_empty_answer_and_keeps_a_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/skills/skl_1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/skills/skl_9"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such skill"))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client.delete_skill("skl_1").await.unwrap();
+        let error = client.delete_skill("skl_9").await.unwrap_err();
+        assert_eq!(error.status, Some(404));
+        assert_eq!(error.message, "no such skill");
+    }
+
+    /// The detail is the row with the prose and the bundle added to it, read as one object. A
+    /// server from before the switch existed says nothing about `enabled`, and every skill on it
+    /// is on: reading that silence as "off" would switch off a whole library nobody touched.
+    #[test]
+    fn a_detail_is_the_row_and_the_prose_together() {
+        let detail: SkillDetail = serde_json::from_value(json!({
+            "id": "skl_1", "name": "expense-report", "description": "How we file expenses",
+            "source": "uploaded", "updatedAtMs": 1717000000000i64, "versionCount": 2,
+            "draft": false, "version": 2, "body": "Ask for the receipt first.",
+            "files": [{"path": "reference/rates.csv", "bytes": "b2ssIGhpCg=="}]
+        }))
+        .expect("the row and the prose are one object on the wire");
+        assert_eq!(detail.skill.name, "expense-report");
+        assert_eq!(detail.skill.source, SkillSource::Uploaded);
+        assert_eq!(detail.version, 2);
+        assert_eq!(detail.files[0].path, "reference/rates.csv");
+        assert!(detail.skill.enabled);
+        assert!(
+            detail.skill.approved_at_ms.is_none(),
+            "a server from before the stamp existed has approved nothing, and must not read as \
+             having approved everything at the epoch"
+        );
+    }
+
+    /// The chip on a row names where the prose came from, and says nothing at all about one
+    /// somebody wrote here: every skill would otherwise wear a label that tells nothing apart.
+    #[test]
+    fn only_a_skill_from_somewhere_else_wears_a_chip() {
+        assert_eq!(SkillSource::Authored.chip(), None);
+        assert_eq!(SkillSource::Uploaded.chip(), Some("Uploaded"));
+        assert_eq!(SkillSource::Taught.chip(), Some("Taught"));
+        assert_eq!(SkillSource::Taught.word(), "taught");
     }
 }

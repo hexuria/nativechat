@@ -1,5 +1,7 @@
 use std::fmt;
 
+use super::pending::PendingCustom;
+
 /// The machine a request could not reach.
 ///
 /// The two are different machines with different fixes, and the app names which one because a
@@ -65,6 +67,8 @@ pub struct OpenGrokError {
     /// What kind of failure this is. Private so the invariant holds — a failure is exactly one
     /// of the three, never two of them at once.
     failure: Failure,
+    /// The `pending-user-message` CUSTOM a pending-route refusal carried.
+    pending_event: Option<serde_json::Value>,
 }
 
 impl OpenGrokError {
@@ -73,6 +77,7 @@ impl OpenGrokError {
             status: None,
             message: message.into(),
             failure: Failure::Verdict,
+            pending_event: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl OpenGrokError {
             status: Some(status),
             message: message.into(),
             failure: Failure::Verdict,
+            pending_event: None,
         }
     }
 
@@ -95,6 +101,7 @@ impl OpenGrokError {
             status: Some(401),
             message: message.into(),
             failure: Failure::SignedOut,
+            pending_event: None,
         }
     }
 
@@ -115,6 +122,7 @@ impl OpenGrokError {
             } else {
                 Failure::Verdict
             },
+            pending_event: None,
         }
     }
 
@@ -135,6 +143,7 @@ impl OpenGrokError {
             status,
             message,
             failure,
+            pending_event: None,
         }
     }
 
@@ -163,6 +172,54 @@ impl OpenGrokError {
     pub fn is_signed_out(&self) -> bool {
         self.failure == Failure::SignedOut
     }
+
+    /// Nothing at this path, or a thread this account does not own. Pending-user-message
+    /// routes treat both as "keep the local queue": an OpenGrok that has not shipped the
+    /// store yet answers 404 the same way an unknown thread does.
+    pub fn is_not_found(&self) -> bool {
+        self.status == Some(404)
+    }
+
+    /// `POST /ag-ui` (or a retry enqueue) for a follow-up that already became a run.
+    pub fn is_already_consumed(&self) -> bool {
+        self.status == Some(409) && self.message == "already-consumed"
+    }
+
+    /// `POST /ag-ui` named a pending id that was canceled (or never heard of).
+    pub fn is_not_pending(&self) -> bool {
+        self.status == Some(409) && self.message == "not-pending"
+    }
+
+    /// `POST /ag-ui` fired a queued send that no longer matches its row. The row is left
+    /// queued, and [`Self::pending_custom`] is the row as it stands now.
+    pub fn is_stale_pending(&self) -> bool {
+        self.status == Some(409) && self.message == "stale-pending-message"
+    }
+
+    /// `POST /pending` lost the race the server describes as "another writer got there
+    /// first; retry". The insert collided and the winning row was gone before it could be
+    /// read, so the same POST is worth one more try. Any other 409 is a decision.
+    pub fn is_enqueue_conflict(&self) -> bool {
+        self.status == Some(409) && self.message == "another writer got there first; retry"
+    }
+
+    /// The `pending-user-message` CUSTOM a pending refusal carried.
+    pub fn pending_custom(&self) -> Option<PendingCustom> {
+        self.pending_event
+            .as_ref()
+            .and_then(PendingCustom::from_agui)
+    }
+
+    pub(super) fn with_pending_event(mut self, event: Option<serde_json::Value>) -> Self {
+        self.pending_event = event;
+        self
+    }
+}
+
+/// Whether `POST /pending` should be sent again. The server asks for one retry of this
+/// conflict. A second one is the same answer, and asking in a loop would not change it.
+pub fn retry_enqueue(error: &OpenGrokError, attempt: u32) -> bool {
+    error.is_enqueue_conflict() && attempt < 2
 }
 
 /// The server's own words for the gateway being out of reach.
@@ -275,6 +332,32 @@ mod tests {
         assert_eq!(refused.failure(), Failure::Verdict);
         assert!(!refused.is_signed_out());
         assert_eq!(refused.unreachable(), None);
+    }
+
+    #[test]
+    fn a_pending_conflict_is_a_verdict_about_that_id() {
+        let consumed = OpenGrokError::from_server(Some(409), "already-consumed");
+        assert!(consumed.is_already_consumed());
+        assert!(!consumed.is_not_pending());
+        assert_eq!(consumed.failure(), Failure::Verdict);
+
+        let canceled = OpenGrokError::from_server(Some(409), "not-pending");
+        assert!(canceled.is_not_pending());
+        assert!(!canceled.is_already_consumed());
+
+        let missing = OpenGrokError::from_server(Some(404), "no such thread");
+        assert!(missing.is_not_found());
+        assert!(!missing.is_already_consumed());
+
+        let raced = OpenGrokError::from_server(Some(409), "another writer got there first; retry");
+        assert!(raced.is_enqueue_conflict());
+        assert!(!consumed.is_enqueue_conflict());
+        assert!(crate::opengrok::retry_enqueue(&raced, 1));
+        assert!(
+            !crate::opengrok::retry_enqueue(&raced, 2),
+            "one retry, then the conflict is a decision"
+        );
+        assert!(!crate::opengrok::retry_enqueue(&consumed, 1));
     }
 
     #[test]

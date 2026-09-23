@@ -8,9 +8,15 @@
 //! ⌘W and ⌘Q close this window only, ⌘M minimizes it, ⌘H hides the app.
 //!
 //! A stopped tape is written to disk and offered on a sheet under the title bar: named, and told
-//! which of three things to become, it goes up as a recipe (`POST /recipes`) and the Recipes page
-//! lists it. The other two outcomes are offered and say plainly that they cannot be made yet;
-//! see [`TeachOutcome`] for what each is still missing.
+//! which of three things to become, it goes up as a recipe (`POST /recipes`) or as a skill
+//! (`POST /skills/from-tape`, where a model reads it into prose). The third outcome is offered
+//! and says plainly that it cannot be made yet; see [`TeachOutcome`] for what it is missing.
+//!
+//! THE SERVER KEEPS NO TAPE. It takes one, makes what it was asked for, and keeps what it made,
+//! so this window holds the only copies there are: the events on the sheet and the file
+//! [`save_tape`] wrote. A refusal therefore leaves the tape where it is and offers to send it
+//! again — a recording is minutes of somebody's work, and pressing Teach a task twice does not
+//! get it back.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -29,11 +35,12 @@ use wry::{
 use crate::actions::{CloseWindow, Hide, Minimize, Quit};
 use crate::components::computer::computer_attention_banner;
 use crate::components::fields::field_input;
+use crate::opengrok::Failure;
 use crate::opengrok::{
     computer_window_attention_done_id, computer_window_attention_id,
     computer_window_attention_skip_id, thin_tape,
 };
-use crate::state::AppState;
+use crate::state::{AfterRefusal, AppState, TaughtSkill, WRITING_A_LESSON};
 
 /// The title bar the window paints for itself: tall enough for the traffic lights and a
 /// button, and the part the person drags the window by.
@@ -109,20 +116,18 @@ const TEACH_SCRIPT: &str = r#"
 
 /// What a stopped tape can become.
 ///
-/// Three outcomes, three prices, and only one of them has an engine behind it today. They are
-/// all offered because the choice is the point — a person who has just taught something knows
-/// which of the three they meant, and a menu that offers one of them silently decides for them —
-/// and the two that cannot be made say so on the sheet instead of being quietly unavailable.
+/// Three outcomes, three prices, and two of them can be made today. They are all offered because
+/// the choice is the point — a person who has just taught something knows which of the three
+/// they meant, and a menu that offers one of them silently decides for them — and the one that
+/// cannot be made says so on the sheet instead of being quietly unavailable.
 ///
-/// WHAT THE OTHER TWO ARE WAITING FOR, precisely:
+/// A RECIPE and a SKILL are made from one recording by two different routes, and they are not
+/// two names for one thing: a recipe replays the clicks, a skill is the lesson a model writes
+/// from watching them. The sheet is the one screen in the app where somebody has to tell the two
+/// apart, which is what every word on it is for.
 ///
-/// - A SKILL is a lesson: a written summary of what was done, which the model reads. It is the
-///   cheapest of the three to build, because there is no engine behind it — but "no engine" is
-///   not "no server". Nothing writes the summary (reading a tape into prose is a model call the
-///   app cannot make on its own), and there is nowhere to keep it: a `recipe_version` is `raw`,
-///   `filtered`, `edited` or `workflow`, and a lesson is none of the four. It needs a kind of its
-///   own on the version table, a route that writes one from a tape, and a line in the turn's
-///   system message the way a chosen recipe already gets one.
+/// WHAT THE THIRD IS WAITING FOR, precisely:
+///
 /// - A WORKFLOW is a decision tree. The server stores and walks one now (`POST /workflows`), and
 ///   it takes a TREE — named steps, branches, a question for Jev at each fork. A tape is none of
 ///   that: it is a list of clicks with nothing in it that ever decided anything, and no filter
@@ -133,10 +138,11 @@ const TEACH_SCRIPT: &str = r#"
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TeachOutcome {
     /// The tape, filtered into steps. What Save has always made, and the default: it is free to
-    /// run, instant, and the only one of the three that exists end to end.
+    /// run and instant, where writing a lesson costs a model call and a wait.
     #[default]
     Recipe,
-    /// A lesson: written notes on how the task is done, which the model reads.
+    /// A lesson: written notes on how the task is done, which the model reads before it works.
+    /// A model writes them from the tape, and nobody may use them until a person has read them.
     Skill,
     /// A decision tree that drives recipes.
     Workflow,
@@ -166,10 +172,18 @@ impl TeachOutcome {
 
     /// What this outcome is, in one line, for the person choosing between three things they
     /// have never had to tell apart before.
+    ///
+    /// The line says what will HAPPEN, not what the thing is called. The two that can be made
+    /// are made in different ways — one is a filter, the other is a model reading the tape and
+    /// taking its time about it — and the difference in the waiting is as much a part of the
+    /// choice as the difference in the result.
     pub fn summary(self) -> &'static str {
         match self {
             Self::Recipe => "The tape, filtered into steps. Your bot replays it exactly.",
-            Self::Skill => "A lesson your bot reads before it works, in its own words.",
+            Self::Skill => {
+                "Your bot reads the tape and writes the lesson, in words. It stays switched off \
+                 until you have read it."
+            }
             Self::Workflow => "A decision tree that looks, chooses, and plays recipes.",
         }
     }
@@ -181,11 +195,8 @@ impl TeachOutcome {
     /// occurs.
     pub fn blocked(self) -> Option<&'static str> {
         match self {
-            Self::Recipe => None,
-            Self::Skill => Some(
-                "Not yet — a lesson has nowhere to be kept and nothing to write it. It needs a \
-                 kind of its own on the server, and a model to read the tape into words.",
-            ),
+            // A tape filtered into steps, and a tape read into prose: two routes, both built.
+            Self::Recipe | Self::Skill => None,
             Self::Workflow => Some(
                 "Not yet — the server stores and walks a tree, but nothing turns a tape into \
                  decisions. It needs a tree: proposed from the recording, or written by hand.",
@@ -200,19 +211,91 @@ struct Teaching {
     events: Rc<RefCell<Vec<serde_json::Value>>>,
 }
 
-/// What became of the last tape: the line the title bar shows, and the recipe it became, so
-/// that line is a way through to the recipe rather than a notice.
+/// What became of the last tape: the line the title bar shows, and what it became, so that line
+/// is a way through to the thing rather than a notice.
 struct SavedTape {
     line: String,
-    recipe: Option<String>,
+    went: Option<SavedInto>,
+}
+
+/// What the last tape became, and therefore what a click on its line opens. Both pages belong
+/// to the main window; this window draws none.
+#[derive(Clone)]
+enum SavedInto {
+    Recipe(String),
+    /// The skill's id. It is switched off until somebody reads it, which is the reason this
+    /// line is worth clicking rather than only worth reading.
+    Skill(String),
+}
+
+impl SavedInto {
+    /// The line's id, which says which of the two it leads to: a driver reading "saved" off this
+    /// window has to be able to tell a recipe from a skill without matching on the copy.
+    fn element_id(&self) -> &'static str {
+        match self {
+            Self::Recipe(_) => "teach-saved-recipe",
+            Self::Skill(_) => "teach-saved-skill",
+        }
+    }
+}
+
+/// Why the last Save did not happen, and what there is to do about it.
+struct SaveRefusal {
+    /// What was said. The server's own sentence where the server spoke, never reworded: it is
+    /// the only part that says which of the things went wrong. Where the server said nothing at
+    /// all — see [`MAY_HAVE_LANDED`] — this is the app's own, because somebody has to say
+    /// something and only the app knows what happened.
+    said: String,
+    /// What there is to do about it, which decides which control the sheet draws. See
+    /// [`after_refusal`]: what the words say is the server's business, whether a button that
+    /// cannot work is put under them is this app's.
+    next: AfterRefusal,
+    /// The tape went out, as against a refusal this app made before sending anything. Only the
+    /// first raises the question "is my recording gone".
+    sent: bool,
+}
+
+impl SaveRefusal {
+    /// A refusal this app made itself, with nothing sent: a tape with no name, no session, an
+    /// outcome nothing can make. Pressing anything again changes none of them.
+    fn here(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            next: AfterRefusal::Nothing,
+            sent: false,
+        }
+    }
+
+    /// What the server said about a tape that went out, or what the app says for the tape whose
+    /// answer never arrived.
+    fn from_server(outcome: TeachOutcome, error: &crate::opengrok::OpenGrokError) -> Self {
+        let next = after_refusal(error);
+        Self {
+            said: match next {
+                AfterRefusal::LookFirst => may_have_landed(outcome),
+                _ => error.message.clone(),
+            },
+            next,
+            sent: true,
+        }
+    }
 }
 
 /// A stopped tape waiting on Save or Discard: the events, and where the local copy went.
+///
+/// It is held until Save is taken or Discard is pressed — a refusal leaves it here, because the
+/// server keeps no tape and this is one of the only two copies of somebody's minutes of work.
 struct PendingTape {
     started_at_ms: i64,
     events: Vec<serde_json::Value>,
-    /// "kept at <path>", or why there is no local copy.
-    backup: String,
+    /// Where the copy on this Mac went, or why there is none. Kept apart rather than as one
+    /// sentence, because the two are opposite news and the line that reassures somebody their
+    /// recording survived cannot be the line that tells them it did not.
+    backup: Result<String, String>,
+    /// When the tape stopped, which is what the name this sheet writes for itself is dated by.
+    /// Kept rather than read off the clock again, so the name does not change under somebody
+    /// while they are looking at it.
+    stopped_at: chrono::DateTime<chrono::Local>,
 }
 
 pub struct ComputerScreen {
@@ -227,10 +310,11 @@ pub struct ComputerScreen {
     /// script only posts while `__ncTeach` is on.
     tape: Rc<RefCell<Vec<serde_json::Value>>>,
     teaching: Option<Teaching>,
-    /// What became of the last tape, in the title bar: the recipe it was saved as, or that
-    /// it was let go.
+    /// What became of the last tape, in the title bar: the recipe or skill it was saved as, or
+    /// that it was let go.
     last_saved: Option<SavedTape>,
-    /// The app: its client uploads a tape, and its Recipes list is refreshed after.
+    /// The app: its client uploads a tape, its Recipes and Skills lists are refreshed after,
+    /// and it carries what is happening to the window that draws those pages.
     app: Entity<AppState>,
     /// Open-the-screen strip. Copied in — `render` must not `app.read` while
     /// Take over still holds the AppState lease (`open_window` draws before it
@@ -242,10 +326,11 @@ pub struct ComputerScreen {
     outcome: TeachOutcome,
     name_input: Entity<InputState>,
     description_input: Entity<InputState>,
-    /// An upload is on its way.
+    /// An upload is on its way. For a skill that is a model call, and long enough that the
+    /// sheet has to say so rather than look idle.
     saving: bool,
-    /// Why the last upload was refused; the sheet stays open with it.
-    save_error: Option<String>,
+    /// Why the last Save did not happen; the sheet stays open with it, still holding the tape.
+    save_error: Option<SaveRefusal>,
 }
 
 impl ComputerScreen {
@@ -270,7 +355,12 @@ impl ComputerScreen {
             cx.spawn(async move |this, cx| {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(app) = app.upgrade() {
-                        this.set_handoff_attention(app.read(cx).computer_window_attention(), cx);
+                        let (attention, taught) = {
+                            let app = app.read(cx);
+                            (app.computer_window_attention(), app.taught_skill.clone())
+                        };
+                        this.set_handoff_attention(attention, cx);
+                        this.follow_taught_skill(taught.as_ref(), cx);
                     }
                     cx.notify();
                 });
@@ -330,6 +420,34 @@ impl ComputerScreen {
             description_input,
             saving: false,
             save_error: None,
+        }
+    }
+
+    /// Keep the line this window is showing about a skill it taught in step with what has
+    /// become of that skill since.
+    ///
+    /// "Switched off until you read it" stops being true the moment somebody reads it and
+    /// switches it on — which happens on a page in ANOTHER window, and this line is the only
+    /// thing left on screen still saying it. The app carries the fact, so this window follows
+    /// it rather than keeping what was true when the lesson landed.
+    fn follow_taught_skill(&mut self, taught: Option<&TaughtSkill>, cx: &mut Context<Self>) {
+        let (
+            Some(SavedTape {
+                line,
+                went: Some(SavedInto::Skill(showing)),
+            }),
+            Some(TaughtSkill::Written { id, name, enabled }),
+        ) = (self.last_saved.as_mut(), taught)
+        else {
+            return;
+        };
+        if showing != id {
+            return;
+        }
+        let said = taught_line(name, *enabled);
+        if *line != said {
+            *line = said;
+            cx.notify();
         }
     }
 
@@ -399,6 +517,21 @@ impl ComputerScreen {
                 }
                 self.tape.borrow_mut().clear();
                 self.last_saved = None;
+                // The app is carrying what became of the LAST tape, for the window that draws
+                // the Skills page. A new recording makes that a stale answer.
+                //
+                // ON A SPAWN, not here. A tape asked for from the composer starts this from
+                // inside an update of the AppState — `open_computer_window` calls
+                // `start_teaching` while it holds the lease — and touching that entity again
+                // from in here is `double_lease_panic`. The same reason the handoff strip is
+                // refreshed on a spawn in `new`.
+                let app = self.app.downgrade();
+                cx.spawn(async move |_, cx| {
+                    if let Some(app) = app.upgrade() {
+                        let _ = app.update(cx, |state, cx| state.set_taught_skill(None, cx));
+                    }
+                })
+                .detach();
                 self.set_teaching(true);
                 self.teaching = Some(Teaching {
                     started_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -408,15 +541,13 @@ impl ComputerScreen {
             Some(session) => {
                 self.set_teaching(false);
                 let events = session.events.borrow().clone();
-                // The file is the backup; the upload is what the Recipes page shows.
-                let backup = match save_tape(&self.coworker_id, session.started_at_ms, &events) {
-                    Ok(path) => format!("kept at {path}"),
-                    Err(error) => format!("no local copy: {error}"),
-                };
-                let name = format!(
-                    "Task taught on {}",
-                    chrono::Local::now().format("%b %-d, %Y")
-                );
+                // The file is the backup; the upload is what a page shows.
+                let backup = save_tape(&self.coworker_id, session.started_at_ms, &events);
+                let stopped_at = chrono::Local::now();
+                // Each tape is asked about on its own. A choice left standing from the last one
+                // would decide this one silently, which is the thing the choice exists to stop.
+                self.outcome = TeachOutcome::default();
+                let name = default_tape_name(self.outcome, &stopped_at);
                 self.name_input.update(cx, |input, cx| {
                     input.set_value(name, window, cx);
                 });
@@ -425,13 +556,11 @@ impl ComputerScreen {
                 });
                 self.last_saved = None;
                 self.save_error = None;
-                // Each tape is asked about on its own. A choice left standing from the last one
-                // would decide this one silently, which is the thing the choice exists to stop.
-                self.outcome = TeachOutcome::default();
                 self.pending = Some(PendingTape {
                     started_at_ms: session.started_at_ms,
                     events,
                     backup,
+                    stopped_at,
                 });
             }
         }
@@ -441,44 +570,120 @@ impl ComputerScreen {
     /// Which of the three the tape is to become. The button for a blocked one is still there to
     /// be pressed: reading why it cannot be made is the only thing it has to offer, and a button
     /// that refuses to be pressed cannot say it.
-    fn choose_outcome(&mut self, outcome: TeachOutcome, cx: &mut Context<Self>) {
+    ///
+    /// The name the sheet wrote for ITSELF changes with the choice, because the two outcomes
+    /// name things differently — see [`default_tape_name`]. A name somebody typed is theirs and
+    /// is left exactly as typed, whichever of the three they then pick.
+    fn choose_outcome(
+        &mut self,
+        outcome: TeachOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.saving || self.outcome == outcome {
             return;
         }
+        if let Some(pending) = self.pending.as_ref() {
+            let ours = default_tape_name(self.outcome, &pending.stopped_at);
+            let theirs = default_tape_name(outcome, &pending.stopped_at);
+            if self.name_input.read(cx).value().as_ref() == ours.as_str() {
+                self.name_input
+                    .update(cx, |input, cx| input.set_value(theirs, window, cx));
+            }
+        }
         self.outcome = outcome;
-        // The refusal from an earlier Save was about the outcome that was picked then.
-        self.save_error = None;
+        // The refusal from an earlier Save was about the outcome that was picked then. It goes
+        // from the app with it, or the Try again the app is offering elsewhere outlives the one
+        // on this sheet — and points at a refusal nobody is being shown.
+        if self.save_error.take().is_some() {
+            self.app
+                .update(cx, |state, cx| state.set_taught_skill(None, cx));
+        }
         cx.notify();
     }
 
-    /// Upload the tape on the sheet as a recipe. The sheet stays, with the reason, when the
-    /// server refuses it; on success the title bar says what it became.
+    /// Put a refusal on the sheet AND on the app, which is the only way the two surfaces can
+    /// agree about one tape.
+    ///
+    /// Every refusal comes through here. Four of them used to be written straight onto the
+    /// sheet — no name, no session, an outcome nothing can make — leaving the app still showing
+    /// the server's older refusal about the same tape, with its own Try again under it.
+    ///
+    /// Only a SKILL is mirrored, because the app's note is about a lesson; anything else takes
+    /// the note away rather than leaving a stale one standing.
+    fn refuse(&mut self, refusal: SaveRefusal, cx: &mut Context<Self>) {
+        let mirror = (self.outcome == TeachOutcome::Skill).then(|| TaughtSkill::Refused {
+            why: refusal.said.clone(),
+            next: refusal.next,
+            coworker: self.coworker_id.clone(),
+        });
+        self.save_error = Some(refusal);
+        self.app
+            .update(cx, |state, cx| state.set_taught_skill(mirror, cx));
+        cx.notify();
+    }
+
+    /// Save, from the sheet's one button: the tape goes up as whichever of the three it was
+    /// told to become.
     ///
     /// An outcome that cannot be made is refused here as well as being unpressable on the sheet,
     /// because this is where the work is: a guard on the button alone is a guard on one of the
     /// ways in.
-    fn save_recipe(&mut self, cx: &mut Context<Self>) {
+    fn save(&mut self, cx: &mut Context<Self>) {
         if self.saving {
             return;
         }
         if let Some(why) = self.outcome.blocked() {
-            self.save_error = Some(why.to_string());
-            cx.notify();
+            self.refuse(SaveRefusal::here(why), cx);
             return;
         }
+        match self.outcome {
+            TeachOutcome::Recipe => self.save_recipe(cx),
+            TeachOutcome::Skill => self.save_skill(cx),
+            // Refused above: nothing turns a tape into a tree.
+            TeachOutcome::Workflow => {}
+        }
+    }
+
+    /// The same bytes again, after a refusal that could come out differently. `false` when this
+    /// window has no such tape, so a caller that cannot see the sheet — the driver, through
+    /// [`AppState`] — can be told rather than left thinking it sent something.
+    ///
+    /// THE WHOLE TAPE GOES AGAIN, unchanged. The server keeps no handle to a recording it
+    /// refused: there is nothing to reference, nothing to resume, and no way to send the part
+    /// that failed. That is the contract, and it is why the events are still in
+    /// [`PendingTape`] rather than dropped when the answer came back.
+    ///
+    /// The server's own refusals end by saying the recording was not consumed and that the same
+    /// tape can be sent again — with one exception, which is why [`can_send_again`] exists: a
+    /// skill that was written and kept and only then failed to come back names its id, and that
+    /// tape IS spent. Sending it again writes a second skill from one recording.
+    pub fn retry_save(&mut self, cx: &mut Context<Self>) -> bool {
+        let sendable = self
+            .save_error
+            .as_ref()
+            .is_some_and(|refusal| refusal.next == AfterRefusal::SendAgain);
+        if self.saving || self.pending.is_none() || !sendable || self.outcome.blocked().is_some() {
+            return false;
+        }
+        self.save(cx);
+        true
+    }
+
+    /// Upload the tape on the sheet as a recipe. The sheet stays, with the reason and the tape,
+    /// when the server refuses it; on success the title bar says what it became.
+    fn save_recipe(&mut self, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
         let name = self.name_input.read(cx).value().trim().to_string();
         if name.is_empty() {
-            self.save_error = Some("Give the task a name.".to_string());
-            cx.notify();
+            self.refuse(SaveRefusal::here("Give the task a name."), cx);
             return;
         }
         let description = self.description_input.read(cx).value().trim().to_string();
         let Some(client) = self.app.read(cx).opengrok.clone() else {
-            self.save_error = Some("Not connected to OpenGrok.".to_string());
-            cx.notify();
+            self.refuse(SaveRefusal::here("Not connected to OpenGrok."), cx);
             return;
         };
         let raw = upload_tape(&pending.events, pending.started_at_ms);
@@ -503,11 +708,87 @@ impl ComputerScreen {
                         this.pending = None;
                         this.last_saved = Some(SavedTape {
                             line: format!("Saved as {name} · v{version} has {steps} steps"),
-                            recipe: Some(detail.recipe.id.clone()),
+                            went: Some(SavedInto::Recipe(detail.recipe.id.clone())),
                         });
                         this.app.update(cx, |state, cx| state.refresh_recipes(cx));
                     }
-                    Err(error) => this.save_error = Some(error.message),
+                    // The tape stays on the sheet, whatever there is to do about it.
+                    Err(error) => {
+                        let refusal = SaveRefusal::from_server(TeachOutcome::Recipe, &error);
+                        this.refuse(refusal, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Upload the tape on the sheet as a skill: the server hands it to a model, which reads it
+    /// and writes the lesson. `save_recipe`'s shape — the same tape, thinned the same way, the
+    /// same coworker, the same sheet left standing with the server's sentence on it — for a
+    /// call that takes long enough that the waiting has to be drawn.
+    ///
+    /// WHAT LANDS IS SWITCHED OFF. A lesson a model wrote is not one anybody has read, and the
+    /// server refuses a switched-off skill even to the person who owns it. That is not a detail
+    /// of the row: it is the whole of what the person has to be told, so it is in the line the
+    /// title bar keeps and in what the app carries to the Skills page.
+    fn save_skill(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        // No name at all is a request for one: the server mints `taught-<hex>`. The field is
+        // filled for exactly that reason (see `default_tape_name`), so this is somebody who
+        // emptied it on purpose.
+        let name = self.name_input.read(cx).value().trim().to_string();
+        let description = self.description_input.read(cx).value().trim().to_string();
+        let Some(client) = self.app.read(cx).opengrok.clone() else {
+            self.refuse(SaveRefusal::here("Not connected to OpenGrok."), cx);
+            return;
+        };
+        let coworker_id = self.coworker_id.clone();
+        let raw = upload_tape(&pending.events, pending.started_at_ms);
+        self.saving = true;
+        self.save_error = None;
+        // The Skills page is in the other window and the driver sees only that one: this is how
+        // either of them knows a lesson is being written.
+        self.app.update(cx, |state, cx| {
+            state.set_taught_skill(Some(TaughtSkill::Writing), cx);
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .create_skill_from_tape(&coworker_id, &name, &description, &raw)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.saving = false;
+                match result {
+                    Ok(detail) => {
+                        // The server's name, not the one that was typed: it mints one when
+                        // nothing was typed, and it is the word that has to be typed after a
+                        // slash for this skill to be used at all.
+                        let name = detail.skill.name.clone();
+                        let id = detail.skill.id.clone();
+                        let enabled = detail.skill.enabled;
+                        this.pending = None;
+                        this.last_saved = Some(SavedTape {
+                            line: taught_line(&name, enabled),
+                            went: Some(SavedInto::Skill(id.clone())),
+                        });
+                        this.app.update(cx, |state, cx| {
+                            state.set_taught_skill(
+                                Some(TaughtSkill::Written { id, name, enabled }),
+                                cx,
+                            );
+                        });
+                    }
+                    Err(error) => {
+                        // The tape stays on the sheet. Nothing about a model that would not
+                        // write a lesson makes a recording worth throwing away, and the server
+                        // kept no copy of it.
+                        let refusal = SaveRefusal::from_server(TeachOutcome::Skill, &error);
+                        this.refuse(refusal, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -519,16 +800,24 @@ impl ComputerScreen {
     fn discard_tape(&mut self, cx: &mut Context<Self>) {
         if let Some(pending) = self.pending.take() {
             self.last_saved = Some(SavedTape {
-                line: format!("Not saved · {}", pending.backup),
-                recipe: None,
+                line: format!("Not saved · {}", backup_note(&pending.backup)),
+                went: None,
             });
         }
         self.save_error = None;
+        // With the tape gone there is nothing left to send again, and a Try again the app was
+        // still offering elsewhere would be a button with no bytes behind it.
+        self.app
+            .update(cx, |state, cx| state.set_taught_skill(None, cx));
         cx.notify();
     }
 
     /// The strip under the title bar after Stop: which of the three to make, a name, a
     /// description, Save and Discard, and what the tape holds or why it cannot go up.
+    ///
+    /// After a refusal it carries one thing more — Try again, and the line saying the recording
+    /// is still here. That is the first question a failed upload raises and the app is the only
+    /// thing that can answer it: the server kept no copy.
     fn save_sheet(
         &self,
         pending: &PendingTape,
@@ -537,19 +826,25 @@ impl ComputerScreen {
     ) -> AnyElement {
         let saving = self.saving;
         let blocked = self.outcome.blocked();
+        // Three different questions: did something go wrong, is the recording still here, and
+        // what — if anything — is worth doing about it.
+        let refusal = self.save_error.as_ref();
+        let sent = refusal.is_some_and(|refusal| refusal.sent);
+        let next = refusal.map(|refusal| refusal.next);
+        let outcome = self.outcome;
         // What the line under the sheet says, in the order it matters: a refusal from the last
         // Save, then an outcome that cannot be made at all, then what was taped. The chosen
         // outcome's own line goes beside it, because "what is this" and "why can it not be
         // made" are two different things to be reading.
-        let (note, note_color) = match (&self.save_error, blocked) {
-            (Some(error), _) => (error.clone(), theme.danger),
+        let (note, note_color) = match (refusal, blocked) {
+            (Some(refusal), _) => (refusal.said.clone(), theme.danger),
             (None, Some(why)) => (why.to_string(), theme.muted_foreground),
             (None, None) => (
                 format!(
                     "{} · {} events · {}",
                     self.outcome.summary(),
                     pending.events.len(),
-                    pending.backup
+                    backup_note(&pending.backup)
                 ),
                 theme.muted_foreground,
             ),
@@ -562,7 +857,9 @@ impl ComputerScreen {
                     .small()
                     .label(outcome.label())
                     .disabled(saving)
-                    .on_click(cx.listener(move |this, _, _, cx| this.choose_outcome(outcome, cx)));
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_outcome(outcome, window, cx)
+                    }));
                 if picked { button.primary() } else { button }.into_any_element()
             })
             .collect();
@@ -607,16 +904,53 @@ impl ComputerScreen {
                 Button::new("teach-save")
                     .small()
                     .primary()
-                    .label(if saving {
-                        "Saving…".to_string()
-                    } else {
-                        format!("Save as {}", self.outcome.label().to_lowercase())
-                    })
+                    .label(saving_label(self.outcome, saving))
                     // An outcome nothing can make is not a Save waiting to happen, and a button
                     // that looks ready would be the half-wired thing this sheet is avoiding.
                     .disabled(saving || blocked.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.save_recipe(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             )
+            // Only where sending the same bytes again could come out differently — see
+            // [`can_send_again`]. Somebody who changed the name presses Save; somebody whose
+            // upload met a busy machine presses this. The label promises nothing about the
+            // second try, because the sentence beside it is what says how likely it is.
+            .when(next == Some(AfterRefusal::SendAgain), |this| {
+                this.child(
+                    Button::new("teach-retry")
+                        .small()
+                        .label("Try again")
+                        .disabled(saving)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.retry_save(cx);
+                        })),
+                )
+            })
+            // Nothing answered, so nobody knows whether it was written. The one thing to do is
+            // look, and this is the way to the page it would be on — sending the tape again
+            // before looking is how one recording becomes two skills.
+            .when(next == Some(AfterRefusal::LookFirst), |this| {
+                this.child(
+                    Button::new("teach-check-library")
+                        .small()
+                        .label(match outcome {
+                            TeachOutcome::Skill => "Check Skills",
+                            TeachOutcome::Recipe | TeachOutcome::Workflow => "Check Recipes",
+                        })
+                        .on_click({
+                            let app = self.app.clone();
+                            move |_, _, cx| {
+                                app.update(cx, |state, cx| match outcome {
+                                    TeachOutcome::Skill => {
+                                        state.show_skill_in_main_window(None, cx)
+                                    }
+                                    TeachOutcome::Recipe | TeachOutcome::Workflow => {
+                                        state.show_recipes_in_main_window(None, cx)
+                                    }
+                                });
+                            }
+                        }),
+                )
+            })
             .child(
                 Button::new("teach-discard")
                     .small()
@@ -625,7 +959,178 @@ impl ComputerScreen {
                     .on_click(cx.listener(|this, _, _, cx| this.discard_tape(cx))),
             )
             .child(div().text_xs().text_color(note_color).child(note))
+            // Whether or not there is anything to press, the recording is still here and the
+            // file is named: a tape refused for a reason no retry can change is still minutes
+            // of somebody's work, and they may want the bytes.
+            .when(sent, |this| {
+                this.child(
+                    div()
+                        .id("teach-tape-kept")
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(tape_survived_line(&pending.backup)),
+                )
+            })
             .into_any_element()
+    }
+}
+
+/// The name the sheet writes for itself when a tape stops, for what that tape is to become.
+///
+/// TWO SHAPES, because the two are named for different things. A recipe is a row in a list and
+/// is named in words. A SKILL's name is what somebody types after a slash — lowercase letters,
+/// digits and dashes — and "Task taught on Sep 22, 2026" is not one: the server would refuse it,
+/// and the refusal would be the first thing anybody teaching a skill ever saw.
+///
+/// Neither is left empty, though the route takes an empty one and mints `taught-<hex>` for it.
+/// Two tapes stopped close together are minted the same name, and the second comes back as "you
+/// already have a skill called that" about a skill nobody named. A field that is already filled
+/// is also the easiest one to replace, which is the thing to encourage: the name is what this
+/// skill will be invoked by, and the person is the only one who knows what to call it.
+///
+/// The second is in it for that same reason. Two tapes stopped inside one minute are two tapes
+/// with one name, which is the collision this is written to keep clear of.
+fn default_tape_name<Tz: chrono::TimeZone>(
+    outcome: TeachOutcome,
+    stopped_at: &chrono::DateTime<Tz>,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    match outcome {
+        TeachOutcome::Skill => stopped_at
+            .format("taught-%b-%-d-%H%M%S")
+            .to_string()
+            .to_lowercase(),
+        TeachOutcome::Recipe | TeachOutcome::Workflow => {
+            format!("Task taught on {}", stopped_at.format("%b %-d, %Y"))
+        }
+    }
+}
+
+/// What the Save button says, which is also how long the person is being asked to wait.
+///
+/// "Saving…" is what an upload is. Writing a lesson is a model reading a recording, which takes
+/// long enough that a button saying "Saving…" reads as stuck — so it says what is happening
+/// instead, and says who is doing it.
+fn saving_label(outcome: TeachOutcome, saving: bool) -> String {
+    match (saving, outcome) {
+        (true, TeachOutcome::Skill) => WRITING_A_LESSON.to_string(),
+        (true, _) => "Saving…".to_string(),
+        (false, outcome) => format!("Save as {}", outcome.label().to_lowercase()),
+    }
+}
+
+/// What the title bar says about a tape that became a skill.
+///
+/// It arrives switched off, and that is the whole of the review: a model wrote it, nobody has
+/// read it, and the server will not let it reach a turn or a colleague until somebody does. The
+/// line says so and is a way through to the skill, because reading it is the next thing to do.
+fn taught_line(name: &str, enabled: bool) -> String {
+    if enabled {
+        format!("Wrote the skill {name} · read it")
+    } else {
+        format!("Wrote the skill {name} · switched off until you read it")
+    }
+}
+
+/// What there is to do about a refused tape, which is not the same question as what went wrong.
+///
+/// The wording of a refusal is the server's and is never touched. The BUTTON under it is this
+/// app's to offer or withhold, and one that cannot work is worse than none: it tells somebody to
+/// press again for a spend cap that will refuse them every time, and it contradicts the sentence
+/// right above it.
+///
+/// NOTHING ANSWERED AT ALL is the dangerous one, and it is why this is three answers and not
+/// two. The model call takes most of a minute, so a connection that drops on the way back — a
+/// laptop that slept, a VPN re-key, a body that would not decode — is as likely to be a skill
+/// the server WROTE and could not report as one it never made. There is no idempotency key on
+/// this route, so a second send of a tape that did land writes a second skill from one
+/// recording, and the server cannot collapse them. Until there is a key, the honest answer is
+/// to say so and send nobody back to the library blind.
+///
+/// Otherwise it is the kind of failure, not the number. A VERDICT is a decision about this
+/// recording, these words or this account — a model that would not write this one down, a model
+/// that overran, a spend cap, a name already taken — and the same bytes earn the same decision.
+/// OUT OF REACH is a machine that never got to decide: the one status the server uses for
+/// "another recording of yours is already being written" is the exception it carves out by hand,
+/// because shortly is exactly when to try that one again.
+fn after_refusal(error: &crate::opengrok::OpenGrokError) -> AfterRefusal {
+    // A skill the server wrote and kept before it failed: named in the sentence, because the
+    // reply has nowhere else to put it. Delete this and [`names_a_skill`] when the route takes
+    // an idempotency key — that is the real fix, and this stands in for it.
+    if names_a_skill(&error.message) {
+        return AfterRefusal::Nothing;
+    }
+    if error.status.is_none() {
+        return AfterRefusal::LookFirst;
+    }
+    if error.status == Some(TOO_MANY_RECORDINGS) {
+        return AfterRefusal::SendAgain;
+    }
+    match error.failure() {
+        Failure::OutOfReach(_) => AfterRefusal::SendAgain,
+        Failure::Verdict | Failure::SignedOut => AfterRefusal::Nothing,
+    }
+}
+
+/// One recording at a time per account, and another is already going. The one refusal about
+/// this tape that says nothing about this tape.
+const TOO_MANY_RECORDINGS: u16 = 429;
+
+/// What the app says when nothing answered at all, in place of a sentence the server never got
+/// to write. The transport's own words ("error decoding response body") are for a log.
+fn may_have_landed(outcome: TeachOutcome) -> String {
+    let (it, page) = match outcome {
+        TeachOutcome::Skill => ("your bot may have written the skill", "your skills"),
+        TeachOutcome::Recipe | TeachOutcome::Workflow => {
+            ("the recipe may have been saved", "your recipes")
+        }
+    };
+    format!(
+        "The connection dropped before the answer came back, and {it} anyway. Look at {page} \
+         before you send this recording again."
+    )
+}
+
+/// Whether a refusal names a skill the server has already kept — how it says the tape was used
+/// up despite the failure.
+///
+/// The id is what is matched, never the words around it: `skl_` is what the server mints, and it
+/// is the one part of that sentence which cannot be reworded without breaking every other thing
+/// that reads an id. A name somebody chose cannot set this off — the server takes no underscores
+/// in one — and the cost of a false match is one button, where the cost of a miss is a second
+/// skill. Goes when the route takes an idempotency key.
+fn names_a_skill(said: &str) -> bool {
+    said.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word.starts_with("skl_") && word.len() > "skl_".len())
+}
+
+/// Where the copy on this Mac went, in the summary line that lists what the tape holds.
+fn backup_note(backup: &Result<String, String>) -> String {
+    match backup {
+        Ok(path) => format!("kept at {path}"),
+        Err(why) => format!("no local copy: {why}"),
+    }
+}
+
+/// What the sheet says under a refusal, answering the question a refusal raises.
+///
+/// The recording is not gone. The server takes a tape, makes what it was asked for and keeps
+/// what it made — it stores no tapes — so the only copies are the one this sheet is holding and
+/// the file on this Mac. Somebody who thinks minutes of their work went with a failed upload
+/// records the whole task again.
+///
+/// TWO SENTENCES WHEN THERE IS NO FILE, because one of them is bad news and the old single line
+/// read "Your recording is still here · no local copy" — which contradicts itself in the one
+/// place written to stop somebody re-recording their work.
+fn tape_survived_line(backup: &Result<String, String>) -> String {
+    match backup {
+        Ok(path) => format!("Your recording is still here · kept at {path}"),
+        Err(why) => format!(
+            "Your recording is still here, and this window is holding the only copy of it. \
+             Nothing could be written to disk: {why}"
+        ),
     }
 }
 
@@ -685,26 +1190,32 @@ impl Render for ComputerScreen {
         // The sheet holds a tape until it is saved or let go; no new tape until then.
         let waiting = self.pending.is_some() || self.saving;
         let count = self.tape.borrow().len();
-        // What became of the last tape. Once it is a recipe, the line is the way to it: the
-        // main window opens that recipe's page and comes forward.
-        let saved = self.last_saved.as_ref().map(|saved| match &saved.recipe {
-            Some(recipe) => div()
-                .id("teach-saved-recipe")
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .cursor_pointer()
-                .hover(|s| s.text_color(theme.foreground))
-                .on_click({
-                    let app = self.app.clone();
-                    let recipe = recipe.clone();
-                    move |_, _, cx| {
-                        app.update(cx, |state, cx| {
-                            state.show_recipes_in_main_window(Some(recipe.clone()), cx);
+        // What became of the last tape. Once it is something, the line is the way to it: the
+        // main window opens that page and comes forward. For a skill that is the point of the
+        // line rather than a courtesy — it is switched off until somebody reads it, and this is
+        // the way to the reading.
+        let saved = self.last_saved.as_ref().map(|saved| match &saved.went {
+            Some(went) => {
+                let (id, app, went) = (went.element_id(), self.app.clone(), went.clone());
+                div()
+                    .id(id)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.foreground))
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |state, cx| match &went {
+                            SavedInto::Recipe(recipe) => {
+                                state.show_recipes_in_main_window(Some(recipe.clone()), cx);
+                            }
+                            SavedInto::Skill(skill) => {
+                                state.show_skill_in_main_window(Some(skill.clone()), cx);
+                            }
                         });
-                    }
-                })
-                .child(saved.line.clone())
-                .into_any_element(),
+                    })
+                    .child(saved.line.clone())
+                    .into_any_element()
+            }
             None => div()
                 .id("teach-saved")
                 .text_xs()
@@ -871,13 +1382,26 @@ impl Render for ComputerScreen {
 
 #[cfg(test)]
 mod tests {
-    use super::TeachOutcome;
+    use super::{
+        AfterRefusal, TeachOutcome, after_refusal, default_tape_name, may_have_landed,
+        saving_label, tape_survived_line, taught_line,
+    };
+    use crate::opengrok::OpenGrokError;
 
-    /// Stopping a tape used to make one thing without asking. It now asks which of three, and
-    /// the answer a person gives has to mean something: the one that works does the work, and
-    /// the two that do not say what they are waiting for rather than failing later.
+    /// A fixed moment, so a name dated by the clock can be read in a test.
+    fn stopped_at() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone as _;
+        chrono::Utc
+            .with_ymd_and_hms(2026, 9, 22, 14, 32, 5)
+            .single()
+            .expect("a real moment")
+    }
+
+    /// Stopping a tape asks which of three to make, and the answer a person gives has to mean
+    /// something: two of them do the work, and the one that cannot be made says what it is
+    /// waiting for rather than failing later.
     #[test]
-    fn stopping_a_tape_offers_three_outcomes_and_only_one_can_be_made_today() {
+    fn stopping_a_tape_offers_three_outcomes_and_two_can_be_made_today() {
         assert_eq!(
             TeachOutcome::ALL
                 .iter()
@@ -889,27 +1413,48 @@ mod tests {
         assert_eq!(
             TeachOutcome::default(),
             TeachOutcome::Recipe,
-            "the cheapest, and the only one with an engine behind it, is what Save still makes"
+            "the cheapest and the quickest is what Save still makes when nobody says otherwise"
         );
         assert!(
             TeachOutcome::Recipe.blocked().is_none(),
             "a tape filtered into steps is what the server has always taken"
         );
+        assert!(
+            TeachOutcome::Skill.blocked().is_none(),
+            "a tape read into prose has a route of its own now, and the sheet must not go on \
+             saying a lesson has nowhere to be kept"
+        );
     }
 
-    /// A blocked outcome that only said "no" would be a dead end. Each names what is missing,
-    /// on the screen where somebody is wishing for it.
+    /// The Skill line has to say what will HAPPEN: a model writes it, and what it writes is off
+    /// until somebody reads it. Both are surprises, and the sheet is where they belong — the
+    /// first is why this one takes a while, the second is why the thing cannot be used yet.
+    #[test]
+    fn the_skill_outcome_says_who_writes_it_and_that_it_arrives_switched_off() {
+        let skill = TeachOutcome::Skill.summary();
+        assert!(
+            skill.contains("Your bot") && skill.contains("writes"),
+            "the model is your bot, and it is the thing doing the writing: {skill:?}"
+        );
+        assert!(
+            skill.contains("switched off") && skill.contains("read it"),
+            "born off, and read before it can be used: {skill:?}"
+        );
+        assert!(
+            !skill.contains("replays"),
+            "replaying clicks is what a RECIPE does, and the two words are the one thing this \
+             sheet exists to keep apart: {skill:?}"
+        );
+        assert!(
+            TeachOutcome::Recipe.summary().contains("replays"),
+            "and a recipe is still the tape played back exactly"
+        );
+    }
+
+    /// The one outcome that cannot be made. Saying "no" on its own would be a dead end: it names
+    /// what is missing, on the screen where somebody is wishing for it.
     #[test]
     fn an_outcome_that_cannot_be_made_says_what_it_is_waiting_for() {
-        let skill = TeachOutcome::Skill
-            .blocked()
-            .expect("nothing writes a lesson or keeps one yet");
-        assert!(skill.starts_with("Not yet"), "{skill}");
-        assert!(
-            skill.contains("kept") && skill.contains("model"),
-            "a lesson needs somewhere to live and something to write it, and it read {skill:?}"
-        );
-
         let workflow = TeachOutcome::Workflow
             .blocked()
             .expect("a tape is not a tree, and nothing turns one into the other");
@@ -918,6 +1463,14 @@ mod tests {
             workflow.contains("tree"),
             "the server stores a tree and this has none, which is the whole of the reason, \
              and it read {workflow:?}"
+        );
+        assert_eq!(
+            TeachOutcome::ALL
+                .iter()
+                .filter(|outcome| outcome.blocked().is_some())
+                .count(),
+            1,
+            "one left, and it is the workflow"
         );
     }
 
@@ -935,6 +1488,223 @@ mod tests {
                 "teach-make-skill",
                 "teach-make-workflow"
             ]
+        );
+    }
+
+    /// A skill's name is what gets typed after a slash. The sentence a recipe is named with is
+    /// not one, and sending it would be refused by the server the first time anybody taught a
+    /// skill — so the sheet writes a different default for it.
+    #[test]
+    fn a_skill_is_not_named_the_way_a_recipe_is() {
+        let at = stopped_at();
+        assert_eq!(
+            default_tape_name(TeachOutcome::Recipe, &at),
+            "Task taught on Sep 22, 2026",
+            "a recipe is a row in a list and is named in words"
+        );
+        assert_eq!(
+            default_tape_name(TeachOutcome::Workflow, &at),
+            "Task taught on Sep 22, 2026"
+        );
+        let skill = default_tape_name(TeachOutcome::Skill, &at);
+        assert_eq!(
+            skill, "taught-sep-22-143205",
+            "down to the second, because two tapes stopped inside one minute would otherwise \
+             be two tapes with one name, and the second is refused as a name already taken"
+        );
+        assert!(
+            skill
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "what can be typed after a slash, and nothing else: {skill:?}"
+        );
+        assert!(
+            !skill.is_empty(),
+            "not left empty either: the server mints a name for an empty one, and two tapes \
+             stopped close together are minted the same name"
+        );
+    }
+
+    /// Writing a lesson is a model reading a recording, and it takes long enough that a button
+    /// saying "Saving…" reads as stuck. It says what is happening, and who is doing it.
+    #[test]
+    fn the_button_says_a_bot_is_writing_rather_than_that_something_is_saving() {
+        assert_eq!(
+            saving_label(TeachOutcome::Skill, true),
+            "Your bot is writing it…"
+        );
+        assert_eq!(saving_label(TeachOutcome::Recipe, true), "Saving…");
+        assert_eq!(
+            saving_label(TeachOutcome::Skill, false),
+            "Save as skill",
+            "and before it is pressed it names what it will make"
+        );
+        assert_eq!(saving_label(TeachOutcome::Recipe, false), "Save as recipe");
+    }
+
+    /// What lands is switched off, and the line says so rather than reporting a save and leaving
+    /// somebody to find out that nothing can use it. The `enabled` it is told is the server's.
+    #[test]
+    fn a_taught_skill_is_reported_as_needing_to_be_read() {
+        let off = taught_line("invoice-lookup", false);
+        assert!(
+            off.contains("invoice-lookup"),
+            "named by what has to be typed after the slash: {off:?}"
+        );
+        assert!(
+            off.contains("switched off") && off.contains("read it"),
+            "off, and what makes it not off, in the one line the title bar keeps: {off:?}"
+        );
+        assert!(
+            taught_line("invoice-lookup", true).contains("read it"),
+            "a server that sent one already on is still a lesson nobody has read"
+        );
+        assert!(
+            !taught_line("invoice-lookup", true).contains("switched off"),
+            "but it must not say off about a skill that is on"
+        );
+    }
+
+    /// Refusals differ in what there is to DO about them, and the control under the sentence is
+    /// the app's answer to that. A Try again under a spend cap contradicts the sentence above it
+    /// and puts somebody in a loop that sentence has already said will not end.
+    #[test]
+    fn what_to_do_about_a_refusal_follows_the_kind_of_failure_not_the_number() {
+        // Worth sending again: the one status that says another recording of this account's is
+        // already going, and anything the server reports as a machine it could not reach.
+        assert_eq!(
+            after_refusal(&OpenGrokError::status(429, "one recording at a time")),
+            AfterRefusal::SendAgain
+        );
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(502),
+                "the model gateway could not be reached"
+            )),
+            AfterRefusal::SendAgain,
+            "nothing ran, so the same tape may well go through"
+        );
+
+        // Not worth it: every verdict about this tape, these words or this account — including
+        // the 5xx this route answers itself, which is a decision and not a hop that failed.
+        for (status, said) in [
+            (402, "This coworker is over its spend limit."),
+            (422, "The recording has four actions in it."),
+            (409, "You already have a skill called invoice-lookup."),
+            (
+                400,
+                "A skill's name is lowercase letters, digits and dashes.",
+            ),
+            (413, "That description is 4001 characters."),
+            (
+                502,
+                "Your bot would not write this one down: the recording shows a password.",
+            ),
+            (
+                504,
+                "Your bot did not finish in time. Teach a shorter task.",
+            ),
+        ] {
+            assert_eq!(
+                after_refusal(&OpenGrokError::status(status, said)),
+                AfterRefusal::Nothing,
+                "{status} decides about what was sent, and it is unchanged"
+            );
+        }
+    }
+
+    /// The dangerous one. A model call takes most of a minute, so a connection that drops on the
+    /// way back is as likely to be a skill the server WROTE and could not report as one it never
+    /// made — and the route has no idempotency key, so sending the same tape again would write a
+    /// second skill from one recording.
+    #[test]
+    fn an_answer_that_never_arrived_sends_nobody_back_with_the_same_tape() {
+        let dropped = OpenGrokError::message("error decoding response body");
+        assert_eq!(after_refusal(&dropped), AfterRefusal::LookFirst);
+        assert!(
+            dropped.status.is_none(),
+            "the case is the missing status, not the words: a transport failure has no sentence"
+        );
+
+        let said = may_have_landed(TeachOutcome::Skill);
+        assert!(
+            said.contains("may have written the skill"),
+            "it says what nobody knows rather than reporting a failure: {said:?}"
+        );
+        assert!(
+            said.contains("Look at your skills"),
+            "and where to look, because looking is the only thing that answers it: {said:?}"
+        );
+        assert!(
+            may_have_landed(TeachOutcome::Recipe).contains("your recipes"),
+            "the same tape saved as a recipe is on the other page"
+        );
+    }
+
+    /// The one refusal where the tape is spent: the lesson was written and kept, and only the
+    /// read-back failed. Sending the same bytes again would write a second skill from one
+    /// recording, so the status alone is not enough — the reply names the skill, and that is
+    /// the one thing in it worth matching on.
+    #[test]
+    fn a_refusal_that_names_a_kept_skill_is_not_sent_again() {
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(502),
+                "The skill skl_7 was written and kept; the gateway could not be reached on the \
+                 way back. Do not send this recording again."
+            )),
+            AfterRefusal::Nothing,
+            "a refusal that would otherwise be worth another try, and is not"
+        );
+        assert_eq!(
+            after_refusal(&OpenGrokError::message(
+                "skl_7 is on the server; the tape is spent"
+            )),
+            AfterRefusal::Nothing,
+            "and a dropped wire that still managed to name what it kept"
+        );
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(503),
+                "the model gateway could not be reached"
+            )),
+            AfterRefusal::SendAgain,
+            "a refusal that names no skill left nothing behind"
+        );
+        assert_eq!(
+            after_refusal(&OpenGrokError::from_server(
+                Some(503),
+                "skl_ is not an id and the gateway could not be reached"
+            )),
+            AfterRefusal::SendAgain,
+            "the prefix on its own is not an id"
+        );
+    }
+
+    /// The question a refused upload raises is whether the recording went with it. It did not:
+    /// the server keeps no tape, so the sheet is holding one of the only two copies there are,
+    /// and the other is named.
+    #[test]
+    fn a_refusal_says_the_recording_is_still_here() {
+        let kept = tape_survived_line(&Ok("/tmp/teach/cw_1/17.raw.json".to_string()));
+        assert!(kept.starts_with("Your recording is still here"), "{kept}");
+        assert!(
+            kept.contains("/tmp/teach/cw_1/17.raw.json"),
+            "and where the file is, for somebody who closes the window: {kept}"
+        );
+
+        // The line that reassures somebody cannot be the line that tells them there is no copy.
+        // "Your recording is still here · no local copy" contradicted itself in the one place
+        // written to stop them recording the whole task a second time.
+        let only = tape_survived_line(&Err("Permission denied".to_string()));
+        assert!(only.starts_with("Your recording is still here"), "{only}");
+        assert!(
+            only.contains("only copy") && only.contains("Permission denied"),
+            "it says where the one copy is and why there is not a second: {only}"
+        );
+        assert!(
+            !only.contains("· no local copy"),
+            "and never in the same breath as the reassurance: {only}"
         );
     }
 }

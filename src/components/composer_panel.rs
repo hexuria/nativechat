@@ -26,6 +26,27 @@ const QUICK_KEYS: usize = 9;
 /// split into letters.
 const MODIFIER_GLYPHS: &[char] = &['⌘', '⇧', '⌥', '⌃', '^', '❖', '⊞'];
 
+/// Where the highlight goes when the rows under an open panel change: back onto the row it was
+/// already on, wherever the new list put it, and onto `first` only when that row has gone.
+///
+/// A listing landing is not something the person did, and `/` now guarantees one shortly after
+/// it opens, because the skills arrive on a second route from the recipes. A highlight that went
+/// back to the top would move under the hand between the arrow key and the Enter — and the row
+/// at the top is a recipe, which is a mode set on the draft and a panel over the message.
+fn held_highlight(
+    shown: &[(SharedString, bool)],
+    held: Option<&SharedString>,
+    first: Option<usize>,
+) -> Option<usize> {
+    let Some(held) = held else {
+        return first;
+    };
+    shown
+        .iter()
+        .position(|(id, selectable)| id == held && *selectable)
+        .or(first)
+}
+
 /// One thing the panel offers: an icon, what it is, what it does, and what kind of thing it is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComposerPanelRow {
@@ -102,7 +123,10 @@ impl ComposerPanelRow {
         self
     }
 
-    fn matches(&self, needle: &str) -> bool {
+    /// Whether this row is left by the search. The rule is the panel's own; it is reachable
+    /// from the sources that build the rows so each list can assert that what it wrote in a
+    /// title and a description is what a person typing that word will find.
+    pub(crate) fn matches(&self, needle: &str) -> bool {
         needle.is_empty()
             || self.always
             || self.title.to_lowercase().contains(needle)
@@ -202,14 +226,42 @@ impl ComposerPanel {
 
     /// Replace the rows of an open panel, for a list that was still being fetched when the
     /// panel opened. The query stands, so what was typed while waiting is not thrown away.
+    ///
+    /// So does the highlight. A listing landing under an open panel is not something the person
+    /// did, and `/` now guarantees one shortly after it opens, because the skills come on a
+    /// second route: arrow down to the third row, press ↵ as they land, and a highlight that had
+    /// been put back to the top takes the first row instead — which for a recipe is a mode set
+    /// on the draft and a parameter panel over the message.
     pub fn set_rows(&mut self, rows: Vec<ComposerPanelRow>, cx: &mut Context<Self>) {
         if self.rows == rows {
             return;
         }
+        let held = self.highlighted_id();
         self.rows = rows;
         let query = self.search.read(cx).value().to_string();
         self.apply_filter(&query);
+        self.highlighted = held_highlight(&self.shown(), held.as_ref(), self.highlighted);
+        // Into view as well as onto the row. Twenty skills landing above it can push the row
+        // somebody is pointing at below the fold, which is the same complaint the line above
+        // answers, one step quieter.
+        if let Some(position) = self.highlighted {
+            self.scroll.scroll_to_item(position);
+        }
         cx.notify();
+    }
+
+    /// What the highlight is on, by the row's own id rather than by where it sits: where it sits
+    /// is the thing a new listing moves.
+    fn highlighted_id(&self) -> Option<SharedString> {
+        self.row_at(self.highlighted?).map(|row| row.id.clone())
+    }
+
+    /// The rows the search is leaving, each with whether it can be picked.
+    fn shown(&self) -> Vec<(SharedString, bool)> {
+        (0..self.filtered.len())
+            .filter_map(|position| self.row_at(position))
+            .map(|row| (row.id.clone(), row.selectable))
+            .collect()
     }
 
     /// Change the line under the list without disturbing what is typed above it, so a value the
@@ -633,7 +685,9 @@ fn keycap(label: SharedString, muted: Hsla) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerPanelRow, chord_keys, quick_number, quick_position};
+    use super::{
+        ComposerPanelRow, SharedString, chord_keys, held_highlight, quick_number, quick_position,
+    };
 
     fn roster() -> Vec<ComposerPanelRow> {
         vec![
@@ -664,6 +718,42 @@ mod tests {
             vec!["shell"],
             "what a tool does is worth searching, not just what it is called"
         );
+    }
+
+    /// A list that fills in under an open panel must not move what the person is pointing at.
+    #[test]
+    fn a_listing_landing_leaves_the_highlight_on_the_row_it_was_on() {
+        let before: Vec<(SharedString, bool)> = vec![
+            ("recipe:a".into(), true),
+            ("recipe:b".into(), true),
+            ("action:settings".into(), true),
+        ];
+        let held: SharedString = "recipe:b".into();
+        // The skills land between the recipes and the actions, so every row under it moves.
+        let after: Vec<(SharedString, bool)> = vec![
+            ("recipe:a".into(), true),
+            ("recipe:b".into(), true),
+            ("skill:skl_1".into(), true),
+            ("action:settings".into(), true),
+        ];
+        assert_eq!(
+            held_highlight(&after, Some(&held), Some(0)),
+            Some(1),
+            "the row is where it was, and the highlight is still on it"
+        );
+
+        // A search that no longer shows it, or a row that has gone: the top is what is left.
+        let narrowed: Vec<(SharedString, bool)> = vec![("skill:skl_1".into(), true)];
+        assert_eq!(held_highlight(&narrowed, Some(&held), Some(0)), Some(0));
+        assert_eq!(
+            held_highlight(&after, None, Some(0)),
+            Some(0),
+            "nothing was highlighted before, so nothing is being kept"
+        );
+        // And a row that is still listed but has become a notice cannot hold it.
+        let dimmed: Vec<(SharedString, bool)> = vec![("recipe:b".into(), false)];
+        assert_eq!(held_highlight(&dimmed, Some(&held), None), None);
+        assert_eq!(before.len(), 3);
     }
 
     #[test]

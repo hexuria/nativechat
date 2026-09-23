@@ -1,6 +1,7 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
 use crate::components::logins::LoginsPage;
+use crate::components::skills::SkillsPage;
 use crate::opengrok::LocalExecMode;
 use crate::send_policy::OnSend;
 use crate::state::{AppSettingsTab, AppState, SubmitChord};
@@ -15,6 +16,8 @@ pub struct AppSettings {
     state: Entity<AppState>,
     /// Settings → Logins, made on the first render of that tab (its fields need a window).
     logins: Option<Entity<LoginsPage>>,
+    /// Settings → Skills, made on the first render of that tab, for the same reason.
+    skills: Option<Entity<SkillsPage>>,
 }
 
 impl AppSettings {
@@ -23,6 +26,7 @@ impl AppSettings {
         Self {
             state,
             logins: None,
+            skills: None,
         }
     }
 
@@ -35,6 +39,16 @@ impl AppSettings {
         self.logins = Some(page.clone());
         page
     }
+
+    fn skills_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<SkillsPage> {
+        if let Some(page) = &self.skills {
+            return page.clone();
+        }
+        let state = self.state.clone();
+        let page = cx.new(|cx| SkillsPage::new(window, state, cx));
+        self.skills = Some(page.clone());
+        page
+    }
 }
 
 impl Render for AppSettings {
@@ -45,6 +59,7 @@ impl Render for AppSettings {
             tab,
             chord,
             on_send,
+            show_turn_timing,
             theme_mode,
             account_name,
             account_email,
@@ -62,6 +77,7 @@ impl Render for AppSettings {
                 state.app_settings_tab,
                 state.submit_chord,
                 state.on_send,
+                state.show_turn_timing,
                 state.theme_mode.clone(),
                 name,
                 email,
@@ -72,12 +88,13 @@ impl Render for AppSettings {
         };
         let app = self.state.clone();
 
-        // Every tab but Logins is a titled column of cards. Logins is three panes edge to
-        // edge, like a passwords app: it takes the whole body and each pane scrolls on its own.
+        // Every tab but Logins and Skills is a titled column of cards. Those two are panes edge
+        // to edge, like a passwords app: each takes the whole body and scrolls on its own.
         let cards: Option<AnyElement> = match tab {
-            AppSettingsTab::General => {
-                Some(general_page(chord, on_send, muted, app.clone()).into_any_element())
-            }
+            AppSettingsTab::General => Some(
+                general_page(chord, on_send, show_turn_timing, muted, app.clone())
+                    .into_any_element(),
+            ),
             AppSettingsTab::Profile => Some(
                 profile_page(account_name, account_email, muted, app.clone()).into_any_element(),
             ),
@@ -94,7 +111,7 @@ impl Render for AppSettings {
             AppSettingsTab::Updates => Some(
                 updates_page(&bot_name, &controls, muted, app.clone(), &theme).into_any_element(),
             ),
-            AppSettingsTab::Logins => None,
+            AppSettingsTab::Logins | AppSettingsTab::Skills => None,
         };
         let body = match cards {
             Some(page) => div()
@@ -119,13 +136,20 @@ impl Render for AppSettings {
                         .child(page),
                 )
                 .into_any_element(),
-            None => div()
-                .id("app-settings-body")
-                .flex_1()
-                .h_full()
-                .min_w(px(0.))
-                .child(self.logins_page(window, cx))
-                .into_any_element(),
+            None => {
+                let pane: AnyElement = if tab == AppSettingsTab::Skills {
+                    self.skills_page(window, cx).into_any_element()
+                } else {
+                    self.logins_page(window, cx).into_any_element()
+                };
+                div()
+                    .id("app-settings-body")
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(0.))
+                    .child(pane)
+                    .into_any_element()
+            }
         };
 
         h_flex()
@@ -251,6 +275,13 @@ impl AppSettings {
                 AppSettingsTab::Logins,
                 cx,
             ))
+            .child(nav_item(
+                "settings-tab-skills",
+                "Skills",
+                tab == AppSettingsTab::Skills,
+                AppSettingsTab::Skills,
+                cx,
+            ))
     }
 }
 
@@ -263,6 +294,7 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Computer => "Computer",
         AppSettingsTab::Updates => "Updates",
         AppSettingsTab::Logins => "Logins",
+        AppSettingsTab::Skills => "Skills",
     }
 }
 
@@ -376,6 +408,7 @@ fn nav_item(
 fn general_page(
     chord: SubmitChord,
     on_send: OnSend,
+    show_turn_timing: bool,
     muted: Hsla,
     app: Entity<AppState>,
 ) -> impl IntoElement {
@@ -453,12 +486,52 @@ fn general_page(
                     "Interrupt and send",
                     "Stops the current turn at its next step, then sends.",
                     on_send == OnSend::Steer,
-                    move |cx| {
-                        app.update(cx, |state, cx| {
-                            state.set_on_send(OnSend::Steer, cx);
-                        });
+                    {
+                        let app = app.clone();
+                        move |cx| {
+                            app.update(cx, |state, cx| {
+                                state.set_on_send(OnSend::Steer, cx);
+                            });
+                        }
                     },
                 )),
+        )
+        .child(div().text_xs().text_color(muted).child("Debug"))
+        .child(
+            card().child(
+                h_flex()
+                    .id("settings-show-turn-timing")
+                    .w_full()
+                    .px(px(16.))
+                    .py(px(14.))
+                    .gap(px(12.))
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(div().text_sm().child("Show turn timing"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x888888))
+                                    .child("Phases of each assistant run: model, each tool, auto-review. Off for demos; the timestamp still shows how long a turn took."),
+                            ),
+                    )
+                    .child(
+                        Switch::new("show-turn-timing")
+                            .checked(show_turn_timing)
+                            .on_click({
+                                let app = app.clone();
+                                move |checked, _, cx| {
+                                    app.update(cx, |state, cx| {
+                                        state.set_show_turn_timing(*checked, cx);
+                                    });
+                                }
+                            }),
+                    ),
+            ),
         )
 }
 

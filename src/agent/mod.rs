@@ -7,6 +7,8 @@
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
+//! `composer-skill` (the skill the next message is sent with, value = the id the turn names;
+//! in the tree only while one is on the draft),
 //! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
 //! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
 //! `user-form-pill-{key}`, `computer-handoff-{key}`,
@@ -61,6 +63,13 @@
 //! Typing goes in as GPUI keystrokes. `type`, `key` and `set_value` on the composer are
 //! planned here ([`ComposePlan`]) and pressed by [`RootView`](crate::root::RootView), because
 //! `/` and `@` are keys the composer takes before the text field ever sees them.
+//!
+//! `/` has no verb of its own: a row is taken the way a person takes it, by typing into
+//! `composer-panel-search` and pressing Enter, which is the only path that puts the chip in the
+//! message and the thing on the draft together. Two skills may share a name, and Enter takes
+//! the first selectable row the search leaves: tell them apart by their description, which the
+//! search reads too, or by counting rows under `composer-panel` and arrowing down to the one
+//! wanted. `composer-skill`'s value says which of them was actually taken.
 
 mod host;
 #[cfg(target_os = "macos")]
