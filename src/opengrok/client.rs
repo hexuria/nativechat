@@ -12,6 +12,9 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::error::{OpenGrokError, reads_as_gateway_unreachable};
+use super::pending::{
+    PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
+};
 use super::types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate,
     error_message_from_body,
@@ -368,7 +371,11 @@ impl OpenGrokClient {
         // `from_server` rather than `status`, because some of what the server refuses with is
         // not a refusal at all: "the gateway could not be reached" is the server reporting a
         // machine it could not get to, which is a state and not a verdict about the request.
+        let event = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|body| body.get("event").cloned());
         OpenGrokError::from_server(Some(status), error_message_from_body(&body))
+            .with_pending_event(event)
     }
 
     /// Nothing on a 2xx, the server's error otherwise. For the doors that answer 204.
@@ -790,6 +797,10 @@ impl OpenGrokClient {
     /// untouched by either: a parameter value is not prose, and there is no `/name` left in the
     /// text for the server to read a skill out of — the id is a field or the skill does not go.
     ///
+    /// `pending_id` is the `pum_…` row this turn is firing, when the send was queued. The
+    /// server drains that row atomically before the harness starts so two machines cannot both
+    /// post it. Absent, a last user-message id that matches `clientMessageId` still drains.
+    ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
     /// client that only learns the id from the frames it already saw: the one moment the id is
@@ -803,6 +814,7 @@ impl OpenGrokClient {
         messages: &[AguiMessage],
         recipe: Option<&TurnRecipe>,
         skill: Option<&str>,
+        pending_id: Option<&str>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
@@ -818,6 +830,9 @@ impl OpenGrokClient {
         // to refuse, and it says so in the frame that ends the run.
         if let Some(skill) = skill {
             forwarded["skill"] = Value::String(skill.to_string());
+        }
+        if let Some(pending_id) = pending_id.filter(|id| !id.is_empty()) {
+            forwarded["pendingId"] = Value::String(pending_id.to_string());
         }
         let body = json!({
             "threadId": thread_id,
@@ -1112,6 +1127,78 @@ impl OpenGrokClient {
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
         Self::json_or_error(response).await
+    }
+
+    /// Live follow-ups on this thread, oldest first.
+    ///
+    /// A 404 is either an OpenGrok that has not shipped the store yet, or a thread this
+    /// account has never run — same status the server uses so a pending id is not a probe.
+    /// Callers keep the local queue.
+    pub async fn list_pending_user_messages(
+        &self,
+        thread_id: &str,
+    ) -> Result<PendingList, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Hold a follow-up on the server until the thread is idle. Idempotent on
+    /// `clientMessageId`: a retry returns the existing pending row. `409 already-consumed`
+    /// means that bubble already became a run. The CUSTOM is `op: created`.
+    pub async fn enqueue_pending_user_message(
+        &self,
+        thread_id: &str,
+        body: &PendingWrite,
+    ) -> Result<PendingMutation, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending");
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Change a live follow-up's words. `404` means it is no longer this account's pending
+    /// row — drained, canceled, or somebody else's. The CUSTOM is `op: edited`.
+    pub async fn edit_pending_user_message(
+        &self,
+        thread_id: &str,
+        pending_id: &str,
+        body: &PendingWrite,
+    ) -> Result<PendingMutation, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending/{pending_id}");
+        let response = self
+            .send_json(reqwest::Method::PATCH, &path, Some(body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Take a follow-up back so it never becomes a run. Idempotent: drained, already
+    /// canceled, and never-heard-of ids on a thread this account owns are the same 200.
+    /// The CUSTOM is `op: canceled` and omits `message`.
+    pub async fn cancel_pending_user_message(
+        &self,
+        thread_id: &str,
+        pending_id: &str,
+    ) -> Result<PendingMutation, OpenGrokError> {
+        let path = format!("/ag-ui/threads/{thread_id}/pending/{pending_id}");
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        match response.json::<PendingMutation>().await {
+            Ok(mutation) => Ok(mutation),
+            Err(_) => Ok(PendingMutation {
+                v: 1,
+                thread_id: thread_id.to_string(),
+                pending_user_message: None,
+                event: None,
+            }),
+        }
     }
 
     /// Hide a turn for this account, on every machine it signs in from.
@@ -1916,6 +2003,28 @@ pub struct ThreadReplay {
     /// go on painting from its own copy what the person deleted on another.
     #[serde(rename = "hiddenRunIds", default, deserialize_with = "list_or_nothing")]
     pub hidden_run_ids: Vec<String>,
+    /// Live follow-ups that have not become a run. `None` when the server has never heard of
+    /// this field (OpenGrok before #171): the local queue is left alone. `Some` is the
+    /// snapshot to replace synced holds with — empty meaning none are pending.
+    #[serde(rename = "pendingUserMessages", default)]
+    pub pending_user_messages: Option<Vec<PendingUserMessage>>,
+    /// CUSTOM `pending-user-message` snapshots for the live queue. `None` on
+    /// OpenGrok before #171; `Some` (even empty) is preferred over
+    /// `pending_user_messages` when hydrating.
+    #[serde(rename = "pendingEvents", default)]
+    pub pending_events: Option<Vec<Value>>,
+}
+
+impl ThreadReplay {
+    /// Live pending rows: snapshot CUSTOMs when `pendingEvents` is present,
+    /// otherwise `pendingUserMessages`. `None` means the server predates the
+    /// field and the local queue must be left alone.
+    pub fn live_pending_messages(&self) -> Option<Vec<PendingUserMessage>> {
+        match &self.pending_events {
+            Some(events) => Some(PendingCustom::snapshot_messages(events)),
+            None => self.pending_user_messages.clone(),
+        }
+    }
 }
 
 /// One turn of a thread, as the server kept it.
@@ -3655,7 +3764,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -3739,6 +3848,379 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let thread = client.replay_thread("th_1", 5).await.expect("the thread");
         assert!(thread.hidden_run_ids.is_empty());
+        assert!(
+            thread.pending_user_messages.is_none(),
+            "a server that predates pending follow-ups must not look like an empty queue"
+        );
+        assert!(
+            thread.pending_events.is_none(),
+            "and pendingEvents is the same omission"
+        );
+        assert!(thread.live_pending_messages().is_none());
+    }
+
+    /// OpenGrok #171: the thread snapshot carries the live queue beside `runs`, never inside them.
+    #[tokio::test]
+    async fn a_thread_names_its_pending_follow_ups_beside_the_runs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "pendingUserMessages": [{
+                    "v": 1,
+                    "id": "pum_1",
+                    "threadId": "th_1",
+                    "content": "send this after the turn",
+                    "clientMessageId": "msg_bubble_1",
+                    "status": "pending",
+                    "createdAtMs": 10,
+                    "updatedAtMs": 10
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        let pending = thread.pending_user_messages.expect("the field is present");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "pum_1");
+        assert_eq!(pending[0].bubble_id(), "msg_bubble_1");
+        assert_eq!(pending[0].content, "send this after the turn");
+    }
+
+    /// Empty array is "none pending", not "the server has never heard of this".
+    #[tokio::test]
+    async fn an_empty_pending_list_on_a_thread_is_none_held() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "pendingUserMessages": [],
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        assert_eq!(
+            thread.pending_user_messages.as_deref(),
+            Some(&[][..]),
+            "so a hydrate can drop synced holds that another machine canceled"
+        );
+        assert!(thread.pending_events.is_none());
+        assert_eq!(thread.live_pending_messages().as_deref(), Some(&[][..]));
+    }
+
+    #[tokio::test]
+    async fn a_thread_prefers_pending_event_snapshots_over_the_row_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "threadId": "th_1",
+                "runs": [],
+                "pendingUserMessages": [{
+                    "id": "pum_stale",
+                    "content": "from the row list",
+                    "clientMessageId": "msg_stale"
+                }],
+                "pendingEvents": [{
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": {
+                        "v": 1,
+                        "op": "snapshot",
+                        "threadId": "th_1",
+                        "message": {
+                            "id": "pum_1",
+                            "content": "from the event",
+                            "clientMessageId": "msg_1"
+                        }
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let thread = client.replay_thread("th_1", 5).await.expect("the thread");
+        let live = thread.live_pending_messages().expect("events are present");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].bubble_id(), "msg_1");
+        assert_eq!(live[0].content, "from the event");
+    }
+
+    #[tokio::test]
+    async fn enqueue_edit_cancel_and_list_pending_follow_the_v1_contract() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui/threads/th_1/pending"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "pendingUserMessage": {
+                    "v": 1,
+                    "id": "pum_1",
+                    "threadId": "th_1",
+                    "content": "later",
+                    "clientMessageId": "msg_1",
+                    "status": "pending"
+                },
+                "event": {
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": { "v": 1, "op": "created", "threadId": "th_1" }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/ag-ui/threads/th_1/pending/pum_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "pendingUserMessage": {
+                    "v": 1,
+                    "id": "pum_1",
+                    "content": "instead",
+                    "clientMessageId": "msg_1",
+                    "status": "pending"
+                },
+                "event": {
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": {
+                        "v": 1,
+                        "op": "edited",
+                        "threadId": "th_1",
+                        "message": {
+                            "v": 1,
+                            "id": "pum_1",
+                            "content": "instead",
+                            "clientMessageId": "msg_1",
+                            "status": "pending"
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/ag-ui/threads/th_1/pending/pum_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "event": {
+                    "type": "CUSTOM",
+                    "name": "pending-user-message",
+                    "value": { "v": 1, "op": "canceled", "threadId": "th_1" }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1/pending"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "v": 1,
+                "threadId": "th_1",
+                "pendingUserMessages": [],
+                "pendingEvents": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let created = client
+            .enqueue_pending_user_message(
+                "th_1",
+                &crate::opengrok::PendingWrite::enqueue(
+                    "later".into(),
+                    "msg_1".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("created");
+        let created_row = created.row().expect("created row");
+        assert_eq!(created_row.id, "pum_1");
+        assert_eq!(created_row.bubble_id(), "msg_1");
+        assert_eq!(
+            created.custom().map(|custom| custom.op),
+            Some(crate::opengrok::PendingOp::Created)
+        );
+
+        let edited = client
+            .edit_pending_user_message(
+                "th_1",
+                "pum_1",
+                &crate::opengrok::PendingWrite::content_patch("instead".into()),
+            )
+            .await
+            .expect("edited");
+        assert_eq!(edited.row().expect("edited row").content, "instead");
+        assert_eq!(
+            edited.custom().map(|custom| custom.op),
+            Some(crate::opengrok::PendingOp::Edited)
+        );
+
+        let canceled = client
+            .cancel_pending_user_message("th_1", "pum_1")
+            .await
+            .expect("canceled");
+        assert_eq!(
+            canceled.custom().map(|custom| custom.op),
+            Some(crate::opengrok::PendingOp::Canceled)
+        );
+        assert!(canceled.row().is_none(), "canceled omits the message");
+
+        let listed = client
+            .list_pending_user_messages("th_1")
+            .await
+            .expect("listed");
+        assert_eq!(listed.v, 1);
+        assert!(listed.pending_user_messages.is_empty());
+        assert_eq!(listed.pending_events.as_deref(), Some(&[][..]));
+        assert!(listed.live_messages().is_empty());
+
+        let requests = server.received_requests().await.expect("the four calls");
+        let post: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            post,
+            json!({
+                "v": 1,
+                "content": "later",
+                "clientMessageId": "msg_1",
+            })
+        );
+        let patch: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(patch, json!({ "v": 1, "content": "instead" }));
+        assert_eq!(requests[2].method.as_str(), "DELETE");
+    }
+
+    /// A 404 on the pending routes is not a verdict about the send: keep the local queue.
+    #[tokio::test]
+    async fn a_missing_pending_route_is_a_404_the_caller_can_fall_back_from() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/th_1/pending"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such thread"))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let error = client
+            .list_pending_user_messages("th_1")
+            .await
+            .expect_err("old OpenGrok");
+        assert!(error.is_not_found());
+    }
+
+    /// Drain names the queued send so two machines cannot both fire it.
+    #[tokio::test]
+    async fn a_queued_turn_carries_pending_id_in_forwarded_props() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        client
+            .run_turn(
+                "cw_1",
+                "th_1",
+                "run_1",
+                &[AguiMessage {
+                    id: "msg_1".into(),
+                    role: "user".into(),
+                    content: "later".into(),
+                    tool_call_id: None,
+                    reply_to: None,
+                }],
+                None,
+                None,
+                Some("pum_1"),
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.expect("the turn");
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "pendingId": "pum_1" })
+        );
+        assert_eq!(body["messages"][0]["id"], "msg_1");
+    }
+
+    /// OpenGrok's 409 for a queued send whose row changed carries the row as it stands now.
+    #[tokio::test]
+    async fn a_stale_queued_turn_keeps_the_row_the_server_answered_with() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "v": 1,
+                "error": "stale-pending-message",
+                "id": "pum_1",
+                "runId": null,
+                "message": "This queued message changed. Refresh it before sending again.",
+                "event": {
+                    "type": "CUSTOM",
+                    "timestamp": 1710000000000i64,
+                    "name": "pending-user-message",
+                    "value": {
+                        "v": 1,
+                        "op": "edited",
+                        "threadId": "th_1",
+                        "message": {
+                            "v": 1,
+                            "id": "pum_1",
+                            "threadId": "th_1",
+                            "content": "the laptop's words",
+                            "clientMessageId": "msg_1",
+                            "status": "pending",
+                        },
+                    },
+                },
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let error = client
+            .run_turn(
+                "cw_1",
+                "th_1",
+                "run_1",
+                &[],
+                None,
+                None,
+                Some("pum_1"),
+                |_| {},
+            )
+            .await
+            .expect_err("refused");
+        assert!(error.is_stale_pending());
+        let custom = error.pending_custom().expect("the row as it stands");
+        assert_eq!(custom.op, crate::opengrok::PendingOp::Edited);
+        assert_eq!(
+            custom.message.map(|row| row.content).as_deref(),
+            Some("the laptop's words")
+        );
     }
 
     /// This is today's bug end to end. The app looks signed in, has nothing to put in the
@@ -3769,7 +4251,7 @@ mod tests {
         // is all that is left, and the app is still showing a roster.
         put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
         client
-            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .expect("the turn goes out, on a token the app fetched for itself");
 
@@ -3805,7 +4287,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -3836,7 +4318,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(!error.is_signed_out(), "nobody should be asked to sign in");
@@ -4309,6 +4791,7 @@ mod tests {
                 }],
                 None,
                 None,
+                None,
                 {
                     let first_at = first_at.clone();
                     move |event| {
@@ -4376,6 +4859,7 @@ mod tests {
                 &[message],
                 Some(&recipe),
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -4414,6 +4898,7 @@ mod tests {
                     tool_call_id: None,
                     reply_to: None,
                 }],
+                None,
                 None,
                 None,
                 |_| {},
@@ -4471,6 +4956,7 @@ mod tests {
                 &[said("u1")],
                 None,
                 Some("skl_1"),
+                None,
                 |_| {},
             )
             .await
@@ -4481,6 +4967,7 @@ mod tests {
                 "thread_1",
                 "run_2",
                 &[said("u1")],
+                None,
                 None,
                 None,
                 |_| {},

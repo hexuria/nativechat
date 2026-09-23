@@ -15,18 +15,19 @@ use crate::opengrok::{
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, ImageVisibility,
     LocalExecMode, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient,
-    OpenGrokError, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind,
-    ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary,
-    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming,
-    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
-    UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
-    save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
+    OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
+    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
+    SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind, ScheduleRow, ScreenshotSpec, SkillDetail,
+    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadReplay, ThreadRun, ToolCallTracker,
+    TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable,
+    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
+    activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
+    keep_local_save_offer, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, retry_enqueue, save_login_from_local, serve_local_exec,
+    stamp_duration, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -581,6 +582,10 @@ fn held_message(
         recipe,
         skill,
         reply,
+        pending_id: None,
+        posted: false,
+        stale: StaleRefusal::Fresh,
+        unsynced: false,
     }
 }
 
@@ -599,6 +604,34 @@ pub struct QueuedSend {
     skill: Option<String>,
     /// The message this one answers, for the quote the coworker is sent.
     reply: Option<ReplyTo>,
+    /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
+    /// OpenGrok that has not shipped pending-user-messages yet.
+    pending_id: Option<String>,
+    /// POST /pending went out and was not answered 404, so a row may exist before
+    /// `pending_id` is known.
+    posted: bool,
+    stale: StaleRefusal,
+    /// Edited here while the row could not be PATCHed. The row still has the old words, so the
+    /// hold waits for the PATCH `came_back` sends, and a hydrate keeps these words.
+    unsynced: bool,
+}
+
+/// How often OpenGrok has refused this hold as stale. A refused hold is put back with the
+/// server's row and sent once more; refused again, it waits for the thread to be read afresh
+/// instead of being sent in a loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StaleRefusal {
+    #[default]
+    Fresh,
+    Refreshed,
+    Parked,
+}
+
+impl QueuedSend {
+    /// OpenGrok may hold a row for this send, and drains it only when the turn is that row.
+    fn on_server(&self) -> bool {
+        self.pending_id.is_some() || self.posted
+    }
 }
 
 /// Where a hold sat when Edit took it off the queue. Sending it again puts it
@@ -636,6 +669,127 @@ pub struct EditRefill {
 struct UserMessagePersist {
     content: String,
     hidden: bool,
+}
+
+/// What to do with a `pum_…` after enqueue returns, once memory has had a chance to cancel
+/// or edit in the meantime.
+#[derive(Debug)]
+enum BindPending {
+    Bound,
+    Patch { pending_id: String, content: String },
+    TakeBack { pending_id: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OwedPatch {
+    thread_id: String,
+    pending_id: String,
+    message_id: String,
+    content: String,
+}
+
+enum QueuedEdit {
+    /// Another mutation of this hold is in flight, or there is no such hold.
+    Refused,
+    Patch {
+        thread_id: String,
+        pending_id: String,
+        content: String,
+    },
+    Applied {
+        content: String,
+    },
+}
+
+#[derive(Default)]
+struct PendingFold {
+    save: Vec<QueuedBubbleSave>,
+    hide: Vec<String>,
+    cancel: Vec<String>,
+}
+
+struct QueuedBubbleSave {
+    id: String,
+    content: String,
+    reply: Option<ReplyTo>,
+    sent_at: SystemTime,
+    insert: bool,
+}
+
+/// The `replyTo` a hold is saved with and drained with. One shape for both, because OpenGrok
+/// compares the two as JSON and refuses the drain on any difference.
+fn saved_reply(reply: &ReplyTo) -> ReplyQuote {
+    ReplyQuote {
+        message_id: reply.message_id.clone(),
+        preview: reply.preview.clone(),
+        is_me: reply.is_me,
+    }
+}
+
+fn reply_json(reply: &ReplyTo) -> serde_json::Value {
+    serde_json::to_value(saved_reply(reply)).unwrap_or(serde_json::Value::Null)
+}
+
+fn reply_from_pending(value: Option<&serde_json::Value>) -> Option<ReplyTo> {
+    let value = value?;
+    if let Some(id) = value.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+        return Some(ReplyTo {
+            message_id: id.to_string(),
+            preview: String::new(),
+            is_me: false,
+        });
+    }
+    let object = value.as_object()?;
+    let message_id = object
+        .get("messageId")
+        .or_else(|| object.get("message_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    Some(ReplyTo {
+        message_id,
+        preview: object
+            .get("preview")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_me: object
+            .get("isMe")
+            .or_else(|| object.get("is_me"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+fn recipe_from_pending(item: &PendingUserMessage) -> Option<TurnRecipe> {
+    let id = item
+        .recipe_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let values = item
+        .recipe_values
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    Some(TurnRecipe { id, values })
+}
+
+fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
+    QueuedSend {
+        message_id: item.bubble_id().to_string(),
+        content: item.content.clone(),
+        recipe: recipe_from_pending(item),
+        skill: item.skill_id.clone().filter(|id| !id.is_empty()),
+        reply: reply_from_pending(item.reply_to.as_ref()),
+        pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
+        posted: true,
+        stale: StaleRefusal::Fresh,
+        unsynced: false,
+    }
 }
 
 /// Write a person's bubble to its row. `read` is the bubble as memory has it at the moment it
@@ -1819,6 +1973,13 @@ pub struct AppState {
     pub show_turn_timing: bool,
     /// Messages held per thread until it is idle, in the order they were typed.
     queued_sends: HashMap<String, VecDeque<QueuedSend>>,
+    /// Bubble ids this process took off the queue. Hydrate must not put them back: a
+    /// GET that raced the DELETE would otherwise restore a send the person just canceled.
+    canceled_pending: HashSet<String>,
+    /// Holds whose DELETE/PATCH has gone out and whose local `queued_sends` has
+    /// not yet applied the CUSTOM. Drain must not pop these (FIFO), and hydrate
+    /// must not replace them with a snapshot that raced the mutation.
+    pending_inflight: HashSet<String>,
     /// The held send whose Edit was clicked, until the composer settles it.
     pending_edit: Option<String>,
     /// The place in the queue that Edit took a hold from, until that hold is sent again.
@@ -2361,6 +2522,8 @@ impl AppState {
             on_send: OnSend::default(),
             show_turn_timing: false,
             queued_sends: HashMap::new(),
+            canceled_pending: HashSet::new(),
+            pending_inflight: HashSet::new(),
             pending_edit: None,
             edit_slot: None,
             audio_input: None,
@@ -3610,6 +3773,21 @@ impl AppState {
         self.reconnect_epoch += 1;
         if self.is_signed_in() {
             self.refresh_coworkers(cx);
+        }
+        // Before the hydrate, whose fold drains: each PATCH marks its hold in flight.
+        if self.can_sync_pending() {
+            for owed in self.take_unsynced_edits() {
+                self.spawn_edit_pending(
+                    owed.thread_id,
+                    owed.pending_id,
+                    owed.message_id,
+                    owed.content,
+                    cx,
+                );
+            }
+        }
+        if let Some(id) = self.active_conversation_id.clone() {
+            self.hydrate_pending_user_messages(&id, cx);
         }
         cx.notify();
     }
@@ -6010,7 +6188,17 @@ impl AppState {
         }
     }
 
-    /// The half of [`Self::delete_message`] that is this Mac's memory. Returns the run the
+    pub fn delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        // Online, a held send's DELETE lands before the bubble goes; offline, the hold
+        // comes off before this returns, so a drain later in the same tick finds nothing.
+        if self.is_send_queued(message_id) {
+            self.take_queued_send_back(message_id, cx);
+            return;
+        }
+        self.hide_transcript_message(message_id, cx);
+    }
+
+    /// The half of [`Self::hide_transcript_message`] that is this Mac's memory. Returns the run the
     /// message came out of, which the server is told about separately.
     fn hide_message_in_memory(&mut self, message_id: &str) -> Option<String> {
         // A deleted bubble never becomes a turn, so its hold goes before this returns: a drain
@@ -6072,7 +6260,7 @@ impl AppState {
         hidden_run
     }
 
-    pub fn delete_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
+    fn hide_transcript_message(&mut self, message_id: &str, cx: &mut Context<Self>) {
         let hidden_run = self.hide_message_in_memory(message_id);
         if let Some(db) = self.database_service.clone() {
             let id = message_id.to_string();
@@ -6943,6 +7131,7 @@ impl AppState {
                         state.hide_withheld_runs(&conversation_id, &thread, cx);
                         state.apply_thread_replay(&conversation_id, &thread, cx);
                         state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        state.apply_pending_from_replay(&conversation_id, &thread, cx);
                     }
                     Err(_) => {
                         state.reconciled_threads.remove(&conversation_id);
@@ -7164,6 +7353,8 @@ impl AppState {
         // sight, which is the only chance there is to write that ending down.
         self.resync_live_turn(&conversation_id, cx);
         self.sync_pending_approvals(cx);
+        // The live queue on OpenGrok, not only what this process has been holding.
+        self.hydrate_pending_user_messages(&conversation_id, cx);
         // A message held while this thread was out of sight goes now if the thread is idle.
         self.drain_queued_send(&conversation_id, cx);
         cx.notify();
@@ -7473,11 +7664,54 @@ impl AppState {
         // sent, and what the composer is holding now belongs to the message still being
         // written. Taking it here sent somebody's skill on a turn they never attached it to
         // and left the chip standing over a draft with nothing behind it.
-        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, cx);
+        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, cx);
+    }
+
+    /// The messages a turn posts.
+    ///
+    /// OpenGrok matches a drained hold against the LAST user message, so the hold goes last and
+    /// the holds still queued behind it are left out. Cutting the thread at the hold instead
+    /// would drop the answer to the hold before it, which is painted after this one.
+    ///
+    /// A drained hold OpenGrok may have a row for goes as that row: its words without the
+    /// client's quote line, and `replyTo` as saved. The server refuses the drain on any other
+    /// text or reply, and writes the quote line itself from `replyTo`.
+    fn turn_history(
+        &self,
+        conversation_id: &str,
+        drained: Option<&QueuedSend>,
+    ) -> Vec<AguiMessage> {
+        let mut history = self
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| agui_messages(&c.messages))
+            .unwrap_or_default();
+        let Some(held) = drained else {
+            return history;
+        };
+        let behind: HashSet<&str> = self
+            .queued_sends
+            .get(conversation_id)
+            .into_iter()
+            .flatten()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        history.retain(|m| !behind.contains(m.id.as_str()));
+        if let Some(at) = history.iter().position(|m| m.id == held.message_id) {
+            let mut message = history.remove(at);
+            if held.on_server() {
+                message.content = held.content.clone();
+                message.reply_to = held.reply.as_ref().map(saved_reply);
+            }
+            history.push(message);
+        }
+        history
     }
 
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
-    /// replaces: it is stopped on the wire before the turn is posted.
+    /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
+    /// turn is firing, when it came off `queued_sends`.
     fn send_opengrok_turn_with(
         &mut self,
         conversation_id: String,
@@ -7485,6 +7719,7 @@ impl AppState {
         recipe: Option<TurnRecipe>,
         skill: Option<String>,
         stop_first: Option<String>,
+        drained: Option<QueuedSend>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -7501,12 +7736,9 @@ impl AppState {
             return;
         }
         let coworker_id = self.active_coworker_id.clone();
-        let history: Vec<AguiMessage> = self
-            .conversations
-            .iter()
-            .find(|c| c.id == conversation_id)
-            .map(|c| agui_messages(&c.messages))
-            .unwrap_or_default();
+        let history = self.turn_history(&conversation_id, drained.as_ref());
+        let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
+        let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
 
         // Both ids are minted here, before anything is sent. The run id because the server files
         // every frame under it and this is the app's only handle on the run once the stream is
@@ -7588,6 +7820,7 @@ impl AppState {
                             &history,
                             recipe.as_ref(),
                             skill.as_deref(),
+                            pending_id.as_deref(),
                             |event| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
@@ -7730,6 +7963,52 @@ impl AppState {
                         cx.notify();
                         return;
                     }
+                }
+                if let Err(error) = &result
+                    && error.is_stale_pending()
+                    && let Some(held) = drained.clone()
+                    && let Some(custom) = error.pending_custom()
+                {
+                    let message_id = held.message_id.clone();
+                    state.put_back_stale_hold(&conversation_id, &reply_id, held, &custom);
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    state.apply_pending_event(&custom, Some(&message_id), cx);
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
+                }
+                if let Err(error) = &result
+                    && (error.is_already_consumed() || error.is_not_pending())
+                {
+                    // Another machine already fired or canceled this hold. The empty
+                    // assistant row this turn minted is not an answer.
+                    if let Some(conversation) = state
+                        .conversations
+                        .iter_mut()
+                        .find(|conversation| conversation.id == conversation_id)
+                    {
+                        conversation
+                            .messages
+                            .retain(|message| message.id != reply_id);
+                        if error.is_not_pending()
+                            && let Some(user_id) = queued_message_id.as_deref()
+                            && let Some(message) = conversation
+                                .messages
+                                .iter_mut()
+                                .find(|message| message.id == user_id)
+                        {
+                            message.hidden = true;
+                        }
+                    }
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    if error.is_already_consumed() {
+                        state.reconcile_thread(&conversation_id, cx);
+                    }
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
                 }
                 if let Some(message) =
                     streaming_message_mut(&mut state.conversations, &conversation_id, &reply_id)
@@ -10929,8 +11208,23 @@ impl AppState {
             // first — the row reads as a message that got no answer, which is what it is.
             SendPlan::Queue => {
                 self.enqueue_hold(
+                    conversation_id.clone(),
+                    held_message(
+                        local_id.clone(),
+                        content.clone(),
+                        recipe.clone(),
+                        skill.clone(),
+                        reply_for_queue.clone(),
+                    ),
+                );
+                self.sync_queued_send_to_server(
                     conversation_id,
-                    held_message(local_id, content, recipe, skill, reply_for_queue),
+                    local_id,
+                    content,
+                    recipe,
+                    skill,
+                    reply_for_queue,
+                    cx,
                 );
                 cx.notify();
                 return;
@@ -10947,7 +11241,15 @@ impl AppState {
                 }
             }
         }
-        self.send_opengrok_turn_with(conversation_id, content, recipe, skill, stop_first, cx);
+        self.send_opengrok_turn_with(
+            conversation_id,
+            content,
+            recipe,
+            skill,
+            stop_first,
+            None,
+            cx,
+        );
     }
 
     /// Post the next held message, if the thread has one and is idle — and is the open
@@ -11000,10 +11302,11 @@ impl AppState {
         }
         self.send_opengrok_turn_with(
             conversation_id.to_string(),
-            next.content,
-            next.recipe,
-            next.skill,
+            next.content.clone(),
+            next.recipe.clone(),
+            next.skill.clone(),
             None,
+            Some(next),
             cx,
         );
     }
@@ -11171,6 +11474,26 @@ impl AppState {
             .any(|queued| queued.message_id == message_id)
     }
 
+    fn bubble_hidden(&self, conversation_id: &str, message_id: &str) -> bool {
+        self.conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .and_then(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+            })
+            .is_some_and(|message| message.hidden)
+    }
+
+    fn hold_mut(&mut self, message_id: &str) -> Option<&mut QueuedSend> {
+        self.queued_sends
+            .values_mut()
+            .flatten()
+            .find(|queued| queued.message_id == message_id)
+    }
+
     /// How many messages the open thread is holding back.
     pub fn queued_send_count(&self) -> usize {
         self.active_conversation_id
@@ -11242,6 +11565,13 @@ impl AppState {
     /// back, and a hidden hold never posts, whichever path hid it.
     fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
         loop {
+            let front = self.queued_sends.get(conversation_id)?.front()?;
+            if self.pending_inflight.contains(&front.message_id)
+                || front.stale == StaleRefusal::Parked
+                || front.unsynced
+            {
+                return None;
+            }
             let next = self
                 .queued_sends
                 .get_mut(conversation_id)
@@ -11302,11 +11632,11 @@ impl AppState {
     }
 
     /// Take a held send off the queue and hide its bubble. The turn is never posted.
+    ///
+    /// Online with a `pum_…`: DELETE, then apply the `canceled` CUSTOM. Offline /
+    /// no pending id: Phase 1 dequeue in this tick so drain cannot fire it.
     pub fn cancel_queued_send(&mut self, message_id: &str, cx: &mut Context<Self>) {
-        if !self.is_send_queued(message_id) {
-            return;
-        }
-        self.delete_message(message_id, cx);
+        self.take_queued_send_back(message_id, cx);
     }
 
     /// Put the held words back in the composer and cancel the queue item.
@@ -11340,8 +11670,12 @@ impl AppState {
         draft: &str,
         cx: &mut Context<Self>,
     ) -> Result<EditRefill, String> {
+        let server_row = self.queued_pending_of(message_id);
         let refill = self.take_hold_for_edit(message_id, draft)?;
-        self.delete_message(message_id, cx);
+        if let Some((thread_id, pending_id)) = server_row {
+            self.spawn_cancel_pending(thread_id, pending_id, cx);
+        }
+        self.hide_transcript_message(message_id, cx);
         Ok(refill)
     }
 
@@ -11356,11 +11690,19 @@ impl AppState {
                 "The composer already has words in it. Send or clear them, then Edit.".to_string(),
             );
         }
+        if self.pending_inflight.contains(message_id) {
+            return Err(
+                "That message is still being updated. Try Edit again in a moment.".to_string(),
+            );
+        }
         let slot = self.queue_slot(message_id);
         let Some(held) = self.dequeue_send(message_id) else {
             return Err("That message has already been sent.".to_string());
         };
         self.edit_slot = slot;
+        // A snapshot or bind that raced the DELETE would otherwise queue the words again while
+        // they sit in the composer.
+        self.canceled_pending.insert(message_id.to_string());
         // Replaced, not added to: the draft becomes the held message, so anything the composer
         // picked up that the message did not carry would go out with it unasked.
         self.reply_to = held.reply;
@@ -11384,10 +11726,95 @@ impl AppState {
     }
 
     /// Change a held send's words in the queue, on the bubble, and on disk. Drain posts these.
+    ///
+    /// Online with a `pum_…`: PATCH, then apply the `edited` CUSTOM. Offline: the
+    /// Phase 1 in-memory edit is enough, and bind will PATCH once enqueue lands.
     pub fn edit_queued_send(&mut self, message_id: &str, content: String, cx: &mut Context<Self>) {
+        match self.begin_queued_edit(message_id, content) {
+            QueuedEdit::Refused => {}
+            QueuedEdit::Patch {
+                thread_id,
+                pending_id,
+                content,
+            } => {
+                self.spawn_edit_pending(thread_id, pending_id, message_id.to_string(), content, cx)
+            }
+            QueuedEdit::Applied { content } => {
+                self.save_queued_words(message_id, content, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// What an edit does to memory before anything is sent or saved.
+    fn begin_queued_edit(&mut self, message_id: &str, content: String) -> QueuedEdit {
+        if self.pending_inflight.contains(message_id) {
+            return QueuedEdit::Refused;
+        }
+        if let Some(held) = self.hold_mut(message_id) {
+            held.stale = StaleRefusal::Fresh;
+        }
+        if let Some((thread_id, pending_id)) = self.pending_sync_target(message_id) {
+            self.pending_inflight.insert(message_id.to_string());
+            return QueuedEdit::Patch {
+                thread_id,
+                pending_id,
+                content,
+            };
+        }
+        if !self.apply_queued_edit(message_id, content.clone()) {
+            return QueuedEdit::Refused;
+        }
+        self.mark_unsynced(message_id);
+        QueuedEdit::Applied { content }
+    }
+
+    /// A hold with a row whose words changed here without a PATCH landing.
+    fn mark_unsynced(&mut self, message_id: &str) {
+        if let Some(held) = self.hold_mut(message_id)
+            && held.pending_id.is_some()
+        {
+            held.unsynced = true;
+        }
+    }
+
+    /// The PATCHes offline edits still owe, each marked in flight so drain waits for it.
+    fn take_unsynced_edits(&mut self) -> Vec<OwedPatch> {
+        let owed: Vec<OwedPatch> = self
+            .queued_sends
+            .iter()
+            .flat_map(|(thread_id, queue)| {
+                queue.iter().filter_map(move |held| {
+                    Some(OwedPatch {
+                        thread_id: thread_id.clone(),
+                        pending_id: held.pending_id.clone().filter(|_| held.unsynced)?,
+                        message_id: held.message_id.clone(),
+                        content: held.content.clone(),
+                    })
+                })
+            })
+            .filter(|owed| !self.pending_inflight.contains(&owed.message_id))
+            .collect();
+        for patch in &owed {
+            self.pending_inflight.insert(patch.message_id.clone());
+        }
+        owed
+    }
+
+    fn apply_local_queued_edit(
+        &mut self,
+        message_id: &str,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
         if !self.apply_queued_edit(message_id, content.clone()) {
             return;
         }
+        self.save_queued_words(message_id, content, cx);
+        cx.notify();
+    }
+
+    fn save_queued_words(&self, message_id: &str, content: String, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             let id = message_id.to_string();
             cx.spawn(async move |_, _| {
@@ -11397,7 +11824,6 @@ impl AppState {
             })
             .detach();
         }
-        cx.notify();
     }
 
     fn apply_queued_edit(&mut self, message_id: &str, content: String) -> bool {
@@ -11426,6 +11852,841 @@ impl AppState {
             }
         }
         true
+    }
+
+    fn thread_holding(&self, message_id: &str) -> Option<String> {
+        self.queued_sends
+            .iter()
+            .find_map(|(conversation_id, queue)| {
+                queue
+                    .iter()
+                    .any(|queued| queued.message_id == message_id)
+                    .then(|| conversation_id.clone())
+            })
+    }
+
+    fn queued_pending_of(&self, message_id: &str) -> Option<(String, String)> {
+        for (conversation_id, queue) in &self.queued_sends {
+            if let Some(queued) = queue.iter().find(|queued| queued.message_id == message_id)
+                && let Some(pending_id) = queued.pending_id.clone()
+            {
+                return Some((conversation_id.clone(), pending_id));
+            }
+        }
+        None
+    }
+
+    fn can_sync_pending(&self) -> bool {
+        self.opengrok.is_some() && self.reachability.is_reachable() && self.can_send_turn()
+    }
+
+    fn pending_sync_target(&self, message_id: &str) -> Option<(String, String)> {
+        if !self.can_sync_pending() {
+            return None;
+        }
+        self.queued_pending_of(message_id)
+    }
+
+    fn take_queued_send_back(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        if self.pending_inflight.contains(message_id) {
+            return;
+        }
+        if !self.is_send_queued(message_id) {
+            return;
+        }
+        if let Some((thread_id, pending_id)) = self.pending_sync_target(message_id) {
+            self.pending_inflight.insert(message_id.to_string());
+            self.spawn_cancel_then_apply(thread_id, pending_id, message_id.to_string(), cx);
+            return;
+        }
+        self.finish_queued_takeback(message_id, cx);
+    }
+
+    /// Offline / no `pum_…`: dequeue now (drain-safe this tick), tombstone, hide.
+    fn finish_queued_takeback(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        self.pending_inflight.remove(message_id);
+        let thread = self.thread_holding(message_id);
+        let held = self.dequeue_send(message_id);
+        if let (Some(thread), Some(held)) = (thread.as_deref(), held.as_ref()) {
+            self.drop_server_pending(thread, held, cx);
+        }
+        self.hide_transcript_message(message_id, cx);
+        if let Some(thread) = thread {
+            self.drain_queued_send(&thread, cx);
+        }
+    }
+
+    /// Local cancel already happened (offline path, or a hydrate tombstone). Tell
+    /// the server when a `pum_…` exists so another machine does not fire it.
+    fn drop_server_pending(&mut self, thread_id: &str, held: &QueuedSend, cx: &mut Context<Self>) {
+        self.canceled_pending.insert(held.message_id.clone());
+        if let Some(pending_id) = held.pending_id.clone() {
+            self.spawn_cancel_pending(thread_id.to_string(), pending_id, cx);
+        }
+    }
+
+    fn spawn_cancel_pending(&self, thread_id: String, pending_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            match client
+                .cancel_pending_user_message(&thread_id, &pending_id)
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) => {
+                    eprintln!("NativeChat: could not cancel a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_cancel_then_apply(
+        &self,
+        thread_id: String,
+        pending_id: String,
+        message_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            match client
+                .cancel_pending_user_message(&thread_id, &pending_id)
+                .await
+            {
+                Ok(mutation) => {
+                    let _ = this.update(cx, |state, cx| {
+                        if let Some(custom) = mutation.custom() {
+                            state.apply_pending_event(&custom, Some(&message_id), cx);
+                        } else {
+                            state.finish_queued_takeback(&message_id, cx);
+                        }
+                    });
+                }
+                Err(error)
+                    if error.is_not_found()
+                        || error.unreachable().is_some()
+                        || error.is_not_pending()
+                        || error.is_already_consumed() =>
+                {
+                    let _ = this.update(cx, |state, cx| {
+                        state.finish_queued_takeback(&message_id, cx);
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |state, _| {
+                        state.pending_inflight.remove(&message_id);
+                    });
+                    eprintln!("NativeChat: could not cancel a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_edit_pending(
+        &self,
+        thread_id: String,
+        pending_id: String,
+        message_id: String,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let local_content = content.clone();
+        cx.spawn(async move |this, cx| {
+            match client
+                .edit_pending_user_message(
+                    &thread_id,
+                    &pending_id,
+                    &PendingWrite::content_patch(content),
+                )
+                .await
+            {
+                Ok(mutation) => {
+                    let _ = this.update(cx, |state, cx| {
+                        if let Some(held) = state.hold_mut(&message_id) {
+                            held.unsynced = false;
+                        }
+                        if let Some(custom) = mutation.custom() {
+                            state.apply_pending_event(&custom, Some(&message_id), cx);
+                        } else if let Some(row) = mutation.row() {
+                            state.apply_local_queued_edit(&message_id, row.content, cx);
+                            state.pending_inflight.remove(&message_id);
+                        } else {
+                            state.apply_local_queued_edit(&message_id, local_content, cx);
+                            state.pending_inflight.remove(&message_id);
+                        }
+                        state.drain_queued_send(&thread_id, cx);
+                    });
+                }
+                Err(error) if error.unreachable().is_some() => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.pending_inflight.remove(&message_id);
+                        state.apply_local_queued_edit(&message_id, local_content, cx);
+                        state.mark_unsynced(&message_id);
+                    });
+                }
+                // The row was drained or canceled since: the new words went nowhere, and the
+                // snapshot says what became of the hold.
+                Err(error) if error.is_not_found() || error.is_not_pending() => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.pending_inflight.remove(&message_id);
+                        if let Some(held) = state.hold_mut(&message_id) {
+                            held.unsynced = false;
+                        }
+                        state.hydrate_pending_user_messages(&thread_id, cx);
+                    });
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.pending_inflight.remove(&message_id);
+                        state.drain_queued_send(&thread_id, cx);
+                    });
+                    eprintln!("NativeChat: could not edit a pending send: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// POST the hold to OpenGrok while the bubble stays local. 404 / unreachable keep the
+    /// in-memory queue (offline, or a server that has not shipped the store).
+    fn sync_queued_send_to_server(
+        &mut self,
+        thread_id: String,
+        message_id: String,
+        content: String,
+        recipe: Option<TurnRecipe>,
+        skill: Option<String>,
+        reply: Option<ReplyTo>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !self.can_send_turn() {
+            return;
+        }
+        if let Some(held) = self.hold_mut(&message_id) {
+            held.posted = true;
+        }
+        let body = PendingWrite::enqueue(
+            content.clone(),
+            message_id.clone(),
+            reply.as_ref().map(reply_json),
+            recipe.as_ref().map(|recipe| recipe.id.clone()),
+            recipe.map(|recipe| serde_json::Value::Object(recipe.values)),
+            skill,
+        );
+        let posted_content = content;
+        cx.spawn(async move |this, cx| {
+            let mut attempt = 1;
+            loop {
+                match client.enqueue_pending_user_message(&thread_id, &body).await {
+                    Ok(mutation) => {
+                        let Some(row) = mutation.row() else {
+                            eprintln!(
+                                "NativeChat: the server accepted a pending send and named no row"
+                            );
+                            return;
+                        };
+                        let _ = this.update(cx, |state, cx| {
+                            match state.bind_pending_id(
+                                &message_id,
+                                row.id.clone(),
+                                &posted_content,
+                            ) {
+                                BindPending::TakeBack { pending_id } => {
+                                    state.spawn_cancel_pending(thread_id.clone(), pending_id, cx);
+                                }
+                                BindPending::Patch {
+                                    pending_id,
+                                    content,
+                                } => {
+                                    state.spawn_edit_pending(
+                                        thread_id.clone(),
+                                        pending_id,
+                                        message_id.clone(),
+                                        content,
+                                        cx,
+                                    );
+                                }
+                                BindPending::Bound => {}
+                            }
+                        });
+                    }
+                    Err(error) if retry_enqueue(&error, attempt) => {
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(error) if error.is_not_found() => {
+                        let _ = this.update(cx, |state, _| {
+                            if let Some(held) = state.hold_mut(&message_id) {
+                                held.posted = false;
+                            }
+                        });
+                    }
+                    Err(error) if error.unreachable().is_some() => {}
+                    Err(error) if error.is_already_consumed() => {
+                        let _ = this.update(cx, |state, cx| {
+                            state.dequeue_send(&message_id);
+                            state.reconcile_thread(&thread_id, cx);
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("NativeChat: could not enqueue a pending send: {error}");
+                    }
+                }
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn bind_pending_id(
+        &mut self,
+        message_id: &str,
+        pending_id: String,
+        posted_content: &str,
+    ) -> BindPending {
+        if self.canceled_pending.contains(message_id) {
+            return BindPending::TakeBack { pending_id };
+        }
+        let Some(queued) = self.hold_mut(message_id) else {
+            return BindPending::TakeBack { pending_id };
+        };
+        queued.pending_id = Some(pending_id.clone());
+        if queued.content == posted_content {
+            return BindPending::Bound;
+        }
+        let content = queued.content.clone();
+        self.pending_inflight.insert(message_id.to_string());
+        BindPending::Patch {
+            pending_id,
+            content,
+        }
+    }
+
+    fn hydrate_pending_user_messages(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |this, cx| {
+            match client.list_pending_user_messages(&conversation_id).await {
+                Ok(list) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.apply_pending_snapshot(&conversation_id, &list.live_messages(), cx);
+                        cx.notify();
+                    });
+                }
+                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) if error.is_signed_out() => {
+                    let _ = this.update(cx, |state, cx| state.note_signed_out(cx));
+                }
+                Err(error) => {
+                    eprintln!("NativeChat: could not load pending sends: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_pending_from_replay(
+        &mut self,
+        conversation_id: &str,
+        thread: &ThreadReplay,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = thread.live_pending_messages() else {
+            return;
+        };
+        self.apply_pending_snapshot(conversation_id, &pending, cx);
+    }
+
+    /// Replace synced holds with the server's live list. Local-only holds (no `pum_…` yet)
+    /// stay, so an enqueue still in flight is not dropped. Tombstoned ids stay gone.
+    fn apply_pending_snapshot(
+        &mut self,
+        conversation_id: &str,
+        pending: &[PendingUserMessage],
+        cx: &mut Context<Self>,
+    ) {
+        let fold = self.fold_pending_snapshot(conversation_id, pending);
+        for pending_id in fold.cancel {
+            self.spawn_cancel_pending(conversation_id.to_string(), pending_id, cx);
+        }
+        for save in fold.save {
+            self.persist_queued_bubble(conversation_id, save, cx);
+        }
+        for message_id in fold.hide {
+            if let Some(db) = self.database_service.clone() {
+                cx.spawn(async move |_, _| {
+                    if let Err(error) = db.hide_message(&message_id).await {
+                        eprintln!("Failed to hide a pending message: {error}");
+                    }
+                })
+                .detach();
+            }
+        }
+        self.drain_queued_send(conversation_id, cx);
+    }
+
+    fn fold_pending_snapshot(
+        &mut self,
+        conversation_id: &str,
+        pending: &[PendingUserMessage],
+    ) -> PendingFold {
+        let rows: HashMap<&str, &PendingUserMessage> = pending
+            .iter()
+            .map(|item| (item.bubble_id(), item))
+            .collect();
+        let previous = self
+            .queued_sends
+            .remove(conversation_id)
+            .unwrap_or_default();
+
+        // The local queue first, in the order it was typed; rows only the server has go after.
+        let mut fold = PendingFold::default();
+        let mut rebuilt = VecDeque::new();
+        for mut queued in previous {
+            if self.canceled_pending.contains(&queued.message_id) {
+                continue;
+            }
+            let row = rows.get(queued.message_id.as_str()).copied();
+            if self.pending_inflight.contains(&queued.message_id) {
+                rebuilt.push_back(queued);
+            } else if queued.pending_id.is_none() {
+                // Enqueue has not bound yet, and bind PATCHes whatever these words have
+                // become since the POST; the row's copy would hide that edit from it.
+                if let Some(row) = row.filter(|row| !row.id.is_empty()) {
+                    queued.pending_id = Some(row.id.clone());
+                }
+                rebuilt.push_back(queued);
+            } else if let Some(row) = row {
+                if self.bubble_hidden(conversation_id, &queued.message_id) {
+                    continue;
+                }
+                if queued.unsynced {
+                    rebuilt.push_back(queued);
+                    continue;
+                }
+                if let Some(save) = self.upsert_queued_bubble(conversation_id, row) {
+                    fold.save.push(save);
+                }
+                rebuilt.push_back(hold_from_row(row));
+            }
+            // The row is gone. A drain on another machine and a cancel on another machine
+            // look the same in this list. The hold stays off the queue, so this machine
+            // does not send it. The bubble stays up: hiding it would drop the person's
+            // words when the other machine already drained the send and the answer is
+            // not here yet. A cancel made here hides the bubble on its own path.
+        }
+        for item in pending {
+            let bubble_id = item.bubble_id();
+            if self.pending_inflight.contains(bubble_id)
+                || rebuilt.iter().any(|queued| queued.message_id == bubble_id)
+            {
+                continue;
+            }
+            // A hidden bubble was taken back here, maybe before a restart lost the tombstone
+            // and while the DELETE could not land. Hidden is the person's word; ask again.
+            if self.canceled_pending.contains(bubble_id)
+                || self.bubble_hidden(conversation_id, bubble_id)
+            {
+                self.canceled_pending.insert(bubble_id.to_string());
+                if !item.id.is_empty() {
+                    fold.cancel.push(item.id.clone());
+                }
+                continue;
+            }
+            if let Some(save) = self.upsert_queued_bubble(conversation_id, item) {
+                fold.save.push(save);
+            }
+            rebuilt.push_back(hold_from_row(item));
+        }
+        if rebuilt.is_empty() {
+            self.queued_sends.remove(conversation_id);
+        } else {
+            self.queued_sends
+                .insert(conversation_id.to_string(), rebuilt);
+        }
+
+        let in_this_thread: HashSet<&str> = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .map(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .map(|message| message.id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A tombstone is only needed while the server still has the row. Once the row is
+        // gone, a hidden bubble is what keeps a restart from queueing the send again.
+        self.canceled_pending
+            .retain(|id| !in_this_thread.contains(id.as_str()) || rows.contains_key(id.as_str()));
+        fold
+    }
+
+    /// A drained hold OpenGrok refused as stale. `edited`: the row is still queued, so the hold
+    /// goes back to the front as the server has it; the CUSTOM, applied after, puts the words on
+    /// the bubble. `drained`: another turn spent the row and the hold stays off. The refused
+    /// turn's reply bubble is not an answer either way.
+    fn put_back_stale_hold(
+        &mut self,
+        conversation_id: &str,
+        reply_id: &str,
+        mut held: QueuedSend,
+        custom: &PendingCustom,
+    ) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != reply_id);
+        }
+        let (PendingOp::Edited, Some(row)) = (custom.op, custom.message.as_ref()) else {
+            return;
+        };
+        held.content = row.content.clone();
+        held.reply = reply_from_pending(row.reply_to.as_ref());
+        held.recipe = recipe_from_pending(row);
+        held.skill = row.skill_id.clone().filter(|id| !id.is_empty());
+        if !row.id.is_empty() {
+            held.pending_id = Some(row.id.clone());
+        }
+        held.stale = match held.stale {
+            StaleRefusal::Fresh => StaleRefusal::Refreshed,
+            StaleRefusal::Refreshed | StaleRefusal::Parked => StaleRefusal::Parked,
+        };
+        self.queued_sends
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push_front(held);
+    }
+
+    fn apply_pending_event(
+        &mut self,
+        custom: &PendingCustom,
+        fallback_bubble: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let conversation_id = if custom.thread_id.is_empty() {
+            self.active_conversation_id.clone().unwrap_or_default()
+        } else {
+            custom.thread_id.clone()
+        };
+        let fold = self.apply_pending_custom(custom, fallback_bubble);
+        for pending_id in fold.cancel {
+            self.spawn_cancel_pending(conversation_id.clone(), pending_id, cx);
+        }
+        for save in fold.save {
+            self.persist_queued_bubble(&conversation_id, save, cx);
+        }
+        match custom.op {
+            PendingOp::Canceled => {
+                if let Some(message_id) = self.bubble_id_for_custom(custom, fallback_bubble) {
+                    self.hide_transcript_message(&message_id, cx);
+                }
+                if !conversation_id.is_empty() {
+                    self.drain_queued_send(&conversation_id, cx);
+                }
+            }
+            PendingOp::Drained => {
+                if !conversation_id.is_empty() {
+                    self.drain_queued_send(&conversation_id, cx);
+                }
+            }
+            PendingOp::Created | PendingOp::Edited | PendingOp::Snapshot => {
+                for message_id in fold.hide {
+                    self.hide_transcript_message(&message_id, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Apply one `pending-user-message` CUSTOM to `queued_sends`. Persist is the
+    /// caller's: tests can fold memory without a GPUI context.
+    fn apply_pending_custom(
+        &mut self,
+        custom: &PendingCustom,
+        fallback_bubble: Option<&str>,
+    ) -> PendingFold {
+        let mut fold = PendingFold::default();
+        let conversation_id = if custom.thread_id.is_empty() {
+            match self.active_conversation_id.clone() {
+                Some(id) => id,
+                None => return fold,
+            }
+        } else {
+            custom.thread_id.clone()
+        };
+        match custom.op {
+            PendingOp::Created | PendingOp::Snapshot => {
+                let Some(item) = custom.message.as_ref() else {
+                    return fold;
+                };
+                let bubble_id = item.bubble_id().to_string();
+                self.pending_inflight.remove(&bubble_id);
+                if self.canceled_pending.contains(&bubble_id)
+                    || self.bubble_hidden(&conversation_id, &bubble_id)
+                {
+                    self.canceled_pending.insert(bubble_id);
+                    if !item.id.is_empty() {
+                        fold.cancel.push(item.id.clone());
+                    }
+                    return fold;
+                }
+                if let Some(save) = self.upsert_hold_from_row(&conversation_id, item) {
+                    fold.save.push(save);
+                }
+            }
+            PendingOp::Edited => {
+                let Some(item) = custom.message.as_ref() else {
+                    return fold;
+                };
+                let bubble_id = item.bubble_id().to_string();
+                self.pending_inflight.remove(&bubble_id);
+                if self.apply_queued_edit(&bubble_id, item.content.clone()) {
+                    if let Some(queued) = self
+                        .queued_sends
+                        .values_mut()
+                        .flatten()
+                        .find(|queued| queued.message_id == bubble_id)
+                        && queued.pending_id.is_none()
+                        && !item.id.is_empty()
+                    {
+                        queued.pending_id = Some(item.id.clone());
+                    }
+                    fold.save.push(QueuedBubbleSave {
+                        id: bubble_id,
+                        content: item.content.clone(),
+                        reply: reply_from_pending(item.reply_to.as_ref()),
+                        sent_at: SystemTime::now(),
+                        insert: false,
+                    });
+                }
+            }
+            PendingOp::Canceled => {
+                let Some(bubble_id) = self.bubble_id_for_custom(custom, fallback_bubble) else {
+                    return fold;
+                };
+                self.pending_inflight.remove(&bubble_id);
+                self.canceled_pending.insert(bubble_id.clone());
+                self.dequeue_send(&bubble_id);
+                if self.hide_queued_bubble(&conversation_id, &bubble_id) {
+                    fold.hide.push(bubble_id);
+                }
+            }
+            PendingOp::Drained => {
+                let Some(bubble_id) = self.bubble_id_for_custom(custom, fallback_bubble) else {
+                    return fold;
+                };
+                self.pending_inflight.remove(&bubble_id);
+                self.dequeue_send(&bubble_id);
+            }
+        }
+        fold
+    }
+
+    fn bubble_id_for_custom(
+        &self,
+        custom: &PendingCustom,
+        fallback_bubble: Option<&str>,
+    ) -> Option<String> {
+        if let Some(message) = custom.message.as_ref() {
+            return Some(message.bubble_id().to_string());
+        }
+        if let Some(id) = fallback_bubble.map(str::trim).filter(|id| !id.is_empty()) {
+            return Some(id.to_string());
+        }
+        None
+    }
+
+    fn hide_queued_bubble(&mut self, conversation_id: &str, message_id: &str) -> bool {
+        let mut found = None;
+        for (index, conversation) in self.conversations.iter().enumerate() {
+            if conversation
+                .messages
+                .iter()
+                .any(|message| message.id == message_id)
+            {
+                let prefer = conversation.id == conversation_id
+                    || self.active_conversation_id.as_deref() == Some(conversation.id.as_str());
+                found = Some(index);
+                if prefer {
+                    break;
+                }
+            }
+        }
+        let Some(index) = found else {
+            return false;
+        };
+        if let Some(message) = self.conversations[index]
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            message.hidden = true;
+            return true;
+        }
+        false
+    }
+
+    fn upsert_hold_from_row(
+        &mut self,
+        conversation_id: &str,
+        item: &PendingUserMessage,
+    ) -> Option<QueuedBubbleSave> {
+        let save = self.upsert_queued_bubble(conversation_id, item)?;
+        let hold = hold_from_row(item);
+        let queue = self
+            .queued_sends
+            .entry(conversation_id.to_string())
+            .or_default();
+        if let Some(existing) = queue
+            .iter_mut()
+            .find(|queued| queued.message_id == hold.message_id)
+        {
+            existing.content = hold.content;
+            existing.recipe = hold.recipe;
+            existing.skill = hold.skill;
+            existing.reply = hold.reply;
+            if hold.pending_id.is_some() {
+                existing.pending_id = hold.pending_id;
+            }
+        } else {
+            queue.push_back(hold);
+        }
+        Some(save)
+    }
+
+    fn upsert_queued_bubble(
+        &mut self,
+        conversation_id: &str,
+        item: &PendingUserMessage,
+    ) -> Option<QueuedBubbleSave> {
+        let bubble_id = item.bubble_id().to_string();
+        let reply = reply_from_pending(item.reply_to.as_ref());
+        let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        else {
+            return None;
+        };
+        if let Some(message) = conversation
+            .messages
+            .iter_mut()
+            .find(|message| message.id == bubble_id)
+        {
+            message.content = item.content.clone();
+            if let Some(reply) = &reply {
+                message.reply_to_id = Some(reply.message_id.clone());
+                message.reply_preview = Some(reply.preview.clone());
+                message.reply_is_me = reply.is_me;
+            }
+            return Some(QueuedBubbleSave {
+                id: bubble_id,
+                content: item.content.clone(),
+                reply,
+                sent_at: message.sent_at,
+                insert: false,
+            });
+        }
+        let sent_at = if item.created_at_ms > 0 {
+            SystemTime::UNIX_EPOCH + Duration::from_millis(item.created_at_ms as u64)
+        } else {
+            SystemTime::now()
+        };
+        conversation.messages.push(Message {
+            id: bubble_id.clone(),
+            sender: "Me".to_string(),
+            content: item.content.clone(),
+            sent_at,
+            finished_at: None,
+            run_timing: None,
+            is_me: true,
+            reply_preview: reply.as_ref().map(|reply| reply.preview.clone()),
+            reply_to_id: reply.as_ref().map(|reply| reply.message_id.clone()),
+            reply_is_me: reply.as_ref().is_some_and(|reply| reply.is_me),
+            parts: Vec::new(),
+            run_id: None,
+            hidden: false,
+        });
+        Some(QueuedBubbleSave {
+            id: bubble_id,
+            content: item.content.clone(),
+            reply,
+            sent_at,
+            insert: true,
+        })
+    }
+
+    fn persist_queued_bubble(
+        &self,
+        conversation_id: &str,
+        save: QueuedBubbleSave,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(db) = self.database_service.clone() else {
+            return;
+        };
+        if save.insert {
+            let thread = conversation_id.to_string();
+            let title = self.conversation_title(conversation_id);
+            let reply = save.reply.map(|reply| ReplyRef {
+                message_id: reply.message_id,
+                preview: reply.preview,
+                is_me: reply.is_me,
+            });
+            cx.spawn(async move |_, _| {
+                if db.ensure_session(&thread, &title).await.is_err() {
+                    return;
+                }
+                if let Err(error) = db
+                    .save_message(
+                        &save.id,
+                        &thread,
+                        "user",
+                        &save.content,
+                        None,
+                        None,
+                        reply,
+                        &[],
+                        None,
+                        false,
+                        SaveStamp::at(save.sent_at),
+                    )
+                    .await
+                {
+                    eprintln!("Failed to save pending message: {error}");
+                }
+            })
+            .detach();
+        } else {
+            cx.spawn(async move |_, _| {
+                if let Err(error) = db.update_message_content(&save.id, &save.content).await {
+                    eprintln!("Failed to update queued message: {error}");
+                }
+            })
+            .detach();
+        }
     }
 
     pub fn set_theme_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -16468,6 +17729,644 @@ mod tests {
             .expect("edited");
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         assert_eq!(rows[0].content, "the new words");
+    }
+
+    fn pending_row(id: &str, bubble: &str, content: &str) -> crate::opengrok::PendingUserMessage {
+        serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "id": id,
+            "threadId": "cw_1",
+            "content": content,
+            "clientMessageId": bubble,
+            "status": "pending",
+            "createdAtMs": 30,
+            "updatedAtMs": 30
+        }))
+        .expect("pending row")
+    }
+
+    /// A follow-up another machine queued shows up here as a held bubble.
+    #[test]
+    fn hydrate_puts_a_server_pending_on_the_queue() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[pending_row("pum_1", "msg_other", "from the laptop")],
+        );
+        assert!(state.is_send_queued("msg_other"));
+        assert_eq!(
+            state
+                .queued_sends
+                .get("cw_1")
+                .and_then(|queue| queue.front())
+                .map(|queued| queued.pending_id.as_deref()),
+            Some(Some("pum_1"))
+        );
+        assert_eq!(bubble(&state, "msg_other").content, "from the laptop");
+        assert!(!bubble(&state, "msg_other").hidden);
+    }
+
+    /// An enqueue that has not landed yet has no `pum_…`. Hydrate must not drop it.
+    #[test]
+    fn hydrate_keeps_a_local_hold_the_server_has_not_heard() {
+        let mut state = holding("m_held", "wait for it");
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(state.is_send_queued("m_held"));
+        assert_eq!(
+            state
+                .queued_sends
+                .get("cw_1")
+                .and_then(|queue| queue.front())
+                .and_then(|queued| queued.pending_id.as_deref()),
+            None
+        );
+    }
+
+    /// The queue is the order the person typed in. A hold whose enqueue has not landed stays
+    /// where it was, not behind the ones the server already has.
+    #[test]
+    fn hydrate_keeps_the_order_the_holds_were_typed_in() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        let mut b = super::held_message("m_b".into(), "second".into(), None, None, None);
+        b.pending_id = Some("pum_b".into());
+        state.queued_sends.get_mut("cw_1").unwrap().push_back(b);
+
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[
+                pending_row("pum_b", "m_b", "second"),
+                pending_row("pum_x", "m_x", "from the laptop"),
+            ],
+        );
+        let order: Vec<&str> = state.queued_sends["cw_1"]
+            .iter()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        assert_eq!(order, ["m_a", "m_b", "m_x"]);
+    }
+
+    /// A synced hold that vanished from the snapshot left the queue. The bubble stays:
+    /// the row being gone is also what a drain on another machine looks like, and the
+    /// answer may not be in this transcript yet.
+    #[test]
+    fn hydrate_keeps_the_bubble_when_a_synced_hold_vanishes() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(
+            !bubble(&state, "m_held").hidden,
+            "the words stay until the answer arrives"
+        );
+    }
+
+    /// The set of canceled ids only has to remember rows the server still has.
+    #[test]
+    fn a_cancel_tombstone_lasts_only_while_the_server_still_has_the_row() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.canceled_pending.insert("m_held".into());
+        state.canceled_pending.insert("m_elsewhere".into());
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert!(
+            state.canceled_pending.contains("m_held"),
+            "the row is still on the server"
+        );
+        assert!(!state.is_send_queued("m_held"));
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(
+            !state.canceled_pending.contains("m_held"),
+            "the row is gone"
+        );
+        assert!(state.canceled_pending.contains("m_elsewhere"));
+    }
+
+    /// A synced hold that vanished because it drained keeps the bubble: an assistant
+    /// reply already sits after it.
+    #[test]
+    fn hydrate_leaves_a_drained_bubble_when_the_reply_is_already_here() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.conversations[0]
+            .messages
+            .push(at(message("m_reply", false, "done"), 40));
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(
+            !bubble(&state, "m_held").hidden,
+            "the send happened; only the hold is gone"
+        );
+    }
+
+    /// Cancel this process, then a GET that raced the DELETE must not restore the bubble.
+    #[test]
+    fn hydrate_does_not_restore_a_hold_this_process_already_took_back() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.canceled_pending.insert("msg_other".into());
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[pending_row("pum_1", "msg_other", "from the laptop")],
+        );
+        assert!(!state.is_send_queued("msg_other"));
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "msg_other"),
+            "the tombstone skips grafting"
+        );
+    }
+
+    /// Edited offline, a synced hold's row still has the old words. A hydrate must not put them
+    /// back, and drain must not post the new words against that row before a PATCH lands.
+    #[test]
+    fn an_offline_edit_of_a_synced_hold_outlives_a_hydrate() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        assert!(matches!(
+            state.begin_queued_edit("m_held", "the offline words".into()),
+            super::QueuedEdit::Applied { .. }
+        ));
+
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert_eq!(bubble(&state, "m_held").content, "the offline words");
+        assert_eq!(state.queued_sends["cw_1"][0].content, "the offline words");
+        go_idle(&mut state);
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "the row has the old words until the PATCH lands"
+        );
+    }
+
+    /// Reconnecting sends the PATCH an offline edit owes, once, with drain held until it lands.
+    #[test]
+    fn coming_back_owes_the_offline_edit_its_patch() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.begin_queued_edit("m_held", "the offline words".into());
+        assert_eq!(
+            state.take_unsynced_edits(),
+            [super::OwedPatch {
+                thread_id: "cw_1".into(),
+                pending_id: "pum_1".into(),
+                message_id: "m_held".into(),
+                content: "the offline words".into(),
+            }]
+        );
+        assert!(state.pending_inflight.contains("m_held"));
+        assert!(
+            state.take_unsynced_edits().is_empty(),
+            "one PATCH at a time"
+        );
+    }
+
+    /// Canceled offline, then the app restarted: the DELETE never landed and the tombstone was
+    /// memory. The bubble on disk is hidden, and that is the person's word: the hold is not
+    /// put back, and the row is asked to go again.
+    #[test]
+    fn hydrate_does_not_restore_a_send_hidden_before_a_restart() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        let mut canceled = at(message("m_held", true, "wait for it"), 30);
+        canceled.hidden = true;
+        state.conversations[0].messages.push(canceled);
+
+        let fold =
+            state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(bubble(&state, "m_held").hidden);
+        assert_eq!(fold.cancel, ["pum_1"]);
+    }
+
+    /// Enqueue landed after the person canceled: give the `pum_…` back.
+    #[test]
+    fn bind_after_a_local_cancel_takes_the_row_back() {
+        let mut state = AppState::new();
+        state.canceled_pending.insert("msg_1".into());
+        match state.bind_pending_id("msg_1", "pum_1".into(), "later") {
+            super::BindPending::TakeBack { pending_id } => assert_eq!(pending_id, "pum_1"),
+            other => panic!("expected TakeBack, got a bind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_stores_the_pending_id_on_the_hold() {
+        let mut state = holding("m_held", "wait for it");
+        match state.bind_pending_id("m_held", "pum_1".into(), "wait for it") {
+            super::BindPending::Bound => {}
+            other => panic!("expected Bound, got {other:?}"),
+        }
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0]
+                .pending_id
+                .as_deref(),
+            Some("pum_1")
+        );
+    }
+
+    #[test]
+    fn bind_after_an_edit_asks_for_a_patch() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "instead".into()));
+        match state.bind_pending_id("m_held", "pum_1".into(), "wait for it") {
+            super::BindPending::Patch {
+                pending_id,
+                content,
+            } => {
+                assert_eq!(pending_id, "pum_1");
+                assert_eq!(content, "instead");
+            }
+            other => panic!("expected Patch, got {other:?}"),
+        }
+    }
+
+    /// The PATCH bind sends is a mutation like any other: drain must not post the new words
+    /// against the row that still has the old ones.
+    #[test]
+    fn drain_waits_for_the_patch_bind_sends() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "instead".into()));
+        assert!(matches!(
+            state.bind_pending_id("m_held", "pum_1".into(), "wait for it"),
+            super::BindPending::Patch { .. }
+        ));
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none());
+        assert!(state.is_send_queued("m_held"));
+    }
+
+    #[test]
+    fn reply_and_recipe_read_off_a_pending_row() {
+        let row: crate::opengrok::PendingUserMessage = serde_json::from_value(serde_json::json!({
+            "id": "pum_1",
+            "content": "later",
+            "replyTo": { "messageId": "m1", "preview": "hi", "isMe": true },
+            "recipeId": "rec_1",
+            "recipeValues": { "q": "x" },
+            "skillId": "skl_1",
+            "clientMessageId": "msg_1"
+        }))
+        .unwrap();
+        let reply = super::reply_from_pending(row.reply_to.as_ref()).expect("reply");
+        assert_eq!(reply.message_id, "m1");
+        assert_eq!(reply.preview, "hi");
+        assert!(reply.is_me);
+        let recipe = super::recipe_from_pending(&row).expect("recipe");
+        assert_eq!(recipe.id, "rec_1");
+        assert_eq!(recipe.values.get("q").and_then(|v| v.as_str()), Some("x"));
+    }
+
+    fn pending_custom(
+        op: &str,
+        message: Option<serde_json::Value>,
+    ) -> crate::opengrok::PendingCustom {
+        let mut value = serde_json::json!({
+            "v": 1,
+            "op": op,
+            "threadId": "cw_1",
+        });
+        if let Some(message) = message {
+            value["message"] = message;
+        }
+        crate::opengrok::PendingCustom::from_agui(&serde_json::json!({
+            "type": "CUSTOM",
+            "name": "pending-user-message",
+            "value": value,
+        }))
+        .expect("custom")
+    }
+
+    /// CUSTOM `created` / `snapshot` put a hold on the queue.
+    #[test]
+    fn a_created_custom_holds_the_bubble() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.apply_pending_custom(
+            &pending_custom(
+                "created",
+                Some(serde_json::json!({
+                    "id": "pum_1",
+                    "threadId": "cw_1",
+                    "content": "from the laptop",
+                    "clientMessageId": "msg_other",
+                })),
+            ),
+            None,
+        );
+        assert!(state.is_send_queued("msg_other"));
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0]
+                .pending_id
+                .as_deref(),
+            Some("pum_1")
+        );
+        assert_eq!(bubble(&state, "msg_other").content, "from the laptop");
+    }
+
+    #[test]
+    fn an_edited_custom_changes_the_hold() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.apply_pending_custom(
+            &pending_custom(
+                "edited",
+                Some(serde_json::json!({
+                    "id": "pum_1",
+                    "content": "the new words",
+                    "clientMessageId": "m_held",
+                })),
+            ),
+            Some("m_held"),
+        );
+        assert_eq!(bubble(&state, "m_held").content, "the new words");
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0].content,
+            "the new words"
+        );
+        assert!(state.pending_inflight.is_empty());
+    }
+
+    #[test]
+    fn a_canceled_custom_without_a_message_still_takes_the_hold_off() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.apply_pending_custom(&pending_custom("canceled", None), Some("m_held"));
+        assert!(!state.is_send_queued("m_held"));
+        assert!(bubble(&state, "m_held").hidden);
+        assert!(state.canceled_pending.contains("m_held"));
+    }
+
+    #[test]
+    fn a_drained_custom_drops_the_hold_and_keeps_the_bubble() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.apply_pending_custom(
+            &pending_custom(
+                "drained",
+                Some(serde_json::json!({
+                    "id": "pum_1",
+                    "content": "wait for it",
+                    "clientMessageId": "m_held",
+                    "status": "drained",
+                })),
+            ),
+            Some("m_held"),
+        );
+        assert!(!state.is_send_queued("m_held"));
+        assert!(!bubble(&state, "m_held").hidden);
+    }
+
+    #[test]
+    fn drain_does_not_pop_a_hold_whose_delete_is_in_flight() {
+        let mut state = holding("m_held", "wait for it");
+        state.pending_inflight.insert("m_held".into());
+        go_idle(&mut state);
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "FIFO: the front hold is being canceled or edited"
+        );
+        assert!(state.is_send_queued("m_held"));
+        state.pending_inflight.remove("m_held");
+        assert_eq!(state.pop_queued_send("cw_1").unwrap().message_id, "m_held");
+    }
+
+    #[test]
+    fn hydrate_keeps_an_inflight_hold_instead_of_replacing_it() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.pending_inflight.insert("m_held".into());
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "stale from GET")]);
+        assert_eq!(
+            state.queued_sends.get("cw_1").unwrap()[0].content,
+            "wait for it"
+        );
+        assert!(!bubble(&state, "m_held").hidden);
+    }
+
+    #[test]
+    fn hydrate_from_snapshot_events_matches_the_row_list() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        let events = vec![serde_json::json!({
+            "type": "CUSTOM",
+            "name": "pending-user-message",
+            "value": {
+                "v": 1,
+                "op": "snapshot",
+                "threadId": "cw_1",
+                "message": {
+                    "id": "pum_1",
+                    "content": "from the event",
+                    "clientMessageId": "msg_other"
+                }
+            }
+        })];
+        let rows = crate::opengrok::PendingCustom::snapshot_messages(&events);
+        state.fold_pending_snapshot("cw_1", &rows);
+        assert!(state.is_send_queued("msg_other"));
+        assert_eq!(bubble(&state, "msg_other").content, "from the event");
+    }
+
+    /// A queued reply as POST /pending saved it: the toolbar's short preview, and no quote line.
+    fn holding_reply_to_a_long_answer() -> (AppState, super::ReplyTo) {
+        let quoted = "The build is green on main.\nEvery crate compiled, every test passed, \
+                      and the deploy is waiting on you.";
+        let mut state = mid_turn(at(message("m_bot", false, quoted), 20));
+        let reply = super::ReplyTo {
+            message_id: "m_bot".into(),
+            preview: "The build is green on main. Every crate compiled, every test passed, an…"
+                .into(),
+            is_me: false,
+        };
+        let mut held = at(message("m_held", true, "ship it?"), 30);
+        held.reply_to_id = Some(reply.message_id.clone());
+        held.reply_preview = Some(reply.preview.clone());
+        state.conversations[0].messages.push(held);
+        let mut queued = super::held_message(
+            "m_held".into(),
+            "ship it?".into(),
+            None,
+            None,
+            Some(reply.clone()),
+        );
+        queued.pending_id = Some("pum_1".into());
+        state
+            .queued_sends
+            .entry("cw_1".into())
+            .or_default()
+            .push_back(queued);
+        (state, reply)
+    }
+
+    /// 409 stale-pending-message: the row changed since this machine read it, and is still
+    /// queued. The hold goes back to the front with the server's words and is sent once more;
+    /// refused again, it stays queued and is not sent again.
+    #[test]
+    fn a_stale_refusal_puts_the_hold_back_with_the_servers_words() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        go_idle(&mut state);
+        let held = state.pop_queued_send("cw_1").expect("drains");
+        state.conversations[0]
+            .messages
+            .push(at(message("r_1", false, ""), 40));
+        let edited = pending_custom(
+            "edited",
+            Some(serde_json::json!({
+                "id": "pum_1",
+                "content": "the laptop's words",
+                "clientMessageId": "m_held",
+                "status": "pending",
+            })),
+        );
+
+        state.put_back_stale_hold("cw_1", "r_1", held, &edited);
+        state.apply_pending_custom(&edited, Some("m_held"));
+        assert_eq!(bubble(&state, "m_held").content, "the laptop's words");
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "r_1"),
+            "the refused turn leaves no reply bubble to carry an error"
+        );
+        let again = state.pop_queued_send("cw_1").expect("sent once more");
+        assert_eq!(again.content, "the laptop's words");
+        assert_eq!(again.pending_id.as_deref(), Some("pum_1"));
+
+        state.put_back_stale_hold("cw_1", "r_2", again, &edited);
+        state.apply_pending_custom(&edited, Some("m_held"));
+        assert!(
+            state.is_send_queued("m_held"),
+            "refused twice, still queued"
+        );
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "and not sent a third time"
+        );
+    }
+
+    /// Parked means another machine's words were refused twice. Words the person types here
+    /// are theirs, so the hold goes out again.
+    #[test]
+    fn editing_a_parked_hold_sends_it_again() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].stale = super::StaleRefusal::Parked;
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none(), "parked");
+
+        assert!(matches!(
+            state.begin_queued_edit("m_held", "my own words".into()),
+            super::QueuedEdit::Applied { .. }
+        ));
+        let next = state.pop_queued_send("cw_1").expect("unparked by the edit");
+        assert_eq!(next.content, "my own words");
+    }
+
+    /// A stale refusal naming a drained row: this run already spent it, so there is nothing to
+    /// put back.
+    #[test]
+    fn a_stale_refusal_for_a_spent_row_leaves_the_hold_off() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        go_idle(&mut state);
+        let held = state.pop_queued_send("cw_1").expect("drains");
+        let drained = pending_custom(
+            "drained",
+            Some(serde_json::json!({
+                "id": "pum_1",
+                "content": "other words",
+                "clientMessageId": "m_held",
+                "status": "drained",
+            })),
+        );
+        state.put_back_stale_hold("cw_1", "r_1", held, &drained);
+        state.apply_pending_custom(&drained, Some("m_held"));
+        assert!(!state.is_send_queued("m_held"));
+        assert_eq!(bubble(&state, "m_held").content, "wait for it");
+        assert!(!bubble(&state, "m_held").hidden);
+    }
+
+    /// OpenGrok compares the LAST user message with the row it drains. A hold still queued behind
+    /// the one going is not part of its turn, and the one going is last even when its answer
+    /// is painted after a later hold.
+    #[test]
+    fn a_drained_hold_is_the_last_user_message_of_its_turn() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        let queue = state.queued_sends.get_mut("cw_1").unwrap();
+        queue.push_back(super::held_message(
+            "m_b".into(),
+            "second".into(),
+            None,
+            None,
+            None,
+        ));
+        queue[0].pending_id = Some("pum_a".into());
+        queue[1].pending_id = Some("pum_b".into());
+        go_idle(&mut state);
+
+        let a = state.pop_queued_send("cw_1").expect("A drains first");
+        let sent: Vec<String> = state
+            .turn_history("cw_1", Some(&a))
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sent, ["m_ask", "m_a"]);
+
+        state.conversations[0]
+            .messages
+            .push(at(message("r_a", false, "done"), 50));
+        let b = state.pop_queued_send("cw_1").expect("then B");
+        let sent: Vec<String> = state
+            .turn_history("cw_1", Some(&b))
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sent, ["m_ask", "m_a", "r_a", "m_b"]);
+    }
+
+    /// OpenGrok drains a queued send only when the last user message is its row: the saved words
+    /// exactly, and `replyTo` exactly as saved. The quote line is the server's to write.
+    #[test]
+    fn a_drained_reply_is_sent_as_its_pending_row() {
+        let (mut state, reply) = holding_reply_to_a_long_answer();
+        go_idle(&mut state);
+        let next = state.pop_queued_send("cw_1").expect("the hold drains");
+        let history = state.turn_history("cw_1", Some(&next));
+        let sent = serde_json::to_value(history.last().expect("the hold")).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "id": "m_held",
+                "role": "user",
+                "content": "ship it?",
+                "replyTo": {
+                    "messageId": "m_bot",
+                    "preview": "The build is green on main. Every crate compiled, every test passed, an…",
+                    "isMe": false,
+                },
+            })
+        );
+        assert_eq!(
+            sent["replyTo"],
+            super::reply_json(&reply),
+            "the replyTo POST /pending saved"
+        );
+
+        let mut never_posted = next.clone();
+        never_posted.pending_id = None;
+        let history = state.turn_history("cw_1", Some(&never_posted));
+        assert_eq!(
+            history.last().map(|m| m.content.as_str()),
+            Some(
+                "[Replying to your earlier message: \"The build is green on main.\nEvery crate \
+                 compiled, every test passed, and the deploy is waiting on you.\"]\n\nship it?"
+            ),
+            "a hold no server heard of keeps the quote in its words, for a server that reads only those"
+        );
     }
 
     /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle.

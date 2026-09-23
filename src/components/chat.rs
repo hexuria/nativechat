@@ -70,7 +70,10 @@ struct ChatFeedRev {
     show_turn_timing: bool,
     /// Every row's, not the last one's: a resumed run finishes on a bubble that a later
     /// message may already sit below.
-    clocks: Vec<(Option<std::time::SystemTime>, Option<crate::opengrok::TurnTiming>)>,
+    clocks: Vec<(
+        Option<std::time::SystemTime>,
+        Option<crate::opengrok::TurnTiming>,
+    )>,
 }
 
 impl ChatFeedRev {
