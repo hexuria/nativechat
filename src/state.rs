@@ -1081,7 +1081,7 @@ fn recovered_finished_at(run: &ThreadRun) -> Option<SystemTime> {
 /// it parks on a card too, and its `total_ms` restarts after the card, so the
 /// harness clock can lengthen the observed end but never stand in for it.
 fn stamp_run_finished(message: &mut Message, observed_end: SystemTime) {
-    if message.is_me {
+    if message.is_me || is_unsent_turn_note(&message.content) {
         return;
     }
     let harness_end = message
