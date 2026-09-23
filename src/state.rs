@@ -11755,11 +11755,15 @@ impl AppState {
                         state.mark_unsynced(&message_id);
                     });
                 }
+                // The row was drained or canceled since: the new words went nowhere, and the
+                // snapshot says what became of the hold.
                 Err(error) if error.is_not_found() || error.is_not_pending() => {
                     let _ = this.update(cx, |state, cx| {
                         state.pending_inflight.remove(&message_id);
-                        state.apply_local_queued_edit(&message_id, local_content, cx);
-                        state.drain_queued_send(&thread_id, cx);
+                        if let Some(held) = state.hold_mut(&message_id) {
+                            held.unsynced = false;
+                        }
+                        state.hydrate_pending_user_messages(&thread_id, cx);
                     });
                 }
                 Err(error) => {
