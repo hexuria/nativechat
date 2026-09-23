@@ -11088,8 +11088,15 @@ impl AppState {
 
     /// The draft half of [`Self::take_queued_send_for_edit`]: the hold comes off the queue and
     /// what it carried goes back on the draft.
-    fn take_hold_for_edit(&mut self, message_id: &str, _draft: &str) -> Result<EditRefill, String> {
+    fn take_hold_for_edit(&mut self, message_id: &str, draft: &str) -> Result<EditRefill, String> {
         self.pending_edit = None;
+        // Checked before the hold is touched: refusing here leaves both copies of the person's
+        // words where they were, the draft in the field and the held one in its bubble.
+        if !draft.trim().is_empty() {
+            return Err(
+                "The composer already has words in it. Send or clear them, then Edit.".to_string(),
+            );
+        }
         let Some(held) = self.dequeue_send(message_id) else {
             return Err("That message has already been sent.".to_string());
         };
