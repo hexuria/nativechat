@@ -11885,6 +11885,16 @@ impl AppState {
         fold
     }
 
+    /// A drained hold OpenGrok refused as stale.
+    fn put_back_stale_hold(
+        &mut self,
+        _conversation_id: &str,
+        _reply_id: &str,
+        _held: QueuedSend,
+        _custom: &PendingCustom,
+    ) {
+    }
+
     fn apply_pending_event(
         &mut self,
         custom: &PendingCustom,
@@ -17086,6 +17096,54 @@ mod tests {
             .or_default()
             .push_back(queued);
         (state, reply)
+    }
+
+    /// 409 stale-pending-message: the row changed since this machine read it, and is still
+    /// queued. The hold goes back to the front with the server's words and is sent once more;
+    /// refused again, it stays queued and is not sent again.
+    #[test]
+    fn a_stale_refusal_puts_the_hold_back_with_the_servers_words() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        go_idle(&mut state);
+        let held = state.pop_queued_send("cw_1").expect("drains");
+        state.conversations[0]
+            .messages
+            .push(at(message("r_1", false, ""), 40));
+        let edited = pending_custom(
+            "edited",
+            Some(serde_json::json!({
+                "id": "pum_1",
+                "content": "the laptop's words",
+                "clientMessageId": "m_held",
+                "status": "pending",
+            })),
+        );
+
+        state.put_back_stale_hold("cw_1", "r_1", held, &edited);
+        state.apply_pending_custom(&edited, Some("m_held"));
+        assert_eq!(bubble(&state, "m_held").content, "the laptop's words");
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "r_1"),
+            "the refused turn leaves no reply bubble to carry an error"
+        );
+        let again = state.pop_queued_send("cw_1").expect("sent once more");
+        assert_eq!(again.content, "the laptop's words");
+        assert_eq!(again.pending_id.as_deref(), Some("pum_1"));
+
+        state.put_back_stale_hold("cw_1", "r_2", again, &edited);
+        state.apply_pending_custom(&edited, Some("m_held"));
+        assert!(
+            state.is_send_queued("m_held"),
+            "refused twice, still queued"
+        );
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "and not sent a third time"
+        );
     }
 
     /// OpenGrok compares the LAST user message with the row it drains. A hold still queued behind

@@ -4162,6 +4162,63 @@ mod tests {
         assert_eq!(body["messages"][0]["id"], "msg_1");
     }
 
+    /// OpenGrok's 409 for a queued send whose row changed carries the row as it stands now.
+    #[tokio::test]
+    async fn a_stale_queued_turn_keeps_the_row_the_server_answered_with() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "v": 1,
+                "error": "stale-pending-message",
+                "id": "pum_1",
+                "runId": null,
+                "message": "This queued message changed. Refresh it before sending again.",
+                "event": {
+                    "type": "CUSTOM",
+                    "timestamp": 1710000000000i64,
+                    "name": "pending-user-message",
+                    "value": {
+                        "v": 1,
+                        "op": "edited",
+                        "threadId": "th_1",
+                        "message": {
+                            "v": 1,
+                            "id": "pum_1",
+                            "threadId": "th_1",
+                            "content": "the laptop's words",
+                            "clientMessageId": "msg_1",
+                            "status": "pending",
+                        },
+                    },
+                },
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let error = client
+            .run_turn(
+                "cw_1",
+                "th_1",
+                "run_1",
+                &[],
+                None,
+                None,
+                Some("pum_1"),
+                |_| {},
+            )
+            .await
+            .expect_err("refused");
+        assert!(error.is_stale_pending());
+        let custom = error.pending_custom().expect("the row as it stands");
+        assert_eq!(custom.op, crate::opengrok::PendingOp::Edited);
+        assert_eq!(
+            custom.message.map(|row| row.content).as_deref(),
+            Some("the laptop's words")
+        );
+    }
+
     /// This is today's bug end to end. The app looks signed in, has nothing to put in the
     /// header, and used to send the turn regardless. It now trades the refresh cookie for a
     /// token first and the turn goes out carrying it — no banner, no red line, nobody told.

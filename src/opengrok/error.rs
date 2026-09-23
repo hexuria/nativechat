@@ -1,5 +1,7 @@
 use std::fmt;
 
+use super::pending::PendingCustom;
+
 /// The machine a request could not reach.
 ///
 /// The two are different machines with different fixes, and the app names which one because a
@@ -65,6 +67,8 @@ pub struct OpenGrokError {
     /// What kind of failure this is. Private so the invariant holds — a failure is exactly one
     /// of the three, never two of them at once.
     failure: Failure,
+    /// The `pending-user-message` CUSTOM a pending-route refusal carried.
+    pending_event: Option<serde_json::Value>,
 }
 
 impl OpenGrokError {
@@ -73,6 +77,7 @@ impl OpenGrokError {
             status: None,
             message: message.into(),
             failure: Failure::Verdict,
+            pending_event: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl OpenGrokError {
             status: Some(status),
             message: message.into(),
             failure: Failure::Verdict,
+            pending_event: None,
         }
     }
 
@@ -95,6 +101,7 @@ impl OpenGrokError {
             status: Some(401),
             message: message.into(),
             failure: Failure::SignedOut,
+            pending_event: None,
         }
     }
 
@@ -115,6 +122,7 @@ impl OpenGrokError {
             } else {
                 Failure::Verdict
             },
+            pending_event: None,
         }
     }
 
@@ -135,6 +143,7 @@ impl OpenGrokError {
             status,
             message,
             failure,
+            pending_event: None,
         }
     }
 
@@ -179,6 +188,19 @@ impl OpenGrokError {
     /// `POST /ag-ui` named a pending id that was canceled (or never heard of).
     pub fn is_not_pending(&self) -> bool {
         self.status == Some(409) && self.message == "not-pending"
+    }
+
+    /// `POST /ag-ui` fired a queued send that no longer matches its row. The row is left
+    /// queued, and [`Self::pending_custom`] is the row as it stands now.
+    pub fn is_stale_pending(&self) -> bool {
+        self.status == Some(409) && self.message == "stale-pending-message"
+    }
+
+    /// The `pending-user-message` CUSTOM a pending refusal carried.
+    pub fn pending_custom(&self) -> Option<PendingCustom> {
+        self.pending_event
+            .as_ref()
+            .and_then(PendingCustom::from_agui)
     }
 }
 
