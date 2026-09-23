@@ -15652,6 +15652,34 @@ mod tests {
         assert!(state.pop_queued_send("cw_1").is_none());
     }
 
+    /// Edit never writes over words already in the composer. The hold stays queued and its
+    /// bubble stays up, and the person is told what to do instead.
+    #[test]
+    fn edit_leaves_the_hold_queued_while_the_composer_has_words_in_it() {
+        let mut state = holding("m_held", "wait for it");
+        state.pending_edit = Some("m_held".to_string());
+        assert_eq!(
+            state
+                .take_hold_for_edit("m_held", "half a new thought")
+                .map(|refill| refill.content),
+            Err("The composer already has words in it. Send or clear them, then Edit.".to_string())
+        );
+        assert!(state.is_send_queued("m_held"), "the hold was not taken");
+        assert!(!bubble(&state, "m_held").hidden);
+        assert_eq!(
+            state.pending_edit(),
+            None,
+            "the Edit is answered once, not retried on every paint"
+        );
+        assert_eq!(
+            state
+                .take_hold_for_edit("m_held", " \n ")
+                .map(|refill| refill.content),
+            Ok("wait for it".to_string()),
+            "spaces alone are not somebody's words"
+        );
+    }
+
     #[cfg(feature = "agent")]
     #[test]
     fn the_queued_pill_leaves_the_tree_when_the_hold_is_taken_back() {
