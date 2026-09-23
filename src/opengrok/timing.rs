@@ -433,6 +433,15 @@ mod tests {
     }
 
     #[test]
+    fn an_absurd_duration_is_no_duration() {
+        for total in [json!("1e400"), json!(1e300), json!(u64::MAX)] {
+            let timing = TurnTiming::from_value(&json!({ "total_ms": total, "tool_wait_ms": 3 }))
+                .expect("the tool wait still reads");
+            assert_eq!(timing.total_ms, None, "{total}");
+        }
+    }
+
+    #[test]
     fn turn_timeline_and_camel_case_and_a_string_value_all_read() {
         let event = json!({
             "type": "CUSTOM",

@@ -14308,6 +14308,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finish_clock_past_what_a_row_can_hold_is_saved_without_one() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let start = SystemTime::UNIX_EPOCH + Duration::from_millis(2_000);
+        db.save_message(
+            "m_reply",
+            "s1",
+            "assistant",
+            "listed",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+            false,
+            SaveStamp {
+                sent_at: start,
+                finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 45)),
+                timing_json: None,
+            },
+        )
+        .await
+        .expect("saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        let restored = restored_message(rows[0].clone());
+        assert_eq!(restored.sent_at, start);
+        assert_eq!(restored.finished_at, None);
+    }
+
+    #[tokio::test]
     async fn a_finished_at_survives_a_reload_without_moving_created_at() {
         let db = test_db().await;
         db.ensure_session("s1", "Ada").await.expect("a session");
