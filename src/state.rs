@@ -16936,6 +16936,23 @@ mod tests {
         );
     }
 
+    /// Canceled offline, then the app restarted: the DELETE never landed and the tombstone was
+    /// memory. The bubble on disk is hidden, and that is the person's word: the hold is not
+    /// put back, and the row is asked to go again.
+    #[test]
+    fn hydrate_does_not_restore_a_send_hidden_before_a_restart() {
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        let mut canceled = at(message("m_held", true, "wait for it"), 30);
+        canceled.hidden = true;
+        state.conversations[0].messages.push(canceled);
+
+        let fold =
+            state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert!(!state.is_send_queued("m_held"));
+        assert!(bubble(&state, "m_held").hidden);
+        assert_eq!(fold.cancel, ["pum_1"]);
+    }
+
     /// Enqueue landed after the person canceled: give the `pum_…` back.
     #[test]
     fn bind_after_a_local_cancel_takes_the_row_back() {
