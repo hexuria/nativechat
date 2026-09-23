@@ -15864,6 +15864,37 @@ mod tests {
         assert_eq!(persist.content, "wait for it");
     }
 
+    /// A Cancel or an Edit that lands while the row is being written meets no row to change.
+    /// Once the write is done the row is the bubble as memory has it, not as it was when the
+    /// write began.
+    #[tokio::test]
+    async fn a_row_written_while_its_hold_is_taken_back_ends_as_memory_does() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let mut reads = 0;
+        super::write_user_row(
+            &db,
+            "m_held",
+            "s1",
+            "wait for it".to_string(),
+            None,
+            SystemTime::UNIX_EPOCH,
+            || {
+                reads += 1;
+                let moved = reads > 1;
+                Some(super::UserMessagePersist {
+                    content: if moved { "the new words" } else { "wait for it" }.to_string(),
+                    hidden: moved,
+                })
+            },
+        )
+        .await
+        .expect("written");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows[0].content, "the new words");
+        assert!(rows[0].deleted_at.is_some(), "the row is hidden, as the bubble is");
+    }
+
     #[tokio::test]
     async fn an_edited_queued_row_reads_back_the_new_words() {
         let db = test_db().await;
