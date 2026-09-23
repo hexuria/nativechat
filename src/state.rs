@@ -14225,7 +14225,7 @@ mod tests {
             "value": { "v": 1, "total_ms": 372000, "tools": [{ "name": "profile.list", "ms": 350000 }] }
         }));
         let mut run = thread_run("run_1", "finished", 2_000, &frames);
-        run.updated_at_ms = 2_000 + 372_000;
+        run.updated_at_ms = 2_000 + 5_000;
         let messages = vec![
             at(message("m_ask", true, "list profiles"), 1_000),
             at(message("m_later", true, "and then?"), 10_000),
@@ -14239,7 +14239,7 @@ mod tests {
         assert_eq!(
             recovered[0].finished_at,
             Some(SystemTime::UNIX_EPOCH + Duration::from_millis(2_000 + 372_000)),
-            "the wait is start + harness total_ms, not the moment we noticed it"
+            "the wait is start + harness total_ms, not the journal's last frame"
         );
         let mut thread = messages.clone();
         graft_reply(&mut thread, &recovered[0]);
