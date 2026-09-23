@@ -5,7 +5,7 @@ use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width};
 use crate::components::message_actions::{CONTROL_PX, MessageToolbar, TOOLBAR_W};
 use crate::state::{AppState, RightPane};
 use gpui_kit::component::text::TextView;
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use gpui_kit::{prelude::FluentBuilder, *};
 
 pub const TIMESTAMP_W: f32 = 82.0;
