@@ -13,7 +13,7 @@ use std::time::SystemTime;
 /// turn recovered after a restart still sits after the message it answers.
 /// `finished_at` is the other end of the wait, for the peek stamp. Timing
 /// JSON is the harness CUSTOM payload, when one arrived.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SaveStamp {
     pub sent_at: SystemTime,
     pub finished_at: Option<SystemTime>,
