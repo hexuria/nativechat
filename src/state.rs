@@ -11534,6 +11534,9 @@ impl AppState {
         if self.pending_inflight.contains(message_id) {
             return QueuedEdit::Refused;
         }
+        if let Some(held) = self.hold_mut(message_id) {
+            held.stale = StaleRefusal::Fresh;
+        }
         if let Some((thread_id, pending_id)) = self.pending_sync_target(message_id) {
             self.pending_inflight.insert(message_id.to_string());
             return QueuedEdit::Patch {
