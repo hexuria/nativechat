@@ -11230,6 +11230,19 @@ impl AppState {
             .any(|queued| queued.message_id == message_id)
     }
 
+    fn bubble_hidden(&self, conversation_id: &str, message_id: &str) -> bool {
+        self.conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .and_then(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+            })
+            .is_some_and(|message| message.hidden)
+    }
+
     fn hold_mut(&mut self, message_id: &str) -> Option<&mut QueuedSend> {
         self.queued_sends
             .values_mut()
@@ -11858,6 +11871,9 @@ impl AppState {
                 }
                 rebuilt.push_back(queued);
             } else if let Some(row) = row {
+                if self.bubble_hidden(conversation_id, &queued.message_id) {
+                    continue;
+                }
                 if let Some(save) = self.upsert_queued_bubble(conversation_id, row) {
                     fold.save.push(save);
                 }
@@ -11873,7 +11889,12 @@ impl AppState {
             {
                 continue;
             }
-            if self.canceled_pending.contains(bubble_id) {
+            // A hidden bubble was taken back here, maybe before a restart lost the tombstone
+            // and while the DELETE could not land. Hidden is the person's word; ask again.
+            if self.canceled_pending.contains(bubble_id)
+                || self.bubble_hidden(conversation_id, bubble_id)
+            {
+                self.canceled_pending.insert(bubble_id.to_string());
                 if !item.id.is_empty() {
                     fold.cancel.push(item.id.clone());
                 }
@@ -12023,7 +12044,10 @@ impl AppState {
                 };
                 let bubble_id = item.bubble_id().to_string();
                 self.pending_inflight.remove(&bubble_id);
-                if self.canceled_pending.contains(&bubble_id) {
+                if self.canceled_pending.contains(&bubble_id)
+                    || self.bubble_hidden(&conversation_id, &bubble_id)
+                {
+                    self.canceled_pending.insert(bubble_id);
                     if !item.id.is_empty() {
                         fold.cancel.push(item.id.clone());
                     }
@@ -12172,7 +12196,6 @@ impl AppState {
             .iter_mut()
             .find(|message| message.id == bubble_id)
         {
-            message.hidden = false;
             message.content = item.content.clone();
             if let Some(reply) = &reply {
                 message.reply_to_id = Some(reply.message_id.clone());
