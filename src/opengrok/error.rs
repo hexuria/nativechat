@@ -202,6 +202,11 @@ impl OpenGrokError {
             .as_ref()
             .and_then(PendingCustom::from_agui)
     }
+
+    pub(super) fn with_pending_event(mut self, event: Option<serde_json::Value>) -> Self {
+        self.pending_event = event;
+        self
+    }
 }
 
 /// The server's own words for the gateway being out of reach.

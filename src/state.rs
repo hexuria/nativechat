@@ -541,6 +541,7 @@ fn held_message(
         reply,
         pending_id: None,
         posted: false,
+        stale: StaleRefusal::Fresh,
     }
 }
 
@@ -565,6 +566,18 @@ pub struct QueuedSend {
     /// POST /pending went out and was not answered 404, so a row may exist before
     /// `pending_id` is known.
     posted: bool,
+    stale: StaleRefusal,
+}
+
+/// How often OpenGrok has refused this hold as stale. A refused hold is put back with the
+/// server's row and sent once more; refused again, it waits for the thread to be read afresh
+/// instead of being sent in a loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StaleRefusal {
+    #[default]
+    Fresh,
+    Refreshed,
+    Parked,
 }
 
 impl QueuedSend {
@@ -7692,6 +7705,20 @@ impl AppState {
                     }
                 }
                 if let Err(error) = &result
+                    && error.is_stale_pending()
+                    && let Some(held) = drained.clone()
+                    && let Some(custom) = error.pending_custom()
+                {
+                    let message_id = held.message_id.clone();
+                    state.put_back_stale_hold(&conversation_id, &reply_id, held, &custom);
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    state.apply_pending_event(&custom, Some(&message_id), cx);
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
+                }
+                if let Err(error) = &result
                     && (error.is_already_consumed() || error.is_not_pending())
                 {
                     // Another machine already fired or canceled this hold. The empty
@@ -11237,11 +11264,9 @@ impl AppState {
     /// [`Self::drain_queued_send`] posts what this returns. Tests pop without a client so
     /// they can pin the words that would have gone, and pin that a cancel left nothing.
     fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
-        let front = self
-            .queued_sends
-            .get(conversation_id)
-            .and_then(|queue| queue.front().map(|queued| queued.message_id.clone()))?;
-        if self.pending_inflight.contains(&front) {
+        let front = self.queued_sends.get(conversation_id)?.front()?;
+        if self.pending_inflight.contains(&front.message_id) || front.stale == StaleRefusal::Parked
+        {
             return None;
         }
         let next = self
@@ -11840,6 +11865,7 @@ impl AppState {
                 reply: reply_from_pending(item.reply_to.as_ref()),
                 pending_id: Some(item.id.clone()),
                 posted: true,
+                stale: StaleRefusal::Fresh,
             });
         }
         for leftover in local_only {
@@ -11885,14 +11911,44 @@ impl AppState {
         fold
     }
 
-    /// A drained hold OpenGrok refused as stale.
+    /// A drained hold OpenGrok refused as stale. `edited`: the row is still queued, so the hold
+    /// goes back to the front as the server has it; the CUSTOM, applied after, puts the words on
+    /// the bubble. `drained`: another turn spent the row and the hold stays off. The refused
+    /// turn's reply bubble is not an answer either way.
     fn put_back_stale_hold(
         &mut self,
-        _conversation_id: &str,
-        _reply_id: &str,
-        _held: QueuedSend,
-        _custom: &PendingCustom,
+        conversation_id: &str,
+        reply_id: &str,
+        mut held: QueuedSend,
+        custom: &PendingCustom,
     ) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != reply_id);
+        }
+        let (PendingOp::Edited, Some(row)) = (custom.op, custom.message.as_ref()) else {
+            return;
+        };
+        held.content = row.content.clone();
+        held.reply = reply_from_pending(row.reply_to.as_ref());
+        held.recipe = recipe_from_pending(row);
+        held.skill = row.skill_id.clone().filter(|id| !id.is_empty());
+        if !row.id.is_empty() {
+            held.pending_id = Some(row.id.clone());
+        }
+        held.stale = match held.stale {
+            StaleRefusal::Fresh => StaleRefusal::Refreshed,
+            StaleRefusal::Refreshed | StaleRefusal::Parked => StaleRefusal::Parked,
+        };
+        self.queued_sends
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push_front(held);
     }
 
     fn apply_pending_event(
@@ -12076,6 +12132,7 @@ impl AppState {
             reply: reply_from_pending(item.reply_to.as_ref()),
             pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
             posted: true,
+            stale: StaleRefusal::Fresh,
         };
         let queue = self
             .queued_sends
@@ -17144,6 +17201,30 @@ mod tests {
             state.pop_queued_send("cw_1").is_none(),
             "and not sent a third time"
         );
+    }
+
+    /// A stale refusal naming a drained row: this run already spent it, so there is nothing to
+    /// put back.
+    #[test]
+    fn a_stale_refusal_for_a_spent_row_leaves_the_hold_off() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        go_idle(&mut state);
+        let held = state.pop_queued_send("cw_1").expect("drains");
+        let drained = pending_custom(
+            "drained",
+            Some(serde_json::json!({
+                "id": "pum_1",
+                "content": "other words",
+                "clientMessageId": "m_held",
+                "status": "drained",
+            })),
+        );
+        state.put_back_stale_hold("cw_1", "r_1", held, &drained);
+        state.apply_pending_custom(&drained, Some("m_held"));
+        assert!(!state.is_send_queued("m_held"));
+        assert_eq!(bubble(&state, "m_held").content, "wait for it");
+        assert!(!bubble(&state, "m_held").hidden);
     }
 
     /// OpenGrok compares the LAST user message with the row it drains. A hold still queued behind

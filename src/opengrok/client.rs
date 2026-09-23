@@ -371,7 +371,11 @@ impl OpenGrokClient {
         // `from_server` rather than `status`, because some of what the server refuses with is
         // not a refusal at all: "the gateway could not be reached" is the server reporting a
         // machine it could not get to, which is a state and not a verdict about the request.
+        let event = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|body| body.get("event").cloned());
         OpenGrokError::from_server(Some(status), error_message_from_body(&body))
+            .with_pending_event(event)
     }
 
     /// Nothing on a 2xx, the server's error otherwise. For the doors that answer 204.
