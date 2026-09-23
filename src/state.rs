@@ -7403,6 +7403,10 @@ impl AppState {
 
     /// The messages a turn posts.
     ///
+    /// OpenGrok matches a drained hold against the LAST user message, so the hold goes last and
+    /// the holds still queued behind it are left out. Cutting the thread at the hold instead
+    /// would drop the answer to the hold before it, which is painted after this one.
+    ///
     /// A drained hold OpenGrok may have a row for goes as that row: its words without the
     /// client's quote line, and `replyTo` as saved. The server refuses the drain on any other
     /// text or reply, and writes the quote line itself from `replyTo`.
@@ -7417,11 +7421,24 @@ impl AppState {
             .find(|c| c.id == conversation_id)
             .map(|c| agui_messages(&c.messages))
             .unwrap_or_default();
-        if let Some(held) = drained.filter(|held| held.on_server())
-            && let Some(message) = history.iter_mut().find(|m| m.id == held.message_id)
-        {
-            message.content = held.content.clone();
-            message.reply_to = held.reply.as_ref().map(saved_reply);
+        let Some(held) = drained else {
+            return history;
+        };
+        let behind: HashSet<&str> = self
+            .queued_sends
+            .get(conversation_id)
+            .into_iter()
+            .flatten()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        history.retain(|m| !behind.contains(m.id.as_str()));
+        if let Some(at) = history.iter().position(|m| m.id == held.message_id) {
+            let mut message = history.remove(at);
+            if held.on_server() {
+                message.content = held.content.clone();
+                message.reply_to = held.reply.as_ref().map(saved_reply);
+            }
+            history.push(message);
         }
         history
     }
