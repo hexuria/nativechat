@@ -114,7 +114,7 @@ impl Message {
     /// message it answers, and painting nothing would keep lying that a
     /// six-minute turn landed at 4:34.
     pub fn formatted_time(&self) -> String {
-        clock_label(DateTime::<Local>::from(self.sent_at))
+        clock_of(self.sent_at).unwrap_or_default()
     }
 
     /// `6m12s` once the run has ended and took at least a second. The peek
@@ -133,6 +133,15 @@ impl Message {
 }
 
 /// Grok's `12:14 PM` column, 12-hour clock, no leading zero on the hour.
+/// `None` when the instant is one chrono cannot hold. `DateTime::from(SystemTime)`
+/// panics on those, and `sent_at` can be a server clock.
+fn clock_of(at: SystemTime) -> Option<String> {
+    let since = at.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    let ms = i64::try_from(since.as_millis()).ok()?;
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)?;
+    Some(clock_label(utc.with_timezone(&Local)))
+}
+
 pub fn clock_label(dt: DateTime<Local>) -> String {
     let (pm, hour) = dt.hour12();
     let hour = if hour == 0 { 12 } else { hour };
@@ -14161,6 +14170,13 @@ mod tests {
             messages[1].content, "an older reply",
             "the last thing said before is untouched"
         );
+    }
+
+    #[test]
+    fn a_sent_time_past_what_a_clock_can_hold_is_blank() {
+        let mut bubble = message("m_far", true, "hi");
+        bubble.sent_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 45);
+        assert_eq!(bubble.formatted_time(), "");
     }
 
     #[test]
