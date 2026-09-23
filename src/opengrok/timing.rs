@@ -437,6 +437,18 @@ mod tests {
     }
 
     #[test]
+    fn only_version_one_or_no_version_is_read() {
+        for v in [json!(2), json!(0), json!("junk"), json!(-1), json!(1.5)] {
+            assert!(
+                TurnTiming::from_value(&json!({ "v": v, "total_ms": 12 })).is_none(),
+                "v {v}"
+            );
+        }
+        assert!(TurnTiming::from_value(&json!({ "v": 1, "total_ms": 12 })).is_some());
+        assert!(TurnTiming::from_value(&json!({ "total_ms": 12 })).is_some());
+    }
+
+    #[test]
     fn turn_timeline_and_camel_case_and_a_string_value_all_read() {
         let event = json!({
             "type": "CUSTOM",
