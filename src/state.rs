@@ -559,6 +559,13 @@ pub struct QueuedSend {
     reply: Option<ReplyTo>,
 }
 
+/// What Edit on a held send puts back in the composer.
+pub struct EditRefill {
+    pub content: String,
+    /// What the composer says about the part of the hold it could not put back.
+    pub notice: Option<String>,
+}
+
 /// What a user-message write should put on disk, as memory stands when the write actually runs.
 struct UserMessagePersist {
     content: String,
@@ -1627,9 +1634,8 @@ pub struct AppState {
     pub on_send: OnSend,
     /// Messages held per thread until it is idle, in the order they were typed.
     queued_sends: HashMap<String, VecDeque<QueuedSend>>,
-    /// Words Edit on a queued bubble put back in the composer. The composer takes them on
-    /// the next paint, once, because the bubble they came from is already gone.
-    pending_composer: Option<String>,
+    /// The held send whose Edit was clicked, until the composer settles it.
+    pending_edit: Option<String>,
     pub audio_input: Option<AudioInput>,
     pub sidebar_collapsed: bool,
     pub sidebar_hidden: bool,
@@ -2167,7 +2173,7 @@ impl AppState {
             submit_chord: SubmitChord::Enter,
             on_send: OnSend::default(),
             queued_sends: HashMap::new(),
-            pending_composer: None,
+            pending_edit: None,
             audio_input: None,
             sidebar_collapsed: false,
             sidebar_hidden: false,
@@ -11051,37 +11057,52 @@ impl AppState {
     /// takes the hold off, hides the bubble, and leaves the sentence in the field to change.
     /// A recipe the hold was carrying is not restored: `TurnRecipe` is not enough to rebuild
     /// the bar. A skill still in `/`'s list is put back on the draft; a reply is too.
+    ///
+    /// The hold stays queued until the composer settles the Edit with
+    /// [`Self::take_queued_send_for_edit`], because the words already in the composer are the
+    /// one part of the draft this state cannot see.
     pub fn begin_edit_queued_send(&mut self, message_id: &str, cx: &mut Context<Self>) {
-        if !self.take_hold_for_edit(message_id) {
+        if !self.is_send_queued(message_id) {
             return;
         }
-        self.delete_message(message_id, cx);
+        self.pending_edit = Some(message_id.to_string());
+        cx.notify();
     }
 
-    /// The draft half of [`Self::begin_edit_queued_send`]: the hold comes off the queue and
-    /// what it carried goes back on the draft. `false` when nothing was held under that id.
-    fn take_hold_for_edit(&mut self, message_id: &str) -> bool {
+    /// The held send an Edit is waiting on the composer for.
+    pub fn pending_edit(&self) -> Option<&str> {
+        self.pending_edit.as_deref()
+    }
+
+    /// Settle an Edit, given what the composer holds now. `Err` is what to tell the person.
+    pub fn take_queued_send_for_edit(
+        &mut self,
+        message_id: &str,
+        draft: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<EditRefill, String> {
+        let refill = self.take_hold_for_edit(message_id, draft)?;
+        self.delete_message(message_id, cx);
+        Ok(refill)
+    }
+
+    /// The draft half of [`Self::take_queued_send_for_edit`]: the hold comes off the queue and
+    /// what it carried goes back on the draft.
+    fn take_hold_for_edit(&mut self, message_id: &str, _draft: &str) -> Result<EditRefill, String> {
+        self.pending_edit = None;
         let Some(held) = self.dequeue_send(message_id) else {
-            return false;
+            return Err("That message has already been sent.".to_string());
         };
-        self.pending_composer = Some(held.content);
         if let Some(reply) = held.reply {
             self.reply_to = Some(reply);
         }
         if let Some(skill) = held.skill.as_deref() {
             let _ = self.attach_skill(skill);
         }
-        true
-    }
-
-    /// Words Edit left for the composer, taken once so a later paint cannot type them again.
-    pub fn take_pending_composer(&mut self) -> Option<String> {
-        self.pending_composer.take()
-    }
-
-    /// The words Edit left for the composer, if it has not taken them yet.
-    pub fn pending_composer(&self) -> Option<&str> {
-        self.pending_composer.as_deref()
+        Ok(EditRefill {
+            content: held.content,
+            notice: None,
+        })
     }
 
     /// Change a held send's words in the queue, on the bubble, and on disk. Drain posts these.
@@ -15614,15 +15635,17 @@ mod tests {
     #[test]
     fn edit_refills_the_composer_and_cancels_the_hold() {
         let mut state = holding("m_held", "wait for it");
-        assert!(state.take_hold_for_edit("m_held"));
+        state.pending_edit = Some("m_held".to_string());
+        let refill = state.take_hold_for_edit("m_held", "");
         assert_eq!(
-            state.take_pending_composer().as_deref(),
-            Some("wait for it")
+            refill.map(|refill| refill.content),
+            Ok("wait for it".to_string())
         );
-        assert!(state.take_pending_composer().is_none());
+        assert_eq!(state.pending_edit(), None, "the Edit is settled once");
         assert!(!state.is_send_queued("m_held"));
-        assert!(
-            !state.take_hold_for_edit("m_held"),
+        assert_eq!(
+            state.take_hold_for_edit("m_held", "").map(|refill| refill.content),
+            Err("That message has already been sent.".to_string()),
             "a second Edit finds nothing held"
         );
         go_idle(&mut state);

@@ -213,23 +213,26 @@ impl MessageInput {
                 }
             }
 
-            // Edit on a queued bubble leaves the held words here. Applied from a read, then
-            // taken off the state after this observer returns, so we do not mutate the entity
-            // we are observing.
-            if let Some(text) = state.read(cx).pending_composer().map(str::to_string) {
-                this.input_state.update(cx, |input, cx| {
-                    input.set_value(text.clone(), window, cx);
+            // Edit on a queued bubble is settled here, not where it was clicked: what is
+            // already typed in this field is the one part of the draft the state cannot see.
+            if let Some(id) = state.read(cx).pending_edit().map(str::to_string) {
+                let draft = this.input_state.read(cx).value().to_string();
+                let taken = state.update(cx, |state, cx| {
+                    state.take_queued_send_for_edit(&id, &draft, cx)
                 });
-                this.tokens.clear();
-                this.remember_text(cx);
-                this.focus(window, cx);
+                match taken {
+                    Ok(refill) => {
+                        this.input_state.update(cx, |input, cx| {
+                            input.set_value(refill.content, window, cx);
+                        });
+                        this.tokens.clear();
+                        this.remember_text(cx);
+                        this.notice = refill.notice;
+                        this.focus(window, cx);
+                    }
+                    Err(notice) => this.notice = Some(notice),
+                }
                 changed = true;
-                let app = this.state.clone();
-                cx.defer(move |cx| {
-                    app.update(cx, |state, _| {
-                        let _ = state.take_pending_composer();
-                    });
-                });
             }
 
             // Recipes and skills that were still being fetched when `/` opened the panel land
