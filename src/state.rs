@@ -14226,6 +14226,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_turn_that_never_happened_wears_no_wait() {
+        let start = SystemTime::UNIX_EPOCH;
+        for note in [TURN_UNREACHED_NOTE, TURN_SIGNED_OUT_NOTE] {
+            let mut bubble = at(message("m_live", false, note), 0);
+            stamp_run_finished(&mut bubble, start + Duration::from_secs(40));
+            assert_eq!(bubble.formatted_duration(), None, "{note}");
+        }
+    }
+
     /// The harness sends `run-timing` and `RUN_FINISHED` when it parks on a card, and starts
     /// its clock again for the half after the card.
     #[test]
