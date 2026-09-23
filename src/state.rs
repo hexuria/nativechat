@@ -11615,6 +11615,7 @@ impl AppState {
                             state.apply_local_queued_edit(&message_id, local_content, cx);
                             state.pending_inflight.remove(&message_id);
                         }
+                        state.drain_queued_send(&thread_id, cx);
                     });
                 }
                 Err(error)
@@ -11625,11 +11626,13 @@ impl AppState {
                     let _ = this.update(cx, |state, cx| {
                         state.pending_inflight.remove(&message_id);
                         state.apply_local_queued_edit(&message_id, local_content, cx);
+                        state.drain_queued_send(&thread_id, cx);
                     });
                 }
                 Err(error) => {
-                    let _ = this.update(cx, |state, _| {
+                    let _ = this.update(cx, |state, cx| {
                         state.pending_inflight.remove(&message_id);
+                        state.drain_queued_send(&thread_id, cx);
                     });
                     eprintln!("NativeChat: could not edit a pending send: {error}");
                 }
@@ -11677,29 +11680,26 @@ impl AppState {
                         );
                         return;
                     };
-                    let follow = this.update(cx, |state, _| {
-                        state.bind_pending_id(&message_id, row.id.clone(), &posted_content)
+                    let _ = this.update(cx, |state, cx| {
+                        match state.bind_pending_id(&message_id, row.id.clone(), &posted_content) {
+                            BindPending::TakeBack { pending_id } => {
+                                state.spawn_cancel_pending(thread_id.clone(), pending_id, cx);
+                            }
+                            BindPending::Patch {
+                                pending_id,
+                                content,
+                            } => {
+                                state.spawn_edit_pending(
+                                    thread_id.clone(),
+                                    pending_id,
+                                    message_id.clone(),
+                                    content,
+                                    cx,
+                                );
+                            }
+                            BindPending::Bound => {}
+                        }
                     });
-                    match follow {
-                        Ok(BindPending::TakeBack { pending_id }) => {
-                            let _ = client
-                                .cancel_pending_user_message(&thread_id, &pending_id)
-                                .await;
-                        }
-                        Ok(BindPending::Patch {
-                            pending_id,
-                            content,
-                        }) => {
-                            let _ = client
-                                .edit_pending_user_message(
-                                    &thread_id,
-                                    &pending_id,
-                                    &PendingWrite::content_patch(content),
-                                )
-                                .await;
-                        }
-                        Ok(BindPending::Bound) | Err(_) => {}
-                    }
                 }
                 Err(error) if error.is_not_found() => {
                     let _ = this.update(cx, |state, _| {
@@ -11732,22 +11732,19 @@ impl AppState {
         if self.canceled_pending.contains(message_id) {
             return BindPending::TakeBack { pending_id };
         }
-        for queue in self.queued_sends.values_mut() {
-            if let Some(queued) = queue
-                .iter_mut()
-                .find(|queued| queued.message_id == message_id)
-            {
-                queued.pending_id = Some(pending_id.clone());
-                if queued.content != posted_content {
-                    return BindPending::Patch {
-                        pending_id,
-                        content: queued.content.clone(),
-                    };
-                }
-                return BindPending::Bound;
-            }
+        let Some(queued) = self.hold_mut(message_id) else {
+            return BindPending::TakeBack { pending_id };
+        };
+        queued.pending_id = Some(pending_id.clone());
+        if queued.content == posted_content {
+            return BindPending::Bound;
         }
-        BindPending::TakeBack { pending_id }
+        let content = queued.content.clone();
+        self.pending_inflight.insert(message_id.to_string());
+        BindPending::Patch {
+            pending_id,
+            content,
+        }
     }
 
     fn hydrate_pending_user_messages(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
