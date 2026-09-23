@@ -15687,6 +15687,61 @@ mod tests {
         );
     }
 
+    /// The draft after Edit is the held message as it was sent: its reply or none, its skill
+    /// or none, and no recipe the composer had picked up since.
+    #[test]
+    fn edit_puts_back_exactly_the_reply_and_skill_the_hold_had() {
+        use super::{ActiveRecipe, ActiveSkill, ReplyTo};
+        let mut state = holding("m_bare", "wait for it");
+        state.your_skills = vec![skill_row("skl_1", true)];
+        state
+            .queued_sends
+            .entry("cw_1".to_string())
+            .or_default()
+            .push_back(super::held_message(
+                "m_dressed".to_string(),
+                "skill-skl_1 and then this".to_string(),
+                None,
+                Some("skl_1".to_string()),
+                Some(ReplyTo {
+                    message_id: "m_ask".to_string(),
+                    preview: "open youtube".to_string(),
+                    is_me: true,
+                }),
+            ));
+        state.reply_to = Some(ReplyTo {
+            message_id: "m_live".to_string(),
+            preview: "something else".to_string(),
+            is_me: false,
+        });
+        state.active_skill = Some(ActiveSkill {
+            id: "skl_other".to_string(),
+            name: "Other".to_string(),
+        });
+        state.active_recipe = Some(ActiveRecipe::from_summary(
+            &serde_json::from_value(serde_json::json!({ "id": "rcp_1", "name": "youtube" }))
+                .expect("a recipe row"),
+        ));
+
+        assert!(state.take_hold_for_edit("m_bare", "").is_ok());
+        assert_eq!(state.reply_to, None, "the hold had no reply");
+        assert_eq!(state.active_skill, None, "the hold had no skill");
+        assert_eq!(state.active_recipe, None, "the hold had no recipe");
+
+        assert!(state.take_hold_for_edit("m_dressed", "").is_ok());
+        assert_eq!(
+            state.reply_to.map(|reply| reply.message_id),
+            Some("m_ask".to_string())
+        );
+        assert_eq!(
+            state.active_skill,
+            Some(ActiveSkill {
+                id: "skl_1".to_string(),
+                name: "skill-skl_1".to_string(),
+            })
+        );
+    }
+
     #[cfg(feature = "agent")]
     #[test]
     fn the_queued_pill_leaves_the_tree_when_the_hold_is_taken_back() {
