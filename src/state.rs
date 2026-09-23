@@ -562,6 +562,9 @@ pub struct QueuedSend {
 /// What Edit on a held send puts back in the composer.
 pub struct EditRefill {
     pub content: String,
+    /// The skill now on the draft. Its chip is the composer's to draw, and a skill with no chip
+    /// is dropped on the next keystroke.
+    pub skill: Option<ActiveSkill>,
     /// What the composer says about the part of the hold it could not put back.
     pub notice: Option<String>,
 }
@@ -11100,14 +11103,17 @@ impl AppState {
         let Some(held) = self.dequeue_send(message_id) else {
             return Err("That message has already been sent.".to_string());
         };
-        if let Some(reply) = held.reply {
-            self.reply_to = Some(reply);
-        }
+        // Replaced, not added to: the draft becomes the held message, so anything the composer
+        // picked up that the message did not carry would go out with it unasked.
+        self.reply_to = held.reply;
+        self.active_recipe = None;
+        self.active_skill = None;
         if let Some(skill) = held.skill.as_deref() {
             let _ = self.attach_skill(skill);
         }
         Ok(EditRefill {
             content: held.content,
+            skill: self.active_skill.clone(),
             notice: None,
         })
     }
@@ -15728,17 +15734,20 @@ mod tests {
         assert_eq!(state.active_skill, None, "the hold had no skill");
         assert_eq!(state.active_recipe, None, "the hold had no recipe");
 
-        assert!(state.take_hold_for_edit("m_dressed", "").is_ok());
+        let refill = state.take_hold_for_edit("m_dressed", "");
         assert_eq!(
             state.reply_to.map(|reply| reply.message_id),
             Some("m_ask".to_string())
         );
+        let restored = Some(ActiveSkill {
+            id: "skl_1".to_string(),
+            name: "skill-skl_1".to_string(),
+        });
+        assert_eq!(state.active_skill, restored);
         assert_eq!(
-            state.active_skill,
-            Some(ActiveSkill {
-                id: "skl_1".to_string(),
-                name: "skill-skl_1".to_string(),
-            })
+            refill.map(|refill| refill.skill),
+            Ok(restored),
+            "the composer is handed the skill to chip"
         );
     }
 

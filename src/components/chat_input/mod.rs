@@ -12,7 +12,7 @@ use crate::components::composer_panel::{ComposerPanel, ComposerPanelEvent, Compo
 use crate::components::voice_wave::VoiceWave;
 use crate::icons::NativeIcon;
 use crate::opengrok::{RecipeParameter, RecipeParameterKind};
-use crate::state::{ActiveRecipe, AppState, ReplyTo, SubmitChord};
+use crate::state::{ActiveRecipe, ActiveSkill, AppState, ReplyTo, SubmitChord};
 use sources::{ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -223,10 +223,25 @@ impl MessageInput {
                 match taken {
                     Ok(refill) => {
                         this.input_state.update(cx, |input, cx| {
-                            input.set_value(refill.content, window, cx);
+                            input.set_value(refill.content.clone(), window, cx);
                         });
                         this.tokens.clear();
                         this.remember_text(cx);
+                        if let Some(skill) = refill.skill {
+                            match held_skill_chip(&refill.content, &skill) {
+                                Some(chip) => this.tokens.push(chip),
+                                None => {
+                                    this.caret = 0;
+                                    this.insert_token(
+                                        TokenKind::Skill,
+                                        skill.id,
+                                        skill.name,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }
+                        }
                         this.notice = refill.notice;
                         this.focus(window, cx);
                     }
@@ -1649,6 +1664,22 @@ fn skill_chip(tokens: &[ComposerToken], id: &str) -> Option<usize> {
         .position(|token| token.kind == TokenKind::Skill && token.id == id)
 }
 
+/// The chip for a skill that was picked into a message before it was held. The pick already
+/// put the skill's name in the words, so the chip goes over the name rather than in beside it.
+///
+/// The first place the name appears is taken, and a message that also says the name in its
+/// own prose ahead of the chip gets the chip on that earlier word: the hold keeps the words,
+/// not where the chip sat in them.
+fn held_skill_chip(text: &str, skill: &ActiveSkill) -> Option<ComposerToken> {
+    let start = text.find(&skill.name)?;
+    Some(ComposerToken {
+        kind: TokenKind::Skill,
+        id: skill.id.clone(),
+        text: skill.name.clone(),
+        range: start..start + skill.name.len(),
+    })
+}
+
 /// Where the caret sits once the bytes in `cut` have been taken out: back by as much as was
 /// removed before it, and at the cut itself when it was inside what went.
 fn caret_after_cut(caret: usize, cut: Range<usize>) -> usize {
@@ -2380,8 +2411,8 @@ fn composer_bot_name(state: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerToken, TokenKind, is_image, join_names, missing_note, opens_on_pick,
-        parameters_hint, remap_tokens, shift_tokens, skill_chip, starts_token,
+        ComposerToken, TokenKind, held_skill_chip, is_image, join_names, missing_note,
+        opens_on_pick, parameters_hint, remap_tokens, shift_tokens, skill_chip, starts_token,
     };
     use crate::opengrok::RecipeSummary;
     use crate::state::ActiveRecipe;
@@ -2400,6 +2431,20 @@ mod tests {
     fn picked(declaration: serde_json::Value) -> ActiveRecipe {
         let recipe: RecipeSummary = serde_json::from_value(declaration).unwrap();
         ActiveRecipe::from_summary(&recipe)
+    }
+
+    /// A held message's words already hold the skill's name, so Edit's chip lands over it.
+    #[test]
+    fn a_held_skill_is_chipped_where_its_name_already_sits() {
+        let skill = crate::state::ActiveSkill {
+            id: "skl_1".to_string(),
+            name: "expense-report".to_string(),
+        };
+        assert_eq!(
+            held_skill_chip("file this expense-report today", &skill),
+            Some(chip("skl_1", "expense-report", 10))
+        );
+        assert_eq!(held_skill_chip("file this today", &skill), None);
     }
 
     #[test]
