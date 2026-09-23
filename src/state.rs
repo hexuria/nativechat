@@ -542,6 +542,7 @@ fn held_message(
         pending_id: None,
         posted: false,
         stale: StaleRefusal::Fresh,
+        unsynced: false,
     }
 }
 
@@ -567,6 +568,9 @@ pub struct QueuedSend {
     /// `pending_id` is known.
     posted: bool,
     stale: StaleRefusal,
+    /// Edited here while the row could not be PATCHed. The row still has the old words, so the
+    /// hold waits for the PATCH `came_back` sends, and a hydrate keeps these words.
+    unsynced: bool,
 }
 
 /// How often OpenGrok has refused this hold as stale. A refused hold is put back with the
@@ -608,6 +612,14 @@ enum BindPending {
     Bound,
     Patch { pending_id: String, content: String },
     TakeBack { pending_id: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OwedPatch {
+    thread_id: String,
+    pending_id: String,
+    message_id: String,
+    content: String,
 }
 
 enum QueuedEdit {
@@ -710,6 +722,7 @@ fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
         pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
         posted: true,
         stale: StaleRefusal::Fresh,
+        unsynced: false,
     }
 }
 
@@ -3588,6 +3601,18 @@ impl AppState {
         self.reconnect_epoch += 1;
         if self.is_signed_in() {
             self.refresh_coworkers(cx);
+        }
+        // Before the hydrate, whose fold drains: each PATCH marks its hold in flight.
+        if self.can_sync_pending() {
+            for owed in self.take_unsynced_edits() {
+                self.spawn_edit_pending(
+                    owed.thread_id,
+                    owed.pending_id,
+                    owed.message_id,
+                    owed.content,
+                    cx,
+                );
+            }
         }
         if let Some(id) = self.active_conversation_id.clone() {
             self.hydrate_pending_user_messages(&id, cx);
@@ -11304,7 +11329,9 @@ impl AppState {
     /// they can pin the words that would have gone, and pin that a cancel left nothing.
     fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
         let front = self.queued_sends.get(conversation_id)?.front()?;
-        if self.pending_inflight.contains(&front.message_id) || front.stale == StaleRefusal::Parked
+        if self.pending_inflight.contains(&front.message_id)
+            || front.stale == StaleRefusal::Parked
+            || front.unsynced
         {
             return None;
         }
@@ -11415,11 +11442,43 @@ impl AppState {
                 content,
             };
         }
-        if self.apply_queued_edit(message_id, content.clone()) {
-            QueuedEdit::Applied { content }
-        } else {
-            QueuedEdit::Refused
+        if !self.apply_queued_edit(message_id, content.clone()) {
+            return QueuedEdit::Refused;
         }
+        self.mark_unsynced(message_id);
+        QueuedEdit::Applied { content }
+    }
+
+    /// A hold with a row whose words changed here without a PATCH landing.
+    fn mark_unsynced(&mut self, message_id: &str) {
+        if let Some(held) = self.hold_mut(message_id)
+            && held.pending_id.is_some()
+        {
+            held.unsynced = true;
+        }
+    }
+
+    /// The PATCHes offline edits still owe, each marked in flight so drain waits for it.
+    fn take_unsynced_edits(&mut self) -> Vec<OwedPatch> {
+        let owed: Vec<OwedPatch> = self
+            .queued_sends
+            .iter()
+            .flat_map(|(thread_id, queue)| {
+                queue.iter().filter_map(move |held| {
+                    Some(OwedPatch {
+                        thread_id: thread_id.clone(),
+                        pending_id: held.pending_id.clone().filter(|_| held.unsynced)?,
+                        message_id: held.message_id.clone(),
+                        content: held.content.clone(),
+                    })
+                })
+            })
+            .filter(|owed| !self.pending_inflight.contains(&owed.message_id))
+            .collect();
+        for patch in &owed {
+            self.pending_inflight.insert(patch.message_id.clone());
+        }
+        owed
     }
 
     fn apply_local_queued_edit(
@@ -11674,6 +11733,9 @@ impl AppState {
             {
                 Ok(mutation) => {
                     let _ = this.update(cx, |state, cx| {
+                        if let Some(held) = state.hold_mut(&message_id) {
+                            held.unsynced = false;
+                        }
                         if let Some(custom) = mutation.custom() {
                             state.apply_pending_event(&custom, Some(&message_id), cx);
                         } else if let Some(row) = mutation.row() {
@@ -11686,11 +11748,14 @@ impl AppState {
                         state.drain_queued_send(&thread_id, cx);
                     });
                 }
-                Err(error)
-                    if error.is_not_found()
-                        || error.unreachable().is_some()
-                        || error.is_not_pending() =>
-                {
+                Err(error) if error.unreachable().is_some() => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.pending_inflight.remove(&message_id);
+                        state.apply_local_queued_edit(&message_id, local_content, cx);
+                        state.mark_unsynced(&message_id);
+                    });
+                }
+                Err(error) if error.is_not_found() || error.is_not_pending() => {
                     let _ = this.update(cx, |state, cx| {
                         state.pending_inflight.remove(&message_id);
                         state.apply_local_queued_edit(&message_id, local_content, cx);
@@ -11914,6 +11979,10 @@ impl AppState {
                 rebuilt.push_back(queued);
             } else if let Some(row) = row {
                 if self.bubble_hidden(conversation_id, &queued.message_id) {
+                    continue;
+                }
+                if queued.unsynced {
+                    rebuilt.push_back(queued);
                     continue;
                 }
                 if let Some(save) = self.upsert_queued_bubble(conversation_id, row) {
@@ -17019,6 +17088,28 @@ mod tests {
         assert!(
             state.pop_queued_send("cw_1").is_none(),
             "the row has the old words until the PATCH lands"
+        );
+    }
+
+    /// Reconnecting sends the PATCH an offline edit owes, once, with drain held until it lands.
+    #[test]
+    fn coming_back_owes_the_offline_edit_its_patch() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.begin_queued_edit("m_held", "the offline words".into());
+        assert_eq!(
+            state.take_unsynced_edits(),
+            [super::OwedPatch {
+                thread_id: "cw_1".into(),
+                pending_id: "pum_1".into(),
+                message_id: "m_held".into(),
+                content: "the offline words".into(),
+            }]
+        );
+        assert!(state.pending_inflight.contains("m_held"));
+        assert!(
+            state.take_unsynced_edits().is_empty(),
+            "one PATCH at a time"
         );
     }
 
