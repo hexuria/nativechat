@@ -68,9 +68,9 @@ struct ChatFeedRev {
     last_output: usize,
     expanded_output: Vec<String>,
     show_turn_timing: bool,
-    last_finished_ms: Option<u128>,
-    last_timing: bool,
-    timed_count: usize,
+    /// Every row's, not the last one's: a resumed run finishes on a bubble that a later
+    /// message may already sit below.
+    clocks: Vec<(Option<std::time::SystemTime>, Option<crate::opengrok::TurnTiming>)>,
 }
 
 impl ChatFeedRev {
@@ -242,22 +242,14 @@ impl ChatFeedRev {
                 ids
             },
             show_turn_timing: state.show_turn_timing,
-            last_finished_ms: last.and_then(|m| {
-                m.finished_at.and_then(|at| {
-                    at.duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_millis())
-                })
-            }),
-            last_timing: last.is_some_and(|m| m.run_timing.is_some()),
-            timed_count: conv
+            clocks: conv
                 .map(|c| {
                     c.messages
                         .iter()
-                        .filter(|m| m.finished_at.is_some() || m.run_timing.is_some())
-                        .count()
+                        .map(|m| (m.finished_at, m.run_timing.clone()))
+                        .collect()
                 })
-                .unwrap_or(0),
+                .unwrap_or_default(),
         }
     }
 }
