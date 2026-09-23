@@ -610,6 +610,19 @@ enum BindPending {
     TakeBack { pending_id: String },
 }
 
+enum QueuedEdit {
+    /// Another mutation of this hold is in flight, or there is no such hold.
+    Refused,
+    Patch {
+        thread_id: String,
+        pending_id: String,
+        content: String,
+    },
+    Applied {
+        content: String,
+    },
+}
+
 #[derive(Default)]
 struct PendingFold {
     save: Vec<QueuedBubbleSave>,
@@ -11373,15 +11386,40 @@ impl AppState {
     /// Online with a `pum_…`: PATCH, then apply the `edited` CUSTOM. Offline: the
     /// Phase 1 in-memory edit is enough, and bind will PATCH once enqueue lands.
     pub fn edit_queued_send(&mut self, message_id: &str, content: String, cx: &mut Context<Self>) {
+        match self.begin_queued_edit(message_id, content) {
+            QueuedEdit::Refused => {}
+            QueuedEdit::Patch {
+                thread_id,
+                pending_id,
+                content,
+            } => {
+                self.spawn_edit_pending(thread_id, pending_id, message_id.to_string(), content, cx)
+            }
+            QueuedEdit::Applied { content } => {
+                self.save_queued_words(message_id, content, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// What an edit does to memory before anything is sent or saved.
+    fn begin_queued_edit(&mut self, message_id: &str, content: String) -> QueuedEdit {
         if self.pending_inflight.contains(message_id) {
-            return;
+            return QueuedEdit::Refused;
         }
         if let Some((thread_id, pending_id)) = self.pending_sync_target(message_id) {
             self.pending_inflight.insert(message_id.to_string());
-            self.spawn_edit_pending(thread_id, pending_id, message_id.to_string(), content, cx);
-            return;
+            return QueuedEdit::Patch {
+                thread_id,
+                pending_id,
+                content,
+            };
         }
-        self.apply_local_queued_edit(message_id, content, cx);
+        if self.apply_queued_edit(message_id, content.clone()) {
+            QueuedEdit::Applied { content }
+        } else {
+            QueuedEdit::Refused
+        }
     }
 
     fn apply_local_queued_edit(
@@ -11393,6 +11431,11 @@ impl AppState {
         if !self.apply_queued_edit(message_id, content.clone()) {
             return;
         }
+        self.save_queued_words(message_id, content, cx);
+        cx.notify();
+    }
+
+    fn save_queued_words(&self, message_id: &str, content: String, cx: &mut Context<Self>) {
         if let Some(db) = self.database_service.clone() {
             let id = message_id.to_string();
             cx.spawn(async move |_, _| {
@@ -11402,7 +11445,6 @@ impl AppState {
             })
             .detach();
         }
-        cx.notify();
     }
 
     fn apply_queued_edit(&mut self, message_id: &str, content: String) -> bool {
@@ -16956,6 +16998,27 @@ mod tests {
                 .iter()
                 .all(|message| message.id != "msg_other"),
             "the tombstone skips grafting"
+        );
+    }
+
+    /// Edited offline, a synced hold's row still has the old words. A hydrate must not put them
+    /// back, and drain must not post the new words against that row before a PATCH lands.
+    #[test]
+    fn an_offline_edit_of_a_synced_hold_outlives_a_hydrate() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        assert!(matches!(
+            state.begin_queued_edit("m_held", "the offline words".into()),
+            super::QueuedEdit::Applied { .. }
+        ));
+
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert_eq!(bubble(&state, "m_held").content, "the offline words");
+        assert_eq!(state.queued_sends["cw_1"][0].content, "the offline words");
+        go_idle(&mut state);
+        assert!(
+            state.pop_queued_send("cw_1").is_none(),
+            "the row has the old words until the PATCH lands"
         );
     }
 
