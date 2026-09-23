@@ -11059,7 +11059,8 @@ impl AppState {
     /// There is no inline editor on a bubble. The composer is where words are typed, so Edit
     /// takes the hold off, hides the bubble, and leaves the sentence in the field to change.
     /// A recipe the hold was carrying is not restored: `TurnRecipe` is not enough to rebuild
-    /// the bar. A skill still in `/`'s list is put back on the draft; a reply is too.
+    /// the bar. A skill still in `/`'s list is put back on the draft; a reply is too. Whatever
+    /// is not put back, the composer's notice says so.
     ///
     /// The hold stays queued until the composer settles the Edit with
     /// [`Self::take_queued_send_for_edit`], because the words already in the composer are the
@@ -11108,13 +11109,20 @@ impl AppState {
         self.reply_to = held.reply;
         self.active_recipe = None;
         self.active_skill = None;
-        if let Some(skill) = held.skill.as_deref() {
-            let _ = self.attach_skill(skill);
+        let skill_kept = held.skill.as_deref().is_none_or(|id| self.attach_skill(id));
+        let mut lost = Vec::new();
+        // A `TurnRecipe` is an id and values, not the declaration the bar is drawn from.
+        if held.recipe.is_some() {
+            lost.push("The recipe on that message was not kept.");
         }
+        if !skill_kept {
+            lost.push("The skill on that message is no longer in your list, so it was not kept.");
+        }
+        let notice = (!lost.is_empty()).then(|| lost.join(" "));
         Ok(EditRefill {
             content: held.content,
             skill: self.active_skill.clone(),
-            notice: None,
+            notice,
         })
     }
 
