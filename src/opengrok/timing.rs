@@ -342,6 +342,64 @@ mod tests {
         );
     }
 
+    /// What `opengrok-harness` `TurnTiming::event` sends, as its
+    /// `timing_event_is_custom_run_timing_with_compact_value` test builds it:
+    /// `record_model(12)`, then one tool round of `shell` 3ms with 3ms of wait
+    /// and no auto-review. No `v`, no `rounds`, `model_ms` per round.
+    #[test]
+    fn the_frame_the_harness_sends_reads() {
+        let event = json!({
+            "type": "CUSTOM",
+            "timestamp": 7,
+            "name": "run-timing",
+            "threadId": "t1",
+            "runId": "r1",
+            "value": {
+                "model_ms": [12],
+                "tools": [{ "name": "shell", "ms": 3 }],
+                "tool_wait_ms": 3,
+                "auto_review_ms": 0,
+                "total_ms": 15,
+                "tool_rounds": 1
+            },
+            "total_ms": 15,
+            "tool_rounds": 1
+        });
+        let timing = TurnTiming::from_event(&event).expect("the harness frame");
+        assert_eq!(timing.total_ms, Some(15));
+        assert_eq!(timing.rounds, vec![RoundTiming { model_ms: 12 }]);
+        assert_eq!(
+            timing.debug_lines(),
+            vec![
+                "15ms total".to_string(),
+                "model  12ms".to_string(),
+                "shell  3ms".to_string(),
+                "tool wait  3ms".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_model_rounds_from_the_harness_read_as_rounds() {
+        let timing = TurnTiming::from_value(&json!({
+            "model_ms": [12, 40],
+            "tools": [],
+            "tool_wait_ms": 0,
+            "auto_review_ms": 0,
+            "total_ms": 60,
+            "tool_rounds": 1
+        }))
+        .expect("the harness value");
+        assert_eq!(
+            timing.debug_lines(),
+            vec![
+                "60ms total".to_string(),
+                "round 1  12ms".to_string(),
+                "round 2  40ms".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn turn_timeline_and_camel_case_and_a_string_value_all_read() {
         let event = json!({
