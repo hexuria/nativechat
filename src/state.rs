@@ -15751,6 +15751,52 @@ mod tests {
         );
     }
 
+    /// What Edit cannot put back it says so about, rather than sending the words on without it.
+    #[test]
+    fn edit_says_what_it_could_not_put_back() {
+        let mut state = holding("m_bare", "wait for it");
+        for (id, recipe, skill) in [
+            (
+                "m_recipe",
+                Some(super::TurnRecipe {
+                    id: "rcp_1".to_string(),
+                    values: serde_json::Map::new(),
+                }),
+                None,
+            ),
+            ("m_skill", None, Some("skl_gone".to_string())),
+        ] {
+            state
+                .queued_sends
+                .entry("cw_1".to_string())
+                .or_default()
+                .push_back(super::held_message(
+                    id.to_string(),
+                    "and then this".to_string(),
+                    recipe,
+                    skill,
+                    None,
+                ));
+        }
+        let notice = |state: &mut AppState, id: &str| {
+            state
+                .take_hold_for_edit(id, "")
+                .map(|refill| refill.notice)
+        };
+        assert_eq!(notice(&mut state, "m_bare"), Ok(None));
+        assert_eq!(
+            notice(&mut state, "m_recipe"),
+            Ok(Some("The recipe on that message was not kept.".to_string()))
+        );
+        assert_eq!(
+            notice(&mut state, "m_skill"),
+            Ok(Some(
+                "The skill on that message is no longer in your list, so it was not kept."
+                    .to_string()
+            ))
+        );
+    }
+
     #[cfg(feature = "agent")]
     #[test]
     fn the_queued_pill_leaves_the_tree_when_the_hold_is_taken_back() {
