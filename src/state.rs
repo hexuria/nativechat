@@ -575,6 +575,45 @@ struct UserMessagePersist {
     hidden: bool,
 }
 
+/// Write a person's bubble to its row. `read` is the bubble as memory has it at the moment it
+/// is called, `None` once memory no longer holds it, when the words as typed are written.
+async fn write_user_row(
+    db: &DatabaseService,
+    id: &str,
+    conversation_id: &str,
+    typed: String,
+    reply: Option<ReplyRef>,
+    said_at: SystemTime,
+    mut read: impl FnMut() -> Option<UserMessagePersist>,
+) -> anyhow::Result<()> {
+    // What is in memory now, not what was typed: a cancel or edit can land before this write
+    // does, and the row has to be the bubble as it stands (hidden, or with the new words), not
+    // the draft that has already gone.
+    let persist = read().unwrap_or(UserMessagePersist {
+        content: typed,
+        hidden: false,
+    });
+    // The row is filed under the bubble's own id, so nothing has to be swapped afterwards:
+    // what is on screen and what is on disk answer to the same name from the first moment,
+    // and a delete in the meantime finds its row.
+    db.save_message(
+        id,
+        conversation_id,
+        "user",
+        &persist.content,
+        None,
+        None,
+        reply,
+        &[],
+        // The person's own message came out of no run. The server's record of a thread is its
+        // runs, and a run is only the coworker's half of a turn.
+        None,
+        persist.hidden,
+        said_at,
+    )
+    .await
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveTurn {
     /// The id the turn was sent under, so `GET /ag-ui/runs/{run_id}` can be asked what became
@@ -10666,37 +10705,21 @@ impl AppState {
                     eprintln!("Failed to save user message: {}", e);
                     return;
                 }
-                // What is in memory now, not what was typed: a cancel or edit can land
-                // before this write does, and the row has to be the bubble as it stands
-                // (hidden, or with the new words), not the draft that has already gone.
-                let persist = this
-                    .update(cx, |state, _| state.user_message_persist(&local_id))
-                    .ok()
-                    .flatten()
-                    .unwrap_or(UserMessagePersist {
-                        content: content_clone,
-                        hidden: false,
-                    });
-                // The row is filed under the bubble's own id, so nothing has to be swapped
-                // afterwards: what is on screen and what is on disk answer to the same name
-                // from the first moment, and a delete in the meantime finds its row.
-                if let Err(e) = db
-                    .save_message(
-                        &local_id,
-                        &conversation_id_clone,
-                        "user",
-                        &persist.content,
-                        None,
-                        None,
-                        reply,
-                        &[],
-                        // The person's own message came out of no run. The server's record of a
-                        // thread is its runs, and a run is only the coworker's half of a turn.
-                        None,
-                        persist.hidden,
-                        said_at,
-                    )
-                    .await
+                let read = || {
+                    this.update(cx, |state, _| state.user_message_persist(&local_id))
+                        .ok()
+                        .flatten()
+                };
+                if let Err(e) = write_user_row(
+                    &db,
+                    &local_id,
+                    &conversation_id_clone,
+                    content_clone,
+                    reply,
+                    said_at,
+                    read,
+                )
+                .await
                 {
                     eprintln!("Failed to save user message: {}", e);
                 }
