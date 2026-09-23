@@ -1054,42 +1054,51 @@ fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
 /// When a recovered run ended, if the server said. Live runs have none.
 ///
 /// `updated_at_ms` is the last frame the journal took; for a finished run that
-/// is the end of the wait. A harness `total_ms` is preferred when present,
-/// because it is the wall clock the operator is debugging.
+/// is the end of the wait. The harness `total_ms` alone is not: the harness
+/// starts its clock again after an approval card, so it counts only the half
+/// after the card. The later of the two is the end.
 fn recovered_finished_at(run: &ThreadRun) -> Option<SystemTime> {
     if run.is_live() {
         return None;
     }
-    let started = (run.started_at_ms > 0)
-        .then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(run.started_at_ms as u64));
-    if let Some(ms) = TurnTiming::from_events(&run.events).and_then(|t| t.total_ms)
-        && let Some(started) = started
-    {
-        return Some(started + Duration::from_millis(ms));
-    }
-    (run.updated_at_ms > run.started_at_ms && run.updated_at_ms > 0)
-        .then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(run.updated_at_ms as u64))
+    let at = |ms: i64| {
+        u64::try_from(ms)
+            .ok()
+            .filter(|ms| *ms > 0)
+            .and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+    };
+    let started = at(run.started_at_ms);
+    let harness_end = started
+        .zip(TurnTiming::from_events(&run.events).and_then(|t| t.total_ms))
+        .and_then(|(started, ms)| started.checked_add(Duration::from_millis(ms)));
+    let last_frame = at(run.updated_at_ms).filter(|_| run.updated_at_ms > run.started_at_ms);
+    harness_end.max(last_frame)
 }
 
 /// The run is over: wear when it ended, without moving when it began.
-fn stamp_run_finished(message: &mut Message, now: SystemTime) {
+///
+/// Only an ending may set `finished_at`. The harness sends a timing frame when
+/// it parks on a card too, and its `total_ms` restarts after the card, so the
+/// harness clock can lengthen the observed end but never stand in for it.
+fn stamp_run_finished(message: &mut Message, observed_end: SystemTime) {
     if message.is_me {
         return;
     }
-    if let Some(ms) = message.run_timing.as_ref().and_then(|t| t.total_ms) {
-        message.finished_at = Some(message.sent_at + Duration::from_millis(ms));
-        return;
-    }
-    if message.finished_at.is_none() {
-        message.finished_at = Some(now.max(message.sent_at));
-    }
+    let harness_end = message
+        .run_timing
+        .as_ref()
+        .and_then(|t| t.total_ms)
+        .and_then(|ms| message.sent_at.checked_add(Duration::from_millis(ms)));
+    let end = message
+        .finished_at
+        .unwrap_or(observed_end)
+        .max(message.sent_at);
+    message.finished_at = Some(harness_end.map_or(end, |harness| end.max(harness)));
 }
 
-/// A harness timing frame landed. The start clock stays put.
+/// A harness timing frame landed. It does not end the run: a run parked on a
+/// card sends one too.
 fn apply_timing(message: &mut Message, timing: TurnTiming) {
-    if let Some(ms) = timing.total_ms {
-        message.finished_at = Some(message.sent_at + Duration::from_millis(ms));
-    }
     message.run_timing = Some(timing);
 }
 
@@ -14194,7 +14203,7 @@ mod tests {
     }
 
     #[test]
-    fn a_harness_timing_frame_sets_the_wait_from_total_ms() {
+    fn a_finished_run_is_never_shorter_than_the_harness_says() {
         let start = SystemTime::UNIX_EPOCH;
         let mut bubble = at(message("m_live", false, "listed"), 0);
         bubble.sent_at = start;
@@ -14208,6 +14217,7 @@ mod tests {
             }))
             .unwrap(),
         );
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(5));
         assert_eq!(bubble.sent_at, start);
         assert_eq!(bubble.formatted_duration().as_deref(), Some("6m12s"));
         assert_eq!(
