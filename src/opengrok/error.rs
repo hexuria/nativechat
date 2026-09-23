@@ -196,6 +196,13 @@ impl OpenGrokError {
         self.status == Some(409) && self.message == "stale-pending-message"
     }
 
+    /// `POST /pending` lost the race the server describes as "another writer got there
+    /// first; retry". The insert collided and the winning row was gone before it could be
+    /// read, so the same POST is worth one more try. Any other 409 is a decision.
+    pub fn is_enqueue_conflict(&self) -> bool {
+        self.status == Some(409) && self.message == "another writer got there first; retry"
+    }
+
     /// The `pending-user-message` CUSTOM a pending refusal carried.
     pub fn pending_custom(&self) -> Option<PendingCustom> {
         self.pending_event
@@ -207,6 +214,12 @@ impl OpenGrokError {
         self.pending_event = event;
         self
     }
+}
+
+/// Whether `POST /pending` should be sent again. The server asks for one retry of this
+/// conflict. A second one is the same answer, and asking in a loop would not change it.
+pub fn retry_enqueue(error: &OpenGrokError, attempt: u32) -> bool {
+    error.is_enqueue_conflict() && attempt < 2
 }
 
 /// The server's own words for the gateway being out of reach.
@@ -335,6 +348,16 @@ mod tests {
         let missing = OpenGrokError::from_server(Some(404), "no such thread");
         assert!(missing.is_not_found());
         assert!(!missing.is_already_consumed());
+
+        let raced = OpenGrokError::from_server(Some(409), "another writer got there first; retry");
+        assert!(raced.is_enqueue_conflict());
+        assert!(!consumed.is_enqueue_conflict());
+        assert!(crate::opengrok::retry_enqueue(&raced, 1));
+        assert!(
+            !crate::opengrok::retry_enqueue(&raced, 2),
+            "one retry, then the conflict is a decision"
+        );
+        assert!(!crate::opengrok::retry_enqueue(&consumed, 1));
     }
 
     #[test]

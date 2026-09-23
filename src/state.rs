@@ -25,7 +25,7 @@ use crate::opengrok::{
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
+    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
     save_login_from_local, serve_local_exec, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
@@ -726,19 +726,6 @@ fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
         stale: StaleRefusal::Fresh,
         unsynced: false,
     }
-}
-
-fn bubble_awaits_reply(conversation: &Conversation, message_id: &str) -> bool {
-    let Some(index) = conversation
-        .messages
-        .iter()
-        .position(|message| message.id == message_id)
-    else {
-        return true;
-    };
-    !conversation.messages[index + 1..]
-        .iter()
-        .any(|message| !message.hidden && !message.is_me)
 }
 
 /// Write a person's bubble to its row. `read` is the bubble as memory has it at the moment it
@@ -11871,52 +11858,64 @@ impl AppState {
         );
         let posted_content = content;
         cx.spawn(async move |this, cx| {
-            match client.enqueue_pending_user_message(&thread_id, &body).await {
-                Ok(mutation) => {
-                    let Some(row) = mutation.row() else {
-                        eprintln!(
-                            "NativeChat: the server accepted a pending send and named no row"
-                        );
-                        return;
-                    };
-                    let _ = this.update(cx, |state, cx| {
-                        match state.bind_pending_id(&message_id, row.id.clone(), &posted_content) {
-                            BindPending::TakeBack { pending_id } => {
-                                state.spawn_cancel_pending(thread_id.clone(), pending_id, cx);
-                            }
-                            BindPending::Patch {
-                                pending_id,
-                                content,
-                            } => {
-                                state.spawn_edit_pending(
-                                    thread_id.clone(),
+            let mut attempt = 1;
+            loop {
+                match client.enqueue_pending_user_message(&thread_id, &body).await {
+                    Ok(mutation) => {
+                        let Some(row) = mutation.row() else {
+                            eprintln!(
+                                "NativeChat: the server accepted a pending send and named no row"
+                            );
+                            return;
+                        };
+                        let _ = this.update(cx, |state, cx| {
+                            match state.bind_pending_id(
+                                &message_id,
+                                row.id.clone(),
+                                &posted_content,
+                            ) {
+                                BindPending::TakeBack { pending_id } => {
+                                    state.spawn_cancel_pending(thread_id.clone(), pending_id, cx);
+                                }
+                                BindPending::Patch {
                                     pending_id,
-                                    message_id.clone(),
                                     content,
-                                    cx,
-                                );
+                                } => {
+                                    state.spawn_edit_pending(
+                                        thread_id.clone(),
+                                        pending_id,
+                                        message_id.clone(),
+                                        content,
+                                        cx,
+                                    );
+                                }
+                                BindPending::Bound => {}
                             }
-                            BindPending::Bound => {}
-                        }
-                    });
+                        });
+                    }
+                    Err(error) if retry_enqueue(&error, attempt) => {
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(error) if error.is_not_found() => {
+                        let _ = this.update(cx, |state, _| {
+                            if let Some(held) = state.hold_mut(&message_id) {
+                                held.posted = false;
+                            }
+                        });
+                    }
+                    Err(error) if error.unreachable().is_some() => {}
+                    Err(error) if error.is_already_consumed() => {
+                        let _ = this.update(cx, |state, cx| {
+                            state.dequeue_send(&message_id);
+                            state.reconcile_thread(&thread_id, cx);
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("NativeChat: could not enqueue a pending send: {error}");
+                    }
                 }
-                Err(error) if error.is_not_found() => {
-                    let _ = this.update(cx, |state, _| {
-                        if let Some(held) = state.hold_mut(&message_id) {
-                            held.posted = false;
-                        }
-                    });
-                }
-                Err(error) if error.unreachable().is_some() => {}
-                Err(error) if error.is_already_consumed() => {
-                    let _ = this.update(cx, |state, cx| {
-                        state.dequeue_send(&message_id);
-                        state.reconcile_thread(&thread_id, cx);
-                    });
-                }
-                Err(error) => {
-                    eprintln!("NativeChat: could not enqueue a pending send: {error}");
-                }
+                break;
             }
         })
         .detach();
@@ -12028,7 +12027,6 @@ impl AppState {
         // The local queue first, in the order it was typed; rows only the server has go after.
         let mut fold = PendingFold::default();
         let mut rebuilt = VecDeque::new();
-        let mut disappeared = Vec::new();
         for mut queued in previous {
             if self.canceled_pending.contains(&queued.message_id) {
                 continue;
@@ -12055,9 +12053,12 @@ impl AppState {
                     fold.save.push(save);
                 }
                 rebuilt.push_back(hold_from_row(row));
-            } else {
-                disappeared.push(queued);
             }
+            // The row is gone. A drain on another machine and a cancel on another machine
+            // look the same in this list. The hold stays off the queue, so this machine
+            // does not send it. The bubble stays up: hiding it would drop the person's
+            // words when the other machine already drained the send and the answer is
+            // not here yet. A cancel made here hides the bubble on its own path.
         }
         for item in pending {
             let bubble_id = item.bubble_id();
@@ -12089,30 +12090,22 @@ impl AppState {
                 .insert(conversation_id.to_string(), rebuilt);
         }
 
-        for leftover in disappeared {
-            if self.canceled_pending.contains(&leftover.message_id) {
-                continue;
-            }
-            let unanswered = self
-                .conversations
-                .iter()
-                .find(|conversation| conversation.id == conversation_id)
-                .is_none_or(|conversation| bubble_awaits_reply(conversation, &leftover.message_id));
-            if unanswered {
-                if let Some(conversation) = self
-                    .conversations
-                    .iter_mut()
-                    .find(|conversation| conversation.id == conversation_id)
-                    && let Some(message) = conversation
-                        .messages
-                        .iter_mut()
-                        .find(|message| message.id == leftover.message_id)
-                {
-                    message.hidden = true;
-                    fold.hide.push(leftover.message_id);
-                }
-            }
-        }
+        let in_this_thread: HashSet<&str> = self
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == conversation_id)
+            .map(|conversation| {
+                conversation
+                    .messages
+                    .iter()
+                    .map(|message| message.id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A tombstone is only needed while the server still has the row. Once the row is
+        // gone, a hidden bubble is what keeps a restart from queueing the send again.
+        self.canceled_pending
+            .retain(|id| !in_this_thread.contains(id.as_str()) || rows.contains_key(id.as_str()));
         fold
     }
 
@@ -17276,14 +17269,40 @@ mod tests {
         assert_eq!(order, ["m_a", "m_b", "m_x"]);
     }
 
-    /// A synced hold that vanished from the snapshot was canceled elsewhere: hide it.
+    /// A synced hold that vanished from the snapshot left the queue. The bubble stays:
+    /// the row being gone is also what a drain on another machine looks like, and the
+    /// answer may not be in this transcript yet.
     #[test]
-    fn hydrate_hides_a_synced_hold_the_server_no_longer_has() {
+    fn hydrate_keeps_the_bubble_when_a_synced_hold_vanishes() {
         let mut state = holding("m_held", "wait for it");
         state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
         state.fold_pending_snapshot("cw_1", &[]);
         assert!(!state.is_send_queued("m_held"));
-        assert!(bubble(&state, "m_held").hidden);
+        assert!(
+            !bubble(&state, "m_held").hidden,
+            "the words stay until the answer arrives"
+        );
+    }
+
+    /// The set of canceled ids only has to remember rows the server still has.
+    #[test]
+    fn a_cancel_tombstone_lasts_only_while_the_server_still_has_the_row() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].pending_id = Some("pum_1".into());
+        state.canceled_pending.insert("m_held".into());
+        state.canceled_pending.insert("m_elsewhere".into());
+        state.fold_pending_snapshot("cw_1", &[pending_row("pum_1", "m_held", "wait for it")]);
+        assert!(
+            state.canceled_pending.contains("m_held"),
+            "the row is still on the server"
+        );
+        assert!(!state.is_send_queued("m_held"));
+        state.fold_pending_snapshot("cw_1", &[]);
+        assert!(
+            !state.canceled_pending.contains("m_held"),
+            "the row is gone"
+        );
+        assert!(state.canceled_pending.contains("m_elsewhere"));
     }
 
     /// A synced hold that vanished because it drained keeps the bubble: an assistant

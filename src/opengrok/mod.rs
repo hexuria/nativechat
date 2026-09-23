@@ -59,7 +59,7 @@ pub use client::{
     collapse_computer_roster, collapse_computers_by_machine_id, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
-pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
+pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable, retry_enqueue};
 pub use pending::{
     CUSTOM_NAME, PAYLOAD_V, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage, PendingWrite,
