@@ -34,8 +34,9 @@
 //! array with one number per model round, beside `tool_wait_ms` and
 //! `tool_rounds`. Both shapes read.
 //!
-//! Unknown fields are ignored. `v` greater than 1 is still read for the
-//! keys this build knows. Absence of every timing field is not a payload.
+//! Unknown fields are ignored. A `v` other than 1 is not read: its keys may
+//! not mean what they mean here. Absence of every timing field is not a
+//! payload.
 //! CamelCase aliases (`totalMs`, `modelMs`, `autoReviewMs`, `durationMs`)
 //! are accepted so a server PR can land either spelling.
 
@@ -108,10 +109,11 @@ impl TurnTiming {
 
     /// The object inside `value` (or the event itself).
     pub fn from_value(value: &Value) -> Option<Self> {
-        let v = u32_at(value, &["v", "version"]).unwrap_or(TIMING_SCHEMA_V);
-        if v == 0 {
-            return None;
-        }
+        let v = match ["v", "version"].iter().find_map(|key| value.get(*key)) {
+            None => TIMING_SCHEMA_V,
+            Some(v) if v.as_u64() == Some(u64::from(TIMING_SCHEMA_V)) => TIMING_SCHEMA_V,
+            Some(_) => return None,
+        };
         let total_ms = ms_at(value, &["total_ms", "totalMs"]);
         // The harness sends `model_ms` as one number per model round; the
         // documented shape is a total beside a `rounds` list.
