@@ -17685,6 +17685,23 @@ mod tests {
         );
     }
 
+    /// Parked means another machine's words were refused twice. Words the person types here
+    /// are theirs, so the hold goes out again.
+    #[test]
+    fn editing_a_parked_hold_sends_it_again() {
+        let mut state = holding("m_held", "wait for it");
+        state.queued_sends.get_mut("cw_1").unwrap()[0].stale = super::StaleRefusal::Parked;
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none(), "parked");
+
+        assert!(matches!(
+            state.begin_queued_edit("m_held", "my own words".into()),
+            super::QueuedEdit::Applied { .. }
+        ));
+        let next = state.pop_queued_send("cw_1").expect("unparked by the edit");
+        assert_eq!(next.content, "my own words");
+    }
+
     /// A stale refusal naming a drained row: this run already spent it, so there is nothing to
     /// put back.
     #[test]
