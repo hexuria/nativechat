@@ -687,6 +687,19 @@ fn recipe_from_pending(item: &PendingUserMessage) -> Option<TurnRecipe> {
     Some(TurnRecipe { id, values })
 }
 
+fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
+    QueuedSend {
+        message_id: item.bubble_id().to_string(),
+        content: item.content.clone(),
+        recipe: recipe_from_pending(item),
+        skill: item.skill_id.clone().filter(|id| !id.is_empty()),
+        reply: reply_from_pending(item.reply_to.as_ref()),
+        pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
+        posted: true,
+        stale: StaleRefusal::Fresh,
+    }
+}
+
 fn bubble_awaits_reply(conversation: &Conversation, message_id: &str) -> bool {
     let Some(index) = conversation
         .messages
@@ -11817,36 +11830,51 @@ impl AppState {
         conversation_id: &str,
         pending: &[PendingUserMessage],
     ) -> PendingFold {
-        let server_ids: HashSet<&str> = pending.iter().map(PendingUserMessage::bubble_id).collect();
-        let previous: Vec<QueuedSend> = self
+        let rows: HashMap<&str, &PendingUserMessage> = pending
+            .iter()
+            .map(|item| (item.bubble_id(), item))
+            .collect();
+        let previous = self
             .queued_sends
             .remove(conversation_id)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let local_only: Vec<QueuedSend> = previous
-            .iter()
-            .filter(|queued| {
-                queued.pending_id.is_none() || self.pending_inflight.contains(&queued.message_id)
-            })
-            .filter(|queued| !self.canceled_pending.contains(&queued.message_id))
-            .cloned()
-            .collect();
-        let disappeared: Vec<QueuedSend> = previous
-            .into_iter()
-            .filter(|queued| queued.pending_id.is_some())
-            .filter(|queued| !self.pending_inflight.contains(&queued.message_id))
-            .filter(|queued| !server_ids.contains(queued.message_id.as_str()))
-            .collect();
+            .unwrap_or_default();
 
+        // The local queue first, in the order it was typed; rows only the server has go after.
         let mut fold = PendingFold::default();
         let mut rebuilt = VecDeque::new();
+        let mut disappeared = Vec::new();
+        for mut queued in previous {
+            if self.canceled_pending.contains(&queued.message_id) {
+                continue;
+            }
+            let row = rows.get(queued.message_id.as_str()).copied();
+            if self.pending_inflight.contains(&queued.message_id) {
+                rebuilt.push_back(queued);
+            } else if queued.pending_id.is_none() {
+                // Enqueue has not bound yet, and bind PATCHes whatever these words have
+                // become since the POST; the row's copy would hide that edit from it.
+                if let Some(row) = row.filter(|row| !row.id.is_empty()) {
+                    queued.pending_id = Some(row.id.clone());
+                }
+                rebuilt.push_back(queued);
+            } else if let Some(row) = row {
+                if let Some(save) = self.upsert_queued_bubble(conversation_id, row) {
+                    fold.save.push(save);
+                }
+                rebuilt.push_back(hold_from_row(row));
+            } else {
+                disappeared.push(queued);
+            }
+        }
         for item in pending {
-            let bubble_id = item.bubble_id().to_string();
-            if self.canceled_pending.contains(&bubble_id)
-                || self.pending_inflight.contains(&bubble_id)
+            let bubble_id = item.bubble_id();
+            if self.pending_inflight.contains(bubble_id)
+                || rebuilt.iter().any(|queued| queued.message_id == bubble_id)
             {
-                if self.canceled_pending.contains(&bubble_id) && !item.id.is_empty() {
+                continue;
+            }
+            if self.canceled_pending.contains(bubble_id) {
+                if !item.id.is_empty() {
                     fold.cancel.push(item.id.clone());
                 }
                 continue;
@@ -11854,25 +11882,7 @@ impl AppState {
             if let Some(save) = self.upsert_queued_bubble(conversation_id, item) {
                 fold.save.push(save);
             }
-            rebuilt.push_back(QueuedSend {
-                message_id: bubble_id,
-                content: item.content.clone(),
-                recipe: recipe_from_pending(item),
-                skill: item.skill_id.clone().filter(|id| !id.is_empty()),
-                reply: reply_from_pending(item.reply_to.as_ref()),
-                pending_id: Some(item.id.clone()),
-                posted: true,
-                stale: StaleRefusal::Fresh,
-            });
-        }
-        for leftover in local_only {
-            if rebuilt
-                .iter()
-                .any(|queued| queued.message_id == leftover.message_id)
-            {
-                continue;
-            }
-            rebuilt.push_back(leftover);
+            rebuilt.push_back(hold_from_row(item));
         }
         if rebuilt.is_empty() {
             self.queued_sends.remove(conversation_id);
@@ -12121,16 +12131,7 @@ impl AppState {
         item: &PendingUserMessage,
     ) -> Option<QueuedBubbleSave> {
         let save = self.upsert_queued_bubble(conversation_id, item)?;
-        let hold = QueuedSend {
-            message_id: item.bubble_id().to_string(),
-            content: item.content.clone(),
-            recipe: recipe_from_pending(item),
-            skill: item.skill_id.clone().filter(|id| !id.is_empty()),
-            reply: reply_from_pending(item.reply_to.as_ref()),
-            pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
-            posted: true,
-            stale: StaleRefusal::Fresh,
-        };
+        let hold = hold_from_row(item);
         let queue = self
             .queued_sends
             .entry(conversation_id.to_string())
