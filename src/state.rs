@@ -16863,6 +16863,32 @@ mod tests {
         );
     }
 
+    /// The queue is the order the person typed in. A hold whose enqueue has not landed stays
+    /// where it was, not behind the ones the server already has.
+    #[test]
+    fn hydrate_keeps_the_order_the_holds_were_typed_in() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        let mut b = super::held_message("m_b".into(), "second".into(), None, None, None);
+        b.pending_id = Some("pum_b".into());
+        state.queued_sends.get_mut("cw_1").unwrap().push_back(b);
+
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[
+                pending_row("pum_b", "m_b", "second"),
+                pending_row("pum_x", "m_x", "from the laptop"),
+            ],
+        );
+        let order: Vec<&str> = state.queued_sends["cw_1"]
+            .iter()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        assert_eq!(order, ["m_a", "m_b", "m_x"]);
+    }
+
     /// A synced hold that vanished from the snapshot was canceled elsewhere: hide it.
     #[test]
     fn hydrate_hides_a_synced_hold_the_server_no_longer_has() {
