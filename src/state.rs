@@ -19,18 +19,18 @@ use crate::opengrok::{
     RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunReplay,
     SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind,
     ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary,
-    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe,
+    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
     UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable,
-    save_login_from_local, serve_local_exec, stored_machine_id, tool_standin,
+    save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
-use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef};
+use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef, SaveStamp};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
@@ -51,7 +51,17 @@ pub struct Message {
     pub id: String,
     pub sender: String,
     pub content: String,
+    /// When the run began (or when the person sent the message). History is
+    /// ordered by this, so a long turn that started before a queued message
+    /// still sits before it.
     pub sent_at: SystemTime,
+    /// When the run ended, for a coworker's reply. The peek stamp wears this
+    /// wait as `4:34 PM · 6m12s` rather than claiming the answer landed at
+    /// start. None while the bubble is still being filled in, and on the
+    /// person's own messages.
+    pub finished_at: Option<SystemTime>,
+    /// Harness CUSTOM `run-timing` / `turn-timeline`, when the server sent one.
+    pub run_timing: Option<TurnTiming>,
     pub is_me: bool,
     pub reply_preview: Option<String>,
     /// The message this one answers. The preview is what the bubble paints; this is what the
@@ -98,17 +108,49 @@ impl Message {
     }
 
     /// Clock time on the message row, matching Grok's `12:14 PM` column.
+    ///
+    /// This is when the run *began*. How long it took is [`formatted_duration`]:
+    /// painting the finish clock here would move the column relative to the
+    /// message it answers, and painting nothing would keep lying that a
+    /// six-minute turn landed at 4:34.
     pub fn formatted_time(&self) -> String {
-        let dt = DateTime::<Local>::from(self.sent_at);
-        let (pm, hour) = dt.hour12();
-        let hour = if hour == 0 { 12 } else { hour };
-        format!(
-            "{}:{:02} {}",
-            hour,
-            dt.minute(),
-            if pm { "PM" } else { "AM" }
-        )
+        clock_of(self.sent_at).unwrap_or_default()
     }
+
+    /// `6m12s` once the run has ended and took at least a second. The peek
+    /// column puts this under the clock: `4:34 PM` / `6m12s`.
+    pub fn formatted_duration(&self) -> Option<String> {
+        stamp_duration(self.sent_at, self.finished_at?)
+    }
+
+    fn save_stamp(&self) -> SaveStamp {
+        SaveStamp {
+            sent_at: self.sent_at,
+            finished_at: self.finished_at,
+            timing_json: self.run_timing.as_ref().map(TurnTiming::to_json),
+        }
+    }
+}
+
+/// Grok's `12:14 PM` column, 12-hour clock, no leading zero on the hour.
+/// `None` when the instant is one chrono cannot hold. `DateTime::from(SystemTime)`
+/// panics on those, and `sent_at` can be a server clock.
+fn clock_of(at: SystemTime) -> Option<String> {
+    let since = at.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    let ms = i64::try_from(since.as_millis()).ok()?;
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)?;
+    Some(clock_label(utc.with_timezone(&Local)))
+}
+
+pub fn clock_label(dt: DateTime<Local>) -> String {
+    let (pm, hour) = dt.hour12();
+    let hour = if hour == 0 { 12 } else { hour };
+    format!(
+        "{}:{:02} {}",
+        hour,
+        dt.minute(),
+        if pm { "PM" } else { "AM" }
+    )
 }
 
 /// What is worth keeping of a message the person watched arrive: its words.
@@ -630,7 +672,7 @@ async fn write_user_row(
         // runs, and a run is only the coworker's half of a turn.
         None,
         persist.hidden,
-        said_at,
+        SaveStamp::at(said_at),
     )
     .await?;
     // A cancel or an edit that landed while that write was in flight met no row to change.
@@ -779,6 +821,8 @@ fn status_row(line: &str) -> Message {
         sender: "AI".to_string(),
         content: line.to_string(),
         sent_at: SystemTime::now(),
+        finished_at: None,
+        run_timing: None,
         is_me: false,
         reply_preview: None,
         reply_to_id: None,
@@ -823,6 +867,8 @@ fn restored_message(row: ChatMessage) -> Message {
         sender: if row.role == "user" { "Me" } else { "AI" }.to_string(),
         content,
         sent_at,
+        finished_at: row.finished_at.as_deref().and_then(parse_sql_time),
+        run_timing: row.run_timing.as_deref().and_then(TurnTiming::from_json),
         is_me: row.role == "user",
         reply_preview: row.reply_preview,
         reply_to_id: row.reply_to_id,
@@ -897,6 +943,10 @@ struct RecoveredReply {
     live: bool,
     /// When the run started, which is where in the thread its reply belongs.
     started_at: SystemTime,
+    /// When the run ended, for a finished turn. Live runs have none.
+    finished_at: Option<SystemTime>,
+    /// Harness timing CUSTOM, when the journal carried one.
+    run_timing: Option<TurnTiming>,
 }
 
 /// What a thread is missing, told by comparing the runs the server kept against the runs the
@@ -956,6 +1006,8 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                         SystemTime::UNIX_EPOCH + Duration::from_millis(run.started_at_ms as u64)
                     })
                     .unwrap_or_else(SystemTime::now),
+                finished_at: recovered_finished_at(run),
+                run_timing: TurnTiming::from_events(&run.events),
             })
         })
         .collect()
@@ -1052,8 +1104,11 @@ fn bubble_for_run(
         content: String::new(),
         // When the run began, not when this machine noticed it: the bubble's time is what the
         // row is stamped with, and a turn recovered after a restart happened before the ones
-        // either side of it.
+        // either side of it. How long it took is `finished_at`, painted later, and never
+        // written over this.
         sent_at: started_at.unwrap_or_else(SystemTime::now),
+        finished_at: None,
+        run_timing: None,
         is_me: false,
         reply_preview: None,
         reply_to_id: None,
@@ -1078,6 +1133,8 @@ fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
             sender: "AI".to_string(),
             content: reply.content.clone(),
             sent_at: reply.started_at,
+            finished_at: reply.finished_at,
+            run_timing: reply.run_timing.clone(),
             is_me: false,
             reply_preview: None,
             reply_to_id: None,
@@ -1088,6 +1145,57 @@ fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
         },
     );
     id
+}
+
+/// When a recovered run ended, if the server said. Live runs have none.
+///
+/// `updated_at_ms` is the last frame the journal took; for a finished run that
+/// is the end of the wait. The harness `total_ms` alone is not: the harness
+/// starts its clock again after an approval card, so it counts only the half
+/// after the card. The later of the two is the end.
+fn recovered_finished_at(run: &ThreadRun) -> Option<SystemTime> {
+    if run.is_live() {
+        return None;
+    }
+    let at = |ms: i64| {
+        u64::try_from(ms)
+            .ok()
+            .filter(|ms| *ms > 0)
+            .and_then(|ms| SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+    };
+    let started = at(run.started_at_ms);
+    let harness_end = started
+        .zip(TurnTiming::from_events(&run.events).and_then(|t| t.total_ms))
+        .and_then(|(started, ms)| started.checked_add(Duration::from_millis(ms)));
+    let last_frame = at(run.updated_at_ms).filter(|_| run.updated_at_ms > run.started_at_ms);
+    harness_end.max(last_frame)
+}
+
+/// The run is over: wear when it ended, without moving when it began.
+///
+/// Only an ending may set `finished_at`. The harness sends a timing frame when
+/// it parks on a card too, and its `total_ms` restarts after the card, so the
+/// harness clock can lengthen the observed end but never stand in for it.
+fn stamp_run_finished(message: &mut Message, observed_end: SystemTime) {
+    if message.is_me || is_unsent_turn_note(&message.content) {
+        return;
+    }
+    let harness_end = message
+        .run_timing
+        .as_ref()
+        .and_then(|t| t.total_ms)
+        .and_then(|ms| message.sent_at.checked_add(Duration::from_millis(ms)));
+    let end = message
+        .finished_at
+        .unwrap_or(observed_end)
+        .max(message.sent_at);
+    message.finished_at = Some(harness_end.map_or(end, |harness| end.max(harness)));
+}
+
+/// A harness timing frame landed. It does not end the run: a run parked on a
+/// card sends one too.
+fn apply_timing(message: &mut Message, timing: TurnTiming) {
+    message.run_timing = Some(timing);
 }
 
 /// What the feed says for a turn that is over but said nothing.
@@ -1706,6 +1814,9 @@ pub struct AppState {
     pub submit_chord: SubmitChord,
     /// What a plain send does while a turn is running. Read from prefs.json at boot.
     pub on_send: OnSend,
+    /// Settings → General: paint the harness phase breakdown under assistant
+    /// bubbles. Off for demos; the peek stamp still wears how long the run took.
+    pub show_turn_timing: bool,
     /// Messages held per thread until it is idle, in the order they were typed.
     queued_sends: HashMap<String, VecDeque<QueuedSend>>,
     /// The held send whose Edit was clicked, until the composer settles it.
@@ -2248,6 +2359,7 @@ impl AppState {
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
             on_send: OnSend::default(),
+            show_turn_timing: false,
             queued_sends: HashMap::new(),
             pending_edit: None,
             edit_slot: None,
@@ -6979,9 +7091,15 @@ impl AppState {
     /// pinned screenshots from OpenGrok onto rows sqlite already has.
     fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
         let mut grafted: Vec<(String, Vec<ChatPart>)> = Vec::new();
+        let mut clocks: Vec<(String, Option<SystemTime>, Option<TurnTiming>)> = Vec::new();
         for run in runs.iter().filter(|run| !run.run_id.trim().is_empty()) {
             let (_, parts) = reply_from_replay(&run.events, &run.status);
             let parts = self.graft_user_forms(parts);
+            clocks.push((
+                run.run_id.clone(),
+                recovered_finished_at(run),
+                TurnTiming::from_events(&run.events),
+            ));
             grafted.push((run.run_id.clone(), parts));
         }
         let Some(conversation) = self
@@ -6998,6 +7116,22 @@ impl AppState {
                 .find(|message| message.run_id.as_deref() == Some(run_id.as_str()))
             {
                 overlay_server_cards(message, parts);
+            }
+        }
+        for (run_id, finished_at, timing) in clocks {
+            if let Some(message) = conversation
+                .messages
+                .iter_mut()
+                .find(|message| message.run_id.as_deref() == Some(run_id.as_str()))
+            {
+                if message.run_timing.is_none()
+                    && let Some(timing) = timing
+                {
+                    apply_timing(message, timing);
+                }
+                if message.finished_at.is_none() {
+                    message.finished_at = finished_at;
+                }
             }
         }
         for (_, parts) in &grafted {
@@ -7284,8 +7418,9 @@ impl AppState {
             .and_then(|c| c.messages.iter().find(|m| m.id == message_id));
         let hidden = bubble.is_some_and(|m| m.hidden);
         // The turn's own time, so a reply recovered from the server keeps the place it had
-        // rather than landing at the bottom of the thread on the next load.
-        let sent_at = bubble.map_or_else(SystemTime::now, |m| m.sent_at);
+        // rather than landing at the bottom of the thread on the next load. Finished-at and
+        // the harness timing JSON ride along; they never move that start clock.
+        let stamp = bubble.map_or_else(|| SaveStamp::at(SystemTime::now()), Message::save_stamp);
         let conversation_id = conversation_id.to_string();
         let message_id = message_id.to_string();
         let run_id = run_id.map(str::to_string);
@@ -7306,7 +7441,7 @@ impl AppState {
                         &parts,
                         run_id.as_deref(),
                         hidden,
-                        sent_at,
+                        stamp,
                     )
                     .await
                 }
@@ -7389,6 +7524,8 @@ impl AppState {
                 sender: "AI".to_string(),
                 content: String::new(),
                 sent_at: SystemTime::now(),
+                finished_at: None,
+                run_timing: None,
                 is_me: false,
                 reply_preview: None,
                 reply_to_id: None,
@@ -7476,12 +7613,14 @@ impl AppState {
                                     }
                                 }
                                 assembler.push_event(&event);
+                                let timing = TurnTiming::from_event(&event);
                                 let (plain, parts) = assembler.snapshot();
                                 let box_shot = assembler.latest_screenshot().cloned();
                                 let sig = stream_part_sig(&parts);
                                 let now = Instant::now();
                                 let paint =
-                                    stream_paint_due(last_stream_paint, now, last_stream_sig, sig);
+                                    stream_paint_due(last_stream_paint, now, last_stream_sig, sig)
+                                        || timing.is_some();
                                 let _ = this.update(cx, |state, cx| {
                                     // A run the person stopped or sent past has no row any more;
                                     // its late frames must not graft into the turn that replaced it.
@@ -7502,6 +7641,9 @@ impl AppState {
                                     ) {
                                         message.content = plain.clone();
                                         message.parts = grafted;
+                                        if let Some(timing) = timing {
+                                            apply_timing(message, timing);
+                                        }
                                         // Tokens update the row every frame; notify at ~60Hz
                                         // or when a card/picture lands, not on every SSE event.
                                         if paint {
@@ -7626,6 +7768,12 @@ impl AppState {
                                 message.content = format!("{RUN_ERROR_PREFIX}{}", error.message)
                             }
                         }
+                    }
+                    if !waiting_approval && !waiting_user_form {
+                        // The start clock stays. This is the other end of the wait, so the
+                        // peek stamp can say `4:34 PM · 6m12s` instead of pretending the
+                        // answer landed when the run began.
+                        stamp_run_finished(message, SystemTime::now());
                     }
                 }
                 if !waiting_approval && !waiting_user_form && result.is_ok() {
@@ -8220,6 +8368,12 @@ impl AppState {
                                     painted = Some(last.id.clone());
                                     last.content = plain.clone();
                                     last.parts = parts.clone();
+                                    if let Some(timing) = TurnTiming::from_events(&replay.events) {
+                                        apply_timing(last, timing);
+                                    }
+                                    if status != "running" && status != "awaiting-approval" {
+                                        stamp_run_finished(last, SystemTime::now());
+                                    }
                                     if let Some(shot) =
                                         parts.iter().rev().find_map(|part| match part {
                                             ChatPart::Screenshot(spec) => Some(spec.clone()),
@@ -8522,6 +8676,8 @@ impl AppState {
             sender: "AI".to_string(),
             content: String::new(),
             sent_at: SystemTime::now(),
+            finished_at: None,
+            run_timing: None,
             is_me: false,
             reply_preview: None,
             reply_to_id: None,
@@ -10708,6 +10864,8 @@ impl AppState {
                 sender: "Me".to_string(),
                 content: content.clone(),
                 sent_at: said_at,
+                finished_at: None,
+                run_timing: None,
                 is_me: true,
                 reply_preview: reply.as_ref().map(|r| r.preview.clone()),
                 reply_to_id: reply.as_ref().map(|r| r.message_id.clone()),
@@ -10829,6 +10987,8 @@ impl AppState {
                 sender: "Me".to_string(),
                 content: next.content.clone(),
                 sent_at: SystemTime::now(),
+                finished_at: None,
+                run_timing: None,
                 is_me: true,
                 reply_preview: next.reply.as_ref().map(|r| r.preview.clone()),
                 reply_to_id: next.reply.as_ref().map(|r| r.message_id.clone()),
@@ -10982,6 +11142,7 @@ impl AppState {
 
     pub fn restore_saved_on_send(&mut self) {
         self.on_send = crate::prefs::load_on_send(&Config::data_dir());
+        self.show_turn_timing = crate::prefs::load_show_turn_timing(&Config::data_dir());
     }
 
     pub fn set_on_send(&mut self, on_send: OnSend, cx: &mut Context<Self>) {
@@ -10989,6 +11150,15 @@ impl AppState {
             self.on_send = on_send;
             #[cfg(not(test))]
             crate::prefs::save_on_send(&Config::data_dir(), on_send);
+            cx.notify();
+        }
+    }
+
+    pub fn set_show_turn_timing(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.show_turn_timing != on {
+            self.show_turn_timing = on;
+            #[cfg(not(test))]
+            crate::prefs::save_show_turn_timing(&Config::data_dir(), on);
             cx.notify();
         }
     }
@@ -13372,15 +13542,15 @@ mod tests {
         ActiveRecipe, ActivityTick, AfterRefusal, AppState, BotActivity, ChatMessage, ChatPart,
         Conversation, DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue,
         PickedKind, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredReply,
-        RouteTrafficSurface, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SkillScope, SkillSummary,
-        TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun, TurnAssembler,
-        TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
-        apply_catalogue, apply_reload, bot_status_line, bubble_for_run, graft_reply,
-        hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note, mark_enabled,
-        missing_replies, overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable,
-        replayed_ending, reply_from_replay, restored_message, restored_parts, saved_parts,
-        spec_from_queued, stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending,
-        unheard_hidden_runs,
+        RouteTrafficSurface, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SaveStamp, SkillScope,
+        SkillSummary, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun,
+        TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
+        apply_catalogue, apply_reload, apply_timing, bot_status_line, bubble_for_run, clock_label,
+        graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note,
+        mark_enabled, missing_replies, overlay_server_cards, parse_sql_time,
+        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_message,
+        restored_parts, saved_parts, spec_from_queued, stamp_run_finished, stream_paint_due,
+        stream_part_sig, streaming_message_mut, turn_ending, unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -13392,6 +13562,7 @@ mod tests {
         ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, once_only_for,
         settled_decision,
     };
+    use chrono::{Local, TimeZone};
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
@@ -13402,6 +13573,8 @@ mod tests {
             sender: if is_me { "Me" } else { "AI" }.to_string(),
             content: content.to_string(),
             sent_at: SystemTime::UNIX_EPOCH,
+            finished_at: None,
+            run_timing: None,
             is_me,
             reply_preview: None,
             reply_to_id: None,
@@ -13953,7 +14126,7 @@ mod tests {
             &saved_parts(&live),
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the turn is saved");
@@ -14313,9 +14486,248 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_500),
             "stamped with when the run began, not when it was noticed"
         );
+        assert!(
+            messages[made].finished_at.is_none(),
+            "a bubble made for a run that is still going has no finish clock"
+        );
         assert_eq!(
             messages[1].content, "an older reply",
             "the last thing said before is untouched"
+        );
+    }
+
+    #[test]
+    fn a_sent_time_past_what_a_clock_can_hold_is_blank() {
+        let mut bubble = message("m_far", true, "hi");
+        bubble.sent_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 45);
+        assert_eq!(bubble.formatted_time(), "");
+    }
+
+    #[test]
+    fn clock_label_is_grok_twelve_hour() {
+        let dt = Local
+            .with_ymd_and_hms(2026, 9, 22, 16, 34, 0)
+            .single()
+            .expect("a civil time");
+        assert_eq!(clock_label(dt), "4:34 PM");
+        let morning = Local
+            .with_ymd_and_hms(2026, 9, 22, 9, 5, 0)
+            .single()
+            .expect("a civil time");
+        assert_eq!(clock_label(morning), "9:05 AM");
+    }
+
+    /// Finishing a run wears how long it took. It does not move when it began,
+    /// so a queued message typed mid-wait still sits after the reply.
+    #[test]
+    fn finishing_a_run_keeps_the_start_stamp_and_wears_the_wait() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(16 * 3600 + 34 * 60);
+        let mut bubble = at(
+            message("m_live", false, "done"),
+            16 * 3600 * 1000 + 34 * 60 * 1000,
+        );
+        bubble.sent_at = start;
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(6 * 60 + 12));
+        assert_eq!(bubble.sent_at, start, "history stays where the run began");
+        assert_eq!(
+            bubble.formatted_duration().as_deref(),
+            Some("6m12s"),
+            "the peek stamp can say how long the person waited"
+        );
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(99));
+        assert_eq!(
+            bubble.formatted_duration().as_deref(),
+            Some("6m12s"),
+            "a second ending does not move the finish clock"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_is_never_shorter_than_the_harness_says() {
+        let start = SystemTime::UNIX_EPOCH;
+        let mut bubble = at(message("m_live", false, "listed"), 0);
+        bubble.sent_at = start;
+        apply_timing(
+            &mut bubble,
+            crate::opengrok::TurnTiming::from_value(&serde_json::json!({
+                "v": 1,
+                "total_ms": 372000,
+                "model_ms": 12000,
+                "tools": [{ "name": "profile.list", "ms": 350000 }]
+            }))
+            .unwrap(),
+        );
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(5));
+        assert_eq!(bubble.sent_at, start);
+        assert_eq!(bubble.formatted_duration().as_deref(), Some("6m12s"));
+        assert_eq!(
+            bubble.run_timing.as_ref().unwrap().tools[0].name,
+            "profile.list"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_never_happened_wears_no_wait() {
+        let start = SystemTime::UNIX_EPOCH;
+        for note in [TURN_UNREACHED_NOTE, TURN_SIGNED_OUT_NOTE] {
+            let mut bubble = at(message("m_live", false, note), 0);
+            stamp_run_finished(&mut bubble, start + Duration::from_secs(40));
+            assert_eq!(bubble.formatted_duration(), None, "{note}");
+        }
+    }
+
+    /// The harness sends `run-timing` and `RUN_FINISHED` when it parks on a card, and starts
+    /// its clock again for the half after the card.
+    #[test]
+    fn a_run_parked_on_a_card_wears_no_wait_and_its_end_wears_all_of_it() {
+        let start = SystemTime::UNIX_EPOCH;
+        let mut bubble = at(message("m_live", false, "may I run this?"), 0);
+        bubble.sent_at = start;
+        let timing = |total_ms: u64| {
+            crate::opengrok::TurnTiming::from_value(&serde_json::json!({ "total_ms": total_ms }))
+                .expect("a timing frame")
+        };
+        apply_timing(&mut bubble, timing(4_000));
+        assert_eq!(
+            bubble.formatted_duration(),
+            None,
+            "a run parked on a card has not ended"
+        );
+        apply_timing(&mut bubble, timing(10_000));
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(6 * 60 + 12));
+        assert_eq!(
+            bubble.formatted_duration().as_deref(),
+            Some("6m12s"),
+            "the stamp is the whole wait, not the half after the card"
+        );
+    }
+
+    #[test]
+    fn a_recovered_run_that_waited_on_a_card_wears_the_whole_wait() {
+        let mut frames = turn_frames();
+        for total_ms in [4_000, 10_000] {
+            frames.push(serde_json::json!({
+                "type": "CUSTOM",
+                "name": "run-timing",
+                "value": { "total_ms": total_ms }
+            }));
+        }
+        let mut run = thread_run("run_1", "finished", 2_000, &frames);
+        run.updated_at_ms = 2_000 + 372_000;
+        let recovered = missing_replies(&[at(message("m_ask", true, "run it"), 1_000)], &[run]);
+        assert_eq!(
+            recovered[0].finished_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(2_000 + 372_000)),
+            "the journal's last frame, not the harness clock that restarted after the card"
+        );
+    }
+
+    #[test]
+    fn a_recovered_finished_run_carries_the_wait_without_moving_its_place() {
+        let mut frames = turn_frames();
+        frames.push(serde_json::json!({
+            "type": "CUSTOM",
+            "name": "run-timing",
+            "value": { "v": 1, "total_ms": 372000, "tools": [{ "name": "profile.list", "ms": 350000 }] }
+        }));
+        let mut run = thread_run("run_1", "finished", 2_000, &frames);
+        run.updated_at_ms = 2_000 + 5_000;
+        let messages = vec![
+            at(message("m_ask", true, "list profiles"), 1_000),
+            at(message("m_later", true, "and then?"), 10_000),
+        ];
+        let recovered = missing_replies(&messages, &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].started_at,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(2_000)
+        );
+        assert_eq!(
+            recovered[0].finished_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(2_000 + 372_000)),
+            "the wait is start + harness total_ms, not the journal's last frame"
+        );
+        let mut thread = messages.clone();
+        graft_reply(&mut thread, &recovered[0]);
+        assert_eq!(
+            ids(&thread),
+            vec!["m_ask", thread[1].id.as_str(), "m_later"],
+            "a six-minute turn still sits where it started, before the next ask"
+        );
+        assert_eq!(thread[1].formatted_duration().as_deref(), Some("6m12s"));
+    }
+
+    #[tokio::test]
+    async fn a_finish_clock_past_what_a_row_can_hold_is_saved_without_one() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let start = SystemTime::UNIX_EPOCH + Duration::from_millis(2_000);
+        db.save_message(
+            "m_reply",
+            "s1",
+            "assistant",
+            "listed",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+            false,
+            SaveStamp {
+                sent_at: start,
+                finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 45)),
+                timing_json: None,
+            },
+        )
+        .await
+        .expect("saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        let restored = restored_message(rows[0].clone());
+        assert_eq!(restored.sent_at, start);
+        assert_eq!(restored.finished_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_finished_at_survives_a_reload_without_moving_created_at() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let start = SystemTime::UNIX_EPOCH + Duration::from_millis(2_000);
+        let end = start + Duration::from_secs(6 * 60 + 12);
+        db.save_message(
+            "m_reply",
+            "s1",
+            "assistant",
+            "listed",
+            None,
+            None,
+            None,
+            &[],
+            Some("run_1"),
+            false,
+            SaveStamp {
+                sent_at: start,
+                finished_at: Some(end),
+                timing_json: Some(
+                    crate::opengrok::TurnTiming::from_value(&serde_json::json!({
+                        "v": 1,
+                        "total_ms": 372000,
+                        "tools": [{ "name": "profile.list", "ms": 350000 }]
+                    }))
+                    .unwrap()
+                    .to_json(),
+                ),
+            },
+        )
+        .await
+        .expect("saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        let restored = restored_message(rows[0].clone());
+        assert_eq!(restored.sent_at, start);
+        assert_eq!(restored.finished_at, Some(end));
+        assert_eq!(restored.formatted_duration().as_deref(), Some("6m12s"));
+        assert_eq!(
+            restored.run_timing.as_ref().unwrap().tools[0].name,
+            "profile.list"
         );
     }
 
@@ -14439,7 +14851,7 @@ mod tests {
                 &[],
                 None,
                 false,
-                at,
+                SaveStamp::at(at),
             )
             .await
             .expect("saved");
@@ -14480,7 +14892,7 @@ mod tests {
                 &[],
                 Some("run_1"),
                 false,
-                at,
+                SaveStamp::at(at),
             )
             .await
             .expect("saved");
@@ -14502,9 +14914,21 @@ mod tests {
         let ask = SystemTime::UNIX_EPOCH + Duration::from_millis(4_100);
         let reply = SystemTime::UNIX_EPOCH + Duration::from_millis(4_350);
         for (id, role, at) in [("m_reply", "assistant", reply), ("m_ask", "user", ask)] {
-            db.save_message(id, "s1", role, "x", None, None, None, &[], None, false, at)
-                .await
-                .expect("saved");
+            db.save_message(
+                id,
+                "s1",
+                role,
+                "x",
+                None,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                SaveStamp::at(at),
+            )
+            .await
+            .expect("saved");
         }
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         assert_eq!(
@@ -14552,7 +14976,7 @@ mod tests {
             &[],
             Some("run_1"),
             true,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the reply is saved");
@@ -14572,7 +14996,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the second write");
@@ -14649,7 +15073,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the reply is saved");
@@ -14690,7 +15114,7 @@ mod tests {
             &once,
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the first write");
@@ -14705,7 +15129,7 @@ mod tests {
             &[],
             Some("run_1"),
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the second write");
@@ -14742,7 +15166,7 @@ mod tests {
             &[],
             None,
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("the message is saved");
@@ -14959,6 +15383,8 @@ mod tests {
             reply_is_me: None,
             run_id: None,
             deleted_at: None,
+            finished_at: None,
+            run_timing: None,
             parts: Vec::new(),
         }
     }
@@ -15335,6 +15761,8 @@ mod tests {
             parts: vec![ChatPart::Text("Opening.".to_string())],
             live: false,
             started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(2_000),
+            finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(8_000)),
+            run_timing: None,
         };
 
         let id = graft_reply(&mut messages, &reply);
@@ -16031,7 +16459,7 @@ mod tests {
             &[],
             None,
             false,
-            SystemTime::UNIX_EPOCH,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
         )
         .await
         .expect("saved");
