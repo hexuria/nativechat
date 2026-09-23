@@ -540,6 +540,7 @@ fn held_message(
         skill,
         reply,
         pending_id: None,
+        posted: false,
     }
 }
 
@@ -561,6 +562,16 @@ pub struct QueuedSend {
     /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
     /// OpenGrok that has not shipped pending-user-messages yet.
     pending_id: Option<String>,
+    /// POST /pending went out and was not answered 404, so a row may exist before
+    /// `pending_id` is known.
+    posted: bool,
+}
+
+impl QueuedSend {
+    /// OpenGrok may hold a row for this send, and drains it only when the turn is that row.
+    fn on_server(&self) -> bool {
+        self.pending_id.is_some() || self.posted
+    }
 }
 
 /// Words and attachments Edit stashed so they can refill the composer after
@@ -601,12 +612,18 @@ struct QueuedBubbleSave {
     insert: bool,
 }
 
+/// The `replyTo` a hold is saved with and drained with. One shape for both, because OpenGrok
+/// compares the two as JSON and refuses the drain on any difference.
+fn saved_reply(reply: &ReplyTo) -> ReplyQuote {
+    ReplyQuote {
+        message_id: reply.message_id.clone(),
+        preview: reply.preview.clone(),
+        is_me: reply.is_me,
+    }
+}
+
 fn reply_json(reply: &ReplyTo) -> serde_json::Value {
-    serde_json::json!({
-        "messageId": reply.message_id,
-        "preview": reply.preview,
-        "isMe": reply.is_me,
-    })
+    serde_json::to_value(saved_reply(reply)).unwrap_or(serde_json::Value::Null)
 }
 
 fn reply_from_pending(value: Option<&serde_json::Value>) -> Option<ReplyTo> {
@@ -7385,16 +7402,28 @@ impl AppState {
     }
 
     /// The messages a turn posts.
+    ///
+    /// A drained hold OpenGrok may have a row for goes as that row: its words without the
+    /// client's quote line, and `replyTo` as saved. The server refuses the drain on any other
+    /// text or reply, and writes the quote line itself from `replyTo`.
     fn turn_history(
         &self,
         conversation_id: &str,
-        _drained: Option<&QueuedSend>,
+        drained: Option<&QueuedSend>,
     ) -> Vec<AguiMessage> {
-        self.conversations
+        let mut history = self
+            .conversations
             .iter()
             .find(|c| c.id == conversation_id)
             .map(|c| agui_messages(&c.messages))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(held) = drained.filter(|held| held.on_server())
+            && let Some(message) = history.iter_mut().find(|m| m.id == held.message_id)
+        {
+            message.content = held.content.clone();
+            message.reply_to = held.reply.as_ref().map(saved_reply);
+        }
+        history
     }
 
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
@@ -11144,6 +11173,13 @@ impl AppState {
             .any(|queued| queued.message_id == message_id)
     }
 
+    fn hold_mut(&mut self, message_id: &str) -> Option<&mut QueuedSend> {
+        self.queued_sends
+            .values_mut()
+            .flatten()
+            .find(|queued| queued.message_id == message_id)
+    }
+
     /// How many messages the open thread is holding back.
     pub fn queued_send_count(&self) -> usize {
         self.active_conversation_id
@@ -11578,6 +11614,9 @@ impl AppState {
         if !self.can_send_turn() {
             return;
         }
+        if let Some(held) = self.hold_mut(&message_id) {
+            held.posted = true;
+        }
         let body = PendingWrite::enqueue(
             content.clone(),
             message_id.clone(),
@@ -11620,7 +11659,14 @@ impl AppState {
                         Ok(BindPending::Bound) | Err(_) => {}
                     }
                 }
-                Err(error) if error.is_not_found() || error.unreachable().is_some() => {}
+                Err(error) if error.is_not_found() => {
+                    let _ = this.update(cx, |state, _| {
+                        if let Some(held) = state.hold_mut(&message_id) {
+                            held.posted = false;
+                        }
+                    });
+                }
+                Err(error) if error.unreachable().is_some() => {}
                 Err(error) if error.is_already_consumed() => {
                     let _ = this.update(cx, |state, cx| {
                         state.dequeue_send(&message_id);
@@ -11776,6 +11822,7 @@ impl AppState {
                 skill: item.skill_id.clone().filter(|id| !id.is_empty()),
                 reply: reply_from_pending(item.reply_to.as_ref()),
                 pending_id: Some(item.id.clone()),
+                posted: true,
             });
         }
         for leftover in local_only {
@@ -12001,6 +12048,7 @@ impl AppState {
             skill: item.skill_id.clone().filter(|id| !id.is_empty()),
             reply: reply_from_pending(item.reply_to.as_ref()),
             pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
+            posted: true,
         };
         let queue = self
             .queued_sends
@@ -17049,6 +17097,18 @@ mod tests {
             sent["replyTo"],
             super::reply_json(&reply),
             "the replyTo POST /pending saved"
+        );
+
+        let mut never_posted = next.clone();
+        never_posted.pending_id = None;
+        let history = state.turn_history("cw_1", Some(&never_posted));
+        assert_eq!(
+            history.last().map(|m| m.content.as_str()),
+            Some(
+                "[Replying to your earlier message: \"The build is green on main.\nEvery crate \
+                 compiled, every test passed, and the deploy is waiting on you.\"]\n\nship it?"
+            ),
+            "a hold no server heard of keeps the quote in its words, for a server that reads only those"
         );
     }
 
