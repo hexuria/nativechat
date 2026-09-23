@@ -591,6 +591,27 @@ impl QueuedSend {
     }
 }
 
+/// Where a hold sat when Edit took it off the queue. Sending it again puts it
+/// back there, behind `after`. No `after` means it was the first hold.
+struct EditSlot {
+    conversation_id: String,
+    after: Option<String>,
+}
+
+/// Put `hold` back immediately after `after`. `after` may have drained while the
+/// words were in the composer, and then this hold is the next one.
+fn insert_held_after(queue: &mut VecDeque<QueuedSend>, hold: QueuedSend, after: Option<&str>) {
+    let index = after
+        .and_then(|id| {
+            queue
+                .iter()
+                .position(|queued| queued.message_id == id)
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    queue.insert(index, hold);
+}
+
 /// What Edit on a held send puts back in the composer.
 pub struct EditRefill {
     pub content: String,
@@ -1849,6 +1870,8 @@ pub struct AppState {
     pending_inflight: HashSet<String>,
     /// The held send whose Edit was clicked, until the composer settles it.
     pending_edit: Option<String>,
+    /// The place in the queue that Edit took a hold from, until that hold is sent again.
+    edit_slot: Option<EditSlot>,
     pub audio_input: Option<AudioInput>,
     pub sidebar_collapsed: bool,
     pub sidebar_hidden: bool,
@@ -2389,6 +2412,7 @@ impl AppState {
             canceled_pending: HashSet::new(),
             pending_inflight: HashSet::new(),
             pending_edit: None,
+            edit_slot: None,
             audio_input: None,
             sidebar_collapsed: false,
             sidebar_hidden: false,
@@ -11017,21 +11041,23 @@ impl AppState {
         }
 
         match plan {
-            SendPlan::Post => {}
+            SendPlan::Post => {
+                self.edit_slot = None;
+            }
             // Held until the thread is idle; `drain_queued_send` posts it then. The bubble is
             // on screen and on its way to disk already, so nothing is lost if the app quits
             // first — the row reads as a message that got no answer, which is what it is.
             SendPlan::Queue => {
-                self.queued_sends
-                    .entry(conversation_id.clone())
-                    .or_default()
-                    .push_back(held_message(
+                self.enqueue_hold(
+                    conversation_id.clone(),
+                    held_message(
                         local_id.clone(),
                         content.clone(),
                         recipe.clone(),
                         skill.clone(),
                         reply_for_queue.clone(),
-                    ));
+                    ),
+                );
                 self.sync_queued_send_to_server(
                     conversation_id,
                     local_id,
@@ -11050,6 +11076,7 @@ impl AppState {
             // does it, and this message goes now. Anything already held stays held — the
             // message the person forced ahead goes first, and the rest follow when it ends.
             SendPlan::Steer => {
+                self.edit_slot = None;
                 if busy == Busy::Parked {
                     self.settle_parked_cards(&conversation_id);
                 }
@@ -11304,6 +11331,36 @@ impl AppState {
             .map_or(0, VecDeque::len)
     }
 
+    /// The place `message_id` occupies, so Edit can put the send back there.
+    fn queue_slot(&self, message_id: &str) -> Option<EditSlot> {
+        self.queued_sends
+            .iter()
+            .find_map(|(conversation_id, queue)| {
+                let index = queue
+                    .iter()
+                    .position(|queued| queued.message_id == message_id)?;
+                Some(EditSlot {
+                    conversation_id: conversation_id.clone(),
+                    after: index
+                        .checked_sub(1)
+                        .and_then(|index| queue.get(index).map(|queued| queued.message_id.clone())),
+                })
+            })
+    }
+
+    /// Queue a hold. One that Edit just took off goes back where it was; any other goes last.
+    fn enqueue_hold(&mut self, conversation_id: String, hold: QueuedSend) {
+        let slot = self
+            .edit_slot
+            .take()
+            .filter(|slot| slot.conversation_id == conversation_id);
+        let queue = self.queued_sends.entry(conversation_id).or_default();
+        match slot {
+            Some(slot) => insert_held_after(queue, hold, slot.after.as_deref()),
+            None => queue.push_back(hold),
+        }
+    }
+
     /// Take a held send off the queue. The bubble is not touched; the caller hides it.
     fn dequeue_send(&mut self, message_id: &str) -> Option<QueuedSend> {
         let mut found: Option<(String, usize)> = None;
@@ -11467,9 +11524,11 @@ impl AppState {
                 "That message is still being updated. Try Edit again in a moment.".to_string(),
             );
         }
+        let slot = self.queue_slot(message_id);
         let Some(held) = self.dequeue_send(message_id) else {
             return Err("That message has already been sent.".to_string());
         };
+        self.edit_slot = slot;
         // A snapshot or bind that raced the DELETE would otherwise queue the words again while
         // they sit in the composer.
         self.canceled_pending.insert(message_id.to_string());
@@ -16936,6 +16995,55 @@ mod tests {
             "the hidden hold is dropped and the visible one behind it goes"
         );
         assert!(state.pop_queued_send("cw_1").is_none());
+    }
+
+    /// Edit takes the hold off, and sending it again puts it back where it was, not behind
+    /// everything that was queued after it.
+    #[test]
+    fn editing_a_queued_message_puts_it_back_in_its_place() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        state
+            .queued_sends
+            .get_mut("cw_1")
+            .unwrap()
+            .push_back(super::held_message(
+                "m_b".into(),
+                "second".into(),
+                None,
+                None,
+                None,
+            ));
+        state
+            .take_hold_for_edit("m_a", "")
+            .expect("the first hold comes off");
+        state.enqueue_hold(
+            "cw_1".into(),
+            super::held_message("m_a".into(), "first, edited".into(), None, None, None),
+        );
+        let ids = |state: &AppState| {
+            state.queued_sends["cw_1"]
+                .iter()
+                .map(|queued| queued.message_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&state), ["m_a", "m_b"]);
+
+        state
+            .take_hold_for_edit("m_b", "")
+            .expect("the second hold comes off");
+        state.queued_sends.get_mut("cw_1").unwrap().pop_front();
+        state.enqueue_hold(
+            "cw_1".into(),
+            super::held_message("m_b".into(), "second, edited".into(), None, None, None),
+        );
+        assert_eq!(
+            ids(&state),
+            ["m_b"],
+            "the hold ahead of it drained while it was being edited, so it is next"
+        );
     }
 
     /// Edit on a queued bubble puts the words back in the composer and cancels the hold.
