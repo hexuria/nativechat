@@ -30,6 +30,10 @@
 //! }
 //! ```
 //!
+//! `opengrok-harness` sends no `v` and no `rounds`: its `model_ms` is an
+//! array with one number per model round, beside `tool_wait_ms` and
+//! `tool_rounds`. Both shapes read.
+//!
 //! Unknown fields are ignored. `v` greater than 1 is still read for the
 //! keys this build knows. Absence of every timing field is not a payload.
 //! CamelCase aliases (`totalMs`, `modelMs`, `autoReviewMs`, `durationMs`)
@@ -70,6 +74,11 @@ pub struct TurnTiming {
     pub model_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_review_ms: Option<u64>,
+    /// Wall clock of the tool batches, which run side by side: not the sum of `tools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rounds: Vec<RoundTiming>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -104,13 +113,21 @@ impl TurnTiming {
             return None;
         }
         let total_ms = ms_at(value, &["total_ms", "totalMs"]);
-        let model_ms = ms_at(value, &["model_ms", "modelMs"]);
+        // The harness sends `model_ms` as one number per model round; the
+        // documented shape is a total beside a `rounds` list.
+        let model = ["model_ms", "modelMs"]
+            .iter()
+            .find_map(|key| value.get(*key));
+        let model_ms = model.and_then(as_ms);
         let auto_review_ms = ms_at(value, &["auto_review_ms", "autoReviewMs"]);
+        let tool_wait_ms = ms_at(value, &["tool_wait_ms", "toolWaitMs"]);
+        let tool_rounds = u32_at(value, &["tool_rounds", "toolRounds"]);
         let tools = parse_tools(value.get("tools"));
-        let rounds = parse_rounds(value.get("rounds"));
+        let rounds = parse_rounds(value.get("rounds").or(model.filter(|m| m.is_array())));
         if total_ms.is_none()
             && model_ms.is_none()
             && auto_review_ms.is_none()
+            && tool_wait_ms.is_none()
             && tools.is_empty()
             && rounds.is_empty()
         {
@@ -121,6 +138,8 @@ impl TurnTiming {
             total_ms,
             model_ms,
             auto_review_ms,
+            tool_wait_ms,
+            tool_rounds,
             rounds,
             tools,
         })
@@ -139,7 +158,11 @@ impl TurnTiming {
     }
 
     /// Lines under the bubble when Settings → Show turn timing is on.
+    ///
+    /// A phase at zero is left out: the harness always sends `auto_review_ms`,
+    /// and a `0ms` line reads as a step that ran.
     pub fn debug_lines(&self) -> Vec<String> {
+        let spent = |ms: Option<u64>| ms.filter(|ms| *ms > 0);
         let mut lines = Vec::new();
         if let Some(ms) = self.total_ms {
             lines.push(format!("{} total", format_ms(ms)));
@@ -148,10 +171,10 @@ impl TurnTiming {
             for (i, round) in self.rounds.iter().enumerate() {
                 lines.push(format!("round {}  {}", i + 1, format_ms(round.model_ms)));
             }
-        } else if let Some(ms) = self.model_ms {
+        } else if let Some(ms) =
+            spent(self.model_ms).or_else(|| spent(self.rounds.first().map(|r| r.model_ms)))
+        {
             lines.push(format!("model  {}", format_ms(ms)));
-        } else if let Some(round) = self.rounds.first() {
-            lines.push(format!("model  {}", format_ms(round.model_ms)));
         }
         for tool in &self.tools {
             let name = if tool.name.is_empty() {
@@ -161,7 +184,14 @@ impl TurnTiming {
             };
             lines.push(format!("{name}  {}", format_ms(tool.ms)));
         }
-        if let Some(ms) = self.auto_review_ms {
+        if let Some(ms) = spent(self.tool_wait_ms) {
+            let over = match self.tool_rounds {
+                Some(n) if n > 1 => format!(" over {n} rounds"),
+                _ => String::new(),
+            };
+            lines.push(format!("tool wait  {}{over}", format_ms(ms)));
+        }
+        if let Some(ms) = spent(self.auto_review_ms) {
             lines.push(format!("auto-review  {}", format_ms(ms)));
         }
         lines
@@ -287,7 +317,7 @@ fn parse_rounds(value: Option<&Value>) -> Vec<RoundTiming> {
     items
         .iter()
         .filter_map(|item| {
-            let model_ms = ms_at(item, &["model_ms", "modelMs", "ms"])?;
+            let model_ms = as_ms(item).or_else(|| ms_at(item, &["model_ms", "modelMs", "ms"]))?;
             Some(RoundTiming { model_ms })
         })
         .collect()
@@ -368,6 +398,8 @@ mod tests {
         let timing = TurnTiming::from_event(&event).expect("the harness frame");
         assert_eq!(timing.total_ms, Some(15));
         assert_eq!(timing.rounds, vec![RoundTiming { model_ms: 12 }]);
+        assert_eq!(timing.tool_wait_ms, Some(3));
+        assert_eq!(timing.tool_rounds, Some(1));
         assert_eq!(
             timing.debug_lines(),
             vec![
