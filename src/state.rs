@@ -611,7 +611,18 @@ async fn write_user_row(
         persist.hidden,
         said_at,
     )
-    .await
+    .await?;
+    // A cancel or an edit that landed while that write was in flight met no row to change.
+    // One from here on finds the row, so a second look is the last one needed.
+    if let Some(now) = read() {
+        if now.hidden && !persist.hidden {
+            db.hide_message(id).await?;
+        }
+        if now.content != persist.content {
+            db.update_message_content(id, &now.content).await?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
