@@ -7,6 +7,7 @@ use crate::send_policy::OnSend;
 use std::path::{Path, PathBuf};
 
 const ON_SEND: &str = "on_send";
+const SHOW_TURN_TIMING: &str = "show_turn_timing";
 
 pub fn prefs_path(data_dir: &Path) -> PathBuf {
     data_dir.join("prefs.json")
@@ -31,12 +32,28 @@ pub fn save_on_send(data_dir: &Path, on_send: OnSend) {
 pub fn save_on_send_to(path: &Path, on_send: OnSend) {
     let mut prefs = read_object(path);
     prefs.insert(ON_SEND.to_string(), on_send.as_str().into());
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(prefs)) {
-        let _ = std::fs::write(path, json);
-    }
+    write_object(path, prefs);
+}
+
+pub fn load_show_turn_timing(data_dir: &Path) -> bool {
+    load_show_turn_timing_from(&prefs_path(data_dir))
+}
+
+pub fn load_show_turn_timing_from(path: &Path) -> bool {
+    read_object(path)
+        .get(SHOW_TURN_TIMING)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub fn save_show_turn_timing(data_dir: &Path, on: bool) {
+    save_show_turn_timing_to(&prefs_path(data_dir), on);
+}
+
+pub fn save_show_turn_timing_to(path: &Path, on: bool) {
+    let mut prefs = read_object(path);
+    prefs.insert(SHOW_TURN_TIMING.to_string(), on.into());
+    write_object(path, prefs);
 }
 
 /// The file as an object, or an empty one: missing, unreadable and
@@ -50,6 +67,15 @@ fn read_object(path: &Path) -> serde_json::Map<String, serde_json::Value> {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+fn write_object(path: &Path, prefs: serde_json::Map<String, serde_json::Value>) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(prefs)) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +133,21 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["on_send"], "steer");
         assert_eq!(value["later_build"]["x"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turn_timing_defaults_off_and_round_trips() {
+        let dir = scratch("turn-timing");
+        let path = prefs_path(&dir);
+        assert!(!load_show_turn_timing_from(&path), "no file yet is off");
+        save_show_turn_timing_to(&path, true);
+        assert!(load_show_turn_timing_from(&path));
+        save_on_send_to(&path, OnSend::Steer);
+        assert!(
+            load_show_turn_timing_from(&path),
+            "saving another pref keeps the switch"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

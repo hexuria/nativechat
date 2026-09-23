@@ -5,6 +5,30 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::collections::HashMap;
+use std::time::SystemTime;
+
+/// When a message was said, and — for a coworker's reply — when its run ended.
+///
+/// `sent_at` is the thread's order: a run is placed by when it began, so a
+/// turn recovered after a restart still sits after the message it answers.
+/// `finished_at` is the other end of the wait, for the peek stamp. Timing
+/// JSON is the harness CUSTOM payload, when one arrived.
+#[derive(Debug, Clone)]
+pub struct SaveStamp {
+    pub sent_at: SystemTime,
+    pub finished_at: Option<SystemTime>,
+    pub timing_json: Option<String>,
+}
+
+impl SaveStamp {
+    pub fn at(sent_at: SystemTime) -> Self {
+        Self {
+            sent_at,
+            finished_at: None,
+            timing_json: None,
+        }
+    }
+}
 
 /// Database service for local session/message cache.
 #[derive(Clone)]
@@ -103,8 +127,9 @@ impl DatabaseService {
         hidden: bool,
         // When the message was said, not when it reached the database: a reply recovered from
         // the server happened before the turns either side of it, and the moment it was
-        // recovered would put it at the bottom of the thread on the next load.
-        sent_at: std::time::SystemTime,
+        // recovered would put it at the bottom of the thread on the next load. Finished-at
+        // and the harness timing JSON ride along; they never move `sent_at`.
+        stamp: SaveStamp,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
@@ -117,14 +142,16 @@ impl DatabaseService {
             // write that comes later never clears a mark that is already there. The person
             // can hide a reply while it is still being typed out, and the row for it does not
             // exist until the turn settles.
-            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, created_at, finished_at, run_timing)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                content = excluded.content,
                model = excluded.model,
                provider = excluded.provider,
                run_id = excluded.run_id,
-               deleted_at = coalesce(chat_messages.deleted_at, excluded.deleted_at)",
+               deleted_at = coalesce(chat_messages.deleted_at, excluded.deleted_at),
+               finished_at = coalesce(excluded.finished_at, chat_messages.finished_at),
+               run_timing = coalesce(excluded.run_timing, chat_messages.run_timing)",
         )
         .bind(id)
         .bind(session_id)
@@ -139,7 +166,9 @@ impl DatabaseService {
         .bind(hidden.then(Self::hidden_now))
         // Only on the way in: a second write of the same message is the same message, said
         // when it was said.
-        .bind(Self::stamp(sent_at))
+        .bind(Self::stamp(stamp.sent_at).unwrap_or_else(Self::hidden_now))
+        .bind(stamp.finished_at.and_then(Self::stamp))
+        .bind(stamp.timing_json.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -177,10 +206,14 @@ impl DatabaseService {
     /// A time as a row carries it: to the millisecond, so a turn read back off the server and
     /// the message it answered do not land in the same second with nothing to order them by.
     /// It reads the same as the old whole-second stamps and sorts beside them.
-    fn stamp(at: std::time::SystemTime) -> String {
-        chrono::DateTime::<chrono::Utc>::from(at)
-            .format("%Y-%m-%d %H:%M:%S%.3f")
-            .to_string()
+    ///
+    /// `None` for a time chrono cannot hold: both clocks can come from the server, and chrono's
+    /// own `From<SystemTime>` panics on them.
+    fn stamp(at: SystemTime) -> Option<String> {
+        let since = at.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        let ms = i64::try_from(since.as_millis()).ok()?;
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)?;
+        Some(at.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
     }
 
     /// Hide a message rather than take it away.
@@ -203,7 +236,7 @@ impl DatabaseService {
     /// pieces were kept has none, and reads back as the words in `content`.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let mut rows = sqlx::query_as::<_, ChatMessage>(
-            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, finished_at, run_timing FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -257,6 +290,12 @@ pub struct ChatMessage {
     /// When the person hid this message, for a message they hid. The row stays so the thread
     /// can still name its run; nothing paints it.
     pub deleted_at: Option<String>,
+    /// When the run ended, for a coworker's reply. Null on the person's own
+    /// messages, on rows written before this column, and on a bubble still
+    /// being filled in.
+    pub finished_at: Option<String>,
+    /// Harness CUSTOM `run-timing` JSON (`v:1`), when the turn sent one.
+    pub run_timing: Option<String>,
     /// The pieces of the message, in the order they were seen. They live in a table of their own
     /// so the picture bytes stay off this row; `get_messages` is what fills this in.
     #[sqlx(skip)]
