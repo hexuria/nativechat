@@ -7381,12 +7381,25 @@ impl AppState {
         // sent, and what the composer is holding now belongs to the message still being
         // written. Taking it here sent somebody's skill on a turn they never attached it to
         // and left the chip standing over a draft with nothing behind it.
-        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, None, cx);
+        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, cx);
+    }
+
+    /// The messages a turn posts.
+    fn turn_history(
+        &self,
+        conversation_id: &str,
+        _drained: Option<&QueuedSend>,
+    ) -> Vec<AguiMessage> {
+        self.conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| agui_messages(&c.messages))
+            .unwrap_or_default()
     }
 
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
-    /// replaces: it is stopped on the wire before the turn is posted. `pending_id` is the
-    /// queued row this turn is firing, when it came off `queued_sends`.
+    /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
+    /// turn is firing, when it came off `queued_sends`.
     fn send_opengrok_turn_with(
         &mut self,
         conversation_id: String,
@@ -7394,8 +7407,7 @@ impl AppState {
         recipe: Option<TurnRecipe>,
         skill: Option<String>,
         stop_first: Option<String>,
-        pending_id: Option<String>,
-        queued_message_id: Option<String>,
+        drained: Option<QueuedSend>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -7412,12 +7424,9 @@ impl AppState {
             return;
         }
         let coworker_id = self.active_coworker_id.clone();
-        let history: Vec<AguiMessage> = self
-            .conversations
-            .iter()
-            .find(|c| c.id == conversation_id)
-            .map(|c| agui_messages(&c.messages))
-            .unwrap_or_default();
+        let history = self.turn_history(&conversation_id, drained.as_ref());
+        let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
+        let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
 
         // Both ids are minted here, before anything is sent. The run id because the server files
         // every frame under it and this is the app's only handle on the run once the stream is
@@ -10903,7 +10912,6 @@ impl AppState {
             skill,
             stop_first,
             None,
-            None,
             cx,
         );
     }
@@ -10974,12 +10982,11 @@ impl AppState {
         }
         self.send_opengrok_turn_with(
             conversation_id.to_string(),
-            next.content,
-            next.recipe,
-            next.skill,
+            next.content.clone(),
+            next.recipe.clone(),
+            next.skill.clone(),
             None,
-            next.pending_id,
-            Some(next.message_id),
+            Some(next),
             cx,
         );
     }
@@ -16983,6 +16990,66 @@ mod tests {
         state.fold_pending_snapshot("cw_1", &rows);
         assert!(state.is_send_queued("msg_other"));
         assert_eq!(bubble(&state, "msg_other").content, "from the event");
+    }
+
+    /// A queued reply as POST /pending saved it: the toolbar's short preview, and no quote line.
+    fn holding_reply_to_a_long_answer() -> (AppState, super::ReplyTo) {
+        let quoted = "The build is green on main.\nEvery crate compiled, every test passed, \
+                      and the deploy is waiting on you.";
+        let mut state = mid_turn(at(message("m_bot", false, quoted), 20));
+        let reply = super::ReplyTo {
+            message_id: "m_bot".into(),
+            preview: "The build is green on main. Every crate compiled, every test passed, an…"
+                .into(),
+            is_me: false,
+        };
+        let mut held = at(message("m_held", true, "ship it?"), 30);
+        held.reply_to_id = Some(reply.message_id.clone());
+        held.reply_preview = Some(reply.preview.clone());
+        state.conversations[0].messages.push(held);
+        let mut queued = super::held_message(
+            "m_held".into(),
+            "ship it?".into(),
+            None,
+            None,
+            Some(reply.clone()),
+        );
+        queued.pending_id = Some("pum_1".into());
+        state
+            .queued_sends
+            .entry("cw_1".into())
+            .or_default()
+            .push_back(queued);
+        (state, reply)
+    }
+
+    /// OpenGrok drains a queued send only when the last user message is its row: the saved words
+    /// exactly, and `replyTo` exactly as saved. The quote line is the server's to write.
+    #[test]
+    fn a_drained_reply_is_sent_as_its_pending_row() {
+        let (mut state, reply) = holding_reply_to_a_long_answer();
+        go_idle(&mut state);
+        let next = state.pop_queued_send("cw_1").expect("the hold drains");
+        let history = state.turn_history("cw_1", Some(&next));
+        let sent = serde_json::to_value(history.last().expect("the hold")).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({
+                "id": "m_held",
+                "role": "user",
+                "content": "ship it?",
+                "replyTo": {
+                    "messageId": "m_bot",
+                    "preview": "The build is green on main. Every crate compiled, every test passed, an…",
+                    "isMe": false,
+                },
+            })
+        );
+        assert_eq!(
+            sent["replyTo"],
+            super::reply_json(&reply),
+            "the replyTo POST /pending saved"
+        );
     }
 
     /// Cold "hi": no open HITL, no Waiting, no parked run. The thread is idle.
