@@ -60,10 +60,7 @@ pub use client::{
     host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable};
-pub use timing::{
-    RUN_TIMING_CUSTOM, RoundTiming, TIMING_SCHEMA_V, TURN_TIMELINE_CUSTOM, ToolTiming, TurnTiming,
-    format_duration, format_ms, is_timing_name, stamp_duration,
-};
+pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
     ReplyQuote, assistant_text_from_sse,

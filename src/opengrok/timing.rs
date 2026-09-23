@@ -46,7 +46,9 @@ use std::time::Duration;
 
 /// CUSTOM `name` the harness is asked to use.
 pub const RUN_TIMING_CUSTOM: &str = "run-timing";
-/// Alias while the server PR settles on a name.
+/// The same frame under the name first proposed for it. `opengrok-harness`
+/// sends [`RUN_TIMING_CUSTOM`]; this is read so a server built to the
+/// proposal still paints.
 pub const TURN_TIMELINE_CUSTOM: &str = "turn-timeline";
 
 /// Schema version this client writes and prefers to read.
