@@ -14216,6 +14216,52 @@ mod tests {
         );
     }
 
+    /// The harness sends `run-timing` and `RUN_FINISHED` when it parks on a card, and starts
+    /// its clock again for the half after the card.
+    #[test]
+    fn a_run_parked_on_a_card_wears_no_wait_and_its_end_wears_all_of_it() {
+        let start = SystemTime::UNIX_EPOCH;
+        let mut bubble = at(message("m_live", false, "may I run this?"), 0);
+        bubble.sent_at = start;
+        let timing = |total_ms: u64| {
+            crate::opengrok::TurnTiming::from_value(&serde_json::json!({ "total_ms": total_ms }))
+                .expect("a timing frame")
+        };
+        apply_timing(&mut bubble, timing(4_000));
+        assert_eq!(
+            bubble.formatted_duration(),
+            None,
+            "a run parked on a card has not ended"
+        );
+        apply_timing(&mut bubble, timing(10_000));
+        stamp_run_finished(&mut bubble, start + Duration::from_secs(6 * 60 + 12));
+        assert_eq!(
+            bubble.formatted_duration().as_deref(),
+            Some("6m12s"),
+            "the stamp is the whole wait, not the half after the card"
+        );
+    }
+
+    #[test]
+    fn a_recovered_run_that_waited_on_a_card_wears_the_whole_wait() {
+        let mut frames = turn_frames();
+        for total_ms in [4_000, 10_000] {
+            frames.push(serde_json::json!({
+                "type": "CUSTOM",
+                "name": "run-timing",
+                "value": { "total_ms": total_ms }
+            }));
+        }
+        let mut run = thread_run("run_1", "finished", 2_000, &frames);
+        run.updated_at_ms = 2_000 + 372_000;
+        let recovered = missing_replies(&[at(message("m_ask", true, "run it"), 1_000)], &[run]);
+        assert_eq!(
+            recovered[0].finished_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(2_000 + 372_000)),
+            "the journal's last frame, not the harness clock that restarted after the card"
+        );
+    }
+
     #[test]
     fn a_recovered_finished_run_carries_the_wait_without_moving_its_place() {
         let mut frames = turn_frames();
