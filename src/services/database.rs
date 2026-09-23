@@ -216,6 +216,17 @@ impl DatabaseService {
         Some(at.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
     }
 
+    /// Rewrite a message's words. A queued send that is edited before it drains has to
+    /// change the row as well as the bubble, or a reload paints the old sentence.
+    pub async fn update_message_content(&self, id: &str, content: &str) -> Result<()> {
+        sqlx::query("UPDATE chat_messages SET content = ? WHERE id = ?")
+            .bind(content)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Hide a message rather than take it away.
     ///
     /// The row is what names the run it came out of, and a thread that can name a run does not

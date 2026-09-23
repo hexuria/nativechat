@@ -202,13 +202,44 @@ impl RenderOnce for MessageToolbar {
                     let text = self.message_text.clone();
                     let on_read_aloud = self.on_read_aloud.clone();
                     let (reading, paused) = (self.reading, self.paused);
+                    let queued = app.read(cx).is_send_queued(&source_id);
                     let (read_label, read_icon) = match (reading, paused) {
                         (true, true) => ("Resume reading", NativeIcon::Play),
                         (true, false) => ("Pause reading", NativeIcon::Pause),
                         _ => ("Read aloud", NativeIcon::ReadAloud),
                     };
                     move |menu, _, _| {
-                        menu.item(
+                        menu.when(queued, |menu| {
+                            menu.item(
+                                PopupMenuItem::new("Cancel")
+                                    .icon(Icon::new(NativeIcon::Close))
+                                    .on_click({
+                                        let app = app.clone();
+                                        let source_id = source_id.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            app.update(cx, |state, cx| {
+                                                state.cancel_queued_send(&source_id, cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new("Edit")
+                                    .icon(Icon::new(NativeIcon::Pencil))
+                                    .on_click({
+                                        let app = app.clone();
+                                        let source_id = source_id.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            app.update(cx, |state, cx| {
+                                                state.begin_edit_queued_send(&source_id, cx);
+                                            });
+                                        }
+                                    }),
+                            )
+                        })
+                        .item(
                             PopupMenuItem::new("Delete")
                                 .icon(Icon::new(NativeIcon::Trash))
                                 .on_click({
