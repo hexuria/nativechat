@@ -16954,6 +16954,21 @@ mod tests {
         }
     }
 
+    /// The PATCH bind sends is a mutation like any other: drain must not post the new words
+    /// against the row that still has the old ones.
+    #[test]
+    fn drain_waits_for_the_patch_bind_sends() {
+        let mut state = holding("m_held", "wait for it");
+        assert!(state.apply_queued_edit("m_held", "instead".into()));
+        assert!(matches!(
+            state.bind_pending_id("m_held", "pum_1".into(), "wait for it"),
+            super::BindPending::Patch { .. }
+        ));
+        go_idle(&mut state);
+        assert!(state.pop_queued_send("cw_1").is_none());
+        assert!(state.is_send_queued("m_held"));
+    }
+
     #[test]
     fn reply_and_recipe_read_off_a_pending_row() {
         let row: crate::opengrok::PendingUserMessage = serde_json::from_value(serde_json::json!({
