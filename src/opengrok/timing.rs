@@ -265,24 +265,19 @@ fn u32_at(value: &Value, keys: &[&str]) -> Option<u32> {
     })
 }
 
+/// Longer than any turn a person waits on. The number is the server's, and
+/// past this it would run a finish clock beyond what a row or a clock label
+/// can hold.
+const LONGEST_TURN_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 fn as_ms(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(n) => {
-            if let Some(i) = n.as_u64() {
-                Some(i)
-            } else if let Some(i) = n.as_i64() {
-                u64::try_from(i).ok()
-            } else {
-                n.as_f64()
-                    .and_then(|f| (f >= 0.0).then_some(f.round() as u64))
-            }
-        }
-        Value::String(s) => s
-            .parse::<f64>()
-            .ok()
-            .and_then(|f| (f >= 0.0).then_some(f.round() as u64)),
+    let whole = |f: f64| (f.is_finite() && f >= 0.0).then(|| f.round() as u64);
+    let ms = match value {
+        Value::Number(n) => n.as_u64().or_else(|| n.as_f64().and_then(whole)),
+        Value::String(s) => s.parse::<f64>().ok().and_then(whole),
         _ => None,
-    }
+    }?;
+    (ms <= LONGEST_TURN_MS).then_some(ms)
 }
 
 fn parse_tools(value: Option<&Value>) -> Vec<ToolTiming> {

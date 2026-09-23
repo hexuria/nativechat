@@ -166,8 +166,8 @@ impl DatabaseService {
         .bind(hidden.then(Self::hidden_now))
         // Only on the way in: a second write of the same message is the same message, said
         // when it was said.
-        .bind(Self::stamp(stamp.sent_at))
-        .bind(stamp.finished_at.map(Self::stamp))
+        .bind(Self::stamp(stamp.sent_at).unwrap_or_else(Self::hidden_now))
+        .bind(stamp.finished_at.and_then(Self::stamp))
         .bind(stamp.timing_json.as_deref())
         .execute(&mut *tx)
         .await?;
@@ -206,10 +206,14 @@ impl DatabaseService {
     /// A time as a row carries it: to the millisecond, so a turn read back off the server and
     /// the message it answered do not land in the same second with nothing to order them by.
     /// It reads the same as the old whole-second stamps and sorts beside them.
-    fn stamp(at: std::time::SystemTime) -> String {
-        chrono::DateTime::<chrono::Utc>::from(at)
-            .format("%Y-%m-%d %H:%M:%S%.3f")
-            .to_string()
+    ///
+    /// `None` for a time chrono cannot hold: both clocks can come from the server, and chrono's
+    /// own `From<SystemTime>` panics on them.
+    fn stamp(at: SystemTime) -> Option<String> {
+        let since = at.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        let ms = i64::try_from(since.as_millis()).ok()?;
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)?;
+        Some(at.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
     }
 
     /// Hide a message rather than take it away.
