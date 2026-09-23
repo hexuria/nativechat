@@ -17071,6 +17071,47 @@ mod tests {
         (state, reply)
     }
 
+    /// OpenGrok compares the LAST user message with the row it drains. A hold still queued behind
+    /// the one going is not part of its turn, and the one going is last even when its answer
+    /// is painted after a later hold.
+    #[test]
+    fn a_drained_hold_is_the_last_user_message_of_its_turn() {
+        let mut state = holding("m_a", "first");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_b", true, "second"), 40));
+        let queue = state.queued_sends.get_mut("cw_1").unwrap();
+        queue.push_back(super::held_message(
+            "m_b".into(),
+            "second".into(),
+            None,
+            None,
+            None,
+        ));
+        queue[0].pending_id = Some("pum_a".into());
+        queue[1].pending_id = Some("pum_b".into());
+        go_idle(&mut state);
+
+        let a = state.pop_queued_send("cw_1").expect("A drains first");
+        let sent: Vec<String> = state
+            .turn_history("cw_1", Some(&a))
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sent, ["m_ask", "m_a"]);
+
+        state.conversations[0]
+            .messages
+            .push(at(message("r_a", false, "done"), 50));
+        let b = state.pop_queued_send("cw_1").expect("then B");
+        let sent: Vec<String> = state
+            .turn_history("cw_1", Some(&b))
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(sent, ["m_ask", "m_a", "r_a", "m_b"]);
+    }
+
     /// OpenGrok drains a queued send only when the last user message is its row: the saved words
     /// exactly, and `replyTo` exactly as saved. The quote line is the server's to write.
     #[test]
