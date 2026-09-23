@@ -30,6 +30,8 @@ pub struct MessageBubble {
     text: String,
     is_me: bool,
     timestamp: Option<String>,
+    duration: Option<String>,
+    timing_debug: Option<String>,
     message_id: String,
     source_id: String,
     debug_mode: bool,
@@ -62,6 +64,8 @@ impl MessageBubble {
             copy_text: text,
             is_me: false,
             timestamp: None,
+            duration: None,
+            timing_debug: None,
             message_id,
             source_id: String::new(),
             debug_mode: false,
@@ -182,6 +186,18 @@ impl MessageBubble {
 
     pub fn timestamp(mut self, timestamp: impl Into<String>) -> Self {
         self.timestamp = Some(timestamp.into());
+        self
+    }
+
+    pub fn duration(mut self, duration: impl Into<String>) -> Self {
+        let duration = duration.into();
+        self.duration = (!duration.trim().is_empty()).then_some(duration);
+        self
+    }
+
+    pub fn timing_debug(mut self, timing: impl Into<String>) -> Self {
+        let timing = timing.into();
+        self.timing_debug = (!timing.trim().is_empty()).then_some(timing);
         self
     }
 
@@ -407,6 +423,21 @@ impl RenderOnce for MessageBubble {
                         .when_some(actions, |this, actions| this.child(actions)),
                 )
             })
+            .when_some(self.timing_debug.clone(), |this, timing| {
+                this.child(
+                    v_flex()
+                        .id(ElementId::Name(format!("turn-timing-{row_key}").into()))
+                        .mt(px(4.))
+                        .gap(px(1.))
+                        .text_xs()
+                        .text_color(muted)
+                        .children(
+                            timing
+                                .lines()
+                                .map(|line| div().child(SharedString::from(line.to_string()))),
+                        ),
+                )
+            })
             .when_some(self.reaction.clone(), |this, emoji| {
                 this.child(
                     div()
@@ -513,6 +544,7 @@ impl RenderOnce for MessageBubble {
         );
 
         let time_label = self.timestamp.clone().unwrap_or_default();
+        let duration_label = self.duration.clone();
 
         let main = if is_me {
             h_flex()
@@ -556,11 +588,25 @@ impl RenderOnce for MessageBubble {
                     .pl(px(10.))
                     .opacity(if peeking { progress } else { 0. })
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .whitespace_nowrap()
-                            .child(time_label),
+                        v_flex()
+                            .items_end()
+                            .gap(px(0.))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .whitespace_nowrap()
+                                    .child(time_label),
+                            )
+                            .when_some(duration_label, |this, duration| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted.opacity(0.85))
+                                        .whitespace_nowrap()
+                                        .child(duration),
+                                )
+                            }),
                     ),
             );
 

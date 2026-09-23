@@ -7,6 +7,7 @@ mod error;
 mod gen_ui;
 mod local_exec;
 mod pending;
+mod timing;
 mod types;
 mod user_form;
 mod visibility;
@@ -64,6 +65,7 @@ pub use pending::{
     CUSTOM_NAME, PAYLOAD_V, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage, PendingWrite,
 };
+pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
     ReplyQuote, assistant_text_from_sse,
