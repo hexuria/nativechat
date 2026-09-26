@@ -16,18 +16,18 @@ use crate::opengrok::{
     Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, ImageVisibility,
     LocalExecMode, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient,
     OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate,
-    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
-    RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
-    SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind, ScheduleRow, ScreenshotSpec, SkillDetail,
-    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
-    ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE,
-    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
-    WAITING_FOR_YOU, activity_from_replay, approval_summary, box_handoff_resolve_entry_id,
-    collapse_computer_roster, command_from_args, command_from_replay_events, deeds_from_replay,
-    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_available,
-    host_egress_tunnel_flag, keep_local_save_offer, place_hitl_cards_in_document_order,
-    policy_answer, reads_as_gateway_unreachable, retry_enqueue, save_login_from_local,
-    serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult,
+    RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunRecipeResponse, RunReplay,
+    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind,
+    ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary,
+    ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming,
+    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
+    UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay, approval_summary,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
+    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
+    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
+    save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -1845,6 +1845,8 @@ impl SkillCounts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecipeRunNote {
     pub ok: bool,
+    /// Nobody finished it, so what it did is not known.
+    pub interrupted: bool,
     pub version: u32,
     /// The step the run stopped at, when it did not finish.
     pub stopped_at: Option<u64>,
@@ -1852,9 +1854,22 @@ pub struct RecipeRunNote {
 }
 
 impl RecipeRunNote {
-    /// "last run ok · v3", "last run stopped at step 7 · v3".
+    fn of(run: &RecipeRun) -> Self {
+        Self {
+            ok: run.ok,
+            interrupted: run.is_interrupted(),
+            version: run.version,
+            stopped_at: run.stopped_at,
+            at_ms: run.at_ms,
+        }
+    }
+
+    /// "last run ok · v3", "last run stopped at step 7 · v3", "last run interrupted · v3".
     pub fn label(&self) -> String {
         let version = self.version;
+        if self.interrupted {
+            return format!("last run interrupted · v{version}");
+        }
         if self.ok {
             format!("last run ok · v{version}")
         } else {
@@ -1875,6 +1890,8 @@ pub struct RecipeRunOutcome {
     pub ran: Option<u64>,
     pub stopped_at: Option<u64>,
     pub error: Option<String>,
+    /// Nobody finished the run: see [`RecipeRun::is_interrupted`].
+    pub interrupted: bool,
     /// The screen after the run, with its size.
     pub image: Option<(Arc<gpui_kit::Image>, u32, u32)>,
 }
@@ -1893,7 +1910,27 @@ impl RecipeRunOutcome {
             ran: result.ran_count(),
             stopped_at: result.stopped_at,
             error: result.error,
+            interrupted: false,
             image,
+        }
+    }
+
+    /// The outcome of a run the server played after it had answered, read off the run's own
+    /// row in the history once the row says it is over. It is what [`Self::from_result`] reads
+    /// off a `200`, and it has no picture for the same reason that `200` has none from a server
+    /// that answers `202`: such a server asks the box to write the run's screens as files
+    /// (`artifact_dir`, since opengrok-server 6ec0e0e) rather than inline them, and they are
+    /// the row's `artifacts`, which this page does not show on either path yet.
+    fn from_run(run: &RecipeRun) -> Self {
+        Self {
+            coworker_id: run.coworker_id.clone(),
+            version: run.version,
+            ok: run.ok,
+            ran: run.ran_count(),
+            stopped_at: run.stopped_at,
+            error: run.error(),
+            interrupted: run.is_interrupted(),
+            image: None,
         }
     }
 
@@ -1907,6 +1944,11 @@ impl RecipeRunOutcome {
         if self.ok {
             return format!("Ran {steps} of v{}", self.version);
         }
+        if self.interrupted {
+            return "Interrupted: how this run ended was never written down, so what the box did \
+                    is not known"
+                .to_string();
+        }
         let stopped = match self.stopped_at {
             Some(step) => format!("Stopped at step {step}"),
             None => "Stopped".to_string(),
@@ -1916,6 +1958,61 @@ impl RecipeRunOutcome {
             None => stopped,
         }
     }
+}
+
+/// The page's word while a run it started plays: the one busy label the run itself writes,
+/// and the only one it clears.
+pub const RECIPE_RUNNING: &str = "Running…";
+
+/// A run the page started and has not yet seen end, from the server's `202` until the run's
+/// row in the history says it is over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecipeRunInFlight {
+    /// The id the `202` named, which is the id of the run's row.
+    run_id: String,
+    /// When the page first read the row as interrupted, while it waits to believe it: see
+    /// [`AppState::RECIPE_RUN_LAPSE_GRACE`]. Back to `None` if the row plays again.
+    lapsed_since: Option<Instant>,
+}
+
+impl RecipeRunInFlight {
+    fn new(run_id: String) -> Self {
+        Self {
+            run_id,
+            lapsed_since: None,
+        }
+    }
+
+    /// The row has read as interrupted for long enough that the run is not coming back.
+    fn lapse_believed(&self) -> bool {
+        self.lapsed_since
+            .is_some_and(|since| since.elapsed() >= AppState::RECIPE_RUN_LAPSE_GRACE)
+    }
+}
+
+/// One reading the follower took of the open recipe, and where the follower was when it took
+/// it: see [`AppState::take_polled_recipe`].
+struct PolledRecipe {
+    /// The recipe it read.
+    id: String,
+    /// [`AppState::recipe_detail_epoch`] when the reading was asked for.
+    epoch: u64,
+    reading: Result<RecipeDetail, OpenGrokError>,
+    /// How long this visit has followed the recipe.
+    followed: Duration,
+    /// How long the server has answered readings with failures and no success between them.
+    failing_for: Duration,
+}
+
+/// What the page does once Run on… has answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterRun {
+    /// Nothing more: what the answer said is on the page, or the page has moved on.
+    Done,
+    /// Follow the run's row, starting the follower over.
+    Follow,
+    /// Read the recipe again: whatever the run came to is in its history.
+    Reload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -2287,6 +2384,16 @@ pub struct AppState {
     /// What the last recipe request said when it was refused.
     pub recipe_error: Option<String>,
     pub recipe_run_result: Option<RecipeRunOutcome>,
+    /// The runs Run on… started, by recipe, while they play. Kept when the person leaves a
+    /// recipe, so coming back to it picks its run up where it is, and a run started meanwhile
+    /// on another recipe is that recipe's own.
+    recipe_runs_in_flight: HashMap<String, RecipeRunInFlight>,
+    /// Reads the open recipe again while a run of it plays; dropped when the recipe closes.
+    recipe_run_poll: Option<Task<()>>,
+    /// Moved when a request that answers with the open recipe's detail is sent and again when
+    /// it lands, so the follower can tell that its own reading may be older than what the page
+    /// stands on.
+    recipe_detail_epoch: u64,
     /// Delete asks first: the dialog over the app, until Delete or Cancel.
     pub recipe_delete_confirm: bool,
     /// What each recipe's newest run came to, kept as details are read, so a row in the list
@@ -2745,6 +2852,9 @@ impl AppState {
             recipe_busy: None,
             recipe_error: None,
             recipe_run_result: None,
+            recipe_runs_in_flight: HashMap::new(),
+            recipe_run_poll: None,
+            recipe_detail_epoch: 0,
             recipe_delete_confirm: false,
             recipe_last_runs: HashMap::new(),
             skills: Vec::new(),
@@ -3734,6 +3844,10 @@ impl AppState {
         self.host_egress_tunnel_available = false;
         self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
+        // The open recipe and the runs the page was waiting on were this account's. Closing the
+        // recipe drops its follower too, which would otherwise read on without a session.
+        self.recipe_runs_in_flight.clear();
+        self.close_recipe(cx);
         cx.notify();
         if let Some(client) = client {
             cx.spawn(async move |_, _| {
@@ -4480,6 +4594,7 @@ impl AppState {
         self.recipe_busy = None;
         self.recipe_error = None;
         self.recipe_run_result = None;
+        self.recipe_run_poll = None;
         self.recipe_delete_confirm = false;
         self.load_open_recipe(cx);
         cx.notify();
@@ -4494,6 +4609,7 @@ impl AppState {
             return;
         };
         self.recipe_loading = true;
+        self.recipe_detail_epoch += 1;
         cx.spawn(async move |this, cx| {
             let result = client.recipe(&id).await;
             let _ = this.update(cx, |state, cx| {
@@ -4502,8 +4618,9 @@ impl AppState {
                     return;
                 }
                 state.recipe_loading = false;
+                state.recipe_detail_epoch += 1;
                 match result {
-                    Ok(detail) => state.set_open_recipe(detail),
+                    Ok(detail) => state.set_open_recipe(detail, cx),
                     Err(error) => state.recipe_error = Some(error.message),
                 }
                 cx.notify();
@@ -4512,21 +4629,251 @@ impl AppState {
         .detach();
     }
 
-    /// Take a detail as the open recipe, keeping what its newest run came to: the list is told
-    /// nothing about runs, so this is the only place the app learns it.
-    fn set_open_recipe(&mut self, detail: RecipeDetail) {
-        if let Some(run) = detail.runs.first() {
-            self.recipe_last_runs.insert(
-                detail.recipe.id.clone(),
-                RecipeRunNote {
-                    ok: run.ok,
-                    version: run.version,
-                    stopped_at: run.stopped_at,
-                    at_ms: run.at_ms,
-                },
-            );
+    /// Take a detail as the open recipe, and follow it while anything on it is still playing.
+    fn set_open_recipe(&mut self, detail: RecipeDetail, cx: &mut Context<Self>) {
+        if self.take_open_recipe(detail, false) {
+            self.follow_recipe_runs(cx);
         }
+    }
+
+    /// Take a detail as the open recipe, and answer whether anything on it is still playing: a
+    /// run of it, or the run the page started, until the page has seen that run end.
+    ///
+    /// What its newest finished run came to is kept for the list, which is told nothing about
+    /// runs, so this is the only place the app learns it. A run still playing has come to
+    /// nothing yet, and a row saying it was playing would outlive the run on a list nobody
+    /// reads again; nor has a run the page is still waiting on, whatever its row says.
+    ///
+    /// `fresh` is a detail [`Self::follow_recipe_runs`] read, which it only does after the run
+    /// the page started was written down. Only there does a run missing from the history mean
+    /// it is gone, rather than that the detail was asked for before the run began.
+    fn take_open_recipe(&mut self, detail: RecipeDetail, fresh: bool) -> bool {
+        self.settle_recipe_run(&detail, fresh);
+        let awaited = self
+            .recipe_runs_in_flight
+            .get(&detail.recipe.id)
+            .map(|run| run.run_id.clone());
+        if let Some(run) = detail
+            .runs
+            .iter()
+            .find(|run| run.is_over() && awaited.as_deref() != Some(run.id.as_str()))
+        {
+            self.recipe_last_runs
+                .insert(detail.recipe.id.clone(), RecipeRunNote::of(run));
+        }
+        let playing = awaited.is_some() || detail.runs.iter().any(RecipeRun::is_running);
         self.recipe_open = Some(detail);
+        playing
+    }
+
+    /// Whether the run the page started of this recipe has ended, read off a detail of it. Over,
+    /// it is the page's last run; still playing, the page says so, which it may not have yet for
+    /// somebody who left the recipe and came back to it.
+    ///
+    /// AN INTERRUPTED ROW IS NOT BELIEVED AT ONCE. The server reads `interrupted` off a lease
+    /// that lapsed, and there a lapse is not an ending: a run whose renewals only stalled takes
+    /// its lease back at its next renewal, and one that finishes after its lease lapsed is
+    /// written down as finished all the same (opengrok-server `hold_recipe_run`,
+    /// `record_recipe_run`). So the page goes on waiting for [`Self::RECIPE_RUN_LAPSE_GRACE`]
+    /// before it says the run was interrupted, and goes back to waiting if the row plays again.
+    fn settle_recipe_run(&mut self, detail: &RecipeDetail, fresh: bool) {
+        let recipe_id = detail.recipe.id.as_str();
+        let Some(awaited) = self.recipe_runs_in_flight.get_mut(recipe_id) else {
+            return;
+        };
+        match detail.runs.iter().find(|run| run.id == awaited.run_id) {
+            Some(run) if run.is_interrupted() && !awaited.lapse_believed() => {
+                awaited.lapsed_since.get_or_insert_with(Instant::now);
+                self.hold_running_label();
+            }
+            Some(run) if !run.is_over() => {
+                awaited.lapsed_since = None;
+                self.hold_running_label();
+            }
+            Some(run) => {
+                self.recipe_run_result = Some(RecipeRunOutcome::from_run(run));
+                self.end_recipe_run(recipe_id);
+            }
+            None if fresh => {
+                self.recipe_error =
+                    Some("That run is no longer in this recipe's history.".to_string());
+                self.end_recipe_run(recipe_id);
+            }
+            // Asked for before the run was written down, so it says nothing of the run yet.
+            None => self.hold_running_label(),
+        }
+    }
+
+    /// Say that the open recipe's run is playing, unless another request holds the page's word:
+    /// that one clears it when it lands, and the next reading says this again.
+    fn hold_running_label(&mut self) {
+        if self.recipe_busy.is_none() {
+            self.recipe_busy = Some(RECIPE_RUNNING.to_string());
+        }
+    }
+
+    /// Take the run's word off the page, and only the run's: a save or an accept in flight keeps
+    /// its own until it lands, and with it the page's one-request-at-a-time guard.
+    fn release_running_label(&mut self) {
+        if self.recipe_busy.as_deref() == Some(RECIPE_RUNNING) {
+            self.recipe_busy = None;
+        }
+    }
+
+    /// The page stops waiting on the run it started of `recipe_id`.
+    fn end_recipe_run(&mut self, recipe_id: &str) {
+        if self.recipe_runs_in_flight.remove(recipe_id).is_some()
+            && self.recipe_open_id.as_deref() == Some(recipe_id)
+        {
+            self.release_running_label();
+        }
+    }
+
+    /// How often the open recipe is read at first while a run of it plays.
+    const RECIPE_RUN_POLL: Duration = Duration::from_secs(1);
+
+    /// The longest the follower waits between two readings, however long the run has played.
+    const RECIPE_RUN_POLL_MAX: Duration = Duration::from_secs(10);
+
+    /// How long one visit follows a recipe's runs before leaving them to their rows. Longer than
+    /// the longest recipe the server will play — 256 steps, each wait at most ten seconds — so
+    /// only a run whose lease never lapses outlasts it.
+    const RECIPE_RUN_FOLLOW_FOR: Duration = Duration::from_secs(60 * 60);
+
+    /// How long the row of a run the page is waiting on may read as interrupted before the page
+    /// believes it. The server renews a playing run's lease every third of a lease (20 s of
+    /// 60 s, opengrok-server `hold_run`), and the reading that saw the lapse came from the store
+    /// the renewal writes to, so a run still playing has its lease back well inside this.
+    const RECIPE_RUN_LAPSE_GRACE: Duration = Duration::from_secs(30);
+
+    /// How long the server may answer the follower with failures that decide nothing (see
+    /// [`Self::passing_failure`]), with no good reading between them, before the follower takes
+    /// the failure for the answer.
+    const RECIPE_RUN_FAILING_FOR: Duration = Duration::from_secs(60);
+
+    /// How long the follower waits before its next reading, `followed` into a visit: a second
+    /// at first, then a tenth of the time it has followed, up to [`Self::RECIPE_RUN_POLL_MAX`].
+    /// A run is seen to end within about a tenth of how long it played, and a forty-minute run
+    /// costs a few hundred readings of the whole detail rather than thousands.
+    fn recipe_run_poll_wait(followed: Duration) -> Duration {
+        (followed / 10).clamp(Self::RECIPE_RUN_POLL, Self::RECIPE_RUN_POLL_MAX)
+    }
+
+    /// A failed reading that decides nothing about the recipe: the server, or whatever stands in
+    /// front of it, had a moment (`408`, `429`, a `5xx`), or what came back did not read as a
+    /// detail at all. A refusal (`403`, `404`) and a session that has gone are answers.
+    fn passing_failure(error: &OpenGrokError) -> bool {
+        matches!(error.status, None | Some(408 | 429 | 500..=599))
+    }
+
+    /// Read the open recipe again while anything on it plays, so a running row turns into what
+    /// it came to without anybody asking: every second at first, less often the longer it plays
+    /// ([`Self::recipe_run_poll_wait`]). Idempotent.
+    ///
+    /// Tied to the recipe being open, the way the Computer pane's poll is tied to the pane:
+    /// leaving the recipe drops it, and coming back to one that is still playing starts it
+    /// again. The run is the server's (opengrok-server #217) and plays on either way.
+    fn follow_recipe_runs(&mut self, cx: &mut Context<Self>) {
+        if self.recipe_run_poll.is_some() {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(id) = self.recipe_open_id.clone() else {
+            return;
+        };
+        let since = Instant::now();
+        self.recipe_run_poll = Some(cx.spawn(async move |this, cx| {
+            let mut failing_since: Option<Instant> = None;
+            loop {
+                let wait = Self::recipe_run_poll_wait(since.elapsed());
+                cx.background_executor().timer(wait).await;
+                let Ok(epoch) = this.read_with(cx, |state, _| state.recipe_detail_epoch) else {
+                    break;
+                };
+                let reading = client.recipe(&id).await;
+                match &reading {
+                    Ok(_) => failing_since = None,
+                    // Nothing answered at all, which the follower rides out for as long as it
+                    // follows: the wire comes back by itself.
+                    Err(error) if error.unreachable().is_some() => {}
+                    Err(_) => {
+                        failing_since.get_or_insert_with(Instant::now);
+                    }
+                }
+                let polled = PolledRecipe {
+                    id: id.clone(),
+                    epoch,
+                    reading,
+                    followed: since.elapsed(),
+                    failing_for: failing_since.map_or(Duration::ZERO, |since| since.elapsed()),
+                };
+                let going = this.update(cx, |state, cx| {
+                    let going = state.take_polled_recipe(polled);
+                    cx.notify();
+                    going
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// One reading of the open recipe while its runs are followed, and whether to read again.
+    /// The follower's slot is emptied when it stops, and left alone when the reading was of a
+    /// recipe the person has since left: the slot is that recipe's now.
+    fn take_polled_recipe(&mut self, polled: PolledRecipe) -> bool {
+        let PolledRecipe {
+            id,
+            epoch,
+            reading,
+            followed,
+            failing_for,
+        } = polled;
+        if self.recipe_open_id.as_deref() != Some(id.as_str()) {
+            return false;
+        }
+        let playing = match reading {
+            // Something else answered with this recipe's detail after this reading was asked
+            // for, so the page may stand on something newer: read again rather than take the
+            // page back to what this saw.
+            _ if epoch != self.recipe_detail_epoch => true,
+            Ok(detail) => self.take_open_recipe(detail, true),
+            // Nothing answered, which decides nothing about the run: the wire comes back by
+            // itself, and the run is on the server either way.
+            Err(error) if error.unreachable().is_some() => true,
+            // Nor does a moment of trouble on the server, until it has gone on too long to be
+            // one.
+            Err(error)
+                if Self::passing_failure(&error) && failing_for < Self::RECIPE_RUN_FAILING_FOR =>
+            {
+                true
+            }
+            Err(error) => {
+                self.recipe_error = Some(error.message);
+                self.end_recipe_run(&id);
+                self.recipe_run_poll = None;
+                return false;
+            }
+        };
+        if playing && followed >= Self::RECIPE_RUN_FOLLOW_FOR {
+            if self.recipe_runs_in_flight.contains_key(&id) {
+                self.recipe_error = Some(
+                    "Still playing after an hour, so the page has stopped watching it. Open the \
+                     recipe again to see how it went."
+                        .to_string(),
+                );
+                self.end_recipe_run(&id);
+            }
+            self.recipe_run_poll = None;
+            return false;
+        }
+        if !playing {
+            self.recipe_run_poll = None;
+        }
+        playing
     }
 
     pub fn close_recipe(&mut self, cx: &mut Context<Self>) {
@@ -4536,6 +4883,7 @@ impl AppState {
         self.recipe_busy = None;
         self.recipe_error = None;
         self.recipe_run_result = None;
+        self.recipe_run_poll = None;
         self.recipe_delete_confirm = false;
         cx.notify();
     }
@@ -4561,6 +4909,7 @@ impl AppState {
         };
         self.recipe_busy = Some(busy.to_string());
         self.recipe_error = None;
+        self.recipe_detail_epoch += 1;
         cx.notify();
         let future = action(client, id.clone());
         cx.spawn(async move |this, cx| {
@@ -4570,9 +4919,10 @@ impl AppState {
                     return;
                 }
                 state.recipe_busy = None;
+                state.recipe_detail_epoch += 1;
                 match result {
                     Ok(detail) => {
-                        state.set_open_recipe(detail);
+                        state.set_open_recipe(detail, cx);
                         state.refresh_recipes(cx);
                     }
                     Err(error) => state.recipe_error = Some(error.message),
@@ -4692,6 +5042,7 @@ impl AppState {
                 .to_string(),
             );
             self.recipe_error = None;
+            self.recipe_detail_epoch += 1;
         }
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -4704,11 +5055,12 @@ impl AppState {
                 let open = state.recipe_open_id.as_deref() == Some(id.as_str());
                 if open {
                     state.recipe_busy = None;
+                    state.recipe_detail_epoch += 1;
                 }
                 match result {
                     Ok(detail) => {
                         if open {
-                            state.set_open_recipe(detail);
+                            state.set_open_recipe(detail, cx);
                         }
                         state.refresh_recipes(cx);
                     }
@@ -4721,8 +5073,10 @@ impl AppState {
         .detach();
     }
 
-    /// Play the open recipe on one of the person's bots. The outcome and the screen after it
-    /// show on the page, and the run joins the history.
+    /// Play the open recipe on one of the person's bots. The server answers at once with the
+    /// run's id and plays it on its own, so the page follows the run's row until it is over
+    /// and then shows what it came to; the run is in the history from its first moment. A
+    /// server that waits answers with the outcome and the screen after it instead.
     pub fn run_open_recipe(&mut self, coworker_id: String, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
@@ -4730,29 +5084,73 @@ impl AppState {
         let Some(id) = self.recipe_open_id.clone() else {
             return;
         };
-        self.recipe_busy = Some("Running…".to_string());
+        self.recipe_busy = Some(RECIPE_RUNNING.to_string());
         self.recipe_error = None;
         self.recipe_run_result = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.run_recipe(&id, &coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                if state.recipe_open_id.as_deref() != Some(id.as_str()) {
-                    return;
-                }
-                state.recipe_busy = None;
-                match result {
-                    Ok(result) => {
-                        state.recipe_run_result =
-                            Some(RecipeRunOutcome::from_result(coworker_id, result));
-                        state.load_open_recipe(cx);
+                match state.take_run_answer(id, coworker_id, result) {
+                    AfterRun::Follow => {
+                        // Started over rather than joined: a reading already on its way was
+                        // asked for before this run was written down.
+                        state.recipe_run_poll = None;
+                        state.follow_recipe_runs(cx);
                     }
-                    Err(error) => state.recipe_error = Some(error.message),
+                    AfterRun::Reload => state.load_open_recipe(cx),
+                    AfterRun::Done => {}
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// What Run on… answered for recipe `id`, taken onto the page, and what the page does next.
+    fn take_run_answer(
+        &mut self,
+        id: String,
+        coworker_id: String,
+        answer: Result<RunRecipeResponse, OpenGrokError>,
+    ) -> AfterRun {
+        let open = self.recipe_open_id.as_deref() == Some(id.as_str());
+        match answer {
+            // Kept whether or not the person is still on the recipe, and beside any other
+            // recipe's: the run plays on either way, and coming back to the recipe picks it up.
+            Ok(RunRecipeResponse::Async(started)) => {
+                self.recipe_runs_in_flight
+                    .insert(id, RecipeRunInFlight::new(started.run_id));
+                if !open {
+                    return AfterRun::Done;
+                }
+                self.hold_running_label();
+                AfterRun::Follow
+            }
+            // A late answer for a recipe the person has since left is stale.
+            _ if !open => AfterRun::Done,
+            Ok(RunRecipeResponse::Sync(result)) => {
+                self.release_running_label();
+                self.recipe_run_result = Some(RecipeRunOutcome::from_result(coworker_id, result));
+                AfterRun::Reload
+            }
+            Err(error) => {
+                self.release_running_label();
+                // Whether a run started is not known when no answer was read (the connection
+                // went, or what came back did not decode), and a `503` with `historyMissed` is
+                // a run that played: the history is what can say, so the page reads it again,
+                // and follows a run it finds playing there. A refusal started nothing.
+                let unknown = error.status.is_none()
+                    || error.unreachable().is_some()
+                    || error.history_missed();
+                self.recipe_error = Some(error.message);
+                if unknown {
+                    AfterRun::Reload
+                } else {
+                    AfterRun::Done
+                }
+            }
+        }
     }
 
     /// Ask before deleting the open recipe: the dialog over the app.
@@ -21050,5 +21448,581 @@ mod tests {
             state.conversations[1].updated_at,
             session_time_of_ms(1_790_000_000_000)
         );
+    }
+
+    /// One row of `GET /recipes/{id}`'s `runs`, as opengrok-server #217 sends it.
+    fn run_row(id: &str, state: &str, ok: bool, receipt: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1", "runId": id,
+            "ok": ok, "stoppedAt": receipt.get("stopped_at"), "receipt": receipt, "atMs": 5,
+            "state": state, "artifacts": [],
+        })
+    }
+
+    /// A recipe with these runs, newest first as the server lists them.
+    fn recipe_of(id: &str, runs: Vec<serde_json::Value>) -> crate::opengrok::RecipeDetail {
+        serde_json::from_value(serde_json::json!({
+            "recipe": {"id": id, "name": "Mail", "relation": "mine", "latestVersion": 2},
+            "runs": runs,
+        }))
+        .expect("a detail")
+    }
+
+    fn recipe_with_runs(runs: Vec<serde_json::Value>) -> crate::opengrok::RecipeDetail {
+        recipe_of("rcp_1", runs)
+    }
+
+    /// A run's row while it plays: written down before the box was asked, so not ok yet.
+    fn playing_row(id: &str) -> serde_json::Value {
+        run_row(
+            id,
+            "running",
+            false,
+            serde_json::json!({"ok": false, "running": true}),
+        )
+    }
+
+    /// A row whose lease lapsed with how the run ended never written down.
+    fn lapsed_row(id: &str) -> serde_json::Value {
+        run_row(
+            id,
+            "interrupted",
+            false,
+            serde_json::json!({"ok": false, "running": true}),
+        )
+    }
+
+    /// A run that played its three steps.
+    fn finished_row(id: &str) -> serde_json::Value {
+        run_row(
+            id,
+            "finished",
+            true,
+            serde_json::json!({"ok": true, "ran": 3, "steps": [{"ok": true}, {"ok": true}, {"ok": true}]}),
+        )
+    }
+
+    /// The page just after Run on… came back `202` for `run_id`.
+    fn waiting_on_run(run_id: &str) -> AppState {
+        let mut state = AppState::new();
+        state.recipe_open_id = Some("rcp_1".to_string());
+        state.recipe_busy = Some(super::RECIPE_RUNNING.to_string());
+        state.recipe_runs_in_flight.insert(
+            "rcp_1".to_string(),
+            super::RecipeRunInFlight::new(run_id.to_string()),
+        );
+        state
+    }
+
+    /// Whether the page is waiting on a run it started of `recipe`.
+    fn waits_on(state: &AppState, recipe: &str) -> bool {
+        state.recipe_runs_in_flight.contains_key(recipe)
+    }
+
+    /// One reading of `rcp_1` by the follower, early in its visit, asked for while nothing else
+    /// had moved the detail.
+    fn reading(
+        reading: Result<crate::opengrok::RecipeDetail, OpenGrokError>,
+    ) -> super::PolledRecipe {
+        super::PolledRecipe {
+            id: "rcp_1".to_string(),
+            epoch: 0,
+            reading,
+            followed: Duration::ZERO,
+            failing_for: Duration::ZERO,
+        }
+    }
+
+    /// A running row has `ok: false` because it has not finished, and the page reads its
+    /// state first: it keeps waiting, says nothing about an outcome, and the list goes on
+    /// saying what the last run that did finish came to.
+    #[test]
+    fn a_run_still_playing_keeps_the_page_waiting_and_is_not_a_failure() {
+        let mut state = waiting_on_run("rrun_2");
+        let earlier = serde_json::json!({"ok": true, "ran": 3, "steps": []});
+        let playing = recipe_with_runs(vec![
+            playing_row("rrun_2"),
+            run_row("rrun_1", "finished", true, earlier),
+        ]);
+
+        assert!(state.take_polled_recipe(reading(Ok(playing))), "read again");
+        assert_eq!(state.recipe_busy.as_deref(), Some(super::RECIPE_RUNNING));
+        assert!(state.recipe_run_result.is_none());
+        assert!(state.recipe_error.is_none());
+        assert!(waits_on(&state, "rcp_1"));
+        assert_eq!(
+            state.recipe_last_runs.get("rcp_1").map(|note| note.label()),
+            Some("last run ok · v2".to_string()),
+            "a run still playing has come to nothing yet"
+        );
+    }
+
+    /// Once the row says it is over, what it came to is the page's last run, read off the row:
+    /// how many steps ran and why it stopped, not "the steps" with the reason lost.
+    #[test]
+    fn a_run_whose_row_is_over_is_the_pages_last_run() {
+        let mut state = waiting_on_run("rrun_2");
+        let done = recipe_with_runs(vec![finished_row("rrun_2")]);
+        assert!(
+            !state.take_polled_recipe(reading(Ok(done))),
+            "nothing left to follow"
+        );
+        let outcome = state.recipe_run_result.clone().expect("the outcome");
+        assert_eq!(outcome.headline(), "Ran 3 steps of v2");
+        assert_eq!(outcome.coworker_id, "cw_1");
+        assert_eq!(state.recipe_busy, None);
+        assert!(!waits_on(&state, "rcp_1"));
+
+        let mut state = waiting_on_run("rrun_3");
+        let stopped = recipe_with_runs(vec![run_row(
+            "rrun_3",
+            "finished",
+            false,
+            serde_json::json!({"ok": false, "ran": 1, "stopped_at": 1,
+                               "steps": [{"ok": true}, {"ok": false, "error": "nothing at (5, 5)"}]}),
+        )]);
+        assert!(!state.take_polled_recipe(reading(Ok(stopped))));
+        assert_eq!(
+            state.recipe_run_result.map(|outcome| outcome.headline()),
+            Some("Stopped at step 1: nothing at (5, 5)".to_string())
+        );
+    }
+
+    /// A lapsed lease is not an ending on the server, so the first reading that says
+    /// `interrupted` keeps the page waiting; one that has said it for the whole grace is the
+    /// run's end, and not a run that stopped at a step, because nothing is known of the box.
+    #[test]
+    fn an_interrupted_row_is_believed_once_it_has_stayed_that_way() {
+        let mut state = waiting_on_run("rrun_2");
+        let lapsed = recipe_with_runs(vec![lapsed_row("rrun_2")]);
+        assert!(
+            state.take_polled_recipe(reading(Ok(lapsed.clone()))),
+            "read again"
+        );
+        assert!(waits_on(&state, "rcp_1"));
+        assert_eq!(state.recipe_busy.as_deref(), Some(super::RECIPE_RUNNING));
+        assert!(state.recipe_run_result.is_none());
+        assert_eq!(
+            state.recipe_last_runs.get("rcp_1"),
+            None,
+            "a run the page is still waiting on has come to nothing yet"
+        );
+
+        let long_ago = Instant::now()
+            .checked_sub(AppState::RECIPE_RUN_LAPSE_GRACE)
+            .expect("a clock older than the grace");
+        state
+            .recipe_runs_in_flight
+            .get_mut("rcp_1")
+            .expect("still waiting")
+            .lapsed_since = Some(long_ago);
+        assert!(!state.take_polled_recipe(reading(Ok(lapsed))));
+        let outcome = state.recipe_run_result.clone().expect("the outcome");
+        assert!(outcome.interrupted);
+        assert!(
+            outcome.headline().starts_with("Interrupted:"),
+            "{}",
+            outcome.headline()
+        );
+        assert!(!waits_on(&state, "rcp_1"));
+        assert_eq!(state.recipe_busy, None);
+        assert_eq!(
+            state.recipe_last_runs.get("rcp_1").map(|note| note.label()),
+            Some("last run interrupted · v2".to_string())
+        );
+    }
+
+    /// A run whose renewals only stalled takes its lease back, and one that finishes late is
+    /// written down as finished: the page follows the row through both rather than stop on
+    /// the first `interrupted` it reads.
+    #[test]
+    fn a_lapsed_run_that_plays_on_is_not_called_interrupted() {
+        let mut state = waiting_on_run("rrun_2");
+        let lapsed_since = |state: &AppState| {
+            state
+                .recipe_runs_in_flight
+                .get("rcp_1")
+                .and_then(|run| run.lapsed_since)
+        };
+        let read = |state: &mut AppState, row: serde_json::Value| {
+            state.take_polled_recipe(reading(Ok(recipe_with_runs(vec![row]))))
+        };
+
+        assert!(read(&mut state, lapsed_row("rrun_2")));
+        assert!(lapsed_since(&state).is_some());
+
+        assert!(read(&mut state, playing_row("rrun_2")));
+        assert_eq!(
+            lapsed_since(&state),
+            None,
+            "playing again, so a later lapse starts its own wait"
+        );
+        assert_eq!(state.recipe_busy.as_deref(), Some(super::RECIPE_RUNNING));
+
+        assert!(read(&mut state, lapsed_row("rrun_2")));
+        assert!(!read(&mut state, finished_row("rrun_2")));
+        let outcome = state.recipe_run_result.clone().expect("the outcome");
+        assert!(!outcome.interrupted);
+        assert_eq!(outcome.headline(), "Ran 3 steps of v2");
+        assert_eq!(
+            state.recipe_last_runs.get("rcp_1").map(|note| note.label()),
+            Some("last run ok · v2".to_string())
+        );
+    }
+
+    /// A detail asked for before the run was written down does not have it yet, so only the
+    /// follower's own reading — always asked for after — may call the run gone.
+    #[test]
+    fn a_run_missing_from_the_history_is_gone_only_on_the_followers_reading() {
+        let mut state = waiting_on_run("rrun_2");
+        let before = recipe_with_runs(vec![run_row(
+            "rrun_1",
+            "finished",
+            true,
+            serde_json::json!({"ok": true, "ran": 3}),
+        )]);
+        assert!(
+            state.take_open_recipe(before.clone(), false),
+            "still waiting on the run"
+        );
+        assert!(waits_on(&state, "rcp_1"));
+        assert!(state.recipe_error.is_none());
+
+        assert!(!state.take_polled_recipe(reading(Ok(before))));
+        assert!(!waits_on(&state, "rcp_1"));
+        assert_eq!(state.recipe_busy, None);
+        assert_eq!(
+            state.recipe_error.as_deref(),
+            Some("That run is no longer in this recipe's history.")
+        );
+    }
+
+    /// Neither the wire going away nor a moment of trouble on the server decides anything about
+    /// the run, so the follower reads again, quietly, and the page stays on it.
+    #[test]
+    fn the_follower_rides_out_the_wire_and_a_moment_of_trouble() {
+        let passing = [
+            OpenGrokError::from_server(Some(502), "Bad Gateway"),
+            OpenGrokError::from_server(Some(500), "pool timed out"),
+            OpenGrokError::from_server(Some(503), "the store is not answering"),
+            OpenGrokError::from_server(Some(429), "slow down"),
+            OpenGrokError::message("error decoding response body"),
+        ];
+        for error in passing {
+            let mut state = waiting_on_run("rrun_2");
+            let said = error.message.clone();
+            assert!(state.take_polled_recipe(reading(Err(error))), "{said}");
+            assert!(waits_on(&state, "rcp_1"), "{said}");
+            assert_eq!(state.recipe_busy.as_deref(), Some(super::RECIPE_RUNNING));
+            assert!(state.recipe_error.is_none(), "{said}");
+        }
+
+        // The wire is ridden out for as long as the follower follows.
+        let mut state = waiting_on_run("rrun_2");
+        let mut away = reading(Err(OpenGrokError::from_server(Some(502), "Bad Gateway")));
+        away.failing_for = AppState::RECIPE_RUN_FAILING_FOR * 5;
+        assert!(state.take_polled_recipe(away));
+    }
+
+    /// The server saying something about the recipe is an answer, and so is trouble that has
+    /// gone on too long to be a moment: the page stops on it and says what it was.
+    #[test]
+    fn the_follower_stops_on_an_answer() {
+        let mut state = waiting_on_run("rrun_2");
+        let mut trouble = reading(Err(OpenGrokError::from_server(Some(500), "pool timed out")));
+        trouble.failing_for = AppState::RECIPE_RUN_FAILING_FOR;
+        assert!(!state.take_polled_recipe(trouble));
+        assert!(!waits_on(&state, "rcp_1"));
+        assert_eq!(state.recipe_busy, None);
+        assert_eq!(state.recipe_error.as_deref(), Some("pool timed out"));
+
+        for answer in [
+            OpenGrokError::from_server(Some(404), "no such recipe"),
+            OpenGrokError::from_server(Some(403), "not yours to read"),
+            OpenGrokError::signed_out("Your session has ended. Sign in again."),
+        ] {
+            let mut state = waiting_on_run("rrun_2");
+            let said = answer.message.clone();
+            assert!(!state.take_polled_recipe(reading(Err(answer))), "{said}");
+            assert!(!waits_on(&state, "rcp_1"), "{said}");
+            assert_eq!(state.recipe_busy, None, "{said}");
+            assert_eq!(state.recipe_error.as_deref(), Some(said.as_str()));
+        }
+
+        // A run the page started on another recipe is that recipe's, and is left alone.
+        let mut state = waiting_on_run("rrun_2");
+        state.recipe_open_id = Some("rcp_9".to_string());
+        state.recipe_busy = None;
+        let mut refused = reading(Err(OpenGrokError::from_server(Some(404), "no such recipe")));
+        refused.id = "rcp_9".to_string();
+        assert!(!state.take_polled_recipe(refused));
+        assert!(waits_on(&state, "rcp_1"));
+    }
+
+    /// A reading of a recipe the person has since left is stale: it stops that follower and
+    /// touches nothing, least of all the page now open.
+    #[test]
+    fn a_reading_of_a_recipe_the_person_left_is_dropped() {
+        let mut state = waiting_on_run("rrun_2");
+        state.recipe_open_id = Some("rcp_9".to_string());
+        state.recipe_busy = Some("Saving…".to_string());
+        let done = recipe_with_runs(vec![finished_row("rrun_2")]);
+        assert!(!state.take_polled_recipe(reading(Ok(done))));
+        assert!(state.recipe_open.is_none());
+        assert!(state.recipe_run_result.is_none());
+        assert!(
+            waits_on(&state, "rcp_1"),
+            "coming back to rcp_1 picks it up"
+        );
+        assert_eq!(state.recipe_busy.as_deref(), Some("Saving…"));
+    }
+
+    /// A reading asked for before something else answered with the detail — a grant, a new
+    /// version — may be older than what the page shows, so it is not taken: the follower reads
+    /// again rather than take the page back, and does not stop on what the old reading said.
+    #[test]
+    fn a_reading_older_than_the_page_is_not_taken() {
+        let mut state = waiting_on_run("rrun_2");
+        let newer = recipe_with_runs(vec![playing_row("rrun_2")]);
+        state.recipe_open = Some(newer.clone());
+        // A grant was asked for and answered while the reading was on its way.
+        state.recipe_detail_epoch = 2;
+        let older = recipe_with_runs(vec![finished_row("rrun_2")]);
+        let mut stale = reading(Ok(older));
+        stale.epoch = 0;
+        assert!(state.take_polled_recipe(stale), "read again");
+        assert_eq!(state.recipe_open.as_ref(), Some(&newer));
+        assert!(state.recipe_run_result.is_none());
+        assert!(waits_on(&state, "rcp_1"));
+
+        let mut current = reading(Ok(recipe_with_runs(vec![finished_row("rrun_2")])));
+        current.epoch = 2;
+        assert!(!state.take_polled_recipe(current));
+        assert!(state.recipe_run_result.is_some());
+    }
+
+    /// "Running…" is the run's word, and the run writes and clears only its own: another
+    /// request in flight keeps its label, and with it the page's one-request-at-a-time guard.
+    #[test]
+    fn the_run_holds_only_its_own_word_on_the_page() {
+        let mut state = waiting_on_run("rrun_2");
+        state.recipe_busy = Some("Saving…".to_string());
+        let playing = recipe_with_runs(vec![playing_row("rrun_2")]);
+        assert!(state.take_polled_recipe(reading(Ok(playing.clone()))));
+        assert_eq!(state.recipe_busy.as_deref(), Some("Saving…"));
+
+        let done = recipe_with_runs(vec![finished_row("rrun_2")]);
+        assert!(!state.take_polled_recipe(reading(Ok(done))));
+        assert!(!waits_on(&state, "rcp_1"));
+        assert_eq!(state.recipe_busy.as_deref(), Some("Saving…"));
+
+        // Once the save lands the word is free, and the run takes it back while it plays.
+        let mut state = waiting_on_run("rrun_2");
+        state.recipe_busy = None;
+        assert!(state.take_open_recipe(playing, false));
+        assert_eq!(state.recipe_busy.as_deref(), Some(super::RECIPE_RUNNING));
+    }
+
+    /// A run playing that the page did not start — from chat, or before the app last closed —
+    /// is followed until it is over, without holding the page's Run.
+    #[test]
+    fn a_run_the_page_did_not_start_is_followed_without_holding_the_page() {
+        let mut state = AppState::new();
+        state.recipe_open_id = Some("rcp_1".to_string());
+        let playing = recipe_with_runs(vec![playing_row("rrun_7")]);
+        assert!(state.take_polled_recipe(reading(Ok(playing))));
+        assert_eq!(state.recipe_busy, None);
+        assert!(state.recipe_run_result.is_none());
+
+        let over = recipe_with_runs(vec![run_row(
+            "rrun_7",
+            "finished",
+            true,
+            serde_json::json!({"ok": true, "ran": 2}),
+        )]);
+        assert!(!state.take_polled_recipe(reading(Ok(over))));
+        assert!(
+            state.recipe_run_result.is_none(),
+            "the last-run card is for a run this page started"
+        );
+    }
+
+    /// Longer than any recipe can play is a lease that never lapses. The follower stops rather
+    /// than read forever, and says so rather than leave the page saying "Running…".
+    #[test]
+    fn the_follower_stops_after_an_hour_and_says_so() {
+        let mut state = waiting_on_run("rrun_2");
+        let mut late = reading(Ok(recipe_with_runs(vec![playing_row("rrun_2")])));
+        late.followed = AppState::RECIPE_RUN_FOLLOW_FOR;
+        assert!(!state.take_polled_recipe(late));
+        assert!(!waits_on(&state, "rcp_1"));
+        assert_eq!(state.recipe_busy, None);
+        assert!(
+            state
+                .recipe_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Still playing after an hour")),
+            "{:?}",
+            state.recipe_error
+        );
+    }
+
+    /// Every second while a run is young, then a tenth of the time it has played, and never
+    /// more than ten seconds: a run is seen to end promptly, and a long one is not read in full
+    /// thousands of times.
+    #[test]
+    fn the_follower_reads_less_often_the_longer_a_run_plays() {
+        let wait = |secs: u64| AppState::recipe_run_poll_wait(Duration::from_secs(secs));
+        assert_eq!(wait(0), Duration::from_secs(1));
+        assert_eq!(wait(10), Duration::from_secs(1));
+        assert_eq!(wait(30), Duration::from_secs(3));
+        assert_eq!(wait(100), Duration::from_secs(10));
+        assert_eq!(wait(40 * 60), Duration::from_secs(10));
+    }
+
+    fn started(run_id: &str) -> Result<crate::opengrok::RunRecipeResponse, OpenGrokError> {
+        Ok(crate::opengrok::RunRecipeResponse::Async(
+            crate::opengrok::AsyncRunResponse {
+                run_id: run_id.to_string(),
+            },
+        ))
+    }
+
+    /// The page just after Run on… was pressed on `recipe`, before the server answered.
+    fn pressed_run(recipe: &str) -> AppState {
+        let mut state = AppState::new();
+        state.recipe_open_id = Some(recipe.to_string());
+        state.recipe_busy = Some(super::RECIPE_RUNNING.to_string());
+        state
+    }
+
+    /// A `202` on the recipe still open is the page's run, followed from a fresh start.
+    #[test]
+    fn a_run_the_server_took_is_followed() {
+        let mut state = pressed_run("rcp_1");
+        let next = state.take_run_answer("rcp_1".into(), "cw_1".into(), started("rrun_1"));
+        assert_eq!(next, super::AfterRun::Follow);
+        assert_eq!(
+            state
+                .recipe_runs_in_flight
+                .get("rcp_1")
+                .map(|run| run.run_id.as_str()),
+            Some("rrun_1")
+        );
+        assert_eq!(state.recipe_busy.as_deref(), Some(super::RECIPE_RUNNING));
+    }
+
+    /// A `202` for a recipe the person has left is kept for when they come back, and nothing
+    /// is followed or labelled on the page they are on now.
+    #[test]
+    fn a_run_started_on_a_recipe_since_left_is_picked_up_on_coming_back() {
+        let mut state = AppState::new();
+        state.recipe_open_id = Some("rcp_9".to_string());
+        let next = state.take_run_answer("rcp_1".into(), "cw_1".into(), started("rrun_1"));
+        assert_eq!(next, super::AfterRun::Done);
+        assert!(waits_on(&state, "rcp_1"));
+        assert_eq!(state.recipe_busy, None);
+
+        state.recipe_open_id = Some("rcp_1".to_string());
+        let playing = recipe_with_runs(vec![playing_row("rrun_1")]);
+        assert!(state.take_open_recipe(playing, false), "followed");
+        assert_eq!(state.recipe_busy.as_deref(), Some(super::RECIPE_RUNNING));
+    }
+
+    /// Run on A, then on B, with A's answer landing last: each recipe keeps its own run, so B's
+    /// ends B's wait and A's is still there for A.
+    #[test]
+    fn answers_that_cross_between_recipes_each_keep_their_own_run() {
+        let mut state = pressed_run("rcp_2");
+        let next = state.take_run_answer("rcp_2".into(), "cw_1".into(), started("rrun_b"));
+        assert_eq!(next, super::AfterRun::Follow);
+        let next = state.take_run_answer("rcp_1".into(), "cw_2".into(), started("rrun_a"));
+        assert_eq!(next, super::AfterRun::Done);
+        assert!(waits_on(&state, "rcp_1") && waits_on(&state, "rcp_2"));
+
+        let mut done = reading(Ok(recipe_of("rcp_2", vec![finished_row("rrun_b")])));
+        done.id = "rcp_2".to_string();
+        assert!(!state.take_polled_recipe(done));
+        assert!(state.recipe_run_result.is_some(), "B's run is B's last run");
+        assert_eq!(state.recipe_busy, None, "and B's page is free again");
+        assert!(!waits_on(&state, "rcp_2"));
+        assert!(waits_on(&state, "rcp_1"));
+    }
+
+    /// Any other answer for a recipe the person has left is stale, and dropped.
+    #[test]
+    fn a_late_answer_for_a_recipe_the_person_left_is_dropped() {
+        let outcome: crate::opengrok::RecipeRunResult =
+            serde_json::from_value(serde_json::json!({"version": 2, "ok": true, "ran": 3}))
+                .unwrap();
+        let mut state = AppState::new();
+        state.recipe_open_id = Some("rcp_9".to_string());
+        let next = state.take_run_answer(
+            "rcp_1".into(),
+            "cw_1".into(),
+            Ok(crate::opengrok::RunRecipeResponse::Sync(outcome)),
+        );
+        assert_eq!(next, super::AfterRun::Done);
+        assert!(state.recipe_run_result.is_none());
+
+        let refused = OpenGrokError::from_server(Some(409), "this bot is already playing");
+        let next = state.take_run_answer("rcp_1".into(), "cw_1".into(), Err(refused));
+        assert_eq!(next, super::AfterRun::Done);
+        assert!(state.recipe_error.is_none());
+        assert!(state.recipe_runs_in_flight.is_empty());
+    }
+
+    /// A server that waits answers with the outcome itself, and the page reads the recipe
+    /// again for the history the run joined.
+    #[test]
+    fn a_server_that_waits_is_taken_at_its_word() {
+        let outcome: crate::opengrok::RecipeRunResult =
+            serde_json::from_value(serde_json::json!({"version": 2, "ok": true, "ran": 3}))
+                .unwrap();
+        let mut state = pressed_run("rcp_1");
+        let next = state.take_run_answer(
+            "rcp_1".into(),
+            "cw_1".into(),
+            Ok(crate::opengrok::RunRecipeResponse::Sync(outcome)),
+        );
+        assert_eq!(next, super::AfterRun::Reload);
+        assert_eq!(
+            state.recipe_run_result.map(|outcome| outcome.headline()),
+            Some("Ran 3 steps of v2".to_string())
+        );
+        assert_eq!(state.recipe_busy, None);
+        assert!(state.recipe_runs_in_flight.is_empty());
+    }
+
+    /// When a run may have started — no answer was read, or the server says it played and
+    /// could not write it down — the history is what can say, so the page reads it again. A
+    /// refusal started nothing, and is only said.
+    #[test]
+    fn a_run_that_may_have_started_sends_the_page_to_its_history() {
+        let maybe = [
+            OpenGrokError::status(
+                503,
+                "the run played but could not be written to the recipe's history: pool timed out",
+            )
+            .with_history_missed(),
+            OpenGrokError::message("error decoding response body"),
+            OpenGrokError::from_server(Some(504), "Gateway Timeout"),
+        ];
+        for error in maybe {
+            let mut state = pressed_run("rcp_1");
+            let said = error.message.clone();
+            let next = state.take_run_answer("rcp_1".into(), "cw_1".into(), Err(error));
+            assert_eq!(next, super::AfterRun::Reload, "{said}");
+            assert_eq!(state.recipe_error.as_deref(), Some(said.as_str()));
+            assert_eq!(state.recipe_busy, None, "{said}");
+        }
+
+        let mut state = pressed_run("rcp_1");
+        let busy = "this bot is already playing a recipe; wait for that run to finish";
+        let refused = OpenGrokError::from_server(Some(409), busy);
+        let next = state.take_run_answer("rcp_1".into(), "cw_1".into(), Err(refused));
+        assert_eq!(next, super::AfterRun::Done);
+        assert_eq!(state.recipe_error.as_deref(), Some(busy));
+        assert_eq!(state.recipe_busy, None);
     }
 }

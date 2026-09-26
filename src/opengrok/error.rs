@@ -69,6 +69,8 @@ pub struct OpenGrokError {
     failure: Failure,
     /// The `pending-user-message` CUSTOM a pending-route refusal carried.
     pending_event: Option<serde_json::Value>,
+    /// A run route's `503` carried `historyMissed`: see [`Self::history_missed`].
+    history_missed: bool,
 }
 
 impl OpenGrokError {
@@ -78,6 +80,7 @@ impl OpenGrokError {
             message: message.into(),
             failure: Failure::Verdict,
             pending_event: None,
+            history_missed: false,
         }
     }
 
@@ -87,6 +90,7 @@ impl OpenGrokError {
             message: message.into(),
             failure: Failure::Verdict,
             pending_event: None,
+            history_missed: false,
         }
     }
 
@@ -102,6 +106,7 @@ impl OpenGrokError {
             message: message.into(),
             failure: Failure::SignedOut,
             pending_event: None,
+            history_missed: false,
         }
     }
 
@@ -123,6 +128,7 @@ impl OpenGrokError {
                 Failure::Verdict
             },
             pending_event: None,
+            history_missed: false,
         }
     }
 
@@ -144,6 +150,7 @@ impl OpenGrokError {
             message,
             failure,
             pending_event: None,
+            history_missed: false,
         }
     }
 
@@ -212,6 +219,19 @@ impl OpenGrokError {
 
     pub(super) fn with_pending_event(mut self, event: Option<serde_json::Value>) -> Self {
         self.pending_event = event;
+        self
+    }
+
+    /// The run PLAYED, and the server could not write it into the recipe's history: a run
+    /// route's `503` with `historyMissed` beside the receipt (opengrok-server #217). Not a
+    /// refusal of the run — the clicks happened — and the message is the server's sentence
+    /// saying so.
+    pub fn history_missed(&self) -> bool {
+        self.history_missed
+    }
+
+    pub(crate) fn with_history_missed(mut self) -> Self {
+        self.history_missed = true;
         self
     }
 }
