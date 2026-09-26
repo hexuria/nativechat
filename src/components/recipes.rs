@@ -19,7 +19,9 @@ use crate::opengrok::{
     RecipeDetail, RecipeParameter, RecipeRelation, RecipeRun, RecipeScreen, RecipeShare,
     RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTapeEvent, RecipeVersion,
 };
-use crate::state::{AppState, RecipeFilter, RecipeRunNote, RecipeRunOutcome, RightPane};
+use crate::state::{
+    AppState, RECIPE_RUNNING, RecipeFilter, RecipeRunNote, RecipeRunOutcome, RightPane,
+};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -1430,7 +1432,7 @@ impl RecipesView {
             .flatten()
             .filter(|version| version.is_edited())
             .map(|version| version.version);
-        let running = busy == Some("Running…");
+        let running = busy == Some(RECIPE_RUNNING);
         let picked = self.picked_bot(detail);
         let granted = granted_bots(detail);
         let version = detail.runnable_version().map(|version| version.version);
@@ -1458,7 +1460,7 @@ impl RecipesView {
                                 Button::new("recipe-run")
                                     .small()
                                     .primary()
-                                    .label(if running { "Running…" } else { "Run" })
+                                    .label(if running { RECIPE_RUNNING } else { "Run" })
                                     .disabled(!can_run)
                                     .on_click({
                                         let app = app.clone();
@@ -2524,6 +2526,40 @@ fn history_tab(
         .into_any_element()
 }
 
+/// What a run came to, in the history's words. The state before `ok`: a run still playing has
+/// `ok: false` because it has not finished.
+fn run_outcome_words(run: &RecipeRun) -> String {
+    if run.is_running() {
+        "running".to_string()
+    } else if run.is_interrupted() {
+        "interrupted".to_string()
+    } else if run.ok {
+        "ok".to_string()
+    } else {
+        match run.stopped_at {
+            Some(step) => format!("stopped at step {step}"),
+            None => "stopped".to_string(),
+        }
+    }
+}
+
+/// Whether the history draws a run in the colour of trouble: one that stopped, or whose end was
+/// never written down. A run still playing has not gone wrong.
+fn run_went_wrong(run: &RecipeRun) -> bool {
+    !run.ok && !run.is_running()
+}
+
+/// What an open run says where its receipt has no steps.
+fn no_receipt_words(run: &RecipeRun) -> &'static str {
+    if run.is_running() {
+        "Still playing: its receipt comes when it finishes."
+    } else if run.is_interrupted() {
+        "How this run ended was never written down, so what the box did is not known."
+    } else {
+        "This run kept no step-by-step receipt."
+    }
+}
+
 /// One run: when it ran, which bot, and what it came to — and under it, when it is the open
 /// one, what the box said of every step.
 fn history_run_row(
@@ -2534,14 +2570,7 @@ fn history_run_row(
     muted: Hsla,
     theme: &Theme,
 ) -> AnyElement {
-    let outcome = if run.ok {
-        "ok".to_string()
-    } else {
-        match run.stopped_at {
-            Some(step) => format!("stopped at step {step}"),
-            None => "stopped".to_string(),
-        }
-    };
+    let outcome = run_outcome_words(run);
     let error = run.error();
     let id = run.id.clone();
     v_flex()
@@ -2580,10 +2609,10 @@ fn history_run_row(
                         .min_w_0()
                         .text_sm()
                         .truncate()
-                        .text_color(if run.ok {
-                            theme.foreground
-                        } else {
+                        .text_color(if run_went_wrong(run) {
                             theme.danger
+                        } else {
+                            theme.foreground
                         })
                         .child(format!(
                             "{} · {} · {outcome}",
@@ -2630,7 +2659,7 @@ fn history_receipt(
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child("This run kept no step-by-step receipt."),
+                    .child(no_receipt_words(run)),
             )
         })
         .children(steps.iter().enumerate().map(|(index, (ok, step_error))| {
@@ -4126,11 +4155,12 @@ mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over
     // the one the test harness wants.
     use super::{
-        COLUMN_MAX, ListBody, MAX_WAIT_MS, RecipeDetail, RecipeFilter, RecipeParameter,
+        COLUMN_MAX, ListBody, MAX_WAIT_MS, RecipeDetail, RecipeFilter, RecipeParameter, RecipeRun,
         RecipeScreen, RecipeStep, RecipeSummary, RecipeTapeEvent, RecipeVersion, StepKind,
         about_edited, build_step, empty_words, event_offset, filtered_version, list_body,
-        list_column_width, parameter_detail, row_stacks, runs_of, shown_version, step_param_values,
-        step_words, tape_words, version_kind, version_of,
+        list_column_width, no_receipt_words, parameter_detail, row_stacks, run_outcome_words,
+        run_went_wrong, runs_of, shown_version, step_param_values, step_words, tape_words,
+        version_kind, version_of,
     };
     use serde_json::{Value, json};
 
@@ -4639,6 +4669,42 @@ mod tests {
             shown_version(&taped, None).map(|version| version.version),
             Some(1),
             "a tape with nothing filtered from it yet is still shown"
+        );
+    }
+
+    /// A history row reads the run's state before its `ok`: a run still playing has `ok: false`
+    /// because it has not finished, which is neither "stopped" nor trouble, and an interrupted
+    /// one says that how it ended was never written down.
+    #[test]
+    fn a_history_row_reads_the_state_before_ok() {
+        let row = |value: Value| -> RecipeRun { serde_json::from_value(value).unwrap() };
+        let placeholder = json!({"ok": false, "running": true});
+        let running =
+            row(json!({"id": "r1", "ok": false, "state": "running", "receipt": placeholder}));
+        let lapsed =
+            row(json!({"id": "r2", "ok": false, "state": "interrupted", "receipt": placeholder}));
+        let fine = row(
+            json!({"id": "r3", "ok": true, "state": "finished", "receipt": {"ok": true, "ran": 1}}),
+        );
+        let stopped = row(
+            json!({"id": "r4", "ok": false, "state": "finished", "stoppedAt": 2,
+                                 "receipt": {"ok": false, "ran": 2}}),
+        );
+        // A server from before the lease names no state: it wrote a run down once it was over.
+        let old = row(json!({"id": "r5", "ok": false, "receipt": {"ok": false}}));
+
+        let read = |run: &RecipeRun| (run_outcome_words(run), run_went_wrong(run));
+        assert_eq!(read(&running), ("running".to_string(), false));
+        assert_eq!(read(&lapsed), ("interrupted".to_string(), true));
+        assert_eq!(read(&fine), ("ok".to_string(), false));
+        assert_eq!(read(&stopped), ("stopped at step 2".to_string(), true));
+        assert_eq!(read(&old), ("stopped".to_string(), true));
+
+        assert!(no_receipt_words(&running).starts_with("Still playing"));
+        assert!(no_receipt_words(&lapsed).starts_with("How this run ended was never written down"));
+        assert_eq!(
+            no_receipt_words(&old),
+            "This run kept no step-by-step receipt."
         );
     }
 }

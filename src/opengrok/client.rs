@@ -32,6 +32,10 @@ const REFRESH_COOKIE: &str = "og_refresh";
 /// that is slow to leave; short enough that a token is not thrown away while it still works.
 const REFRESH_SLACK: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// RFC 7240's word for "answer now and do the work after". A route that honours it answers
+/// `202`; one that does not answers exactly as it would have without it.
+const RESPOND_ASYNC: &str = "respond-async";
+
 /// What the app says when the session is gone and the server sent no sentence of its own.
 ///
 /// Addressed to the person, because signing in is a thing only a person can do, and it names no
@@ -298,18 +302,34 @@ impl OpenGrokClient {
         path: &str,
         body: Option<&T>,
     ) -> Result<reqwest::Response, OpenGrokError> {
-        self.send_json_within(method, path, body, None).await
+        self.send_json_within(method, path, body, None, None).await
+    }
+
+    /// [`Self::send_json`] asking not to be waited on (`Prefer: respond-async`), for a route
+    /// that can answer `202` and finish the work after it has answered. Whether it did is in the
+    /// status, not in what was asked: a server that does not honour the preference answers the
+    /// way it always has.
+    async fn send_json_with_prefer_async<T: Serialize>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&T>,
+    ) -> Result<reqwest::Response, OpenGrokError> {
+        self.send_json_within(method, path, body, None, Some(RESPOND_ASYNC))
+            .await
     }
 
     /// [`Self::send_json`] with a deadline of its own, for the one kind of route that is not a
     /// database read: one that waits on a model. `None` is every other route, which takes the
-    /// client's default and has no deadline of its own.
+    /// client's default and has no deadline of its own. `prefer` is an RFC 7240 `Prefer` header,
+    /// for the routes that honour one.
     async fn send_json_within<T: Serialize>(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&T>,
         timeout: Option<std::time::Duration>,
+        prefer: Option<&str>,
     ) -> Result<reqwest::Response, OpenGrokError> {
         let url = self.url(path)?;
         self.ensure_fresh_token(path).await;
@@ -323,6 +343,9 @@ impl OpenGrokClient {
             }
             if let Some(timeout) = timeout {
                 req = req.timeout(timeout);
+            }
+            if let Some(prefer) = prefer {
+                req = req.header("Prefer", prefer);
             }
             req
         };
@@ -1526,18 +1549,68 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
-    /// Play the recipe's current version on one of the person's bots and wait for the outcome.
+    /// Play the recipe's current version on one of the person's bots.
+    ///
+    /// Asked for without waiting. Since opengrok-server #217 a run is the server's from the
+    /// moment its row is written, and it plays on whether or not anybody still holds this
+    /// request — so what is worth having back is the `202` with the run's id, and what the run
+    /// came to is read off that run's row in [`Self::recipe`] once its [`RecipeRun::state`]
+    /// says it is over. A server that waits anyway (one from before #217) answers `200` with
+    /// the outcome itself, read as it always was.
+    ///
+    /// THIS IS THE CLIENT THAT READS THE ASYNC REPLY (hexuria/opengrok-server#227): with it
+    /// shipped, the server can make `202` its default.
     pub async fn run_recipe(
         &self,
         id: &str,
         coworker_id: &str,
-    ) -> Result<RecipeRunResult, OpenGrokError> {
+    ) -> Result<RunRecipeResponse, OpenGrokError> {
         let path = format!("/recipes/{id}/run");
         let body = json!({ "coworkerId": coworker_id });
         let response = self
-            .send_json(reqwest::Method::POST, &path, Some(&body))
+            .send_json_with_prefer_async(reqwest::Method::POST, &path, Some(&body))
             .await?;
-        Self::json_or_error(response).await
+        if !response.status().is_success() {
+            return Err(Self::run_error(response).await);
+        }
+        if response.status() == StatusCode::ACCEPTED {
+            return Self::json_or_error(response)
+                .await
+                .map(RunRecipeResponse::Async);
+        }
+        Self::json_or_error(response)
+            .await
+            .map(RunRecipeResponse::Sync)
+    }
+
+    /// What a refusal from `POST /recipes/{id}/run` says.
+    ///
+    /// Read apart from [`Self::read_error`] for one answer that is not a refusal of the run at
+    /// all: a `503` with `historyMissed` is a run that played and whose history could not be
+    /// written. Its body is the receipt with that sentence beside it, and the receipt's `error`
+    /// — what the general reader would take — is about a step, not about why the answer is not
+    /// a `200`. So the sentence is what the refusal says; see [`OpenGrokError::history_missed`].
+    ///
+    /// Only an answer that waited carries it. The server that writes `historyMissed` is the one
+    /// that honours `Prefer: respond-async` (both opengrok-server 1ca8756), so this reads it
+    /// when the preference did not reach the route — something between them dropped it. A run
+    /// that was not waited on and could not be written down has only its row to say so, and
+    /// the row reads `interrupted` once its lease lapses.
+    ///
+    /// Every other refusal is the server's own sentence, as anywhere else. Among them is the
+    /// `409` "this bot is already playing a recipe", which since opengrok-server #246 a recipe
+    /// played from chat can cause as well as one played from here.
+    async fn run_error(response: reqwest::Response) -> OpenGrokError {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let missed = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|body| Some(body.get("historyMissed")?.as_str()?.trim().to_string()))
+            .filter(|missed| !missed.is_empty());
+        match missed {
+            Some(missed) => OpenGrokError::status(status, missed).with_history_missed(),
+            None => OpenGrokError::from_server(Some(status), error_message_from_body(&body)),
+        }
     }
 
     pub async fn delete_recipe(&self, id: &str) -> Result<(), OpenGrokError> {
@@ -1670,6 +1743,7 @@ impl OpenGrokClient {
                 "/skills/from-tape",
                 Some(&body),
                 Some(SKILL_FROM_TAPE_TIMEOUT),
+                None,
             )
             .await?;
         if !response.status().is_success() {
@@ -3273,6 +3347,15 @@ pub struct RecipeRun {
     pub coworker_id: String,
     #[serde(default)]
     pub ok: bool,
+    /// `running`, `finished`, or `interrupted` (opengrok-server `RecipeRunRow::state`, #217),
+    /// which the server reads off the lease it holds on a run while something plays it.
+    ///
+    /// A run is written down before the box is asked to play it, so a running row has
+    /// `ok: false` because it has not finished, not because it failed: `ok` alone no longer
+    /// says a run went wrong. A server from before the lease names no state, and it wrote a
+    /// run down only once the run was over.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub state: String,
     /// The step the run stopped at, when it did not finish.
     #[serde(default)]
     pub stopped_at: Option<u64>,
@@ -3285,6 +3368,34 @@ pub struct RecipeRun {
 }
 
 impl RecipeRun {
+    /// Still playing: its `ok` is false only because it has not finished yet.
+    pub fn is_running(&self) -> bool {
+        self.state == "running"
+    }
+
+    /// Its lease ran out with how it ended never written down: whatever was playing it stopped,
+    /// or could not write what it came to. What the box did is not known, and its receipt is the
+    /// placeholder it started with.
+    ///
+    /// Not quite an ending on the server, which does not fence a lapsed lease: a run whose
+    /// renewals only stalled can read as running again, and one that finishes late is written
+    /// down as finished. See `AppState::settle_recipe_run` for how the page waits on one.
+    pub fn is_interrupted(&self) -> bool {
+        self.state == "interrupted"
+    }
+
+    /// Over as the row stands: finished, interrupted, or from a server that wrote runs down only
+    /// once they were over. A state this client has no word for is not taken for an ending.
+    pub fn is_over(&self) -> bool {
+        matches!(self.state.as_str(), "finished" | "interrupted" | "")
+    }
+
+    /// How many steps ran: the receipt's `ran`, read the way [`RecipeRunResult::ran_count`]
+    /// reads the same word off the run route.
+    pub fn ran_count(&self) -> Option<u64> {
+        count_ran(self.receipt.get("ran"))
+    }
+
     /// Every step of the run as the box reported it: whether it did what it was asked, and
     /// what went wrong where it did not.
     pub fn receipt_steps(&self) -> Vec<(bool, Option<String>)> {
@@ -3404,12 +3515,38 @@ pub struct RecipeRunResult {
 
 impl RecipeRunResult {
     pub fn ran_count(&self) -> Option<u64> {
-        match &self.ran {
-            Some(Value::Number(count)) => count.as_u64(),
-            Some(Value::Array(steps)) => Some(steps.len() as u64),
-            _ => None,
-        }
+        count_ran(self.ran.as_ref())
     }
+}
+
+/// A `ran` as the box writes it: a count, or the steps themselves.
+fn count_ran(ran: Option<&Value>) -> Option<u64> {
+    match ran {
+        Some(Value::Number(count)) => count.as_u64(),
+        Some(Value::Array(steps)) => Some(steps.len() as u64),
+        _ => None,
+    }
+}
+
+/// The `202` `POST /recipes/{id}/run` answers a caller that asked not to wait
+/// (opengrok-server `recipes::run`, #217): `{recipe, version, runId, state: "running"}`, sent
+/// once the run's row is written and before the box has done anything. Only the id is read;
+/// what the run came to is on its row, see [`RecipeRun::state`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsyncRunResponse {
+    /// The run's own id, `rrun_…`. It is the [`RecipeRun::id`] of the row that will say how
+    /// the run went: the server writes the row under the id it answers with.
+    pub run_id: String,
+}
+
+/// What `POST /recipes/{id}/run` came back with.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunRecipeResponse {
+    /// `202`: the run is playing on the server, and its row in the history is where it ends.
+    Async(AsyncRunResponse),
+    /// `200`: a server that played the run before it answered, and answered with the outcome.
+    Sync(RecipeRunResult),
 }
 
 /// Where a skill's prose came from.
@@ -6422,6 +6559,65 @@ mod tests {
         );
     }
 
+    /// Run rows exactly as `GET /recipes/{id}` sends them since opengrok-server #217: the
+    /// stored row, camelCase, with `state` and `artifacts` put beside it. A run is written down
+    /// before the box is asked, so a running row carries `ok: false` and a placeholder receipt.
+    #[test]
+    fn a_run_row_says_whether_it_is_still_playing() {
+        let runs: Vec<RecipeRun> = serde_json::from_value(json!([
+            {"id": "rrun_3", "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1", "runId": "rrun_3",
+             "ok": false, "stoppedAt": null, "receipt": {"ok": false, "running": true}, "atMs": 9,
+             "leaseUntilMs": 60009, "state": "running", "artifacts": []},
+            {"id": "rrun_2", "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1", "runId": "rrun_2",
+             "ok": true, "stoppedAt": null,
+             "receipt": {"ok": true, "ran": 3, "stopped_at": null, "steps": [{"ok": true}, {"ok": true}, {"ok": true}]},
+             "atMs": 7, "leaseUntilMs": null, "state": "finished",
+             "artifacts": [{"id": "art_1", "kind": "screenshot", "mime": "image/png", "stepIndex": 0, "sizeBytes": 10, "meta": {}}]},
+            {"id": "rrun_1", "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1", "runId": "rrun_1",
+             "ok": false, "stoppedAt": null, "receipt": {"ok": false, "running": true}, "atMs": 5,
+             "leaseUntilMs": 60005, "state": "interrupted", "artifacts": []},
+            // A server from before the lease names no state: it wrote a run down once it was over.
+            {"id": "rrun_0", "recipeId": "rcp_1", "version": 2, "coworkerId": "cw_1",
+             "ok": false, "stoppedAt": 1, "receipt": {"ok": false, "ran": 1, "error": "nothing at (5, 5)"}, "atMs": 3},
+            {"id": "rrun_9", "state": "a word from the future"},
+            {"id": "rrun_8", "state": null},
+        ]))
+        .unwrap();
+
+        let running = &runs[0];
+        assert!(running.is_running());
+        assert!(
+            !running.is_over(),
+            "a running row has not come to anything yet"
+        );
+        assert!(
+            !running.ok,
+            "and it says so with `ok: false`, which is not a failure"
+        );
+        assert_eq!(running.error(), None);
+
+        let finished = &runs[1];
+        assert!(finished.is_over() && !finished.is_running() && !finished.is_interrupted());
+        assert_eq!(finished.ran_count(), Some(3));
+
+        let interrupted = &runs[2];
+        assert!(interrupted.is_interrupted());
+        assert!(interrupted.is_over());
+        assert!(!interrupted.is_running());
+
+        let old = &runs[3];
+        assert_eq!(old.state, "");
+        assert!(old.is_over() && !old.is_running());
+        assert_eq!(old.ran_count(), Some(1));
+        assert_eq!(old.error().as_deref(), Some("nothing at (5, 5)"));
+
+        assert!(
+            !runs[4].is_over() && !runs[4].is_running(),
+            "a word this client does not know is not taken for an ending"
+        );
+        assert!(runs[5].is_over(), "null reads as no state at all");
+    }
+
     #[test]
     fn a_raw_version_takes_the_tape_or_its_count() {
         let with_tape: RecipeVersion = serde_json::from_value(json!({
@@ -6761,6 +6957,128 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status, Some(403));
         assert_eq!(error.message, "Only the owner can share a recipe.");
+    }
+
+    /// Run asks not to wait, and the `202` is what opengrok-server #217 answers that with: the
+    /// run's id, before the box has done anything. The mock only answers a request that carries
+    /// the preference, so a run sent without it fails here.
+    #[tokio::test]
+    async fn a_run_asks_not_to_wait_and_takes_the_run_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_1/run"))
+            .and(wiremock::matchers::header("prefer", "respond-async"))
+            .and(body_json(json!({ "coworkerId": "cw_1" })))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("preference-applied", "respond-async")
+                    .set_body_json(json!({
+                        "recipe": "rcp_1", "version": 2, "runId": "rrun_1", "state": "running",
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let answer = client.run_recipe("rcp_1", "cw_1").await.unwrap();
+        assert_eq!(
+            answer,
+            RunRecipeResponse::Async(AsyncRunResponse {
+                run_id: "rrun_1".to_string()
+            })
+        );
+    }
+
+    /// A server that waits for the run before it answers — any from before #217, which never
+    /// heard of the preference — still gets its outcome read the way it always was, though the
+    /// request asked not to wait.
+    #[tokio::test]
+    async fn a_server_that_waits_still_answers_with_the_outcome() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_1/run"))
+            .and(wiremock::matchers::header("prefer", "respond-async"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "recipe": "rcp_1", "version": 2, "runId": "rrun_1", "ok": true, "ran": 3,
+                "stoppedAt": null, "error": null, "image": null, "artifacts": [],
+                "artifactsMissed": [],
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let Ok(RunRecipeResponse::Sync(outcome)) = client.run_recipe("rcp_1", "cw_1").await else {
+            panic!("a 200 is the outcome itself");
+        };
+        assert!(outcome.ok);
+        assert_eq!(outcome.version, 2);
+        assert_eq!(outcome.ran_count(), Some(3));
+    }
+
+    /// One run per bot at a time. The sentence is the server's, and it goes to the person as it
+    /// came: since opengrok-server #246 the run holding the bot may be one played from chat.
+    #[tokio::test]
+    async fn a_bot_already_playing_a_recipe_is_the_servers_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_1/run"))
+            .respond_with(ResponseTemplate::new(409).set_body_string(
+                "this bot is already playing a recipe; wait for that run to finish",
+            ))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.run_recipe("rcp_1", "cw_1").await.unwrap_err();
+        assert_eq!(error.status, Some(409));
+        assert_eq!(
+            error.message,
+            "this bot is already playing a recipe; wait for that run to finish"
+        );
+        assert_eq!(error.failure(), Failure::Verdict);
+        assert!(!error.history_missed());
+    }
+
+    /// A `503` with `historyMissed` is a run that PLAYED and was not written down. Its body is the
+    /// receipt with the sentence beside it, and the receipt's own `error` is about a step: read
+    /// the general way, the page would have said that step's error as the reason, or shown the
+    /// whole JSON. Any other `503` is a refusal like the rest.
+    #[tokio::test]
+    async fn a_run_that_played_but_was_not_written_down_says_so_in_the_servers_words() {
+        let server = MockServer::start().await;
+        let missed =
+            "the run played but could not be written to the recipe's history: pool timed out";
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_1/run"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "recipe": "rcp_1", "version": 2, "runId": "rrun_1", "ok": false, "ran": 2,
+                "stoppedAt": 2, "error": "nothing at (5, 5)", "image": null, "artifacts": [],
+                "artifactsMissed": [], "historyMissed": missed,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_2/run"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(
+                "the run could not be written down, so nothing was played: pool timed out",
+            ))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let played = client.run_recipe("rcp_1", "cw_1").await.unwrap_err();
+        assert!(played.history_missed());
+        assert_eq!(played.status, Some(503));
+        assert_eq!(played.message, missed);
+        assert_eq!(
+            played.failure(),
+            Failure::Verdict,
+            "the server answered, and said what happened"
+        );
+
+        let refused = client.run_recipe("rcp_2", "cw_1").await.unwrap_err();
+        assert!(!refused.history_missed());
+        assert_eq!(
+            refused.message,
+            "the run could not be written down, so nothing was played: pool timed out"
+        );
     }
 
     /// The listing is the rows themselves, and the scope word goes on the query. A `source` this
