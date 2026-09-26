@@ -1,0 +1,8 @@
+# Pinned so a laptop and CI judge the code with the same compiler. On a floating toolchain a
+# lint can fire only on the runner, and a red build nobody can reproduce at their desk is a gate
+# nobody trusts. Bumping this is a deliberate change that fixes whatever the new clippy finds in
+# the same PR.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

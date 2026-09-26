@@ -20,6 +20,8 @@ version = "0.1.0"
 edition = "2024"
 # `cargo bundle` will not build the .app without it.
 description = "Chat with bots that work on their own computers."
+# An app, not a library: nothing here is meant for crates.io.
+publish = false
 
 [features]
 default = []
@@ -30,7 +32,9 @@ agent = ["dep:gpui-agent"]
 [dependencies]
 gpui-kit = "0.6"
 gpui-fps = "0.6"
-gpui-agent = { git = "https://github.com/hexuria/gpui-agent", optional = true }
+# Pinned to a commit: a git dependency with no rev follows whatever its branch says today, so
+# two builds of the same tree could get two different agents.
+gpui-agent = { git = "https://github.com/hexuria/gpui-agent", rev = "a5877168c718b7f3181ad0e4d690b6d8bf250478", optional = true }
 raw-window-handle = "0.6"
 # Screenshots arrive base64 in AG-UI frames and are decoded once into a gpui Image.
 base64 = "0.22"
