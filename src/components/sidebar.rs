@@ -3,7 +3,7 @@ use crate::chrome::{
 };
 use crate::components::persona::PersonaMark;
 use crate::icons::NativeIcon;
-use crate::state::{AppSettingsTab, AppState, Conversation};
+use crate::state::{AppSettingsTab, AppState, Conversation, THREAD_LIST_UNAVAILABLE};
 use chrono::NaiveDateTime;
 use gpui_kit::assets::IconNamed;
 use gpui_kit::base::{Align, ElementExt as _, POPUP_PRIORITY, Placement, Positioner};
@@ -38,6 +38,7 @@ struct SidebarRev {
     renaming: Option<String>,
     account_label: String,
     account_email: String,
+    thread_list_unavailable: bool,
 }
 
 impl SidebarRev {
@@ -86,6 +87,7 @@ impl SidebarRev {
                 .as_ref()
                 .map(|a| a.email.clone())
                 .unwrap_or_default(),
+            thread_list_unavailable: state.thread_list_unavailable,
         }
     }
 }
@@ -234,6 +236,7 @@ impl Render for SidebarView {
         let conversations = state.conversations.clone();
         let active_coworker = state.active_coworker_id.clone();
         let hidden_ids = state.hidden_coworker_ids.clone();
+        let thread_list_unavailable = state.thread_list_unavailable;
         let any_modal_open = state.is_voice_mode_open || state.is_app_settings_open;
         let account_label = state
             .account
@@ -486,6 +489,19 @@ impl Render for SidebarView {
                                             rail_hover,
                                             view.clone(),
                                         ))
+                                    })
+                                    // Under the bots it is about: their order and times are
+                                    // only what this Mac knew.
+                                    .when(!collapsed && thread_list_unavailable, |this| {
+                                        this.child(
+                                            div()
+                                                .id("thread-list-unavailable")
+                                                .w_full()
+                                                .px(px(9.))
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(THREAD_LIST_UNAVAILABLE),
+                                        )
                                     }),
                             ),
                     ),
@@ -959,9 +975,14 @@ fn rail_preview(conversation: Option<&Conversation>) -> (String, String) {
         .map(|message| rail_preview_text(&message.content))
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "No messages yet".into());
+    let since = if conversation.known_only_from_list() {
+        &conversation.updated_at
+    } else {
+        &conversation.created_at
+    };
     let time = match last {
         Some(message) => rail_card_time(message.sent_at),
-        None => NaiveDateTime::parse_from_str(&conversation.created_at, "%Y-%m-%d %H:%M:%S")
+        None => NaiveDateTime::parse_from_str(since, "%Y-%m-%d %H:%M:%S")
             .ok()
             .map(|dt| rail_card_time(SystemTime::from(dt.and_utc())))
             .unwrap_or_default(),
@@ -1125,4 +1146,45 @@ fn agent_menu(
             app.update(cx, |state, cx| state.delete_coworker(id.clone(), cx));
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    // Named imports, not a glob: this module globs `gpui_kit::*`, whose root re-exports GPUI's
+    // own `test` attribute, and a glob here would make every `#[test]` below resolve to it.
+    use super::{rail_card_time, rail_preview};
+    use crate::state::Conversation;
+    use std::time::{Duration, SystemTime};
+
+    fn unopened(created_at: &str, updated_at: &str) -> Conversation {
+        Conversation {
+            id: "cw_1".to_string(),
+            title: "cw_1".to_string(),
+            created_at: created_at.to_string(),
+            updated_at: updated_at.to_string(),
+            messages: Vec::new(),
+            unread_count: 0,
+        }
+    }
+
+    /// A thread the server listed has no start this Mac knows of, and its card carries when it
+    /// last moved rather than no time at all. One this Mac began keeps the time it began.
+    #[test]
+    fn a_listed_thread_is_dated_by_when_it_last_moved() {
+        let (_, listed) = rail_preview(Some(&unopened("", "2026-09-21 14:13:20")));
+        assert_eq!(
+            listed,
+            rail_card_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000))
+        );
+        assert!(!listed.is_empty());
+
+        let (_, local) = rail_preview(Some(&unopened(
+            "2026-09-01 10:00:00",
+            "2026-09-21 14:13:20",
+        )));
+        assert_eq!(
+            local,
+            rail_card_time(SystemTime::UNIX_EPOCH + Duration::from_secs(1_788_256_800))
+        );
+    }
 }

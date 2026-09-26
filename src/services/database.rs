@@ -67,6 +67,24 @@ impl DatabaseService {
         Ok(())
     }
 
+    /// A session row for a thread the server listed and this Mac has never had.
+    ///
+    /// It is written with the thread's latest activity as the server gave it, not the moment it
+    /// was written, so it sorts and reads as that on the next launch. When the thread began is
+    /// not known here, and `created_at` is left empty to say so. A row that exists is left
+    /// alone.
+    pub async fn keep_listed_session(&self, id: &str, title: &str, updated_at: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO chat_sessions (id, title, created_at, updated_at) VALUES (?, ?, '', ?)",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_sessions(&self) -> Result<Vec<ChatSession>> {
         let rows = sqlx::query_as::<_, ChatSession>(
             "SELECT id, title, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC",

@@ -19,19 +19,21 @@ use crate::opengrok::{
     QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRunResult, RecipeShareTarget,
     RecipeStep, RecipeSummary, ReplyQuote, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
     SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind, ScheduleRow, ScreenshotSpec, SkillDetail,
-    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable,
-    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
-    activity_from_replay, approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster,
-    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
-    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
-    keep_local_save_offer, place_hitl_cards_in_document_order, policy_answer,
-    reads_as_gateway_unreachable, retry_enqueue, save_login_from_local, serve_local_exec,
-    stamp_duration, stored_machine_id, tool_standin,
+    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
+    ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE,
+    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
+    WAITING_FOR_YOU, activity_from_replay, approval_summary, box_handoff_resolve_entry_id,
+    collapse_computer_roster, command_from_args, command_from_replay_events, deeds_from_replay,
+    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_available,
+    host_egress_tunnel_flag, keep_local_save_offer, place_hitl_cards_in_document_order,
+    policy_answer, reads_as_gateway_unreachable, retry_enqueue, save_login_from_local,
+    serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
-use crate::services::database::{ChatMessage, DatabaseService, MessagePart, ReplyRef, SaveStamp};
+use crate::services::database::{
+    ChatMessage, ChatSession, DatabaseService, MessagePart, ReplyRef, SaveStamp,
+};
 use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
@@ -520,6 +522,12 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// A thread known only from the server's list: it began before this Mac knew of it, so
+    /// there is no start for it here, and when it last moved is the time there is for it.
+    pub fn known_only_from_list(&self) -> bool {
+        self.created_at.is_empty()
+    }
+
     pub fn relative_time(&self) -> String {
         let now = SystemTime::now();
 
@@ -1394,6 +1402,91 @@ fn system_time_ms(at: SystemTime) -> u128 {
         .unwrap_or(0)
 }
 
+/// A server's millisecond clock as a session row carries it: whole seconds in UTC, which is what
+/// SQLite's `CURRENT_TIMESTAMP` writes into every other row of `chat_sessions` and what the
+/// sidebar reads back. Empty for a time chrono cannot hold, which reads as no time at all.
+fn session_time_of_ms(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|at| at.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+/// How many threads one page of the server's list is asked for: the most the server will put on
+/// one. The walk goes on until a page comes back empty, so this only sets how many round trips a
+/// long history takes.
+const THREAD_LIST_PAGE: u32 = 100;
+
+/// What the sidebar says when the server's list of the person's threads cannot be had.
+pub const THREAD_LIST_UNAVAILABLE: &str =
+    "The server's list of your conversations is unavailable right now.";
+
+/// What a thread the server lists without a title is called here: what a new chat is called.
+const UNTITLED_THREAD: &str = "New Chat";
+
+/// A thread the server listed that this Mac had no row for, as it is written down.
+#[derive(Clone, Debug, PartialEq)]
+struct ListedThread {
+    id: String,
+    title: String,
+    /// When the thread last moved, as a session row carries it.
+    updated_at: String,
+}
+
+/// Every thread the server lists for this account, newest first and each one once, and what
+/// stopped the walk when something did before the end.
+///
+/// The list is ordered by each thread's latest activity, so a thread that moves while the pages
+/// are being read can come round again on a later page. It is kept where it was first seen. What
+/// was read before a failure is kept too: every row of it is one of this person's threads, and
+/// the merge it goes to only ever adds.
+async fn fetch_thread_list(client: &OpenGrokClient) -> (Vec<ThreadListing>, Option<OpenGrokError>) {
+    let mut listed: Vec<ThreadListing> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor: Option<(i64, String)> = None;
+    loop {
+        let (before, before_thread_id) = match &cursor {
+            Some((at, thread_id)) => (Some(*at), Some(thread_id.as_str())),
+            None => (None, None),
+        };
+        let page = match client
+            .list_threads(before, before_thread_id, Some(THREAD_LIST_PAGE))
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => return (listed, Some(error)),
+        };
+        // The next page is asked for from the last row of this one, as the server asks. A page
+        // that ends where the one before it did would be asked for again forever.
+        let Some(last) = page.last() else {
+            break;
+        };
+        let next = (last.updated_at_ms, last.thread_id.clone());
+        listed.extend(
+            page.into_iter()
+                .filter(|row| seen.insert(row.thread_id.clone())),
+        );
+        if cursor.as_ref() == Some(&next) {
+            break;
+        }
+        cursor = Some(next);
+    }
+    (listed, None)
+}
+
+/// Write down the threads the server listed that this Mac had no row for, so the next launch has
+/// them before the server has answered, or without it, and in the place their latest activity
+/// puts them. A row that is already there is left as it is.
+async fn keep_listed_threads(db: &DatabaseService, rows: &[ListedThread]) {
+    for row in rows {
+        if let Err(error) = db
+            .keep_listed_session(&row.id, &row.title, &row.updated_at)
+            .await
+        {
+            eprintln!("Failed to keep a conversation the server listed: {error}");
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum VoiceStatus {
     Ready,
@@ -1932,6 +2025,16 @@ pub struct AppState {
     reconciled_threads: HashSet<String>,
     /// Last send/receive per coworker. Beats an unopened session's empty `messages`.
     pub last_active_at: HashMap<String, SystemTime>,
+    /// The walk of the server's thread list that is out, by the sign-in (`login_epoch`) it was
+    /// started for. One at a time per sign-in, and one that lands after its sign-in has ended is
+    /// dropped: the list is whoever's bearer asked for it.
+    thread_list_walk: Option<u64>,
+    /// The last walk of the server's thread list stopped before the end of it, so the list is
+    /// walked again the next time the server comes back.
+    thread_list_short: bool,
+    /// The server answered the thread list with a `503`: its store could not say what this
+    /// account's threads are. The sidebar says so until a walk gets to the end.
+    pub thread_list_unavailable: bool,
     pub active_conversation_id: Option<String>,
     pub theme_mode: String,
     pub amplitude: Arc<AtomicU32>,
@@ -2515,6 +2618,9 @@ impl AppState {
             live_turns: HashMap::new(),
             reconciled_threads: HashSet::new(),
             last_active_at: HashMap::new(),
+            thread_list_walk: None,
+            thread_list_short: false,
+            thread_list_unavailable: false,
             active_conversation_id: None,
             theme_mode: "light".to_string(),
             amplitude: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2725,6 +2831,7 @@ impl AppState {
                         state.note_server_answered(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
+                        state.sync_server_threads(cx);
                         state.refresh_computers(cx);
                         state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
@@ -3579,6 +3686,7 @@ impl AppState {
                         state.note_server_answered(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
+                        state.sync_server_threads(cx);
                         state.refresh_computers(cx);
                         state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
@@ -3609,6 +3717,11 @@ impl AppState {
         self.session.signed_in();
         self.coworkers.clear();
         self.last_active_at.clear();
+        // A walk still out is this account's list, and whatever it or the last one said about
+        // the server's list was said about this account.
+        self.thread_list_walk = None;
+        self.thread_list_short = false;
+        self.thread_list_unavailable = false;
         self.active_coworker_id = None;
         self.thread_activity.clear();
         self.is_app_settings_open = false;
@@ -3791,6 +3904,10 @@ impl AppState {
         self.reconnect_epoch += 1;
         if self.is_signed_in() {
             self.refresh_coworkers(cx);
+            // What a walk of the server's thread list did not get to before the outage.
+            if self.thread_list_short {
+                self.sync_server_threads(cx);
+            }
         }
         // Before the hydrate, whose fold drains: each PATCH marks its hold in flight.
         if self.can_sync_pending() {
@@ -6491,17 +6608,7 @@ impl AppState {
                 match db.get_sessions().await {
                     Ok(sessions) => {
                         this.update(cx, |state, cx| {
-                            state.conversations = sessions
-                                .into_iter()
-                                .map(|s| Conversation {
-                                    id: s.id,
-                                    title: s.title,
-                                    created_at: s.created_at,
-                                    updated_at: s.updated_at,
-                                    messages: Vec::new(),
-                                    unread_count: 0,
-                                })
-                                .collect();
+                            state.take_sessions(sessions);
 
                             // If no active conversation, select the most recent one
                             if state.active_conversation_id.is_none() {
@@ -6518,6 +6625,159 @@ impl AppState {
                 }
             })
             .detach();
+        }
+    }
+
+    /// The conversation list as this Mac's database has it, with whatever arrived before the
+    /// rows did and is not among them kept.
+    ///
+    /// The server's thread list can land first, when the account is known before the rows are,
+    /// and its rows are written down after they are merged: the read can miss them. So can a
+    /// bot opened before the rows landed. Neither is on disk to be read back yet, and dropping
+    /// them here would leave the person looking at a list that forgot them.
+    fn take_sessions(&mut self, sessions: Vec<ChatSession>) {
+        let on_disk: HashSet<String> = sessions.iter().map(|s| s.id.clone()).collect();
+        let arrived: Vec<Conversation> = std::mem::take(&mut self.conversations)
+            .into_iter()
+            .filter(|conversation| !on_disk.contains(&conversation.id))
+            .collect();
+        self.conversations = sessions
+            .into_iter()
+            .map(|s| Conversation {
+                id: s.id,
+                title: s.title,
+                created_at: s.created_at,
+                updated_at: s.updated_at,
+                messages: Vec::new(),
+                unread_count: 0,
+            })
+            .collect();
+        self.conversations.extend(arrived);
+    }
+
+    /// Fill the conversation list from the server's, so a Mac that has never seen this account's
+    /// threads (a new one, or one whose data was cleared) still signs in to its history: each
+    /// bot in the sidebar in the place its latest activity puts it, with when that was.
+    ///
+    /// Asked for when the account is known, and again when the server comes back if an outage
+    /// cut the last walk short. The local rows need not have landed: `take_sessions` keeps what
+    /// this merged when they do.
+    fn sync_server_threads(&mut self, cx: &mut Context<Self>) {
+        let Some((client, walk)) = self.begin_thread_list_walk() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let (listed, stopped) = fetch_thread_list(&client).await;
+            let _ = this.update(cx, |state, cx| {
+                let Some(added) = state.land_thread_list(walk, listed, stopped.as_ref()) else {
+                    return;
+                };
+                if let Some(db) = state.database_service.clone()
+                    && !added.is_empty()
+                {
+                    cx.spawn(async move |_, _| keep_listed_threads(&db, &added).await)
+                        .detach();
+                }
+                // A server out of reach, or a session that has gone, is the rest of the app's
+                // to say, in the places it says them, and the first is what brings the walk
+                // round again. A `503` reads as out of reach too, but here it is the server
+                // answering that its store could not, which the sidebar says for itself.
+                if let Some(error) = stopped.as_ref()
+                    && error.status != Some(503)
+                    && error.failure() != Failure::Verdict
+                {
+                    state.note_failure(error, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Mark a walk of the server's thread list as out, and hand back what it is asked with and
+    /// the number it lands under. Nothing when nobody is signed in, or when this sign-in has one
+    /// out already: a second would walk the same pages beside it.
+    fn begin_thread_list_walk(&mut self) -> Option<(OpenGrokClient, u64)> {
+        if !self.is_signed_in() || self.thread_list_walk == Some(self.login_epoch) {
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        self.thread_list_walk = Some(self.login_epoch);
+        Some((client, self.login_epoch))
+    }
+
+    /// A walk of the server's thread list, landed: taken into the conversation list, with what
+    /// was new here handed back to be written down. Nothing when the walk is not the one out for
+    /// this sign-in: the list belongs to whoever's bearer asked for it, and that sign-in has ended.
+    fn land_thread_list(
+        &mut self,
+        walk: u64,
+        listed: Vec<ThreadListing>,
+        stopped: Option<&OpenGrokError>,
+    ) -> Option<Vec<ListedThread>> {
+        if self.thread_list_walk != Some(walk) {
+            return None;
+        }
+        self.thread_list_walk = None;
+        if self.login_epoch != walk || !self.is_signed_in() {
+            return None;
+        }
+        let added = self.merge_thread_list(listed);
+        self.note_thread_list(stopped);
+        Some(added)
+    }
+
+    /// Take the server's list into the conversation list, and hand back what was new here.
+    ///
+    /// Merged by thread id, never replaced. A thread this Mac already has keeps its own row, and
+    /// one the server does not list stays: a chat that never ran is not on the server.
+    ///
+    /// Only a bot's own chat is taken: the thread filed under its coworker's id, which is the one
+    /// thread the sidebar opens for that bot. A routine's thread, one with no coworker, or a chat
+    /// another app filed under an id of its own has no row here to be opened from, and would
+    /// only pile up out of sight.
+    ///
+    /// A new row carries the thread's latest activity as its `updated_at`, which is what ranks
+    /// the bot and dates its card, and no `created_at`, since the server does not say when the
+    /// thread began. The rows go at the end: the list's own order is not what the sidebar shows.
+    fn merge_thread_list(&mut self, listed: Vec<ThreadListing>) -> Vec<ListedThread> {
+        let mut known: HashSet<String> = self.conversations.iter().map(|c| c.id.clone()).collect();
+        let mut added = Vec::new();
+        for row in listed {
+            if row.coworker_id.as_deref() != Some(row.thread_id.as_str())
+                || !known.insert(row.thread_id.clone())
+            {
+                continue;
+            }
+            let thread = ListedThread {
+                id: row.thread_id,
+                title: row.title.unwrap_or_else(|| UNTITLED_THREAD.to_string()),
+                updated_at: session_time_of_ms(row.updated_at_ms),
+            };
+            self.conversations.push(Conversation {
+                id: thread.id.clone(),
+                title: thread.title.clone(),
+                created_at: String::new(),
+                updated_at: thread.updated_at.clone(),
+                messages: Vec::new(),
+                unread_count: 0,
+            });
+            added.push(thread);
+        }
+        added
+    }
+
+    /// What the sidebar says about the server's list, and whether it is owed another walk.
+    ///
+    /// A `503` is the server saying its store could not answer, and the sidebar says so, since
+    /// what it shows is then only what this Mac knew. Whatever stopped a walk short, the list is
+    /// walked again when the server next comes back. A walk that gets to the end, `[]` included,
+    /// takes both back.
+    fn note_thread_list(&mut self, stopped: Option<&OpenGrokError>) {
+        self.thread_list_short = stopped.is_some();
+        self.thread_list_unavailable = stopped.is_some_and(|error| error.status == Some(503));
+        if let Some(error) = stopped {
+            eprintln!("Failed to list the server's conversations: {error}");
         }
     }
 
@@ -6775,6 +7035,10 @@ impl AppState {
             return Some(system_time_ms(message.sent_at));
         }
         let updated = parse_sql_time(&conversation.updated_at)?;
+        // Listed because it has had turns, so when it last moved is its activity.
+        if conversation.known_only_from_list() {
+            return Some(system_time_ms(updated));
+        }
         let created = parse_sql_time(&conversation.created_at);
         if created.is_some_and(|c| updated > c) {
             Some(system_time_ms(updated))
@@ -20265,6 +20529,526 @@ mod tests {
         assert!(
             state.session.may_send(true),
             "and turns can be sent again the moment there is something to send them with"
+        );
+    }
+
+    // ---- The server's list of threads (nativechat#91) ---------------------------------------
+
+    use super::{
+        AuthStatus, ChatSession, ListedThread, UNTITLED_THREAD, fetch_thread_list,
+        keep_listed_threads, session_time_of_ms,
+    };
+    use crate::opengrok::ThreadListing;
+
+    /// One of the server's rows as `GET /ag-ui/threads` writes it: a person's chat with a bot,
+    /// which is filed under the bot's id.
+    fn listing(thread_id: &str, title: Option<&str>, updated_at_ms: i64) -> serde_json::Value {
+        serde_json::json!({
+            "threadId": thread_id,
+            "coworkerId": thread_id,
+            "origin": "chat",
+            "title": title,
+            "lastRunId": format!("run_{thread_id}"),
+            "lastStatus": "finished",
+            "updatedAtMs": updated_at_ms,
+        })
+    }
+
+    fn page_of(rows: serde_json::Value) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(rows)
+    }
+
+    fn unavailable() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(503)
+            .set_body_json(serde_json::json!({ "error": "the thread list is unavailable" }))
+    }
+
+    /// What the server answers for one cursor: no cursor for the first page, and otherwise the
+    /// last row of the page before.
+    async fn serve_page(
+        server: &wiremock::MockServer,
+        cursor: Option<(i64, &str)>,
+        answer: wiremock::ResponseTemplate,
+    ) {
+        let page = wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/ag-ui/threads"));
+        let page = match cursor {
+            None => page.and(wiremock::matchers::query_param_is_missing("before")),
+            Some((before, thread_id)) => page
+                .and(wiremock::matchers::query_param(
+                    "before",
+                    before.to_string(),
+                ))
+                .and(wiremock::matchers::query_param("beforeThreadId", thread_id)),
+        };
+        page.respond_with(answer).mount(server).await;
+    }
+
+    /// Somebody signed in to this server, with the client the walk is asked with.
+    fn signed_in_to(server: &wiremock::MockServer) -> AppState {
+        let mut state = AppState::new();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL that parses"));
+        state.account = Some(
+            serde_json::from_value(
+                serde_json::json!({ "id": "acc_1", "email": "ada@example.com" }),
+            )
+            .expect("an account"),
+        );
+        state.auth_status = AuthStatus::SignedIn;
+        state
+    }
+
+    /// A walk, start to landing, the way `sync_server_threads` makes one.
+    async fn walk(state: &mut AppState) -> Option<Vec<ListedThread>> {
+        let (client, walk) = state.begin_thread_list_walk().expect("a walk to start");
+        let (listed, stopped) = fetch_thread_list(&client).await;
+        state.land_thread_list(walk, listed, stopped.as_ref())
+    }
+
+    /// A bot on the server's roster, hired at this time.
+    fn hired(id: &str, at_ms: i64) -> Coworker {
+        serde_json::from_value(serde_json::json!({ "id": id, "name": id, "updatedAtMs": at_ms }))
+            .expect("a coworker")
+    }
+
+    fn ranked(state: &AppState) -> Vec<String> {
+        state
+            .ranked_coworkers()
+            .into_iter()
+            .map(|coworker| coworker.id)
+            .collect()
+    }
+
+    fn conversation_ids(state: &AppState) -> Vec<&str> {
+        state
+            .conversations
+            .iter()
+            .map(|conversation| conversation.id.as_str())
+            .collect()
+    }
+
+    /// The bug in the issue: a new Mac, or one whose data was cleared, signed in to nothing
+    /// although every thread was on the server. Its bots stood in the order they were hired,
+    /// with no time on any of them. The list puts each in the place its latest activity puts it,
+    /// with that time on the row, and writes the rows down so the next launch has the same
+    /// sidebar without the server.
+    #[tokio::test]
+    async fn a_fresh_mac_signs_in_to_the_threads_the_server_has() {
+        let server = wiremock::MockServer::start().await;
+        serve_page(
+            &server,
+            None,
+            page_of(serde_json::json!([
+                listing("cw_2", Some("Book a table for two"), 1_790_000_000_000),
+                listing("cw_1", None, 1_789_000_000_000),
+            ])),
+        )
+        .await;
+        serve_page(
+            &server,
+            Some((1_789_000_000_000, "cw_1")),
+            page_of(serde_json::json!([])),
+        )
+        .await;
+        let db = test_db().await;
+        let mut state = signed_in_to(&server);
+        let roster = vec![
+            hired("cw_1", 2_000),
+            hired("cw_2", 1_000),
+            hired("cw_3", 3_000),
+        ];
+        state.coworkers = roster.clone();
+        assert_eq!(
+            ranked(&state),
+            ["cw_3", "cw_1", "cw_2"],
+            "by when each was hired"
+        );
+
+        let added = walk(&mut state)
+            .await
+            .expect("the walk this sign-in asked for");
+        keep_listed_threads(&db, &added).await;
+
+        assert_eq!(conversation_ids(&state), ["cw_2", "cw_1"]);
+        assert_eq!(state.conversations[0].title, "Book a table for two");
+        assert_eq!(state.conversations[1].title, UNTITLED_THREAD);
+        assert_eq!(
+            parse_sql_time(&state.conversations[0].updated_at),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000)),
+            "the thread's own latest activity, not the moment it was listed"
+        );
+        assert_eq!(
+            state.conversations[0].created_at, "",
+            "when it began is not the server's to say"
+        );
+        assert_eq!(
+            ranked(&state),
+            ["cw_2", "cw_1", "cw_3"],
+            "the bots with history by their latest activity, then the one nobody has spoken to"
+        );
+        assert!(!state.thread_list_unavailable);
+
+        let kept: Vec<(String, String, String, String)> = db
+            .get_sessions()
+            .await
+            .expect("the rows")
+            .into_iter()
+            .map(|s| (s.id, s.title, s.created_at, s.updated_at))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (
+                    "cw_2".to_string(),
+                    "Book a table for two".to_string(),
+                    String::new(),
+                    session_time_of_ms(1_790_000_000_000),
+                ),
+                (
+                    "cw_1".to_string(),
+                    UNTITLED_THREAD.to_string(),
+                    String::new(),
+                    session_time_of_ms(1_789_000_000_000),
+                ),
+            ],
+            "on disk as the server dated them, not as the moment they were written"
+        );
+
+        // The next launch, before the server has answered or without it.
+        let mut relaunched = AppState::new();
+        relaunched.take_sessions(db.get_sessions().await.expect("the rows"));
+        relaunched.coworkers = roster;
+        assert_eq!(ranked(&relaunched), ["cw_2", "cw_1", "cw_3"]);
+    }
+
+    /// A thread this Mac already has is not listed twice, and keeps its own row, whose name may
+    /// be one the person gave it. A thread the server does not list stays, because a chat that
+    /// never ran is not on the server.
+    #[tokio::test]
+    async fn a_thread_this_mac_already_has_keeps_its_own_row() {
+        let db = test_db().await;
+        db.ensure_session("cw_1", "Ada").await.expect("a session");
+        let mut state = AppState::new();
+        let mut ada = thread("cw_1", Vec::new());
+        ada.title = "Ada".to_string();
+        ada.created_at = "2026-09-01 10:00:00".to_string();
+        ada.updated_at = "2026-09-20 10:00:00".to_string();
+        state.conversations.push(ada);
+        state.conversations.push(thread("draft", Vec::new()));
+
+        let listed: Vec<ThreadListing> = serde_json::from_value(serde_json::json!([
+            listing("cw_2", Some("Plan the offsite"), 1_790_000_000_000),
+            listing("cw_1", Some("What is on my calendar?"), 1_789_000_000_000),
+        ]))
+        .expect("the server's rows");
+        let added = state.merge_thread_list(listed);
+        keep_listed_threads(&db, &added).await;
+
+        assert_eq!(
+            added,
+            [ListedThread {
+                id: "cw_2".to_string(),
+                title: "Plan the offsite".to_string(),
+                updated_at: session_time_of_ms(1_790_000_000_000),
+            }],
+            "only what was new here is written down"
+        );
+        assert_eq!(conversation_ids(&state), ["cw_1", "draft", "cw_2"]);
+        assert_eq!(state.conversations[0].title, "Ada", "the row this Mac had");
+        assert_eq!(state.conversations[0].updated_at, "2026-09-20 10:00:00");
+        let kept = db.get_sessions().await.expect("the rows");
+        assert_eq!(
+            kept.iter()
+                .filter(|session| session.id == "cw_1")
+                .map(|session| session.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Ada"],
+            "one row for a thread already on disk, under the name it had"
+        );
+        assert!(kept.iter().any(|session| session.id == "cw_2"));
+    }
+
+    /// The sidebar opens one thread per bot, the one filed under the bot's own id. A routine's
+    /// thread, a thread with no coworker, and a chat another app filed under an id of its own
+    /// have no row there to be opened from, so they are not taken in, on screen or on disk.
+    #[test]
+    fn only_a_bots_own_chat_is_taken_into_the_list() {
+        let mut state = AppState::new();
+        let listed: Vec<ThreadListing> = serde_json::from_value(serde_json::json!([
+            {
+                "threadId": "sch_1", "coworkerId": "cw_1", "origin": "schedule",
+                "title": "Morning brief", "lastRunId": "run_3", "lastStatus": "finished",
+                "updatedAtMs": 4_000
+            },
+            {
+                "threadId": "th_9", "coworkerId": null, "origin": "chat",
+                "title": null, "lastRunId": "run_2", "lastStatus": "finished",
+                "updatedAtMs": 3_000
+            },
+            {
+                "threadId": "th_web", "coworkerId": "cw_1", "origin": "chat",
+                "title": "From the browser", "lastRunId": "run_1", "lastStatus": "finished",
+                "updatedAtMs": 2_000
+            },
+            listing("cw_1", Some("Hello"), 1_000),
+        ]))
+        .expect("the server's rows");
+
+        let added = state.merge_thread_list(listed);
+        assert_eq!(
+            added.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["cw_1"]
+        );
+        assert_eq!(conversation_ids(&state), ["cw_1"]);
+    }
+
+    /// The list follows each thread's latest activity, so a thread can move while the pages are
+    /// read and come round again on a later one. It is listed once, where it was first seen,
+    /// and each page is asked for from the last row of the page before, for every coworker.
+    #[tokio::test]
+    async fn a_thread_that_moves_between_pages_is_listed_once() {
+        let server = wiremock::MockServer::start().await;
+        serve_page(
+            &server,
+            None,
+            page_of(serde_json::json!([
+                listing("t3", Some("third"), 3_000),
+                listing("t2", Some("second"), 2_000),
+            ])),
+        )
+        .await;
+        serve_page(
+            &server,
+            Some((2_000, "t2")),
+            page_of(serde_json::json!([
+                listing("t3", Some("third"), 1_500),
+                listing("t1", Some("first"), 1_000),
+            ])),
+        )
+        .await;
+        serve_page(&server, Some((1_000, "t1")), page_of(serde_json::json!([]))).await;
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL that parses");
+
+        let (listed, stopped) = fetch_thread_list(&client).await;
+        assert!(stopped.is_none(), "{stopped:?}");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|row| (row.thread_id.as_str(), row.updated_at_ms))
+                .collect::<Vec<_>>(),
+            vec![("t3", 3_000), ("t2", 2_000), ("t1", 1_000)]
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the recorder is on");
+        assert_eq!(
+            requests.len(),
+            3,
+            "two pages, and the empty one that ends the list"
+        );
+        assert!(
+            requests.iter().all(|request| !request
+                .url
+                .query_pairs()
+                .any(|(key, _)| key == "coworkerId")),
+            "every coworker's threads, not one's"
+        );
+    }
+
+    /// A server whose store cannot answer says so with a `503`. The conversations this Mac has
+    /// stay as they are, and the sidebar says the server's list is missing: in a place of its
+    /// own, not over a verdict something else left, and not where a verdict is drawn. What was
+    /// read before the failure is kept, since every row of it is one of this person's threads,
+    /// and a walk cut short is owed another.
+    #[tokio::test]
+    async fn an_unavailable_list_leaves_this_macs_conversations_and_says_so() {
+        let server = wiremock::MockServer::start().await;
+        serve_page(&server, None, unavailable()).await;
+        let mut state = signed_in_to(&server);
+        state.conversations.push(thread("cw_1", Vec::new()));
+        state.auth_error = Some("That name is taken".to_string());
+
+        let added = walk(&mut state)
+            .await
+            .expect("the walk this sign-in asked for");
+        assert!(added.is_empty());
+        assert_eq!(conversation_ids(&state), ["cw_1"], "the local list stays");
+        assert!(state.thread_list_unavailable);
+        assert!(state.thread_list_short);
+        assert_eq!(
+            state.auth_error.as_deref(),
+            Some("That name is taken"),
+            "somebody else's sentence, left where it was"
+        );
+
+        let halfway = wiremock::MockServer::start().await;
+        serve_page(
+            &halfway,
+            None,
+            page_of(serde_json::json!([listing(
+                "cw_2",
+                Some("Plan the offsite"),
+                2_000
+            )])),
+        )
+        .await;
+        serve_page(&halfway, Some((2_000, "cw_2")), unavailable()).await;
+        state.opengrok = Some(OpenGrokClient::new(&halfway.uri()).expect("a URL that parses"));
+        let added = walk(&mut state)
+            .await
+            .expect("the walk this sign-in asked for");
+        assert_eq!(
+            added.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["cw_2"],
+            "the first page is kept when the second cannot be had"
+        );
+        assert_eq!(conversation_ids(&state), ["cw_1", "cw_2"]);
+        assert!(
+            state.thread_list_unavailable,
+            "the list is still not all there"
+        );
+    }
+
+    /// A session the server no longer recognises is not this list's to announce: the banner says
+    /// that. The local list stays, nothing is written under the fields, and nothing is said about
+    /// the server's store, which nobody asked.
+    #[tokio::test]
+    async fn a_signed_out_list_leaves_this_macs_conversations_alone() {
+        let server = wiremock::MockServer::start().await;
+        serve_page(
+            &server,
+            None,
+            wiremock::ResponseTemplate::new(401)
+                .set_body_json(serde_json::json!({ "error": "sign in first" })),
+        )
+        .await;
+        let mut state = signed_in_to(&server);
+        state.conversations.push(thread("cw_1", Vec::new()));
+
+        let added = walk(&mut state)
+            .await
+            .expect("the walk this sign-in asked for");
+        assert!(added.is_empty());
+        assert_eq!(conversation_ids(&state), ["cw_1"]);
+        assert_eq!(state.auth_error, None);
+        assert!(!state.thread_list_unavailable);
+    }
+
+    /// An account with no history yet gets `[]`, which is an answer and not a failure: nothing
+    /// is added and nothing is said, and what an earlier walk left said is taken back. A verdict
+    /// something else left is not the list's to take.
+    #[tokio::test]
+    async fn an_empty_list_is_an_account_with_no_history_yet() {
+        let server = wiremock::MockServer::start().await;
+        serve_page(&server, None, page_of(serde_json::json!([]))).await;
+        let mut state = signed_in_to(&server);
+        state.conversations.push(thread("draft", Vec::new()));
+        state.thread_list_unavailable = true;
+        state.thread_list_short = true;
+        state.auth_error = Some("Sign in first".to_string());
+
+        let added = walk(&mut state)
+            .await
+            .expect("the walk this sign-in asked for");
+        assert!(added.is_empty());
+        assert_eq!(conversation_ids(&state), ["draft"]);
+        assert!(!state.thread_list_unavailable);
+        assert!(
+            !state.thread_list_short,
+            "nothing owed: the list was read to the end"
+        );
+        assert_eq!(state.auth_error.as_deref(), Some("Sign in first"));
+    }
+
+    /// One walk at a time for a sign-in, and a walk lands only for the sign-in that started it.
+    /// The list is whoever's bearer asked for it: after a sign-out, or once somebody has signed
+    /// in again, it is not the list of anybody the sidebar is showing.
+    #[test]
+    fn a_walk_lands_only_for_the_sign_in_that_started_it() {
+        let server_uri = "http://127.0.0.1:9";
+        let listed = || -> Vec<ThreadListing> {
+            serde_json::from_value(serde_json::json!([listing("cw_1", None, 1_000)]))
+                .expect("the server's rows")
+        };
+        let mut state = AppState::new();
+        state.opengrok = Some(OpenGrokClient::new(server_uri).expect("a URL that parses"));
+        assert!(
+            state.begin_thread_list_walk().is_none(),
+            "nobody signed in, nothing to walk"
+        );
+
+        state.account = Some(
+            serde_json::from_value(
+                serde_json::json!({ "id": "acc_1", "email": "ada@example.com" }),
+            )
+            .expect("an account"),
+        );
+        state.auth_status = AuthStatus::SignedIn;
+        let (_, first) = state.begin_thread_list_walk().expect("a walk");
+        assert!(
+            state.begin_thread_list_walk().is_none(),
+            "one is out for this sign-in already"
+        );
+
+        // Signed out while it was out, as `logout` leaves things.
+        state.thread_list_walk = None;
+        state.account = None;
+        state.auth_status = AuthStatus::SignedOut;
+        assert_eq!(state.land_thread_list(first, listed(), None), None);
+        assert!(state.conversations.is_empty());
+
+        // Signed in again while the old one was still out.
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acc_2", "email": "bo@example.com" }))
+                .expect("an account"),
+        );
+        state.auth_status = AuthStatus::SignedIn;
+        state.login_epoch += 1;
+        let (_, stale) = state.begin_thread_list_walk().expect("a walk");
+        state.login_epoch += 1;
+        let (_, current) = state
+            .begin_thread_list_walk()
+            .expect("a new sign-in is not held up by the last one's walk");
+        assert_eq!(state.land_thread_list(stale, listed(), None), None);
+        assert!(state.conversations.is_empty());
+        assert!(state.land_thread_list(current, listed(), None).is_some());
+        assert_eq!(conversation_ids(&state), ["cw_1"]);
+        assert!(
+            state.begin_thread_list_walk().is_some(),
+            "and once it has landed, the next can go"
+        );
+    }
+
+    /// The local rows can land after the server's list did, and the rows the list added may not
+    /// be on disk yet when they are read. What the read did not have is kept; what it did have
+    /// is taken as it was read.
+    #[test]
+    fn rows_that_arrived_before_the_disk_did_are_kept() {
+        let mut state = AppState::new();
+        let listed: Vec<ThreadListing> = serde_json::from_value(serde_json::json!([listing(
+            "cw_2",
+            None,
+            1_790_000_000_000
+        )]))
+        .expect("the server's rows");
+        state.merge_thread_list(listed);
+        let mut stale = thread("cw_1", Vec::new());
+        stale.title = "not what the disk says".to_string();
+        state.conversations.push(stale);
+
+        state.take_sessions(vec![ChatSession {
+            id: "cw_1".to_string(),
+            title: "Ada".to_string(),
+            created_at: "2026-09-01 10:00:00".to_string(),
+            updated_at: "2026-09-20 10:00:00".to_string(),
+        }]);
+
+        assert_eq!(conversation_ids(&state), ["cw_1", "cw_2"]);
+        assert_eq!(state.conversations[0].title, "Ada");
+        assert_eq!(
+            state.conversations[1].updated_at,
+            session_time_of_ms(1_790_000_000_000)
         );
     }
 }
