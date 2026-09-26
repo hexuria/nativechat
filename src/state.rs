@@ -22,7 +22,7 @@ use crate::opengrok::{
     SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadReplay, ThreadRun, ToolCallTracker,
     TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable,
     UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU,
-    activity_from_replay, box_handoff_resolve_entry_id, collapse_computer_roster,
+    activity_from_replay, approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster,
     command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
     env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
     keep_local_save_offer, place_hitl_cards_in_document_order, policy_answer,
@@ -2271,9 +2271,10 @@ pub enum ApprovalDecision {
     /// A later message moved the thread on. The server closed the card when
     /// that message arrived; nothing was allowed or denied.
     Superseded,
-    /// Always or Never on the local shell's card, whose rule was not kept: the server refused
-    /// it, or the write never reached it. The call was still allowed, or not, this once, and
-    /// `why` is what went wrong with the rule.
+    /// A standing Always or Never that was not kept: the local shell's rule (see
+    /// `rule_not_kept`) or the tunnel's policy (see `policy_not_kept`). The call was still
+    /// answered, once: `allowed` says which way. `why` is the sentence the card ends on, so the
+    /// person is not left thinking every later call is settled.
     NotKept {
         allowed: bool,
         why: String,
@@ -2302,15 +2303,12 @@ impl ApprovalDecision {
             Self::Never => LocalExecResolution::Never,
             Self::Superseded => return Some(SUPERSEDED_NOTE.to_string()),
             Self::NotKept { allowed, why } => {
-                let (once, standing) = if *allowed {
-                    (LocalExecResolution::AllowOnce, "Always allow")
+                let once = if *allowed {
+                    LocalExecResolution::AllowOnce
                 } else {
-                    (LocalExecResolution::DenyOnce, "Never")
+                    LocalExecResolution::DenyOnce
                 };
-                return Some(format!(
-                    "{} {standing} was not kept: {why}",
-                    spec.outcome(bot, once)
-                ));
+                return Some(format!("{} {why}", spec.outcome(bot, once)));
             }
             _ => return None,
         };
@@ -3164,7 +3162,8 @@ impl AppState {
     /// and held against any record fetch already in flight until the write has landed; then
     /// it is read back from the server. When the write fails, `card` (the answered card, if
     /// one) is re-marked as a once-only answer, so the transcript does not claim a standing
-    /// choice that was not kept.
+    /// choice that was not kept, and says why when the server gave a reason. A card whose
+    /// answer itself failed keeps saying so: see `policy_not_kept`.
     pub fn set_egress_policy_for(
         &mut self,
         coworker_id: String,
@@ -3196,10 +3195,11 @@ impl AppState {
                         "NativeChat computer: could not set the network policy: {}",
                         error.message
                     );
-                    if let Some(call_id) = card {
-                        state
-                            .approval_decisions
-                            .insert(call_id, once_only_for(mode));
+                    if let Some(call_id) = card
+                        && let Some(decision) =
+                            policy_not_kept(state.approval_decisions.get(&call_id), mode, error)
+                    {
+                        state.approval_decisions.insert(call_id, decision);
                     }
                     cx.notify();
                 }
@@ -8364,6 +8364,20 @@ impl AppState {
         }
     }
 
+    /// The thread a card belongs to, which is its bot's: the thread its run is live in, not
+    /// the thread that happens to be open. A card can be answered from the notification while
+    /// the person is reading somewhere else, and the resumed run must go on filling in its own
+    /// bubble. Failing that, the thread the card was filed under — which for the MCP door is
+    /// not a conversation at all but the coworker whose calls it audits, and that is the thread
+    /// the card was grafted onto. `None` for a card that names neither.
+    fn card_bot(&self, spec: &ApprovalSpec) -> Option<String> {
+        self.live_turns
+            .iter()
+            .find(|(_, turn)| turn.run_id == spec.run_id)
+            .map(|(id, _)| id.clone())
+            .or_else(|| spec.conversation_id().map(str::to_string))
+    }
+
     /// The person's answer on a card.
     pub fn answer_approval(
         &mut self,
@@ -8427,32 +8441,29 @@ impl AppState {
             return;
         };
         let machine_id = self.this_mac_id();
-        // The thread the run belongs to, not the thread that happens to be open: a card can be
-        // answered from the notification while the person is reading somewhere else, and the
-        // resumed run must go on filling in its own bubble. Failing that, the thread the card
-        // was filed under — which for the MCP door is not a conversation at all but the coworker
-        // whose calls it audits, and that is the thread the card was grafted onto. The open
-        // thread is the last resort, for a card that came with no thread on it.
-        let conversation_id = self
-            .live_turns
-            .iter()
-            .find(|(_, turn)| turn.run_id == spec.run_id)
-            .map(|(id, _)| id.clone())
-            .or_else(|| spec.conversation_id().map(str::to_string))
+        let card_bot = self.card_bot(&spec);
+        // The open thread is the last resort, for a card that came with no thread on it. It
+        // only places the working line: nothing is kept for the open thread's bot on the word
+        // of a card that never named it.
+        let conversation_id = card_bot
+            .clone()
             .or_else(|| self.active_conversation_id.clone());
-        let (approved, decision, rule) =
+        let (approved, decided, rule) =
             card_answer(&spec, resolution, by_mode, machine_id.as_deref());
         // Always and Never on the tunnel's card are the computer's standing choice, kept on
         // the server for the card's own bot — which is not always the one being looked at.
-        if spec.is_egress_tunnel() {
-            let standing = match resolution {
-                LocalExecResolution::Always => Some(LocalExecMode::Always),
-                LocalExecResolution::Never => Some(LocalExecMode::Never),
-                _ => None,
-            };
-            if let (Some(standing), Some(coworker_id)) = (standing, conversation_id.clone()) {
+        let (standing, decision) = egress_answer(&spec, resolution, card_bot, decided);
+        match standing {
+            Some((coworker_id, standing)) => {
                 self.set_egress_policy_for(coworker_id, standing, Some(spec.call_id.clone()), cx);
             }
+            None if spec.egress_standing(resolution).is_some() => {
+                eprintln!(
+                    "NativeChat computer: the tunnel's card {} names no bot; its standing choice was not kept",
+                    spec.call_id
+                );
+            }
+            None => {}
         }
         // What the thread says while the answered run finishes. "Running commands" is the
         // local shell being let loose; an MCP card is one call being let through, so it says
@@ -8478,13 +8489,9 @@ impl AppState {
                     .await
             {
                 let _ = this.update(cx, |state, cx| {
-                    state.approval_decisions.insert(
-                        spec.call_id.clone(),
-                        ApprovalDecision::NotKept {
-                            allowed: approved,
-                            why: error.message,
-                        },
-                    );
+                    state
+                        .approval_decisions
+                        .insert(spec.call_id.clone(), rule_not_kept(approved, &error));
                     cx.notify();
                 });
             }
@@ -13150,6 +13157,115 @@ fn once_only_for(mode: LocalExecMode) -> ApprovalDecision {
     }
 }
 
+/// What an answer to a card writes as its bot's computer's standing network choice, and what
+/// the card settles on once the run has the answer. Only Always and Never on the tunnel's card
+/// write one (`ApprovalSpec::egress_standing`), and only for `card_bot`, the bot the card
+/// belongs to. A tunnel card with no bot of its own writes nothing and settles as the once it
+/// was, so the transcript does not claim a standing choice. Until the run has the answer it
+/// reads "Sending…" like any other card, and an answer that fails still says so.
+fn egress_answer(
+    spec: &ApprovalSpec,
+    resolution: LocalExecResolution,
+    card_bot: Option<String>,
+    decided: ApprovalDecision,
+) -> (Option<(String, LocalExecMode)>, ApprovalDecision) {
+    match (spec.egress_standing(resolution), card_bot) {
+        (Some(standing), Some(bot)) => (Some((bot, standing)), decided),
+        (Some(standing), None) => (None, once_only_for(standing)),
+        (None, _) => (None, decided),
+    }
+}
+
+/// What opengrok-server says to a member who asks for what only the organization's admin may
+/// do (`account_api.rs` `admin_org`, as of 234e755). Matched whole, because the same route
+/// answers 403 for other reasons too ("you are not in an organization"), and those are given
+/// in the server's own words.
+const ADMIN_ONLY_REFUSAL: &str = "only the organization's admin may do that";
+
+/// What the local shell's card becomes when the rule its Always or Never was to keep did not
+/// land: the once-only answer the call still got, and that the rule was not kept. The server
+/// keeps an allow only for one plain command and never for `sudo`, and says why in a 422
+/// (opengrok-server `standing_rule_refusal`, PR #213); that reason is given when it is a line
+/// of plain text. A write that never got there says only that the rule was not kept.
+fn rule_not_kept(allowed: bool, error: &OpenGrokError) -> ApprovalDecision {
+    let standing = if allowed { "Always allow" } else { "Never" };
+    let reason = (error.failure() == Failure::Verdict)
+        .then(|| plain_reason(&error.message))
+        .flatten();
+    let why = match reason {
+        Some(reason) => format!("{standing} was not kept: {reason}"),
+        None => format!("{standing} was not kept."),
+    };
+    ApprovalDecision::NotKept { allowed, why }
+}
+
+/// What the tunnel's card becomes when the server would not keep its standing choice: the
+/// once-only answer the call still got, and the reason when the server gave one. `None`
+/// leaves the card as it is.
+///
+/// Only a card that is still sending its answer, or already reads as the standing choice, is
+/// re-marked. The run's answer and this write are two requests that land in either order, and
+/// a card whose answer failed must keep saying so. That call was not answered at all, and
+/// "may use your network this time" would be a claim about a call that never went through.
+///
+/// The admin's refusal means the computer is the organization's shared one, and its choice is
+/// the organization's admin's to make (opengrok-server `routes.rs` `set_egress_policy`, through
+/// `account_api::admin_org`). Any other refusal is given in the server's own words, when those
+/// are a line of plain text. A server out of reach or a session that has gone is not about
+/// this card, and the once-only line is all it gets, as before.
+fn policy_not_kept(
+    current: Option<&ApprovalDecision>,
+    mode: LocalExecMode,
+    error: &OpenGrokError,
+) -> Option<ApprovalDecision> {
+    if !matches!(
+        current,
+        Some(ApprovalDecision::Sending | ApprovalDecision::Always | ApprovalDecision::Never)
+    ) {
+        return None;
+    }
+    let why = if error.status == Some(403) && error.message.trim() == ADMIN_ONLY_REFUSAL {
+        "Only the organization's admin can make that choice for its shared computer.".to_string()
+    } else if error.failure() == Failure::Verdict {
+        match plain_reason(&error.message) {
+            Some(reason) => format!("The choice for every time was not kept: {reason}"),
+            None => "The choice for every time was not kept.".to_string(),
+        }
+    } else {
+        return Some(once_only_for(mode));
+    };
+    Some(ApprovalDecision::NotKept {
+        allowed: mode != LocalExecMode::Never,
+        why,
+    })
+}
+
+/// The most of a refusal's own words that a card's line carries.
+const REASON_CHARS: usize = 160;
+
+/// A refusal as a transcript line can end on it: the first line of plain text, closed with a
+/// full stop, or clipped. What stands in front of OpenGrok can answer with a whole HTML page,
+/// or a body of JSON, and neither is a reason anybody can read in a sentence. `None` when
+/// there is no such line.
+fn plain_reason(message: &str) -> Option<String> {
+    let line = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    if line.starts_with(['<', '{', '[']) {
+        return None;
+    }
+    if line.chars().count() > REASON_CHARS {
+        let head: String = line.chars().take(REASON_CHARS).collect();
+        return Some(format!("{}…", head.trim_end()));
+    }
+    Some(if line.ends_with(['.', '!', '?']) {
+        line.to_string()
+    } else {
+        format!("{line}.")
+    })
+}
+
 /// What a card's decision becomes once the run has taken the answer. A standing choice
 /// (Always / Never) whose policy or rule write has already failed was re-marked as once-only by
 /// that failure — a rule with why it was not kept — and the answer landing later must not
@@ -13250,6 +13366,10 @@ fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
             .as_deref()
             .and_then(some_unless_blank)
             .unwrap_or_else(|| "exec-consent".to_string()),
+        // The queue's rows carry the tool and its arguments but no summary (opengrok-server
+        // `list_awaiting`), so a card rebuilt from one says what the call would do the same
+        // way the stream's card does.
+        summary: approval_summary(&item.tool, &item.arguments),
         output: None,
         ok: None,
     }
@@ -14929,7 +15049,8 @@ mod tests {
     };
     use crate::state::{
         ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, StandingRule,
-        card_answer, once_only_for, settled_decision,
+        card_answer, egress_answer, once_only_for, policy_not_kept, rule_not_kept,
+        settled_decision,
     };
     use chrono::{Local, TimeZone};
     use std::str::FromStr;
@@ -17351,6 +17472,7 @@ mod tests {
             command: "ls".into(),
             why: String::new(),
             reason: "exec-consent".into(),
+            summary: String::new(),
             output: None,
             ok: None,
         };
@@ -18955,16 +19077,16 @@ mod tests {
     }
 
     /// A rule that was not kept leaves, where the card was, what the answer still did to this
-    /// one call and why the rule was not kept, whether the server refused it or the write never
-    /// reached it. The run's answer landing afterwards must not paint the standing wording back
-    /// over that.
+    /// one call and that the rule was not kept: with the server's reason when it refused the
+    /// rule, and no more than that when the write never reached it. The run's answer landing
+    /// afterwards must not paint the standing wording back over that.
     #[test]
     fn a_rule_not_kept_leaves_the_once_only_answer_and_why() {
         let card = local_shell_card("ls | head");
-        let refused = ApprovalDecision::NotKept {
-            allowed: true,
-            why: "an allow rule must be one plain command".into(),
-        };
+        let refused = rule_not_kept(
+            true,
+            &OpenGrokError::from_server(Some(422), "an allow rule must be one plain command"),
+        );
         assert!(refused.is_settled());
         assert_eq!(
             settled_decision(Some(&refused), ApprovalDecision::Always),
@@ -18974,23 +19096,17 @@ mod tests {
             refused.outcome_line("Hexuria", &card).as_deref(),
             Some(
                 "Hexuria can run commands on your computer this time. Always allow was not \
-                 kept: an allow rule must be one plain command"
+                 kept: an allow rule must be one plain command."
             )
         );
-        let unreached = ApprovalDecision::NotKept {
-            allowed: false,
-            why: "error sending request".into(),
-        };
+        let unreached = rule_not_kept(false, &OpenGrokError::from_server(Some(502), "Bad Gateway"));
         assert_eq!(
             settled_decision(Some(&unreached), ApprovalDecision::Never),
             None
         );
         assert_eq!(
             unreached.outcome_line("Hexuria", &card).as_deref(),
-            Some(
-                "Hexuria was not allowed to run commands on your computer. Never was not kept: \
-                 error sending request"
-            )
+            Some("Hexuria was not allowed to run commands on your computer. Never was not kept.")
         );
     }
 
@@ -19003,6 +19119,22 @@ mod tests {
             command: command.into(),
             why: String::new(),
             reason: "exec-consent".into(),
+            summary: String::new(),
+            output: None,
+            ok: None,
+        }
+    }
+
+    fn tunnel_card() -> crate::opengrok::ApprovalSpec {
+        crate::opengrok::ApprovalSpec {
+            run_id: "run_1".into(),
+            thread_id: Some("cw_1".into()),
+            call_id: "call_1".into(),
+            tool: "computer".into(),
+            command: String::new(),
+            why: "This action would use your network through the egress tunnel. Review it before it runs.".into(),
+            reason: "auto-review".into(),
+            summary: "Click at (120, 40) on the agent's own screen".into(),
             output: None,
             ok: None,
         }
@@ -19125,6 +19257,233 @@ mod tests {
 
         state.local_exec_machine_id = Some("mac_daemon".into());
         assert_eq!(state.this_mac_id().as_deref(), Some("mac_daemon"));
+    }
+
+    /// The line a card is left with when the policy write for `mode` fails with `error` while
+    /// the card is still sending its answer.
+    fn not_kept_line(mode: LocalExecMode, error: &OpenGrokError) -> Option<String> {
+        policy_not_kept(Some(&ApprovalDecision::Sending), mode, error)
+            .expect("a sending card is re-marked")
+            .outcome_line("Vamos", &tunnel_card())
+    }
+
+    /// A member who answers Always or Never on the tunnel's card for the organization's shared
+    /// computer is refused with a 403. The call still went through once, and the card says so,
+    /// then says whose choice the standing one is, rather than quietly reading as a once.
+    #[test]
+    fn a_member_refused_the_computers_choice_is_told_why() {
+        let refused =
+            OpenGrokError::from_server(Some(403), "only the organization's admin may do that");
+        // The write fails while the answer is still on its way.
+        let always = policy_not_kept(
+            Some(&ApprovalDecision::Sending),
+            LocalExecMode::Always,
+            &refused,
+        )
+        .expect("re-marked");
+        assert_eq!(
+            always.outcome_line("Vamos", &tunnel_card()).as_deref(),
+            Some(
+                "Vamos may use your network this time. Only the organization's admin can make \
+                 that choice for its shared computer."
+            )
+        );
+        // The answer landed first and the card already read as the standing choice.
+        let never = policy_not_kept(
+            Some(&ApprovalDecision::Never),
+            LocalExecMode::Never,
+            &refused,
+        )
+        .expect("re-marked");
+        assert_eq!(
+            never.outcome_line("Vamos", &tunnel_card()).as_deref(),
+            Some(
+                "Vamos was not allowed to use your network this time. Only the organization's \
+                 admin can make that choice for its shared computer."
+            )
+        );
+        // The run's answer landing afterwards must not put the standing line back over it.
+        assert_eq!(
+            settled_decision(Some(&always), ApprovalDecision::Always),
+            None
+        );
+        assert_eq!(
+            settled_decision(Some(&never), ApprovalDecision::Never),
+            None
+        );
+    }
+
+    /// Any other refusal is given in the server's own words, the 403 of an account in no
+    /// organization among them, as one short line of plain text. The server out of reach, or a
+    /// session that has gone, leaves the once-only line and nothing more, as before.
+    #[test]
+    fn a_refused_policy_write_gives_the_servers_reason_and_nothing_else_does() {
+        let storage = OpenGrokError::from_server(Some(500), "storage failed");
+        assert_eq!(
+            not_kept_line(LocalExecMode::Always, &storage).as_deref(),
+            Some(
+                "Vamos may use your network this time. The choice for every time was not kept: \
+                 storage failed."
+            )
+        );
+        let no_org = OpenGrokError::from_server(Some(403), "you are not in an organization");
+        assert_eq!(
+            not_kept_line(LocalExecMode::Always, &no_org).as_deref(),
+            Some(
+                "Vamos may use your network this time. The choice for every time was not kept: \
+                 you are not in an organization."
+            )
+        );
+        // A proxy's error page is not a reason; the line says only that the choice was not kept.
+        let page = OpenGrokError::from_server(
+            Some(413),
+            "<html>\n<head><title>413 Request Entity Too Large</title></head>\n</html>",
+        );
+        assert_eq!(
+            not_kept_line(LocalExecMode::Never, &page).as_deref(),
+            Some(
+                "Vamos was not allowed to use your network this time. The choice for every time \
+                 was not kept."
+            )
+        );
+        let rambling = OpenGrokError::from_server(
+            Some(429),
+            format!("slow down {}\nsecond line", "x".repeat(400)),
+        );
+        let line = not_kept_line(LocalExecMode::Always, &rambling).expect("a line");
+        assert!(!line.contains("second line"), "{line}");
+        assert!(line.ends_with("x…"), "{line}");
+        assert!(line.chars().count() < 260, "{line}");
+
+        let unreached = OpenGrokError::from_server(Some(502), "Bad Gateway");
+        assert_eq!(
+            policy_not_kept(
+                Some(&ApprovalDecision::Sending),
+                LocalExecMode::Always,
+                &unreached
+            ),
+            Some(ApprovalDecision::AllowOnce)
+        );
+        let gone = OpenGrokError::signed_out("sign in first");
+        assert_eq!(
+            policy_not_kept(Some(&ApprovalDecision::Never), LocalExecMode::Never, &gone),
+            Some(ApprovalDecision::Denied)
+        );
+    }
+
+    /// The run's answer and the policy write land in either order. A card whose answer failed
+    /// keeps saying so when the write fails after it: the call never went through, so "may use
+    /// your network this time" would be untrue. A card that is gone, or that a later message
+    /// closed, is left alone too.
+    #[test]
+    fn a_failed_answer_is_not_turned_into_a_once_by_the_policy_write() {
+        let refused =
+            OpenGrokError::from_server(Some(403), "only the organization's admin may do that");
+        let failed = ApprovalDecision::Failed("the run could not be answered".into());
+        assert_eq!(
+            policy_not_kept(Some(&failed), LocalExecMode::Always, &refused),
+            None
+        );
+        assert_eq!(
+            policy_not_kept(
+                Some(&ApprovalDecision::Superseded),
+                LocalExecMode::Always,
+                &refused
+            ),
+            None
+        );
+        assert_eq!(policy_not_kept(None, LocalExecMode::Never, &refused), None);
+        // Either order with an answer that landed ends on the same line.
+        let write_first = policy_not_kept(
+            Some(&ApprovalDecision::Sending),
+            LocalExecMode::Always,
+            &refused,
+        )
+        .expect("re-marked");
+        assert_eq!(
+            settled_decision(Some(&write_first), ApprovalDecision::Always),
+            None
+        );
+        let answer_first = policy_not_kept(
+            Some(&ApprovalDecision::Always),
+            LocalExecMode::Always,
+            &refused,
+        );
+        assert_eq!(answer_first, Some(write_first));
+    }
+
+    /// Always on the tunnel's card is kept for the card's own bot: the one whose live turn
+    /// raised it, else the one its thread names, and never the bot that happens to be open. A
+    /// card with neither keeps nothing, says "Sending…" like any other answer, and settles as
+    /// the once it was when the run has the answer.
+    #[test]
+    fn a_tunnel_cards_standing_answer_is_kept_only_for_its_own_bot() {
+        let mut state = AppState::new();
+        state.active_conversation_id = Some("cw_open".into());
+        let tunnel = tunnel_card();
+        assert_eq!(state.card_bot(&tunnel).as_deref(), Some("cw_1"));
+        assert_eq!(
+            egress_answer(
+                &tunnel,
+                LocalExecResolution::Always,
+                state.card_bot(&tunnel),
+                ApprovalDecision::Always
+            ),
+            (
+                Some(("cw_1".to_string(), LocalExecMode::Always)),
+                ApprovalDecision::Always
+            )
+        );
+
+        let mut unnamed = tunnel_card();
+        unnamed.thread_id = None;
+        assert_eq!(state.card_bot(&unnamed), None, "not the open bot");
+        let (write, settles) = egress_answer(
+            &unnamed,
+            LocalExecResolution::Never,
+            state.card_bot(&unnamed),
+            ApprovalDecision::Never,
+        );
+        assert_eq!(write, None);
+        assert_eq!(settles, ApprovalDecision::Denied);
+        // Nothing is written over "Sending…" at the click; the once lands with the answer.
+        assert_eq!(
+            settled_decision(Some(&ApprovalDecision::Sending), settles),
+            Some(ApprovalDecision::Denied)
+        );
+
+        // A run still live in a thread is that thread's card, whatever the card says.
+        state.live_turns.insert(
+            "cw_live".to_string(),
+            LiveTurn {
+                run_id: unnamed.run_id.clone(),
+                message_id: "m_live".to_string(),
+                persisting: false,
+            },
+        );
+        assert_eq!(state.card_bot(&unnamed).as_deref(), Some("cw_live"));
+
+        // A judge's card and a once write nothing.
+        let mut judge = tunnel_card();
+        judge.why = "Ask first: the page is a bank.".into();
+        assert_eq!(
+            egress_answer(
+                &judge,
+                LocalExecResolution::Always,
+                Some("cw_1".into()),
+                ApprovalDecision::Always
+            ),
+            (None, ApprovalDecision::Always)
+        );
+        assert_eq!(
+            egress_answer(
+                &tunnel,
+                LocalExecResolution::AllowOnce,
+                Some("cw_1".into()),
+                ApprovalDecision::AllowOnce
+            ),
+            (None, ApprovalDecision::AllowOnce)
+        );
     }
 
     /// The network choice follows Route traffic's surface, and only exists when the server
@@ -19593,6 +19952,22 @@ mod tests {
         let spec = spec_from_queued(&silent);
         assert_eq!(spec.reason, "exec-consent");
         assert_eq!(spec.why, "your machine's owner must approve this command");
+    }
+
+    /// A card rebuilt off the queue after a relaunch says what the call would do, the same way
+    /// the stream's card does: the queue carries the tool and its arguments and no summary.
+    #[test]
+    fn a_queued_card_says_what_the_call_would_do() {
+        let read = spec_from_queued(&queued("mcp-cw_1", "call_9", "read_file"));
+        assert_eq!(read.summary, "Read /etc/hosts on the agent's own box");
+        let mut click = queued("cw_1", "call_1", "computer");
+        click.arguments = serde_json::json!({"action": "click", "coordinate": [120, 40]});
+        assert_eq!(
+            spec_from_queued(&click).summary,
+            "Click at (120, 40) on the agent's own screen"
+        );
+        let shell = spec_from_queued(&queued("cw_1", "call_2", USER_MACHINE_SHELL));
+        assert_eq!(shell.summary, "");
     }
 
     /// The card the door raised is answered from the coworker's thread, and the line it leaves

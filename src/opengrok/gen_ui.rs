@@ -154,6 +154,12 @@ pub struct ApprovalSpec {
     pub command: String,
     pub why: String,
     pub reason: String,
+    /// What the call would do, in the words the server's own approval card uses: "Click at
+    /// (120, 40) on the agent's own screen", "Open https://example.com/inbox in the agent's own
+    /// browser". Built from the tool and its arguments by [`approval_summary`], because neither
+    /// the frame nor the approvals queue carries the server's sentence. Empty for a shell, whose
+    /// command is what the card shows, and for a call that came without its arguments.
+    pub summary: String,
     /// Tool result after the command ran (`exit 0` + stdout/stderr).
     pub output: Option<String>,
     pub ok: Option<bool>,
@@ -230,6 +236,20 @@ impl ApprovalSpec {
             && !self.runs_on_this_mac()
             && (self.reason.trim().eq_ignore_ascii_case("egress")
                 || self.why.trim() == EGRESS_TUNNEL_ASK_REASON)
+    }
+
+    /// The standing choice an answer to the tunnel's card writes for its computer, as
+    /// `PUT /coworkers/{id}/computer/egress-policy`: Always is `bypass`, Never is `never`. A
+    /// once answers only this call, and no other card has the computer's choice behind it.
+    pub fn egress_standing(&self, resolution: LocalExecResolution) -> Option<LocalExecMode> {
+        if !self.is_egress_tunnel() {
+            return None;
+        }
+        match resolution {
+            LocalExecResolution::Always => Some(LocalExecMode::Always),
+            LocalExecResolution::Never => Some(LocalExecMode::Never),
+            LocalExecResolution::AllowOnce | LocalExecResolution::DenyOnce => None,
+        }
     }
 
     /// The centered line this card leaves behind once it is answered, in the
@@ -1094,6 +1114,7 @@ pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
                 .cloned()
         })
         .unwrap_or(Value::Null);
+    let summary = approval_summary(&tool, &arguments);
     Some(ApprovalSpec {
         run_id,
         thread_id: string_at(event, "threadId").filter(|id| !id.trim().is_empty()),
@@ -1101,10 +1122,195 @@ pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
         command: command_from_args(&arguments),
         why: string_at(event, "why").unwrap_or_default(),
         reason: string_at(event, "reason").unwrap_or_else(|| "exec-consent".to_string()),
+        summary,
         tool,
         output: None,
         ok: None,
     })
+}
+
+/// What a call would do, in the words opengrok-server's own approval card uses: "Click at
+/// (120, 40) on the agent's own screen", "Open https://example.com/inbox in the agent's own
+/// browser". Transcribed from `summary_for` in opengrok-server `cards.rs` (#211, and #246 for
+/// the redaction) as of 234e755.
+///
+/// It is built here because the server writes that sentence only onto its gateway transcript
+/// card, which this app does not read. The `run-awaiting-approval` frame and the approvals
+/// queue carry the tool and its arguments and nothing else about what the call would do, so
+/// the card used to show the arguments as JSON. Built the same way, typed text and keys that
+/// look like secrets read `«redacted»` and a page is named without its query, as on the
+/// server's card.
+///
+/// Empty for the two shells, whose command is what the card shows (the server's card shows
+/// its `command_for` in place of the summary), and for a call that came without arguments.
+/// An empty summary leaves the card as it was.
+pub fn approval_summary(tool: &str, arguments: &Value) -> String {
+    if !arguments.is_object() {
+        return String::new();
+    }
+    match tool {
+        USER_MACHINE_SHELL | "shell" => String::new(),
+        "read_file" => format!(
+            "Read {} on the agent's own box",
+            clip(string_arg(arguments, "path").unwrap_or("a file"), 200)
+        ),
+        "write_file" => format!(
+            "Write {} bytes to {} on the agent's own box",
+            string_arg(arguments, "content").map_or(0, str::len),
+            clip(string_arg(arguments, "path").unwrap_or("a file"), 200)
+        ),
+        "computer" => screen_summary(arguments),
+        "open_url" => format!(
+            "Open {} in the agent's own browser",
+            clip(page_of(arguments), 120)
+        ),
+        // The recipe's `values` stay off the card: a login recipe is handed a password.
+        "run_recipe" => format!(
+            "Play the recipe \"{}\" on the agent's own computer",
+            clip(string_arg(arguments, "recipe").unwrap_or("(unnamed)"), 80)
+        ),
+        other => format!(
+            "{other} — a plugin tool this agent wants to call, with {}",
+            clip(&redacted_arguments(arguments), 160)
+        ),
+    }
+}
+
+/// A `computer` call in words, from the fields the server's `screen_summary` reads. An action
+/// it does not know is named, not dropped.
+fn screen_summary(arguments: &Value) -> String {
+    let screen = if string_arg(arguments, "machine") == Some("group") {
+        "the group's shared screen"
+    } else {
+        "the agent's own screen"
+    };
+    let point = |key: &str| {
+        let xy = arguments.get(key).and_then(Value::as_array);
+        let at = |i: usize| xy.and_then(|xy| xy.get(i)).and_then(Value::as_i64);
+        match (at(0), at(1)) {
+            (Some(x), Some(y)) => format!("({x}, {y})"),
+            _ => "(no position)".to_string(),
+        }
+    };
+    let at = point("coordinate");
+    match string_arg(arguments, "action").unwrap_or("") {
+        "screenshot" => format!("Take a screenshot of {screen}"),
+        "click" | "left_click" => format!("Click at {at} on {screen}"),
+        "right_click" => format!("Right-click at {at} on {screen}"),
+        "double_click" => format!("Double-click at {at} on {screen}"),
+        "move" | "mouse_move" => format!("Move the pointer to {at} on {screen}"),
+        "drag" | "left_click_drag" => format!("Drag from {at} to {} on {screen}", point("to")),
+        "type" => format!(
+            "Type \"{}\" on {screen}",
+            shown(string_arg(arguments, "text").unwrap_or(""), 60)
+        ),
+        "key" => format!(
+            "Press {} on {screen}",
+            shown(string_arg(arguments, "key").unwrap_or("a key"), 40)
+        ),
+        "scroll" => format!("Scroll at {at} on {screen}"),
+        other => format!("Screen action \"{}\" on {screen}", clip(other, 30)),
+    }
+}
+
+fn string_arg<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments.get(key).and_then(Value::as_str)
+}
+
+/// Typed text as the card may show it. The whole text is checked before it is clipped, which
+/// would otherwise cut a key below the length the check needs.
+fn shown(text: &str, max: usize) -> String {
+    if looks_like_a_secret(text) {
+        REDACTED.to_string()
+    } else {
+        clip(text, max)
+    }
+}
+
+/// The page an `open_url` call names, without its query or fragment, where a link's token
+/// rides.
+fn page_of(arguments: &Value) -> &str {
+    let url = string_arg(arguments, "url").unwrap_or("a page");
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}…")
+}
+
+/// What a secret-looking value reads as on the server's card (opengrok-tools `review.rs`).
+const REDACTED: &str = "«redacted»";
+
+/// The server's own test for a key-shaped string (opengrok-tools `review.rs`
+/// `looks_like_a_secret`): a known key prefix, or one long run of token characters with no
+/// spaces. As coarse as the server's, so the two cards hide the same values.
+fn looks_like_a_secret(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.starts_with("Bearer ") || trimmed.starts_with("sk-") || trimmed.starts_with("xoxb-")
+    {
+        return true;
+    }
+    trimmed.len() >= 40
+        && !trimmed.contains(' ')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '='))
+}
+
+/// A plugin call's arguments as the server's card shows them (opengrok-tools `review.rs`
+/// `redact_arguments`): the identity keys the server fills in itself are dropped, and a value
+/// under a secret's name, or shaped like one, reads `«redacted»`. The server also clips each
+/// value at 500 characters, which the 160 the summary keeps never reaches.
+fn redacted_arguments(arguments: &Value) -> String {
+    redact_value(arguments, None).to_string()
+}
+
+fn redact_value(value: &Value, key: Option<&str>) -> Value {
+    const IDENTITY_KEYS: &[&str] = &[
+        "account_id",
+        "accountId",
+        "coworker_id",
+        "coworkerId",
+        "box_id",
+        "boxId",
+    ];
+    const SECRET_KEY_FRAGMENTS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "api_key",
+        "apikey",
+        "credential",
+        "cookie",
+    ];
+    if let Some(key) = key {
+        let lower = key.to_ascii_lowercase();
+        if SECRET_KEY_FRAGMENTS
+            .iter()
+            .any(|fragment| lower.contains(fragment))
+        {
+            return Value::String(REDACTED.to_string());
+        }
+    }
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !IDENTITY_KEYS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), redact_value(value, Some(key))))
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| redact_value(item, None)).collect())
+        }
+        Value::String(text) if looks_like_a_secret(text) => Value::String(REDACTED.to_string()),
+        other => other.clone(),
+    }
 }
 
 /// Centered status Grok paints after the permission card leaves the transcript.
@@ -1309,6 +1515,7 @@ mod tests {
             command: "screenshot".into(),
             why: why.into(),
             reason: "auto-review".into(),
+            summary: String::new(),
             output: None,
             ok: None,
         }
@@ -1355,6 +1562,35 @@ mod tests {
             judge.outcome("Vamos", LocalExecResolution::AllowOnce),
             "Vamos can run commands on its computer this time."
         );
+    }
+
+    /// Always and Never on the tunnel's card write its computer's standing choice, for the bot
+    /// whose thread raised it: Always goes out as `bypass`. A once writes nothing, and a judge's
+    /// card, a local-shell card or a plain consent card has no computer choice behind its Always.
+    #[test]
+    fn only_the_tunnel_cards_always_and_never_write_the_computers_choice() {
+        let tunnel = review_card(EGRESS_TUNNEL_ASK_REASON);
+        assert_eq!(tunnel.conversation_id(), Some("cw_1"));
+        assert_eq!(
+            tunnel.egress_standing(LocalExecResolution::Always),
+            Some(LocalExecMode::Always)
+        );
+        assert_eq!(LocalExecMode::Always.as_stored(), "bypass");
+        assert_eq!(
+            tunnel.egress_standing(LocalExecResolution::Never),
+            Some(LocalExecMode::Never)
+        );
+        assert_eq!(tunnel.egress_standing(LocalExecResolution::AllowOnce), None);
+        assert_eq!(tunnel.egress_standing(LocalExecResolution::DenyOnce), None);
+
+        let judge = review_card("Ask first: the page is a bank.");
+        assert_eq!(judge.egress_standing(LocalExecResolution::Always), None);
+        let mut local = tunnel.clone();
+        local.tool = USER_MACHINE_SHELL.into();
+        assert_eq!(local.egress_standing(LocalExecResolution::Always), None);
+        let mut consent = tunnel.clone();
+        consent.reason = "exec-consent".into();
+        assert_eq!(consent.egress_standing(LocalExecResolution::Never), None);
     }
 
     /// A generative form or chart is saved as the value it was parsed from, so a thread read
@@ -1604,6 +1840,159 @@ mod tests {
         assert!(!turn.waiting_approval());
     }
 
+    /// The frame is the one the server sends today (opengrok-harness `projection.rs`
+    /// `awaiting_approval`): the tool and its arguments, and no summary. The card says what the
+    /// call would do all the same, in the server's card's words.
+    #[test]
+    fn a_card_says_what_the_call_would_do_from_the_frame_the_server_sends() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "threadId": "cw_1",
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "computer",
+            "arguments": {"action": "click", "coordinate": [120, 40]},
+            "reason": "auto-review",
+            "why": EGRESS_TUNNEL_ASK_REASON
+        }));
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::Approval(spec)] => {
+                assert!(spec.is_egress_tunnel());
+                assert_eq!(spec.summary, "Click at (120, 40) on the agent's own screen");
+            }
+            other => panic!("expected one approval card, got {other:?}"),
+        }
+
+        // The same frame with its fields under `value`.
+        let nested = approval_from_event(&json!({
+            "value": {
+                "runId": "run-1",
+                "callId": "call-9",
+                "tool": "open_url",
+                "arguments": {"url": "https://example.com/inbox?token=s3cret#top"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            nested.summary,
+            "Open https://example.com/inbox in the agent's own browser"
+        );
+    }
+
+    /// Each tool reads as it does on the server's card (opengrok-server `tests/unit/cards.rs`),
+    /// and what that card keeps off, this one keeps off too: a typed key, a pressed key, a
+    /// link's token, a recipe's values, and a plugin call's secrets and identity keys.
+    #[test]
+    fn the_summary_is_the_servers_sentence_for_each_tool() {
+        let said = |tool: &str, arguments: Value| approval_summary(tool, &arguments);
+        let screen = |arguments: Value| said("computer", arguments);
+        assert_eq!(
+            screen(
+                json!({"to": [0, 0], "key": "", "text": "", "action": "screenshot",
+                          "button": 1, "scroll": [0, 0], "coordinate": [0, 0]})
+            ),
+            "Take a screenshot of the agent's own screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "screenshot", "machine": "group"})),
+            "Take a screenshot of the group's shared screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "right_click", "coordinate": [5, 6]})),
+            "Right-click at (5, 6) on the agent's own screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "left_click_drag", "coordinate": [1, 2], "to": [30, 40]})),
+            "Drag from (1, 2) to (30, 40) on the agent's own screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "scroll"})),
+            "Scroll at (no position) on the agent's own screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "type", "text": "hello world"})),
+            "Type \"hello world\" on the agent's own screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "key", "key": "Return"})),
+            "Press Return on the agent's own screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "zoom", "coordinate": [1, 2]})),
+            "Screen action \"zoom\" on the agent's own screen"
+        );
+        let key = format!("sk-live-{}", "a1".repeat(24));
+        assert_eq!(
+            screen(json!({"action": "type", "text": key})),
+            "Type \"«redacted»\" on the agent's own screen"
+        );
+        assert_eq!(
+            screen(json!({"action": "key", "key": key})),
+            "Press «redacted» on the agent's own screen"
+        );
+        let long_token = "Z".repeat(30) + &"9".repeat(30);
+        assert!(!screen(json!({"action": "type", "text": long_token})).contains("ZZZZ"));
+        let typed = screen(json!({"action": "type", "text": "say x ".repeat(50)}));
+        assert!(
+            typed.contains("say x say x") && typed.contains('…'),
+            "{typed}"
+        );
+
+        assert_eq!(
+            said("read_file", json!({"path": "/etc/hosts"})),
+            "Read /etc/hosts on the agent's own box"
+        );
+        assert_eq!(
+            said(
+                "write_file",
+                json!({"path": "/etc/hosts", "content": "abc"})
+            ),
+            "Write 3 bytes to /etc/hosts on the agent's own box"
+        );
+        assert_eq!(
+            said(
+                "run_recipe",
+                json!({"recipe": "Open Gmail", "values": {"password": "s3cret"}})
+            ),
+            "Play the recipe \"Open Gmail\" on the agent's own computer"
+        );
+        let plugin = said(
+            "gmail.api.send",
+            json!({"to": "a@example.com", "api_key": "s3cret", "coworkerId": "cw_1",
+                   "auth": "Bearer s3cret"}),
+        );
+        assert!(
+            plugin.starts_with("gmail.api.send — a plugin tool this agent wants to call, with {"),
+            "{plugin}"
+        );
+        assert!(plugin.contains("a@example.com"), "{plugin}");
+        assert!(!plugin.contains("s3cret"), "{plugin}");
+        assert!(!plugin.contains("cw_1"), "{plugin}");
+    }
+
+    /// A shell's card shows its command, not a summary of it, and a call that came without its
+    /// arguments has nothing to summarise: both cards read as they did.
+    #[test]
+    fn a_shell_or_a_call_without_arguments_has_no_summary() {
+        let command = json!({"command": "ls"});
+        assert_eq!(approval_summary(USER_MACHINE_SHELL, &command), "");
+        assert_eq!(approval_summary("shell", &command), "");
+        assert_eq!(approval_summary("computer", &Value::Null), "");
+
+        let older = approval_from_event(&json!({
+            "runId": "run-1",
+            "callId": "call-9",
+            "tool": "computer",
+            "reason": "auto-review"
+        }))
+        .unwrap();
+        assert_eq!(older.summary, "");
+        assert_eq!(older.command, "");
+    }
+
     fn ask(call_id: &str, command: &str) -> ChatPart {
         ChatPart::Approval(ApprovalSpec {
             run_id: "r".into(),
@@ -1613,6 +2002,7 @@ mod tests {
             command: command.into(),
             why: String::new(),
             reason: "exec-consent".into(),
+            summary: String::new(),
             output: None,
             ok: None,
         })
@@ -1725,6 +2115,7 @@ mod tests {
             command: "ls".into(),
             why: String::new(),
             reason: "exec-consent".into(),
+            summary: String::new(),
             output: None,
             ok: None,
         }
