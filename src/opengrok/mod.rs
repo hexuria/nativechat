@@ -23,8 +23,8 @@ pub use credential::{
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, CompletedUiTool, FormField, FormSpec,
     LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, TurnAssembler, UI_TOOL_RESULT,
-    USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event, collapse_open_approvals,
-    command_from_args, command_from_replay_events, local_exec_outcome,
+    USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event, approval_summary,
+    collapse_open_approvals, command_from_args, command_from_replay_events, local_exec_outcome,
     place_hitl_cards_in_document_order, policy_answer,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};

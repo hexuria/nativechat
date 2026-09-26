@@ -5459,6 +5459,42 @@ mod tests {
             .expect("204 is success");
     }
 
+    /// Always on the tunnel's card goes out as `bypass`. On an organization's shared computer
+    /// only the admin may write it, and a member's 403 comes back with its status and the
+    /// server's sentence, which is what the card reads to say why.
+    #[tokio::test]
+    async fn set_egress_policy_sends_bypass_and_keeps_a_members_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_own/computer/egress-policy"))
+            .and(body_json(json!({ "mode": "bypass" })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_org/computer/egress-policy"))
+            .and(body_json(json!({ "mode": "bypass" })))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("only the organization's admin may do that"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client
+            .set_egress_policy("cw_own", LocalExecMode::Always)
+            .await
+            .expect("204 is success");
+        let refused = client
+            .set_egress_policy("cw_org", LocalExecMode::Always)
+            .await
+            .expect_err("a member may not set the organization's computer's choice");
+        assert_eq!(refused.status, Some(403));
+        assert_eq!(refused.message, "only the organization's admin may do that");
+    }
+
     #[test]
     fn coworker_computer_reads_egress_tunnel_flag() {
         let off: CoworkerComputer = serde_json::from_value(json!({

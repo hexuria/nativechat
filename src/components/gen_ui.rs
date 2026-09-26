@@ -227,6 +227,9 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
             )
             .into_any_element();
     }
+    // Painted as a Review-an-action card: the title, the lines under it and the buttons all
+    // go by this one gate (see the buttons below for why the tunnel flag is part of it).
+    let review = spec.is_review_an_action() && (tunnel || app.is_none());
     let mut body = v_flex()
         .w_full()
         .gap(px(8.))
@@ -246,26 +249,19 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                     .flex_1()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(if spec.is_review_an_action() && (tunnel || app.is_none()) {
-                        "Review an action".to_string()
-                    } else if spec.runs_on_this_mac() {
-                        format!("Allow {bot} to run this command on your local computer?")
-                    } else {
-                        format!("Allow {bot} to run {} on its computer?", spec.tool)
-                    }),
+                    .child(approval_title(spec, &bot, review)),
             )
             .child(dismiss_button(spec, app.clone(), theme.muted_foreground)),
     );
-    // What the card is about, in the server's words. A Review-an-action card used to show
-    // only its title, so the person could not tell the tunnel's card from a judge's. Only on
-    // a card painted AS a review card (the same gate the buttons use), or the sentence would
-    // sit under a plain consent title.
-    if spec.is_review_an_action() && (tunnel || app.is_none()) && !spec.why.trim().is_empty() {
+    // What the card is about, in the server's words: see `card_lines`. A Review-an-action card
+    // used to show only its title, so the person could not tell the tunnel's card from a
+    // judge's.
+    for line in card_lines(spec, review) {
         body = body.child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(spec.why.trim().to_string()),
+                .child(line.to_string()),
         );
     }
     if spec.runs_on_this_mac() {
@@ -286,22 +282,19 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 )),
         );
     }
-    let command = if spec.command.trim().is_empty() {
-        "Command was not included with this request.".to_string()
-    } else {
-        spec.command.clone()
-    };
-    body = body.child(
-        div()
-            .w_full()
-            .px(px(8.))
-            .py(px(6.))
-            .rounded(px(6.))
-            .bg(theme.secondary)
-            .text_xs()
-            .text_color(theme.secondary_foreground)
-            .child(command),
-    );
+    if let Some(command) = arguments_box(spec) {
+        body = body.child(
+            div()
+                .w_full()
+                .px(px(8.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .bg(theme.secondary)
+                .text_xs()
+                .text_color(theme.secondary_foreground)
+                .child(command),
+        );
+    }
     if matches!(decision, ApprovalDecision::Sending) {
         body = body.child(
             div()
@@ -317,7 +310,6 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
         // the reason when the tunnel is on; we still require the flag here so
         // exec-consent never grows Review chrome because a leftover reason.
         let local = spec.runs_on_this_mac();
-        let review = spec.is_review_an_action() && (tunnel || app.is_none());
         let (primary, plain) = (
             (theme.primary, theme.primary_foreground, theme.primary),
             (theme.border, theme.foreground, theme.background),
@@ -370,6 +362,59 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
         body = body.child(row);
     }
     body.into_any_element()
+}
+
+/// The card's title: one short question about where the call would act, by the surface the
+/// server's own card files it under (opengrok-server `cards.rs` `surface_for`). A shell runs a
+/// command on its computer, a qualified `plugin.server.tool` is a connected service, and every
+/// other tool uses its computer. What the call would do is the line under the title (see
+/// `card_lines`). The title used to be built from the tool's name, and read "Allow Hex to run
+/// computer on its computer?". A review card keeps its own title, and the local shell's card
+/// asks about this Mac's policy rather than one call, so neither changes.
+fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> String {
+    if review {
+        return "Review an action".to_string();
+    }
+    if spec.runs_on_this_mac() {
+        return format!("Allow {bot} to run this command on your local computer?");
+    }
+    match spec.tool.as_str() {
+        "shell" => format!("Allow {bot} to run a command on its computer?"),
+        "read_file" => format!("Allow {bot} to read a file on its computer?"),
+        "write_file" => format!("Allow {bot} to write a file on its computer?"),
+        tool if tool.matches('.').count() >= 2 => {
+            format!("Allow {bot} to use a connected service?")
+        }
+        _ => format!("Allow {bot} to use its computer?"),
+    }
+}
+
+/// The lines under the title, in the server's words. A card painted as a review card says why
+/// the call was stopped and then what it would do: the tunnel's reason is the same sentence
+/// for every call, and the summary is what tells a click from a page load. A consent card says
+/// only what the call would do, because a reason under a plain consent title would read as a
+/// review card's.
+fn card_lines(spec: &ApprovalSpec, review: bool) -> Vec<&str> {
+    let why = if review { spec.why.trim() } else { "" };
+    [why, spec.summary.as_str()]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// The raw arguments box, where the card has one. It is there only where the arguments are
+/// what the call means: a shell's command, or a call that could not be put in words. Under a
+/// summary it showed the same call again as JSON, including typed text that the summary keeps
+/// as `«redacted»`.
+fn arguments_box(spec: &ApprovalSpec) -> Option<String> {
+    if !spec.summary.is_empty() {
+        return None;
+    }
+    Some(if spec.command.trim().is_empty() {
+        "Command was not included with this request.".to_string()
+    } else {
+        spec.command.clone()
+    })
 }
 
 fn dismiss_button(spec: &ApprovalSpec, app: Option<Entity<AppState>>, color: Hsla) -> AnyElement {
@@ -591,7 +636,145 @@ fn render_form(
 
 #[cfg(test)]
 mod tests {
-    use super::{STRIP_TILES, overflow_count};
+    use super::{STRIP_TILES, approval_title, arguments_box, card_lines, overflow_count};
+    use crate::opengrok::{ApprovalSpec, USER_MACHINE_SHELL, approval_from_event};
+    use serde_json::{Value, json};
+
+    const CLICK: &str = "Click at (120, 40) on the agent's own screen";
+    const TUNNEL: &str =
+        "This action would use your network through the egress tunnel. Review it before it runs.";
+
+    /// A card off the frame the server sends today (opengrok-harness `projection.rs`
+    /// `awaiting_approval`), which carries the tool and its arguments and no summary.
+    fn card(tool: &str, arguments: Value, reason: &str, why: &str) -> ApprovalSpec {
+        approval_from_event(&json!({
+            "type": "CUSTOM",
+            "name": "run-awaiting-approval",
+            "threadId": "cw_1",
+            "runId": "run_1",
+            "callId": "call_1",
+            "tool": tool,
+            "arguments": arguments,
+            "reason": reason,
+            "why": why
+        }))
+        .expect("a card")
+    }
+
+    fn click() -> Value {
+        json!({"action": "click", "coordinate": [120, 40]})
+    }
+
+    /// A consent card asks where the call would act, never "run computer on its computer",
+    /// and says what the call would do under that.
+    #[test]
+    fn a_consent_card_is_titled_by_where_the_call_acts() {
+        let screen = card("computer", click(), "exec-consent", "");
+        assert_eq!(
+            approval_title(&screen, "Hex", false),
+            "Allow Hex to use its computer?"
+        );
+        assert_eq!(card_lines(&screen, false), vec![CLICK]);
+        let shell = card("shell", json!({"command": "ls -la"}), "policy-approval", "");
+        assert_eq!(
+            approval_title(&shell, "Hex", false),
+            "Allow Hex to run a command on its computer?"
+        );
+        let read = card(
+            "read_file",
+            json!({"path": "notes.md"}),
+            "policy-approval",
+            "",
+        );
+        assert_eq!(
+            approval_title(&read, "Hex", false),
+            "Allow Hex to read a file on its computer?"
+        );
+        let write = card(
+            "write_file",
+            json!({"path": "notes.md"}),
+            "policy-approval",
+            "",
+        );
+        assert_eq!(
+            approval_title(&write, "Hex", false),
+            "Allow Hex to write a file on its computer?"
+        );
+        let plugin = card(
+            "gmail.api.send",
+            json!({"to": "a@example.com"}),
+            "policy-approval",
+            "",
+        );
+        assert_eq!(
+            approval_title(&plugin, "Hex", false),
+            "Allow Hex to use a connected service?"
+        );
+    }
+
+    /// A review card keeps its own title whatever the call is, and the local shell's card asks
+    /// about the one command on it (#87).
+    #[test]
+    fn review_and_local_shell_cards_keep_their_titles() {
+        let review = card(
+            "computer",
+            click(),
+            "auto-review",
+            "Ask first: the page is a bank.",
+        );
+        assert_eq!(approval_title(&review, "Hex", true), "Review an action");
+        let local = card(
+            USER_MACHINE_SHELL,
+            json!({"command": "ls"}),
+            "exec-consent",
+            "",
+        );
+        assert_eq!(
+            approval_title(&local, "Hex", false),
+            "Allow Hex to run this command on your local computer?"
+        );
+    }
+
+    /// Under a review card's title: why the call was stopped, then what it would do. A consent
+    /// card says only what it would do, and a call with nothing to summarise shows only its
+    /// why, as before.
+    #[test]
+    fn a_review_card_says_why_then_what_under_its_title() {
+        let tunnel = card("computer", click(), "auto-review", TUNNEL);
+        assert_eq!(card_lines(&tunnel, true), vec![TUNNEL, CLICK]);
+        assert_eq!(card_lines(&tunnel, false), vec![CLICK]);
+        let older = card("computer", Value::Null, "auto-review", TUNNEL);
+        assert_eq!(card_lines(&older, true), vec![TUNNEL]);
+    }
+
+    /// The raw arguments are shown only where they are the meaning. A typed key used to sit in
+    /// the box as JSON under a summary that had redacted it.
+    #[test]
+    fn the_raw_arguments_show_only_where_nothing_else_says_what_the_call_does() {
+        let key = format!("sk-live-{}", "a1".repeat(24));
+        let typed = card(
+            "computer",
+            json!({"action": "type", "text": key}),
+            "auto-review",
+            TUNNEL,
+        );
+        assert_eq!(arguments_box(&typed), None);
+        let said = format!(
+            "{} {}",
+            approval_title(&typed, "Hex", true),
+            card_lines(&typed, true).join(" ")
+        );
+        assert!(said.contains("«redacted»"), "{said}");
+        assert!(!said.contains("a1a1"), "{said}");
+
+        let shell = card("shell", json!({"command": "ls -la"}), "policy-approval", "");
+        assert_eq!(arguments_box(&shell).as_deref(), Some("ls -la"));
+        let bare = card("computer", Value::Null, "auto-review", TUNNEL);
+        assert_eq!(
+            arguments_box(&bare).as_deref(),
+            Some("Command was not included with this request.")
+        );
+    }
 
     /// The strip shows three tiles; the count on the last one is what is left over, so a
     /// set of five reads "+2" and every picture is still one click away.
