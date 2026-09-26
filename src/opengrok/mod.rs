@@ -24,7 +24,7 @@ pub use client::{
     QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeParameter, RecipeParameterKind,
     RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare, RecipeShareState,
     RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent, RecipeVersion,
-    RunReplay, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, thin_tape,
+    RunReplay, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, thin_tape,
 };
 pub use error::OpenGrokError;
 pub use types::{

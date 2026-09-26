@@ -11,7 +11,7 @@ use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::find_text::{FindHit, marks_for_row, project_hits};
 use crate::opengrok::{ApprovalSpec, ChatPart, ScreenshotSpec, UiSpec, collapse_open_approvals};
-use crate::state::{AppState, EmojiPickerOpen, is_status_line, is_tool_standin};
+use crate::state::{AppState, EmojiPickerOpen, STOPPED_TURN_NOTE, is_status_line, is_tool_standin};
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -252,7 +252,10 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             // speech: they get the quiet centred line, not a bubble with a toolbar on it.
             if !msg.is_me && (is_status_line(&text) || is_tool_standin(&text)) {
                 rows.push(ChatRow {
-                    status_failed: is_status_line(&text),
+                    // Red is for a turn that went wrong. A turn the person stopped went exactly
+                    // as they asked, so it gets the quiet grey the stand-ins get; painting it in
+                    // the colour of a failure would send someone looking for what broke.
+                    status_failed: is_status_line(&text) && text.trim() != STOPPED_TURN_NOTE,
                     content: SharedString::from(text.clone()),
                     status_line: Some(text),
                     ..ChatRow::slot(id, msg.id.clone())
