@@ -1095,6 +1095,27 @@ impl OpenGrokClient {
     /// a success, so nothing has to be checked about the run before asking. A `404` is a run the
     /// server has never heard of or one belonging to somebody else, which from here means the
     /// same thing — there is nothing of ours left running under that id.
+    /// Add words to a run that is still going. The run id does not change and the
+    /// server does not stop it. `409` / `404` mean the run is no longer the one to
+    /// append to; the caller sends a new turn so the words are not dropped.
+    pub async fn steer_run(
+        &self,
+        run_id: &str,
+        content: &str,
+        client_message_id: &str,
+    ) -> Result<(), OpenGrokError> {
+        let path = format!("/ag-ui/runs/{run_id}/steer");
+        let body = serde_json::json!({
+            "content": content,
+            "clientMessageId": client_message_id,
+        });
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(&body))
+            .await?;
+        let _: serde_json::Value = Self::json_or_error(response).await?;
+        Ok(())
+    }
+
     pub async fn stop_run(&self, run_id: &str) -> Result<StopReply, OpenGrokError> {
         let path = format!("/ag-ui/runs/{run_id}/stop");
         let response = self

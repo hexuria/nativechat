@@ -286,6 +286,13 @@ impl ChatPart {
     }
 }
 
+/// A later `TEXT_MESSAGE_START` in a run that already has a reply. The words
+/// already painted are one answer. The deltas after this start are the next
+/// one — a steered follow-up — and they belong in their own bubble.
+pub fn starts_another_reply(event: &Value, turn: &TurnAssembler) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("TEXT_MESSAGE_START") && turn.has_reply_text()
+}
+
 /// At most one open permission card. Older unanswered host-shell runs stay
 /// off this bubble so a turn does not look like it needs two yeses.
 pub fn collapse_open_approvals(
@@ -372,6 +379,9 @@ pub struct TurnAssembler {
     form_args: std::collections::HashMap<String, String>,
     /// Newest tool PNG. Computer pane / last-screen thumb; chat only on pin.
     latest_shot: Option<ScreenshotSpec>,
+    /// The next text delta is a new model round in this run. It must not
+    /// continue the last sentence already committed.
+    break_paragraph: bool,
 }
 
 #[derive(Debug)]
@@ -385,8 +395,25 @@ impl TurnAssembler {
     pub fn push_event(&mut self, event: &Value) {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
+            "TEXT_MESSAGE_START" => {
+                // A later model round in this same run. The words already here are
+                // one reply. The next deltas are the next reply. Joining them with
+                // nothing is what turned "…don't work." and "Hi, hello." into one
+                // sentence. The first start has nothing behind it.
+                let already = !self.text.trim().is_empty()
+                    || self.committed.iter().any(
+                        |part| matches!(part, ChatPart::Text(text) if !text.trim().is_empty()),
+                    );
+                self.break_paragraph = already;
+            }
             "TEXT_MESSAGE_CONTENT" | "TEXT_MESSAGE_CHUNK" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    if self.break_paragraph {
+                        self.break_paragraph = false;
+                        if !self.text.ends_with("\n\n") {
+                            self.text.push_str("\n\n");
+                        }
+                    }
                     self.text.push_str(delta);
                     if self.tool.is_none() {
                         self.flush_text();
@@ -460,7 +487,14 @@ impl TurnAssembler {
             }
             "CUSTOM" => {
                 let name = event.get("name").and_then(Value::as_str).unwrap_or("");
-                if is_user_form_awaiting(event) {
+                if name == "drop-streamed-preamble" {
+                    // A work tool started in this round. The text already painted
+                    // was "I'll probe…", and the server is taking that paint back.
+                    // Only the suffix it names goes: a reply already on screen
+                    // stays.
+                    let suffix = event.get("text").and_then(Value::as_str).unwrap_or("");
+                    self.retract_trailing_text(suffix);
+                } else if is_user_form_awaiting(event) {
                     self.flush_text();
                     let call_id = event
                         .get("callId")
@@ -519,6 +553,47 @@ impl TurnAssembler {
                 self.waiting_approval = false;
             }
             _ => {}
+        }
+    }
+
+    pub fn has_reply_text(&self) -> bool {
+        !self.text.trim().is_empty()
+            || self
+                .committed
+                .iter()
+                .any(|part| matches!(part, ChatPart::Text(text) if !text.trim().is_empty()))
+    }
+
+    /// Remove a preamble the server already streamed, once a work tool starts.
+    ///
+    /// Deltas are committed as their own text parts, so the preamble is a
+    /// suffix of those parts, not one of them. An earlier reply in the same
+    /// run is the prefix and stays.
+    fn retract_trailing_text(&mut self, suffix: &str) {
+        if suffix.is_empty() {
+            return;
+        }
+        self.flush_text();
+        let mut start = self.committed.len();
+        while start > 0 && matches!(self.committed[start - 1], ChatPart::Text(_)) {
+            start -= 1;
+        }
+        let mut run = String::new();
+        for part in &self.committed[start..] {
+            if let ChatPart::Text(text) = part {
+                run.push_str(text);
+            }
+        }
+        let kept = if let Some(rest) = run.strip_suffix(suffix) {
+            rest.to_string()
+        } else if run == suffix {
+            String::new()
+        } else {
+            return;
+        };
+        self.committed.truncate(start);
+        if !kept.is_empty() {
+            self.committed.push(ChatPart::Text(kept));
         }
     }
 
@@ -1882,6 +1957,73 @@ mod tests {
             [ChatPart::Screenshot(spec)] => assert_eq!(spec.call_id, "c-fail"),
             other => panic!("failure pins immediately, got {other:?}"),
         }
+    }
+
+    /// Two model rounds in one run. The second message must not continue the
+    /// last sentence of the first. The live turn opens a new bubble for that
+    /// start; this assembler still keeps them apart inside one snapshot so a
+    /// replay that has not split rows does not glue the sentences.
+    #[test]
+    fn a_later_message_in_the_same_run_starts_a_new_paragraph() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"
+        }));
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "Because their horns don't work."
+        }));
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_END", "messageId": "m1"
+        }));
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_START", "messageId": "m2", "role": "assistant"
+        }));
+        turn.push_event(&json!({
+            "type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "Hi, hello."
+        }));
+        let (plain, _) = turn.snapshot();
+        assert_eq!(plain, "Because their horns don't work.\n\nHi, hello.");
+    }
+
+    #[test]
+    fn a_second_text_message_starts_another_reply() {
+        let mut turn = TurnAssembler::default();
+        assert!(!starts_another_reply(
+            &json!({"type": "TEXT_MESSAGE_START", "messageId": "m1"}),
+            &turn
+        ));
+        turn.push_event(&json!({"type": "TEXT_MESSAGE_CONTENT", "delta": "50 jokes"}));
+        assert!(starts_another_reply(
+            &json!({"type": "TEXT_MESSAGE_START", "messageId": "m2"}),
+            &turn
+        ));
+    }
+
+    #[test]
+    fn a_streamed_preamble_is_taken_back_when_a_tool_starts() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({"type": "TEXT_MESSAGE_CONTENT", "delta": "I'll probe the host"}));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "drop-streamed-preamble",
+            "text": "I'll probe the host"
+        }));
+        let (plain, _) = turn.snapshot();
+        assert!(plain.trim().is_empty(), "{plain}");
+    }
+
+    #[test]
+    fn retracting_a_preamble_leaves_the_reply_already_shown() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&json!({"type": "TEXT_MESSAGE_CONTENT", "delta": "Here are the files."}));
+        turn.push_event(&json!({"type": "TEXT_MESSAGE_CONTENT", "delta": "I'll probe the host"}));
+        turn.push_event(&json!({
+            "type": "CUSTOM",
+            "name": "drop-streamed-preamble",
+            "text": "I'll probe the host"
+        }));
+        let (plain, _) = turn.snapshot();
+        assert_eq!(plain, "Here are the files.");
     }
 
     /// The giveaway of the bug the person reported: two things the coworker said either side of

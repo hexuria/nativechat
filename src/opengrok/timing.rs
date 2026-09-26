@@ -161,10 +161,11 @@ impl TurnTiming {
             .and_then(Self::from_value)
     }
 
-    /// Lines under the bubble when Settings → Show turn timing is on.
+    /// Phase breakdown of a `run-timing` frame.
     ///
-    /// A phase at zero is left out: the harness always sends `auto_review_ms`,
-    /// and a `0ms` line reads as a step that ran.
+    /// The chat does not paint this. A swipe already shows the clock and how
+    /// long the turn took. A phase at zero is left out: the harness always
+    /// sends `auto_review_ms`, and a `0ms` line reads as a step that ran.
     pub fn debug_lines(&self) -> Vec<String> {
         let spent = |ms: Option<u64>| ms.filter(|ms| *ms > 0);
         let mut lines = Vec::new();

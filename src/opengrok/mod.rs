@@ -25,7 +25,7 @@ pub use gen_ui::{
     LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, TurnAssembler, UI_TOOL_RESULT,
     USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event, collapse_open_approvals,
     command_from_args, command_from_replay_events, local_exec_outcome,
-    place_hitl_cards_in_document_order, policy_answer,
+    place_hitl_cards_in_document_order, policy_answer, starts_another_reply,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub use user_form::{

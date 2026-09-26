@@ -7,7 +7,9 @@ use crate::send_policy::OnSend;
 use std::path::{Path, PathBuf};
 
 const ON_SEND: &str = "on_send";
-const SHOW_TURN_TIMING: &str = "show_turn_timing";
+/// Present once this build has decided what `steer` means. Without it, `steer`
+/// is the old word for stop-then-send and is rewritten to `interrupt`.
+const ON_SEND_REVISION: &str = "on_send_revision";
 
 pub fn prefs_path(data_dir: &Path) -> PathBuf {
     data_dir.join("prefs.json")
@@ -18,11 +20,26 @@ pub fn load_on_send(data_dir: &Path) -> OnSend {
 }
 
 pub fn load_on_send_from(path: &Path) -> OnSend {
-    read_object(path)
+    let mut prefs = read_object(path);
+    let revised = prefs
+        .get(ON_SEND_REVISION)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        >= 1;
+    let raw = prefs
         .get(ON_SEND)
         .and_then(serde_json::Value::as_str)
-        .map(OnSend::parse)
-        .unwrap_or_default()
+        .unwrap_or("queue")
+        .to_string();
+    if !revised && raw.trim().eq_ignore_ascii_case("steer") {
+        prefs.insert(ON_SEND.to_string(), "interrupt".into());
+        prefs.insert(ON_SEND_REVISION.to_string(), 1.into());
+        if path.exists() {
+            write_object(path, prefs);
+        }
+        return OnSend::Interrupt;
+    }
+    OnSend::parse(&raw)
 }
 
 pub fn save_on_send(data_dir: &Path, on_send: OnSend) {
@@ -32,27 +49,7 @@ pub fn save_on_send(data_dir: &Path, on_send: OnSend) {
 pub fn save_on_send_to(path: &Path, on_send: OnSend) {
     let mut prefs = read_object(path);
     prefs.insert(ON_SEND.to_string(), on_send.as_str().into());
-    write_object(path, prefs);
-}
-
-pub fn load_show_turn_timing(data_dir: &Path) -> bool {
-    load_show_turn_timing_from(&prefs_path(data_dir))
-}
-
-pub fn load_show_turn_timing_from(path: &Path) -> bool {
-    read_object(path)
-        .get(SHOW_TURN_TIMING)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-pub fn save_show_turn_timing(data_dir: &Path, on: bool) {
-    save_show_turn_timing_to(&prefs_path(data_dir), on);
-}
-
-pub fn save_show_turn_timing_to(path: &Path, on: bool) {
-    let mut prefs = read_object(path);
-    prefs.insert(SHOW_TURN_TIMING.to_string(), on.into());
+    prefs.insert(ON_SEND_REVISION.to_string(), 1.into());
     write_object(path, prefs);
 }
 
@@ -132,22 +129,36 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["on_send"], "steer");
+        assert_eq!(value["on_send_revision"], 1);
         assert_eq!(value["later_build"]["x"], 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn turn_timing_defaults_off_and_round_trips() {
-        let dir = scratch("turn-timing");
+    fn legacy_steer_is_interrupt_and_is_rewritten() {
+        let dir = scratch("legacy-steer");
         let path = prefs_path(&dir);
-        assert!(!load_show_turn_timing_from(&path), "no file yet is off");
-        save_show_turn_timing_to(&path, true);
-        assert!(load_show_turn_timing_from(&path));
-        save_on_send_to(&path, OnSend::Steer);
-        assert!(
-            load_show_turn_timing_from(&path),
-            "saving another pref keeps the switch"
+        std::fs::write(&path, r#"{"on_send":"steer","later_build":1}"#).unwrap();
+        assert_eq!(load_on_send_from(&path), OnSend::Interrupt);
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["on_send"], "interrupt");
+        assert_eq!(value["on_send_revision"], 1);
+        assert_eq!(value["later_build"], 1);
+        assert_eq!(
+            load_on_send_from(&path),
+            OnSend::Interrupt,
+            "a second load does not turn the rewritten word back into steer"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_revised_steer_stays_steer() {
+        let dir = scratch("revised-steer");
+        let path = prefs_path(&dir);
+        std::fs::write(&path, r#"{"on_send":"steer","on_send_revision":1}"#).unwrap();
+        assert_eq!(load_on_send_from(&path), OnSend::Steer);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

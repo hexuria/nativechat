@@ -13,16 +13,25 @@ pub enum OnSend {
     /// Hold the message and send it when the turn ends.
     #[default]
     Queue,
-    /// Stop the turn at its next step and send now.
+    /// Add the message to the turn that is already running. Does not stop it.
     Steer,
+    /// Stop the turn at its next step and send now.
+    ///
+    /// This is what a prefs file used to store as `steer`, before Steer meant
+    /// the other thing. `load_on_send_from` rewrites that word once.
+    Interrupt,
 }
 
 impl OnSend {
     /// Unknown words fall back to `Queue`, so a preference written by a later
     /// build (say, `auto`) never turns into an interrupt on this one.
+    ///
+    /// `steer` here is the new meaning. A file that still has the old `steer`
+    /// (stop, then send) is rewritten to `interrupt` before this runs.
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "steer" | "interrupt" => Self::Steer,
+            "steer" => Self::Steer,
+            "interrupt" => Self::Interrupt,
             _ => Self::Queue,
         }
     }
@@ -31,6 +40,7 @@ impl OnSend {
         match self {
             Self::Queue => "queue",
             Self::Steer => "steer",
+            Self::Interrupt => "interrupt",
         }
     }
 }
@@ -50,8 +60,11 @@ pub enum Busy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendPlan {
     Post,
-    /// Settle what is parked (or stop what is running), then post.
-    Steer,
+    /// Stop a running turn, then post. A parked card takes this path too, and
+    /// does not `/stop` first: the new message is what settles the card.
+    Interrupt,
+    /// Append to the run that is already going. Same run id, no stop.
+    IntoTurn,
     /// Keep it until the thread is idle.
     Queue,
 }
@@ -59,11 +72,14 @@ pub enum SendPlan {
 pub fn plan_send(busy: Busy, on_send: OnSend, force_steer: bool) -> SendPlan {
     match busy {
         Busy::Idle => SendPlan::Post,
-        // Parked is always a steer: the server ends the parked run on the
-        // next message whatever the preference says, and holding the words
-        // back would leave the card open for nothing.
-        Busy::Parked => SendPlan::Steer,
-        Busy::Running if force_steer || on_send == OnSend::Steer => SendPlan::Steer,
+        // Parked is always a new message: the server ends the parked run on
+        // the next message whatever the preference says, and holding the words
+        // back would leave the card open for nothing. That is not IntoTurn.
+        // The running turn has already finished its model loop.
+        Busy::Parked => SendPlan::Interrupt,
+        // ⌘⇧Enter is "send now", which stops the turn. The Queue row says so.
+        Busy::Running if force_steer || on_send == OnSend::Interrupt => SendPlan::Interrupt,
+        Busy::Running if on_send == OnSend::Steer => SendPlan::IntoTurn,
         Busy::Running => SendPlan::Queue,
     }
 }
@@ -74,7 +90,7 @@ mod tests {
 
     #[test]
     fn idle_posts_whatever_the_preference_or_chord() {
-        for on_send in [OnSend::Queue, OnSend::Steer] {
+        for on_send in [OnSend::Queue, OnSend::Steer, OnSend::Interrupt] {
             for force in [false, true] {
                 assert_eq!(plan_send(Busy::Idle, on_send, force), SendPlan::Post);
             }
@@ -82,42 +98,48 @@ mod tests {
     }
 
     #[test]
-    fn parked_always_steers() {
-        for on_send in [OnSend::Queue, OnSend::Steer] {
+    fn parked_always_sends_a_new_message() {
+        for on_send in [OnSend::Queue, OnSend::Steer, OnSend::Interrupt] {
             for force in [false, true] {
-                assert_eq!(plan_send(Busy::Parked, on_send, force), SendPlan::Steer);
+                assert_eq!(plan_send(Busy::Parked, on_send, force), SendPlan::Interrupt);
             }
         }
     }
 
     #[test]
-    fn running_queues_by_default_and_steers_on_request() {
+    fn running_queue_holds_interrupt_stops_and_steer_stays_in_the_turn() {
         assert_eq!(
             plan_send(Busy::Running, OnSend::Queue, false),
             SendPlan::Queue
         );
         assert_eq!(
             plan_send(Busy::Running, OnSend::Queue, true),
-            SendPlan::Steer
+            SendPlan::Interrupt,
+            "⌘⇧Enter sends now by stopping"
+        );
+        assert_eq!(
+            plan_send(Busy::Running, OnSend::Interrupt, false),
+            SendPlan::Interrupt
         );
         assert_eq!(
             plan_send(Busy::Running, OnSend::Steer, false),
-            SendPlan::Steer
+            SendPlan::IntoTurn
         );
         assert_eq!(
             plan_send(Busy::Running, OnSend::Steer, true),
-            SendPlan::Steer
+            SendPlan::Interrupt,
+            "the chord still interrupts, even when the preference is steer"
         );
     }
 
     #[test]
     fn preference_words_round_trip_and_unknown_means_queue() {
         assert_eq!(OnSend::parse("steer"), OnSend::Steer);
-        assert_eq!(OnSend::parse(" Interrupt "), OnSend::Steer);
+        assert_eq!(OnSend::parse(" Interrupt "), OnSend::Interrupt);
         assert_eq!(OnSend::parse("queue"), OnSend::Queue);
         assert_eq!(OnSend::parse("auto"), OnSend::Queue);
         assert_eq!(OnSend::parse(""), OnSend::Queue);
-        for on_send in [OnSend::Queue, OnSend::Steer] {
+        for on_send in [OnSend::Queue, OnSend::Steer, OnSend::Interrupt] {
             assert_eq!(OnSend::parse(on_send.as_str()), on_send);
         }
         assert_eq!(OnSend::default(), OnSend::Queue);

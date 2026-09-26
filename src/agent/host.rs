@@ -419,6 +419,10 @@ pub enum Command {
     },
     SetAppSettingsTab(crate::state::AppSettingsTab),
     CloseAppSettings,
+    /// Settings → General, "While the coworker is busy". The same three rows a click on the
+    /// page sets. Refused while Settings is shut, so a driver cannot change the preference
+    /// from a control that is not on screen.
+    SetOnSend(crate::send_policy::OnSend),
     /// The Computer pane's routines: open one (or a blank one), give a draft its trigger, ask
     /// for a new webhook key, drop one.
     OpenRoutineEditor(Option<String>),
@@ -578,6 +582,7 @@ impl Command {
             Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
             Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
             Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
+            Self::SetOnSend(mode) => state.set_on_send(mode, cx),
             Self::CloseAppSettings => {
                 if state.is_app_settings_open {
                     state.toggle_app_settings(cx);
@@ -716,6 +721,16 @@ fn login_field(target: &str) -> Option<LoginField> {
 /// `image-thumb-3` → 3.
 fn thumb_target(target: &str) -> Option<usize> {
     gpui_agent::parse_numbered_id("image-thumb-", target).map(|index| index as usize)
+}
+
+/// Settings → General rows for what a send does while a turn is running.
+fn on_send_click(target: &str) -> Option<crate::send_policy::OnSend> {
+    match target {
+        "settings-on-send-queue" => Some(crate::send_policy::OnSend::Queue),
+        "settings-on-send-steer" => Some(crate::send_policy::OnSend::Steer),
+        "settings-on-send-interrupt" => Some(crate::send_policy::OnSend::Interrupt),
+        _ => None,
+    }
 }
 
 /// The pictures of the newest set in the transcript, which is the set `image-thumb-<n>` names.
@@ -3237,6 +3252,11 @@ impl NativeChatHost {
             Command::SetAppSettingsTab(AppSettingsTab::Computer)
         } else if target == "settings-tab-updates" {
             Command::SetAppSettingsTab(AppSettingsTab::Updates)
+        } else if let Some(mode) = on_send_click(target) {
+            if !self.account_open {
+                return Err("no send choice is on screen to click".to_string());
+            }
+            Command::SetOnSend(mode)
         } else if target == "app-settings-back" {
             Command::CloseAppSettings
         } else if target == "computer-update" || target == "settings-computer-update" {

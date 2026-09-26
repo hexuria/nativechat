@@ -27,7 +27,7 @@ use crate::opengrok::{
     env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
     keep_local_save_offer, place_hitl_cards_in_document_order, policy_answer,
     reads_as_gateway_unreachable, retry_enqueue, save_login_from_local, serve_local_exec,
-    stamp_duration, stored_machine_id, tool_standin,
+    stamp_duration, starts_another_reply, stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
@@ -392,14 +392,17 @@ pub fn is_waiting_on_person(status: Option<&str>) -> bool {
     )
 }
 
-/// Footer chrome: the server waiting label as-is, else `{name} is working`.
+/// Footer chrome. Waiting and waking keep the sentences they already had.
+/// Every other label is the phase the turn is in — Thinking, Writing, Reading,
+/// the tool line — and the hover shows that same label, so this line must not
+/// replace it with "{name} is working".
 pub fn bot_status_line(name: &str, label: &str) -> String {
     if is_waiting_on_person(Some(label)) {
         label.to_string()
     } else if label == crate::opengrok::WAKING_COMPUTER {
         format!("Waking {name}'s computer")
     } else {
-        format!("{name} is working")
+        label.to_string()
     }
 }
 
@@ -1968,9 +1971,6 @@ pub struct AppState {
     pub submit_chord: SubmitChord,
     /// What a plain send does while a turn is running. Read from prefs.json at boot.
     pub on_send: OnSend,
-    /// Settings → General: paint the harness phase breakdown under assistant
-    /// bubbles. Off for demos; the peek stamp still wears how long the run took.
-    pub show_turn_timing: bool,
     /// Messages held per thread until it is idle, in the order they were typed.
     queued_sends: HashMap<String, VecDeque<QueuedSend>>,
     /// Bubble ids this process took off the queue. Hydrate must not put them back: a
@@ -2520,7 +2520,6 @@ impl AppState {
             app_settings_tab: AppSettingsTab::General,
             submit_chord: SubmitChord::Enter,
             on_send: OnSend::default(),
-            show_turn_timing: false,
             queued_sends: HashMap::new(),
             canceled_pending: HashSet::new(),
             pending_inflight: HashSet::new(),
@@ -7709,6 +7708,90 @@ impl AppState {
         history
     }
 
+    /// A steered follow-up's row. The run id stays the same, so the thread
+    /// still counts this run as one it has already accounted for. The new id
+    /// is the row the rest of the stream paints into.
+    fn open_followup_bubble(&mut self, conversation_id: &str, run_id: &str, message_id: &str) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation.messages.push(Message {
+                id: message_id.to_string(),
+                sender: "AI".to_string(),
+                content: String::new(),
+                sent_at: SystemTime::now(),
+                finished_at: None,
+                run_timing: None,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: Vec::new(),
+                run_id: Some(run_id.to_string()),
+                hidden: false,
+            });
+        }
+        if let Some(turn) = self.live_turns.get_mut(conversation_id)
+            && turn.run_id == run_id
+        {
+            turn.message_id = message_id.to_string();
+        }
+    }
+
+    /// Append `content` to the run that is already going. Does not stop it and does not
+    /// mint a run id. A 404 or 409 means that run is no longer running, so the words go
+    /// out as their own turn instead of disappearing.
+    fn post_steer(
+        &mut self,
+        conversation_id: String,
+        run_id: String,
+        content: String,
+        client_message_id: String,
+        recipe: Option<TurnRecipe>,
+        skill: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            match client
+                .steer_run(&run_id, &content, &client_message_id)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if error.status == Some(404) || error.status == Some(409) => {
+                    let _ = this.update(cx, |state, cx| {
+                        state.send_opengrok_turn_with(
+                            conversation_id,
+                            content,
+                            recipe,
+                            skill,
+                            None,
+                            None,
+                            cx,
+                        );
+                    });
+                }
+                Err(error) => {
+                    eprintln!("NativeChat: steer did not reach the turn: {error}");
+                    let _ = this.update(cx, |state, cx| {
+                        state.say_status_line(
+                            &conversation_id,
+                            "That message did not reach the turn.",
+                        );
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
     /// turn is firing, when it came off `queued_sends`.
@@ -7796,7 +7879,7 @@ impl AppState {
                     Err(error) => Err(error),
                 },
             };
-            let (result, waiting_approval, waiting_user_form, deeds) = match coworker {
+            let (result, waiting_approval, waiting_user_form, deeds, bubble_ids) = match coworker {
                 Ok(id) => {
                     // A forced send over a running turn: that turn is stopped here, in order,
                     // before this one is posted. 404 means it had already ended.
@@ -7809,7 +7892,9 @@ impl AppState {
                         );
                     }
                     let mut tracker = ToolCallTracker::default();
-                    let mut assembler = TurnAssembler::default();
+                    let mut segment = TurnAssembler::default();
+                    let mut bubble_id = reply_id.clone();
+                    let mut bubble_ids = vec![reply_id.clone()];
                     let mut last_stream_paint: Option<Instant> = None;
                     let mut last_stream_sig = (0usize, 0u8);
                     let result = client
@@ -7845,10 +7930,31 @@ impl AppState {
                                         });
                                     }
                                 }
-                                assembler.push_event(&event);
-                                let timing = TurnTiming::from_event(&event);
-                                let (plain, parts) = assembler.snapshot();
-                                let box_shot = assembler.latest_screenshot().cloned();
+                                if starts_another_reply(event, &segment) {
+                                    // The reply already on screen stays in its bubble.
+                                    // This start is the steered follow-up, and it gets
+                                    // its own row. Resetting the assembler is what keeps
+                                    // the second bubble from also containing the first.
+                                    let new_id = uuid::Uuid::now_v7().to_string();
+                                    let _ = this.update(cx, |state, cx| {
+                                        if !state.turn_is_unsettled(&conversation_id, &run_id) {
+                                            return;
+                                        }
+                                        state.open_followup_bubble(
+                                            &conversation_id,
+                                            &run_id,
+                                            &new_id,
+                                        );
+                                        cx.notify();
+                                    });
+                                    bubble_ids.push(new_id.clone());
+                                    bubble_id = new_id;
+                                    segment = TurnAssembler::default();
+                                }
+                                segment.push_event(event);
+                                let timing = TurnTiming::from_event(event);
+                                let (plain, parts) = segment.snapshot();
+                                let box_shot = segment.latest_screenshot().cloned();
                                 let sig = stream_part_sig(&parts);
                                 let now = Instant::now();
                                 let paint =
@@ -7870,7 +7976,7 @@ impl AppState {
                                     if let Some(message) = streaming_message_mut(
                                         &mut state.conversations,
                                         &conversation_id,
-                                        &reply_id,
+                                        &bubble_id,
                                     ) {
                                         message.content = plain.clone();
                                         message.parts = grafted;
@@ -7884,7 +7990,7 @@ impl AppState {
                                         }
                                     }
                                     state.collect_handoff_ids_and_flush(&conversation_id, cx);
-                                    if assembler.waiting_approval() {
+                                    if segment.waiting_approval() {
                                         let open = parts.iter().rev().find_map(|part| match part {
                                             ChatPart::Approval(spec) => Some(spec.clone()),
                                             _ => None,
@@ -7905,13 +8011,13 @@ impl AppState {
                             },
                         )
                         .await;
-                    assembler.finish();
-                    let waiting_approval = assembler.waiting_approval();
-                    let waiting_user_form = assembler.waiting_user_form();
+                    segment.finish();
+                    let waiting_approval = segment.waiting_approval();
+                    let waiting_user_form = segment.waiting_user_form();
                     // What the tools did, in case the turn ends without a word about it.
                     let deeds = tracker.deeds();
-                    let (plain, parts) = assembler.snapshot();
-                    let box_shot = assembler.latest_screenshot().cloned();
+                    let (plain, parts) = segment.snapshot();
+                    let box_shot = segment.latest_screenshot().cloned();
                     let _ = this.update(cx, |state, cx| {
                         if let Some(shot) = box_shot {
                             state.last_box_shot = Some(shot);
@@ -7920,7 +8026,7 @@ impl AppState {
                         if let Some(message) = streaming_message_mut(
                             &mut state.conversations,
                             &conversation_id,
-                            &reply_id,
+                            &bubble_id,
                         ) {
                             message.content = plain;
                             message.parts = grafted;
@@ -7931,9 +8037,9 @@ impl AppState {
                     let waiting_form = this
                         .update(cx, |state, _| state.has_open_user_form(&conversation_id))
                         .unwrap_or(waiting_user_form);
-                    (result, waiting_approval, waiting_form, deeds)
+                    (result, waiting_approval, waiting_form, deeds, bubble_ids)
                 }
-                Err(error) => (Err(error), false, false, Vec::new()),
+                Err(error) => (Err(error), false, false, Vec::new(), vec![reply_id.clone()]),
             };
             let _ = this.update(cx, |state, cx| {
                 // Something else may already have decided what this turn came to: the person
@@ -8010,8 +8116,12 @@ impl AppState {
                     cx.notify();
                     return;
                 }
+                let latest_id = bubble_ids
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| reply_id.clone());
                 if let Some(message) =
-                    streaming_message_mut(&mut state.conversations, &conversation_id, &reply_id)
+                    streaming_message_mut(&mut state.conversations, &conversation_id, &latest_id)
                 {
                     // A turn that ends without words is spoken for by the app: why it
                     // failed, what its tools did, or the note that it said nothing at all.
@@ -8019,9 +8129,18 @@ impl AppState {
                     // turn left a screenshot behind.
                     if !message.has_text_body() {
                         match &result {
-                            Ok(text) if !text.is_empty() => message.content = text.clone(),
+                            // One bubble: the stream's own text is that bubble. More than
+                            // one means a steered follow-up already has its own row, and
+                            // this string is both replies joined — painting it here would
+                            // put the first answer into the second bubble.
+                            Ok(text) if !text.is_empty() && bubble_ids.len() == 1 => {
+                                message.content = text.clone()
+                            }
                             // Parked on a permission card or a user-form: the turn is not over yet.
                             Ok(_) if waiting_approval || waiting_user_form => {}
+                            // A steered follow-up that never received words is not the
+                            // turn saying nothing. The earlier bubble is the reply.
+                            Ok(_) if bubble_ids.len() > 1 => {}
                             Ok(_) => {
                                 message.content = tool_standin(&deeds)
                                     .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
@@ -8048,11 +8167,21 @@ impl AppState {
                             }
                         }
                     }
-                    if !waiting_approval && !waiting_user_form {
-                        // The start clock stays. This is the other end of the wait, so the
-                        // peek stamp can say `4:34 PM · 6m12s` instead of pretending the
-                        // answer landed when the run began.
-                        stamp_run_finished(message, SystemTime::now());
+                }
+                if !waiting_approval && !waiting_user_form {
+                    let ended = SystemTime::now();
+                    if let Some(conversation) = state
+                        .conversations
+                        .iter_mut()
+                        .find(|c| c.id == conversation_id)
+                    {
+                        for id in &bubble_ids {
+                            if let Some(message) =
+                                conversation.messages.iter_mut().find(|m| m.id == *id)
+                            {
+                                stamp_run_finished(message, ended);
+                            }
+                        }
                     }
                 }
                 if !waiting_approval && !waiting_user_form && result.is_ok() {
@@ -8061,16 +8190,30 @@ impl AppState {
                     // it, so it cannot become history the model is shown next turn. Settling the
                     // reply is also what lets the thread go: from here it reads from the
                     // database again, because from here the database has the turn.
-                    let reply = state
+                    // Each steered follow-up is its own row. Saving only the first would
+                    // drop the second on the next load, and saving them joined would be
+                    // the one bubble this split exists to avoid.
+                    let replies: Vec<(String, String, Vec<ChatPart>)> = state
                         .conversations
                         .iter()
                         .find(|c| c.id == conversation_id)
-                        .and_then(|c| c.messages.iter().find(|m| m.id == reply_id))
-                        .map(|m| (m.content.clone(), m.parts.clone()));
-                    if let Some((content, parts)) = reply {
+                        .map(|c| {
+                            bubble_ids
+                                .iter()
+                                .filter_map(|id| {
+                                    c.messages.iter().find(|m| m.id == *id).and_then(|m| {
+                                        (!m.content.trim().is_empty()).then(|| {
+                                            (m.id.clone(), m.content.clone(), m.parts.clone())
+                                        })
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (id, content, parts) in replies {
                         state.persist_assistant_reply(
                             &conversation_id,
-                            &reply_id,
+                            &id,
                             content,
                             &parts,
                             Some(&run_id),
@@ -11115,7 +11258,7 @@ impl AppState {
         // the message that stopped it.
         let busy = self.busy_state(&conversation_id);
         let plan = plan_send(busy, self.on_send, force_steer);
-        let stop_first = if plan == SendPlan::Steer && busy == Busy::Running {
+        let stop_first = if plan == SendPlan::Interrupt && busy == Busy::Running {
             self.take_running_turn_for_steer(cx)
         } else {
             None
@@ -11234,10 +11377,31 @@ impl AppState {
             // `settle_parked_cards`. Running: the turn was stopped above, the way the button
             // does it, and this message goes now. Anything already held stays held — the
             // message the person forced ahead goes first, and the rest follow when it ends.
-            SendPlan::Steer => {
+            SendPlan::Interrupt => {
                 self.edit_slot = None;
                 if busy == Busy::Parked {
                     self.settle_parked_cards(&conversation_id);
+                }
+            }
+            // Same run. The bubble is already on screen. The server appends the
+            // words for the next model call and does not stop the turn. If that
+            // run has already ended, the fallback posts a new one.
+            SendPlan::IntoTurn => {
+                self.edit_slot = None;
+                let run_id = self
+                    .turn_to_stop()
+                    .and_then(|(id, turn)| (id == conversation_id).then_some(turn.run_id));
+                if let Some(run_id) = run_id {
+                    self.post_steer(
+                        conversation_id,
+                        run_id,
+                        content,
+                        local_id,
+                        recipe,
+                        skill,
+                        cx,
+                    );
+                    return;
                 }
             }
         }
@@ -11445,7 +11609,6 @@ impl AppState {
 
     pub fn restore_saved_on_send(&mut self) {
         self.on_send = crate::prefs::load_on_send(&Config::data_dir());
-        self.show_turn_timing = crate::prefs::load_show_turn_timing(&Config::data_dir());
     }
 
     pub fn set_on_send(&mut self, on_send: OnSend, cx: &mut Context<Self>) {
@@ -11453,15 +11616,6 @@ impl AppState {
             self.on_send = on_send;
             #[cfg(not(test))]
             crate::prefs::save_on_send(&Config::data_dir(), on_send);
-            cx.notify();
-        }
-    }
-
-    pub fn set_show_turn_timing(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.show_turn_timing != on {
-            self.show_turn_timing = on;
-            #[cfg(not(test))]
-            crate::prefs::save_show_turn_timing(&Config::data_dir(), on);
             cx.notify();
         }
     }
@@ -17161,7 +17315,10 @@ mod tests {
             bot_status_line("Grok", WAITING_FOR_YOU_STATUS),
             "Waiting for you"
         );
-        assert_eq!(bot_status_line("Grok", "Working"), "Grok is working");
+        assert_eq!(bot_status_line("Grok", "Thinking"), "Thinking");
+        assert_eq!(bot_status_line("Grok", "Writing"), "Writing");
+        assert_eq!(bot_status_line("Grok", "Reading file"), "Reading file");
+        assert_eq!(bot_status_line("Grok", "Running `ls`"), "Running `ls`");
         assert_eq!(
             bot_status_line("Vamos", crate::opengrok::WAKING_COMPUTER),
             "Waking Vamos's computer",
