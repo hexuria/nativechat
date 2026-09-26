@@ -6,6 +6,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  # Line tables keep file and line numbers in panics and backtraces. Full debuginfo only makes
+  # compiling, linking and the rust-cache archive bigger.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 # A new push to a pull request cancels the run it replaces. Each push to main keeps its own run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -42,3 +47,20 @@ jobs:
             exit 1
           fi
           echo "No shipped migration was changed."
+
+  test:
+    # The crate links AppKit, CoreAudio and LocalAuthentication unconditionally, so it only builds
+    # on a Mac. The image is pinned rather than macos-latest: a new image brings a new Xcode SDK
+    # underneath the pinned toolchain.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Pull requests read main's cache and never write their own, so the cache stays one
+          # warm copy of main instead of one per branch.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --all-features: `agent` is the only feature, and the gpui-agent host tests
+      # (src/agent/host.rs) only compile with it. Plain `cargo test` skips them.
+      - name: cargo test
+        run: cargo test --locked -p nativechat --all-features
