@@ -1,0 +1,44 @@
+name: pr
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to a pull request cancels the run it replaces. Each push to main keeps its own run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # rustup reads rust-toolchain.toml, so this is the same rustfmt as a laptop's.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  migrations:
+    # The app runs every migration at launch and panics if one fails (`main.rs`, `run_migrations`
+    # then `expect`). sqlx records each applied migration's checksum, so editing, renaming or
+    # deleting one that has shipped makes every existing install crash on its next launch.
+    # A schema change is always a new file.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Migrations are append-only
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          changed="$(git diff --name-only --diff-filter=MDR "origin/${BASE}...HEAD" -- migrations/)"
+          if [ -n "${changed}" ]; then
+            echo "Migrations are append-only: add a new file instead of changing these:" >&2
+            printf '  %s\n' ${changed} >&2
+            exit 1
+          fi
+          echo "No shipped migration was changed."

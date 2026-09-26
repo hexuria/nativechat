@@ -1,5 +1,4 @@
 /target
-*.lock
 *.env
 *.env.*
 !.env.example
