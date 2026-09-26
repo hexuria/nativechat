@@ -2271,6 +2271,13 @@ pub enum ApprovalDecision {
     /// A later message moved the thread on. The server closed the card when
     /// that message arrived; nothing was allowed or denied.
     Superseded,
+    /// Always or Never on the local shell's card, whose rule was not kept: the server refused
+    /// it, or the write never reached it. The call was still allowed, or not, this once, and
+    /// `why` is what went wrong with the rule.
+    NotKept {
+        allowed: bool,
+        why: String,
+    },
     Failed(String),
 }
 
@@ -2294,6 +2301,17 @@ impl ApprovalDecision {
             Self::Denied => LocalExecResolution::DenyOnce,
             Self::Never => LocalExecResolution::Never,
             Self::Superseded => return Some(SUPERSEDED_NOTE.to_string()),
+            Self::NotKept { allowed, why } => {
+                let (once, standing) = if *allowed {
+                    (LocalExecResolution::AllowOnce, "Always allow")
+                } else {
+                    (LocalExecResolution::DenyOnce, "Never")
+                };
+                return Some(format!(
+                    "{} {standing} was not kept: {why}",
+                    spec.outcome(bot, once)
+                ));
+            }
             _ => return None,
         };
         Some(spec.outcome(bot, resolution))
@@ -7893,7 +7911,7 @@ impl AppState {
                                             if let Some(resolution) =
                                                 state.auto_resolve_local_exec(&spec)
                                             {
-                                                state.answer_approval(spec, resolution, cx);
+                                                state.answer_approval_by_mode(spec, resolution, cx);
                                             }
                                         }
                                     }
@@ -8103,7 +8121,7 @@ impl AppState {
                         .and_then(|spec| state.auto_resolve_local_exec(spec))
                         .zip(open);
                     if let Some((resolution, spec)) = auto {
-                        state.answer_approval(spec, resolution, cx);
+                        state.answer_approval_by_mode(spec, resolution, cx);
                         state.finish_responding(Some(&conversation_id), false);
                     } else {
                         state.finish_responding(Some(&conversation_id), true);
@@ -8346,10 +8364,52 @@ impl AppState {
         }
     }
 
+    /// The person's answer on a card.
     pub fn answer_approval(
         &mut self,
         spec: ApprovalSpec,
         resolution: LocalExecResolution,
+        cx: &mut Context<Self>,
+    ) {
+        self.answer_card(spec, resolution, false, cx);
+    }
+
+    /// This Mac's own Always or Never answering a card for the person, which keeps no rule;
+    /// see `card_answer`.
+    fn answer_approval_by_mode(
+        &mut self,
+        spec: ApprovalSpec,
+        resolution: LocalExecResolution,
+        cx: &mut Context<Self>,
+    ) {
+        self.answer_card(spec, resolution, true, cx);
+    }
+
+    /// This Mac's machine id, as far as the app knows it: the daemon's, the roster's entry for
+    /// this Mac, or the one it enrolled with. Never some other computer's: a rule a card keeps
+    /// is for the Mac it was answered on, and one guessed onto another machine would let the
+    /// command through (or stop it) there instead.
+    fn this_mac_id(&self) -> Option<String> {
+        self.local_exec_machine_id
+            .clone()
+            .or_else(|| {
+                self.computers
+                    .iter()
+                    .find(|computer| computer.this_machine)
+                    .map(|computer| computer.machine_id.clone())
+            })
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .and_then(|config| stored_machine_id(&config.data_dir))
+            })
+    }
+
+    fn answer_card(
+        &mut self,
+        spec: ApprovalSpec,
+        resolution: LocalExecResolution,
+        by_mode: bool,
         cx: &mut Context<Self>,
     ) {
         if self.approval_answered(&spec.call_id) {
@@ -8366,25 +8426,7 @@ impl AppState {
             );
             return;
         };
-        let machine_id = self
-            .local_exec_machine_id
-            .clone()
-            .or_else(|| {
-                self.computers
-                    .iter()
-                    .find(|computer| computer.this_machine)
-                    .map(|computer| computer.machine_id.clone())
-            })
-            .or_else(|| {
-                self.config
-                    .as_ref()
-                    .and_then(|config| stored_machine_id(&config.data_dir))
-            })
-            .or_else(|| {
-                self.computers
-                    .first()
-                    .map(|computer| computer.machine_id.clone())
-            });
+        let machine_id = self.this_mac_id();
         // The thread the run belongs to, not the thread that happens to be open: a card can be
         // answered from the notification while the person is reading somewhere else, and the
         // resumed run must go on filling in its own bubble. Failing that, the thread the card
@@ -8398,14 +8440,8 @@ impl AppState {
             .map(|(id, _)| id.clone())
             .or_else(|| spec.conversation_id().map(str::to_string))
             .or_else(|| self.active_conversation_id.clone());
-        let (approved, decision, mode) = match resolution {
-            LocalExecResolution::Always => (true, ApprovalDecision::Always, Some("bypass")),
-            LocalExecResolution::AllowOnce => (true, ApprovalDecision::AllowOnce, None),
-            LocalExecResolution::Never => (false, ApprovalDecision::Never, Some("never")),
-            LocalExecResolution::DenyOnce => (false, ApprovalDecision::Denied, None),
-        };
-        // Only the local-shell tool can move this Mac's policy.
-        let mode = mode.filter(|_| spec.runs_on_this_mac());
+        let (approved, decision, rule) =
+            card_answer(&spec, resolution, by_mode, machine_id.as_deref());
         // Always and Never on the tunnel's card are the computer's standing choice, kept on
         // the server for the card's own bot — which is not always the one being looked at.
         if spec.is_egress_tunnel() {
@@ -8426,22 +8462,30 @@ impl AppState {
             (true, true) => format!("Answering {}", spec.tool),
             (true, false) => "Running commands".to_string(),
         };
-        if let (Some(machine_id), Some(stored)) = (machine_id.as_ref(), mode) {
-            if let Some(computer) = self
-                .computers
-                .iter_mut()
-                .find(|computer| &computer.machine_id == machine_id)
-            {
-                computer.mode = LocalExecMode::from_stored(stored);
-            }
-            cx.notify();
-        }
         let run_id_empty = spec.run_id.trim().is_empty();
         cx.spawn(async move |this, cx| {
-            if let (Some(machine_id), Some(mode)) = (machine_id.as_deref(), mode) {
-                let _ = client.set_local_exec_mode(machine_id, mode).await;
+            // The rule is written before the answer goes, so that a rule not kept is already on
+            // the card when the answer lands and is not painted over by it; see
+            // `settled_decision`. It does not hold the answer back: the person has still said
+            // yes, or no, to this one call, and the card says that, and why the rule was not
+            // kept. The server keeps an allow only for one plain command, compared word by
+            // word, and never for `sudo`, and answers anything else with a 422 and the reason
+            // (opengrok-server `standing_rule_refusal`, PR #213); a write that never got there
+            // reads the same way, with what stopped it.
+            if let Some(rule) = rule
+                && let Err(error) = client
+                    .add_local_exec_rule(&rule.machine_id, rule.kind, &rule.pattern)
+                    .await
+            {
                 let _ = this.update(cx, |state, cx| {
-                    state.refresh_computers(cx);
+                    state.approval_decisions.insert(
+                        spec.call_id.clone(),
+                        ApprovalDecision::NotKept {
+                            allowed: approved,
+                            why: error.message,
+                        },
+                    );
+                    cx.notify();
                 });
             }
             if run_id_empty {
@@ -8467,8 +8511,8 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(_) => {
-                        // A standing choice the policy write already failed to keep must not be
-                        // written back over the once-only line that failure left; see
+                        // A standing choice the policy or rule write already failed to keep must
+                        // not be written back over the once-only line that failure left; see
                         // `settled_decision`.
                         let current = state.approval_decisions.get(&spec.call_id).cloned();
                         if let Some(settled) = settled_decision(current.as_ref(), decision) {
@@ -8857,7 +8901,7 @@ impl AppState {
                     }
                     let spec = spec_from_queued(&item);
                     match state.auto_resolve_local_exec(&spec) {
-                        Some(resolution) => state.answer_approval(spec, resolution, cx),
+                        Some(resolution) => state.answer_approval_by_mode(spec, resolution, cx),
                         None => needs_card.push(item),
                     }
                 }
@@ -13107,9 +13151,9 @@ fn once_only_for(mode: LocalExecMode) -> ApprovalDecision {
 }
 
 /// What a card's decision becomes once the run has taken the answer. A standing choice
-/// (Always / Never) whose policy write has already failed was re-marked as once-only by that
-/// failure, and the answer landing later must not promote it back: `None` keeps what is
-/// there. Everything else is written as decided.
+/// (Always / Never) whose policy or rule write has already failed was re-marked as once-only by
+/// that failure — a rule with why it was not kept — and the answer landing later must not
+/// promote it back: `None` keeps what is there. Everything else is written as decided.
 fn settled_decision(
     current: Option<&ApprovalDecision>,
     decided: ApprovalDecision,
@@ -13117,13 +13161,76 @@ fn settled_decision(
     let standing = matches!(decided, ApprovalDecision::Always | ApprovalDecision::Never);
     let downgraded = matches!(
         current,
-        Some(ApprovalDecision::AllowOnce | ApprovalDecision::Denied)
+        Some(
+            ApprovalDecision::AllowOnce
+                | ApprovalDecision::Denied
+                | ApprovalDecision::NotKept { .. }
+        )
     );
     if standing && downgraded {
         None
     } else {
         Some(decided)
     }
+}
+
+/// A standing rule an answer keeps for this Mac: the body of `POST /local-exec/policy/rule`.
+/// Transcribed from `RuleBody` in opengrok-server `crates/opengrok-server/src/local_exec.rs`
+/// (`add_rule`, which answers 422 with its reason for a rule it will not keep: PR #213).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StandingRule {
+    machine_id: String,
+    /// `allow` or `deny`.
+    kind: &'static str,
+    /// The command on the card.
+    pattern: String,
+}
+
+/// What an answer on a card does: whether the call goes ahead, what the card says once it is
+/// answered, and the standing rule this Mac is to keep, if any.
+///
+/// Always and Never on the local shell's card are about the command on it, not the Mac. They
+/// used to write this Mac's mode, so one Always let every command after it run unasked (#87);
+/// the mode is the person's to set in Settings, and a card only keeps a rule for its own
+/// command, on `machine_id`, this Mac. A card with no command has nothing for a rule to name,
+/// and with no id for this Mac there is nowhere to keep one, so either answer is the once-only
+/// one it amounts to. Nor does a card answered `by_mode` — by this Mac's own Always or Never
+/// rather than by the person — keep a rule: the mode said it, and a rule written in its name
+/// would outlast it, still letting the command through (or still stopping it) after the person
+/// has put the Mac back on Ask.
+fn card_answer(
+    spec: &ApprovalSpec,
+    resolution: LocalExecResolution,
+    by_mode: bool,
+    machine_id: Option<&str>,
+) -> (bool, ApprovalDecision, Option<StandingRule>) {
+    let (approved, decision) = match resolution {
+        LocalExecResolution::Always => (true, ApprovalDecision::Always),
+        LocalExecResolution::AllowOnce => (true, ApprovalDecision::AllowOnce),
+        LocalExecResolution::Never => (false, ApprovalDecision::Never),
+        LocalExecResolution::DenyOnce => (false, ApprovalDecision::Denied),
+    };
+    let standing = matches!(decision, ApprovalDecision::Always | ApprovalDecision::Never);
+    if !standing || !spec.runs_on_this_mac() || by_mode {
+        return (approved, decision, None);
+    }
+    let machine_id = match machine_id {
+        Some(machine_id) if !spec.command.trim().is_empty() => machine_id,
+        _ => {
+            let once = if approved {
+                ApprovalDecision::AllowOnce
+            } else {
+                ApprovalDecision::Denied
+            };
+            return (approved, once, None);
+        }
+    };
+    let rule = StandingRule {
+        machine_id: machine_id.to_string(),
+        kind: if approved { "allow" } else { "deny" },
+        pattern: spec.command.clone(),
+    };
+    (approved, decision, Some(rule))
 }
 
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
@@ -14816,12 +14923,13 @@ mod tests {
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
     use crate::opengrok::{
-        Failure, FormField, FormResolution, FormSpec, LocalExecMode, ModelEntry, OpenGrokClient,
-        OpenGrokError, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
+        ApprovalSpec, ConnectedComputer, Failure, FormField, FormResolution, FormSpec,
+        LocalExecMode, LocalExecResolution, ModelEntry, OpenGrokClient, OpenGrokError,
+        QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
     use crate::state::{
-        ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, once_only_for,
-        settled_decision,
+        ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, StandingRule,
+        card_answer, once_only_for, settled_decision,
     };
     use chrono::{Local, TimeZone};
     use std::str::FromStr;
@@ -18844,6 +18952,179 @@ mod tests {
             once_only_for(LocalExecMode::Always),
             ApprovalDecision::AllowOnce
         );
+    }
+
+    /// A rule that was not kept leaves, where the card was, what the answer still did to this
+    /// one call and why the rule was not kept, whether the server refused it or the write never
+    /// reached it. The run's answer landing afterwards must not paint the standing wording back
+    /// over that.
+    #[test]
+    fn a_rule_not_kept_leaves_the_once_only_answer_and_why() {
+        let card = local_shell_card("ls | head");
+        let refused = ApprovalDecision::NotKept {
+            allowed: true,
+            why: "an allow rule must be one plain command".into(),
+        };
+        assert!(refused.is_settled());
+        assert_eq!(
+            settled_decision(Some(&refused), ApprovalDecision::Always),
+            None
+        );
+        assert_eq!(
+            refused.outcome_line("Hexuria", &card).as_deref(),
+            Some(
+                "Hexuria can run commands on your computer this time. Always allow was not \
+                 kept: an allow rule must be one plain command"
+            )
+        );
+        let unreached = ApprovalDecision::NotKept {
+            allowed: false,
+            why: "error sending request".into(),
+        };
+        assert_eq!(
+            settled_decision(Some(&unreached), ApprovalDecision::Never),
+            None
+        );
+        assert_eq!(
+            unreached.outcome_line("Hexuria", &card).as_deref(),
+            Some(
+                "Hexuria was not allowed to run commands on your computer. Never was not kept: \
+                 error sending request"
+            )
+        );
+    }
+
+    fn local_shell_card(command: &str) -> ApprovalSpec {
+        ApprovalSpec {
+            run_id: "run_1".into(),
+            thread_id: Some("cw_1".into()),
+            call_id: "call_1".into(),
+            tool: USER_MACHINE_SHELL.into(),
+            command: command.into(),
+            why: String::new(),
+            reason: "exec-consent".into(),
+            output: None,
+            ok: None,
+        }
+    }
+
+    fn rule_on_mac_1(kind: &'static str, pattern: &str) -> Option<StandingRule> {
+        Some(StandingRule {
+            machine_id: "mac_1".into(),
+            kind,
+            pattern: pattern.into(),
+        })
+    }
+
+    /// Always and Never on the local shell's card keep a rule for the command on it, on this
+    /// Mac, and nothing wider: this Mac's mode is not theirs to move (#87). Once is once, and
+    /// keeps nothing.
+    #[test]
+    fn always_and_never_keep_a_rule_for_the_command_on_the_card() {
+        let card = local_shell_card("ls -la");
+        let here = Some("mac_1");
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::Always, false, here),
+            (
+                true,
+                ApprovalDecision::Always,
+                rule_on_mac_1("allow", "ls -la")
+            )
+        );
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::Never, false, here),
+            (
+                false,
+                ApprovalDecision::Never,
+                rule_on_mac_1("deny", "ls -la")
+            )
+        );
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::AllowOnce, false, here),
+            (true, ApprovalDecision::AllowOnce, None)
+        );
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::DenyOnce, false, here),
+            (false, ApprovalDecision::Denied, None)
+        );
+    }
+
+    /// A card with no command has nothing for a rule to name, and with no id for this Mac there
+    /// is nowhere to keep one. Either way the card says the once-only thing its answer amounted
+    /// to rather than claim a standing choice nobody kept.
+    #[test]
+    fn a_rule_with_nothing_to_name_or_nowhere_to_go_is_an_answer_once() {
+        for (command, machine) in [("", Some("mac_1")), ("   ", Some("mac_1")), ("ls", None)] {
+            let card = local_shell_card(command);
+            assert_eq!(
+                card_answer(&card, LocalExecResolution::Always, false, machine),
+                (true, ApprovalDecision::AllowOnce, None)
+            );
+            assert_eq!(
+                card_answer(&card, LocalExecResolution::Never, false, machine),
+                (false, ApprovalDecision::Denied, None)
+            );
+        }
+    }
+
+    /// A card this Mac's own Always or Never answered keeps no rule: the mode said it, and a
+    /// rule written in its name would still hold after the person put the Mac back on Ask.
+    #[test]
+    fn a_card_the_mode_answered_keeps_no_rule() {
+        let card = local_shell_card("ls -la");
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::Always, true, Some("mac_1")),
+            (true, ApprovalDecision::Always, None)
+        );
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::Never, true, Some("mac_1")),
+            (false, ApprovalDecision::Never, None)
+        );
+    }
+
+    /// Only the local shell's card has this Mac behind it. The tunnel's card keeps its standing
+    /// words, which its own path writes to the computer's policy, and no rule is kept here —
+    /// even when it carries no command.
+    #[test]
+    fn a_card_off_this_mac_keeps_no_rule_here() {
+        let mut card = local_shell_card("");
+        card.tool = "Shell".into();
+        card.reason = "egress".into();
+        assert!(card.is_egress_tunnel());
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::Always, false, Some("mac_1")),
+            (true, ApprovalDecision::Always, None)
+        );
+        assert_eq!(
+            card_answer(&card, LocalExecResolution::Never, false, Some("mac_1")),
+            (false, ApprovalDecision::Never, None)
+        );
+    }
+
+    /// A card's rule is kept for this Mac or not at all. Another computer on the roster is never
+    /// taken for it, even when it is the only one there.
+    #[test]
+    fn a_rule_is_kept_for_this_mac_and_no_other() {
+        let mut state = AppState::new();
+        let other = ConnectedComputer {
+            machine_id: "mac_other".into(),
+            label: "Other Mac".into(),
+            mode: LocalExecMode::Ask,
+            this_machine: false,
+            online: true,
+        };
+        state.computers = vec![other.clone()];
+        assert_eq!(state.this_mac_id(), None);
+
+        state.computers.push(ConnectedComputer {
+            machine_id: "mac_here".into(),
+            this_machine: true,
+            ..other
+        });
+        assert_eq!(state.this_mac_id().as_deref(), Some("mac_here"));
+
+        state.local_exec_machine_id = Some("mac_daemon".into());
+        assert_eq!(state.this_mac_id().as_deref(), Some("mac_daemon"));
     }
 
     /// The network choice follows Route traffic's surface, and only exists when the server

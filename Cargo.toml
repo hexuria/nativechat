@@ -39,6 +39,9 @@ rust-embed.workspace = true
 rand = "0.9.2"
 coreaudio-sys = "0.2.17"
 tokio = { version = "1.36", features = ["full"] }
+# `killpg`: a command run for the server is stopped with everything it started, not only the
+# shell in front of it (opengrok/local_exec.rs).
+libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 schemars = "1"

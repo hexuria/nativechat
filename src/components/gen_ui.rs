@@ -249,7 +249,7 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                     .child(if spec.is_review_an_action() && (tunnel || app.is_none()) {
                         "Review an action".to_string()
                     } else if spec.runs_on_this_mac() {
-                        format!("Allow {bot} and all Bots to run commands on your local computer?")
+                        format!("Allow {bot} to run this command on your local computer?")
                     } else {
                         format!("Allow {bot} to run {} on its computer?", spec.tool)
                     }),
@@ -282,7 +282,7 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(format!(
-                    "This applies to {bot} and every Bot. It can always be changed in Settings."
+                    "Always allow and Never answer this command from now on, for {bot} and every Bot."
                 )),
         );
     }
@@ -310,8 +310,8 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 .child("Sending…"),
         );
     } else {
-        // Always/Never set this Mac's policy, so only the local-shell tool
-        // offers them. A box tool is answered one request at a time.
+        // Always/Never keep a rule for the command on this Mac, so only the
+        // local-shell tool offers them. A box tool is answered one request at a time.
         // Review an action (egress / auto-review): Always allow / Allow once / Deny.
         // Gated on host/env/box isEgressTunnelAvailable — OpenGrok only stamps
         // the reason when the tunnel is on; we still require the flag here so
@@ -354,8 +354,8 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
                 plain.1,
                 plain.2,
             ));
-        // Never sets a standing policy: this Mac's for the local shell, the computer's for
-        // the tunnel's card. A judge's card has no policy for it to write.
+        // Never is a standing no: a rule for the command on this Mac for the local shell, the
+        // computer's policy for the tunnel's card. A judge's card has nothing for it to keep.
         if (local && !review) || (review && spec.is_egress_tunnel()) {
             row = row.child(approval_button(
                 spec,

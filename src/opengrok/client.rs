@@ -1865,11 +1865,7 @@ impl OpenGrokClient {
                 Some(&body),
             )
             .await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(Self::read_error(response).await)
-        }
+        Self::empty_or_error(response).await
     }
 
     pub async fn post_local_exec_responses(
@@ -5764,6 +5760,47 @@ mod tests {
         assert_eq!(computers[0].machine_id, "mac_live");
         assert_eq!(computers[0].mode, LocalExecMode::Always);
         assert!(computers[0].online);
+    }
+
+    /// Always on the local shell's card posts one rule for the command on it. A rule the server
+    /// will not keep comes back as a 422 whose body is the reason, and the reason is what the
+    /// card shows (opengrok-server `add_rule` in `crates/opengrok-server/src/local_exec.rs`).
+    #[tokio::test]
+    async fn a_standing_rule_names_its_command_and_a_refusal_reads_back_why() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/policy/rule"))
+            .and(body_json(
+                json!({ "machineId": "mac_1", "kind": "allow", "pattern": "ls -la" }),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/policy/rule"))
+            .and(body_json(
+                json!({ "machineId": "mac_1", "kind": "allow", "pattern": "sudo ls" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(422).set_body_string("sudo cannot be a standing allow"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        client
+            .add_local_exec_rule("mac_1", "allow", "ls -la")
+            .await
+            .unwrap();
+        let refused = client
+            .add_local_exec_rule("mac_1", "allow", "sudo ls")
+            .await
+            .unwrap_err();
+
+        assert_eq!(refused.status, Some(422));
+        assert_eq!(refused.message, "sudo cannot be a standing allow");
     }
 
     fn computer(

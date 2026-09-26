@@ -223,7 +223,8 @@ impl ApprovalSpec {
     /// The Review-an-action card the egress tunnel raises: the server's own sentence for it,
     /// whole — a judge's card whose instructions merely mention the tunnel is not this card.
     /// Always and Never on THIS card set the computer's standing policy; on a judge's card
-    /// they answer the one call. Never a local-shell card, whose Always/Never move this Mac.
+    /// they answer the one call. Never a local-shell card, whose Always/Never keep a rule for
+    /// its command on this Mac.
     pub fn is_egress_tunnel(&self) -> bool {
         self.is_review_an_action()
             && !self.runs_on_this_mac()
@@ -238,6 +239,8 @@ impl ApprovalSpec {
             mcp_call_outcome(bot, resolution, &self.tool)
         } else if self.is_egress_tunnel() {
             egress_tunnel_outcome(bot, resolution)
+        } else if self.runs_on_this_mac() {
+            local_shell_outcome(bot, resolution)
         } else {
             local_exec_outcome(bot, resolution, self.place())
         }
@@ -1119,6 +1122,21 @@ pub fn local_exec_outcome(bot: &str, resolution: LocalExecResolution, place: &st
     }
 }
 
+/// The line the local shell's card leaves behind. Always and Never there answer the one command
+/// on the card from then on, with a rule this Mac keeps for it, and not every command (#87):
+/// "can run commands on your computer" told the person the whole Mac was open, or shut, when it
+/// was not. Said by this Mac's own Always or Never instead, the same words are as true. Once is
+/// once, in the words it always had.
+pub fn local_shell_outcome(bot: &str, resolution: LocalExecResolution) -> String {
+    match resolution {
+        LocalExecResolution::Always => {
+            format!("{bot} can run this command on your computer without asking.")
+        }
+        LocalExecResolution::Never => format!("{bot} cannot run this command on your computer."),
+        once => local_exec_outcome(bot, once, "your computer"),
+    }
+}
+
 /// The same line for a card the MCP door raised.
 ///
 /// The local-shell wording is about a machine and a policy that outlives the
@@ -1747,7 +1765,8 @@ mod tests {
             spec.outcome("Hexuria", LocalExecResolution::DenyOnce),
             "Hexuria was told no."
         );
-        // The local shell keeps every word it had.
+        // The local shell keeps its own words: once for the call, and Always and Never for
+        // the command on the card, never the whole Mac.
         let local = approval_for(USER_MACHINE_SHELL);
         assert!(!local.is_mcp());
         assert_eq!(
@@ -1755,14 +1774,22 @@ mod tests {
             "Hexuria can run commands on your computer this time."
         );
         assert_eq!(
+            local.outcome("Hexuria", LocalExecResolution::DenyOnce),
+            "Hexuria was not allowed to run commands on your computer."
+        );
+        assert_eq!(
             local.outcome("Hexuria", LocalExecResolution::Always),
-            "Hexuria can run commands on your computer."
+            "Hexuria can run this command on your computer without asking."
+        );
+        assert_eq!(
+            local.outcome("Hexuria", LocalExecResolution::Never),
+            "Hexuria cannot run this command on your computer."
         );
     }
 
-    /// Review chrome is Always allow, and Always writes a standing policy for
-    /// this Mac. An MCP card has no such thing behind it, whatever word the
-    /// door used for why it stopped the call.
+    /// Review chrome is Always allow, and Always keeps a standing answer. An
+    /// MCP card has no such thing behind it, whatever word the door used for
+    /// why it stopped the call.
     #[test]
     fn an_mcp_card_is_never_review_an_action() {
         let mut spec = mcp_card();
