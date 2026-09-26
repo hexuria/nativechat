@@ -29,8 +29,8 @@ fn main() {
         .expect("Failed to create tokio runtime");
     let _guard = runtime.enter();
 
-    dotenv::from_filename(".env.local").ok();
-    dotenv::dotenv().ok();
+    dotenvy::from_filename(".env.local").ok();
+    dotenvy::dotenv().ok();
 
     let (config, db_service) = runtime.block_on(async {
         let config = Config::load().expect("Failed to load config");

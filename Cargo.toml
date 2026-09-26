@@ -53,7 +53,8 @@ futures = "0.3"
 url = "2.5"
 log = "0.4.29"
 reqwest = { version = "0.12.24", features = ["json", "rustls-tls", "stream", "cookies"] }
-dotenv = "0.15.0"
+# The maintained fork of dotenv (RUSTSEC-2021-0141: dotenv is unmaintained); same API.
+dotenvy = "0.15"
 thiserror = "2.0"
 directories = "6"
 uuid = { version = "1.19.0", features = ["v4", "v7", "serde", "js"] }

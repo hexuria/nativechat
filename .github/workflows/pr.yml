@@ -48,6 +48,22 @@ jobs:
           fi
           echo "No shipped migration was changed."
 
+  deny:
+    # cargo deny reads Cargo.lock and the crate graph; it builds nothing, so Ubuntu is enough.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install cargo-deny
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/cargo-deny.tgz \
+            https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf /tmp/cargo-deny.tgz -C /tmp
+          install -m 755 /tmp/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny "$HOME/.local/bin/cargo-deny"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: cargo deny check
+        run: cargo deny --locked check
+
   test:
     # The crate links AppKit, CoreAudio and LocalAuthentication unconditionally, so it only builds
     # on a Mac. The image is pinned rather than macos-latest: a new image brings a new Xcode SDK
