@@ -16,7 +16,7 @@ use super::pending::{
     PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
 };
 use super::types::{
-    Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate,
+    Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate, ThreadListing,
     error_message_from_body,
 };
 use crate::threads::conversation_for_thread;
@@ -1123,6 +1123,49 @@ impl OpenGrokClient {
         limit: usize,
     ) -> Result<ThreadReplay, OpenGrokError> {
         let path = format!("/ag-ui/threads/{thread_id}?limit={limit}");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// One page of the account's conversations, newest first, from `GET /ag-ui/threads`.
+    ///
+    /// Nothing here names the account: the server lists whoever the bearer belongs to. Nothing
+    /// asks for one coworker either (`coworkerId`), because the sidebar wants every thread.
+    ///
+    /// The next page is keyed by the last row of this one: its `updatedAtMs` as `before` and its
+    /// `threadId` as `beforeThreadId`, since a page can end partway through a millisecond. A
+    /// thread id with no time is a `400` on the server, and one refused here costs no round trip.
+    /// `None` for `limit` takes the server's page size, and the server caps whatever is asked.
+    ///
+    /// An empty list is an answer, from an account with no history yet.
+    pub async fn list_threads(
+        &self,
+        before: Option<i64>,
+        before_thread_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ThreadListing>, OpenGrokError> {
+        if before_thread_id.is_some() && before.is_none() {
+            return Err(OpenGrokError::message("beforeThreadId needs before"));
+        }
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(limit) = limit {
+            query.append_pair("limit", &limit.to_string());
+        }
+        if let Some(before) = before {
+            query.append_pair("before", &before.to_string());
+        }
+        // Encoded, because it is the server's id handed back and nothing here chose its letters.
+        if let Some(thread_id) = before_thread_id {
+            query.append_pair("beforeThreadId", thread_id);
+        }
+        let query = query.finish();
+        let path = if query.is_empty() {
+            "/ag-ui/threads".to_string()
+        } else {
+            format!("/ag-ui/threads?{query}")
+        };
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
@@ -3946,6 +3989,154 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].bubble_id(), "msg_1");
         assert_eq!(live[0].content, "from the event");
+    }
+
+    // ---- The account's list of threads (opengrok-server#230) --------------------------------
+
+    /// The list is every thread of the bearer's account, so nothing names a coworker. A thread
+    /// with no coworker or no title comes as `null`, and reads as having none rather than
+    /// failing the page it is on.
+    #[tokio::test]
+    async fn the_thread_list_asks_for_every_coworker_and_reads_a_null_as_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads"))
+            .and(wiremock::matchers::query_param("limit", "50"))
+            .and(wiremock::matchers::query_param_is_missing("coworkerId"))
+            .and(wiremock::matchers::query_param_is_missing("before"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "threadId": "cw_1", "coworkerId": "cw_1", "origin": "chat",
+                    "title": "Book a table for two", "lastRunId": "run_2",
+                    "lastStatus": "finished", "updatedAtMs": 1790000000000i64
+                },
+                {
+                    "threadId": "sch_1", "coworkerId": null, "origin": "schedule",
+                    "title": null, "lastRunId": "run_1", "lastStatus": "failed",
+                    "updatedAtMs": 1789000000000i64
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client
+            .list_threads(None, None, Some(50))
+            .await
+            .expect("the list");
+        assert_eq!(
+            rows[0],
+            ThreadListing {
+                thread_id: "cw_1".into(),
+                coworker_id: Some("cw_1".into()),
+                origin: "chat".into(),
+                title: Some("Book a table for two".into()),
+                last_run_id: "run_2".into(),
+                last_status: "finished".into(),
+                updated_at_ms: 1_790_000_000_000,
+            }
+        );
+        assert_eq!(rows[1].thread_id, "sch_1");
+        assert_eq!(rows[1].coworker_id, None);
+        assert_eq!(rows[1].title, None);
+        assert_eq!(rows[1].origin, "schedule");
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// The next page is asked for by the last row's time and id together, and the id arrives as
+    /// the server wrote it, whatever letters are in it. A page with nothing on it is an answer.
+    #[tokio::test]
+    async fn the_next_page_is_asked_for_by_the_last_rows_time_and_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads"))
+            .and(wiremock::matchers::query_param("before", "1790000000000"))
+            .and(wiremock::matchers::query_param("beforeThreadId", "th 1&2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client
+            .list_threads(Some(1_790_000_000_000), Some("th 1&2"), None)
+            .await
+            .expect("an empty page is still a page");
+        assert!(
+            rows.is_empty(),
+            "an account with no more history, not an error"
+        );
+    }
+
+    /// A thread id with no time is what the server refuses with a `400`, because answering it
+    /// would hand a pager page one again. Refused here, it never leaves.
+    #[tokio::test]
+    async fn a_thread_id_cursor_with_no_time_is_refused_before_it_leaves() {
+        let server = MockServer::start().await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client
+            .list_threads(None, Some("cw_1"), None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, None, "the server was never asked");
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(paths.is_empty(), "nothing went out at all: {paths:?}");
+    }
+
+    /// A store that could not answer is a `503` the caller can tell apart from everything else,
+    /// and a session the server does not recognise is the session being gone, as on every other
+    /// route.
+    #[tokio::test]
+    async fn an_unavailable_thread_list_and_a_signed_out_one_are_told_apart() {
+        let unavailable = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({ "error": "the thread list is unavailable" })),
+            )
+            .mount(&unavailable)
+            .await;
+        let client = OpenGrokClient::new(&unavailable.uri()).unwrap();
+        let error = client.list_threads(None, None, None).await.unwrap_err();
+        assert_eq!(error.status, Some(503));
+        assert_eq!(error.message, "the thread list is unavailable");
+        assert!(!error.is_signed_out());
+
+        let refused = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({ "error": "sign in first" })),
+            )
+            .mount(&refused)
+            .await;
+        let client = OpenGrokClient::new(&refused.uri()).unwrap();
+        let error = client.list_threads(None, None, None).await.unwrap_err();
+        assert!(error.is_signed_out(), "{error}");
+        assert_eq!(error.message, "sign in first");
+    }
+
+    /// A row without its time is not a thread from 1970 whose time is also the cursor that ends
+    /// the list: the server always sends one, and a page without it is refused as a page.
+    #[tokio::test]
+    async fn a_thread_row_without_its_time_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "threadId": "cw_1", "coworkerId": "cw_1", "origin": "chat",
+                "title": null, "lastRunId": "run_1", "lastStatus": "finished"
+            }])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.list_threads(None, None, None).await.unwrap_err();
+        assert_eq!(error.unreachable(), None, "the server answered: {error}");
+        assert!(!error.is_signed_out());
     }
 
     #[tokio::test]

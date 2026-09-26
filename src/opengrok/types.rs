@@ -112,6 +112,33 @@ impl CoworkerPatch {
     }
 }
 
+/// One of the account's conversations, as `GET /ag-ui/threads` lists it.
+///
+/// Transcribed from `ThreadListRow` in opengrok-server
+/// `crates/opengrok-server/src/agui/routes.rs` (hexuria/opengrok-server#247, for #230). The list
+/// is the caller's own threads, newest first, without hidden runs or the MCP door's audit thread.
+/// The server sends `coworkerId` and `title` as `null` when there is none, never leaves them out.
+/// Every other field is always there, so a row without one is refused rather than read as zero:
+/// a time of zero would date the thread 1970 and hand the pager a cursor that ends the list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListing {
+    pub thread_id: String,
+    #[serde(default)]
+    pub coworker_id: Option<String>,
+    /// `chat`, `schedule`, `webhook` or `monitor`: whether a person started the thread or one of
+    /// their routines did.
+    pub origin: String,
+    /// A routine's name, or the first line of the first thing the person said.
+    #[serde(default)]
+    pub title: Option<String>,
+    pub last_run_id: String,
+    pub last_status: String,
+    /// The thread's latest activity. The list is ordered by it, and a page's last row hands it
+    /// back as the cursor for the next page.
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
