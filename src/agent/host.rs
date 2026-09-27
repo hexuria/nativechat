@@ -2391,7 +2391,11 @@ impl NativeChatHost {
                                 settings = settings.with_child(egress_policy_node(current));
                             }
                         }
-                        if self.computer_tab
+                        // Only while the dialog is open on Computer: the tab stays selected after
+                        // Settings closes, and a closed dialog's children are still found by id, so
+                        // a snapshot would otherwise keep listing the commands after the person left.
+                        if self.account_open
+                            && self.computer_tab
                             && let Some(rules) = &self.local_rules
                         {
                             for node in local_rules_nodes(rules) {

@@ -20509,6 +20509,15 @@ mod tests {
         state.is_app_settings_open = true;
         state.app_settings_tab = super::AppSettingsTab::Computer;
         assert_eq!(deny(&state).as_deref(), Some("rm -rf /tmp/x"));
+
+        // Closed with Computer still the selected tab: the commands leave the snapshot with it.
+        state.is_app_settings_open = false;
+        assert_eq!(deny(&state), None, "Settings closed on the Computer tab");
+
+        // Open on another tab: not there either.
+        state.is_app_settings_open = true;
+        state.app_settings_tab = super::AppSettingsTab::General;
+        assert_eq!(deny(&state), None, "Settings open on General");
     }
 
     /// The line a card is left with when the policy write for `mode` fails with `error` while
