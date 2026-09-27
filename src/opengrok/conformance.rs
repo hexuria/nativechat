@@ -451,12 +451,7 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[(
-    "agui/TOOL_CALL_START/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
-    "Using shell",
-    "The status line has no arm for the box's `shell` tool, so a running command reads \
-         \"Using shell\" instead of what it runs (hexuria/nativechat#115).",
-)];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
 
