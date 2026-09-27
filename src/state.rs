@@ -7727,7 +7727,6 @@ impl AppState {
             title: source.title.clone(),
             avatar_shape: source.avatar_shape.clone(),
             avatar_color: source.avatar_color.clone(),
-            notify_on_updates: source.notify_on_updates,
             ..Default::default()
         };
         cx.spawn(async move |this, cx| {
@@ -14364,9 +14363,6 @@ fn apply_patch(coworker: &mut Coworker, patch: &CoworkerPatch) {
     if let Some(color) = patch.avatar_color.as_deref() {
         coworker.avatar_color = some_unless_blank(color);
     }
-    if let Some(notify) = patch.notify_on_updates {
-        coworker.notify_on_updates = Some(notify);
-    }
 }
 
 /// The roster's copy of a coworker once the server has answered, for the fields the patch
@@ -14424,11 +14420,6 @@ fn settle_patch(
             answered && some_unless_blank(color).is_none(),
             before.avatar_color.clone(),
         );
-    }
-    if patch.notify_on_updates.is_some() {
-        coworker.notify_on_updates = echo
-            .and_then(|c| c.notify_on_updates)
-            .or(before.notify_on_updates);
     }
 }
 
@@ -17668,7 +17659,6 @@ mod tests {
             title: Some("Analyst".to_string()),
             avatar_shape: Some("circle".to_string()),
             avatar_color: Some("blue".to_string()),
-            notify_on_updates: Some(false),
             updated_at_ms: 17,
             hidden_from_sidebar: false,
             box_id: None,
@@ -17726,7 +17716,6 @@ mod tests {
             name: Some("Roberta".to_string()),
             title: Some(String::new()),
             role: Some("Marketing".to_string()),
-            notify_on_updates: Some(true),
             ..Default::default()
         };
         let mut roster = before.clone();
@@ -17756,7 +17745,6 @@ mod tests {
             title: None,
             avatar_shape: None,
             avatar_color: None,
-            notify_on_updates: None,
             updated_at_ms: 0,
             hidden_from_sidebar: false,
             box_id: None,

@@ -67,8 +67,6 @@ pub struct Coworker {
     pub avatar_shape: Option<String>,
     #[serde(default)]
     pub avatar_color: Option<String>,
-    #[serde(default)]
-    pub notify_on_updates: Option<bool>,
     /// Hire/rename time from the server. Idle bots (no messages) sort by this.
     #[serde(default, alias = "updated_at_ms", alias = "updatedAt")]
     pub updated_at_ms: i64,
@@ -93,8 +91,9 @@ pub struct CoworkerPatch {
     pub avatar_shape: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_color: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notify_on_updates: Option<bool>,
+    // No `notifyOnUpdates`: opengrok-server reads it nowhere, on purpose (`agui/routes.rs`,
+    // the coworker PATCH), and refuses a patch carrying only that with a 400. The desktop
+    // client keeps that setting on the machine, and NativeChat has nowhere to keep it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_from_sidebar: Option<bool>,
 }
@@ -107,7 +106,6 @@ impl CoworkerPatch {
             && self.title.is_none()
             && self.avatar_shape.is_none()
             && self.avatar_color.is_none()
-            && self.notify_on_updates.is_none()
             && self.hidden_from_sidebar.is_none()
     }
 }
@@ -236,6 +234,45 @@ pub fn error_message_from_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every key a coworker patch can carry is one the server's patch route reads
+    /// (opengrok-server `agui/routes.rs`: name, model, role, visibility, hiddenFromSidebar, and
+    /// title/avatarShape/avatarColor). A key it reads nowhere is a setting that looks saved and
+    /// is not, and a patch of only that is refused.
+    #[test]
+    fn a_coworker_patch_names_only_what_the_server_keeps() {
+        let full = CoworkerPatch {
+            name: Some("n".into()),
+            model: Some("m".into()),
+            role: Some("r".into()),
+            title: Some("t".into()),
+            avatar_shape: Some("s".into()),
+            avatar_color: Some("c".into()),
+            hidden_from_sidebar: Some(true),
+        };
+        let wire = serde_json::to_value(&full).unwrap();
+        let mut keys: Vec<&str> = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let read = [
+            "avatarColor",
+            "avatarShape",
+            "hiddenFromSidebar",
+            "model",
+            "name",
+            "role",
+            "title",
+            "visibility",
+        ];
+        for key in &keys {
+            assert!(read.contains(key), "the server reads no {key:?}");
+        }
+        assert_eq!(keys.len(), 7, "every field is on the wire: {keys:?}");
+    }
 
     /// The field is new: a server that has never heard of it must still see the array it saw
     /// before, field for field.
