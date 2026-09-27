@@ -1,0 +1,74 @@
+{
+  "method": "GET",
+  "path": "/recipes/rcp_0199bb4e-0000-7000-8000-000000000803",
+  "status": 200,
+  "body": {
+    "recipe": {
+      "id": "rcp_0199bb4e-0000-7000-8000-000000000803",
+      "ownerId": "acct_0199bb4e-0000-7000-8000-000000000801",
+      "orgId": "org_0199bb4e-0000-7000-8000-000000000802",
+      "name": "Export the ledger",
+      "description": "",
+      "screen": {
+        "width": 1280,
+        "height": 800
+      },
+      "createdAtMs": 1790413250000,
+      "updatedAtMs": 1790413250000,
+      "deletedAtMs": null,
+      "latestVersion": 1,
+      "relation": "mine",
+      "shareState": null,
+      "kind": "recipe",
+      "parameters": []
+    },
+    "versions": [
+      {
+        "version": 1,
+        "kind": "filtered",
+        "note": "filtered",
+        "createdBy": "acct_0199bb4e-0000-7000-8000-000000000801",
+        "createdAtMs": 1790413250000,
+        "body": {
+          "steps": [
+            {
+              "op": "click",
+              "x": 10,
+              "y": 10,
+              "button": 1
+            }
+          ],
+          "stop_on_error": true,
+          "screenshot": "end"
+        }
+      }
+    ],
+    "shares": [],
+    "grants": [],
+    "runs": [
+      {
+        "id": "rrun_0199bb4e-0000-7000-8000-000000000805",
+        "recipeId": "rcp_0199bb4e-0000-7000-8000-000000000803",
+        "version": 1,
+        "coworkerId": "cw_0199bb4e-0000-7000-8000-000000000804",
+        "runId": "rrun_0199bb4e-0000-7000-8000-000000000805",
+        "ok": false,
+        "stoppedAt": null,
+        "receipt": {
+          "ok": false,
+          "running": true
+        },
+        "atMs": 1790413251000,
+        "leaseUntilMs": 1790413311000,
+        "state": "running",
+        "artifacts": []
+      }
+    ],
+    "myBots": [
+      {
+        "id": "cw_0199bb4e-0000-7000-8000-000000000804",
+        "name": "Ada"
+      }
+    ]
+  }
+}

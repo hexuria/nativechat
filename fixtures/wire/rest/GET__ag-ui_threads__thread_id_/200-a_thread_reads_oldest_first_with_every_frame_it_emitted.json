@@ -1,0 +1,65 @@
+{
+  "method": "GET",
+  "path": "/ag-ui/threads/th-0199bb4e000070008000000000000501",
+  "status": 200,
+  "body": {
+    "threadId": "th-0199bb4e000070008000000000000501",
+    "runs": [
+      {
+        "runId": "run_0199bb4e-0000-7000-8000-000000000511",
+        "status": "awaiting-approval",
+        "startedAtMs": 1790413221000,
+        "updatedAtMs": 1790413229000,
+        "failure": null,
+        "events": [
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "msg-1",
+            "delta": "hello "
+          },
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "msg-1",
+            "delta": "world"
+          },
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "msg-1",
+            "delta": " (still here)"
+          }
+        ]
+      },
+      {
+        "runId": "run_0199bb4e-0000-7000-8000-000000000512",
+        "status": "finished",
+        "startedAtMs": 1790413222000,
+        "updatedAtMs": 1790413222000,
+        "failure": null,
+        "events": [
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "msg-1",
+            "delta": "the second turn"
+          }
+        ]
+      },
+      {
+        "runId": "run_0199bb4e-0000-7000-8000-000000000513",
+        "status": "failed",
+        "startedAtMs": 1790413223000,
+        "updatedAtMs": 1790413223000,
+        "failure": "the model gateway refused",
+        "events": [
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "msg-1",
+            "delta": "the third turn"
+          }
+        ]
+      }
+    ],
+    "hiddenRunIds": [],
+    "pendingUserMessages": [],
+    "pendingEvents": []
+  }
+}

@@ -169,6 +169,24 @@ pub struct ApprovalSpec {
 /// app's local-exec daemon. Every other tool runs on the coworker's box.
 pub const USER_MACHINE_SHELL: &str = "user_machine_shell";
 
+/// The CUSTOM `name` of a run parked on a card: a tool waiting on a yes, or a form waiting on the
+/// person (opengrok-harness `projection.rs` `awaiting_approval`).
+pub(crate) const RUN_AWAITING_APPROVAL: &str = "run-awaiting-approval";
+
+/// The tunnel's card named in a word rather than by its sentence. OpenGrok raises that card with
+/// `reason: auto-review` and [`EGRESS_TUNNEL_ASK_REASON`] as its `why`, so this word is read only
+/// in case a server says it.
+pub(crate) const EGRESS_REASON: &str = "egress";
+
+/// The `reason`s that put Review-an-action chrome on a card. The conformance ledger reads this
+/// list, so a word added here is checked against the reasons the server sends.
+pub(crate) const REVIEW_AN_ACTION_REASONS: &[&str] = &[
+    "auto-review",
+    "review-an-action",
+    "computer-action",
+    EGRESS_REASON,
+];
+
 /// The sentence OpenGrok puts on the egress tunnel's Review-an-action card
 /// (`opengrok_tools::review::EGRESS_TUNNEL_ASK_REASON`), and which its
 /// approvals queue carries for a card rebuilt after a relaunch. Matched whole.
@@ -220,10 +238,7 @@ impl ApprovalSpec {
     /// there is nothing on this Mac for Always to write to.
     pub fn is_review_an_action(&self) -> bool {
         !self.is_mcp()
-            && matches!(
-                self.reason.trim().to_ascii_lowercase().as_str(),
-                "auto-review" | "review-an-action" | "computer-action" | "egress"
-            )
+            && REVIEW_AN_ACTION_REASONS.contains(&self.reason.trim().to_ascii_lowercase().as_str())
     }
 
     /// The Review-an-action card the egress tunnel raises: the server's own sentence for it,
@@ -234,7 +249,7 @@ impl ApprovalSpec {
     pub fn is_egress_tunnel(&self) -> bool {
         self.is_review_an_action()
             && !self.runs_on_this_mac()
-            && (self.reason.trim().eq_ignore_ascii_case("egress")
+            && (self.reason.trim().eq_ignore_ascii_case(EGRESS_REASON)
                 || self.why.trim() == EGRESS_TUNNEL_ASK_REASON)
     }
 
@@ -498,7 +513,7 @@ impl TurnAssembler {
                     {
                         self.push_user_form(spec);
                     }
-                } else if name == "run-awaiting-approval" {
+                } else if name == RUN_AWAITING_APPROVAL {
                     self.flush_text();
                     if let Some(mut spec) = approval_from_event(event) {
                         if spec.command.is_empty()
@@ -764,6 +779,18 @@ impl TurnAssembler {
     }
 }
 
+/// What a chart is called: a CUSTOM `name`, a tool's name, or the object's own `ui` /
+/// `component` / `type`, each after [`normalize_name`]. OpenGrok paints charts and forms through
+/// the `bar_chart` and `form` tools it offers the model (opengrok-server `agui/chat_ui.rs`), so as
+/// CUSTOM names these are the conformance ledger's, checked against what the server sends.
+pub(crate) const BAR_CHART_NAMES: &[&str] = &["bar-chart", "barchart"];
+
+/// What a generative form is called, read the same way as [`BAR_CHART_NAMES`].
+pub(crate) const FORM_NAMES: &[&str] = &["form"];
+
+/// The CUSTOM `name` of a widget that says what it is inside its own value.
+pub(crate) const UI_CUSTOM_NAME: &str = "ui";
+
 impl UiSpec {
     /// The widget as a value `from_value` reads back unchanged — what the database keeps, so a
     /// thread read back off disk mounts the same form or chart the stream did.
@@ -792,27 +819,29 @@ impl UiSpec {
     }
 
     pub fn from_value(value: &Value) -> Option<Self> {
-        let kind = ui_kind(value)?;
-        match kind.as_str() {
-            "bar-chart" | "barchart" => Some(Self::BarChart(BarChartSpec::from_value(value)?)),
-            "form" => Some(Self::Form(FormSpec::from_value(value)?)),
-            _ => None,
-        }
+        Self::named(&ui_kind(value)?, value)
     }
 
     fn from_tool(name: &str, value: &Value) -> Option<Self> {
         if let Some(spec) = Self::from_value(value) {
             return Some(spec);
         }
-        match normalize_name(name).as_str() {
-            "bar-chart" | "barchart" => Some(Self::BarChart(BarChartSpec::from_value(value)?)),
-            "form" => Some(Self::Form(FormSpec::from_value(value)?)),
-            _ => None,
+        Self::named(&normalize_name(name), value)
+    }
+
+    /// The widget a normalized name stands for, read from `value`.
+    fn named(kind: &str, value: &Value) -> Option<Self> {
+        if BAR_CHART_NAMES.contains(&kind) {
+            Some(Self::BarChart(BarChartSpec::from_value(value)?))
+        } else if FORM_NAMES.contains(&kind) {
+            Some(Self::Form(FormSpec::from_value(value)?))
+        } else {
+            None
         }
     }
 
     fn from_custom(name: &str, value: &Value) -> Option<Self> {
-        if normalize_name(name) == "ui" || name.is_empty() {
+        if normalize_name(name) == UI_CUSTOM_NAME || name.is_empty() {
             return Self::from_value(value);
         }
         Self::from_tool(name, value)
@@ -1417,7 +1446,7 @@ pub fn command_from_replay_events(events: &[Value], call_id: &str) -> String {
             }
         }
         if kind == "CUSTOM"
-            && event.get("name").and_then(Value::as_str) == Some("run-awaiting-approval")
+            && event.get("name").and_then(Value::as_str) == Some(RUN_AWAITING_APPROVAL)
             && event.get("callId").and_then(Value::as_str) == Some(call_id)
         {
             let from_args = event

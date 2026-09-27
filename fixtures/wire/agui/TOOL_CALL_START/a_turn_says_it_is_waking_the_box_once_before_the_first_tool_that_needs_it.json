@@ -1,0 +1,6 @@
+{
+  "type": "TOOL_CALL_START",
+  "timestamp": 1,
+  "toolCallId": "c1",
+  "toolCallName": "shell"
+}

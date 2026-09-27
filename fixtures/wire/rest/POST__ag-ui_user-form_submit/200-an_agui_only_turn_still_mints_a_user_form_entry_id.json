@@ -1,0 +1,51 @@
+{
+  "method": "POST",
+  "path": "/ag-ui/user-form/submit",
+  "status": 200,
+  "body": {
+    "kind": "send-message",
+    "id": "e_0199bb4e-0000-7000-8000-000000000303",
+    "timestampMs": 1790413202000,
+    "message": {
+      "type": "user-form",
+      "formRequest": {
+        "title": "Google account",
+        "instruction": "Enter the address and password.",
+        "fields": [
+          {
+            "id": "email",
+            "label": "Email",
+            "type": "email",
+            "required": true,
+            "secret": false
+          },
+          {
+            "id": "password",
+            "label": "Password",
+            "type": "password",
+            "required": true,
+            "secret": false
+          }
+        ],
+        "liveHost": "accounts.google.com"
+      }
+    },
+    "callId": "mock-form-1",
+    "formResolution": "submitted",
+    "sharedValues": {
+      "email": "ada@example.com"
+    },
+    "formFieldOutcomes": [
+      {
+        "id": "email",
+        "filled": true,
+        "fillFailed": false
+      },
+      {
+        "id": "password",
+        "filled": false,
+        "fillFailed": false
+      }
+    ]
+  }
+}

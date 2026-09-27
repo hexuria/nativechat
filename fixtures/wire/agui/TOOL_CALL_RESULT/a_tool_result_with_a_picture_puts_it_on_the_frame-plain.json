@@ -1,0 +1,7 @@
+{
+  "type": "TOOL_CALL_RESULT",
+  "timestamp": 100,
+  "toolCallId": "c2",
+  "content": "done",
+  "ok": true
+}

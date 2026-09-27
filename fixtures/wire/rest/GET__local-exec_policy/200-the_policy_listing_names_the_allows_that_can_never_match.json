@@ -1,0 +1,27 @@
+{
+  "method": "GET",
+  "path": "/local-exec/policy?machine=mac-1",
+  "status": 200,
+  "body": {
+    "machineId": "mac-1",
+    "mode": "ask",
+    "allow": [
+      "cargo test",
+      "cd src && cargo test",
+      "sudo ls"
+    ],
+    "deny": [
+      "rm"
+    ],
+    "inert": [
+      {
+        "pattern": "cd src && cargo test",
+        "reason": "an allow rule must be one plain command: no ; && || | & or newline, no $( ) or backticks, no redirection to a path, no VAR= in front, and not a program that runs another (sh, eval, env, sudo, xargs…)"
+      },
+      {
+        "pattern": "sudo ls",
+        "reason": "sudo cannot be a standing allow"
+      }
+    ]
+  }
+}

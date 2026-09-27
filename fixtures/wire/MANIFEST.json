@@ -1,0 +1,237 @@
+{
+  "server_sha": "b4aaa143abfa2f1c352b3a01a28a4d4ba525a0d3",
+  "recorded_by": "hand-copied",
+  "emits": {
+    "agui_types": [
+      "RUN_STARTED",
+      "RUN_FINISHED",
+      "RUN_ERROR",
+      "TEXT_MESSAGE_START",
+      "TEXT_MESSAGE_CONTENT",
+      "TEXT_MESSAGE_END",
+      "TOOL_CALL_START",
+      "TOOL_CALL_ARGS",
+      "TOOL_CALL_END",
+      "TOOL_CALL_RESULT",
+      "REASONING_MESSAGE_START",
+      "REASONING_MESSAGE_CONTENT",
+      "REASONING_MESSAGE_END",
+      "CUSTOM"
+    ],
+    "custom_names": [
+      "run-awaiting-approval",
+      "run-stopped",
+      "box-waking",
+      "run-timing",
+      "pending-user-message",
+      "user-form",
+      "credential.offer_save"
+    ],
+    "approval_reasons": [
+      "exec-consent",
+      "policy-approval",
+      "auto-review",
+      "user-form"
+    ],
+    "form_resolutions": [
+      "submitted",
+      "fill_failed",
+      "dismissed",
+      "escalated"
+    ]
+  },
+  "entries": [
+    {
+      "file": "agui/RUN_STARTED/a_single_text_fragment_becomes_a_whole_message.json",
+      "source": "crates/opengrok-harness/src/projection.rs:83 Projection::start, in the test a_single_text_fragment_becomes_a_whole_message (crates/opengrok-harness/src/projection.rs:428)"
+    },
+    {
+      "file": "agui/TEXT_MESSAGE_START/a_tool_call_closes_the_open_text_message_first.json",
+      "source": "crates/opengrok-harness/src/projection.rs:123 Projection::push (ModelDelta::Text), in the test a_tool_call_closes_the_open_text_message_first (crates/opengrok-harness/src/projection.rs:471)"
+    },
+    {
+      "file": "agui/TEXT_MESSAGE_CONTENT/a_tool_call_closes_the_open_text_message_first.json",
+      "source": "crates/opengrok-harness/src/projection.rs:123 Projection::push (ModelDelta::Text), in the test a_tool_call_closes_the_open_text_message_first (crates/opengrok-harness/src/projection.rs:471)"
+    },
+    {
+      "file": "agui/TEXT_MESSAGE_END/a_tool_call_closes_the_open_text_message_first.json",
+      "source": "crates/opengrok-harness/src/projection.rs:96 Projection::close_open, in the test a_tool_call_closes_the_open_text_message_first (crates/opengrok-harness/src/projection.rs:471)"
+    },
+    {
+      "file": "agui/TEXT_MESSAGE_START/a_replayed_run_draws_the_question_after_it_opens.json",
+      "source": "crates/opengrok-server/src/agui/history.rs:450 with_prompt_frames, in the test a_replayed_run_draws_the_question_after_it_opens (crates/opengrok-server/tests/unit/history.rs:217)"
+    },
+    {
+      "file": "agui/TEXT_MESSAGE_CONTENT/a_replayed_run_draws_the_question_after_it_opens.json",
+      "source": "crates/opengrok-server/src/agui/history.rs:450 with_prompt_frames, in the test a_replayed_run_draws_the_question_after_it_opens (crates/opengrok-server/tests/unit/history.rs:217)"
+    },
+    {
+      "file": "agui/TOOL_CALL_START/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
+      "source": "crates/opengrok-harness/src/projection.rs:123 Projection::push (ModelDelta::ToolCallStart), in the test crates/opengrok-harness/tests/unit/loop_tests.rs:274 a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it (run_turn_with_tools \"t1\", \"r1\", at 1)"
+    },
+    {
+      "file": "agui/TOOL_CALL_ARGS/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
+      "source": "crates/opengrok-harness/src/projection.rs:123 Projection::push (ModelDelta::ToolCallArgs), in the test crates/opengrok-harness/tests/unit/loop_tests.rs:274 a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it (run_turn_with_tools \"t1\", \"r1\", at 1)"
+    },
+    {
+      "file": "agui/TOOL_CALL_END/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
+      "source": "crates/opengrok-harness/src/projection.rs:123 Projection::push (ModelDelta::ToolCallEnd), in the test crates/opengrok-harness/tests/unit/loop_tests.rs:274 a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it (run_turn_with_tools \"t1\", \"r1\", at 1)"
+    },
+    {
+      "file": "agui/custom/box-waking/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
+      "source": "crates/opengrok-harness/src/projection.rs:314 Projection::box_waking, in the test crates/opengrok-harness/tests/unit/loop_tests.rs:274 a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it (run_turn_with_tools \"t1\", \"r1\", at 1)"
+    },
+    {
+      "file": "agui/TOOL_CALL_RESULT/a_tool_result_with_a_picture_puts_it_on_the_frame.json",
+      "source": "crates/opengrok-harness/src/projection.rs:209 Projection::push_tool_result, in the test a_tool_result_with_a_picture_puts_it_on_the_frame (crates/opengrok-harness/src/projection.rs:713)"
+    },
+    {
+      "file": "agui/TOOL_CALL_RESULT/a_tool_result_with_a_picture_puts_it_on_the_frame-plain.json",
+      "source": "crates/opengrok-harness/src/projection.rs:209 Projection::push_tool_result, in the test a_tool_result_with_a_picture_puts_it_on_the_frame (crates/opengrok-harness/src/projection.rs:713), its second result (no picture)"
+    },
+    {
+      "file": "agui/REASONING_MESSAGE_START/reasoning_and_text_do_not_share_a_message.json",
+      "source": "crates/opengrok-harness/src/projection.rs:123 Projection::push (ModelDelta::Reasoning), in the test reasoning_and_text_do_not_share_a_message (crates/opengrok-harness/src/projection.rs:530)"
+    },
+    {
+      "file": "agui/REASONING_MESSAGE_CONTENT/reasoning_and_text_do_not_share_a_message.json",
+      "source": "crates/opengrok-harness/src/projection.rs:123 Projection::push (ModelDelta::Reasoning), in the test reasoning_and_text_do_not_share_a_message (crates/opengrok-harness/src/projection.rs:530)"
+    },
+    {
+      "file": "agui/REASONING_MESSAGE_END/reasoning_and_text_do_not_share_a_message.json",
+      "source": "crates/opengrok-harness/src/projection.rs:96 Projection::close_open, in the test reasoning_and_text_do_not_share_a_message (crates/opengrok-harness/src/projection.rs:530)"
+    },
+    {
+      "file": "agui/RUN_FINISHED/a_single_text_fragment_becomes_a_whole_message.json",
+      "source": "crates/opengrok-harness/src/projection.rs:296 Projection::finish, in the test a_single_text_fragment_becomes_a_whole_message (crates/opengrok-harness/src/projection.rs:428)"
+    },
+    {
+      "file": "agui/RUN_ERROR/a_failure_closes_what_is_open_and_still_ends_the_run.json",
+      "source": "crates/opengrok-harness/src/projection.rs:361 Projection::fail, in the test a_failure_closes_what_is_open_and_still_ends_the_run (crates/opengrok-harness/src/projection.rs:553)"
+    },
+    {
+      "file": "agui/custom/run-stopped/a_stopped_run_asks_the_model_nothing_further_and_ends_as_a_stop.json",
+      "source": "crates/opengrok-harness/src/projection.rs:338 Projection::stopped, in the test a_stopped_run_asks_the_model_nothing_further_and_ends_as_a_stop (crates/opengrok-harness/tests/unit/loop_tests.rs:572, \"t1\", \"r1\", at 1)"
+    },
+    {
+      "file": "agui/custom/run-timing/timing_event_is_custom_run_timing_with_compact_value.json",
+      "source": "crates/opengrok-harness/src/timing.rs:136 TurnTiming::event, in the test timing_event_is_custom_run_timing_with_compact_value (crates/opengrok-harness/src/timing.rs:182); total_ms is the test's own clock"
+    },
+    {
+      "file": "agui/custom/run-awaiting-approval/awaiting_approval_leaves_the_run_open.json",
+      "source": "crates/opengrok-harness/src/projection.rs:245 Projection::awaiting_approval, in the test awaiting_approval_leaves_the_run_open (crates/opengrok-harness/src/projection.rs:624)"
+    },
+    {
+      "file": "agui/custom/run-awaiting-approval/a_no_on_the_desktop_card_is_told_to_the_model_and_ends_the_run.json",
+      "source": "crates/opengrok-harness/src/projection.rs:245 Projection::awaiting_approval on POST /ag-ui, in the test a_no_on_the_desktop_card_is_told_to_the_model_and_ends_the_run (crates/opengrok-server/tests/against_a_no_on_the_desktop_card.rs:332; MockDoor::asking_for_a_tool, crates/opengrok-harness/src/mock.rs:238; why from crates/opengrok-policy/src/lib.rs:212)"
+    },
+    {
+      "file": "agui/custom/run-awaiting-approval/bypass_skips_the_card_and_a_deny_does_not_consent_the_run.json",
+      "source": "crates/opengrok-harness/src/projection.rs:245 Projection::awaiting_approval on POST /ag-ui, in the test crates/opengrok-server/tests/against_egress_policy.rs:730 bypass_skips_the_card_and_a_deny_does_not_consent_the_run (the ask turn, LookingModel round 1); the reason and why from crates/opengrok-tools/src/lib.rs:1727 (EGRESS_TUNNEL_ASK_REASON, crates/opengrok-tools/src/review.rs:145)"
+    },
+    {
+      "file": "agui/custom/run-awaiting-approval/an_agui_only_turn_still_mints_a_user_form_entry_id.json",
+      "source": "crates/opengrok-harness/src/projection.rs:245 Projection::awaiting_approval (arguments through sanitize_arguments, crates/opengrok-tools/src/user_form.rs:263), stamped on the SSE by crates/opengrok-server/src/agui/resume.rs:434 apply_user_form_stamp, in the test an_agui_only_turn_still_mints_a_user_form_entry_id (crates/opengrok-server/tests/against_user_form.rs:817; MockDoor::asking_for_user_form, crates/opengrok-harness/src/mock.rs:350)"
+    },
+    {
+      "file": "agui/custom/user-form/an_agui_only_turn_still_mints_a_user_form_entry_id.json",
+      "source": "crates/opengrok-server/src/agui/user_form.rs:1433 agui_user_form_frame, journaled by journal_agui_custom (crates/opengrok-server/src/agui/user_form.rs:1377) and replayed by GET /ag-ui/threads/{id}, in the test an_agui_only_turn_still_mints_a_user_form_entry_id (crates/opengrok-server/tests/against_user_form.rs:817); the entry from crates/opengrok-server/src/cards.rs:79 settled by crates/opengrok-server/src/agui/user_form.rs:958"
+    },
+    {
+      "file": "agui/custom/credential.offer_save/an_agui_only_turn_still_mints_a_user_form_entry_id.json",
+      "source": "crates/opengrok-tools/src/credential.rs:89 offer_save_frame, journaled by crates/opengrok-server/src/agui/credential.rs:18 offer_save_after_submit and replayed by GET /ag-ui/threads/{id}, in the test an_agui_only_turn_still_mints_a_user_form_entry_id (crates/opengrok-server/tests/against_user_form.rs:817)"
+    },
+    {
+      "file": "agui/custom/pending-user-message/a_custom_event_names_the_op_inside_value.json",
+      "source": "crates/opengrok-server/src/agui/pending.rs:81 custom_event, in the test a_custom_event_names_the_op_inside_value (crates/opengrok-server/src/agui/pending.rs:714); the timestamp is now_ms"
+    },
+    {
+      "file": "agui/custom/pending-user-message/cancel_omits_the_message_so_the_text_is_not_re_sent.json",
+      "source": "crates/opengrok-server/src/agui/pending.rs:81 custom_event, in the test cancel_omits_the_message_so_the_text_is_not_re_sent (crates/opengrok-server/src/agui/pending.rs:725); the timestamp is now_ms"
+    },
+    {
+      "file": "rest/GET__ag-ui_threads/200-the_list_filters_by_coworker_and_names_each_threads_origin.json",
+      "source": "crates/opengrok-server/src/agui/routes.rs:4078 ThreadListRow via list_threads (crates/opengrok-server/src/agui/routes.rs:4099), in the test crates/opengrok-server/tests/against_the_thread_list.rs:574 the_list_filters_by_coworker_and_names_each_threads_origin"
+    },
+    {
+      "file": "rest/GET__ag-ui_threads__thread_id_/200-a_thread_reads_oldest_first_with_every_frame_it_emitted.json",
+      "source": "crates/opengrok-server/src/agui/routes.rs:3910 replay_thread (ThreadRunReplay crates/opengrok-server/src/agui/routes.rs:3883; pending from crates/opengrok-server/src/agui/pending.rs:111), in the test crates/opengrok-server/tests/against_a_whole_thread.rs:358 a_thread_reads_oldest_first_with_every_frame_it_emitted"
+    },
+    {
+      "file": "rest/GET__ag-ui_approvals/200-bypass_skips_the_card_and_a_deny_does_not_consent_the_run.json",
+      "source": "crates/opengrok-server/src/agui/routes.rs:4962 list_awaiting, in the test crates/opengrok-server/tests/against_egress_policy.rs:730 bypass_skips_the_card_and_a_deny_does_not_consent_the_run (the ask turn, LookingModel round 1)"
+    },
+    {
+      "file": "rest/POST__ag-ui_runs__run_id__answer/200-bypass_skips_the_card_and_a_deny_does_not_consent_the_run.json",
+      "source": "crates/opengrok-server/src/agui/routes.rs:4217 answer_run, in the test crates/opengrok-server/tests/against_egress_policy.rs:730 bypass_skips_the_card_and_a_deny_does_not_consent_the_run (the ask turn, LookingModel round 1) (the first answer, a no)"
+    },
+    {
+      "file": "rest/GET__local-exec_policy/200-the_policy_listing_names_the_allows_that_can_never_match.json",
+      "source": "crates/opengrok-server/src/local_exec.rs:473 policy_listing (served by get_policy, crates/opengrok-server/src/local_exec.rs:456), in the test the_policy_listing_names_the_allows_that_can_never_match (crates/opengrok-server/tests/against_a_chained_command.rs:410)"
+    },
+    {
+      "file": "rest/GET__coworkers/200-the_roster_row_speaks_the_same_camelcase_as_the_patch_reply.json",
+      "source": "crates/opengrok-server/src/agui/routes.rs:1437 coworker_row via list_coworkers (crates/opengrok-server/src/agui/routes.rs:1842), in the test the_roster_row_speaks_the_same_camelcase_as_the_patch_reply (crates/opengrok-server/tests/against_a_renamed_coworker.rs:403), its first read"
+    },
+    {
+      "file": "rest/POST__coworkers/201-the_hire_reply_is_the_roster_row_plus_what_only_a_hire_knows.json",
+      "source": "crates/opengrok-server/src/agui/routes.rs:1561 hire (the row from crates/opengrok-server/src/agui/routes.rs:1437; computerError from crates/opengrok-server/src/agui/provision.rs:286, the harness has no computer), in the test the_hire_reply_is_the_roster_row_plus_what_only_a_hire_knows (crates/opengrok-server/tests/against_a_renamed_coworker.rs:473)"
+    },
+    {
+      "file": "rest/GET__recipes/200-one_listing_shows_both_and_can_be_asked_for_either.json",
+      "source": "crates/opengrok-server/src/recipes.rs:303 summary via list (crates/opengrok-server/src/recipes.rs:350), in the test one_listing_shows_both_and_can_be_asked_for_either (crates/opengrok-server/tests/against_a_workflow.rs:468; the tree's parameters from a_tree, :318)"
+    },
+    {
+      "file": "rest/GET__recipes__id_/200-a_run_whose_caller_hung_up_still_lands_in_history_with_its_pictures.json",
+      "source": "crates/opengrok-server/src/recipes.rs:558 detail_body (the running row from crates/opengrok-store/src/postgres.rs:3427 start_recipe_run), in the test a_run_whose_caller_hung_up_still_lands_in_history_with_its_pictures (crates/opengrok-server/tests/against_a_recipe_in_two_hands.rs:545), its first read while the box still plays"
+    },
+    {
+      "file": "rest/POST__recipes__id__run/202-a_caller_that_prefers_not_to_wait_gets_the_run_id_at_once.json",
+      "source": "crates/opengrok-server/src/recipes.rs:1161 run (Prefer: respond-async), in the test a_caller_that_prefers_not_to_wait_gets_the_run_id_at_once (crates/opengrok-server/tests/against_a_recipe_in_two_hands.rs:601)"
+    },
+    {
+      "file": "rest/GET__schedules/200-a_webhook_routine_is_minted_with_a_url_and_a_key.json",
+      "source": "crates/opengrok-server/src/autonomy/routes.rs:157 RoutineRow::json via list_schedules (crates/opengrok-server/src/autonomy/routes.rs:293; the webhook block from crates/opengrok-server/src/hooks.rs:146), in the test a_webhook_routine_is_minted_with_a_url_and_a_key (crates/opengrok-server/tests/against_routines.rs:442); the key is a bearer secret and is redacted"
+    },
+    {
+      "file": "rest/GET__skills/200-a_skill_is_written_read_back_and_listed_only_for_its_owner.json",
+      "source": "crates/opengrok-server/src/skills.rs:630 summary via list (crates/opengrok-server/src/skills.rs:713), in the test a_skill_is_written_read_back_and_listed_only_for_its_owner (crates/opengrok-server/tests/against_another_persons_skill.rs:188)"
+    },
+    {
+      "file": "rest/GET__skills__id_/200-a_skill_is_written_read_back_and_listed_only_for_its_owner.json",
+      "source": "crates/opengrok-server/src/skills.rs:657 detail_of, in the test a_skill_is_written_read_back_and_listed_only_for_its_owner (crates/opengrok-server/tests/against_another_persons_skill.rs:188)"
+    },
+    {
+      "file": "rest/GET__account/200-a_browser_logs_in_by_cookie_and_reaches_its_account_with_no_bearer.json",
+      "source": "crates/opengrok-server/src/account_api.rs:132 me (account_json, :117), in the test a_browser_logs_in_by_cookie_and_reaches_its_account_with_no_bearer (crates/opengrok-server/tests/against_the_web_console.rs:159)"
+    },
+    {
+      "file": "rest/POST__auth_login/200-a_browser_logs_in_by_cookie_and_reaches_its_account_with_no_bearer.json",
+      "source": "crates/opengrok-server/src/auth/routes.rs:461 login_cookie, in the test a_browser_logs_in_by_cookie_and_reaches_its_account_with_no_bearer (crates/opengrok-server/tests/against_the_web_console.rs:159); the tokens ride Set-Cookie, not the body"
+    },
+    {
+      "file": "rest/POST__auth_login/401-bad_credentials_and_gated_accounts_set_no_cookie_and_say_which.json",
+      "source": "crates/opengrok-server/src/auth/routes.rs:474 login_cookie (authenticate, :415), in the test bad_credentials_and_gated_accounts_set_no_cookie_and_say_which (crates/opengrok-server/tests/against_the_web_console.rs:217)"
+    },
+    {
+      "file": "rest/POST__ag-ui_user-form_submit/200-an_agui_only_turn_still_mints_a_user_form_entry_id.json",
+      "source": "crates/opengrok-server/src/agui/user_form.rs:130 submit_user_form (the card from crates/opengrok-server/src/cards.rs:79, settled by crates/opengrok-server/src/agui/user_form.rs:958; outcomes from crates/opengrok-tools/src/user_form.rs:743 fill_into_focus), in the test an_agui_only_turn_still_mints_a_user_form_entry_id (crates/opengrok-server/tests/against_user_form.rs:817)"
+    },
+    {
+      "file": "rest/POST__ag-ui_user-form_submit/404-a_missing_form_entry_is_an_error_not_null.json",
+      "source": "crates/opengrok-server/src/agui/user_form.rs:933 load_owned_entry, in the test a_missing_form_entry_is_an_error_not_null (crates/opengrok-server/tests/against_user_form.rs:1395)"
+    },
+    {
+      "file": "rest/POST__ag-ui_user-form_submit/403-a_saved_login_fills_only_a_dedicated_box.json",
+      "source": "crates/opengrok-server/src/agui/user_form.rs:130 submit_user_form (SHARED_COMPUTER, crates/opengrok-server/src/agui/user_form.rs:874), in the test a_saved_login_fills_only_a_dedicated_box (crates/opengrok-server/tests/against_user_form.rs:1962)"
+    },
+    {
+      "file": "rest/POST__ag-ui_user-form_dismiss/200-skip_via_form_entry_id_settles_the_live_handoff_and_resumes.json",
+      "source": "crates/opengrok-server/src/agui/user_form.rs:302 dismiss_user_form (mode escalated; settled by crates/opengrok-server/src/agui/user_form.rs:958), in the test skip_via_form_entry_id_settles_the_live_handoff_and_resumes (crates/opengrok-server/tests/against_user_form.rs:1174)"
+    },
+    {
+      "file": "rest/POST__ag-ui_box-handoff_resolve/200-skip_via_form_entry_id_settles_the_live_handoff_and_resumes.json",
+      "source": "crates/opengrok-server/src/agui/user_form.rs:384 resolve_box_handoff (the card from crates/opengrok-server/src/cards.rs:113 computer_handoff_card, settled by crates/opengrok-server/src/agui/user_form.rs:991; the instruction from crates/opengrok-tools/src/user_form.rs:590), in the test skip_via_form_entry_id_settles_the_live_handoff_and_resumes (crates/opengrok-server/tests/against_user_form.rs:1174)"
+    }
+  ]
+}

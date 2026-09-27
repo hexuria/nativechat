@@ -2840,10 +2840,11 @@ where
     Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
+/// `GET /recipes`: the rows sit under `recipes`. `pub(super)` for the wire conformance tests.
 #[derive(Debug, Clone, Deserialize)]
-struct RecipeList {
+pub(super) struct RecipeList {
     #[serde(default)]
-    recipes: Vec<RecipeSummary>,
+    pub(super) recipes: Vec<RecipeSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
