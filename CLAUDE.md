@@ -15,10 +15,11 @@ Sibling checkouts live in `/Volumes/goldcoders/OSS`: `opengrok-server` (the sour
 ## Commands
 
 ```sh
-just run [port]                                        # build with --features agent, codesign, relaunch against :1447 (or port)
+just run [port]                                        # --features agent build, codesign, relaunch against :1447 (or port), with the
+                                                       # gpui-agent control plane ON (GPUI_AGENT=1, token dev-secret): a dev build only
 OPENGROK_BASE_URL=http://127.0.0.1:1447 cargo run -p nativechat
 cargo test --locked -p nativechat --all-features       # what CI runs; plain `cargo test` skips the gpui-agent host tests
-cargo test -p nativechat <name_filter>                 # a single test / module
+cargo test --locked -p nativechat --all-features <name_filter>   # one test / module (without --all-features, host tests silently skip)
 cargo clippy --locked -p nativechat --all-targets -- -D warnings                  # CI runs both of these
 cargo clippy --locked -p nativechat --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
@@ -47,7 +48,7 @@ Lints (`[lints]` in `Cargo.toml`): every `unsafe` block and impl carries a `// S
 
   New surfaces register **stable ids** in `src/agent/host.rs` (catalogue in the `src/agent/mod.rs` doc comment). If a surface can't be clicked from a snapshot, it isn't done. If the in-process screenshot is empty, use shell `screencapture -l <CGWindowID>`.
 - **Wire shapes:** a new or changed wire type names the opengrok-server file or PR it was transcribed from (see Conventions), checked against the server checkout.
-- **Migrations:** `db::tests::every_past_schema_with_data_in_it_upgrades_to_the_current_one` runs a new migration against every past schema with a row in every table; a migration that cannot keep a row says why in the file.
+- **Migrations:** `db::tests::every_past_schema_with_data_in_it_upgrades_to_the_current_one` runs a new migration against every past schema with a row in every table and requires every row to survive; the only exemption is a table a later migration drops (`DROP TABLE`), read from the SQL.
 - **Secrets on disk** go through `private_file::write_private` (a new `0600` file renamed over the old), never `fs::write`; site-login secrets go to the Keychain.
 - **A bug fix** comes with a test that fails without the fix; say in the PR that you checked it fails.
 
@@ -55,8 +56,9 @@ Lints (`[lints]` in `Cargo.toml`): every `unsafe` block and impl carries a `// S
 
 - **`src/opengrok/`**: the HTTP/AG-UI client, with no GPUI. `client.rs` has `OpenGrokClient` (cookie session, bearer for `/ag-ui`, all REST routes) and its wiremock tests. `types.rs` holds wire types. `gen_ui.rs` has `TurnAssembler`, which folds the AG-UI event stream into `ChatPart`s (text, tool calls, approval cards, forms, screenshots). `activity.rs` turns tool calls into "what the bot is doing" ticks. `user_form.rs` covers the user-form and computer-handoff HITL cards. `local_exec.rs` is reverse-exec: this Mac enrolled as a machine that runs `user_machine_shell` commands for the server. `pending.rs` covers queued/offline sends.
 - **`src/state.rs`**: `AppState`, a single very large GPUI model (~20k lines) owning conversations, coworkers, the running turn, queued sends, approvals, routines, recipes and the computer pane. UI components read it and call its methods, and it spawns the async client calls. Search it by function name rather than reading it top to bottom.
-- **`src/components/`**: GPUI views. `root.rs` holds `RootView`, the top-level window, which also drains the gpui-agent mailbox. Parent views pass callbacks into `RenderOnce` children instead of dispatching actions (`docs/state_management.md`).
-- **`src/send_policy.rs`**: decides what a send does while a turn is running (queue, steer, blocked on a card).
+- **`src/components/`**: GPUI views. Parent views pass callbacks into `RenderOnce` children instead of dispatching actions (`docs/state_management.md`).
+- **`src/root.rs`**: `RootView`, the top-level window, which also drains the gpui-agent mailbox.
+- **`src/send_policy.rs`**: what a send does while the coworker is busy: idle posts; parked (a card waiting on the person) steers, because the server settles the card on the next message; running queues unless the person asked to interrupt.
 - **Local persistence**: sqlite via sqlx (`src/db`, `src/services/database.rs`, `migrations/`), run at startup. It is a cache and preferences only; coworkers and transcripts live on the server. Site-login secrets go to the macOS Keychain (`src/site_login/`), never sqlite.
 - **`src/agent/`**: behind the `agent` feature; the in-process gpui-agent control plane.
 - `main.rs`: tokio runtime, config, migrations, key bindings, window.
