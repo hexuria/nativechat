@@ -650,7 +650,8 @@ impl TurnAssembler {
     /// Pins the last computer PNG when `image.visibility` is not `agent` (turn-end
     /// `end` / untagged heuristic). Tagged `agent` stays Computer-pane only.
     pub fn finish(&mut self) {
-        self.flush_text();
+        // Nothing more is coming, so nothing is held back: an object that never closed is words.
+        drain_complete_ui(&mut self.text, &mut self.committed, Held::Release);
         if let Some(tool) = self.tool.take() {
             self.close_tool(tool);
         }
@@ -751,11 +752,15 @@ impl TurnAssembler {
     }
 
     fn holding_ui(&self) -> bool {
-        self.tool.is_some() || ui_object_incomplete(&self.text)
+        self.tool.is_some()
+            || ui_object_incomplete(&self.text)
+            || ui_opening_at_end(&self.text).is_some()
     }
 
+    /// Commit what the text so far can be committed as, mid-stream. An object not yet closed, and
+    /// a tail that may yet become one, are held for the next delta.
     fn flush_text(&mut self) {
-        drain_complete_ui(&mut self.text, &mut self.committed);
+        drain_complete_ui(&mut self.text, &mut self.committed, Held::Keep);
     }
 }
 
@@ -958,15 +963,35 @@ fn normalize_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace(['_', ' '], "-")
 }
 
-fn drain_complete_ui(buf: &mut String, out: &mut Vec<ChatPart>) {
+/// What `drain_complete_ui` does with text that may still become a UI object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// Mid-stream: keep it for the next delta.
+    Keep,
+    /// The stream is over: it is words, and goes out as text.
+    Release,
+}
+
+fn drain_complete_ui(buf: &mut String, out: &mut Vec<ChatPart>, held: Held) {
     loop {
         let Some(start) = find_ui_object(buf) else {
-            if !buf.is_empty() {
-                out.push(ChatPart::Text(std::mem::take(buf)));
+            // A delta can end partway into an object's opening (`{`, `{"u`, `{ "compon`). Sent on
+            // as text, the rest of the object would arrive with no `{` in front of it and never be
+            // recognised, so that tail waits for the next delta.
+            let keep = match held {
+                Held::Keep => ui_opening_at_end(buf).unwrap_or(buf.len()),
+                Held::Release => buf.len(),
+            };
+            if keep > 0 {
+                out.push(ChatPart::Text(buf[..keep].to_string()));
+                buf.replace_range(..keep, "");
             }
             return;
         };
         let Some(len) = complete_json_len(&buf[start..]) else {
+            if held == Held::Release {
+                out.push(ChatPart::Text(std::mem::take(buf)));
+            }
             return;
         };
         if start > 0 {
@@ -990,6 +1015,21 @@ fn ui_object_incomplete(buf: &str) -> bool {
         None => false,
         Some(start) => complete_json_len(&buf[start..]).is_none(),
     }
+}
+
+/// Where a UI object's opening may be starting at the very end of `s`: a `{` followed by no more
+/// than a strict prefix of what `find_ui_object` looks for. `None` when the tail cannot be one.
+fn ui_opening_at_end(s: &str) -> Option<usize> {
+    s.char_indices()
+        .filter(|&(_, c)| c == '{')
+        .map(|(i, _)| i)
+        .find(|&i| {
+            let rest = &s[i + 1..];
+            let key = rest.strip_prefix(' ').unwrap_or(rest);
+            ["\"ui\"", "\"component\""]
+                .iter()
+                .any(|opening| opening.len() > key.len() && opening.starts_with(key))
+        })
 }
 
 fn find_ui_object(s: &str) -> Option<usize> {
@@ -1636,6 +1676,62 @@ mod tests {
         let (plain, parts) = turn.snapshot();
         assert_eq!(plain, "");
         assert!(parts.is_empty());
+    }
+
+    /// A delta can end anywhere, including partway into an object's opening. Wherever the stream
+    /// is cut, the chart still mounts and the words around it read the same as one delta would.
+    #[test]
+    fn a_ui_object_split_at_any_byte_still_mounts() {
+        for whole in [
+            "Here: {\"ui\":\"bar-chart\",\"title\":\"Q3\",\"bars\":[{\"label\":\"A\",\"value\":3}]} done",
+            "Here: { \"component\":\"bar-chart\",\"title\":\"Q3\",\"bars\":[{\"label\":\"A\",\"value\":3}]} done",
+        ] {
+            let mut once = TurnAssembler::default();
+            once.push_event(&text(whole));
+            once.finish();
+            let (expected, _) = once.snapshot();
+            for cut in 0..=whole.len() {
+                let mut turn = TurnAssembler::default();
+                turn.push_event(&text(&whole[..cut]));
+                turn.push_event(&text(&whole[cut..]));
+                turn.finish();
+                let (plain, parts) = turn.snapshot();
+                let charts = parts
+                    .iter()
+                    .filter(|part| matches!(part, ChatPart::Ui(UiSpec::BarChart(_))))
+                    .count();
+                assert_eq!(charts, 1, "cut at {cut} of {whole:?}: {parts:?}");
+                assert_eq!(plain, expected, "cut at {cut} of {whole:?}");
+            }
+        }
+    }
+
+    /// A `{` at the end of a delta is held only until it is clear it opens no object; words keep
+    /// their braces, and one left dangling when the turn ends is still said.
+    #[test]
+    fn a_brace_that_opens_no_ui_is_still_words() {
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&text("use {"));
+        turn.push_event(&text("braces} freely"));
+        turn.finish();
+        assert_eq!(turn.snapshot().0, "use {braces} freely");
+
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&text("a dangling {"));
+        turn.finish();
+        assert_eq!(turn.snapshot().0, "a dangling {");
+    }
+
+    /// An object that never closes is held while the stream runs, and is words once it has ended,
+    /// rather than vanishing with the turn.
+    #[test]
+    fn an_object_that_never_closes_is_words_when_the_turn_ends() {
+        let unclosed = "See {\"ui\":\"bar-chart\",\"bars\":[";
+        let mut turn = TurnAssembler::default();
+        turn.push_event(&text(unclosed));
+        assert_eq!(turn.snapshot().0, "");
+        turn.finish();
+        assert_eq!(turn.snapshot().0, unclosed);
     }
 
     #[test]
