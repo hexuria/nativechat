@@ -48,7 +48,7 @@ Lints (`[lints]` in `Cargo.toml`): every `unsafe` block and impl carries a `// S
 
   New surfaces register **stable ids** in `src/agent/host.rs` (catalogue in the `src/agent/mod.rs` doc comment). If a surface can't be clicked from a snapshot, it isn't done. If the in-process screenshot is empty, use shell `screencapture -l <CGWindowID>`.
 - **Wire shapes:** a new or changed wire type names the opengrok-server file or PR it was transcribed from (see Conventions), checked against the server checkout.
-- **Migrations:** `db::tests::every_past_schema_with_data_in_it_upgrades_to_the_current_one` runs a new migration against every past schema with a row in every table and requires every row to survive; the only exemption is a table a later migration drops (`DROP TABLE`), read from the SQL.
+- **Migrations:** `db::tests::every_past_schema_with_data_in_it_upgrades_to_the_current_one` upgrades every past schema, seeded with two rows in every table (foreign keys on, every column a real value), and requires every row to survive value for value, foreign keys to check clean, and the schema to equal a fresh install's. A migration that drops a table with data on purpose adds it to `INTENDED_DROPS` in the same change.
 - **Secrets on disk** go through `private_file::write_private` (a new `0600` file renamed over the old), never `fs::write`; site-login secrets go to the Keychain.
 - **A bug fix** comes with a test that fails without the fix; say in the PR that you checked it fails.
 
