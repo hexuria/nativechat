@@ -190,7 +190,11 @@ impl OpenGrokClient {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = write_private(path, &json);
+        // A session that could not be kept privately is not kept: the old file stays as it was,
+        // and the next launch signs in again.
+        if let Err(error) = write_private(path, &json) {
+            eprintln!("NativeChat: the session was not saved: {error}");
+        }
     }
 
     pub fn clear_session(&self) {

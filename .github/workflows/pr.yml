@@ -68,17 +68,41 @@ jobs:
     # The shipped app is built with default features (`build.sh`: `cargo bundle --release`). The
     # `agent` feature compiles in gpui-agent, a TCP control plane that can click through the UI,
     # approval cards included. It must never be in that build. cargo tree only reads the graph,
-    # so Ubuntu is enough.
+    # so Ubuntu is enough; `--target` resolves it for the Macs the app is built for.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: gpui-agent is not in the default build
         run: |
-          if cargo tree --locked -p nativechat -e normal -i gpui-agent; then
-            echo "gpui-agent is reachable with default features; it must stay behind the agent feature." >&2
-            exit 1
-          fi
-          echo "gpui-agent is only in the agent build."
+          set -u
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            query() {
+              cargo tree --locked -p nativechat -e normal --target "$target" "$@" -i gpui-agent 2>&1
+            }
+            # Control: with the agent feature the same query must find gpui-agent under
+            # nativechat. If it cannot, the query itself is broken (a renamed package, a bad flag,
+            # an unreadable graph), and a "not found" below would prove nothing.
+            if ! control="$(query --features agent)" \
+              || ! grep -q '^gpui-agent v' <<<"$control" \
+              || ! grep -q 'nativechat v' <<<"$control"; then
+              echo "$control" >&2
+              echo "$target: the query cannot see gpui-agent even with the agent feature on" >&2
+              exit 1
+            fi
+            # The release graph: only cargo's "not in the graph" answer passes. Any other failure
+            # is a broken check, not a clean build.
+            if release="$(query)"; then
+              echo "$release" >&2
+              echo "$target: gpui-agent is reachable with default features" >&2
+              exit 1
+            fi
+            if ! grep -q 'package ID specification `gpui-agent` did not match any packages' <<<"$release"; then
+              echo "$release" >&2
+              echo "$target: cargo tree failed for a reason other than gpui-agent being absent" >&2
+              exit 1
+            fi
+            echo "$target: gpui-agent is only in the agent build."
+          done
 
   test:
     # The crate links AppKit, CoreAudio and LocalAuthentication unconditionally, so it only builds

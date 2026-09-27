@@ -365,7 +365,10 @@ fn save_credential(path: &Path, cred: &StoredDaemon) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = write_private(path, &json);
+    // Not kept privately means not kept: the old file stays as it was.
+    if let Err(error) = write_private(path, &json) {
+        eprintln!("NativeChat local exec: this Mac's credential was not saved: {error}");
+    }
 }
 
 #[cfg(test)]
