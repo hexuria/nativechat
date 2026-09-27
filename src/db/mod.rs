@@ -96,7 +96,9 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
-    /// A literal of the column's declared type, distinct per table, column and `copy`.
+    /// A literal of the column's declared type, distinct per table, column and `copy`, and never
+    /// NULL or a column's default: a migration that resets a value to either is a change the
+    /// comparison sees.
     fn literal(table: &str, column: &str, kind: &str, copy: u32) -> String {
         if kind.contains("INT") {
             format!("{}", 1000 + copy)
@@ -109,10 +111,34 @@ mod tests {
         }
     }
 
-    /// Rows in every table, with foreign keys on: parents first, and every foreign key (nullable
-    /// or not) pointing at a real parent row, so cascades, restricts and joins have something
-    /// to act on. Each table gets two rows that differ only in their keys where the schema
-    /// allows it, so a later unique index over existing duplicates meets duplicates.
+    /// Each unique index (a key included) on `table`, as its columns.
+    async fn unique_indexes(pool: &DbPool, table: &str) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        for index in sqlx::query(&format!("PRAGMA index_list(\"{table}\")"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        {
+            if index.get::<i64, _>("unique") != 1 {
+                continue;
+            }
+            let name: String = index.get("name");
+            let columns = sqlx::query(&format!("PRAGMA index_info(\"{name}\")"))
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|column| column.get::<Option<String>, _>("name"))
+                .collect();
+            out.push(columns);
+        }
+        out
+    }
+
+    /// Two rows in every table, with foreign keys on, parents first, every foreign key pointing
+    /// at a real parent row. Every column holds a value (never NULL, never its default), so a
+    /// migration that wipes one is seen. The two rows are the same except where a key or unique
+    /// index makes them differ, so a later unique index over existing duplicates meets them.
     async fn seed(pool: &DbPool) {
         let tables = user_tables(pool).await;
         let mut parents: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
@@ -152,8 +178,8 @@ mod tests {
                 "foreign keys form a cycle: {tables:?}"
             );
         }
-        // (table, column) -> the literal the first seeded row holds there.
-        let mut seeded: BTreeMap<(String, String), String> = BTreeMap::new();
+        // (table, column, copy) -> the literal that seeded row holds there.
+        let mut seeded: BTreeMap<(String, String, u32), String> = BTreeMap::new();
         for table in &order {
             let columns = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
                 .fetch_all(pool)
@@ -163,80 +189,109 @@ mod tests {
                 .iter()
                 .filter(|column| column.get::<i64, _>("pk") > 0)
                 .count();
+            let rowid_key = |column: &sqlx::sqlite::SqliteRow| {
+                column.get::<i64, _>("pk") > 0
+                    && key_columns == 1
+                    && column
+                        .get::<String, _>("type")
+                        .eq_ignore_ascii_case("INTEGER")
+            };
+            let uniques = unique_indexes(pool, table).await;
+            let foreign: Vec<&str> = parents[table]
+                .iter()
+                .map(|(from, ..)| from.as_str())
+                .collect();
+            // A column the second row varies: in some unique index, and either not a foreign key
+            // or in an index made only of foreign keys (which then point at the parents' second
+            // rows instead).
+            let varies = |name: &str| {
+                uniques.iter().any(|index| {
+                    index.iter().any(|c| c == name)
+                        && (!foreign.contains(&name)
+                            || index.iter().all(|c| foreign.contains(&c.as_str())))
+                })
+            };
+            let count_sql = format!("SELECT COUNT(*) FROM \"{table}\"");
+            let before: i64 = sqlx::query_scalar(&count_sql)
+                .fetch_one(pool)
+                .await
+                .unwrap();
             for copy in 1..=2u32 {
                 let mut names = Vec::new();
                 let mut values = Vec::new();
                 for column in &columns {
                     let name: String = column.get("name");
+                    if rowid_key(column) {
+                        continue; // SQLite fills the rowid in
+                    }
                     let kind = column.get::<String, _>("type").to_ascii_uppercase();
-                    let not_null: i64 = column.get("notnull");
-                    let default: Option<String> = column.get("dflt_value");
-                    let pk: i64 = column.get("pk");
-                    let link = parents[table].iter().find(|(from, _, _)| *from == name);
-                    let value = if let Some((_, parent, to)) = link {
-                        let to = if to.is_empty() { "rowid" } else { to.as_str() };
-                        match seeded.get(&(parent.clone(), to.to_string())) {
-                            Some(value) => value.clone(),
-                            None => continue,
+                    let use_copy = if varies(&name) { copy } else { 1 };
+                    let link = parents[table].iter().find(|(from, ..)| *from == name);
+                    let value = match link {
+                        Some((_, parent, to)) => {
+                            let to = if to.is_empty() { "rowid" } else { to.as_str() };
+                            seeded
+                                .get(&(parent.clone(), to.to_string(), use_copy))
+                                .unwrap_or_else(|| {
+                                    panic!("{table}.{name}: no seeded {parent}.{to}")
+                                })
+                                .clone()
                         }
-                    } else if pk > 0 && key_columns == 1 && kind == "INTEGER" {
-                        continue; // the rowid: SQLite fills it in
-                    } else if pk > 0 {
-                        literal(table, &name, &kind, copy)
-                    } else if not_null == 1 && default.is_none() {
-                        // Same value in both copies: the duplicates a unique index would meet.
-                        literal(table, &name, &kind, 1)
-                    } else {
-                        continue;
+                        None => literal(table, &name, &kind, use_copy),
                     };
                     names.push(format!("\"{name}\""));
                     values.push(value);
                 }
-                let sql = if names.is_empty() {
-                    format!("INSERT INTO \"{table}\" DEFAULT VALUES")
-                } else {
-                    format!(
-                        "INSERT INTO \"{table}\" ({}) VALUES ({})",
-                        names.join(", "),
-                        values.join(", ")
-                    )
-                };
-                let inserted = sqlx::query(&sql).execute(pool).await;
-                match inserted {
-                    Ok(done) if copy == 1 => {
-                        for (name, value) in names.iter().zip(&values) {
-                            seeded.insert(
-                                (table.clone(), name.trim_matches('"').into()),
-                                value.clone(),
-                            );
-                        }
-                        seeded.insert(
-                            (table.clone(), "rowid".into()),
-                            done.last_insert_rowid().to_string(),
-                        );
-                        for column in &columns {
-                            let name: String = column.get("name");
-                            if column.get::<i64, _>("pk") > 0 && key_columns == 1 {
-                                seeded
-                                    .entry((table.clone(), name))
-                                    .or_insert_with(|| done.last_insert_rowid().to_string());
-                            }
-                        }
+                let sql = format!(
+                    "INSERT INTO \"{table}\" ({}) VALUES ({})",
+                    names.join(", "),
+                    values.join(", ")
+                );
+                let done = sqlx::query(&sql)
+                    .execute(pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("seeding {table} (row {copy}): {e}\n{sql}"));
+                for (name, value) in names.iter().zip(&values) {
+                    seeded.insert(
+                        (table.clone(), name.trim_matches('"').into(), copy),
+                        value.clone(),
+                    );
+                }
+                let rowid = done.last_insert_rowid().to_string();
+                seeded.insert((table.clone(), "rowid".into(), copy), rowid.clone());
+                for column in &columns {
+                    if rowid_key(column) {
+                        seeded.insert((table.clone(), column.get("name"), copy), rowid.clone());
                     }
-                    Ok(_) => {}
-                    // A unique constraint already in the schema: the duplicate cannot exist, so
-                    // no later index can meet one here.
-                    Err(e) if copy == 2 && e.to_string().contains("UNIQUE") => {}
-                    Err(e) => panic!("seeding {table}: {e}\n{sql}"),
                 }
             }
+            let after: i64 = sqlx::query_scalar(&count_sql)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(after - before, 2, "{table}: both seeded rows are there");
         }
+    }
+
+    /// The schema as SQLite stores it: every table, index and trigger with its SQL.
+    async fn schema(pool: &DbPool) -> Vec<(String, String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT type, name, sql FROM sqlite_master \
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
     }
 
     /// For every point in `files`' history: build the schema that far, seed it, finish the
     /// upgrade with `finish`, and check that it succeeded, that foreign keys were on for it, and
     /// that every table that existed keeps every column and every row, value for value.
-    async fn upgrade_from_every_point<F, Fut>(files: &[PathBuf], finish: F) -> Result<(), String>
+    async fn upgrade_from_every_point<F, Fut>(
+        files: &[PathBuf],
+        fresh_schema: Option<&Vec<(String, String, Option<String>)>>,
+        finish: F,
+    ) -> Result<(), String>
     where
         F: Fn(DbPool) -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
@@ -287,6 +342,23 @@ mod tests {
                     files.len()
                 ));
             }
+            let broken: Vec<String> =
+                sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_check")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            if !broken.is_empty() {
+                return Err(format!(
+                    "upgrading from {last}: rows point at missing parents in {broken:?}"
+                ));
+            }
+            if let Some(fresh) = fresh_schema
+                && &schema(&pool).await != fresh
+            {
+                return Err(format!(
+                    "upgrading from {last}: the schema differs from a fresh install's"
+                ));
+            }
             let after_tables = user_tables(&pool).await;
             for (table, (columns, rows)) in &before {
                 let dropped = INTENDED_DROPS.iter().any(|(file, dropped)| {
@@ -323,7 +395,15 @@ mod tests {
     async fn every_past_schema_with_data_in_it_upgrades_to_the_current_one() {
         let files = migration_files();
         assert!(files.len() > 1, "no migrations found in {MIGRATIONS}");
-        upgrade_from_every_point(&files, |pool| async move {
+        // What a new install ends up with, to compare every upgrade against: an upgrade that
+        // skips a step (`CREATE TABLE IF NOT EXISTS` over an older table) differs from it.
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("fresh.db").display());
+        let fresh_pool = create_pool(&url).await.unwrap();
+        run_migrations(&fresh_pool).await.unwrap();
+        let fresh = schema(&fresh_pool).await;
+        fresh_pool.close().await;
+        upgrade_from_every_point(&files, Some(&fresh), |pool| async move {
             run_migrations(&pool).await.map_err(|e| e.to_string())
         })
         .await
@@ -342,7 +422,7 @@ mod tests {
         for file in &files {
             std::fs::copy(file, all.join(file.file_name().unwrap())).unwrap();
         }
-        upgrade_from_every_point(&files, |pool| {
+        upgrade_from_every_point(&files, None, |pool| {
             let all = all.clone();
             async move {
                 sqlx::migrate::Migrator::new(all.as_path())
@@ -396,5 +476,37 @@ mod tests {
             dropped_column.contains("column site_logins.notes is gone"),
             "{dropped_column}"
         );
+
+        let dropped_table = upgrade_with_one_more("DROP TABLE site_logins;")
+            .await
+            .unwrap_err();
+        assert!(
+            dropped_table.contains("table site_logins is gone"),
+            "{dropped_table}"
+        );
+
+        // Nullable and defaulted columns hold real values too, so a reset to NULL or to the
+        // default is a change, and a unique index over them meets the seeded duplicates.
+        for (sql, expect) in [
+            (
+                "UPDATE site_logins SET notes = '';",
+                "rows in site_logins did not survive",
+            ),
+            (
+                "UPDATE chat_messages SET run_id = NULL;",
+                "rows in chat_messages did not survive",
+            ),
+            (
+                "CREATE UNIQUE INDEX one_label ON site_logins(label);",
+                "UNIQUE constraint failed",
+            ),
+            (
+                "CREATE UNIQUE INDEX one_run ON chat_messages(run_id);",
+                "UNIQUE constraint failed",
+            ),
+        ] {
+            let caught = upgrade_with_one_more(sql).await.unwrap_err();
+            assert!(caught.contains(expect), "{sql}: {caught}");
+        }
     }
 }
