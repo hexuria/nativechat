@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -19,6 +19,7 @@ use super::types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate, ThreadListing,
     error_message_from_body,
 };
+use crate::private_file::write_private;
 use crate::threads::conversation_for_thread;
 
 /// The cookie the server puts the access JWT in. It is also what goes out as the Bearer.
@@ -189,7 +190,11 @@ impl OpenGrokClient {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = write_private(path, &json);
+        // A session that could not be kept privately is not kept: the old file stays as it was,
+        // and the next launch signs in again.
+        if let Err(error) = write_private(path, &json) {
+            eprintln!("NativeChat: the session was not saved: {error}");
+        }
     }
 
     pub fn clear_session(&self) {
@@ -3724,25 +3729,6 @@ pub const SKILL_BODY_CHARS: usize = 8000;
 /// checkout, a downloads directory — is read into memory whole, and only then refused.
 pub const SKILL_BUNDLE_LIMIT: usize = 256 * 1024;
 pub const SKILL_BUNDLE_FILES: usize = 32;
-
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        file.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes)
-    }
-}
 
 /// What a save sends. The secrets are redacted in Debug.
 #[derive(Clone)]

@@ -95,15 +95,10 @@ impl FileVault {
             fs::create_dir_all(parent).map_err(|err| StoreError::Io(err.to_string()))?;
         }
         let bytes = serde_json::to_vec(map).map_err(|err| StoreError::Io(err.to_string()))?;
-        let tmp = self.path.with_extension("vault.tmp");
-        fs::write(&tmp, bytes).map_err(|err| StoreError::Io(err.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp, &self.path).map_err(|err| StoreError::Io(err.to_string()))?;
-        Ok(())
+        // A new private file renamed over the old one (see `write_private`). It used to be written
+        // plainly and narrowed afterwards, the secrets readable by every account in between.
+        crate::private_file::write_private(&self.path, &bytes)
+            .map_err(|err| StoreError::Io(err.to_string()))
     }
 }
 
