@@ -2503,9 +2503,13 @@ pub struct AppState {
     /// can both have one out, and an older page that missed a run must not delete the line a
     /// newer one already settled.
     routine_runs_asked: HashMap<String, u64>,
-    /// Bumped whenever the server's copy of a routine is written over what the editor shows (an
-    /// edit's answer, or a refused edit put back), so the editor's fields follow it.
-    pub routine_resync: u64,
+    /// The latest edit started for each routine, kept after it settles. A read of the server's
+    /// copy started before it is older than what it saved, and is dropped.
+    routine_latest_edit: HashMap<String, u64>,
+    /// Per routine, bumped whenever the server's copy is written over what the editor shows (an
+    /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
+    /// because an answer for one must leave another's half-typed fields alone.
+    routine_resyncs: HashMap<String, u64>,
     pub model_picker_open: bool,
     pub avatar_editor_open: bool,
     pub hiring: bool,
@@ -3058,7 +3062,8 @@ impl AppState {
             routine_edits: HashMap::new(),
             routine_seq: 0,
             routine_runs_asked: HashMap::new(),
-            routine_resync: 0,
+            routine_latest_edit: HashMap::new(),
+            routine_resyncs: HashMap::new(),
             model_picker_open: false,
             avatar_editor_open: false,
             hiring: false,
@@ -6494,6 +6499,8 @@ impl AppState {
         let routine_id = routine_id.to_string();
         self.routine_seq += 1;
         let this_edit = self.routine_seq;
+        self.routine_latest_edit
+            .insert(routine_id.clone(), this_edit);
         // A Test run already waiting keeps waiting, now on this edit.
         let entry = self
             .routine_edits
@@ -6545,31 +6552,57 @@ impl AppState {
         if let Some(current) = self.routine_mut(coworker_id, &routine_id) {
             routine.runs = std::mem::take(&mut current.runs);
             *current = routine;
-            self.routine_resync += 1;
+            *self.routine_resyncs.entry(routine_id).or_default() += 1;
         }
+    }
+
+    /// How many times the server's copy of this routine has been written over the editor's.
+    pub fn routine_resync(&self, routine_id: &str) -> u64 {
+        self.routine_resyncs
+            .get(routine_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Put back the server's copy of a routine after it refused an edit, so the editor stops
     /// showing words that were never saved. Only this routine, and not over an edit started
-    /// since: that one says what the routine is once it lands.
+    /// since, whether that one is still out or has already landed: this read began before it,
+    /// and would put the refused edit's predecessor back over the correction.
     fn restore_routine(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
+        let edit_at_start = self.routine_latest_edit.get(&routine_id).copied();
         cx.spawn(async move |this, cx| {
             let result = client.list_schedules(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                if state.routine_edits.contains_key(&routine_id) {
+                if state.routine_latest_edit.get(&routine_id).copied() != edit_at_start {
                     return;
                 }
-                if let Ok(rows) = result
-                    && let Some(row) = rows.into_iter().find(|row| row.id == routine_id)
-                {
-                    state.put_server_routine(&coworker_id, row);
-                    cx.notify();
+                match result {
+                    Ok(rows) => {
+                        if let Some(row) = rows.into_iter().find(|row| row.id == routine_id) {
+                            state.put_server_routine(&coworker_id, row);
+                        }
+                    }
+                    // The fields still hold what the server refused, and saying nothing would
+                    // let the next Back send it again as though it were fine.
+                    Err(error) => {
+                        let refused = state.computer_action_error.take().unwrap_or_default();
+                        state.computer_action_error = Some(
+                            format!(
+                                "{refused} The saved routine could not be read back ({}), so \
+                                 what is shown may not be what is saved.",
+                                error.message
+                            )
+                            .trim()
+                            .to_string(),
+                        );
+                    }
                 }
+                cx.notify();
             });
         })
         .detach();

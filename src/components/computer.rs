@@ -67,7 +67,11 @@ impl ComputerPane {
         // Again whenever the server's copy of the routine replaced the one on screen (an edit's
         // answer, or a refused edit put back): fields left on the old text would send it again
         // on the next Back or Test run, over what the server just said.
-        let resync = self.state.read(cx).routine_resync;
+        // Only this routine's: an answer for another one must leave these fields, which may be
+        // half-typed, as they are.
+        let resync = id
+            .as_deref()
+            .map_or(0, |rid| self.state.read(cx).routine_resync(rid));
         if self.loaded_editor.as_ref() == Some(&(id.clone(), resync)) {
             return;
         }
