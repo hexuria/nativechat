@@ -290,14 +290,21 @@ fn describe_tool(name: &str, args: Option<&str>) -> String {
         .as_ref()
         .and_then(|v| v.get("command").and_then(Value::as_str));
     match name {
-        "Read" | "ExternalRead" | "BoxRead" | "readToolCall" => path
+        // `read_file`, `write_file` and `shell` are opengrok-server's own names for the box's tools,
+        // the ones every coworker is hired with; the capitalised names are the Grok Bot desktop
+        // client's. A name with no arm here reads "Using <name>".
+        "Read" | "ExternalRead" | "BoxRead" | "readToolCall" | "read_file" => path
             .and_then(file_basename)
             .map(|n| format!("Reading {n}"))
             .unwrap_or_else(|| "Reading file".into()),
+        "write_file" => path
+            .and_then(file_basename)
+            .map(|n| format!("Writing {n}"))
+            .unwrap_or_else(|| "Writing a file".into()),
         "WebSearch" | "webSearchToolCall" => "Searching the web".into(),
         "WebFetch" | "webFetchToolCall" => "Reading the web".into(),
         "GenerateImage" | "generateImageToolCall" => "Generating a photo".into(),
-        "Shell" | "BoxShell" | "shellToolCall" | "ExternalShell" => match command {
+        "shell" | "Shell" | "BoxShell" | "shellToolCall" | "ExternalShell" => match command {
             Some(c) if c.contains('>') || c.contains("tee ") || c.contains("sed ") => {
                 "Drafting the file".into()
             }
@@ -358,6 +365,56 @@ mod tests {
         );
         let ev = json!({"type":"RUN_FINISHED"});
         assert_eq!(activity_from_agui(&ev, None), ActivityTick::Clear);
+    }
+
+    /// The box's tools under the server's own names say what they do, not "Using shell": the
+    /// command once its arguments are in, and a plain line before they are.
+    #[test]
+    fn the_servers_own_tool_names_say_what_they_do() {
+        let label = |name: &str, args: Option<&str>| describe_tool(name, args);
+        assert_eq!(
+            label("shell", Some(r#"{"command":"cargo test"}"#)),
+            "Running `cargo test`"
+        );
+        assert_eq!(label("shell", None), "Running commands");
+        assert_eq!(
+            label("read_file", Some(r#"{"path":"src/main.rs"}"#)),
+            "Reading main.rs"
+        );
+        assert_eq!(
+            label("write_file", Some(r#"{"path":"notes/todo.md"}"#)),
+            "Writing todo.md"
+        );
+        assert_eq!(label("write_file", None), "Writing a file");
+        for name in ["shell", "read_file", "write_file"] {
+            assert!(!label(name, None).starts_with("Using "), "{name}");
+        }
+    }
+
+    /// The same, from the frames the server sent for one shell call (`fixtures/wire`, the start
+    /// and the arguments of `a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it`).
+    #[test]
+    fn a_shell_call_off_the_wire_reads_as_the_command_it_runs() {
+        let frame = |kind: &str| -> Value {
+            let path = format!(
+                "{}/fixtures/wire/agui/{kind}/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            serde_json::from_str(&std::fs::read_to_string(&path).expect(&path)).expect(&path)
+        };
+        let mut tracker = ToolCallTracker::default();
+        assert_eq!(
+            tracker.tick(&frame("TOOL_CALL_START")),
+            ActivityTick::Set(BotActivity {
+                label: "Running commands".into()
+            })
+        );
+        assert_eq!(
+            tracker.tick(&frame("TOOL_CALL_ARGS")),
+            ActivityTick::Set(BotActivity {
+                label: "Running `whoami`".into()
+            })
+        );
     }
 
     #[test]
