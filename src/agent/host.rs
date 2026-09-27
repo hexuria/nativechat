@@ -1223,7 +1223,7 @@ fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
                     crate::opengrok::ScheduleRunStatus::Waiting => "waiting",
                     crate::opengrok::ScheduleRunStatus::Ok => "ok",
                     crate::opengrok::ScheduleRunStatus::Error => "error",
-                    crate::opengrok::ScheduleRunStatus::Other => "",
+                    crate::opengrok::ScheduleRunStatus::Other => "other",
                 };
                 (run.run_id.clone(), run.cause_label(), status)
             })
@@ -4228,6 +4228,39 @@ mod tests {
             host.take_command().unwrap(),
             Command::RunRoutineNow { routine_id } if routine_id == "sch-1-2"
         ));
+    }
+
+    /// The driver's two routine verbs: Test run by name, and an edit saved the way the editor
+    /// saves one. An edit that names nothing to change is refused before it reaches the app.
+    #[test]
+    fn a_driver_can_test_run_and_edit_a_routine_by_name() {
+        let mut host = host();
+        host.routines = vec![routine("sch_1", "cron")];
+        host.invoke("routine.run", &serde_json::json!({ "id": "sch_1" }))
+            .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::RunRoutineNow { routine_id } if routine_id == "sch_1"
+        ));
+        host.invoke(
+            "routine.edit",
+            &serde_json::json!({ "id": "sch_1", "prompt": "summarise the standup notes" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::EditRoutine { routine_id, name: None, prompt: Some(prompt) }
+                if routine_id == "sch_1" && prompt == "summarise the standup notes"
+        ));
+        assert!(
+            host.invoke("routine.edit", &serde_json::json!({ "id": "sch_1" }))
+                .is_err()
+        );
+        assert!(
+            host.invoke("routine.run", &serde_json::json!({ "id": "sch_nope" }))
+                .is_err(),
+            "a routine the open bot does not have"
+        );
     }
 
     /// A cron routine carries the line the server keeps, and nothing about a webhook it has

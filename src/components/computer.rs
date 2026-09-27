@@ -32,7 +32,9 @@ pub struct ComputerPane {
     name_input: Entity<InputState>,
     instruction_input: Entity<TextareaState>,
     custom_cron: Entity<InputState>,
-    loaded_editor: Option<Option<String>>,
+    /// The routine the fields were last filled from, and the `routine_resync` they were
+    /// filled at.
+    loaded_editor: Option<(Option<String>, u64)>,
     webhook_popover: Option<String>,
 }
 
@@ -62,10 +64,14 @@ impl ComputerPane {
             self.loaded_editor = None;
             return;
         };
-        if self.loaded_editor.as_ref() == Some(&id) {
+        // Again whenever the server's copy of the routine replaced the one on screen (an edit's
+        // answer, or a refused edit put back): fields left on the old text would send it again
+        // on the next Back or Test run, over what the server just said.
+        let resync = self.state.read(cx).routine_resync;
+        if self.loaded_editor.as_ref() == Some(&(id.clone(), resync)) {
             return;
         }
-        self.loaded_editor = Some(id.clone());
+        self.loaded_editor = Some((id.clone(), resync));
         let coworker = self.state.read(cx).active_coworker_id.clone();
         let routine = coworker.as_ref().and_then(|cid| {
             id.as_ref().and_then(|rid| {

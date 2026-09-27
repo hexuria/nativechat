@@ -246,6 +246,19 @@ impl ScheduleSpec {
     pub fn from_cron(line: &str) -> Self {
         parse_cron(line).unwrap_or_else(|| Self::custom(line.trim()))
     }
+
+    /// A line as opengrok-server keeps it: six fields, a seconds field of `0` first
+    /// (`0 0 9 * * 1`). Read the way the server shows it (`display_cron` in opengrok-core
+    /// `schedule.rs`), with that `0` dropped, so a Monday-at-nine routine opens as Every week
+    /// on Monday at 9:00 and not as a line to decipher, and saving it unchanged sends nothing.
+    pub fn from_server_cron(line: &str) -> Self {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() == 6 && fields[0] == "0" {
+            Self::from_cron(&fields[1..].join(" "))
+        } else {
+            Self::from_cron(line)
+        }
+    }
 }
 
 /// `Every N minutes/hours/days` as a cron line.

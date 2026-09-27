@@ -1589,11 +1589,27 @@ fn with_unlisted_runs(
     runs
 }
 
+/// A listing's routines, each keeping the history already read for it. The listing has no
+/// history in it, and a roster refresh re-lists while a routine is open: the history stays until
+/// the next read of its own replaces it.
+fn relisted(before: Option<&[AgentRoutine]>, rows: Vec<ScheduleRow>) -> Vec<AgentRoutine> {
+    rows.into_iter()
+        .map(|row| {
+            let mut routine = routine_from_schedule(row);
+            if let Some(listed) = before.and_then(|rows| rows.iter().find(|r| r.id == routine.id)) {
+                routine.runs = listed.runs.clone();
+            }
+            routine
+        })
+        .collect()
+}
+
 /// What an edit of a routine the server has should send: each field the person changed from
 /// what the server last said, and nothing else.
 ///
 /// The cron line is compared as the schedule it means rather than as text: the server hands a
-/// line back in its own six-field form, and a line that only reads differently is no change. A
+/// line back in its own six-field form (`0 0 9 * * 1` for Mondays at 9), which is read the way
+/// the server shows it (`from_server_cron`), so the picker's `0 9 * * 1` is no change. A
 /// schedule the picker cannot turn into one line is not sent at all; the editor already says
 /// why, and the server would refuse it.
 fn routine_edit(routine: &AgentRoutine) -> ScheduleEdit {
@@ -1611,7 +1627,7 @@ fn routine_edit(routine: &AgentRoutine) -> ScheduleEdit {
     let before = saved
         .cron
         .as_deref()
-        .and_then(|line| ScheduleSpec::from_cron(line).to_cron().ok());
+        .and_then(|line| ScheduleSpec::from_server_cron(line).to_cron().ok());
     let cron = cron.filter(|line| Some(line) != before.as_ref());
     ScheduleEdit { name, prompt, cron }
 }
@@ -1632,7 +1648,7 @@ fn trigger_from_schedule(row: &ScheduleRow) -> RoutineTrigger {
         }
         ScheduleKind::Cron => RoutineTrigger::Schedule {
             id: row.id.clone(),
-            spec: ScheduleSpec::from_cron(row.cron.as_deref().unwrap_or_default()),
+            spec: ScheduleSpec::from_server_cron(row.cron.as_deref().unwrap_or_default()),
         },
     }
 }
@@ -2476,10 +2492,20 @@ pub struct AppState {
     pub right_pane: RightPane,
     pub computer_view: ComputerView,
     pub routines: HashMap<String, Vec<AgentRoutine>>,
-    /// Routines with an edit on its way to the server, and whether a Test run is waiting on it.
-    /// A Test run pressed straight after a change has to run the changed routine, so it waits
-    /// for the edit to land rather than racing it.
-    routine_edits: HashMap<String, bool>,
+    /// Routines with an edit on its way to the server: the number of the latest one, and whether
+    /// a Test run is waiting on it. A Test run pressed straight after a change has to run the
+    /// changed routine, so it waits for the latest edit to settle rather than racing it, and an
+    /// earlier edit's answer landing late is not what the routine now says.
+    routine_edits: HashMap<String, (u64, bool)>,
+    /// Numbers every edit and every history read, so a late answer can be told from the latest.
+    routine_seq: u64,
+    /// The latest history read asked for, per routine. The Computer pane's poll and a Test run
+    /// can both have one out, and an older page that missed a run must not delete the line a
+    /// newer one already settled.
+    routine_runs_asked: HashMap<String, u64>,
+    /// Bumped whenever the server's copy of a routine is written over what the editor shows (an
+    /// edit's answer, or a refused edit put back), so the editor's fields follow it.
+    pub routine_resync: u64,
     pub model_picker_open: bool,
     pub avatar_editor_open: bool,
     pub hiring: bool,
@@ -3030,6 +3056,9 @@ impl AppState {
             computer_view: ComputerView::Overview,
             routines: HashMap::new(),
             routine_edits: HashMap::new(),
+            routine_seq: 0,
+            routine_runs_asked: HashMap::new(),
+            routine_resync: 0,
             model_picker_open: false,
             avatar_editor_open: false,
             hiring: false,
@@ -6463,20 +6492,34 @@ impl AppState {
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
-        self.routine_edits
+        self.routine_seq += 1;
+        let this_edit = self.routine_seq;
+        // A Test run already waiting keeps waiting, now on this edit.
+        let entry = self
+            .routine_edits
             .entry(routine_id.clone())
-            .or_insert(false);
+            .or_insert((this_edit, false));
+        entry.0 = this_edit;
         cx.spawn(async move |this, cx| {
             let result = client.edit_schedule(&routine_id, &edit).await;
             let _ = this.update(cx, |state, cx| {
-                let run_waiting = state.routine_edits.remove(&routine_id).unwrap_or(false);
+                // An earlier edit's answer, with a later one still out: the later one says what
+                // the routine is, and settles the wait.
+                if state
+                    .routine_edits
+                    .get(&routine_id)
+                    .map(|(latest, _)| *latest)
+                    != Some(this_edit)
+                {
+                    return;
+                }
+                let run_waiting = state
+                    .routine_edits
+                    .remove(&routine_id)
+                    .is_some_and(|(_, waiting)| waiting);
                 match result {
                     Ok(row) => {
-                        let mut edited = routine_from_schedule(row);
-                        if let Some(current) = state.routine_mut(&coworker_id, &routine_id) {
-                            edited.runs = std::mem::take(&mut current.runs);
-                            *current = edited;
-                        }
+                        state.put_server_routine(&coworker_id, row);
                         if run_waiting {
                             state.run_routine_now(&coworker_id, &routine_id, cx);
                         }
@@ -6485,10 +6528,48 @@ impl AppState {
                     // routine the person just tried to change.
                     Err(error) => {
                         state.computer_action_error = Some(error.message);
-                        state.load_routines(cx);
+                        state.restore_routine(&coworker_id, &routine_id, cx);
                     }
                 }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The server's copy of one routine, written over the one on screen and into the editor's
+    /// fields. Its history is its own read and is kept.
+    fn put_server_routine(&mut self, coworker_id: &str, row: ScheduleRow) {
+        let mut routine = routine_from_schedule(row);
+        let routine_id = routine.id.clone();
+        if let Some(current) = self.routine_mut(coworker_id, &routine_id) {
+            routine.runs = std::mem::take(&mut current.runs);
+            *current = routine;
+            self.routine_resync += 1;
+        }
+    }
+
+    /// Put back the server's copy of a routine after it refused an edit, so the editor stops
+    /// showing words that were never saved. Only this routine, and not over an edit started
+    /// since: that one says what the routine is once it lands.
+    fn restore_routine(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let coworker_id = coworker_id.to_string();
+        let routine_id = routine_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = client.list_schedules(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.routine_edits.contains_key(&routine_id) {
+                    return;
+                }
+                if let Ok(rows) = result
+                    && let Some(row) = rows.into_iter().find(|row| row.id == routine_id)
+                {
+                    state.put_server_routine(&coworker_id, row);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -6530,9 +6611,17 @@ impl AppState {
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
+        self.routine_seq += 1;
+        let this_read = self.routine_seq;
+        self.routine_runs_asked
+            .insert(routine_id.clone(), this_read);
         cx.spawn(async move |this, cx| {
             let result = client.schedule_runs(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
+                // A page asked for before the latest one is older news than it.
+                if state.routine_runs_asked.get(&routine_id) != Some(&this_read) {
+                    return;
+                }
                 match result {
                     Ok(runs) => {
                         if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
@@ -6639,19 +6728,10 @@ impl AppState {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let before = state.routines.get(&coworker_id);
-                        routines.extend(rows.into_iter().map(|row| {
-                            let mut routine = routine_from_schedule(row);
-                            // The listing has no history in it, and a roster refresh re-lists
-                            // while a routine is open: the history already read stays until the
-                            // next read of its own replaces it.
-                            if let Some(listed) =
-                                before.and_then(|rows| rows.iter().find(|r| r.id == routine.id))
-                            {
-                                routine.runs = listed.runs.clone();
-                            }
-                            routine
-                        }));
+                        routines.extend(relisted(
+                            state.routines.get(&coworker_id).map(Vec::as_slice),
+                            rows,
+                        ));
                         state.routines.insert(coworker_id, routines);
                     }
                     Err(error) => state.computer_action_error = Some(error.message),
@@ -6812,7 +6892,7 @@ impl AppState {
             cx.notify();
             return;
         }
-        if let Some(run_waiting) = self.routine_edits.get_mut(routine_id) {
+        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
             *run_waiting = true;
             return;
         }
@@ -15907,6 +15987,63 @@ mod tests {
             super::routine_edit(&hook).is_empty(),
             "a draft is not on the server"
         );
+    }
+
+    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it,
+    /// it is the picker's own Every week on Monday at 9:00: the editor opens on the picker and
+    /// not a line to decipher, switching the mode control keeps Monday at nine, and the picker
+    /// choosing that same schedule is no edit at all.
+    #[test]
+    fn the_servers_six_field_line_is_the_pickers_own_schedule() {
+        let mut routine = super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
+                "prompt": "weekly report", "name": "Report", "active": true
+            }))
+            .unwrap(),
+        );
+        let super::RoutineTrigger::Schedule { spec, .. } = &mut routine.triggers[0] else {
+            panic!("a cron row is a schedule trigger");
+        };
+        assert_ne!(spec.mode, super::ScheduleUiMode::Custom, "{spec:?}");
+        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * 1"));
+        *spec = super::ScheduleSpec::from_cron("0 9 * * 1");
+        assert!(
+            super::routine_edit(&routine).is_empty(),
+            "the picker's Monday at nine is the server's Monday at nine"
+        );
+        assert_eq!(
+            super::ScheduleSpec::from_server_cron("@every 90m")
+                .to_cron()
+                .ok(),
+            super::ScheduleSpec::from_cron("@every 90m").to_cron().ok(),
+            "a line with no seconds field is read as it is"
+        );
+    }
+
+    /// A roster refresh re-lists the routines while one is open, and the history already read
+    /// for it stays: the listing has none in it.
+    #[test]
+    fn a_relist_keeps_the_history_already_read() {
+        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        let row = || -> crate::opengrok::ScheduleRow {
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
+                "prompt": "weekly report", "active": true
+            }))
+            .unwrap()
+        };
+        let mut shown = super::routine_from_schedule(row());
+        shown.runs = vec![super::RoutineRun::from_server(ScheduleRun {
+            run_id: "run_1".into(),
+            cause: RunCause::Manual,
+            status: ScheduleRunStatus::Ok,
+            started_at_ms: 1_000,
+            ended_at_ms: Some(2_000),
+        })];
+        let relisted = super::relisted(Some(std::slice::from_ref(&shown)), vec![row()]);
+        assert_eq!(relisted[0].runs, shown.runs);
+        assert!(super::relisted(None, vec![row()])[0].runs.is_empty());
     }
 
     /// A Test run's line stays on screen, still running, while the history has not caught up
