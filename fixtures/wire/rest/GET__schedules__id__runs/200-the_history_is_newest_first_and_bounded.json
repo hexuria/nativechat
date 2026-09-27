@@ -1,0 +1,21 @@
+{
+  "method": "GET",
+  "path": "/schedules/sched_0199bb4e-0000-7000-8000-000000000921/runs?limit=2",
+  "status": 200,
+  "body": [
+    {
+      "runId": "run_0199bb4e-0000-7000-8000-000000000925",
+      "cause": "clock",
+      "status": "running",
+      "startedAtMs": 1759000000015,
+      "endedAtMs": null
+    },
+    {
+      "runId": "run_0199bb4e-0000-7000-8000-000000000924",
+      "cause": "clock",
+      "status": "running",
+      "startedAtMs": 1759000000010,
+      "endedAtMs": null
+    }
+  ]
+}

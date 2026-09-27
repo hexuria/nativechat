@@ -231,6 +231,17 @@ pub mod ids {
         format!("routine-{id}-rotate")
     }
 
+    /// Test run: the server starts the routine now. Only on a routine the server has.
+    pub fn routine_test(id: &str) -> String {
+        format!("routine-{id}-test")
+    }
+
+    /// One line of the routine's Run history, by the server's run id. Its label is what set
+    /// the run off and its value where the run got to, in the history's own words.
+    pub fn routine_run(id: &str, run_id: &str) -> String {
+        format!("routine-{id}-run-{run_id}")
+    }
+
     pub fn routine_delete(id: &str) -> String {
         format!("routine-{id}-delete")
     }
@@ -473,6 +484,9 @@ pub enum Command {
     RotateRoutineWebhook {
         routine_id: String,
     },
+    RunRoutineNow {
+        routine_id: String,
+    },
     DeleteRoutine {
         routine_id: String,
     },
@@ -641,6 +655,11 @@ impl Command {
             Self::RotateRoutineWebhook { routine_id } => {
                 if let Some(coworker_id) = state.active_coworker_id.clone() {
                     state.rotate_routine_webhook(&coworker_id, &routine_id, cx);
+                }
+            }
+            Self::RunRoutineNow { routine_id } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone() {
+                    state.run_routine_now(&coworker_id, &routine_id, cx);
                 }
             }
             Self::DeleteRoutine { routine_id } => {
@@ -999,6 +1018,8 @@ struct RoutineSnap {
     active: bool,
     webhook_url: Option<String>,
     webhook_key: Option<String>,
+    /// Run history, newest first: run id, what set it off, where it got to.
+    runs: Vec<(String, &'static str, &'static str)>,
 }
 
 /// An approval card still waiting on the person.
@@ -1173,6 +1194,20 @@ fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
         active: routine.active,
         webhook_url: None,
         webhook_key: None,
+        runs: routine
+            .runs
+            .iter()
+            .map(|run| {
+                let status = match run.status {
+                    crate::opengrok::ScheduleRunStatus::Running => "running",
+                    crate::opengrok::ScheduleRunStatus::Waiting => "waiting",
+                    crate::opengrok::ScheduleRunStatus::Ok => "ok",
+                    crate::opengrok::ScheduleRunStatus::Error => "error",
+                    crate::opengrok::ScheduleRunStatus::Other => "",
+                };
+                (run.run_id.clone(), run.cause_label(), status)
+            })
+            .collect(),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -1230,6 +1265,15 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
                 ids::routine_rotate(&routine.id),
                 "Rotate key",
             ));
+    }
+    if routine.kind != "draft" {
+        node = node.with_child(UiNode::button(ids::routine_test(&routine.id), "Test run"));
+    }
+    for (run_id, cause, status) in &routine.runs {
+        node = node.with_child(
+            UiNode::status(ids::routine_run(&routine.id, run_id), *cause)
+                .with_value(status.to_string()),
+        );
     }
     node.with_child(UiNode::button(ids::routine_delete(&routine.id), "Delete"))
 }
@@ -3677,6 +3721,10 @@ impl NativeChatHost {
                 (|id| Command::RotateRoutineWebhook { routine_id: id }) as fn(String) -> Command,
             ),
             (
+                "-test",
+                (|id| Command::RunRoutineNow { routine_id: id }) as fn(String) -> Command,
+            ),
+            (
                 "-delete",
                 (|id| Command::DeleteRoutine { routine_id: id }) as fn(String) -> Command,
             ),
@@ -4014,6 +4062,9 @@ impl NativeChatHost {
             "routine.delete" => Command::DeleteRoutine {
                 routine_id: self.invoke_routine_id(args, "routine.delete")?,
             },
+            "routine.run" => Command::RunRoutineNow {
+                routine_id: self.invoke_routine_id(args, "routine.run")?,
+            },
             other => return Err(format!("unknown invoke `{other}`")),
         };
         self.pending = Some(cmd);
@@ -4114,7 +4165,36 @@ mod tests {
             active: true,
             webhook_url: (kind == "webhook").then(|| "https://og.example/hooks/sch_2".to_string()),
             webhook_key: (kind == "webhook").then(|| "og_live_abc".to_string()),
+            runs: Vec::new(),
         }
+    }
+
+    /// A routine the server has can be test-run, and its history is on the tree line by line:
+    /// what set each run off, and where it got to. A draft has neither.
+    #[test]
+    fn a_routine_shows_its_history_and_can_be_test_run() {
+        let mut host = host();
+        host.computer_open = true;
+        let mut fired = routine("sch-1-2", "webhook");
+        fired.runs = vec![
+            ("run_b".into(), "Test run", "running"),
+            ("run_a".into(), "Webhook", "ok"),
+        ];
+        host.routines = vec![fired, routine("draft-1", "draft")];
+        let tree = host.snapshot();
+        let newest = tree.find(&ids::routine_run("sch-1-2", "run_b")).unwrap();
+        assert_eq!(newest.name, "Test run");
+        assert_eq!(newest.value.as_deref(), Some("running"));
+        let hooked = tree.find(&ids::routine_run("sch-1-2", "run_a")).unwrap();
+        assert_eq!(hooked.name, "Webhook");
+        assert_eq!(hooked.value.as_deref(), Some("ok"));
+        assert!(tree.find(&ids::routine_test("draft-1")).is_none());
+
+        host.click(&ids::routine_test("sch-1-2")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::RunRoutineNow { routine_id } if routine_id == "sch-1-2"
+        ));
     }
 
     /// A cron routine carries the line the server keeps, and nothing about a webhook it has

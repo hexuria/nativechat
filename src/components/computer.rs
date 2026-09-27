@@ -10,8 +10,8 @@ use crate::components::alert_chrome::{
 };
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    BoxHandoffResolution, LocalExecMode, computer_attention_done_id, computer_attention_id,
-    computer_attention_skip_id,
+    BoxHandoffResolution, LocalExecMode, ScheduleRunStatus, computer_attention_done_id,
+    computer_attention_id, computer_attention_skip_id,
 };
 use crate::state::{
     AgentRoutine, AppState, ComputerView, NewTrigger, RoutineTrigger, ScheduleDayKind,
@@ -225,7 +225,7 @@ impl ComputerPane {
             let instruction = instruction_input.read(cx).value().to_string();
             let cron = custom_cron.read(cx).value().to_string();
             app.update(cx, |state, cx| {
-                state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
+                // The typed cron line first, so the save below sends the line on screen.
                 if let Some(sid) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
                     row.triggers.iter().rev().find_map(|t| match t {
                         RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
@@ -238,6 +238,7 @@ impl ComputerPane {
                 {
                     spec.expr = cron;
                 }
+                state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
             });
         })
     }
@@ -555,7 +556,7 @@ impl ComputerPane {
                                         persist(cx);
                                         if let Some(id) = id.clone() {
                                             app.update(cx, |state, cx| {
-                                                state.record_routine_run(&coworker_id, &id, cx);
+                                                state.run_routine_now(&coworker_id, &id, cx);
                                             });
                                         }
                                     }
@@ -605,14 +606,39 @@ impl ComputerPane {
                                 .justify_between()
                                 .items_center()
                                 .py(px(4.))
-                                .child(div().text_sm().child(run.at))
-                                .when(run.ok, |this| {
-                                    this.child(
-                                        Icon::default()
-                                            .path("icons/check.svg")
-                                            .size(px(14.))
-                                            .text_color(rgb(0x34c759)),
-                                    )
+                                .child(
+                                    h_flex()
+                                        .gap(px(6.))
+                                        .child(div().text_sm().child(run.at.clone()))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(run.cause_label()),
+                                        ),
+                                )
+                                .child(match run.status {
+                                    ScheduleRunStatus::Ok => Icon::default()
+                                        .path("icons/check.svg")
+                                        .size(px(14.))
+                                        .text_color(rgb(0x34c759))
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Error => div()
+                                        .text_xs()
+                                        .text_color(theme.danger)
+                                        .child("Failed")
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Running => div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("Running")
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Waiting => div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("Waiting on you")
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Other => div().into_any_element(),
                                 })
                         }))
                         .into_any_element()

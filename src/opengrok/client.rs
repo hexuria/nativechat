@@ -1922,6 +1922,45 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// Save what the person changed on a routine the server already has. Only the fields named
+    /// are sent: an absent one keeps what the routine has, and a webhook's URL and key never
+    /// move on an edit (opengrok-server `autonomy/routes.rs`, `edit_schedule`). The answer is
+    /// the row as the server now has it.
+    pub async fn edit_schedule(
+        &self,
+        id: &str,
+        edit: &ScheduleEdit,
+    ) -> Result<ScheduleRow, OpenGrokError> {
+        let path = format!("/schedules/{id}");
+        let response = self
+            .send_json(reqwest::Method::PATCH, &path, Some(edit))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// The person's "Test run": the routine's own prompt, started now, in the routine's own
+    /// thread. A paused routine runs and stays paused. The answer is `202` and the id of the run
+    /// it started (`run_schedule_now`).
+    pub async fn run_schedule_now(&self, id: &str) -> Result<String, OpenGrokError> {
+        let path = format!("/schedules/{id}/run");
+        let response = self
+            .send_json(reqwest::Method::POST, &path, Some(&json!({})))
+            .await?;
+        let started: ScheduleRunStarted = Self::json_or_error(response).await?;
+        Ok(started.run_id)
+    }
+
+    /// What the routine started, newest first: the clock, its webhook, or a person's Test run.
+    /// A person replying in the routine's thread is no firing of the routine's, and the server
+    /// leaves those out (`schedule_runs`).
+    pub async fn schedule_runs(&self, id: &str) -> Result<Vec<ScheduleRun>, OpenGrokError> {
+        let path = format!("/schedules/{id}/runs");
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     /// A bodiless POST that answers with nothing worth reading.
     async fn schedule_action(&self, path: &str) -> Result<(), OpenGrokError> {
         let response = self
@@ -2793,6 +2832,77 @@ pub struct ScheduleRow {
     pub next_due_ms: Option<i64>,
     #[serde(default)]
     pub webhook: Option<WebhookInfo>,
+}
+
+/// What `PATCH /schedules/{id}` is asked to change. Every field is optional on the server, and
+/// one left out keeps what the routine has, so only what the person changed is sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleEdit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Only for a cron routine: the server refuses a clock on a webhook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+}
+
+impl ScheduleEdit {
+    /// The server answers an edit that names nothing with a 422, so one is never sent.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.prompt.is_none() && self.cron.is_none()
+    }
+}
+
+/// One line of a routine's history, as `GET /schedules/{id}/runs` answers it
+/// (opengrok-server `autonomy/routes.rs`, `history`): `{runId, cause, status, startedAtMs,
+/// endedAtMs}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleRun {
+    pub run_id: String,
+    pub cause: RunCause,
+    pub status: ScheduleRunStatus,
+    #[serde(default)]
+    pub started_at_ms: i64,
+    /// `null` while the run is going or waiting on the person.
+    #[serde(default)]
+    pub ended_at_ms: Option<i64>,
+}
+
+/// What `POST /schedules/{id}/run` answers with: `202 {accepted, runId}` (opengrok-server
+/// `autonomy/mod.rs`, `start_fired`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleRunStarted {
+    pub run_id: String,
+}
+
+/// What set a routine's run off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunCause {
+    /// A person pressed Test run.
+    Manual,
+    Webhook,
+    Clock,
+    /// A word this client has no name for yet: still a run, and still listed.
+    #[serde(other)]
+    Other,
+}
+
+/// Where a routine's run got to, in the history's own words (not the run store's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduleRunStatus {
+    Running,
+    /// Parked on a card for the person.
+    Waiting,
+    Ok,
+    Error,
+    #[serde(other)]
+    Other,
 }
 
 /// What `POST /schedules` is asked for. `cron` is the line for a cron schedule and nothing at
@@ -7040,6 +7150,116 @@ mod tests {
         let hook = row.webhook.unwrap();
         assert_eq!(hook.url, "https://og.example/hooks/sch_2");
         assert_eq!(hook.header, "Authorization: Bearer og_live_abc");
+    }
+
+    /// An edit sends only what the person changed: an absent field keeps what the routine has
+    /// on the server, so a rename never resends the prompt, and the row that comes back is the
+    /// routine as it now is.
+    #[tokio::test]
+    async fn an_edit_sends_only_the_fields_that_changed() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/schedules/sch_1"))
+            .and(body_json(json!({ "name": "Standup" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
+                "name": "Standup", "prompt": "weekly report", "active": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let row = client
+            .edit_schedule(
+                "sch_1",
+                &ScheduleEdit {
+                    name: Some("Standup".into()),
+                    ..ScheduleEdit::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.name.as_deref(), Some("Standup"));
+        assert_eq!(row.cron.as_deref(), Some("0 0 9 * * 1"));
+        assert!(ScheduleEdit::default().is_empty());
+    }
+
+    /// Test run is the server's: a 202 and the id of the run it started, which the history
+    /// then lists as a person's.
+    #[tokio::test]
+    async fn a_test_run_is_started_by_the_server_and_named_by_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_1/run"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(json!({ "accepted": true, "runId": "run_9" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_busy/run"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_json(json!({ "error": "too many runs going at once" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert_eq!(client.run_schedule_now("sch_1").await.unwrap(), "run_9");
+        let refused = client.run_schedule_now("sch_busy").await.unwrap_err();
+        assert!(
+            refused.message.contains("too many runs"),
+            "the server's sentence, not a guess: {}",
+            refused.message
+        );
+    }
+
+    /// The history says what set each run off and where it got to. A running run has not ended,
+    /// and a word this client has never heard is still a run it lists.
+    #[tokio::test]
+    async fn a_routines_history_names_the_cause_and_the_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "runId": "run_3", "cause": "manual", "status": "running",
+                  "startedAtMs": 3000, "endedAtMs": null },
+                { "runId": "run_2", "cause": "webhook", "status": "ok",
+                  "startedAtMs": 2000, "endedAtMs": 2500 },
+                { "runId": "run_1", "cause": "clock", "status": "error",
+                  "startedAtMs": 1000, "endedAtMs": 1200 },
+                { "runId": "run_0", "cause": "somethingnew", "status": "waiting",
+                  "startedAtMs": 500, "endedAtMs": null }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let runs = client.schedule_runs("sch_1").await.unwrap();
+        let read: Vec<(&str, RunCause, ScheduleRunStatus, Option<i64>)> = runs
+            .iter()
+            .map(|run| (run.run_id.as_str(), run.cause, run.status, run.ended_at_ms))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("run_3", RunCause::Manual, ScheduleRunStatus::Running, None),
+                (
+                    "run_2",
+                    RunCause::Webhook,
+                    ScheduleRunStatus::Ok,
+                    Some(2500)
+                ),
+                (
+                    "run_1",
+                    RunCause::Clock,
+                    ScheduleRunStatus::Error,
+                    Some(1200)
+                ),
+                ("run_0", RunCause::Other, ScheduleRunStatus::Waiting, None),
+            ]
+        );
     }
 
     #[tokio::test]

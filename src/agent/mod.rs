@@ -45,7 +45,10 @@
 //! could not be read. Nothing for a machine that is not this Mac.
 //! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
-//! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-delete`.
+//! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-test` (Test run, on a
+//! routine the server has), `routine-{id}-run-{runId}` (one Run history line: label `Test run` /
+//! `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`), `routine-{id}-delete`.
+//! Invoke `routine.run {id}` is Test run.
 //!
 //! A routine's `{id}` is the server's schedule id. The two trigger ids are in the tree only
 //! while the routine has no trigger, and the webhook's three only while it has one, so
