@@ -457,7 +457,7 @@ impl Render for AgentSettings {
         let dark = theme.is_dark();
         let muted = theme.muted_foreground;
         let card_fill: Hsla = rgb(0x777777).opacity(0.173).into();
-        let (id, model, shape, color, notify, catalogue, note, error, model_open, editor_open) = {
+        let (id, model, shape, color, catalogue, note, error, model_open, editor_open) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -470,7 +470,6 @@ impl Render for AgentSettings {
                 coworker.map(|c| c.model.clone()).unwrap_or_default(),
                 coworker.and_then(|c| c.avatar_shape.clone()),
                 coworker.and_then(|c| c.avatar_color.clone()),
-                coworker.and_then(|c| c.notify_on_updates).unwrap_or(false),
                 state.model_catalogue.models.clone(),
                 state.model_catalogue.note.clone(),
                 state.auth_error.clone(),
@@ -629,19 +628,18 @@ impl Render for AgentSettings {
                                                                     div()
                                                                         .text_xs()
                                                                         .text_color(muted)
-                                                                        .child("Get notified when this agent finishes or needs input. There is nowhere to keep this yet, so the switch does nothing."),
+                                                                        .child("Get notified when this agent finishes or needs input. Not available yet: this Mac has nowhere to keep it."),
                                                                 ),
                                                         )
-                                                        // The switch shows what the roster says
-                                                        // and takes no orders. Nothing stores
-                                                        // this: the two handlers that mention it
-                                                        // answer a fixed yes, and the patch route
-                                                        // does not read the key at all, so a flip
-                                                        // was thrown away in silence — and once
-                                                        // that route refuses a patch with nothing
-                                                        // in it to change, the same flip would
-                                                        // come back as an error in the row below.
-                                                        // It stays on show, dimmed, because the
+                                                        // Off, and it takes no orders. The server
+                                                        // keeps no such setting and never will:
+                                                        // its coworker patch reads the key nowhere
+                                                        // and refuses a patch carrying only that
+                                                        // (opengrok-server `agui/routes.rs`), and
+                                                        // the desktop client keeps it on the
+                                                        // machine. NativeChat has no notification
+                                                        // of its own for it to turn on yet. It
+                                                        // stays on show, dimmed, because the
                                                         // setting is a real one waiting on
                                                         // somewhere to live, and the line beside
                                                         // it says as much.
@@ -649,7 +647,7 @@ impl Render for AgentSettings {
                                                             div()
                                                                 .id("agent-notify-switch")
                                                                 .opacity(0.5)
-                                                                .child(notify_switch(notify)),
+                                                                .child(notify_switch(false)),
                                                         ),
                                                 ),
                                         ),
