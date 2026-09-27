@@ -73,6 +73,12 @@ pub mod ids {
     pub const DIALOG_ACCOUNT: &str = "dialog-account";
     pub const DIALOG_VOICE: &str = "dialog-voice";
     pub const HEADER_SETTINGS: &str = "header-settings";
+    /// The open recipe's Run, the outcome of the run it started (value `running`, `ok`,
+    /// `failed` or `interrupted`), and its run history.
+    pub const RECIPE_RUN: &str = "recipe-run";
+    pub const RECIPE_RUN_RESULT: &str = "recipe-run-result";
+    pub const RECIPE_HISTORY_RUNS: &str = "recipe-history-runs";
+    pub const RECIPE_ERROR: &str = "recipe-error";
     /// On a routine's thread: which routine (label) and what fires it (value, `schedule` or
     /// `webhook`), and the way back to the bot's own chat.
     pub const CHAT_ROUTINE_THREAD: &str = "chat-routine-thread";
@@ -249,6 +255,21 @@ pub mod ids {
     /// Open the thread the routine runs in. Only on a routine the server has.
     pub fn routine_thread(id: &str) -> String {
         format!("routine-{id}-thread")
+    }
+
+    /// Settings → Computer: one connected computer's local-exec mode (value the stored word,
+    /// `ask` / `bypass` / `never`), and a button per mode under it.
+    pub fn computer_exec(machine_id: &str) -> String {
+        format!("settings-computer-{machine_id}-exec")
+    }
+
+    pub fn computer_exec_mode(machine_id: &str, mode: crate::opengrok::LocalExecMode) -> String {
+        format!("settings-computer-{machine_id}-exec-{}", mode.as_stored())
+    }
+
+    /// One line of the open recipe's run history, by the run's id (`rrun_…`).
+    pub fn recipe_history_run(run_id: &str) -> String {
+        format!("recipe-history-run-{run_id}")
     }
 
     pub fn routine_delete(id: &str) -> String {
@@ -500,6 +521,12 @@ pub enum Command {
         routine_id: String,
     },
     BackToBotChat,
+    /// Run the open recipe on this bot.
+    RunOpenRecipe(String),
+    SetComputerExecMode {
+        machine_id: String,
+        mode: crate::opengrok::LocalExecMode,
+    },
     /// A routine's name or instruction changed the way the editor saves them, which is how a
     /// driver edits one: the editor's fields are the pane's own text, not the app's.
     EditRoutine {
@@ -679,6 +706,10 @@ impl Command {
             }
             Self::OpenRoutineThread { routine_id } => state.open_routine_thread(&routine_id, cx),
             Self::BackToBotChat => state.back_to_bot_chat(cx),
+            Self::RunOpenRecipe(coworker_id) => state.run_open_recipe(coworker_id, cx),
+            Self::SetComputerExecMode { machine_id, mode } => {
+                state.set_computer_exec_mode(machine_id, mode, cx)
+            }
             Self::RunRoutineNow { routine_id } => {
                 if let Some(coworker_id) = state.active_coworker_id.clone() {
                     state.run_routine_now(&coworker_id, &routine_id, cx);
@@ -923,6 +954,12 @@ struct SessionSnap {
     id: String,
     title: String,
     active: bool,
+    /// What the sidebar row says under the name (`rail_preview`): the last thing said in the
+    /// bot's thread, or "No messages yet".
+    preview: Option<String>,
+    /// The thread is known only from the server's list (`GET /ag-ui/threads`): this Mac never
+    /// held it, and the list is what put it here.
+    listed: bool,
 }
 
 /// One row of the composer's open panel, by the id the panel gives it on screen.
@@ -1057,12 +1094,32 @@ struct RoutineSnap {
     runs: Vec<(String, &'static str, &'static str)>,
 }
 
+/// The open recipe as the driver needs it: whether Run can be pressed and which bot it plays on,
+/// how the run it started came out, and the history.
+#[derive(Clone, Default)]
+struct RecipeDetailSnap {
+    /// The bot Run plays on when nobody picked one: the page's own default, the first bot the
+    /// recipe is granted to or else the person's first bot. `None` when they have no bot.
+    run_bot: Option<String>,
+    runnable: bool,
+    running: bool,
+    /// `ok`, `failed` or `interrupted`, for the run this page started.
+    result: Option<&'static str>,
+    /// What the page says went wrong, in its words: a Run the server refused, among others.
+    error: Option<String>,
+    /// Run id and its state word (`running`, `finished`, `interrupted`), plus whether it
+    /// succeeded, newest first as the server lists them.
+    runs: Vec<(String, String, bool)>,
+}
+
 /// An approval card still waiting on the person.
 #[derive(Clone)]
 struct ApprovalSnap {
     call_id: String,
+    /// The card's own title, from the function that draws it (`gen_ui::approval_title`), so a
+    /// snapshot catches the title a person would read and not one rebuilt here.
+    title: String,
     tool: String,
-    place: &'static str,
     local: bool,
     review: bool,
     /// The server's word for what suspended the run, and the thread it filed
@@ -1675,6 +1732,10 @@ pub struct NativeChatHost {
     recipes_filter: &'static str,
     recipes: Vec<RecipeSnap>,
     recipe_open: Option<String>,
+    /// The open recipe's Run and what it has run, when its detail has come back.
+    recipe_detail: Option<RecipeDetailSnap>,
+    /// Settings → Computer's connected computers: id, name, mode, and whether it is this Mac.
+    computers: Vec<(String, String, crate::opengrok::LocalExecMode, bool)>,
     /// The open bot's routines, as the Computer pane lists them.
     routines: Vec<RoutineSnap>,
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
@@ -1759,10 +1820,16 @@ impl NativeChatHost {
             state
                 .coworkers
                 .iter()
-                .map(|c| SessionSnap {
-                    active: state.active_coworker_id.as_ref() == Some(&c.id),
-                    id: c.id.clone(),
-                    title: c.name.clone(),
+                .map(|c| {
+                    let thread = state.conversations.iter().find(|conv| conv.id == c.id);
+                    SessionSnap {
+                        active: state.active_coworker_id.as_ref() == Some(&c.id),
+                        id: c.id.clone(),
+                        title: c.name.clone(),
+                        // The hover card's own line, so the tree says what the row says.
+                        preview: Some(crate::components::sidebar::rail_preview(thread).0),
+                        listed: thread.is_some_and(|conv| conv.known_only_from_list()),
+                    }
                 })
                 .collect()
         } else {
@@ -1773,6 +1840,8 @@ impl NativeChatHost {
                     active: active.as_ref() == Some(&c.id),
                     id: c.id.clone(),
                     title: c.title.clone(),
+                    preview: None,
+                    listed: false,
                 })
                 .collect()
         };
@@ -1808,10 +1877,14 @@ impl NativeChatHost {
                 .open_approvals()
                 .into_iter()
                 .map(|spec| ApprovalSnap {
+                    title: crate::components::gen_ui::approval_title(
+                        &spec,
+                        &state.active_bot_name(),
+                        spec.is_review_an_action() && state.egress_tunnel_available(),
+                    ),
                     local: spec.runs_on_this_mac(),
                     review: spec.is_review_an_action() && state.egress_tunnel_available(),
                     tunnel: spec.is_egress_tunnel(),
-                    place: spec.place(),
                     reason: spec.reason,
                     thread_id: spec.thread_id.unwrap_or_default(),
                     call_id: spec.call_id,
@@ -1895,6 +1968,56 @@ impl NativeChatHost {
                 })
                 .collect(),
             recipe_open: state.recipe_open_id.clone(),
+            recipe_detail: state.recipe_open.as_ref().map(|detail| {
+                // The page's default when nobody has picked: the first bot the recipe is granted
+                // to, else the person's first bot (`RecipesView::picked_bot` without its first
+                // clause). A bot picked from the chevron beside Run is the view's own and out of
+                // this state's reach, so a driver runs the default; `recipe.run {bot}` names
+                // another.
+                let run_bot = detail
+                    .my_bots
+                    .iter()
+                    .find(|bot| detail.is_granted(&bot.id))
+                    .or_else(|| detail.my_bots.first())
+                    .map(|bot| bot.id.clone());
+                RecipeDetailSnap {
+                    // What the toolbar asks before it enables Run: a bot, a version to play, and
+                    // nothing else under way on the page. A save, delete or accept in flight
+                    // clears the page's busy line when it lands, whatever started under it.
+                    runnable: run_bot.is_some()
+                        && detail.runnable_version().is_some()
+                        && state.recipe_busy.is_none(),
+                    run_bot,
+                    running: state.recipe_busy.as_deref() == Some(crate::state::RECIPE_RUNNING),
+                    result: state.recipe_run_result.as_ref().map(|run| {
+                        if run.interrupted {
+                            "interrupted"
+                        } else if run.ok {
+                            "ok"
+                        } else {
+                            "failed"
+                        }
+                    }),
+                    error: state.recipe_error.clone(),
+                    runs: detail
+                        .runs
+                        .iter()
+                        .map(|run| (run.id.clone(), run.state.clone(), run.ok))
+                        .collect(),
+                }
+            }),
+            computers: state
+                .computers
+                .iter()
+                .map(|c| {
+                    (
+                        c.machine_id.clone(),
+                        c.label.clone(),
+                        c.mode,
+                        c.this_machine,
+                    )
+                })
+                .collect(),
             routine_thread: state
                 .active_thread_origin()
                 .map(|origin| (origin.routine_name.clone(), origin.word.clone())),
@@ -2209,6 +2332,12 @@ impl NativeChatHost {
                 if s.active {
                     item.states.push("selected".into());
                 }
+                if let Some(preview) = &s.preview {
+                    item = item.with_value(preview.clone());
+                }
+                if s.listed {
+                    item.states.push("listed".into());
+                }
                 item
             })
             .collect();
@@ -2292,19 +2421,15 @@ impl NativeChatHost {
         }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
-            let title = if approval.review {
-                "Review an action".to_string()
-            } else {
-                format!("Allow {} on {}?", approval.tool, approval.place)
-            };
-            let mut card = UiNode::new(id.clone(), "dialog", title)
+            let mut card = UiNode::new(id.clone(), "dialog", approval.title.clone())
                 .with_child(UiNode::button(format!("{id}-allow-once"), "Allow once"))
                 .with_child(UiNode::button(
                     format!("{id}-deny-once"),
                     if approval.review { "Deny" } else { "Deny once" },
                 ));
-            // Bare facts as states, so an assert does not have to match a sentence.
-            for state in [&approval.reason, &approval.thread_id] {
+            // Bare facts as states, so an assert does not have to match a sentence: the reason,
+            // the thread, and the tool the call would use.
+            for state in [&approval.reason, &approval.thread_id, &approval.tool] {
                 if !state.is_empty() {
                     card.states.push(state.clone());
                 }
@@ -2486,6 +2611,33 @@ impl NativeChatHost {
                                 "settings-computer-update",
                                 self.computer_update_label.clone(),
                             ));
+                        }
+                        // Each connected computer's local-exec mode, while Settings is open on
+                        // Computer: the choice a check of this Mac's Ask / Always / Never sets.
+                        if self.account_open && self.computer_tab {
+                            for (machine, label, mode, this_mac) in &self.computers {
+                                let mut menu =
+                                    UiNode::new(ids::computer_exec(machine), "menu", label.clone())
+                                        .with_value(mode.as_stored());
+                                if *this_mac {
+                                    menu.states.push("this-mac".into());
+                                }
+                                for choice in [
+                                    crate::opengrok::LocalExecMode::Always,
+                                    crate::opengrok::LocalExecMode::Ask,
+                                    crate::opengrok::LocalExecMode::Never,
+                                ] {
+                                    let mut button = UiNode::button(
+                                        ids::computer_exec_mode(machine, choice),
+                                        choice.label(),
+                                    );
+                                    if choice == *mode {
+                                        button.states.push("selected".into());
+                                    }
+                                    menu = menu.with_child(button);
+                                }
+                                settings = settings.with_child(menu);
+                            }
                         }
                         if self.computer_tab && self.route_traffic_in_user_settings {
                             settings = settings.with_child(UiNode::new(
@@ -2732,10 +2884,48 @@ impl NativeChatHost {
         }
         page = page.with_child(list);
         if let Some(id) = &self.recipe_open {
-            page = page.with_child(
-                UiNode::new("recipe-detail", "dialog", format!("Recipe {id}"))
-                    .with_child(UiNode::button("recipe-back", "Back")),
-            );
+            let mut detail = UiNode::new("recipe-detail", "dialog", format!("Recipe {id}"))
+                .with_child(UiNode::button("recipe-back", "Back"));
+            if let Some(open) = &self.recipe_detail {
+                let mut run = UiNode::button(
+                    ids::RECIPE_RUN,
+                    if open.running {
+                        crate::state::RECIPE_RUNNING
+                    } else {
+                        "Run"
+                    },
+                )
+                .with_enabled(open.runnable);
+                if let Some(bot) = &open.run_bot {
+                    run = run.with_value(bot.clone());
+                }
+                detail = detail.with_child(run);
+                let outcome = if open.running {
+                    Some("running")
+                } else {
+                    open.result
+                };
+                if let Some(outcome) = outcome {
+                    detail = detail.with_child(
+                        UiNode::status(ids::RECIPE_RUN_RESULT, "Run").with_value(outcome),
+                    );
+                }
+                if let Some(error) = &open.error {
+                    detail = detail.with_child(UiNode::status(ids::RECIPE_ERROR, error.clone()));
+                }
+                let mut history = UiNode::list(ids::RECIPE_HISTORY_RUNS, "Runs")
+                    .with_value(open.runs.len().to_string());
+                for (run_id, state, ok) in &open.runs {
+                    let mut line = UiNode::status(ids::recipe_history_run(run_id), run_id.clone())
+                        .with_value(state.clone());
+                    if *ok {
+                        line.states.push("ok".into());
+                    }
+                    history = history.with_child(line);
+                }
+                detail = detail.with_child(history);
+            }
+            page = page.with_child(detail);
         }
         page
     }
@@ -3425,6 +3615,22 @@ impl NativeChatHost {
             return Ok(DispatchResult::empty());
         } else if target == ids::NAV_RECIPES {
             Command::OpenRecipes
+        } else if target == ids::RECIPE_RUN {
+            let open = self
+                .recipe_detail
+                .as_ref()
+                .ok_or_else(|| "no recipe is open".to_string())?;
+            let bot = open
+                .run_bot
+                .clone()
+                .filter(|_| open.runnable)
+                .ok_or_else(|| {
+                    "Run is not on offer: no bot, no version to play, or the page is busy"
+                        .to_string()
+                })?;
+            Command::RunOpenRecipe(bot)
+        } else if let Some(command) = self.computer_exec_command(target) {
+            command
         } else if target == "recipe-back" {
             Command::CloseRecipe
         } else if let Some(word) = target.strip_prefix("recipes-filter-") {
@@ -3753,6 +3959,29 @@ impl NativeChatHost {
             [] => Err("no idle user-form".into()),
             _ => Err("user-form invoke requires arg card_key".into()),
         }
+    }
+
+    /// A button under one connected computer's local-exec mode.
+    fn computer_exec_command(&self, target: &str) -> Option<Command> {
+        use crate::opengrok::LocalExecMode;
+        // Only what is on screen: the buttons are in the tree while Settings is open on
+        // Computer, and a click on one that is not there is a wrong address.
+        if !(self.account_open && self.computer_tab) {
+            return None;
+        }
+        self.computers.iter().find_map(|(machine, _, _, _)| {
+            [
+                LocalExecMode::Always,
+                LocalExecMode::Ask,
+                LocalExecMode::Never,
+            ]
+            .into_iter()
+            .find(|mode| target == ids::computer_exec_mode(machine, *mode))
+            .map(|mode| Command::SetComputerExecMode {
+                machine_id: machine.clone(),
+                mode,
+            })
+        })
     }
 
     /// One of a routine's controls, or `None` for a target that is not a routine's at all.
@@ -4150,6 +4379,24 @@ impl NativeChatHost {
             "routine.thread" => Command::OpenRoutineThread {
                 routine_id: self.invoke_routine_id(args, "routine.thread")?,
             },
+            "recipe.run" => {
+                let open = self
+                    .recipe_detail
+                    .as_ref()
+                    .ok_or_else(|| "recipe.run needs an open recipe".to_string())?;
+                // The same gate as the button: a second start would drop the run the page is
+                // following, and one under a save would lose its busy line when the save lands.
+                if !open.runnable {
+                    return Err(
+                        "recipe.run: Run is not on offer (no version to play, or the page is busy)"
+                            .to_string(),
+                    );
+                }
+                let bot = invoke_arg_str(args, &["bot", "coworker", "coworker_id"])
+                    .or_else(|| open.run_bot.clone())
+                    .ok_or_else(|| "recipe.run: no bot is granted this recipe".to_string())?;
+                Command::RunOpenRecipe(bot)
+            }
             "routine.run" => Command::RunRoutineNow {
                 routine_id: self.invoke_routine_id(args, "routine.run")?,
             },
@@ -5553,6 +5800,8 @@ mod tests {
                 id: "bot-1".into(),
                 title: "Ada".into(),
                 active: true,
+                preview: None,
+                listed: false,
             }],
             ..Default::default()
         }
@@ -6996,7 +7245,7 @@ mod tests {
         host.approvals = vec![ApprovalSnap {
             call_id: "call_9".into(),
             tool: "read_file".into(),
-            place: "its computer",
+            title: "Allow Ada to read a file on its computer?".into(),
             local: false,
             review: false,
             reason: "policy-approval".into(),
@@ -7014,8 +7263,321 @@ mod tests {
         );
         assert_eq!(
             card.states,
-            vec!["policy-approval".to_string(), "mcp-cw_1".to_string()]
+            vec![
+                "policy-approval".to_string(),
+                "mcp-cw_1".to_string(),
+                "read_file".to_string()
+            ]
         );
+    }
+
+    /// The approval card's title in the tree is the one the card draws: the same function, the
+    /// same bot name, so a snapshot catches a title a person would read wrong.
+    #[test]
+    fn an_approval_card_is_titled_as_the_person_sees_it() {
+        let spec = crate::opengrok::approval_from_event(&serde_json::json!({
+            "type": "CUSTOM", "name": "run-awaiting-approval", "threadId": "cw_1",
+            "runId": "run_1", "callId": "call_1", "tool": "shell",
+            "arguments": { "command": "ls" }, "reason": "exec-consent"
+        }))
+        .expect("a card");
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Hex" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "Hex".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![crate::state::Message {
+                id: "m_1".into(),
+                sender: "AI".into(),
+                content: String::new(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: vec![crate::opengrok::ChatPart::Approval(spec.clone())],
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        let mut host = NativeChatHost::from_app(&state);
+        // Signed in draws the chat; a state with no account would draw the sign-in page.
+        host.signed_in = true;
+        let card = host.snapshot().find("approval-call_1").cloned().unwrap();
+        assert_eq!(
+            card.name,
+            crate::components::gen_ui::approval_title(&spec, "Hex", false)
+        );
+        assert_eq!(card.name, "Allow Hex to run a command on its computer?");
+        assert!(card.states.contains(&"shell".to_string()));
+    }
+
+    /// Settings → Computer lists each connected computer's local-exec mode, marks this Mac, and
+    /// a button per mode sets it: the Ask / Always / Never a check of this Mac's commands needs.
+    #[test]
+    fn a_computers_exec_mode_can_be_read_and_set_from_settings() {
+        use crate::opengrok::LocalExecMode;
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.computers = vec![
+            ("mac-1".into(), "This Mac".into(), LocalExecMode::Ask, true),
+            ("mac-2".into(), "Studio".into(), LocalExecMode::Never, false),
+        ];
+        let tree = host.snapshot();
+        let mine = tree.find(&ids::computer_exec("mac-1")).unwrap();
+        assert_eq!(mine.value.as_deref(), Some("ask"));
+        assert!(mine.states.contains(&"this-mac".to_string()));
+        assert_eq!(
+            tree.find(&ids::computer_exec("mac-2"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("never")
+        );
+        host.click(&ids::computer_exec_mode("mac-1", LocalExecMode::Always))
+            .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetComputerExecMode { machine_id, mode: LocalExecMode::Always }
+                if machine_id == "mac-1"
+        ));
+        host.account_open = false;
+        assert!(host.snapshot().find(&ids::computer_exec("mac-1")).is_none());
+        assert!(
+            host.click(&ids::computer_exec_mode("mac-1", LocalExecMode::Never))
+                .is_err(),
+            "not a target while Settings is shut"
+        );
+    }
+
+    /// The open recipe's Run, the run it started and its history are on the tree, so an async
+    /// run can be followed from snapshots: Run plays on the first bot granted it, is dead while
+    /// a run is going, and each history line says where its run got to.
+    #[test]
+    fn a_recipe_run_can_be_started_and_followed() {
+        let mut host = host();
+        host.recipes_open = true;
+        host.recipe_open = Some("rcp_1".into());
+        host.recipe_detail = Some(RecipeDetailSnap {
+            run_bot: Some("cw_1".into()),
+            runnable: true,
+            running: false,
+            result: None,
+            error: None,
+            runs: vec![
+                ("rrun_2".into(), "running".into(), false),
+                ("rrun_1".into(), "finished".into(), true),
+            ],
+        });
+        let tree = host.snapshot();
+        let run = tree.find(ids::RECIPE_RUN).unwrap();
+        assert!(run.enabled);
+        assert_eq!(run.value.as_deref(), Some("cw_1"));
+        assert!(tree.find(ids::RECIPE_RUN_RESULT).is_none());
+        assert_eq!(
+            tree.find(&ids::recipe_history_run("rrun_2"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("running")
+        );
+        assert!(
+            tree.find(&ids::recipe_history_run("rrun_1"))
+                .unwrap()
+                .states
+                .contains(&"ok".to_string())
+        );
+        host.click(ids::RECIPE_RUN).unwrap();
+        assert!(
+            matches!(host.take_command().unwrap(), Command::RunOpenRecipe(bot) if bot == "cw_1")
+        );
+
+        host.recipe_detail.as_mut().unwrap().running = true;
+        host.recipe_detail.as_mut().unwrap().runnable = false;
+        let tree = host.snapshot();
+        assert!(!tree.find(ids::RECIPE_RUN).unwrap().enabled);
+        assert_eq!(
+            tree.find(ids::RECIPE_RUN_RESULT).unwrap().value.as_deref(),
+            Some("running")
+        );
+        assert!(
+            host.click(ids::RECIPE_RUN).is_err(),
+            "not while a run is going"
+        );
+
+        host.recipe_detail.as_mut().unwrap().running = false;
+        host.recipe_detail.as_mut().unwrap().runnable = true;
+        host.recipe_detail.as_mut().unwrap().result = Some("interrupted");
+        assert_eq!(
+            host.snapshot()
+                .find(ids::RECIPE_RUN_RESULT)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("interrupted")
+        );
+        host.recipe_detail.as_mut().unwrap().error = Some("this recipe is not granted".into());
+        assert_eq!(
+            host.snapshot().find(ids::RECIPE_ERROR).unwrap().name,
+            "this recipe is not granted"
+        );
+        host.invoke("recipe.run", &serde_json::json!({ "bot": "cw_2" }))
+            .unwrap();
+        assert!(
+            matches!(host.take_command().unwrap(), Command::RunOpenRecipe(bot) if bot == "cw_2")
+        );
+    }
+
+    /// Run is on offer exactly when the page would enable it: a bot, a version to play, and
+    /// nothing else under way. A save or an accept in flight is as good as a run in flight: a
+    /// second start would drop the run the page follows, and one under a save loses its line
+    /// when the save lands. The click and `recipe.run` both refuse then.
+    #[test]
+    fn a_recipe_is_run_from_the_tree_only_when_the_page_would_run_it() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/wire/rest/GET__recipes__id_/200-a_run_whose_caller_hung_up_still_lands_in_history_with_its_pictures.json"
+        ))
+        .unwrap();
+        let detail: crate::opengrok::RecipeDetail =
+            serde_json::from_value(fixture["body"].clone()).unwrap();
+        let mut state = AppState::new();
+        // Signed in with a bot on the roster, or the tree is the sign-in or empty-roster page
+        // and has no Recipes in it.
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_9", "name": "Bo" })).unwrap(),
+        ];
+        state.page = crate::state::MainPage::Recipes;
+        state.recipe_open_id = Some(detail.recipe.id.clone());
+        state.recipe_open = Some(detail);
+        let signed_in = |state: &AppState| {
+            let mut host = NativeChatHost::from_app(state);
+            host.signed_in = true;
+            host
+        };
+
+        let mut host = signed_in(&state);
+        assert!(host.snapshot().find(ids::RECIPE_RUN).unwrap().enabled);
+        host.click(ids::RECIPE_RUN).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RunOpenRecipe(_))
+        ));
+
+        for busy in [crate::state::RECIPE_RUNNING, "Saving…", "Accepting…"] {
+            state.recipe_busy = Some(busy.to_string());
+            let mut host = signed_in(&state);
+            assert!(
+                !host.snapshot().find(ids::RECIPE_RUN).unwrap().enabled,
+                "{busy}"
+            );
+            assert!(host.click(ids::RECIPE_RUN).is_err(), "{busy}");
+            assert!(
+                host.invoke("recipe.run", &serde_json::json!({})).is_err(),
+                "{busy}"
+            );
+            assert!(host.take_command().is_none(), "{busy}");
+        }
+    }
+
+    /// The sidebar row's value is the hover card's own line: whitespace folded, a long message
+    /// cut with an ellipsis, and "No messages yet" for a thread with nothing in it.
+    #[test]
+    fn a_sidebar_row_reads_as_its_hover_card() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({
+                "id": "acct_1", "email": "a@b.c"
+            }))
+            .unwrap(),
+        );
+        state.coworkers = ["cw_1", "cw_2"]
+            .iter()
+            .map(|id| serde_json::from_value(serde_json::json!({ "id": id, "name": id })).unwrap())
+            .collect();
+        let said = "two   meetings\n\ttoday ".repeat(20);
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "cw_1".into(),
+            created_at: String::new(),
+            updated_at: "2026-09-27 10:00:00".into(),
+            messages: vec![crate::state::Message {
+                id: "m_1".into(),
+                sender: "AI".into(),
+                content: said.clone(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: Vec::new(),
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        let host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let listed = tree.find(&ids::coworker("cw_1")).unwrap();
+        let expected = crate::components::sidebar::rail_preview(state.conversations.first()).0;
+        assert_eq!(listed.value.as_deref(), Some(expected.as_str()));
+        assert!(
+            !expected.contains("  ") && expected.ends_with('…'),
+            "{expected}"
+        );
+        assert!(listed.states.contains(&"listed".to_string()));
+        let empty = tree.find(&ids::coworker("cw_2")).unwrap();
+        assert_eq!(empty.value.as_deref(), Some("No messages yet"));
+        assert!(!empty.states.contains(&"listed".to_string()));
+    }
+
+    /// A sidebar row carries what the bot's thread last said, and says when that thread came
+    /// from the server's list rather than from this Mac: the merge of the two, visible.
+    #[test]
+    fn a_sidebar_row_says_what_its_thread_holds_and_where_it_came_from() {
+        let mut host = host();
+        host.sessions = vec![
+            SessionSnap {
+                id: "cw_1".into(),
+                title: "Ada".into(),
+                active: true,
+                preview: Some("Two meetings.".into()),
+                listed: true,
+            },
+            SessionSnap {
+                id: "cw_2".into(),
+                title: "Bo".into(),
+                active: false,
+                preview: None,
+                listed: false,
+            },
+        ];
+        let tree = host.snapshot();
+        let ada = tree.find(&ids::coworker("cw_1")).unwrap();
+        assert_eq!(ada.value.as_deref(), Some("Two meetings."));
+        assert!(ada.states.contains(&"listed".to_string()));
+        let bo = tree.find(&ids::coworker("cw_2")).unwrap();
+        assert_eq!(bo.value, None);
+        assert!(!bo.states.contains(&"listed".to_string()));
     }
 
     /// A host on Settings → Computer with this Mac's rules as the server listed them: two

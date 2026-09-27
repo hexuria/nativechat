@@ -33,6 +33,16 @@
 //! `settings-login-add-sheet` while the Add sheet is up (`settings-login-add-title`,
 //! `settings-login-add-username`, `settings-login-add-password`, `settings-login-add-website`,
 //! `settings-login-add-notes`, `settings-login-add-save`, `settings-login-add-cancel`),
+//! `coworker-{id}` (a sidebar row: value = the last thing said in the bot's thread, state
+//! `listed` when that thread came from the server's list and not this Mac),
+//! `approval-{call}` (title = the card's own, states = reason, thread, tool),
+//! `recipe-run` (on the open recipe: value = the bot it plays on, disabled while it cannot run
+//! or a run is going; invoke `recipe.run {bot?}`), `recipe-run-result` (value `running` / `ok`
+//! / `failed` / `interrupted`), `recipe-error` (what the page says went wrong, e.g. a
+//! refused Run), `recipe-history-runs` (value = count) with
+//! `recipe-history-run-{runId}` (value = `running` / `finished` / `interrupted`, state `ok`),
+//! `settings-computer-{machine}-exec` (a connected computer's local-exec mode, value `ask` /
+//! `bypass` / `never`, state `this-mac`) with `settings-computer-{machine}-exec-ask|bypass|never`,
 //! `settings-tab-computer`, where this Mac's standing rules sit under its mode:
 //! `settings-local-rules-allow|deny` (a list, value = its count; in the tree only while it has a
 //! rule on it) with its rows `settings-local-rule-allow|deny-{n}` (counted from 0 in the

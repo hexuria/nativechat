@@ -371,7 +371,7 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
 /// `card_lines`). The title used to be built from the tool's name, and read "Allow Hex to run
 /// computer on its computer?". A review card keeps its own title, and the local shell's card
 /// asks about this Mac's policy rather than one call, so neither changes.
-fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> String {
+pub(crate) fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> String {
     if review {
         return "Review an action".to_string();
     }
