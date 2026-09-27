@@ -954,8 +954,8 @@ struct SessionSnap {
     id: String,
     title: String,
     active: bool,
-    /// What the sidebar row says under the name: the last thing said in the bot's thread, from
-    /// the thread the app holds for it. A row with none is a bot nobody has talked to here.
+    /// What the sidebar row says under the name (`rail_preview`): the last thing said in the
+    /// bot's thread, or "No messages yet".
     preview: Option<String>,
     /// The thread is known only from the server's list (`GET /ag-ui/threads`): this Mac never
     /// held it, and the list is what put it here.
@@ -1826,14 +1826,8 @@ impl NativeChatHost {
                         active: state.active_coworker_id.as_ref() == Some(&c.id),
                         id: c.id.clone(),
                         title: c.name.clone(),
-                        preview: thread
-                            .and_then(|conv| {
-                                conv.messages
-                                    .iter()
-                                    .rev()
-                                    .find(|m| !m.hidden && !m.content.trim().is_empty())
-                            })
-                            .map(|m| m.content.chars().take(140).collect()),
+                        // The hover card's own line, so the tree says what the row says.
+                        preview: Some(crate::components::sidebar::rail_preview(thread).0),
                         listed: thread.is_some_and(|conv| conv.known_only_from_list()),
                     }
                 })
@@ -1975,8 +1969,11 @@ impl NativeChatHost {
                 .collect(),
             recipe_open: state.recipe_open_id.clone(),
             recipe_detail: state.recipe_open.as_ref().map(|detail| {
-                // The page's own default (`RecipesView::picked_bot`): the first bot the recipe is
-                // granted to, else the person's first bot.
+                // The page's default when nobody has picked: the first bot the recipe is granted
+                // to, else the person's first bot (`RecipesView::picked_bot` without its first
+                // clause). A bot picked from the chevron beside Run is the view's own and out of
+                // this state's reach, so a driver runs the default; `recipe.run {bot}` names
+                // another.
                 let run_bot = detail
                     .my_bots
                     .iter()
@@ -1984,7 +1981,12 @@ impl NativeChatHost {
                     .or_else(|| detail.my_bots.first())
                     .map(|bot| bot.id.clone());
                 RecipeDetailSnap {
-                    runnable: run_bot.is_some() && detail.runnable_version().is_some(),
+                    // What the toolbar asks before it enables Run: a bot, a version to play, and
+                    // nothing else under way on the page. A save, delete or accept in flight
+                    // clears the page's busy line when it lands, whatever started under it.
+                    runnable: run_bot.is_some()
+                        && detail.runnable_version().is_some()
+                        && state.recipe_busy.is_none(),
                     run_bot,
                     running: state.recipe_busy.as_deref() == Some(crate::state::RECIPE_RUNNING),
                     result: state.recipe_run_result.as_ref().map(|run| {
@@ -2893,7 +2895,7 @@ impl NativeChatHost {
                         "Run"
                     },
                 )
-                .with_enabled(open.runnable && !open.running);
+                .with_enabled(open.runnable);
                 if let Some(bot) = &open.run_bot {
                     run = run.with_value(bot.clone());
                 }
@@ -3621,9 +3623,10 @@ impl NativeChatHost {
             let bot = open
                 .run_bot
                 .clone()
-                .filter(|_| open.runnable && !open.running)
+                .filter(|_| open.runnable)
                 .ok_or_else(|| {
-                    "Run is not on offer: no granted bot, or a run is going".to_string()
+                    "Run is not on offer: no bot, no version to play, or the page is busy"
+                        .to_string()
                 })?;
             Command::RunOpenRecipe(bot)
         } else if let Some(command) = self.computer_exec_command(target) {
@@ -3961,6 +3964,11 @@ impl NativeChatHost {
     /// A button under one connected computer's local-exec mode.
     fn computer_exec_command(&self, target: &str) -> Option<Command> {
         use crate::opengrok::LocalExecMode;
+        // Only what is on screen: the buttons are in the tree while Settings is open on
+        // Computer, and a click on one that is not there is a wrong address.
+        if !(self.account_open && self.computer_tab) {
+            return None;
+        }
         self.computers.iter().find_map(|(machine, _, _, _)| {
             [
                 LocalExecMode::Always,
@@ -4376,6 +4384,14 @@ impl NativeChatHost {
                     .recipe_detail
                     .as_ref()
                     .ok_or_else(|| "recipe.run needs an open recipe".to_string())?;
+                // The same gate as the button: a second start would drop the run the page is
+                // following, and one under a save would lose its busy line when the save lands.
+                if !open.runnable {
+                    return Err(
+                        "recipe.run: Run is not on offer (no version to play, or the page is busy)"
+                            .to_string(),
+                    );
+                }
                 let bot = invoke_arg_str(args, &["bot", "coworker", "coworker_id"])
                     .or_else(|| open.run_bot.clone())
                     .ok_or_else(|| "recipe.run: no bot is granted this recipe".to_string())?;
@@ -7338,6 +7354,11 @@ mod tests {
         ));
         host.account_open = false;
         assert!(host.snapshot().find(&ids::computer_exec("mac-1")).is_none());
+        assert!(
+            host.click(&ids::computer_exec_mode("mac-1", LocalExecMode::Never))
+                .is_err(),
+            "not a target while Settings is shut"
+        );
     }
 
     /// The open recipe's Run, the run it started and its history are on the tree, so an async
@@ -7383,6 +7404,7 @@ mod tests {
         );
 
         host.recipe_detail.as_mut().unwrap().running = true;
+        host.recipe_detail.as_mut().unwrap().runnable = false;
         let tree = host.snapshot();
         assert!(!tree.find(ids::RECIPE_RUN).unwrap().enabled);
         assert_eq!(
@@ -7395,6 +7417,7 @@ mod tests {
         );
 
         host.recipe_detail.as_mut().unwrap().running = false;
+        host.recipe_detail.as_mut().unwrap().runnable = true;
         host.recipe_detail.as_mut().unwrap().result = Some("interrupted");
         assert_eq!(
             host.snapshot()
@@ -7414,6 +7437,117 @@ mod tests {
         assert!(
             matches!(host.take_command().unwrap(), Command::RunOpenRecipe(bot) if bot == "cw_2")
         );
+    }
+
+    /// Run is on offer exactly when the page would enable it: a bot, a version to play, and
+    /// nothing else under way. A save or an accept in flight is as good as a run in flight: a
+    /// second start would drop the run the page follows, and one under a save loses its line
+    /// when the save lands. The click and `recipe.run` both refuse then.
+    #[test]
+    fn a_recipe_is_run_from_the_tree_only_when_the_page_would_run_it() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/wire/rest/GET__recipes__id_/200-a_run_whose_caller_hung_up_still_lands_in_history_with_its_pictures.json"
+        ))
+        .unwrap();
+        let detail: crate::opengrok::RecipeDetail =
+            serde_json::from_value(fixture["body"].clone()).unwrap();
+        let mut state = AppState::new();
+        // Signed in with a bot on the roster, or the tree is the sign-in or empty-roster page
+        // and has no Recipes in it.
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_9", "name": "Bo" })).unwrap(),
+        ];
+        state.page = crate::state::MainPage::Recipes;
+        state.recipe_open_id = Some(detail.recipe.id.clone());
+        state.recipe_open = Some(detail);
+        let signed_in = |state: &AppState| {
+            let mut host = NativeChatHost::from_app(state);
+            host.signed_in = true;
+            host
+        };
+
+        let mut host = signed_in(&state);
+        assert!(host.snapshot().find(ids::RECIPE_RUN).unwrap().enabled);
+        host.click(ids::RECIPE_RUN).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RunOpenRecipe(_))
+        ));
+
+        for busy in [crate::state::RECIPE_RUNNING, "Saving…", "Accepting…"] {
+            state.recipe_busy = Some(busy.to_string());
+            let mut host = signed_in(&state);
+            assert!(
+                !host.snapshot().find(ids::RECIPE_RUN).unwrap().enabled,
+                "{busy}"
+            );
+            assert!(host.click(ids::RECIPE_RUN).is_err(), "{busy}");
+            assert!(
+                host.invoke("recipe.run", &serde_json::json!({})).is_err(),
+                "{busy}"
+            );
+            assert!(host.take_command().is_none(), "{busy}");
+        }
+    }
+
+    /// The sidebar row's value is the hover card's own line: whitespace folded, a long message
+    /// cut with an ellipsis, and "No messages yet" for a thread with nothing in it.
+    #[test]
+    fn a_sidebar_row_reads_as_its_hover_card() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({
+                "id": "acct_1", "email": "a@b.c"
+            }))
+            .unwrap(),
+        );
+        state.coworkers = ["cw_1", "cw_2"]
+            .iter()
+            .map(|id| serde_json::from_value(serde_json::json!({ "id": id, "name": id })).unwrap())
+            .collect();
+        let said = "two   meetings\n\ttoday ".repeat(20);
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "cw_1".into(),
+            created_at: String::new(),
+            updated_at: "2026-09-27 10:00:00".into(),
+            messages: vec![crate::state::Message {
+                id: "m_1".into(),
+                sender: "AI".into(),
+                content: said.clone(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: Vec::new(),
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        let host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let listed = tree.find(&ids::coworker("cw_1")).unwrap();
+        let expected = crate::components::sidebar::rail_preview(state.conversations.first()).0;
+        assert_eq!(listed.value.as_deref(), Some(expected.as_str()));
+        assert!(
+            !expected.contains("  ") && expected.ends_with('…'),
+            "{expected}"
+        );
+        assert!(listed.states.contains(&"listed".to_string()));
+        let empty = tree.find(&ids::coworker("cw_2")).unwrap();
+        assert_eq!(empty.value.as_deref(), Some("No messages yet"));
+        assert!(!empty.states.contains(&"listed".to_string()));
     }
 
     /// A sidebar row carries what the bot's thread last said, and says when that thread came

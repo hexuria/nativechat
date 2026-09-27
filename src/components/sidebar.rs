@@ -964,7 +964,7 @@ impl SidebarView {
     }
 }
 
-fn rail_preview(conversation: Option<&Conversation>) -> (String, String) {
+pub(crate) fn rail_preview(conversation: Option<&Conversation>) -> (String, String) {
     let Some(conversation) = conversation else {
         return ("No messages yet".into(), String::new());
     };
