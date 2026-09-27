@@ -119,4 +119,34 @@ mod tests {
         assert_eq!(report.items[0].origin, "amazon.com");
         assert_eq!(report.items[0].otpauth, None);
     }
+
+    /// Each refusal is the sentence the person is shown, not merely some error: a file with no
+    /// header, and a header missing any of the three columns a login needs.
+    #[test]
+    fn a_csv_without_the_columns_a_login_needs_is_refused_by_name() {
+        let refused = |text: &str| read_login_csv(text, Source::ChromeCsv).unwrap_err();
+        assert_eq!(refused(""), "the file is empty");
+        assert_eq!(
+            refused("name,username,password\n"),
+            "no url column in the header"
+        );
+        assert_eq!(
+            refused("name,url,password\n"),
+            "no username column in the header"
+        );
+        assert_eq!(
+            refused("name,url,username\n"),
+            "no password column in the header"
+        );
+    }
+
+    /// A row with something in it that is not a login is counted as skipped, so the person is
+    /// told; a blank line is nothing and is not.
+    #[test]
+    fn a_row_that_is_not_a_login_is_counted_and_a_blank_one_is_not() {
+        let text = "name,url,username,password\nX,https://x.com,ada,pw\nNo site,,bob,pw\n,,,\n";
+        let report = read_login_csv(text, Source::ChromeCsv).expect("parse");
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.skipped, 1);
+    }
 }

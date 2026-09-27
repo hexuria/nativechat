@@ -216,4 +216,38 @@ mod tests {
             "no site, no name"
         );
     }
+
+    /// A store that is not there is refused with where it looked; an empty one is an empty
+    /// report with nothing to say; entries are listed sorted, by path, without dotfiles or
+    /// files that are not `.gpg`.
+    #[test]
+    fn a_store_is_listed_and_a_missing_one_is_refused() {
+        let dir = tempfile::tempdir().expect("dir");
+        let missing = dir.path().join("no-store");
+        let refused = entries(&missing).unwrap_err();
+        assert!(refused.starts_with("could not read "), "{refused}");
+        assert!(read_store(&missing).is_err());
+
+        let (report, error) = read_store(dir.path()).expect("empty store");
+        assert!(report.items.is_empty());
+        assert_eq!(report.skipped, 0);
+        assert!(error.is_none());
+
+        let store = dir.path();
+        std::fs::create_dir_all(store.join("web")).expect("dir");
+        std::fs::create_dir_all(store.join(".git")).expect("dir");
+        for file in [
+            "web/github.com.gpg",
+            "email.gpg",
+            ".gpg-id",
+            ".git/config.gpg",
+            "readme.txt",
+        ] {
+            std::fs::write(store.join(file), b"x").expect("write");
+        }
+        assert_eq!(
+            entries(store).expect("list"),
+            vec!["email", "web/github.com"]
+        );
+    }
 }

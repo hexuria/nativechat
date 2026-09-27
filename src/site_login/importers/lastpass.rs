@@ -61,4 +61,21 @@ mod tests {
             Some("otpauth://totp/X%20site:ada?secret=JBSWY3DPEHPK3PXP")
         );
     }
+
+    #[test]
+    fn a_lastpass_csv_without_the_columns_a_login_needs_is_refused_by_name() {
+        assert_eq!(read_csv("").unwrap_err(), "the file is empty");
+        assert_eq!(
+            read_csv("username,password,totp\n").unwrap_err(),
+            "no url column in the header"
+        );
+        assert_eq!(
+            read_csv("url,password,totp\n").unwrap_err(),
+            "no username column"
+        );
+        assert_eq!(
+            read_csv("url,username,totp\n").unwrap_err(),
+            "no password column"
+        );
+    }
 }

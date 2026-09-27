@@ -271,4 +271,23 @@ mod tests {
         );
         assert_eq!(detect(Path::new("a.txt"), b"hello"), None);
     }
+
+    /// A file that is not there, and a file that is none of the exports this reads, are each
+    /// refused with their own sentence.
+    #[test]
+    fn a_file_that_is_missing_or_unknown_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("dir");
+        let missing = dir.path().join("gone.csv");
+        let refused = read_file(&missing).unwrap_err();
+        assert!(refused.starts_with("could not read "), "{refused}");
+        assert!(refused.contains("gone.csv"), "{refused}");
+
+        let unknown = dir.path().join("notes.txt");
+        std::fs::write(&unknown, "just some notes\n").expect("write");
+        assert!(
+            read_file(&unknown)
+                .unwrap_err()
+                .starts_with("not an export this app reads: ")
+        );
+    }
 }
