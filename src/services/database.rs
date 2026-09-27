@@ -217,6 +217,35 @@ impl DatabaseService {
     }
 
     /// The stamp a hidden row carries, in the same shape as `created_at`.
+    /// Write down something the person said that a replay brought back, under the id it was
+    /// sent with, unless a row already has that id.
+    ///
+    /// Not `save_message`: that one's second write is an update, and it clears the message's
+    /// pieces. The id here is whatever the server put in `messageId`, and a row's id is unique
+    /// across every thread. A recovered question that is already on disk is already right, and
+    /// an id that names some other row must never rewrite that row's words or take its pieces.
+    /// Reports whether a row was written.
+    pub async fn keep_recovered_question(
+        &self,
+        id: &str,
+        session_id: &str,
+        content: &str,
+        sent_at: SystemTime,
+    ) -> Result<bool> {
+        let written = sqlx::query(
+            "INSERT OR IGNORE INTO chat_messages (id, session_id, role, content, created_at)
+             VALUES (?, ?, 'user', ?, ?)",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(content)
+        .bind(Self::stamp(sent_at).unwrap_or_else(Self::hidden_now))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(written == 1)
+    }
+
     fn hidden_now() -> String {
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
