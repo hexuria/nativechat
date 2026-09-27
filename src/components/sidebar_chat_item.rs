@@ -7,6 +7,7 @@ use gpui_kit::{
 use std::rc::Rc;
 
 #[derive(IntoElement)]
+#[allow(clippy::type_complexity)]
 pub struct ChatSessionItem {
     id: String,
     title: String,

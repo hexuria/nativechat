@@ -8,8 +8,11 @@ use std::sync::{
 
 pub struct AudioInput {
     audio_unit: sys::AudioUnit,
-    // Keep context alive
-    _context: Box<InputContext>,
+    /// The callback's context, handed to the audio unit as its refcon. It is owned through this
+    /// raw pointer, not a Box: CoreAudio reads it on its own thread for as long as the unit runs,
+    /// and a Box held (or moved) here meanwhile would claim a uniqueness it does not have. Taken
+    /// back in Drop, once the unit is disposed of.
+    context: *mut InputContext,
 }
 
 struct InputContext {
@@ -21,10 +24,11 @@ impl AudioInput {
     pub fn new(amplitude: Arc<AtomicU32>) -> anyhow::Result<Self> {
         eprintln!("[AudioInput] Creating new VoiceProcessingIO instance (sys)");
 
-        // SAFETY: plain CoreAudio C calls. Every pointer passed in is to a local or to the boxed
-        // context, each valid for the call it is passed to. The context's address is handed to
-        // the audio unit as its refcon; the Box is kept in `_context`, so it stays put, and Drop
-        // disposes of the unit, stopping callbacks, before the Box is freed.
+        // SAFETY: plain CoreAudio C calls. Every pointer passed in is to a local or to the context,
+        // each valid for the call it is passed to. The context is leaked with `Box::into_raw` and
+        // handed to the unit as its refcon; nothing else refers to it, and it is taken back with
+        // `Box::from_raw` exactly once: in `abandon` if setup fails after that, else in Drop, in
+        // both cases only after the unit is disposed of and its callback can no longer run.
         unsafe {
             // 1. Describe the Audio Component (VoiceProcessingIO)
             let desc = sys::AudioComponentDescription {
@@ -121,17 +125,21 @@ impl AudioInput {
             }
 
             // 6. Setup Callback Context
-            let mut context = Box::new(InputContext {
-                unit: ptr::null_mut(), // Initialize as null, update later
+            let context = Box::into_raw(Box::new(InputContext {
+                unit: audio_unit,
                 amplitude,
-            });
-
-            // Update unit in context
-            context.unit = audio_unit;
+            }));
+            // Setup failed after the unit was handed the context. The unit never started, so its
+            // callback has not run; dispose of it first, so it cannot, then take the context back.
+            let abandon = |step: &str, status: sys::OSStatus| {
+                sys::AudioComponentInstanceDispose(audio_unit);
+                drop(Box::from_raw(context));
+                anyhow::anyhow!("{step}: {status}")
+            };
 
             let callback_struct = sys::AURenderCallbackStruct {
                 inputProc: Some(input_callback),
-                inputProcRefCon: &*context as *const _ as *mut c_void,
+                inputProcRefCon: context.cast(),
             };
 
             let status = sys::AudioUnitSetProperty(
@@ -143,23 +151,23 @@ impl AudioInput {
                 std::mem::size_of::<sys::AURenderCallbackStruct>() as u32,
             );
             if status != 0 {
-                return Err(anyhow::anyhow!("Failed to set callback: {}", status));
+                return Err(abandon("Failed to set callback", status));
             }
 
             // 7. Initialize and Start
             let status = sys::AudioUnitInitialize(audio_unit);
             if status != 0 {
-                return Err(anyhow::anyhow!("Failed to initialize unit: {}", status));
+                return Err(abandon("Failed to initialize unit", status));
             }
 
             let status = sys::AudioOutputUnitStart(audio_unit);
             if status != 0 {
-                return Err(anyhow::anyhow!("Failed to start unit: {}", status));
+                return Err(abandon("Failed to start unit", status));
             }
 
             Ok(Self {
                 audio_unit,
-                _context: context,
+                context,
             })
         }
     }
@@ -168,11 +176,13 @@ impl AudioInput {
 impl Drop for AudioInput {
     fn drop(&mut self) {
         // SAFETY: `audio_unit` is the instance `new` created and started, and it is disposed of
-        // exactly once, here.
+        // exactly once, here. Once it is disposed of its callback cannot run again, so the
+        // context `new` leaked with `Box::into_raw` is taken back, also exactly once.
         unsafe {
             sys::AudioOutputUnitStop(self.audio_unit);
             sys::AudioUnitUninitialize(self.audio_unit);
             sys::AudioComponentInstanceDispose(self.audio_unit);
+            drop(Box::from_raw(self.context));
         }
     }
 }
@@ -185,9 +195,9 @@ extern "C" fn input_callback(
     in_number_frames: u32,
     _io_data: *mut sys::AudioBufferList, // This is ignored for input callbacks
 ) -> sys::OSStatus {
-    // SAFETY: `in_ref_con` is the boxed InputContext `new` registered, alive until Drop disposes of
-    // the unit (see `new`). The callback only reads it and stores to an atomic, so it takes a
-    // shared reference: a `&mut` here would alias the Box that owns it.
+    // SAFETY: `in_ref_con` is the InputContext `new` leaked with `Box::into_raw`, freed only after
+    // the unit is disposed of (see `new` and Drop), so it is alive whenever this runs. The callback
+    // only reads it and stores to an atomic, so a shared reference is all it takes.
     unsafe {
         let context = &*(in_ref_con as *const InputContext);
 

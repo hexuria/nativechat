@@ -22,6 +22,7 @@ struct BtnBounds {
 }
 
 #[derive(IntoElement)]
+#[allow(clippy::type_complexity)]
 pub struct MessageToolbar {
     message_id: String,
     source_id: String,

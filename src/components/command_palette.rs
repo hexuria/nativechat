@@ -606,6 +606,7 @@ fn empty_state(tab: PaletteTab, muted: Hsla) -> AnyElement {
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn palette_row(
     index: usize,
     item: PaletteItem,

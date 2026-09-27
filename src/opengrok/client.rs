@@ -829,6 +829,7 @@ impl OpenGrokClient {
     /// client that only learns the id from the frames it already saw: the one moment the id is
     /// needed is the moment the stream has been lost. So it is minted before the turn is sent,
     /// by whoever will have to ask about it later.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_turn<F>(
         &self,
         coworker_id: &str,

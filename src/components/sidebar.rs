@@ -563,6 +563,7 @@ impl Render for SidebarView {
 }
 
 impl SidebarView {
+    #[allow(clippy::too_many_arguments)]
     fn brand_row(
         &self,
         collapsed: bool,
@@ -786,6 +787,7 @@ impl SidebarView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dock(
         &self,
         collapsed: bool,
@@ -927,6 +929,7 @@ impl SidebarView {
             })
     }
 
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn dock_item(
         &self,
         id: &'static str,
@@ -1013,6 +1016,7 @@ fn rail_card_time(at: SystemTime) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn agent_hover_card(
     id: String,
     name: String,

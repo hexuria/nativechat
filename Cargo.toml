@@ -85,11 +85,6 @@ unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [lints.clippy]
-# GPUI's own shape: listeners are `Rc<dyn Fn(&E, &mut Window, &mut App)>` and render helpers take
-# the entity, the window, the context and the theme. Type aliases and parameter structs for each
-# would only move the same words somewhere else.
-type_complexity = "allow"
-too_many_arguments = "allow"
 # Every unsafe block says, in a `// SAFETY:` comment, what makes it sound.
 undocumented_unsafe_blocks = "deny"
 # The app's diagnostics go to stderr. stdout is not a log, and a print there once echoed every

@@ -891,6 +891,7 @@ impl SavedLoginContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_field(
     spec: &UserFormSpec,
     field: &UserFormField,

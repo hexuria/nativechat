@@ -8387,6 +8387,7 @@ impl AppState {
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
     /// turn is firing, when it came off `queued_sends`.
+    #[allow(clippy::too_many_arguments)]
     fn send_opengrok_turn_with(
         &mut self,
         conversation_id: String,
@@ -10009,6 +10010,7 @@ impl AppState {
         self.settle_chrome_and_drain(conversation_id, cx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn post_box_handoff_resolve(
         &mut self,
         card_key: String,
@@ -12763,6 +12765,7 @@ impl AppState {
 
     /// POST the hold to OpenGrok while the bubble stays local. 404 / unreachable keep the
     /// in-memory queue (offline, or a server that has not shipped the store).
+    #[allow(clippy::too_many_arguments)]
     fn sync_queued_send_to_server(
         &mut self,
         thread_id: String,

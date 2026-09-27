@@ -135,6 +135,7 @@ fn glyph_btn(
         .on_click(on_click)
 }
 
+#[allow(clippy::type_complexity)]
 pub fn reaction_strip(
     app: Entity<AppState>,
     message_id: String,
@@ -187,6 +188,7 @@ pub fn reaction_strip(
         )
 }
 
+#[allow(clippy::type_complexity)]
 pub fn full_picker(
     app: Entity<AppState>,
     message_id: String,

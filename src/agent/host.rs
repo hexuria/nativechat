@@ -2844,6 +2844,7 @@ impl NativeChatHost {
     /// skill", because that is a wrong address rather than an unknown control — and it is told
     /// apart by the `skl_` the server mints, the way a recipe row's id is (see
     /// [`recipe_row_target`]).
+    #[allow(clippy::type_complexity)]
     fn skill_target(&self, target: &str) -> Option<Result<Command, String>> {
         for side in SkillScope::ALL {
             if target == side.element_id() {
@@ -3491,6 +3492,7 @@ impl NativeChatHost {
     /// The id is the server's and can hold anything, dashes included, so this reads the tail
     /// first and takes what is left as the id — and then only if that id is a routine the open
     /// bot has. An id nobody is showing is a wrong address, not a click.
+    #[allow(clippy::type_complexity)]
     fn routine_command(&self, target: &str) -> Option<Command> {
         let rest = target.strip_prefix("routine-")?;
         let mut cmd: Option<(&str, fn(String) -> Command)> = None;

@@ -38,10 +38,13 @@ pub struct MacTtsBridge {
 
 // SAFETY: the two ids are only ever messaged, never dereferenced from Rust, and the callback they
 // reach is behind a Mutex and is itself Send + Sync. NSSpeechSynthesizer is not documented as
-// thread-safe, though: this relies on TtsService, the only owner, messaging it from the UI thread.
-// Nothing in the types enforces that.
+// thread-safe, so this relies on it never being messaged from two threads at once. TtsService,
+// the only owner, holds to that: `AppState::ensure_tts_service` builds and warms it on the
+// background executor, awaits that task, and only then hands it to the UI thread, which is the
+// only thread that messages it from there on. Nothing in the types enforces this; a second owner
+// that messages it concurrently would break it.
 unsafe impl Send for MacTtsBridge {}
-// SAFETY: as for Send above.
+// SAFETY: as for Send above: shared, but messaged by one thread at a time.
 unsafe impl Sync for MacTtsBridge {}
 
 impl Default for MacTtsBridge {

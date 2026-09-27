@@ -6,6 +6,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 /// Grok's find chrome: search field, `n/m`, previous, next, close.
+#[allow(clippy::too_many_arguments)]
 pub fn find_bar_element(
     query: &Entity<InputState>,
     current: Option<usize>,
@@ -113,6 +114,7 @@ pub fn find_bar_element(
         ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_icon_btn(
     id: &'static str,
     icon: IconName,
