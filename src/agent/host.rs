@@ -3763,6 +3763,20 @@ impl NativeChatHost {
     #[allow(clippy::type_complexity)]
     fn routine_command(&self, target: &str) -> Option<Command> {
         let rest = target.strip_prefix("routine-")?;
+        // A line of a routine's history opens its thread, as it does in the editor. Matched
+        // against the routines and runs on screen, because both ids can hold dashes and no
+        // tail can tell where one ends.
+        for routine in &self.routines {
+            if let Some(run) = rest
+                .strip_prefix(routine.id.as_str())
+                .and_then(|tail| tail.strip_prefix("-run-"))
+                && routine.runs.iter().any(|(id, _, _)| id == run)
+            {
+                return Some(Command::OpenRoutineThread {
+                    routine_id: routine.id.clone(),
+                });
+            }
+        }
         let mut cmd: Option<(&str, fn(String) -> Command)> = None;
         for (tail, make) in [
             (
@@ -4333,6 +4347,13 @@ mod tests {
         assert!(host.click(ids::CHAT_ROUTINE_BACK).is_err());
 
         host.click(&ids::routine_thread("sch-1-2")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
+        ));
+        // A line of its history opens the same thread, dashes in both ids and all.
+        host.routines[0].runs = vec![("run-a-1".into(), "Test run", "ok")];
+        host.click(&ids::routine_run("sch-1-2", "run-a-1")).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),
             Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"

@@ -635,9 +635,10 @@ impl ComputerPane {
                             h_flex()
                                 .id(SharedString::from(format!("run-{i}")))
                                 // A line of the history opens the thread it ran in, which is
-                                // where what it said is.
+                                // where what it said is. On click, not on press, so a scroll
+                                // that starts on a line stays in the editor.
                                 .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, {
+                                .on_click({
                                     let persist = persist.clone();
                                     let app = app.clone();
                                     let id = id.clone();

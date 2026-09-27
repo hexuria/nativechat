@@ -71,6 +71,15 @@ enum RefreshOutcome {
 
 type RefreshShared = Shared<futures::future::BoxFuture<'static, RefreshOutcome>>;
 
+/// An id as one segment of a path. A thread's id is whatever the server chose (a schedule's id
+/// is the thread its routine runs in), and a `/`, `?` or `#` in it must not turn one route into
+/// another. `+` is only a space in a query, so a space is written the way a path spells it.
+fn path_segment(id: &str) -> String {
+    url::form_urlencoded::byte_serialize(id.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
+}
+
 #[derive(Clone)]
 pub struct OpenGrokClient {
     base: Url,
@@ -1155,7 +1164,7 @@ impl OpenGrokClient {
         thread_id: &str,
         limit: usize,
     ) -> Result<ThreadReplay, OpenGrokError> {
-        let path = format!("/ag-ui/threads/{thread_id}?limit={limit}");
+        let path = format!("/ag-ui/threads/{}?limit={limit}", path_segment(thread_id));
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
@@ -1214,7 +1223,7 @@ impl OpenGrokClient {
         &self,
         thread_id: &str,
     ) -> Result<PendingList, OpenGrokError> {
-        let path = format!("/ag-ui/threads/{thread_id}/pending");
+        let path = format!("/ag-ui/threads/{}/pending", path_segment(thread_id));
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
@@ -1229,7 +1238,7 @@ impl OpenGrokClient {
         thread_id: &str,
         body: &PendingWrite,
     ) -> Result<PendingMutation, OpenGrokError> {
-        let path = format!("/ag-ui/threads/{thread_id}/pending");
+        let path = format!("/ag-ui/threads/{}/pending", path_segment(thread_id));
         let response = self
             .send_json(reqwest::Method::POST, &path, Some(body))
             .await?;
@@ -1244,7 +1253,11 @@ impl OpenGrokClient {
         pending_id: &str,
         body: &PendingWrite,
     ) -> Result<PendingMutation, OpenGrokError> {
-        let path = format!("/ag-ui/threads/{thread_id}/pending/{pending_id}");
+        let path = format!(
+            "/ag-ui/threads/{}/pending/{}",
+            path_segment(thread_id),
+            path_segment(pending_id)
+        );
         let response = self
             .send_json(reqwest::Method::PATCH, &path, Some(body))
             .await?;
@@ -1259,7 +1272,11 @@ impl OpenGrokClient {
         thread_id: &str,
         pending_id: &str,
     ) -> Result<PendingMutation, OpenGrokError> {
-        let path = format!("/ag-ui/threads/{thread_id}/pending/{pending_id}");
+        let path = format!(
+            "/ag-ui/threads/{}/pending/{}",
+            path_segment(thread_id),
+            path_segment(pending_id)
+        );
         let response = self
             .send_json::<()>(reqwest::Method::DELETE, &path, None)
             .await?;
@@ -7260,6 +7277,23 @@ mod tests {
                 ("run_0", RunCause::Other, ScheduleRunStatus::Waiting, None),
             ]
         );
+    }
+
+    /// A thread id is the server's to choose, so it goes into a path as one segment: a `/` or
+    /// `?` in it cannot reach another route.
+    #[tokio::test]
+    async fn a_thread_id_is_one_segment_of_the_path() {
+        assert_eq!(path_segment("sched_01a0-e27a"), "sched_01a0-e27a");
+        assert_eq!(path_segment("a/b?c#d e"), "a%2Fb%3Fc%23d%20e");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ag-ui/threads/a%2Fb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "runs": [] })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client.replay_thread("a/b", 5).await.unwrap();
     }
 
     #[tokio::test]
