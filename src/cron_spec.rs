@@ -379,7 +379,12 @@ fn read_field(raw: &str, ceiling: u8) -> Option<CronField> {
     }
     if let Some(step) = raw.strip_prefix("*/") {
         let step: u32 = step.parse().ok()?;
-        return (step >= 1).then_some(CronField::Every(step));
+        // The same ceiling `interval_cron` writes to. `*/90` in a field that counts to 59 is not
+        // "every 90 minutes": read as an interval, the editor would show a schedule it then
+        // refuses to save. Left `Custom`, it is shown and saved as written.
+        return (1..=u32::from(ceiling))
+            .contains(&step)
+            .then_some(CronField::Every(step));
     }
     let mut numbers = Vec::new();
     for part in raw.split(',') {
@@ -520,6 +525,55 @@ mod tests {
         assert_eq!(cron(6, ScheduleUnit::Hours), "0 */6 * * *");
         assert_eq!(cron(1, ScheduleUnit::Days), "0 0 * * *");
         assert_eq!(cron(2, ScheduleUnit::Days), "0 0 */2 * *");
+    }
+
+    /// Every interval the editor can write reads back as a schedule that saves the same line, for
+    /// every step the pickers allow and a few past them. (Every 1 day reads back as "every day
+    /// at 00:00": the same schedule, drawn by the other picker.)
+    #[test]
+    fn every_interval_the_editor_writes_reads_back_the_same() {
+        for (unit, ceiling) in [
+            (ScheduleUnit::Minutes, 59),
+            (ScheduleUnit::Hours, 23),
+            (ScheduleUnit::Days, 31),
+        ] {
+            for every in 0..=ceiling + 10 {
+                let spec = ScheduleSpec::interval(every, unit);
+                match spec.to_cron() {
+                    Ok(line) => {
+                        assert!((1..=ceiling).contains(&every), "{every} {unit:?} -> {line}");
+                        let again = ScheduleSpec::from_cron(&line).to_cron();
+                        assert_eq!(again.as_deref(), Ok(line.as_str()), "{every} {unit:?}");
+                    }
+                    Err(_) => assert!(every == 0 || every > ceiling, "{every} {unit:?} refused"),
+                }
+            }
+        }
+    }
+
+    /// Whatever step the server sends back, the editor can save it again: a step its field can
+    /// hold is an interval, and one it cannot (`*/90` minutes, `*/48` hours) is shown and kept
+    /// as written rather than read as an interval the editor would then refuse.
+    #[test]
+    fn every_stepped_line_from_the_server_saves_again() {
+        for step in 1..=200u32 {
+            for (line, ceiling) in [
+                (format!("*/{step} * * * *"), 59),
+                (format!("0 */{step} * * *"), 23),
+                (format!("0 0 */{step} * *"), 31),
+            ] {
+                let read = ScheduleSpec::from_cron(&line);
+                let saved = read.to_cron().unwrap_or_else(|e| {
+                    panic!("{line} read back as a schedule that will not save: {e}")
+                });
+                if step > ceiling {
+                    assert_eq!(read.mode, ScheduleUiMode::Custom, "{line}");
+                    assert_eq!(saved, line);
+                } else if step > 1 {
+                    assert_eq!(saved, line);
+                }
+            }
+        }
     }
 
     /// Cron steps inside one field, so an interval that overflows its field is not a schedule
