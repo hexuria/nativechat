@@ -1,0 +1,19 @@
+# Stagnation is a choice: a reminder every week, so being behind is visible rather than silent.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # gpui moves together, and the unit tests do not exercise rendering. A person merges these
+      # after running the app (`just run`), not on green CI alone.
+      gpui:
+        patterns: ["gpui*"]
+      everything-else:
+        patterns: ["*"]
+        exclude-patterns: ["gpui*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
