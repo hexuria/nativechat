@@ -10,8 +10,8 @@ use crate::components::alert_chrome::{
 };
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    BoxHandoffResolution, LocalExecMode, computer_attention_done_id, computer_attention_id,
-    computer_attention_skip_id,
+    BoxHandoffResolution, LocalExecMode, ScheduleRunStatus, computer_attention_done_id,
+    computer_attention_id, computer_attention_skip_id,
 };
 use crate::state::{
     AgentRoutine, AppState, ComputerView, NewTrigger, RoutineTrigger, ScheduleDayKind,
@@ -32,7 +32,9 @@ pub struct ComputerPane {
     name_input: Entity<InputState>,
     instruction_input: Entity<TextareaState>,
     custom_cron: Entity<InputState>,
-    loaded_editor: Option<Option<String>>,
+    /// The routine the fields were last filled from, and the `routine_resync` they were
+    /// filled at.
+    loaded_editor: Option<(Option<String>, u64)>,
     webhook_popover: Option<String>,
 }
 
@@ -62,10 +64,18 @@ impl ComputerPane {
             self.loaded_editor = None;
             return;
         };
-        if self.loaded_editor.as_ref() == Some(&id) {
+        // Again whenever the server's copy of the routine replaced the one on screen (an edit's
+        // answer, or a refused edit put back): fields left on the old text would send it again
+        // on the next Back or Test run, over what the server just said.
+        // Only this routine's: an answer for another one must leave these fields, which may be
+        // half-typed, as they are.
+        let resync = id
+            .as_deref()
+            .map_or(0, |rid| self.state.read(cx).routine_resync(rid));
+        if self.loaded_editor.as_ref() == Some(&(id.clone(), resync)) {
             return;
         }
-        self.loaded_editor = Some(id.clone());
+        self.loaded_editor = Some((id.clone(), resync));
         let coworker = self.state.read(cx).active_coworker_id.clone();
         let routine = coworker.as_ref().and_then(|cid| {
             id.as_ref().and_then(|rid| {
@@ -225,7 +235,7 @@ impl ComputerPane {
             let instruction = instruction_input.read(cx).value().to_string();
             let cron = custom_cron.read(cx).value().to_string();
             app.update(cx, |state, cx| {
-                state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
+                // The typed cron line first, so the save below sends the line on screen.
                 if let Some(sid) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
                     row.triggers.iter().rev().find_map(|t| match t {
                         RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
@@ -238,6 +248,7 @@ impl ComputerPane {
                 {
                     spec.expr = cron;
                 }
+                state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
             });
         })
     }
@@ -555,7 +566,7 @@ impl ComputerPane {
                                         persist(cx);
                                         if let Some(id) = id.clone() {
                                             app.update(cx, |state, cx| {
-                                                state.record_routine_run(&coworker_id, &id, cx);
+                                                state.run_routine_now(&coworker_id, &id, cx);
                                             });
                                         }
                                     }
@@ -605,14 +616,39 @@ impl ComputerPane {
                                 .justify_between()
                                 .items_center()
                                 .py(px(4.))
-                                .child(div().text_sm().child(run.at))
-                                .when(run.ok, |this| {
-                                    this.child(
-                                        Icon::default()
-                                            .path("icons/check.svg")
-                                            .size(px(14.))
-                                            .text_color(rgb(0x34c759)),
-                                    )
+                                .child(
+                                    h_flex()
+                                        .gap(px(6.))
+                                        .child(div().text_sm().child(run.at.clone()))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(run.cause_label()),
+                                        ),
+                                )
+                                .child(match run.status {
+                                    ScheduleRunStatus::Ok => Icon::default()
+                                        .path("icons/check.svg")
+                                        .size(px(14.))
+                                        .text_color(rgb(0x34c759))
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Error => div()
+                                        .text_xs()
+                                        .text_color(theme.danger)
+                                        .child("Failed")
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Running => div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("Running")
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Waiting => div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("Waiting on you")
+                                        .into_any_element(),
+                                    ScheduleRunStatus::Other => div().into_any_element(),
                                 })
                         }))
                         .into_any_element()

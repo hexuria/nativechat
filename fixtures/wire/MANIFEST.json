@@ -232,6 +232,22 @@
     {
       "file": "rest/POST__ag-ui_box-handoff_resolve/200-skip_via_form_entry_id_settles_the_live_handoff_and_resumes.json",
       "source": "crates/opengrok-server/src/agui/user_form.rs:384 resolve_box_handoff (the card from crates/opengrok-server/src/cards.rs:113 computer_handoff_card, settled by crates/opengrok-server/src/agui/user_form.rs:991; the instruction from crates/opengrok-tools/src/user_form.rs:590), in the test skip_via_form_entry_id_settles_the_live_handoff_and_resumes (crates/opengrok-server/tests/against_user_form.rs:1174)"
+    },
+    {
+      "file": "rest/GET__schedules__id__runs/200-run_now_starts_a_run_the_history_calls_manual.json",
+      "source": "crates/opengrok-server/src/autonomy/routes.rs:807 history via schedule_runs (crates/opengrok-server/src/autonomy/routes.rs:752), in the test run_now_starts_a_run_the_history_calls_manual (crates/opengrok-server/tests/against_routines.rs:1133); ids and times are placeholders"
+    },
+    {
+      "file": "rest/GET__schedules__id__runs/200-the_history_is_newest_first_and_bounded.json",
+      "source": "crates/opengrok-server/src/autonomy/routes.rs:807 history via schedule_runs (crates/opengrok-server/src/autonomy/routes.rs:752), in the test the_history_is_newest_first_and_bounded (crates/opengrok-server/tests/against_routines.rs:1416); ids and times are placeholders"
+    },
+    {
+      "file": "rest/POST__schedules__id__run/202-run_now_starts_a_run_the_history_calls_manual.json",
+      "source": "crates/opengrok-server/src/autonomy/mod.rs:249 start_fired via run_schedule_now (crates/opengrok-server/src/autonomy/routes.rs:674), in the test run_now_starts_a_run_the_history_calls_manual (crates/opengrok-server/tests/against_routines.rs:1133)"
+    },
+    {
+      "file": "rest/PATCH__schedules__id_/200-an_edited_routine_runs_now_with_its_new_prompt.json",
+      "source": "crates/opengrok-server/src/autonomy/routes.rs:157 RoutineRow::json via edit_schedule (crates/opengrok-server/src/autonomy/routes.rs:511), in the test an_edited_routine_runs_now_with_its_new_prompt (crates/opengrok-server/tests/against_routines.rs:1086); ids and nextDueMs are placeholders"
     }
   ],
   "unrecorded": [

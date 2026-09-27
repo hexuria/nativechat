@@ -38,8 +38,8 @@ use super::activity::{
 };
 use super::client::{
     AnswerReply, AsyncRunResponse, LocalExecMode, LocalExecPolicy, QueuedApproval, RecipeDetail,
-    RecipeList, RecipeParameterKind, RecipeRunResult, ScheduleKind, ScheduleRow, SkillDetail,
-    SkillSummary, ThreadReplay,
+    RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, ScheduleKind, ScheduleRow,
+    ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, ThreadReplay,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::gen_ui::{
@@ -1148,6 +1148,9 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__recipes__id_", recipe_detail),
     ("POST__recipes__id__run", recipe_run),
     ("GET__schedules", schedules),
+    ("GET__schedules__id__runs", schedule_runs),
+    ("POST__schedules__id__run", schedule_run_started),
+    ("PATCH__schedules__id_", schedule_edited),
     ("GET__skills", skills),
     ("GET__skills__id_", skill_detail),
     ("GET__account", account),
@@ -1510,6 +1513,42 @@ fn recipe_run(status: u16, body: &Value) -> Check {
         other => return Err(format!("no reading for a {other} from a run")),
     }
     Ok(())
+}
+
+/// Every line of a routine's history comes through, and every word in it is one this app has
+/// a name for: a cause or a status read as `Other` is the server saying something the editor
+/// cannot say back.
+fn schedule_runs(_: u16, body: &Value) -> Check {
+    let listed: Vec<ScheduleRun> = parse(body)?;
+    let raw = rows(body)?;
+    same_len(&listed, raw)?;
+    for (run, raw) in listed.iter().zip(raw) {
+        must!(
+            run.run_id == str_at(raw, "runId")
+                && Some(run.started_at_ms) == raw.get("startedAtMs").and_then(Value::as_i64)
+                && run.ended_at_ms == raw.get("endedAtMs").and_then(Value::as_i64),
+            "a run came through changed: {run:?}"
+        );
+        must!(
+            run.cause != RunCause::Other && run.status != ScheduleRunStatus::Other,
+            "a word this app has no name for: {raw}"
+        );
+    }
+    Ok(())
+}
+
+fn schedule_run_started(_: u16, body: &Value) -> Check {
+    let started: ScheduleRunStarted = parse(body)?;
+    must!(
+        started.run_id == str_at(body, "runId") && !started.run_id.is_empty(),
+        "the run id should come through: {started:?}"
+    );
+    Ok(())
+}
+
+/// An edit answers with the routine as it now is, which is what the editor draws next.
+fn schedule_edited(status: u16, body: &Value) -> Check {
+    schedules(status, &Value::Array(vec![body.clone()]))
 }
 
 fn schedules(_: u16, body: &Value) -> Check {

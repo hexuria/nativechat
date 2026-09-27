@@ -17,13 +17,14 @@ use crate::opengrok::{
     LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill,
     OpenGrokClient, OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite,
     ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunRecipeResponse,
-    RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
-    ScheduleKind, ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
-    SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
-    TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
-    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunCause,
+    RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT,
+    SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus,
+    ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing,
+    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming,
+    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
+    UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay, approval_summary,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
@@ -1643,6 +1644,9 @@ pub struct AgentRoutine {
     pub active: bool,
     pub triggers: Vec<RoutineTrigger>,
     pub runs: Vec<RoutineRun>,
+    /// The name, prompt and cron line as the server last answered them, for a routine it has.
+    /// An edit sends only what differs from this. A draft has none.
+    pub saved: Option<ScheduleEdit>,
 }
 
 /// What the app says when somebody asks a routine for a second way of firing.
@@ -1656,16 +1660,86 @@ pub const ROUTINE_IS_ONE_SCHEDULE: &str =
 /// One schedule as the editor draws it.
 fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
     let trigger = trigger_from_schedule(&row);
+    let saved = ScheduleEdit {
+        name: row.name.clone(),
+        prompt: Some(row.prompt.clone()),
+        cron: row.cron.clone(),
+    };
     AgentRoutine {
         name: row.name.unwrap_or_default(),
         instruction: row.prompt,
         active: row.active,
         triggers: vec![trigger],
-        // The server keeps no history of a schedule's runs, so there is none to show. Test run
-        // still writes its own line, which is this app's note of a thing it just did.
+        // The history is its own route (`GET /schedules/{id}/runs`), read when the routine is
+        // opened.
         runs: Vec::new(),
+        saved: Some(saved),
         id: row.id,
     }
+}
+
+/// A fresh read of the history, with any run this app was just told about and the history does
+/// not list yet kept on top (see `UNLISTED_RUN_MS`). It is still `running`, so the Computer pane
+/// keeps reading until the history has it.
+fn with_unlisted_runs(
+    shown: &[RoutineRun],
+    listed: Vec<RoutineRun>,
+    now_ms: i64,
+) -> Vec<RoutineRun> {
+    let mut runs: Vec<RoutineRun> = shown
+        .iter()
+        .filter(|run| {
+            run.unsettled()
+                && now_ms - run.started_at_ms < UNLISTED_RUN_MS
+                && !listed.iter().any(|listed| listed.run_id == run.run_id)
+        })
+        .cloned()
+        .collect();
+    runs.extend(listed);
+    runs
+}
+
+/// A listing's routines, each keeping the history already read for it. The listing has no
+/// history in it, and a roster refresh re-lists while a routine is open: the history stays until
+/// the next read of its own replaces it.
+fn relisted(before: Option<&[AgentRoutine]>, rows: Vec<ScheduleRow>) -> Vec<AgentRoutine> {
+    rows.into_iter()
+        .map(|row| {
+            let mut routine = routine_from_schedule(row);
+            if let Some(listed) = before.and_then(|rows| rows.iter().find(|r| r.id == routine.id)) {
+                routine.runs = listed.runs.clone();
+            }
+            routine
+        })
+        .collect()
+}
+
+/// What an edit of a routine the server has should send: each field the person changed from
+/// what the server last said, and nothing else.
+///
+/// The cron line is compared as the schedule it means rather than as text: the server hands a
+/// line back in its own six-field form (`0 0 9 * * 1` for Mondays at 9), which is read the way
+/// the server shows it (`from_server_cron`), so the picker's `0 9 * * 1` is no change. A
+/// schedule the picker cannot turn into one line is not sent at all; the editor already says
+/// why, and the server would refuse it.
+fn routine_edit(routine: &AgentRoutine) -> ScheduleEdit {
+    let Some(saved) = &routine.saved else {
+        return ScheduleEdit::default();
+    };
+    let name =
+        (saved.name.as_deref().unwrap_or_default() != routine.name).then(|| routine.name.clone());
+    let prompt = (saved.prompt.as_deref().unwrap_or_default() != routine.instruction)
+        .then(|| routine.instruction.clone());
+    let cron = routine.triggers.iter().find_map(|trigger| match trigger {
+        RoutineTrigger::Schedule { spec, .. } => spec.to_cron().ok(),
+        _ => None,
+    });
+    let before = saved
+        .cron
+        .as_deref()
+        .and_then(|line| ScheduleSpec::from_server_cron(line).to_cron().ok());
+    let cron = cron.filter(|line| Some(line) != before.as_ref());
+    ScheduleEdit { name, prompt, cron }
 }
 
 /// The trigger a schedule is. A cron row is read back into the picker where the line is one of
@@ -1684,7 +1758,7 @@ fn trigger_from_schedule(row: &ScheduleRow) -> RoutineTrigger {
         }
         ScheduleKind::Cron => RoutineTrigger::Schedule {
             id: row.id.clone(),
-            spec: ScheduleSpec::from_cron(row.cron.as_deref().unwrap_or_default()),
+            spec: ScheduleSpec::from_server_cron(row.cron.as_deref().unwrap_or_default()),
         },
     }
 }
@@ -1735,10 +1809,69 @@ impl RoutineTrigger {
     }
 }
 
+/// One line of a routine's Run history, from the server's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutineRun {
+    pub run_id: String,
+    /// When it started, as the row reads.
     pub at: String,
-    pub ok: bool,
+    pub started_at_ms: i64,
+    pub cause: RunCause,
+    pub status: ScheduleRunStatus,
+}
+
+/// How long a Test run the server has named stays on screen before its history lists it. The
+/// server answers `202` and starts the run on its own task, so the read straight after can
+/// come back without it; a run the history never lists by then was not one worth showing.
+const UNLISTED_RUN_MS: i64 = 60_000;
+
+impl RoutineRun {
+    fn from_server(run: ScheduleRun) -> Self {
+        let at = chrono::DateTime::from_timestamp_millis(run.started_at_ms)
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%b %d at %I:%M %p")
+                    .to_string()
+                    .replace(" 0", " ")
+            })
+            .unwrap_or_default();
+        Self {
+            run_id: run.run_id,
+            at,
+            started_at_ms: run.started_at_ms,
+            cause: run.cause,
+            status: run.status,
+        }
+    }
+
+    /// The run a Test run just started, before the history has it.
+    fn just_started(run_id: String) -> Self {
+        Self::from_server(ScheduleRun {
+            run_id,
+            cause: RunCause::Manual,
+            status: ScheduleRunStatus::Running,
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
+            ended_at_ms: None,
+        })
+    }
+
+    /// Still going, or parked on a card: a later look can say how it ended.
+    pub fn unsettled(&self) -> bool {
+        matches!(
+            self.status,
+            ScheduleRunStatus::Running | ScheduleRunStatus::Waiting
+        )
+    }
+
+    /// What set it off, in the words the editor uses for it.
+    pub fn cause_label(&self) -> &'static str {
+        match self.cause {
+            RunCause::Manual => "Test run",
+            RunCause::Webhook => "Webhook",
+            RunCause::Clock => "Schedule",
+            RunCause::Other => "Run",
+        }
+    }
 }
 
 /// What the confirm dialog over the app is asking about the active bot's computer.
@@ -2469,6 +2602,24 @@ pub struct AppState {
     pub right_pane: RightPane,
     pub computer_view: ComputerView,
     pub routines: HashMap<String, Vec<AgentRoutine>>,
+    /// Routines with an edit on its way to the server: the number of the latest one, and whether
+    /// a Test run is waiting on it. A Test run pressed straight after a change has to run the
+    /// changed routine, so it waits for the latest edit to settle rather than racing it, and an
+    /// earlier edit's answer landing late is not what the routine now says.
+    routine_edits: HashMap<String, (u64, bool)>,
+    /// Numbers every edit and every history read, so a late answer can be told from the latest.
+    routine_seq: u64,
+    /// The latest history read asked for, per routine. The Computer pane's poll and a Test run
+    /// can both have one out, and an older page that missed a run must not delete the line a
+    /// newer one already settled.
+    routine_runs_asked: HashMap<String, u64>,
+    /// The latest edit started for each routine, kept after it settles. A read of the server's
+    /// copy started before it is older than what it saved, and is dropped.
+    routine_latest_edit: HashMap<String, u64>,
+    /// Per routine, bumped whenever the server's copy is written over what the editor shows (an
+    /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
+    /// because an answer for one must leave another's half-typed fields alone.
+    routine_resyncs: HashMap<String, u64>,
     pub model_picker_open: bool,
     pub avatar_editor_open: bool,
     pub hiring: bool,
@@ -3018,6 +3169,11 @@ impl AppState {
             right_pane: RightPane::Closed,
             computer_view: ComputerView::Overview,
             routines: HashMap::new(),
+            routine_edits: HashMap::new(),
+            routine_seq: 0,
+            routine_runs_asked: HashMap::new(),
+            routine_latest_edit: HashMap::new(),
+            routine_resyncs: HashMap::new(),
             model_picker_open: false,
             avatar_editor_open: false,
             hiring: false,
@@ -4467,6 +4623,7 @@ impl AppState {
                     if state.right_pane == RightPane::Computer {
                         state.refresh_coworker_computer(cx);
                         state.refresh_coworker_screen(cx);
+                        state.refresh_unsettled_routine_runs(cx);
                     }
                 });
                 if alive.is_err() {
@@ -6366,21 +6523,26 @@ impl AppState {
             Some(id) => id,
             None => {
                 let id = uuid::Uuid::new_v4().to_string();
-                self.routines.entry(coworker_id).or_default().insert(
-                    0,
-                    AgentRoutine {
-                        id: id.clone(),
-                        name: String::new(),
-                        instruction: String::new(),
-                        active: true,
-                        triggers: Vec::new(),
-                        runs: Vec::new(),
-                    },
-                );
+                self.routines
+                    .entry(coworker_id.clone())
+                    .or_default()
+                    .insert(
+                        0,
+                        AgentRoutine {
+                            id: id.clone(),
+                            name: String::new(),
+                            instruction: String::new(),
+                            active: true,
+                            triggers: Vec::new(),
+                            runs: Vec::new(),
+                            saved: None,
+                        },
+                    );
                 id
             }
         };
         self.set_right_pane(RightPane::Computer, cx);
+        self.load_routine_runs(&coworker_id, &id, cx);
         self.computer_view = ComputerView::Editor { id: Some(id) };
         self.record_nav();
         cx.notify();
@@ -6417,11 +6579,11 @@ impl AppState {
             .unwrap_or(&[])
     }
 
-    /// The editor's two fields, written back to the routine on screen.
-    ///
-    /// Only on screen: `/schedules` takes a name and a prompt when a schedule is made and has
-    /// no route to change either afterwards. So this is what a routine reads as here until the
-    /// next listing, which is the server's copy and wins.
+    /// The editor's fields, written back to the routine, and to the server when it has the
+    /// routine: `PATCH /schedules/{id}` with the name, prompt and cron line that changed. The
+    /// row that comes back is what the routine now reads as. A refusal says why and puts the
+    /// server's copy back, because a routine that looks saved and is not is the one thing an
+    /// editor must never show.
     pub fn save_routine_fields(
         &mut self,
         coworker_id: &str,
@@ -6430,11 +6592,195 @@ impl AppState {
         instruction: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(row) = self.routine_mut(coworker_id, routine_id) {
-            row.name = name;
-            row.instruction = instruction;
-        }
+        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
+            return;
+        };
+        row.name = name;
+        row.instruction = instruction;
+        let edit = routine_edit(row);
         cx.notify();
+        if edit.is_empty() {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let coworker_id = coworker_id.to_string();
+        let routine_id = routine_id.to_string();
+        self.routine_seq += 1;
+        let this_edit = self.routine_seq;
+        self.routine_latest_edit
+            .insert(routine_id.clone(), this_edit);
+        // A Test run already waiting keeps waiting, now on this edit.
+        let entry = self
+            .routine_edits
+            .entry(routine_id.clone())
+            .or_insert((this_edit, false));
+        entry.0 = this_edit;
+        cx.spawn(async move |this, cx| {
+            let result = client.edit_schedule(&routine_id, &edit).await;
+            let _ = this.update(cx, |state, cx| {
+                // An earlier edit's answer, with a later one still out: the later one says what
+                // the routine is, and settles the wait.
+                if state
+                    .routine_edits
+                    .get(&routine_id)
+                    .map(|(latest, _)| *latest)
+                    != Some(this_edit)
+                {
+                    return;
+                }
+                let run_waiting = state
+                    .routine_edits
+                    .remove(&routine_id)
+                    .is_some_and(|(_, waiting)| waiting);
+                match result {
+                    Ok(row) => {
+                        state.put_server_routine(&coworker_id, row);
+                        if run_waiting {
+                            state.run_routine_now(&coworker_id, &routine_id, cx);
+                        }
+                    }
+                    // A Test run waiting on a refused edit is not started: it would run the
+                    // routine the person just tried to change.
+                    Err(error) => {
+                        state.computer_action_error = Some(error.message);
+                        state.restore_routine(&coworker_id, &routine_id, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The server's copy of one routine, written over the one on screen and into the editor's
+    /// fields. Its history is its own read and is kept.
+    fn put_server_routine(&mut self, coworker_id: &str, row: ScheduleRow) {
+        let mut routine = routine_from_schedule(row);
+        let routine_id = routine.id.clone();
+        if let Some(current) = self.routine_mut(coworker_id, &routine_id) {
+            routine.runs = std::mem::take(&mut current.runs);
+            *current = routine;
+            *self.routine_resyncs.entry(routine_id).or_default() += 1;
+        }
+    }
+
+    /// How many times the server's copy of this routine has been written over the editor's.
+    pub fn routine_resync(&self, routine_id: &str) -> u64 {
+        self.routine_resyncs
+            .get(routine_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Put back the server's copy of a routine after it refused an edit, so the editor stops
+    /// showing words that were never saved. Only this routine, and not over an edit started
+    /// since, whether that one is still out or has already landed: this read began before it,
+    /// and would put the refused edit's predecessor back over the correction.
+    fn restore_routine(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let coworker_id = coworker_id.to_string();
+        let routine_id = routine_id.to_string();
+        let edit_at_start = self.routine_latest_edit.get(&routine_id).copied();
+        cx.spawn(async move |this, cx| {
+            let result = client.list_schedules(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.routine_latest_edit.get(&routine_id).copied() != edit_at_start {
+                    return;
+                }
+                match result {
+                    Ok(rows) => {
+                        if let Some(row) = rows.into_iter().find(|row| row.id == routine_id) {
+                            state.put_server_routine(&coworker_id, row);
+                        }
+                    }
+                    // The fields still hold what the server refused, and saying nothing would
+                    // let the next Back send it again as though it were fine.
+                    Err(error) => {
+                        let refused = state.computer_action_error.take().unwrap_or_default();
+                        state.computer_action_error = Some(
+                            format!(
+                                "{refused} The saved routine could not be read back ({}), so \
+                                 what is shown may not be what is saved.",
+                                error.message
+                            )
+                            .trim()
+                            .to_string(),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The open routine's history again, while a run in it has not said how it ended: a Test
+    /// run is `running` when it is first listed, and a history that stopped there would say so
+    /// for good.
+    fn refresh_unsettled_routine_runs(&mut self, cx: &mut Context<Self>) {
+        let (
+            Some(coworker_id),
+            ComputerView::Editor {
+                id: Some(routine_id),
+            },
+        ) = (self.active_coworker_id.clone(), self.computer_view.clone())
+        else {
+            return;
+        };
+        if self
+            .routine_mut(&coworker_id, &routine_id)
+            .is_some_and(|row| row.runs.iter().any(RoutineRun::unsettled))
+        {
+            self.load_routine_runs(&coworker_id, &routine_id, cx);
+        }
+    }
+
+    /// Read a routine's Run history from the server. A draft has none to read.
+    pub fn load_routine_runs(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        let Some(client) = self.opengrok.clone().filter(|_| on_the_server) else {
+            return;
+        };
+        let coworker_id = coworker_id.to_string();
+        let routine_id = routine_id.to_string();
+        self.routine_seq += 1;
+        let this_read = self.routine_seq;
+        self.routine_runs_asked
+            .insert(routine_id.clone(), this_read);
+        cx.spawn(async move |this, cx| {
+            let result = client.schedule_runs(&routine_id).await;
+            let _ = this.update(cx, |state, cx| {
+                // A page asked for before the latest one is older news than it.
+                if state.routine_runs_asked.get(&routine_id) != Some(&this_read) {
+                    return;
+                }
+                match result {
+                    Ok(runs) => {
+                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
+                            row.runs = with_unlisted_runs(
+                                &row.runs,
+                                runs.into_iter().map(RoutineRun::from_server).collect(),
+                                chrono::Utc::now().timestamp_millis(),
+                            );
+                        }
+                    }
+                    Err(error) => state.computer_action_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn routine_mut(
@@ -6525,7 +6871,10 @@ impl AppState {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        routines.extend(rows.into_iter().map(routine_from_schedule));
+                        routines.extend(relisted(
+                            state.routines.get(&coworker_id).map(Vec::as_slice),
+                            rows,
+                        ));
                         state.routines.insert(coworker_id, routines);
                     }
                     Err(error) => state.computer_action_error = Some(error.message),
@@ -6669,26 +7018,46 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn record_routine_run(
-        &mut self,
-        coworker_id: &str,
-        routine_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let stamp = chrono::Local::now()
-            .format("%b %d at %I:%M %p")
-            .to_string()
-            .replace(" 0", " ");
-        if let Some(row) = self.routine_mut(coworker_id, routine_id) {
-            row.runs.insert(
-                0,
-                RoutineRun {
-                    at: stamp,
-                    ok: true,
-                },
-            );
+    /// Test run: the server starts the routine's prompt now, in the routine's thread, and the
+    /// history is read again so the run it started is the top line. The line is the server's,
+    /// not this app's note that a button was pressed; while it is going, the Computer pane's
+    /// poll keeps reading it until it says how it ended.
+    pub fn run_routine_now(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !on_the_server {
+            self.computer_action_error =
+                Some("Choose when this routine runs first, then test it.".to_string());
+            cx.notify();
+            return;
         }
-        cx.notify();
+        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
+            *run_waiting = true;
+            return;
+        }
+        let coworker_id = coworker_id.to_string();
+        let routine_id = routine_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = client.run_schedule_now(&routine_id).await;
+            let _ = this.update(cx, |state, cx| {
+                match result {
+                    Ok(run_id) => {
+                        state.computer_action_error = None;
+                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
+                            row.runs.insert(0, RoutineRun::just_started(run_id));
+                        }
+                        state.load_routine_runs(&coworker_id, &routine_id, cx);
+                    }
+                    Err(error) => state.computer_action_error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Drop the routine here and on the server.
@@ -15758,6 +16127,197 @@ mod tests {
         assert_eq!(url, "https://og.example/hooks/sch_2");
         assert_eq!(key, "og_live_abc");
         assert_eq!(header, "Authorization: Bearer og_live_abc");
+    }
+
+    /// An edit of a routine the server has sends what the person changed and nothing else. The
+    /// server's six-field line and the picker's own line for the same schedule are no change;
+    /// a draft has nothing on the server to edit.
+    #[test]
+    fn an_edit_is_only_what_changed_from_the_servers_copy() {
+        let row = |json: serde_json::Value| {
+            super::routine_from_schedule(serde_json::from_value(json).unwrap())
+        };
+        let mut routine = row(serde_json::json!({
+            "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
+            "prompt": "weekly report", "name": "Report", "active": true
+        }));
+        assert!(
+            super::routine_edit(&routine).is_empty(),
+            "opened and closed untouched: nothing to send"
+        );
+
+        routine.name = "Standup".into();
+        assert_eq!(
+            super::routine_edit(&routine),
+            super::ScheduleEdit {
+                name: Some("Standup".into()),
+                ..Default::default()
+            }
+        );
+
+        routine.name = "Report".into();
+        if let super::RoutineTrigger::Schedule { spec, .. } = &mut routine.triggers[0] {
+            *spec = super::ScheduleSpec::from_preset("Every day");
+        }
+        let edit = super::routine_edit(&routine);
+        assert!(edit.name.is_none() && edit.prompt.is_none());
+        assert!(edit.cron.is_some(), "a new schedule is sent: {edit:?}");
+
+        let mut hook = row(serde_json::json!({
+            "id": "sch_2", "coworkerId": "cw_1", "kind": "webhook", "cron": null,
+            "prompt": "Deal with it", "active": true,
+            "webhook": { "url": "u", "key": "k", "header": "h" }
+        }));
+        hook.instruction = "Deal with it now".into();
+        assert_eq!(
+            super::routine_edit(&hook),
+            super::ScheduleEdit {
+                prompt: Some("Deal with it now".into()),
+                ..Default::default()
+            },
+            "a webhook's edit never carries a clock"
+        );
+
+        hook.saved = None;
+        assert!(
+            super::routine_edit(&hook).is_empty(),
+            "a draft is not on the server"
+        );
+    }
+
+    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it,
+    /// it is the picker's own Every week on Monday at 9:00: the editor opens on the picker and
+    /// not a line to decipher, switching the mode control keeps Monday at nine, and the picker
+    /// choosing that same schedule is no edit at all.
+    #[test]
+    fn the_servers_six_field_line_is_the_pickers_own_schedule() {
+        let mut routine = super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
+                "prompt": "weekly report", "name": "Report", "active": true
+            }))
+            .unwrap(),
+        );
+        let super::RoutineTrigger::Schedule { spec, .. } = &mut routine.triggers[0] else {
+            panic!("a cron row is a schedule trigger");
+        };
+        assert_ne!(spec.mode, super::ScheduleUiMode::Custom, "{spec:?}");
+        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * 1"));
+        *spec = super::ScheduleSpec::from_cron("0 9 * * 1");
+        assert!(
+            super::routine_edit(&routine).is_empty(),
+            "the picker's Monday at nine is the server's Monday at nine"
+        );
+        assert_eq!(
+            super::ScheduleSpec::from_server_cron("@every 90m")
+                .to_cron()
+                .ok(),
+            super::ScheduleSpec::from_cron("@every 90m").to_cron().ok(),
+            "a line with no seconds field is read as it is"
+        );
+    }
+
+    /// A roster refresh re-lists the routines while one is open, and the history already read
+    /// for it stays: the listing has none in it.
+    #[test]
+    fn a_relist_keeps_the_history_already_read() {
+        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        let row = || -> crate::opengrok::ScheduleRow {
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
+                "prompt": "weekly report", "active": true
+            }))
+            .unwrap()
+        };
+        let mut shown = super::routine_from_schedule(row());
+        shown.runs = vec![super::RoutineRun::from_server(ScheduleRun {
+            run_id: "run_1".into(),
+            cause: RunCause::Manual,
+            status: ScheduleRunStatus::Ok,
+            started_at_ms: 1_000,
+            ended_at_ms: Some(2_000),
+        })];
+        let relisted = super::relisted(Some(std::slice::from_ref(&shown)), vec![row()]);
+        assert_eq!(relisted[0].runs, shown.runs);
+        assert!(super::relisted(None, vec![row()])[0].runs.is_empty());
+    }
+
+    /// A Test run's line stays on screen, still running, while the history has not caught up
+    /// with it, and gives way to the history's own line once it has. One the history never
+    /// lists is dropped after a minute rather than running for good.
+    #[test]
+    fn a_test_run_is_shown_before_the_history_lists_it() {
+        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        let started = super::RoutineRun::just_started("run_new".into());
+        let now = started.started_at_ms;
+        let old = super::RoutineRun::from_server(ScheduleRun {
+            run_id: "run_old".into(),
+            cause: RunCause::Clock,
+            status: ScheduleRunStatus::Ok,
+            started_at_ms: now - 86_400_000,
+            ended_at_ms: Some(now - 86_000_000),
+        });
+        let shown = vec![started.clone(), old.clone()];
+        let ids = |runs: &[super::RoutineRun]| -> Vec<String> {
+            runs.iter().map(|run| run.run_id.clone()).collect()
+        };
+
+        let behind = super::with_unlisted_runs(&shown, vec![old.clone()], now + 50);
+        assert_eq!(
+            ids(&behind),
+            ["run_new", "run_old"],
+            "not listed yet: kept on top"
+        );
+        assert!(behind[0].unsettled(), "and still read again");
+
+        let mut listed = started.clone();
+        listed.status = ScheduleRunStatus::Ok;
+        let caught_up = super::with_unlisted_runs(&shown, vec![listed, old.clone()], now + 50);
+        assert_eq!(ids(&caught_up), ["run_new", "run_old"]);
+        assert_eq!(
+            caught_up[0].status,
+            ScheduleRunStatus::Ok,
+            "the history's own line wins"
+        );
+
+        let never = super::with_unlisted_runs(&shown, vec![old], now + super::UNLISTED_RUN_MS);
+        assert_eq!(
+            ids(&never),
+            ["run_old"],
+            "a run the history never lists is let go"
+        );
+    }
+
+    /// A history line says what set the run off in the editor's words, and whether a later look
+    /// could still change it.
+    #[test]
+    fn a_history_line_names_its_cause_and_knows_when_it_is_settled() {
+        let line = |cause, status| {
+            super::RoutineRun::from_server(crate::opengrok::ScheduleRun {
+                run_id: "run_1".into(),
+                cause,
+                status,
+                started_at_ms: 1_000,
+                ended_at_ms: None,
+            })
+        };
+        use crate::opengrok::{RunCause, ScheduleRunStatus};
+        assert_eq!(
+            line(RunCause::Manual, ScheduleRunStatus::Ok).cause_label(),
+            "Test run"
+        );
+        assert_eq!(
+            line(RunCause::Webhook, ScheduleRunStatus::Ok).cause_label(),
+            "Webhook"
+        );
+        assert_eq!(
+            line(RunCause::Clock, ScheduleRunStatus::Ok).cause_label(),
+            "Schedule"
+        );
+        assert!(line(RunCause::Manual, ScheduleRunStatus::Running).unsettled());
+        assert!(line(RunCause::Manual, ScheduleRunStatus::Waiting).unsettled());
+        assert!(!line(RunCause::Manual, ScheduleRunStatus::Error).unsettled());
+        assert!(!line(RunCause::Manual, ScheduleRunStatus::Ok).at.is_empty());
     }
 
     /// A line the pickers cannot draw is still a routine: it lists, it pauses, it deletes, and
