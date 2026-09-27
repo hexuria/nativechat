@@ -33,6 +33,16 @@
 //! `settings-login-add-sheet` while the Add sheet is up (`settings-login-add-title`,
 //! `settings-login-add-username`, `settings-login-add-password`, `settings-login-add-website`,
 //! `settings-login-add-notes`, `settings-login-add-save`, `settings-login-add-cancel`),
+//! `settings-tab-computer`, where this Mac's standing rules sit under its mode:
+//! `settings-local-rules-allow|deny` (a list, value = its count; in the tree only while it has a
+//! rule on it) with its rows `settings-local-rule-allow|deny-{n}` (counted from 0 in the
+//! server's order, value = the command exactly; state `inert` on an allow the server says can
+//! never match, with `settings-local-rule-inert-allow-{n}` saying so and the server's reason as
+//! its value; state `removing` while its Remove is with the server), and under each row
+//! `settings-local-rule-remove-allow|deny-{n}` (dead while removing) and
+//! `settings-local-rule-error-allow|deny-{n}` (why its last Remove did not go through);
+//! `settings-local-rules-empty` while there are none, `settings-local-rules-error` while they
+//! could not be read. Nothing for a machine that is not this Mac.
 //! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-delete`.

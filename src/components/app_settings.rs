@@ -4,7 +4,7 @@ use crate::components::logins::LoginsPage;
 use crate::components::skills::SkillsPage;
 use crate::opengrok::LocalExecMode;
 use crate::send_policy::OnSend;
-use crate::state::{AppSettingsTab, AppState, SubmitChord};
+use crate::state::{AppSettingsTab, AppState, LocalRuleRow, LocalRules, RuleKind, SubmitChord};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
@@ -726,6 +726,8 @@ fn computer_page(
                 .child("No computers yet. Stay signed in here and NativeChat enrols this Mac."),
         );
     }
+    let rules = app.read(cx).this_mac_rules();
+    let theme = cx.theme();
     let mut card = v_flex()
         .w_full()
         .rounded(px(12.))
@@ -736,9 +738,158 @@ fn computer_page(
         if i > 0 {
             card = card.child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)));
         }
-        card = card.child(computer_row(computer, muted, app.clone()));
+        // This Mac's rules go under its own row and no other: they were read for its machine,
+        // and the app keeps no other machine's.
+        let rules = rules
+            .filter(|rules| computer.this_machine && rules.machine_id == computer.machine_id)
+            .map(|rules| local_rules_block(rules, theme, app.clone()).into_any_element());
+        card = card.child(computer_row(computer, rules, muted, app.clone()));
     }
     page.child(card)
+}
+
+/// What this Mac's rules say when there are none.
+pub(crate) const NO_LOCAL_RULES: &str = "No commands are always allowed or never allowed yet. \
+     Always allow or Never on a command's card keeps one here.";
+
+/// Above this Mac's rules: where they come from, and when they count. The gate reads them only
+/// while the machine is on Ask (opengrok-server `decide`): Always allow skips both lists and
+/// Never allow refuses everything, so a rule under either is kept but not read.
+const LOCAL_RULES_NOTE: &str = "Always allow and Never on a command's card keep the command \
+     here. They apply only while this computer is set to Ask every time.";
+
+/// The heading over each of this Mac's two lists.
+pub(crate) fn rule_list_title(kind: RuleKind) -> &'static str {
+    match kind {
+        RuleKind::Allow => "Always allowed",
+        RuleKind::Deny => "Never allowed",
+    }
+}
+
+/// What a rule's Remove says, and what it says while the server has it.
+pub(crate) fn remove_label(removing: bool) -> &'static str {
+    if removing { "Removing…" } else { "Remove" }
+}
+
+/// The line under an allow the gate can never match: that it is not in effect, then the
+/// server's reason as `inert` gives it (opengrok-server `standing_rule_refusal`, #246).
+///
+/// The reason is given whole. It is the rule endpoint's own sentence for what an allow may be,
+/// read here by somebody deciding whether to take the rule off, and the long one is the list
+/// of what a plain command may not contain.
+pub(crate) fn not_in_effect_line(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        "Not in effect.".to_string()
+    } else if reason.ends_with(['.', '!', '?']) {
+        format!("Not in effect: {reason}")
+    } else {
+        format!("Not in effect: {reason}.")
+    }
+}
+
+/// The Remove on this Mac's `n`th rule of `kind`. The same id is the one gpui-agent clicks, so
+/// the control a driver presses is the control a person presses.
+pub(crate) fn local_rule_remove_id(kind: RuleKind, n: usize) -> String {
+    format!("settings-local-rule-remove-{}-{n}", kind.word())
+}
+
+/// This Mac's standing rules, under its mode: the commands a local-shell card's Always allow
+/// and Never kept, in two lists, each with a Remove.
+fn local_rules_block(
+    rules: &LocalRules,
+    theme: &gpui_kit::component::Theme,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    let muted = theme.muted_foreground;
+    let mut block = v_flex().w_full().gap(px(10.));
+    if let Some(error) = &rules.error {
+        block = block.child(
+            div()
+                .text_xs()
+                .text_color(theme.danger)
+                .child(error.clone()),
+        );
+    }
+    if rules.is_empty() {
+        // A list that could not be read is not a list with nothing on it.
+        if rules.listed {
+            block = block.child(div().text_xs().text_color(muted).child(NO_LOCAL_RULES));
+        }
+        return block;
+    }
+    block = block.child(div().text_xs().text_color(muted).child(LOCAL_RULES_NOTE));
+    for kind in RuleKind::ALL {
+        let rows = rules.rows(kind);
+        if rows.is_empty() {
+            continue;
+        }
+        let mut list = v_flex()
+            .w_full()
+            .gap(px(6.))
+            .child(div().text_sm().child(rule_list_title(kind)));
+        for (n, row) in rows.iter().enumerate() {
+            list = list.child(local_rule_row(kind, n, row, rules, theme, app.clone()));
+        }
+        block = block.child(list);
+    }
+    block
+}
+
+/// One rule: the command as the server keeps it, whether the gate can ever match it, why its
+/// last Remove did not go through, and Remove.
+fn local_rule_row(
+    kind: RuleKind,
+    n: usize,
+    row: &LocalRuleRow,
+    rules: &LocalRules,
+    theme: &gpui_kit::component::Theme,
+    app: Entity<AppState>,
+) -> impl IntoElement {
+    let muted = theme.muted_foreground;
+    let removing = rules.is_removing(kind, &row.pattern);
+    let not_removed = rules.not_removed(kind, &row.pattern).map(str::to_string);
+    let pattern = row.pattern.clone();
+    h_flex()
+        .w_full()
+        .items_start()
+        .justify_between()
+        .gap(px(12.))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_family(theme.mono_font_family.clone())
+                        // An allow that is never read is drawn like one: there, and dimmed.
+                        .when(row.inert.is_some(), |this| this.text_color(muted))
+                        .child(row.pattern.clone()),
+                )
+                .when_some(
+                    row.inert.as_deref().map(not_in_effect_line),
+                    |this, line| this.child(div().text_xs().text_color(muted).child(line)),
+                )
+                .when_some(not_removed, |this, why| {
+                    this.child(div().text_xs().text_color(theme.danger).child(why))
+                }),
+        )
+        .child(
+            div().flex_shrink_0().child(
+                Button::new(ElementId::Name(local_rule_remove_id(kind, n).into()))
+                    .label(remove_label(removing))
+                    .ghost()
+                    .small()
+                    .disabled(removing)
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |state, cx| {
+                            state.remove_local_rule(kind, pattern.clone(), cx);
+                        });
+                    }),
+            ),
+        )
 }
 
 fn settings_route_traffic_row(app: Entity<AppState>, muted: Hsla, cx: &App) -> impl IntoElement {
@@ -863,8 +1014,11 @@ fn egress_menu_item(
         })
 }
 
+/// One computer on the roster: what it is, and its mode. `rules` is drawn under the mode, and
+/// only this Mac's row has any.
 fn computer_row(
     computer: crate::opengrok::ConnectedComputer,
+    rules: Option<AnyElement>,
     muted: Hsla,
     app: Entity<AppState>,
 ) -> impl IntoElement {
@@ -946,6 +1100,7 @@ fn computer_row(
                     app,
                 )),
         )
+        .when_some(rules, |this, rules| this.child(rules))
 }
 
 fn exec_mode_picker(
@@ -1080,4 +1235,32 @@ fn shortcuts_page(
                         })),
                 )
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::not_in_effect_line;
+
+    /// An allow the gate never reads says so, in the server's sentence given whole and closed
+    /// with a full stop: the long one lists everything a plain command may not have in it, and
+    /// clipping it would clip off the part that says which one this rule has.
+    #[test]
+    fn an_allow_that_is_never_read_says_why_in_the_servers_words() {
+        assert_eq!(
+            not_in_effect_line("sudo cannot be a standing allow"),
+            "Not in effect: sudo cannot be a standing allow."
+        );
+        let whole = "an allow rule must be one plain command: no ; && || | & or newline, no $( ) \
+                     or backticks, no redirection to a path, no VAR= in front, and not a program \
+                     that runs another (sh, eval, env, sudo, xargs…)";
+        assert_eq!(
+            not_in_effect_line(whole),
+            format!("Not in effect: {whole}.")
+        );
+        assert_eq!(
+            not_in_effect_line("  it was kept before the refusal. \n"),
+            "Not in effect: it was kept before the refusal."
+        );
+        assert_eq!(not_in_effect_line("   "), "Not in effect.");
+    }
 }

@@ -1,6 +1,9 @@
 use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
+use crate::components::app_settings::{
+    NO_LOCAL_RULES, not_in_effect_line, remove_label, rule_list_title,
+};
 use crate::components::chat_input::PanelMode;
 use crate::components::chat_input::sources::{
     ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource,
@@ -23,11 +26,13 @@ use crate::opengrok::{
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
-    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, SWITCH_IN_FLIGHT, SkillScope,
-    TaughtSkill, WRITING_A_LESSON,
+    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, LocalRuleRow, LocalRules, RuleKind,
+    SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, WRITING_A_LESSON,
 };
 
 pub mod ids {
+    use crate::state::RuleKind;
+
     pub const WINDOW: &str = "app-window";
     pub const PAGE: &str = "page-chat";
     pub const SIDEBAR: &str = "sidebar";
@@ -228,6 +233,39 @@ pub mod ids {
 
     pub fn routine_delete(id: &str) -> String {
         format!("routine-{id}-delete")
+    }
+
+    /// This Mac's standing rules on Settings → Computer, drawn under its mode. The line saying
+    /// there are none is in the tree only while there are none, and the one saying the lists
+    /// could not be read only while they could not.
+    pub const LOCAL_RULES_EMPTY: &str = "settings-local-rules-empty";
+    pub const LOCAL_RULES_ERROR: &str = "settings-local-rules-error";
+
+    /// One of the two lists, `allow` or `deny`, with its count as the value. In the tree only
+    /// while it has a rule on it, as on screen.
+    pub fn local_rules(kind: RuleKind) -> String {
+        format!("settings-local-rules-{}", kind.word())
+    }
+
+    /// The `n`th rule on that list, counted from 0 in the server's order. The value is the
+    /// command exactly as the server keeps it, which is how a driver says which rule it meant.
+    pub fn local_rule(kind: RuleKind, n: usize) -> String {
+        format!("settings-local-rule-{}-{n}", kind.word())
+    }
+
+    /// That rule's Remove: the id the button on screen carries.
+    pub fn local_rule_remove(kind: RuleKind, n: usize) -> String {
+        crate::components::app_settings::local_rule_remove_id(kind, n)
+    }
+
+    /// Why that allow is never read, while the server names it in `inert`.
+    pub fn local_rule_inert(kind: RuleKind, n: usize) -> String {
+        format!("settings-local-rule-inert-{}-{n}", kind.word())
+    }
+
+    /// Why that rule's last Remove did not go through.
+    pub fn local_rule_error(kind: RuleKind, n: usize) -> String {
+        format!("settings-local-rule-error-{}-{n}", kind.word())
     }
 }
 
@@ -438,6 +476,11 @@ pub enum Command {
     DeleteRoutine {
         routine_id: String,
     },
+    /// Settings → Computer: take one of this Mac's standing rules off, named by its command.
+    RemoveLocalRule {
+        kind: RuleKind,
+        pattern: String,
+    },
     Shutdown,
 }
 
@@ -605,6 +648,7 @@ impl Command {
                     state.delete_routine(&coworker_id, &routine_id, cx);
                 }
             }
+            Self::RemoveLocalRule { kind, pattern } => state.remove_local_rule(kind, pattern, cx),
             Self::Shutdown => {}
         }
     }
@@ -1403,6 +1447,62 @@ fn egress_policy_node(current: crate::opengrok::LocalExecMode) -> UiNode {
         .with_child(UiNode::button("egress-policy-never", "Never allow"))
 }
 
+/// This Mac's standing rules as Settings → Computer draws them under its mode: why they could
+/// not be read, the line saying there are none, and each list that has a rule on it.
+fn local_rules_nodes(rules: &LocalRules) -> Vec<UiNode> {
+    let mut nodes = Vec::new();
+    if let Some(error) = &rules.error {
+        nodes.push(UiNode::status(ids::LOCAL_RULES_ERROR, error.clone()));
+    }
+    if rules.is_empty() {
+        // A list that could not be read is not a list with nothing on it.
+        if rules.listed {
+            nodes.push(UiNode::status(ids::LOCAL_RULES_EMPTY, NO_LOCAL_RULES));
+        }
+        return nodes;
+    }
+    for kind in RuleKind::ALL {
+        let rows = rules.rows(kind);
+        if rows.is_empty() {
+            continue;
+        }
+        let mut list = UiNode::list(ids::local_rules(kind), rule_list_title(kind))
+            .with_value(rows.len().to_string());
+        for (n, row) in rows.iter().enumerate() {
+            list = list.with_child(local_rule_node(kind, n, row, rules));
+        }
+        nodes.push(list);
+    }
+    nodes
+}
+
+/// One rule, named and valued by its command. An allow the gate never reads carries `inert`
+/// as a state, so an assert does not have to match the sentence, and the sentence under it with
+/// the server's reason as its value. One whose Remove is with the server carries `removing`,
+/// and its button is dead, as on screen.
+fn local_rule_node(kind: RuleKind, n: usize, row: &LocalRuleRow, rules: &LocalRules) -> UiNode {
+    let removing = rules.is_removing(kind, &row.pattern);
+    let mut node = UiNode::listitem(ids::local_rule(kind, n), row.pattern.clone())
+        .with_value(row.pattern.clone());
+    if let Some(reason) = &row.inert {
+        node.states.push("inert".to_string());
+        node = node.with_child(
+            UiNode::status(ids::local_rule_inert(kind, n), not_in_effect_line(reason))
+                .with_value(reason.clone()),
+        );
+    }
+    if removing {
+        node.states.push("removing".to_string());
+    }
+    if let Some(why) = rules.not_removed(kind, &row.pattern) {
+        node = node.with_child(UiNode::status(ids::local_rule_error(kind, n), why));
+    }
+    node.with_child(
+        UiNode::button(ids::local_rule_remove(kind, n), remove_label(removing))
+            .with_enabled(!removing),
+    )
+}
+
 /// `approval-<call_id>-<verb>` → the answer it stands for.
 fn approval_target(target: &str) -> Option<(String, LocalExecResolution)> {
     let rest = target.strip_prefix("approval-")?;
@@ -1556,6 +1656,9 @@ pub struct NativeChatHost {
     egress_policy: Option<crate::opengrok::LocalExecMode>,
     /// The permission dialog the shield badge opens, on screen.
     network_policy_open: bool,
+    /// This Mac's standing rules, where Settings → Computer draws them: see
+    /// [`AppState::this_mac_rules`]. `None` where it draws none.
+    local_rules: Option<LocalRules>,
     pending: Option<Command>,
     /// Keys the last op asked the window for. The host has no window; the root view presses
     /// them (see [`Self::take_compose`]).
@@ -1944,6 +2047,7 @@ impl NativeChatHost {
             .then(|| state.egress_policy())
             .flatten(),
             network_policy_open: state.network_policy_open,
+            local_rules: state.this_mac_rules().cloned(),
             pending: None,
             compose: None,
         }
@@ -2285,6 +2389,17 @@ impl NativeChatHost {
                             ));
                             if let Some(current) = self.egress_policy {
                                 settings = settings.with_child(egress_policy_node(current));
+                            }
+                        }
+                        // Only while the dialog is open on Computer: the tab stays selected after
+                        // Settings closes, and a closed dialog's children are still found by id, so
+                        // a snapshot would otherwise keep listing the commands after the person left.
+                        if self.account_open
+                            && self.computer_tab
+                            && let Some(rules) = &self.local_rules
+                        {
+                            for node in local_rules_nodes(rules) {
+                                settings = settings.with_child(node);
                             }
                         }
                         settings
@@ -3123,6 +3238,46 @@ impl NativeChatHost {
         Some((id, accept))
     }
 
+    /// Remove on one of this Mac's rules, or `None` for a target that is not one.
+    ///
+    /// The rule is the one at that place on the page as it is now, and the command sent is
+    /// that row's own. Refused while the page is not on screen, for a place with no rule on
+    /// it, and for a rule already on its way off: its button is dead, and a second press would
+    /// be a second request about one rule.
+    fn local_rule_command(&self, target: &str) -> Option<Result<Command, String>> {
+        let rest = target.strip_prefix("settings-local-rule-remove-")?;
+        let (kind, n) = RuleKind::ALL.into_iter().find_map(|kind| {
+            let n = rest.strip_prefix(kind.word())?.strip_prefix('-')?;
+            n.parse::<usize>().ok().map(|n| (kind, n))
+        })?;
+        if !(self.account_open && self.computer_tab) {
+            return Some(Err(format!(
+                "`{target}` is on Settings → Computer, which is not what is on screen: open it \
+                 with `settings-tab-computer`"
+            )));
+        }
+        let Some(rules) = &self.local_rules else {
+            return Some(Err(format!(
+                "`{target}` is not on screen: this Mac's rules have not been read"
+            )));
+        };
+        let rows = rules.rows(kind);
+        let Some(row) = rows.get(n) else {
+            return Some(Err(format!(
+                "no rule `{target}`: {} lists {}",
+                rule_list_title(kind),
+                rows.len()
+            )));
+        };
+        if rules.is_removing(kind, &row.pattern) {
+            return Some(Err(format!("`{}` is already being removed", row.pattern)));
+        }
+        Some(Ok(Command::RemoveLocalRule {
+            kind,
+            pattern: row.pattern.clone(),
+        }))
+    }
+
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
         let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
@@ -3226,6 +3381,8 @@ impl NativeChatHost {
         } else if let Some(cmd) = self.skill_command(target) {
             cmd?
         } else if let Some(cmd) = self.taught_skill_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.local_rule_command(target) {
             cmd?
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
@@ -6599,5 +6756,183 @@ mod tests {
             card.states,
             vec!["policy-approval".to_string(), "mcp-cw_1".to_string()]
         );
+    }
+
+    /// A host on Settings → Computer with this Mac's rules as the server listed them: two
+    /// allows, the second of which the gate never reads, and a deny.
+    fn rules_host() -> NativeChatHost {
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.local_rules = Some(LocalRules {
+            machine_id: "mac_1".into(),
+            allow: vec![
+                LocalRuleRow {
+                    pattern: "ls -la".into(),
+                    inert: None,
+                },
+                LocalRuleRow {
+                    pattern: "sudo ls".into(),
+                    inert: Some("sudo cannot be a standing allow".into()),
+                },
+            ],
+            deny: vec![LocalRuleRow {
+                pattern: "rm -rf /tmp/x".into(),
+                inert: None,
+            }],
+            listed: true,
+            ..LocalRules::default()
+        });
+        host
+    }
+
+    /// Each of this Mac's rules is a row a driver reads the command off exactly, under the list
+    /// it is on, with a Remove of its own. An allow the gate never reads says so as a state, and
+    /// why in the server's words.
+    #[test]
+    fn this_macs_rules_are_rows_of_their_commands_each_with_a_remove() {
+        let tree = rules_host().snapshot();
+        let allow = tree.find(&ids::local_rules(RuleKind::Allow)).unwrap();
+        assert_eq!(allow.name, "Always allowed");
+        assert_eq!(allow.value.as_deref(), Some("2"));
+        let deny = tree.find(&ids::local_rules(RuleKind::Deny)).unwrap();
+        assert_eq!(deny.name, "Never allowed");
+        assert_eq!(deny.value.as_deref(), Some("1"));
+
+        let read = tree.find("settings-local-rule-allow-0").unwrap();
+        assert_eq!(read.value.as_deref(), Some("ls -la"));
+        assert!(read.states.is_empty());
+        assert!(tree.find("settings-local-rule-inert-allow-0").is_none());
+
+        let never_read = tree.find("settings-local-rule-allow-1").unwrap();
+        assert_eq!(never_read.value.as_deref(), Some("sudo ls"));
+        assert_eq!(never_read.states, vec!["inert".to_string()]);
+        let why = tree.find("settings-local-rule-inert-allow-1").unwrap();
+        assert_eq!(why.name, "Not in effect: sudo cannot be a standing allow.");
+        assert_eq!(
+            why.value.as_deref(),
+            Some("sudo cannot be a standing allow")
+        );
+
+        assert_eq!(
+            tree.find("settings-local-rule-deny-0")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("rm -rf /tmp/x")
+        );
+        for id in [
+            "settings-local-rule-remove-allow-0",
+            "settings-local-rule-remove-allow-1",
+            "settings-local-rule-remove-deny-0",
+        ] {
+            let button = tree.find(id).unwrap();
+            assert_eq!(button.name, "Remove");
+            assert!(button.enabled, "{id}");
+        }
+        assert!(tree.find(ids::LOCAL_RULES_EMPTY).is_none());
+        assert!(tree.find(ids::LOCAL_RULES_ERROR).is_none());
+    }
+
+    /// Remove takes off the rule at that place, named by its command, and only while a person
+    /// could press it: with the page on screen, on a row that is there, and not while that
+    /// rule's Remove is still with the server.
+    #[test]
+    fn remove_names_its_rule_by_command_and_only_while_it_can_be_pressed() {
+        let mut host = rules_host();
+        host.dispatch(&Op::click("settings-local-rule-remove-deny-0"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RemoveLocalRule { kind: RuleKind::Deny, pattern }) if pattern == "rm -rf /tmp/x"
+        ));
+        host.dispatch(&Op::click("settings-local-rule-remove-allow-1"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RemoveLocalRule { kind: RuleKind::Allow, pattern }) if pattern == "sudo ls"
+        ));
+        assert!(
+            host.dispatch(&Op::click("settings-local-rule-remove-deny-1"))
+                .is_err(),
+            "no rule is there"
+        );
+
+        host.local_rules
+            .as_mut()
+            .unwrap()
+            .removing
+            .insert((RuleKind::Allow, "ls -la".into()));
+        let tree = host.snapshot();
+        assert!(
+            tree.find("settings-local-rule-allow-0")
+                .unwrap()
+                .states
+                .contains(&"removing".to_string())
+        );
+        let button = tree.find("settings-local-rule-remove-allow-0").unwrap();
+        assert_eq!(button.name, "Removing…");
+        assert!(!button.enabled);
+        assert!(
+            host.dispatch(&Op::click("settings-local-rule-remove-allow-0"))
+                .is_err()
+        );
+        assert!(host.take_command().is_none());
+
+        host.computer_tab = false;
+        host.updates_tab = true;
+        assert!(
+            host.snapshot()
+                .find("settings-local-rule-allow-1")
+                .is_none()
+        );
+        assert!(
+            host.dispatch(&Op::click("settings-local-rule-remove-allow-1"))
+                .is_err()
+        );
+        assert!(host.take_command().is_none());
+    }
+
+    /// No rules is a line saying so. Lists that could not be read say why instead, and never
+    /// that there are none. A Remove that did not go through says why under its own row.
+    #[test]
+    fn no_rules_says_so_and_a_failure_says_why_where_it_happened() {
+        let mut host = rules_host();
+        host.local_rules = Some(LocalRules {
+            machine_id: "mac_1".into(),
+            listed: true,
+            ..LocalRules::default()
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::LOCAL_RULES_EMPTY).unwrap().name,
+            NO_LOCAL_RULES
+        );
+        assert!(tree.find(&ids::local_rules(RuleKind::Allow)).is_none());
+        assert!(tree.find(&ids::local_rules(RuleKind::Deny)).is_none());
+
+        host.local_rules = Some(LocalRules {
+            machine_id: "mac_1".into(),
+            error: Some("This Mac's rules could not be read.".into()),
+            ..LocalRules::default()
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::LOCAL_RULES_ERROR).unwrap().name,
+            "This Mac's rules could not be read."
+        );
+        assert!(tree.find(ids::LOCAL_RULES_EMPTY).is_none());
+
+        let mut host = rules_host();
+        host.local_rules.as_mut().unwrap().not_removed.insert(
+            (RuleKind::Deny, "rm -rf /tmp/x".into()),
+            "Not removed: could not remove the rule.".into(),
+        );
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("settings-local-rule-error-deny-0").unwrap().name,
+            "Not removed: could not remove the rule."
+        );
+        assert!(tree.find("settings-local-rule-error-allow-0").is_none());
     }
 }
