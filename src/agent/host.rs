@@ -73,6 +73,10 @@ pub mod ids {
     pub const DIALOG_ACCOUNT: &str = "dialog-account";
     pub const DIALOG_VOICE: &str = "dialog-voice";
     pub const HEADER_SETTINGS: &str = "header-settings";
+    /// On a routine's thread: which routine (label) and what fires it (value, `schedule` or
+    /// `webhook`), and the way back to the bot's own chat.
+    pub const CHAT_ROUTINE_THREAD: &str = "chat-routine-thread";
+    pub const CHAT_ROUTINE_BACK: &str = "chat-routine-back";
     pub const AGENT_SETTINGS: &str = "agent-settings";
     pub const AGENT_SAVE: &str = "agent-save";
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
@@ -240,6 +244,11 @@ pub mod ids {
     /// the run off and its value where the run got to, in the history's own words.
     pub fn routine_run(id: &str, run_id: &str) -> String {
         format!("routine-{id}-run-{run_id}")
+    }
+
+    /// Open the thread the routine runs in. Only on a routine the server has.
+    pub fn routine_thread(id: &str) -> String {
+        format!("routine-{id}-thread")
     }
 
     pub fn routine_delete(id: &str) -> String {
@@ -487,6 +496,10 @@ pub enum Command {
     RunRoutineNow {
         routine_id: String,
     },
+    OpenRoutineThread {
+        routine_id: String,
+    },
+    BackToBotChat,
     /// A routine's name or instruction changed the way the editor saves them, which is how a
     /// driver edits one: the editor's fields are the pane's own text, not the app's.
     EditRoutine {
@@ -664,6 +677,8 @@ impl Command {
                     state.rotate_routine_webhook(&coworker_id, &routine_id, cx);
                 }
             }
+            Self::OpenRoutineThread { routine_id } => state.open_routine_thread(&routine_id, cx),
+            Self::BackToBotChat => state.back_to_bot_chat(cx),
             Self::RunRoutineNow { routine_id } => {
                 if let Some(coworker_id) = state.active_coworker_id.clone() {
                     state.run_routine_now(&coworker_id, &routine_id, cx);
@@ -1287,7 +1302,12 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
             ));
     }
     if routine.kind != "draft" {
-        node = node.with_child(UiNode::button(ids::routine_test(&routine.id), "Test run"));
+        node = node
+            .with_child(UiNode::button(ids::routine_test(&routine.id), "Test run"))
+            .with_child(UiNode::button(
+                ids::routine_thread(&routine.id),
+                "Open thread",
+            ));
     }
     for (run_id, cause, status) in &routine.runs {
         node = node.with_child(
@@ -1657,6 +1677,9 @@ pub struct NativeChatHost {
     recipe_open: Option<String>,
     /// The open bot's routines, as the Computer pane lists them.
     routines: Vec<RoutineSnap>,
+    /// The open thread's routine, when it is one of the bot's routines' threads: its name and
+    /// the server's word for what fires it.
+    routine_thread: Option<(String, String)>,
     /// The composer's panel, when one is open: which list it is, and the rows in it.
     composer_panel: Option<PanelMode>,
     panel_rows: Vec<PanelRow>,
@@ -1872,6 +1895,9 @@ impl NativeChatHost {
                 })
                 .collect(),
             recipe_open: state.recipe_open_id.clone(),
+            routine_thread: state
+                .active_thread_origin()
+                .map(|origin| (origin.routine_name.clone(), origin.word.clone())),
             routines: state
                 .active_coworker_id
                 .as_deref()
@@ -2222,6 +2248,22 @@ impl NativeChatHost {
             ));
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
+        }
+        if let Some((name, word)) = &self.routine_thread {
+            page = page
+                .with_child(
+                    UiNode::status(ids::CHAT_ROUTINE_THREAD, name.clone()).with_value(word.clone()),
+                )
+                .with_child(UiNode::button(
+                    ids::CHAT_ROUTINE_BACK,
+                    format!(
+                        "Back to {}",
+                        self.sessions
+                            .iter()
+                            .find(|session| session.active)
+                            .map_or("the bot", |session| session.title.as_str())
+                    ),
+                ));
         }
         if self.queued_sends > 0 {
             page = page.with_child(UiNode::new(
@@ -3353,6 +3395,11 @@ impl NativeChatHost {
             Command::ToggleAccount
         } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
             Command::ToggleAgentSettings
+        } else if target == ids::CHAT_ROUTINE_BACK {
+            if self.routine_thread.is_none() {
+                return Err("the open thread is the bot's own chat already".to_string());
+            }
+            Command::BackToBotChat
         } else if target == "agent-model-field" || target == "agent-model-dismiss" {
             Command::ToggleModelPicker
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
@@ -3745,6 +3792,10 @@ impl NativeChatHost {
                 (|id| Command::RunRoutineNow { routine_id: id }) as fn(String) -> Command,
             ),
             (
+                "-thread",
+                (|id| Command::OpenRoutineThread { routine_id: id }) as fn(String) -> Command,
+            ),
+            (
                 "-delete",
                 (|id| Command::DeleteRoutine { routine_id: id }) as fn(String) -> Command,
             ),
@@ -4082,6 +4133,9 @@ impl NativeChatHost {
             "routine.delete" => Command::DeleteRoutine {
                 routine_id: self.invoke_routine_id(args, "routine.delete")?,
             },
+            "routine.thread" => Command::OpenRoutineThread {
+                routine_id: self.invoke_routine_id(args, "routine.thread")?,
+            },
             "routine.run" => Command::RunRoutineNow {
                 routine_id: self.invoke_routine_id(args, "routine.run")?,
             },
@@ -4261,6 +4315,45 @@ mod tests {
                 .is_err(),
             "a routine the open bot does not have"
         );
+    }
+
+    /// A routine the server has opens its thread, by its button or by name. The chat then says
+    /// which routine it is and what fires it, and the way back is there only while it is open.
+    #[test]
+    fn a_routines_thread_is_opened_and_left_by_id() {
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch-1-2", "cron"), routine("draft-1", "draft")];
+        assert!(
+            host.snapshot()
+                .find(&ids::routine_thread("draft-1"))
+                .is_none()
+        );
+        assert!(host.snapshot().find(ids::CHAT_ROUTINE_BACK).is_none());
+        assert!(host.click(ids::CHAT_ROUTINE_BACK).is_err());
+
+        host.click(&ids::routine_thread("sch-1-2")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
+        ));
+        host.invoke("routine.thread", &serde_json::json!({ "id": "sch-1-2" }))
+            .unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenRoutineThread { .. }
+        ));
+
+        host.routine_thread = Some(("Morning post".into(), "schedule".into()));
+        let tree = host.snapshot();
+        let badge = tree.find(ids::CHAT_ROUTINE_THREAD).unwrap();
+        assert_eq!(badge.name, "Morning post");
+        assert_eq!(badge.value.as_deref(), Some("schedule"));
+        host.click(ids::CHAT_ROUTINE_BACK).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::BackToBotChat
+        ));
     }
 
     /// A cron routine carries the line the server keeps, and nothing about a webhook it has

@@ -553,6 +553,28 @@ impl ComputerPane {
                                 }),
                             )
                         })
+                        // What the routine said each time it ran, and any card it is waiting on,
+                        // are in its own thread; only a routine the server has has one.
+                        .when(id.is_some() && !triggers.is_empty(), |this| {
+                            this.child(
+                                Button::new("routine-open-thread")
+                                    .ghost()
+                                    .label("Open thread")
+                                    .on_click({
+                                        let persist = persist.clone();
+                                        let app = app.clone();
+                                        let id = id.clone();
+                                        move |_, _, cx| {
+                                            persist(cx);
+                                            if let Some(id) = id.clone() {
+                                                app.update(cx, |state, cx| {
+                                                    state.open_routine_thread(&id, cx);
+                                                });
+                                            }
+                                        }
+                                    }),
+                            )
+                        })
                         .child(
                             Button::new("routine-test")
                                 .primary()
@@ -612,6 +634,22 @@ impl ComputerPane {
                         .children(runs.into_iter().enumerate().map(|(i, run)| {
                             h_flex()
                                 .id(SharedString::from(format!("run-{i}")))
+                                // A line of the history opens the thread it ran in, which is
+                                // where what it said is.
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let persist = persist.clone();
+                                    let app = app.clone();
+                                    let id = id.clone();
+                                    move |_, _, cx| {
+                                        persist(cx);
+                                        if let Some(id) = id.clone() {
+                                            app.update(cx, |state, cx| {
+                                                state.open_routine_thread(&id, cx);
+                                            });
+                                        }
+                                    }
+                                })
                                 .w_full()
                                 .justify_between()
                                 .items_center()
