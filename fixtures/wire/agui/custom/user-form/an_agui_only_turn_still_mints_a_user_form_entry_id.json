@@ -1,0 +1,101 @@
+{
+  "type": "CUSTOM",
+  "name": "user-form",
+  "entryId": "e_0199bb4e-0000-7000-8000-000000000303",
+  "callId": "mock-form-1",
+  "formRequest": {
+    "title": "Google account",
+    "instruction": "Enter the address and password.",
+    "fields": [
+      {
+        "id": "email",
+        "label": "Email",
+        "type": "email",
+        "required": true,
+        "secret": false
+      },
+      {
+        "id": "password",
+        "label": "Password",
+        "type": "password",
+        "required": true,
+        "secret": false
+      }
+    ],
+    "liveHost": "accounts.google.com"
+  },
+  "formResolution": "submitted",
+  "message": {
+    "type": "user-form",
+    "formRequest": {
+      "title": "Google account",
+      "instruction": "Enter the address and password.",
+      "fields": [
+        {
+          "id": "email",
+          "label": "Email",
+          "type": "email",
+          "required": true,
+          "secret": false
+        },
+        {
+          "id": "password",
+          "label": "Password",
+          "type": "password",
+          "required": true,
+          "secret": false
+        }
+      ],
+      "liveHost": "accounts.google.com"
+    }
+  },
+  "value": {
+    "kind": "send-message",
+    "id": "e_0199bb4e-0000-7000-8000-000000000303",
+    "timestampMs": 1790413202000,
+    "message": {
+      "type": "user-form",
+      "formRequest": {
+        "title": "Google account",
+        "instruction": "Enter the address and password.",
+        "fields": [
+          {
+            "id": "email",
+            "label": "Email",
+            "type": "email",
+            "required": true,
+            "secret": false
+          },
+          {
+            "id": "password",
+            "label": "Password",
+            "type": "password",
+            "required": true,
+            "secret": false
+          }
+        ],
+        "liveHost": "accounts.google.com"
+      }
+    },
+    "callId": "mock-form-1",
+    "formResolution": "submitted",
+    "sharedValues": {
+      "email": "ada@example.com"
+    },
+    "formFieldOutcomes": [
+      {
+        "id": "email",
+        "filled": true,
+        "fillFailed": false
+      },
+      {
+        "id": "password",
+        "filled": false,
+        "fillFailed": false
+      }
+    ]
+  },
+  "threadId": "thr-0199bb4e-0000-7000-8000-000000000301",
+  "runId": "0199bb4e-0000-7000-8000-000000000302",
+  "timestamp": 1790413205000
+}

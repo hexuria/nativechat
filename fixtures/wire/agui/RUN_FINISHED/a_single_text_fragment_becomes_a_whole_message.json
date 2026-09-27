@@ -1,0 +1,6 @@
+{
+  "type": "RUN_FINISHED",
+  "timestamp": 100,
+  "threadId": "t1",
+  "runId": "r1"
+}

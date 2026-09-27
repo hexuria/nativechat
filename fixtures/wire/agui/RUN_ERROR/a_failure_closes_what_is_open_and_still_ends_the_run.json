@@ -1,0 +1,7 @@
+{
+  "type": "RUN_ERROR",
+  "timestamp": 100,
+  "threadId": "t1",
+  "runId": "r1",
+  "message": "upstream hung up"
+}

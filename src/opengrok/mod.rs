@@ -2,6 +2,9 @@
 
 mod activity;
 mod client;
+// The wire corpus in `fixtures/wire/`, read by this module's own parsers.
+#[cfg(test)]
+mod conformance;
 mod credential;
 mod error;
 mod gen_ui;

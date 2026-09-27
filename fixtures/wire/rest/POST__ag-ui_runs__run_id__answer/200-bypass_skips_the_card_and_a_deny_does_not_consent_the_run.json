@@ -1,0 +1,12 @@
+{
+  "method": "POST",
+  "path": "/ag-ui/runs/0199bb4e-0000-7000-8000-000000000202/answer",
+  "status": 200,
+  "body": {
+    "runId": "0199bb4e-0000-7000-8000-000000000202",
+    "callId": "look-1",
+    "approved": false,
+    "alreadyAnswered": false,
+    "continuing": true
+  }
+}

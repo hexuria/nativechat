@@ -1,0 +1,10 @@
+{
+  "type": "CUSTOM",
+  "timestamp": 1790413200000,
+  "name": "pending-user-message",
+  "value": {
+    "v": 1,
+    "op": "canceled",
+    "threadId": "th_1"
+  }
+}

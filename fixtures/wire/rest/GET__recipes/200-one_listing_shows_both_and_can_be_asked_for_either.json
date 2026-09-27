@@ -1,0 +1,75 @@
+{
+  "method": "GET",
+  "path": "/recipes",
+  "status": 200,
+  "body": {
+    "recipes": [
+      {
+        "id": "rcp_0199bb4e-0000-7000-8000-000000000713",
+        "ownerId": "acct_0199bb4e-0000-7000-8000-000000000701",
+        "orgId": null,
+        "name": "Search once",
+        "description": "",
+        "screen": {
+          "width": 1280,
+          "height": 800
+        },
+        "createdAtMs": 1790413240003,
+        "updatedAtMs": 1790413240003,
+        "deletedAtMs": null,
+        "latestVersion": 1,
+        "relation": "mine",
+        "shareState": null,
+        "kind": "workflow",
+        "parameters": [
+          {
+            "name": "term",
+            "description": "what to search for",
+            "required": true,
+            "kind": "text",
+            "default": null,
+            "values": null
+          }
+        ]
+      },
+      {
+        "id": "rcp_0199bb4e-0000-7000-8000-000000000712",
+        "ownerId": "acct_0199bb4e-0000-7000-8000-000000000701",
+        "orgId": null,
+        "name": "Search",
+        "description": "",
+        "screen": {
+          "width": 1280,
+          "height": 800
+        },
+        "createdAtMs": 1790413240002,
+        "updatedAtMs": 1790413240002,
+        "deletedAtMs": null,
+        "latestVersion": 1,
+        "relation": "mine",
+        "shareState": null,
+        "kind": "recipe",
+        "parameters": []
+      },
+      {
+        "id": "rcp_0199bb4e-0000-7000-8000-000000000711",
+        "ownerId": "acct_0199bb4e-0000-7000-8000-000000000701",
+        "orgId": null,
+        "name": "Clear the field",
+        "description": "",
+        "screen": {
+          "width": 1280,
+          "height": 800
+        },
+        "createdAtMs": 1790413240001,
+        "updatedAtMs": 1790413240001,
+        "deletedAtMs": null,
+        "latestVersion": 1,
+        "relation": "mine",
+        "shareState": null,
+        "kind": "recipe",
+        "parameters": []
+      }
+    ]
+  }
+}

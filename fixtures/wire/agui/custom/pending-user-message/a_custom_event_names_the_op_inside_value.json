@@ -1,0 +1,31 @@
+{
+  "type": "CUSTOM",
+  "timestamp": 1790413200000,
+  "name": "pending-user-message",
+  "value": {
+    "v": 1,
+    "op": "created",
+    "threadId": "th_1",
+    "message": {
+      "v": 1,
+      "id": "pum_1",
+      "threadId": "th_1",
+      "content": "later",
+      "replyTo": {
+        "messageId": "m1",
+        "preview": "hi"
+      },
+      "recipeId": "rec_1",
+      "recipeValues": {
+        "q": "x"
+      },
+      "skillId": "skl_1",
+      "clientMessageId": "msg_1",
+      "status": "pending",
+      "createdAtMs": 10,
+      "updatedAtMs": 20,
+      "drainedAtMs": null,
+      "drainedRunId": null
+    }
+  }
+}

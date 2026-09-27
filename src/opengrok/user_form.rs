@@ -90,9 +90,16 @@
 
 use serde_json::{Value, json};
 
+use super::gen_ui::RUN_AWAITING_APPROVAL;
+
 /// Settled/replay CUSTOM `name`. Live #139 HITL is `run-awaiting-approval`
 /// with `reason: "user-form"` — see [`is_user_form_awaiting`].
 pub const USER_FORM_CUSTOM: &str = "user-form";
+
+/// The `reason` on a `run-awaiting-approval` that is a form waiting on the person rather than a
+/// tool waiting on a yes (opengrok-core `SuspendReason::UserForm`). The same letters as
+/// [`USER_FORM_CUSTOM`], and a different field.
+pub(crate) const USER_FORM_REASON: &str = "user-form";
 
 /// Tool name official 0.29 uses while the bot waits on the card. Activity:
 /// **Waiting for you**, distinct from **Waiting for approval**.
@@ -245,19 +252,36 @@ pub enum FormResolution {
     Superseded,
 }
 
+/// Every `formResolution` word this client reads, and what it reads it as. A word that is not
+/// here is read as [`FormResolution::Dismissed`], which is what the server's own `dismissed`
+/// means too. The conformance ledger reads this table, so a word added here is checked against
+/// what the server sends.
+pub(crate) const FORM_RESOLUTION_WORDS: &[(&str, FormResolution)] = &[
+    ("sending", FormResolution::Sending),
+    ("submitting", FormResolution::Sending),
+    ("submitted", FormResolution::Submitted),
+    ("fill_failed", FormResolution::FillFailed),
+    ("fill-failed", FormResolution::FillFailed),
+    ("not_filled", FormResolution::FillFailed),
+    ("not-filled", FormResolution::FillFailed),
+    ("escalated", FormResolution::Escalated),
+    ("on_screen", FormResolution::Escalated),
+    ("on-screen", FormResolution::Escalated),
+    ("on_the_computer", FormResolution::Escalated),
+    ("on-the-computer", FormResolution::Escalated),
+    ("dismissed", FormResolution::Dismissed),
+    ("skipped", FormResolution::Skipped),
+    ("skip", FormResolution::Skipped),
+    ("superseded", FormResolution::Superseded),
+];
+
 impl FormResolution {
     pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "sending" | "submitting" => Self::Sending,
-            "submitted" => Self::Submitted,
-            "fill_failed" | "fill-failed" | "not_filled" | "not-filled" => Self::FillFailed,
-            "escalated" | "on_screen" | "on-screen" | "on_the_computer" | "on-the-computer" => {
-                Self::Escalated
-            }
-            "skipped" | "skip" => Self::Skipped,
-            "superseded" => Self::Superseded,
-            _ => Self::Dismissed,
-        }
+        let word = raw.trim().to_ascii_lowercase();
+        FORM_RESOLUTION_WORDS
+            .iter()
+            .find(|(known, _)| *known == word)
+            .map_or(Self::Dismissed, |(_, resolution)| *resolution)
     }
 
     pub fn as_str(self) -> &'static str {
@@ -643,17 +667,21 @@ impl ComputerHandoffSpec {
     }
 }
 
+/// The CUSTOM `name`s read as a Computer handoff card, after [`normalize_name`]. OpenGrok sends
+/// none of them: its handoff is a gateway transcript entry, not a frame, and this app learns of it
+/// from the dismiss reply's `handoffEntryId`. The conformance ledger reads this list, so a name
+/// added here is checked against what the server sends.
+pub(crate) const COMPUTER_HANDOFF_NAMES: &[&str] = &[
+    "computer-handoff-card",
+    "computer-handoff",
+    "sand://box",
+    "sand:box",
+    "box-handoff",
+    "box-handoff-card",
+];
+
 pub fn is_computer_handoff_name(name: &str) -> bool {
-    let n = normalize_name(name);
-    matches!(
-        n.as_str(),
-        "computer-handoff-card"
-            | "computer-handoff"
-            | "sand://box"
-            | "sand:box"
-            | "box-handoff"
-            | "box-handoff-card"
-    )
+    COMPUTER_HANDOFF_NAMES.contains(&normalize_name(name).as_str())
 }
 
 fn is_computer_handoff_payload(value: &Value) -> bool {
@@ -1151,13 +1179,17 @@ impl UserFormValues {
     }
 }
 
-/// Fixture / settled-replay CUSTOM names. Live HITL on AG-UI SSE is
-/// `run-awaiting-approval`, not these.
+/// Fixture / settled-replay CUSTOM names, after [`normalize_name`]. Live HITL on AG-UI SSE is
+/// `run-awaiting-approval`, not these. The conformance ledger reads this list.
+pub(crate) const USER_FORM_CUSTOM_NAMES: &[&str] = &[
+    USER_FORM_CUSTOM,
+    "form-request",
+    "form-resolution",
+    "request-user-form",
+];
+
 pub fn is_user_form_custom_name(name: &str) -> bool {
-    matches!(
-        normalize_name(name).as_str(),
-        "user-form" | "form-request" | "form-resolution" | "request-user-form"
-    )
+    USER_FORM_CUSTOM_NAMES.contains(&normalize_name(name).as_str())
 }
 
 pub fn is_user_form_tool(name: &str) -> bool {
@@ -1184,7 +1216,7 @@ pub fn is_user_form_awaiting(event: &Value) -> bool {
                 .and_then(Value::as_str)
         })
         .unwrap_or("");
-    if name != "run-awaiting-approval" {
+    if name != RUN_AWAITING_APPROVAL {
         return false;
     }
     let reason = string_field(event, "reason")
@@ -1194,7 +1226,7 @@ pub fn is_user_form_awaiting(event: &Value) -> bool {
                 .and_then(|value| string_field(value, "reason"))
         })
         .unwrap_or_default();
-    if reason.eq_ignore_ascii_case("user-form") {
+    if reason.eq_ignore_ascii_case(USER_FORM_REASON) {
         return true;
     }
     let tool = string_field(event, "tool")

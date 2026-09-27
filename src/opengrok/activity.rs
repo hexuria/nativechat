@@ -8,6 +8,10 @@ use serde_json::Value;
 /// the footer turns it into "Waking {name}'s computer" (`bot_status_line`).
 pub const WAKING_COMPUTER: &str = "Waking the computer";
 
+/// The CUSTOM `name` the server sends before a turn wakes a sleeping box (opengrok-harness
+/// `projection.rs` `box_waking`).
+pub(crate) const BOX_WAKING: &str = "box-waking";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotActivity {
     pub label: String,
@@ -229,11 +233,13 @@ pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTic
                 ActivityTick::Set(BotActivity {
                     label: super::user_form::WAITING_FOR_YOU.into(),
                 })
-            } else if event.get("name").and_then(Value::as_str) == Some("run-awaiting-approval") {
+            } else if event.get("name").and_then(Value::as_str)
+                == Some(super::gen_ui::RUN_AWAITING_APPROVAL)
+            {
                 ActivityTick::Set(BotActivity {
                     label: "Waiting for approval".into(),
                 })
-            } else if event.get("name").and_then(Value::as_str) == Some("box-waking") {
+            } else if event.get("name").and_then(Value::as_str) == Some(BOX_WAKING) {
                 ActivityTick::Set(BotActivity {
                     label: WAKING_COMPUTER.into(),
                 })

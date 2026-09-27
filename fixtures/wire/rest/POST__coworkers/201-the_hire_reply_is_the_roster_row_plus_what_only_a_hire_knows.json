@@ -1,0 +1,32 @@
+{
+  "method": "POST",
+  "path": "/coworkers",
+  "status": 201,
+  "body": {
+    "id": "cw_0199bb4e-0000-7000-8000-000000000603",
+    "name": "Ada",
+    "model": "oag/cheap",
+    "role": null,
+    "title": null,
+    "avatarShape": null,
+    "avatarColor": null,
+    "visibility": "private",
+    "hiddenFromSidebar": false,
+    "updatedAtMs": 1790413231000,
+    "boxId": null,
+    "isGroup": false,
+    "memberIds": [],
+    "mine": true,
+    "canManage": true,
+    "owner": {
+      "id": "acct_0199bb4e-0000-7000-8000-000000000601",
+      "name": "Test User"
+    },
+    "computerError": {
+      "code": "no_org_key",
+      "message": "no computer is configured for your organization — an admin must set up box.ascii.dev on the dashboard",
+      "updatedAtMs": 1790413231000
+    },
+    "templateNote": null
+  }
+}

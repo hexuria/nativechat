@@ -1,0 +1,54 @@
+{
+  "type": "CUSTOM",
+  "timestamp": 1790413202000,
+  "name": "run-awaiting-approval",
+  "threadId": "thr-0199bb4e-0000-7000-8000-000000000301",
+  "runId": "0199bb4e-0000-7000-8000-000000000302",
+  "callId": "mock-form-1",
+  "tool": "request_user_form",
+  "arguments": {
+    "title": "Google account",
+    "instruction": "Enter the address and password.",
+    "fields": [
+      {
+        "id": "email",
+        "label": "Email",
+        "type": "email",
+        "required": true,
+        "secret": false
+      },
+      {
+        "id": "password",
+        "label": "Password",
+        "type": "password",
+        "required": true,
+        "secret": false
+      }
+    ],
+    "liveHost": "accounts.google.com"
+  },
+  "reason": "user-form",
+  "why": "Waiting for you",
+  "entryId": "e_0199bb4e-0000-7000-8000-000000000303",
+  "formRequest": {
+    "title": "Google account",
+    "instruction": "Enter the address and password.",
+    "fields": [
+      {
+        "id": "email",
+        "label": "Email",
+        "type": "email",
+        "required": true,
+        "secret": false
+      },
+      {
+        "id": "password",
+        "label": "Password",
+        "type": "password",
+        "required": true,
+        "secret": false
+      }
+    ],
+    "liveHost": "accounts.google.com"
+  }
+}
