@@ -184,6 +184,7 @@ pub struct AguiMessage {
 /// on the `POST /ag-ui` stream).
 pub fn assistant_text_from_sse(body: &str) -> Result<String, String> {
     let mut out = String::new();
+    let mut persons = super::gen_ui::PersonsText::default();
     for block in body.split("\n\n") {
         for line in block.lines() {
             let Some(data) = line.strip_prefix("data:") else {
@@ -204,7 +205,10 @@ pub fn assistant_text_from_sse(body: &str) -> Result<String, String> {
                     .unwrap_or("run failed");
                 return Err(message.to_string());
             }
-            if (kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK")
+            // The person's own words (a replay opens each run with them) are not the reply.
+            let persons = kind.starts_with("TEXT_MESSAGE") && persons.is_persons(&value);
+            if !persons
+                && (kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK")
                 && let Some(delta) = value.get("delta").and_then(|v| v.as_str())
             {
                 out.push_str(delta);

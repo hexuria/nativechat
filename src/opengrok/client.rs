@@ -901,6 +901,7 @@ impl OpenGrokClient {
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
         let mut assistant = String::new();
+        let mut persons = super::gen_ui::PersonsText::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| OpenGrokError::transport(&e))?;
             buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -929,7 +930,10 @@ impl OpenGrokClient {
                         // whether the model refused or the gateway was never reached.
                         return Err(OpenGrokError::from_server(None, message));
                     }
-                    if (kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK")
+                    // The person's own words, if a stream ever carries them, are not the reply.
+                    let persons = kind.starts_with("TEXT_MESSAGE") && persons.is_persons(&value);
+                    if !persons
+                        && (kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK")
                         && let Some(delta) = value.get("delta").and_then(|v| v.as_str())
                     {
                         assistant.push_str(delta);
@@ -5120,6 +5124,21 @@ mod tests {
             "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n",
         );
         assert_eq!(assistant_text_from_sse(body).unwrap(), "Hello world");
+    }
+
+    /// The person's words opening a run are not collected as the reply.
+    #[test]
+    fn sse_leaves_the_persons_words_out_of_the_reply() {
+        let body = concat!(
+            "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"t\",\"runId\":\"r\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"u1\",\"role\":\"user\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"u1\",\"delta\":\"Hi there\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_END\",\"messageId\":\"u1\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_START\",\"messageId\":\"m1\",\"role\":\"assistant\"}\n\n",
+            "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\"Hello\"}\n\n",
+            "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n",
+        );
+        assert_eq!(assistant_text_from_sse(body).unwrap(), "Hello");
     }
 
     #[tokio::test]

@@ -13,6 +13,20 @@
         "failure": null,
         "events": [
           {
+            "type": "TEXT_MESSAGE_START",
+            "messageId": "client-msg-1",
+            "role": "user"
+          },
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "client-msg-1",
+            "delta": "question 1"
+          },
+          {
+            "type": "TEXT_MESSAGE_END",
+            "messageId": "client-msg-1"
+          },
+          {
             "type": "TEXT_MESSAGE_CONTENT",
             "messageId": "msg-1",
             "delta": "hello "
@@ -37,6 +51,20 @@
         "failure": null,
         "events": [
           {
+            "type": "TEXT_MESSAGE_START",
+            "messageId": "client-msg-2",
+            "role": "user"
+          },
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "client-msg-2",
+            "delta": "question 2"
+          },
+          {
+            "type": "TEXT_MESSAGE_END",
+            "messageId": "client-msg-2"
+          },
+          {
             "type": "TEXT_MESSAGE_CONTENT",
             "messageId": "msg-1",
             "delta": "the second turn"
@@ -50,6 +78,20 @@
         "updatedAtMs": 1790413223000,
         "failure": "the model gateway refused",
         "events": [
+          {
+            "type": "TEXT_MESSAGE_START",
+            "messageId": "client-msg-3",
+            "role": "user"
+          },
+          {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "messageId": "client-msg-3",
+            "delta": "question 3"
+          },
+          {
+            "type": "TEXT_MESSAGE_END",
+            "messageId": "client-msg-3"
+          },
           {
             "type": "TEXT_MESSAGE_CONTENT",
             "messageId": "msg-1",
