@@ -540,6 +540,22 @@ pub struct ThreadOrigin {
     pub coworker_id: String,
 }
 
+/// The line over a routine's own instruction in its thread, where one is.
+///
+/// A routine's run opens with the instruction it was given, journaled as a `user` message under
+/// `{runId}-prompt` (opengrok-server `agui/history.rs`, `routine_prompt`), so a replay draws it
+/// where the person's words go. It was not typed: it is what the routine says every time it
+/// runs, and a bubble with nothing on it reads as the person having said it just then. Only on a
+/// routine's own thread, where that id cannot be anything else.
+pub fn routine_instruction_caption(
+    conversation: &Conversation,
+    message: &Message,
+) -> Option<String> {
+    let origin = conversation.origin.as_ref()?;
+    (message.is_me && message.id.starts_with("run_") && message.id.ends_with("-prompt"))
+        .then(|| format!("Instruction from {}", origin.routine_name))
+}
+
 impl Conversation {
     /// A thread known only from the server's list: it began before this Mac knew of it, so
     /// there is no start for it here, and when it last moved is the time there is for it.
@@ -19358,6 +19374,30 @@ mod tests {
         assert_eq!(rows[0].role, "user");
         assert_eq!(rows[0].content, "What is on my calendar?");
         assert_eq!(rows[0].created_at, "1970-01-01 00:00:01.999");
+    }
+
+    /// A routine's instruction in its thread says it is the routine's: the replay draws it where
+    /// the person's words go, under the run's `{runId}-prompt` id. The person's own reply in the
+    /// same thread, and the same id on the bot's own chat, are left as they are.
+    #[test]
+    fn a_routines_instruction_is_labelled_as_the_routines() {
+        let prompt = message("run_01a0-prompt", true, "write the weekly report");
+        let reply = message("client-q1", true, "and next week too");
+        let mut routine = thread("sch_1", vec![prompt.clone(), reply.clone()]);
+        routine.origin = Some(super::ThreadOrigin {
+            word: "schedule".into(),
+            routine_name: "Weekly".into(),
+            coworker_id: "cw_1".into(),
+        });
+        assert_eq!(
+            super::routine_instruction_caption(&routine, &prompt).as_deref(),
+            Some("Instruction from Weekly")
+        );
+        assert!(super::routine_instruction_caption(&routine, &reply).is_none());
+        let bots_chat = thread("cw_1", vec![prompt.clone()]);
+        assert!(super::routine_instruction_caption(&bots_chat, &prompt).is_none());
+        let from_the_bot = message("run_01a0-prompt", false, "…");
+        assert!(super::routine_instruction_caption(&routine, &from_the_bot).is_none());
     }
 
     /// The open bot, one saved routine and one draft, the way the Computer pane leaves them.

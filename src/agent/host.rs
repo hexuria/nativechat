@@ -83,6 +83,8 @@ pub mod ids {
     /// `webhook`), and the way back to the bot's own chat.
     pub const CHAT_ROUTINE_THREAD: &str = "chat-routine-thread";
     pub const CHAT_ROUTINE_BACK: &str = "chat-routine-back";
+    /// On a routine's thread: how many bubbles are labelled as its instruction (value).
+    pub const CHAT_ROUTINE_INSTRUCTIONS: &str = "chat-routine-instructions";
     pub const AGENT_SETTINGS: &str = "agent-settings";
     pub const AGENT_SAVE: &str = "agent-save";
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
@@ -1741,6 +1743,8 @@ pub struct NativeChatHost {
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
+    /// How many of the open routine thread's bubbles carry a routine's instruction caption.
+    routine_instructions: usize,
     /// The composer's panel, when one is open: which list it is, and the rows in it.
     composer_panel: Option<PanelMode>,
     panel_rows: Vec<PanelRow>,
@@ -2018,6 +2022,19 @@ impl NativeChatHost {
                     )
                 })
                 .collect(),
+            routine_instructions: state
+                .active_conversation_id
+                .as_ref()
+                .and_then(|id| state.conversations.iter().find(|c| &c.id == id))
+                .map_or(0, |conv| {
+                    conv.messages
+                        .iter()
+                        .filter(|m| {
+                            !m.hidden
+                                && crate::state::routine_instruction_caption(conv, m).is_some()
+                        })
+                        .count()
+                }),
             routine_thread: state
                 .active_thread_origin()
                 .map(|origin| (origin.routine_name.clone(), origin.word.clone())),
@@ -2380,6 +2397,10 @@ impl NativeChatHost {
         }
         if let Some((name, word)) = &self.routine_thread {
             page = page
+                .with_child(
+                    UiNode::status(ids::CHAT_ROUTINE_INSTRUCTIONS, "Instructions")
+                        .with_value(self.routine_instructions.to_string()),
+                )
                 .with_child(
                     UiNode::status(ids::CHAT_ROUTINE_THREAD, name.clone()).with_value(word.clone()),
                 )

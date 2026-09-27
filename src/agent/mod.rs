@@ -61,7 +61,8 @@
 //! routine's thread), `routine-{id}-delete`.
 //! `routine-{id}-thread` (Open thread, on a routine the server has); on a routine's thread the
 //! chat carries `chat-routine-thread` (label the routine's name, value `schedule` / `webhook`)
-//! and `chat-routine-back` (back to the bot's own chat). Invoke `routine.thread {id}` opens it.
+//! and `chat-routine-back` (back to the bot's own chat), `chat-routine-instructions` (value = how many
+//! bubbles are labelled as the routine's instruction). Invoke `routine.thread {id}` opens it.
 //! Invoke `routine.run {id}` is Test run; `routine.edit {id, name?, prompt?}` saves an edit the
 //! way the editor does (a `PATCH` of what changed).
 //!
