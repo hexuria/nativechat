@@ -13629,8 +13629,7 @@ impl AppState {
         let (Some(client), Some(machine_id)) = (self.opengrok.clone(), self.this_mac_id()) else {
             return;
         };
-        self.local_rules_epoch += 1;
-        let epoch = self.local_rules_epoch;
+        let epoch = self.next_rules_read();
         cx.spawn(async move |this, cx| {
             let listed = client.local_exec_policy(&machine_id).await;
             let _ = this.update(cx, |state, cx| {
@@ -13640,6 +13639,13 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// Begin a read of this Mac's rules: every read before it is overtaken, and is dropped when it
+    /// answers (see `take_local_rules`).
+    fn next_rules_read(&mut self) -> u64 {
+        self.local_rules_epoch += 1;
+        self.local_rules_epoch
     }
 
     /// Take a read of this Mac's rules, unless a newer read has begun since. `false` when the
@@ -20266,6 +20272,65 @@ mod tests {
             ]
         );
         assert_eq!(rules.deny, vec![rule("sudo ls", None)]);
+    }
+
+    /// Two Removes in flight at once, with reads crossing them: a read that began before a
+    /// delete answers after it, and a delete lands while the read the first one started is still
+    /// out. Neither deleted row comes back, and one Remove never clears the other's "Removing…".
+    #[test]
+    fn two_removes_and_the_reads_between_them_never_bring_a_row_back() {
+        let mut state = AppState::new();
+        let first = state.next_rules_read();
+        assert!(state.take_local_rules(
+            first,
+            "mac_here".into(),
+            Ok(policy(&["ls -la", "pwd"], &[], &[])),
+        ));
+        let before_either = state.next_rules_read();
+        let rules = state.local_rules.as_mut().unwrap();
+        rules.removing.insert((RuleKind::Allow, "ls -la".into()));
+        rules.removing.insert((RuleKind::Allow, "pwd".into()));
+        let shown = |state: &AppState| -> Vec<String> {
+            let rules = state.local_rules.as_ref().unwrap();
+            rules
+                .rows(RuleKind::Allow)
+                .iter()
+                .map(|row| row.pattern.clone())
+                .collect()
+        };
+        let removing = |state: &AppState| state.local_rules.as_ref().unwrap().removing.len();
+
+        // `ls -la` comes off; the other is still on its way.
+        assert!(state.take_removal("mac_here", RuleKind::Allow, "ls -la", Ok(())));
+        assert_eq!(shown(&state), ["pwd"]);
+        assert_eq!(removing(&state), 1, "pwd is still being removed");
+        let after_first = state.next_rules_read();
+
+        // The read that began before either delete answers now, still listing both: dropped.
+        assert!(!state.take_local_rules(
+            before_either,
+            "mac_here".into(),
+            Ok(policy(&["ls -la", "pwd"], &[], &[])),
+        ));
+        assert_eq!(shown(&state), ["pwd"]);
+
+        // `pwd` comes off before the first re-read answers.
+        assert!(state.take_removal("mac_here", RuleKind::Allow, "pwd", Ok(())));
+        assert!(shown(&state).is_empty());
+        let after_second = state.next_rules_read();
+
+        // The first re-read, taken before `pwd` went, answers late: dropped too.
+        assert!(!state.take_local_rules(
+            after_first,
+            "mac_here".into(),
+            Ok(policy(&["pwd"], &[], &[])),
+        ));
+        assert!(shown(&state).is_empty());
+
+        // The newest read is what the lists are.
+        assert!(state.take_local_rules(after_second, "mac_here".into(), Ok(policy(&[], &[], &[]))));
+        assert!(shown(&state).is_empty());
+        assert_eq!(removing(&state), 0);
     }
 
     /// A read answered after a newer one began is dropped whole. A read that failed empties the
