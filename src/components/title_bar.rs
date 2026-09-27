@@ -81,6 +81,12 @@ impl Render for TitleBar {
                     c.avatar_color.clone(),
                 )
             });
+        // A routine's thread says so beside the bot's name, with the way back to the bot's own
+        // chat: it is not in the sidebar, so the header is where a person finds where they are.
+        let routine_thread = state
+            .active_thread_origin()
+            .filter(|_| !state.is_app_settings_open)
+            .map(|origin| origin.routine_name.clone());
         // The spans line up with the columns below. The chat's starts where the sidebar
         // ends, or past the traffic lights when the sidebar is its rail or gone. A floating
         // sidebar or pane (a narrow window) keeps its header to itself, over the chat.
@@ -135,33 +141,62 @@ impl Render for TitleBar {
             .map(|this| match (recipes_span, &coworker, signed_in) {
                 // The Recipes page's own title and back chevron, in place of a bot's name.
                 (Some(header), _, _) => this.child(header),
-                (None, Some((id, name, shape, color)), _) => this.child(
-                    div()
-                        .id("header-coworker")
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, {
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                app.update(cx, |state, cx| state.toggle_agent_settings(cx));
-                            }
-                        })
-                        .child(
-                            PersonaMark::new(id.clone())
-                                .shape(shape.clone())
-                                .color(color.clone())
-                                .size(px(24.))
-                                .dark(theme.is_dark()),
+                (None, Some((id, name, shape, color)), _) => this
+                    .child(
+                        div()
+                            .id("header-coworker")
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, {
+                                let app = app.clone();
+                                move |_, _, cx| {
+                                    app.update(cx, |state, cx| state.toggle_agent_settings(cx));
+                                }
+                            })
+                            .child(
+                                PersonaMark::new(id.clone())
+                                    .shape(shape.clone())
+                                    .color(color.clone())
+                                    .size(px(24.))
+                                    .dark(theme.is_dark()),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(name.clone()),
+                            ),
+                    )
+                    .when_some(routine_thread.clone(), |this, routine| {
+                        this.child(
+                            div()
+                                .id("header-routine-thread")
+                                .px(px(8.))
+                                .py(px(2.))
+                                .rounded(px(6.))
+                                .bg(rgb(0x777777).opacity(0.17))
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("Routine · {routine}")),
                         )
                         .child(
                             div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(name.clone()),
-                        ),
-                ),
+                                .id("header-routine-back")
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.foreground))
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| state.back_to_bot_chat(cx));
+                                    }
+                                })
+                                .child(format!("Back to {name}")),
+                        )
+                    }),
                 // No bot: the page's title, in the same place and style.
                 (None, None, true) => this.child(window_drag(
                     div()

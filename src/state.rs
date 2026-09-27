@@ -520,6 +520,24 @@ pub struct Conversation {
     pub updated_at: String,
     pub messages: Vec<Message>,
     pub unread_count: usize,
+    /// Set on a thread one of the bot's routines runs in, rather than the bot's own chat.
+    pub origin: Option<ThreadOrigin>,
+}
+
+/// What started a thread that is not the bot's own chat: one of its routines. The thread's id
+/// is the routine's (opengrok-server fires a schedule into the thread named by its id), so the
+/// routine's output, and any card it stops on, is read and answered there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadOrigin {
+    /// The server's word for it, as `GET /ag-ui/threads` and the approvals queue say it:
+    /// `schedule` or `webhook`.
+    pub word: String,
+    /// The routine's name, which is what the thread is called.
+    pub routine_name: String,
+    /// The bot the routine belongs to. Every call about this thread that names a coworker names
+    /// this one: the thread's id is the schedule's, and the server answers a form posted under
+    /// a coworker id it does not know with `null`, which reads as "Not filled".
+    pub coworker_id: String,
 }
 
 impl Conversation {
@@ -2400,6 +2418,8 @@ impl LocalRules {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NavLocation {
     pub coworker_id: Option<String>,
+    /// The thread on screen when it is not the bot's own chat: one of its routines' threads.
+    pub thread_id: Option<String>,
     pub page: MainPage,
     pub right_pane: RightPane,
     pub computer_view: ComputerView,
@@ -7652,6 +7672,7 @@ impl AppState {
                 updated_at: s.updated_at,
                 messages: Vec::new(),
                 unread_count: 0,
+                origin: None,
             })
             .collect();
         self.conversations.extend(arrived);
@@ -7763,6 +7784,7 @@ impl AppState {
                 updated_at: thread.updated_at.clone(),
                 messages: Vec::new(),
                 unread_count: 0,
+                origin: None,
             });
             added.push(thread);
         }
@@ -7908,6 +7930,7 @@ impl AppState {
                     updated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                     messages: Vec::new(),
                     unread_count: 0,
+                    origin: None,
                 },
             );
         }
@@ -7923,9 +7946,120 @@ impl AppState {
         self.record_nav();
     }
 
+    /// Open the thread one of the open bot's routines runs in: what it said each time it ran,
+    /// and any card it stopped on, to read and answer.
+    ///
+    /// The thread's id is the routine's, because that is the thread the server fires it into.
+    /// It opens in the chat like the bot's own, rebuilt from the server the way a thread this
+    /// Mac never saw is, and a message sent here goes to the same bot in the same thread. It is
+    /// not a row of the sidebar, which is one row per bot: the way back is the header's.
+    pub fn open_routine_thread(&mut self, routine_id: &str, cx: &mut Context<Self>) {
+        let Some(origin) = self.routine_thread_origin(routine_id) else {
+            return;
+        };
+        match self.conversations.iter_mut().find(|c| c.id == routine_id) {
+            Some(thread) => {
+                thread.title = origin.routine_name.clone();
+                thread.origin = Some(origin);
+            }
+            None => self.conversations.push(Conversation {
+                id: routine_id.to_string(),
+                title: origin.routine_name.clone(),
+                created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                updated_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                messages: Vec::new(),
+                unread_count: 0,
+                origin: Some(origin),
+            }),
+        }
+        self.page = MainPage::Chat;
+        self.is_app_settings_open = false;
+        self.select_conversation(routine_id.to_string(), cx);
+        self.record_nav();
+    }
+
+    /// What a routine's thread is, when `routine_id` names one that can be opened: a routine
+    /// the server has, of the open bot. Not an id that is some bot's own chat, or a thread this
+    /// app already holds as an ordinary one: stamping a routine on either would mix two
+    /// transcripts, and Back would have nowhere to go.
+    fn routine_thread_origin(&self, routine_id: &str) -> Option<ThreadOrigin> {
+        let coworker_id = self.active_coworker_id.clone()?;
+        if self.coworkers.iter().any(|c| c.id == routine_id)
+            || routine_id == coworker_id
+            || self
+                .conversations
+                .iter()
+                .any(|c| c.id == routine_id && c.origin.is_none())
+        {
+            return None;
+        }
+        let routine = self
+            .coworker_routines(&coworker_id)
+            .iter()
+            .find(|row| row.id == routine_id && row.saved.is_some())?;
+        Some(ThreadOrigin {
+            word: match routine.triggers.first() {
+                Some(RoutineTrigger::Webhook { .. }) => "webhook",
+                _ => "schedule",
+            }
+            .to_string(),
+            routine_name: if routine.name.trim().is_empty() {
+                "Routine".to_string()
+            } else {
+                routine.name.clone()
+            },
+            coworker_id,
+        })
+    }
+
+    /// Whether a thread's words go to this Mac's database. A routine's thread does not: the
+    /// server keeps it and it is rebuilt from there each time it is opened, and a row for it
+    /// on disk would come back at the next launch as a chat with no bot and no way back.
+    fn keeps_on_disk(&self, conversation_id: &str) -> bool {
+        !self
+            .conversations
+            .iter()
+            .any(|c| c.id == conversation_id && c.origin.is_some())
+    }
+
+    /// From a routine's thread back to the bot's own chat. When that is where the person came
+    /// from, it is a step back rather than a new place, so forward still leads to the routine.
+    pub fn back_to_bot_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(bot) = self.active_thread_origin().map(|o| o.coworker_id.clone()) else {
+            return;
+        };
+        let came_from_it = self.nav.back.last().is_some_and(|prev| {
+            prev.thread_id.is_none() && prev.coworker_id.as_deref() == Some(bot.as_str())
+        });
+        if came_from_it {
+            self.nav_back(cx);
+            return;
+        }
+        if self.active_coworker_id.as_ref() != Some(&bot) {
+            self.select_coworker(bot, cx);
+        } else {
+            self.select_conversation(bot, cx);
+            self.record_nav();
+        }
+    }
+
+    /// The routine the open thread belongs to, when it is one of the bot's routines' threads.
+    pub fn active_thread_origin(&self) -> Option<&ThreadOrigin> {
+        let id = self.active_conversation_id.as_ref()?;
+        self.conversations
+            .iter()
+            .find(|c| &c.id == id)?
+            .origin
+            .as_ref()
+    }
+
     fn nav_location(&self) -> NavLocation {
         NavLocation {
             coworker_id: self.active_coworker_id.clone(),
+            thread_id: self
+                .active_conversation_id
+                .clone()
+                .filter(|id| Some(id) != self.active_coworker_id.as_ref()),
             page: self.page,
             right_pane: self.right_pane,
             computer_view: self.computer_view.clone(),
@@ -7991,6 +8125,27 @@ impl AppState {
         // skills yet" about a library nobody had asked for.
         if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills {
             self.refresh_skills(cx);
+        }
+        // A routine's thread is somewhere a person can go back to, while it is still one of
+        // this bot's routines' threads and this bot is the one open. Anything else lands on the
+        // bot's own chat: a thread opened under another bot would send under the wrong name.
+        let restorable = loc.thread_id.as_ref().filter(|thread| {
+            self.active_coworker_id == loc.coworker_id
+                && self.conversations.iter().any(|c| {
+                    &&c.id == thread
+                        && c.origin
+                            .as_ref()
+                            .is_some_and(|o| Some(&o.coworker_id) == loc.coworker_id.as_ref())
+                })
+        });
+        match (restorable, self.active_coworker_id.clone()) {
+            (Some(thread), _) if self.active_conversation_id.as_ref() != Some(thread) => {
+                self.select_conversation(thread.clone(), cx);
+            }
+            (None, Some(bot)) if self.active_conversation_id.as_ref() != Some(&bot) => {
+                self.select_conversation(bot, cx);
+            }
+            _ => {}
         }
         // After `select_coworker`, which lands on the chat: the page is where the person was.
         self.page = loc.page;
@@ -8283,6 +8438,7 @@ impl AppState {
                                         .to_string(),
                                     messages: Vec::new(),
                                     unread_count: 0,
+                                    origin: None,
                                 },
                             );
                             state.select_conversation(id, cx);
@@ -8863,6 +9019,9 @@ impl AppState {
         let Some(db) = self.database_service.clone() else {
             return;
         };
+        if !self.keeps_on_disk(conversation_id) {
+            return;
+        }
         let title = self.conversation_title(conversation_id);
         let conversation_id = conversation_id.to_string();
         cx.spawn(async move |_this, _cx| {
@@ -8926,7 +9085,11 @@ impl AppState {
             }
             return;
         }
-        let Some(db) = self.database_service.clone() else {
+        let Some(db) = self
+            .database_service
+            .clone()
+            .filter(|_| self.keeps_on_disk(conversation_id))
+        else {
             if settles {
                 self.live_turns.remove(conversation_id);
             }
@@ -10541,11 +10704,18 @@ impl AppState {
                         } else {
                             spec.run_id.clone()
                         };
+                        // The thread is where the card is; the coworker is whose card it is. On a
+                        // bot's own chat they are the same id, and on a routine's thread they are
+                        // not.
+                        let coworker = conversation
+                            .origin
+                            .as_ref()
+                            .map_or_else(|| conversation.id.clone(), |o| o.coworker_id.clone());
                         return Some((
                             spec.entry_id.clone(),
                             run_id,
                             conversation.id.clone(),
-                            conversation.id.clone(),
+                            coworker,
                         ));
                     }
                 }
@@ -12535,7 +12705,11 @@ impl AppState {
         cx.notify();
 
         // Save to DB
-        if let Some(db) = self.database_service.clone() {
+        if let Some(db) = self
+            .database_service
+            .clone()
+            .filter(|_| self.keeps_on_disk(&conversation_id))
+        {
             let content_clone = content.clone();
             let conversation_id_clone = conversation_id.clone();
             let title = self.conversation_title(&conversation_id);
@@ -14016,7 +14190,11 @@ impl AppState {
         save: QueuedBubbleSave,
         cx: &mut Context<Self>,
     ) {
-        let Some(db) = self.database_service.clone() else {
+        let Some(db) = self
+            .database_service
+            .clone()
+            .filter(|_| self.keeps_on_disk(conversation_id))
+        else {
             return;
         };
         if save.insert {
@@ -18526,6 +18704,7 @@ mod tests {
             updated_at: String::new(),
             messages,
             unread_count: 0,
+            origin: None,
         }
     }
 
@@ -19179,6 +19358,97 @@ mod tests {
         assert_eq!(rows[0].role, "user");
         assert_eq!(rows[0].content, "What is on my calendar?");
         assert_eq!(rows[0].created_at, "1970-01-01 00:00:01.999");
+    }
+
+    /// The open bot, one saved routine and one draft, the way the Computer pane leaves them.
+    fn with_routines() -> AppState {
+        let mut state = AppState::new();
+        state.coworkers = vec![hired("cw_1", 1)];
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        state.conversations.push(thread("cw_1", Vec::new()));
+        let saved = super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
+                "prompt": "write the weekly report", "name": "Weekly", "active": true
+            }))
+            .unwrap(),
+        );
+        let mut draft = saved.clone();
+        draft.id = "draft-1".into();
+        draft.saved = None;
+        state.routines.insert("cw_1".into(), vec![saved, draft]);
+        state
+    }
+
+    /// What can be opened as a routine's thread: a routine the server has, of the open bot.
+    /// Not a draft, not another bot's routine, and never an id some bot's chat or an ordinary
+    /// thread already answers to, which would mix two transcripts under one id.
+    #[test]
+    fn only_a_saved_routine_of_the_open_bot_opens_as_its_thread() {
+        let mut state = with_routines();
+        let origin = state
+            .routine_thread_origin("sch_1")
+            .expect("a saved routine");
+        assert_eq!(origin.coworker_id, "cw_1");
+        assert_eq!(origin.routine_name, "Weekly");
+        assert_eq!(origin.word, "schedule");
+        assert!(state.routine_thread_origin("draft-1").is_none());
+        assert!(state.routine_thread_origin("sch_nope").is_none());
+        assert!(
+            state.routine_thread_origin("cw_1").is_none(),
+            "a bot's own chat"
+        );
+
+        state.conversations.push(thread("sch_1", Vec::new()));
+        assert!(
+            state.routine_thread_origin("sch_1").is_none(),
+            "an ordinary thread already under that id"
+        );
+        state.conversations.pop();
+        state.coworkers.push(hired("sch_1", 2));
+        assert!(
+            state.routine_thread_origin("sch_1").is_none(),
+            "an id that is some bot's"
+        );
+    }
+
+    /// A routine's thread is somewhere of its own: the header names it, back and forward keep
+    /// it apart from the bot's own chat, nothing about it is written to this Mac's database, and
+    /// a form answered there is answered as the bot's, not as the schedule's.
+    #[test]
+    fn a_routines_thread_is_a_place_apart_from_the_bots_chat() {
+        let mut state = with_routines();
+        let mut card = message("m_card", false, "");
+        card.parts = vec![ChatPart::UserForm(parked_form())];
+        let mut routine = thread("sch_1", vec![card]);
+        routine.origin = state.routine_thread_origin("sch_1");
+        state.conversations.push(routine);
+
+        assert!(state.active_thread_origin().is_none());
+        assert_eq!(state.nav_location().thread_id, None, "the bot's own chat");
+        assert!(state.keeps_on_disk("cw_1"));
+
+        state.active_conversation_id = Some("sch_1".into());
+        assert_eq!(
+            state
+                .active_thread_origin()
+                .map(|o| o.routine_name.as_str()),
+            Some("Weekly")
+        );
+        assert_eq!(state.nav_location().thread_id.as_deref(), Some("sch_1"));
+        assert_eq!(state.nav_location().coworker_id.as_deref(), Some("cw_1"));
+        assert!(
+            !state.keeps_on_disk("sch_1"),
+            "rebuilt from the server each time, never a row of its own"
+        );
+
+        let (entry, _, thread_id, agent_id) = state
+            .user_form_context(parked_form().card_key())
+            .expect("the card is on the routine's thread");
+        assert_eq!(entry, "e_form");
+        assert_eq!(thread_id, "sch_1", "the card is on the routine's thread");
+        assert_eq!(agent_id, "cw_1", "and it is the bot's card to answer");
     }
 
     // ---- Stopping a turn --------------------------------------------------------------------

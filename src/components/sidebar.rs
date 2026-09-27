@@ -1168,6 +1168,7 @@ mod tests {
             updated_at: updated_at.to_string(),
             messages: Vec::new(),
             unread_count: 0,
+            origin: None,
         }
     }
 
