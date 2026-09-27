@@ -203,50 +203,59 @@ fn ledger() -> Vec<(Slot, &'static str)> {
 /// camelCase and hyphenated spellings, as a `type`, a `name`, a `reason`, a field). The client
 /// code for them stays until somebody decides what to do with it; this list is the record of why
 /// the server never sends each.
-const NOT_SENT_BY_SERVER: &[(&str, &str)] = &[
+const NOT_SENT_BY_SERVER: &[(Slot, &str, &str)] = &[
     (
+        Slot::AguiType,
         "TEXT_MESSAGE_CHUNK",
         "AG-UI's shorthand for a text delta. The server's projection opens, fills and closes every \
          message (TEXT_MESSAGE_START/CONTENT/END, opengrok-harness projection.rs) and never \
          sends a chunk; it is read so another AG-UI producer still paints.",
     ),
     (
+        Slot::AguiType,
         "TOOL_CALL_CHUNK",
         "AG-UI's shorthand for a tool call. The server sends TOOL_CALL_START/ARGS/END \
          (projection.rs) and never a chunk.",
     ),
     (
+        Slot::AguiType,
         "REASONING_START",
         "The server opens reasoning with REASONING_MESSAGE_START and never sends \
          REASONING_START (projection.rs).",
     ),
     (
+        Slot::AguiType,
         "REASONING_MESSAGE_CHUNK",
         "The server's reasoning is REASONING_MESSAGE_START/CONTENT/END (projection.rs); it sends \
          no chunk.",
     ),
     (
+        Slot::AguiType,
         "custom",
         "The lowercase spelling timing.rs accepts for a run-timing frame. opengrok-wire \
          serialises EventType in SCREAMING_SNAKE_CASE, so the server only ever says CUSTOM.",
     ),
     (
+        Slot::CustomName,
         "turn-timeline",
         "The name first proposed for run-timing. The harness names the frame run-timing \
          (opengrok-harness timing.rs RUN_TIMING_NAME); no server file says turn-timeline.",
     ),
     (
+        Slot::CustomName,
         "form-request",
         "No frame is named form-request or form_request. formRequest is a field: the user-form \
          card's message.formRequest (cards.rs user_form_card) and its alias on the stamped \
          run-awaiting-approval (agui/resume.rs apply_user_form_stamp), which this app reads.",
     ),
     (
+        Slot::CustomName,
         "form-resolution",
         "No frame is named form-resolution or form_resolution. formResolution is a field on a \
          settled card and on the user-form CUSTOM (agui/user_form.rs agui_user_form_frame).",
     ),
     (
+        Slot::CustomName,
         "request-user-form",
         "No CUSTOM is named request-user-form or request_user_form. request_user_form is the \
          tool (opengrok-tools user_form.rs REQUEST_USER_FORM): it arrives as \
@@ -255,6 +264,7 @@ const NOT_SENT_BY_SERVER: &[(&str, &str)] = &[
          user-form, the settled one a user-form CUSTOM.",
     ),
     (
+        Slot::CustomName,
         "computer-handoff-card",
         "The Computer handoff is a gateway transcript entry (cards.rs computer_handoff_card: \
          message.type attachment, url sand://box, boxRequestId, boxInstruction), appended to the \
@@ -262,43 +272,63 @@ const NOT_SENT_BY_SERVER: &[(&str, &str)] = &[
          type. This app learns of it from the dismiss reply's handoffEntryId.",
     ),
     (
+        Slot::CustomName,
         "computer-handoff",
         "No frame carries a handoff; see computer-handoff-card.",
     ),
     (
+        Slot::CustomName,
         "sand://box",
         "The url on the handoff entry's attachment message (cards.rs), never a frame name.",
     ),
-    ("sand:box", "No spelling of sand://box names a frame."),
     (
+        Slot::CustomName,
+        "sand:box",
+        "No spelling of sand://box names a frame.",
+    ),
+    (
+        Slot::CustomName,
         "box-handoff",
         "Only in the route /ag-ui/box-handoff/resolve and the functions behind it \
          (agui/user_form.rs resolve_box_handoff, start_box_handoff); no frame is named \
          box-handoff, box_handoff or boxHandoff. The handoff is a transcript entry.",
     ),
-    ("box-handoff-card", "Never sent; see box-handoff."),
     (
+        Slot::CustomName,
+        "box-handoff-card",
+        "Never sent; see box-handoff.",
+    ),
+    (
+        Slot::CustomName,
         "ui",
         "The server paints charts and forms through the bar_chart and form tools it offers the \
          model (agui/chat_ui.rs, \"NativeChat paints them from the TOOL_CALL frames\") and sends \
          no generative-UI CUSTOM.",
     ),
     (
+        Slot::CustomName,
         "bar-chart",
         "A tool name on the server (bar_chart, agui/chat_ui.rs), read here from TOOL_CALL \
          frames; never a CUSTOM name.",
     ),
-    ("barchart", "Never sent under any name; see bar-chart."),
     (
+        Slot::CustomName,
+        "barchart",
+        "Never sent under any name; see bar-chart.",
+    ),
+    (
+        Slot::CustomName,
         "form",
         "A tool name on the server (agui/chat_ui.rs form_schema), never a CUSTOM name.",
     ),
     (
+        Slot::CustomName,
         "",
         "A CUSTOM with no name. Every CUSTOM the server builds is named (projection.rs, \
          agui/pending.rs, agui/user_form.rs, opengrok-tools credential.rs).",
     ),
     (
+        Slot::ApprovalReason,
         "review-an-action",
         "The name of Grok Bot's card chrome, in server comments only (opengrok-tools review.rs \
          EGRESS_TUNNEL_ASK_REASON's doc). That card is raised with reason auto-review, and the \
@@ -306,6 +336,7 @@ const NOT_SENT_BY_SERVER: &[(&str, &str)] = &[
          spelling of review-an-action is a reason.",
     ),
     (
+        Slot::ApprovalReason,
         "computer-action",
         "A Grok Bot desktop gateway event channel (the server's docs/research/client-grok-bot.md \
          and docs/archive/client-versions-0.18-0.30.md), in no server code. The server's \
@@ -313,48 +344,72 @@ const NOT_SENT_BY_SERVER: &[(&str, &str)] = &[
          run.rs SuspendReason, opengrok-tools review.rs AwaitingReason).",
     ),
     (
+        Slot::ApprovalReason,
         "egress",
         "The tunnel's card arrives as reason auto-review with EGRESS_TUNNEL_ASK_REASON as its \
          why, and is_egress_tunnel reads that sentence. No server reason is the word egress.",
     ),
     (
+        Slot::FormResolution,
         "sending",
         "This app's own pill between Continue and the reply. The server settles a form as \
          submitted, fill_failed, dismissed or escalated and nothing else (opengrok-tools \
          user_form.rs FormResolution::as_str).",
     ),
     (
+        Slot::FormResolution,
         "submitting",
         "Another spelling of this app's Sending pill; never on the wire.",
     ),
     (
+        Slot::FormResolution,
         "fill-failed",
         "The server spells it fill_failed (FormResolution::as_str); the hyphenated word is in no \
          server file. fillFailed is a different field, on formFieldOutcomes rows.",
     ),
     (
+        Slot::FormResolution,
         "not_filled",
         "Not filled is this app's pill for fill_failed. No server file spells a resolution \
          not_filled, not-filled or notFilled.",
     ),
-    ("not-filled", "Never sent; see not_filled."),
     (
+        Slot::FormResolution,
+        "not-filled",
+        "Never sent; see not_filled.",
+    ),
+    (
+        Slot::FormResolution,
         "on_screen",
         "No server file spells a resolution on_screen, on-screen, on_the_computer or \
          on-the-computer. The server's word for Open the screen is escalated \
          (agui/user_form.rs dismiss_user_form), which this app reads too.",
     ),
-    ("on-screen", "Never sent; see on_screen."),
-    ("on_the_computer", "Never sent; see on_screen."),
-    ("on-the-computer", "Never sent; see on_screen."),
     (
+        Slot::FormResolution,
+        "on-screen",
+        "Never sent; see on_screen.",
+    ),
+    (
+        Slot::FormResolution,
+        "on_the_computer",
+        "Never sent; see on_screen.",
+    ),
+    (
+        Slot::FormResolution,
+        "on-the-computer",
+        "Never sent; see on_screen.",
+    ),
+    (
+        Slot::FormResolution,
         "skipped",
         "Skip settles the form here (UserFormSpec::settle_form_from_box, declined to Skipped). \
          The server writes boxResolution declined on the handoff entry and never a skipped \
          formResolution.",
     ),
-    ("skip", "Never sent; see skipped."),
+    (Slot::FormResolution, "skip", "Never sent; see skipped."),
     (
+        Slot::FormResolution,
         "superseded",
         "This app paints it when a later message moved the thread on. The server closes that \
          card as dismissed (agui/user_form.rs settle_dead_holds).",
@@ -362,27 +417,32 @@ const NOT_SENT_BY_SERVER: &[(&str, &str)] = &[
 ];
 
 /// Words the server sends that this app has no arm for, each with what happens instead.
-const CLIENT_IGNORES: &[(&str, &str)] = &[
+const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
     (
+        Slot::AguiType,
         "TEXT_MESSAGE_END",
         "Words are painted delta by delta and a turn ends on RUN_FINISHED or RUN_ERROR, so the \
          end of one message changes nothing on screen.",
     ),
     (
+        Slot::AguiType,
         "REASONING_MESSAGE_END",
         "Reasoning only puts Thinking on the status line, and the next frame replaces it.",
     ),
     (
+        Slot::CustomName,
         "run-stopped",
         "The RUN_FINISHED the server always sends right after it (projection.rs stopped) ends \
          the turn, so on the stream a stop reads as a finish.",
     ),
     (
+        Slot::ApprovalReason,
         "exec-consent",
         "The default card. approval_from_event fills this word in when a frame has none, and \
          which card shows is decided by the tool (user_machine_shell or not), not by the word.",
     ),
     (
+        Slot::ApprovalReason,
         "policy-approval",
         "Shown as the default permission card, allow or deny once; nothing branches on the word.",
     ),
@@ -391,14 +451,22 @@ const CLIENT_IGNORES: &[(&str, &str)] = &[
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[(
-    "agui/TEXT_MESSAGE_CONTENT/a_replayed_run_draws_the_question_after_it_opens.json",
-    "were painted as the coworker's reply",
-    "A replay (GET /ag-ui/runs/{id}, GET /ag-ui/threads/{id}) opens each run with the person's \
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
+    (
+        "agui/TOOL_CALL_START/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
+        "Using shell",
+        "The status line has no arm for the box's `shell` tool, so a running command reads \
+         \"Using shell\" instead of what it runs (hexuria/nativechat#115).",
+    ),
+    (
+        "agui/TEXT_MESSAGE_CONTENT/a_replayed_run_draws_the_question_after_it_opens.json",
+        "were painted as the coworker's reply",
+        "A replay (GET /ag-ui/runs/{id}, GET /ag-ui/threads/{id}) opens each run with the person's \
      own words as TEXT_MESSAGE_* frames with role user (opengrok-server 5814af1, agui/history.rs \
      with_prompt_frames). TurnAssembler does not read the role, so a turn rebuilt from the \
      server shows the question inside the coworker's answer (hexuria/nativechat#113).",
-)];
+    ),
+];
 
 // ---- the corpus ----
 
@@ -482,6 +550,11 @@ impl Corpus {
         }
     }
 
+    /// Every frame and every REST fixture.
+    fn every_value(&self) -> impl Iterator<Item = &Value> {
+        self.frames.values().chain(self.bodies.values())
+    }
+
     fn frames_of<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a Value> {
         self.frames
             .values()
@@ -542,8 +615,11 @@ fn str_at<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-fn is_excused(list: &[(&str, &str)], word: &str) -> bool {
-    list.iter().any(|(listed, _)| *listed == word)
+/// Whether `word`, in `slot`, is on `list`. Keyed by slot: `user-form` is both a CUSTOM name and
+/// an approval reason, and excusing it in one place must not excuse it in the other.
+fn is_excused(list: &[(Slot, &str, &str)], slot: Slot, word: &str) -> bool {
+    list.iter()
+        .any(|(listed_slot, listed, _)| *listed_slot == slot && *listed == word)
 }
 
 /// One check's verdict: `Err` says what came out wrong.
@@ -653,7 +729,7 @@ fn check_frame(corpus: &Corpus, frame: &Value) -> Check {
             Ok(())
         }
         "CUSTOM" => custom(frame),
-        kind if is_excused(CLIENT_IGNORES, kind) => ignored(frame),
+        kind if is_excused(CLIENT_IGNORES, Slot::AguiType, kind) => ignored(frame),
         kind => Err(format!(
             "no check for a {kind:?} frame: say here what this app does with one"
         )),
@@ -721,8 +797,10 @@ fn text_content(corpus: &Corpus, frame: &Value) -> Check {
 fn tool_call_start(frame: &Value) -> Check {
     let mut tracker = ToolCallTracker::default();
     let status = tracker.tick(frame);
+    let tool = str_at(frame, "toolCallName");
     must!(
-        matches!(&status, ActivityTick::Set(activity) if activity.label != "Working"),
+        matches!(&status, ActivityTick::Set(activity)
+            if activity.label != "Working" && activity.label != format!("Using {tool}")),
         "TOOL_CALL_START should name what is being done, not {status:?}"
     );
     must!(
@@ -737,9 +815,18 @@ fn tool_call_args(frame: &Value) -> Check {
     let call_id = str_at(frame, "toolCallId");
     let delta = str_at(frame, "delta");
     let command = command_from_replay_events(std::slice::from_ref(frame), call_id);
+    let sent = serde_json::from_str::<Value>(delta).ok().and_then(|args| {
+        args.get("command")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
     must!(
-        !command.is_empty() && delta.contains(&command),
-        "the arguments of {call_id:?} should read back from its delta {delta:?}, got {command:?}"
+        sent.is_some(),
+        "the fixture's delta should be a shell call's arguments with a command: {delta:?}"
+    );
+    must!(
+        Some(&command) == sent.as_ref(),
+        "the command of {call_id:?} should read back as {sent:?}, got {command:?}"
     );
     Ok(())
 }
@@ -809,7 +896,7 @@ fn custom(frame: &Value) -> Check {
         PENDING_CUSTOM => pending(frame),
         USER_FORM_CUSTOM => settled_form(frame),
         CREDENTIAL_OFFER_SAVE => offer_save(frame),
-        name if is_excused(CLIENT_IGNORES, name) => ignored(frame),
+        name if is_excused(CLIENT_IGNORES, Slot::CustomName, name) => ignored(frame),
         name => Err(format!(
             "no check for a CUSTOM {name:?}: say here what this app does with one"
         )),
@@ -1174,7 +1261,9 @@ fn thread_replay(_: u16, body: &Value) -> Check {
         assembler.finish();
         let (plain, _) = assembler.snapshot();
         // Blank lines are the transcript's own, put between the words a card or a picture splits.
-        let words = |text: &str| text.split_whitespace().collect::<String>();
+        // Compared word by word: a space lost between two deltas joins two words and fails.
+        let words =
+            |text: &str| -> Vec<String> { text.split_whitespace().map(str::to_string).collect() };
         must!(
             words(&plain) == words(&said),
             "run {:?} should read {said:?}, not {plain:?}",
@@ -1260,11 +1349,41 @@ fn local_exec_policy(_: u16, body: &Value) -> Check {
         view.allow == listed("allow") && view.deny == listed("deny"),
         "the rule lists should read as sent: {view:?}"
     );
+    // This fixture is here to lock `inert` (#93, server #246): it must carry some, and they must
+    // read back exactly, pattern and reason, so a parse that drops the field (it defaults to
+    // empty) fails rather than agreeing with an empty list.
+    let sent: Vec<(String, String)> = body
+        .get("inert")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        str_at(row, "pattern").to_string(),
+                        str_at(row, "reason").to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    must!(
+        !sent.is_empty(),
+        "the policy fixture should carry inert rules to lock: {body}"
+    );
+    let read: Vec<(String, String)> = view
+        .inert
+        .iter()
+        .map(|rule| (rule.pattern.clone(), rule.reason.clone()))
+        .collect();
+    must!(
+        read == sent,
+        "the inert rules should read as sent: {read:?} vs {sent:?}"
+    );
     must!(
         view.inert
             .iter()
-            .all(|rule| view.allow.contains(&rule.pattern) && !rule.reason.is_empty()),
-        "every inert rule should be one of the allows, with a reason: {view:?}"
+            .all(|rule| view.allow.contains(&rule.pattern)),
+        "every inert rule should be one of the allows: {view:?}"
     );
     Ok(())
 }
@@ -1738,7 +1857,41 @@ fn every_type_and_name_the_server_sends_has_a_fixture() {
             missing.push(name.as_str());
         }
     }
+    // The words inside frames and bodies too: every approval reason, and every formResolution,
+    // appears in some fixture. `dismissed` is also what an unknown word parses as, so only a
+    // fixture carrying it can show it is read rather than defaulted.
+    let mut carried = BTreeSet::new();
+    for value in corpus.every_value() {
+        collect_words(value, &mut carried);
+    }
+    for (slot, key) in [
+        (Slot::ApprovalReason, "reason"),
+        (Slot::FormResolution, "formResolution"),
+    ] {
+        for word in emits.words(slot) {
+            let seen = carried.contains(&(key.to_string(), word.clone()));
+            if !seen && !corpus.manifest.unrecorded.contains(word) {
+                missing.push(word.as_str());
+            }
+        }
+    }
     assert!(missing.is_empty(), "sent, with no fixture: {missing:?}");
+}
+
+/// Every `(key, string value)` pair anywhere in `value`.
+fn collect_words(value: &Value, out: &mut BTreeSet<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            for (key, inner) in map {
+                if let Value::String(text) = inner {
+                    out.insert((key.clone(), text.clone()));
+                }
+                collect_words(inner, out);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect_words(item, out)),
+        _ => {}
+    }
 }
 
 /// Every word this app matches on is one the server sends, or is excused with the evidence that
@@ -1751,7 +1904,7 @@ fn every_word_this_app_matches_is_sent_or_excused() {
     let mut problems = Vec::new();
     for (slot, word) in &ledger {
         let sent = emits.words(*slot).iter().any(|sent| sent.as_str() == *word);
-        let excused = is_excused(NOT_SENT_BY_SERVER, word);
+        let excused = is_excused(NOT_SENT_BY_SERVER, *slot, word);
         if sent && excused {
             problems.push(format!(
                 "{} {word:?} is sent now: take it off NOT_SENT_BY_SERVER",
@@ -1766,7 +1919,7 @@ fn every_word_this_app_matches_is_sent_or_excused() {
         }
     }
     let matched: BTreeSet<&str> = ledger.iter().map(|(_, word)| *word).collect();
-    for (word, why) in NOT_SENT_BY_SERVER {
+    for (_, word, why) in NOT_SENT_BY_SERVER {
         if !matched.contains(word) {
             problems.push(format!(
                 "NOT_SENT_BY_SERVER excuses {word:?}, which nothing here matches"
@@ -1792,7 +1945,7 @@ fn every_word_the_server_sends_is_matched_or_excused() {
             let matched = ledger
                 .iter()
                 .any(|(matched_slot, matched)| *matched_slot == slot && *matched == word.as_str());
-            let ignored = is_excused(CLIENT_IGNORES, word);
+            let ignored = is_excused(CLIENT_IGNORES, slot, word);
             if matched && ignored {
                 problems.push(format!(
                     "{} {word:?} is matched now: take it off CLIENT_IGNORES",
@@ -1811,7 +1964,7 @@ fn every_word_the_server_sends_is_matched_or_excused() {
         .iter()
         .flat_map(|slot| emits.words(*slot).iter().map(String::as_str))
         .collect();
-    for (word, why) in CLIENT_IGNORES {
+    for (_, word, why) in CLIENT_IGNORES {
         if !sent.contains(word) {
             problems.push(format!(
                 "CLIENT_IGNORES lists {word:?}, which the server does not send"

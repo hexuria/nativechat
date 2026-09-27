@@ -233,5 +233,9 @@
       "file": "rest/POST__ag-ui_box-handoff_resolve/200-skip_via_form_entry_id_settles_the_live_handoff_and_resumes.json",
       "source": "crates/opengrok-server/src/agui/user_form.rs:384 resolve_box_handoff (the card from crates/opengrok-server/src/cards.rs:113 computer_handoff_card, settled by crates/opengrok-server/src/agui/user_form.rs:991; the instruction from crates/opengrok-tools/src/user_form.rs:590), in the test skip_via_form_entry_id_settles_the_live_handoff_and_resumes (crates/opengrok-server/tests/against_user_form.rs:1174)"
     }
+  ],
+  "unrecorded": [
+    "dismissed",
+    "fill_failed"
   ]
 }
