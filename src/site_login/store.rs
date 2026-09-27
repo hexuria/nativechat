@@ -28,6 +28,9 @@ pub struct SiteLoginRecord {
 }
 
 /// Every column the record reads, in its order.
+// The one part of a query here that is not a literal is this constant, and every value in a
+// WHERE goes in by `.bind`: that is what `AssertSqlSafe` below vouches for (sqlx 0.9 asks for
+// SQL that is not a `&'static str` to say so).
 const SELECT: &str = "SELECT id, origin, username, label, kind, notes, last_used_at_ms, \
                       created_at, updated_at FROM site_logins";
 
@@ -80,10 +83,11 @@ impl SiteLoginVault {
     }
 
     pub async fn list(&self) -> Result<Vec<SiteLoginRecord>, StoreError> {
-        let rows =
-            sqlx::query_as::<_, SiteLoginRecord>(&format!("{SELECT} ORDER BY origin, username"))
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query_as::<_, SiteLoginRecord>(sqlx::AssertSqlSafe(format!(
+            "{SELECT} ORDER BY origin, username"
+        )))
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -93,18 +97,18 @@ impl SiteLoginVault {
         username: Option<&str>,
     ) -> Result<Option<SiteLoginRecord>, StoreError> {
         if let Some(username) = username.filter(|name| !name.is_empty()) {
-            let row = sqlx::query_as::<_, SiteLoginRecord>(&format!(
+            let row = sqlx::query_as::<_, SiteLoginRecord>(sqlx::AssertSqlSafe(format!(
                 "{SELECT} WHERE origin = ? AND username = ?"
-            ))
+            )))
             .bind(origin)
             .bind(username)
             .fetch_optional(&self.pool)
             .await?;
             return Ok(row);
         }
-        let row = sqlx::query_as::<_, SiteLoginRecord>(&format!(
+        let row = sqlx::query_as::<_, SiteLoginRecord>(sqlx::AssertSqlSafe(format!(
             "{SELECT} WHERE origin = ? ORDER BY updated_at DESC LIMIT 1"
-        ))
+        )))
         .bind(origin)
         .fetch_optional(&self.pool)
         .await?;

@@ -31,6 +31,13 @@ pub async fn run_migrations(pool: &DbPool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A statement this test builds from the schema itself: table, index and column names read
+    /// back out of `sqlite_master` and `PRAGMA`, each written inside double quotes, never a
+    /// value from outside. sqlx 0.9 asks for SQL that is not a literal to say so.
+    fn audited(sql: String) -> sqlx::AssertSqlSafe<String> {
+        sqlx::AssertSqlSafe(sql)
+    }
+
     use super::{DbPool, create_pool, run_migrations};
     use sqlx::Row;
     use std::collections::BTreeMap;
@@ -69,7 +76,7 @@ mod tests {
     }
 
     async fn column_names(pool: &DbPool, table: &str) -> Vec<String> {
-        sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+        sqlx::query(audited(format!("PRAGMA table_info(\"{table}\")")))
             .fetch_all(pool)
             .await
             .unwrap()
@@ -90,7 +97,7 @@ mod tests {
             .map(|column| format!("quote(\"{column}\")"))
             .collect::<Vec<_>>()
             .join(" || ',' || ");
-        sqlx::query_scalar(&format!("SELECT {row} FROM \"{table}\" ORDER BY 1"))
+        sqlx::query_scalar(audited(format!("SELECT {row} FROM \"{table}\" ORDER BY 1")))
             .fetch_all(pool)
             .await
             .map_err(|e| e.to_string())
@@ -114,7 +121,7 @@ mod tests {
     /// Each unique index (a key included) on `table`, as its columns.
     async fn unique_indexes(pool: &DbPool, table: &str) -> Vec<Vec<String>> {
         let mut out = Vec::new();
-        for index in sqlx::query(&format!("PRAGMA index_list(\"{table}\")"))
+        for index in sqlx::query(audited(format!("PRAGMA index_list(\"{table}\")")))
             .fetch_all(pool)
             .await
             .unwrap()
@@ -123,7 +130,7 @@ mod tests {
                 continue;
             }
             let name: String = index.get("name");
-            let columns = sqlx::query(&format!("PRAGMA index_info(\"{name}\")"))
+            let columns = sqlx::query(audited(format!("PRAGMA index_info(\"{name}\")")))
                 .fetch_all(pool)
                 .await
                 .unwrap()
@@ -143,7 +150,7 @@ mod tests {
         let tables = user_tables(pool).await;
         let mut parents: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
         for table in &tables {
-            let links = sqlx::query(&format!("PRAGMA foreign_key_list(\"{table}\")"))
+            let links = sqlx::query(audited(format!("PRAGMA foreign_key_list(\"{table}\")")))
                 .fetch_all(pool)
                 .await
                 .unwrap()
@@ -181,7 +188,7 @@ mod tests {
         // (table, column, copy) -> the literal that seeded row holds there.
         let mut seeded: BTreeMap<(String, String, u32), String> = BTreeMap::new();
         for table in &order {
-            let columns = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+            let columns = sqlx::query(audited(format!("PRAGMA table_info(\"{table}\")")))
                 .fetch_all(pool)
                 .await
                 .unwrap();
@@ -212,7 +219,7 @@ mod tests {
                 })
             };
             let count_sql = format!("SELECT COUNT(*) FROM \"{table}\"");
-            let before: i64 = sqlx::query_scalar(&count_sql)
+            let before: i64 = sqlx::query_scalar(audited(count_sql.clone()))
                 .fetch_one(pool)
                 .await
                 .unwrap();
@@ -247,7 +254,7 @@ mod tests {
                     names.join(", "),
                     values.join(", ")
                 );
-                let done = sqlx::query(&sql)
+                let done = sqlx::query(audited(sql.clone()))
                     .execute(pool)
                     .await
                     .unwrap_or_else(|e| panic!("seeding {table} (row {copy}): {e}\n{sql}"));
@@ -265,7 +272,7 @@ mod tests {
                     }
                 }
             }
-            let after: i64 = sqlx::query_scalar(&count_sql)
+            let after: i64 = sqlx::query_scalar(audited(count_sql.clone()))
                 .fetch_one(pool)
                 .await
                 .unwrap();
