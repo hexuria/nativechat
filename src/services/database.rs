@@ -216,7 +216,6 @@ impl DatabaseService {
         Ok(())
     }
 
-    /// The stamp a hidden row carries, in the same shape as `created_at`.
     /// Write down something the person said that a replay brought back, under the id it was
     /// sent with, unless a row already has that id.
     ///
@@ -246,6 +245,7 @@ impl DatabaseService {
         Ok(written == 1)
     }
 
+    /// The stamp a hidden row carries, in the same shape as `created_at`.
     fn hidden_now() -> String {
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }

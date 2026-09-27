@@ -1299,16 +1299,16 @@ fn bubble_for_run(
 /// holds the answer and not what it answered. Whether the thread holds a message is told by id,
 /// the one this app sent it under, so the device it was typed on never gets it twice.
 ///
-/// A run's prompt is the whole conversation up to it, as `agui_messages` sends it, and the
-/// replay opens the run with every one of the person's messages in it (opengrok-server
-/// `with_prompt_frames`, `agui/history.rs`). So a message belongs to the first run it appears in.
-/// The oldest run in the list cannot tell its own from the ones before it, and is given only its
-/// last: drawing the rest would stack every earlier question above it with no answer beside
-/// any of them.
+/// The replay opens each run with the messages the person sent that turn (opengrok-server
+/// `with_prompt_frames`, `agui/history.rs`). This app sends the whole thread, but the server
+/// journals only the turn's own: the tail after the last answer, less any id an earlier run
+/// already kept (`new_turn_messages`). So every one of a run's messages is its own, and one that
+/// turned up on an earlier run anyway is drawn there, once.
 ///
 /// A run is answered here only by a reply this thread shows. One with no reply here has nothing
-/// for its question to stand before, and one the person hid, here or on another machine, is not
-/// brought back by the back door.
+/// for its question to stand before. A run the person hid is not in the list at all, only
+/// named beside it, and a run that is somehow both is skipped rather than brought back by the
+/// back door.
 ///
 /// Placed by the reply this thread already has rather than by the server's clock, for the reason
 /// `missing_replies` gives: the run's clock is the server's and the reply's is this Mac's. A
@@ -1324,19 +1324,8 @@ fn missing_questions(
     hidden_runs: &HashSet<&str>,
 ) -> Vec<RecoveredQuestion> {
     let mut held: HashSet<String> = messages.iter().map(|message| message.id.clone()).collect();
-    let mut earlier: Option<HashSet<String>> = None;
     let mut missing = Vec::new();
     for run in runs.iter().filter(|run| !run.run_id.trim().is_empty()) {
-        let said = persons_messages(&run.events);
-        let in_prompt: HashSet<String> = said.iter().map(|(id, _)| id.clone()).collect();
-        let own: Vec<(String, String)> = match &earlier {
-            Some(earlier) => said
-                .into_iter()
-                .filter(|(id, _)| !earlier.contains(id))
-                .collect(),
-            None => said.into_iter().last().into_iter().collect(),
-        };
-        earlier = Some(in_prompt);
         if hidden_runs.contains(run.run_id.as_str()) {
             continue;
         }
@@ -1347,8 +1336,9 @@ fn missing_questions(
         else {
             continue;
         };
-        let count = own.len();
-        for (index, (id, words)) in own.into_iter().enumerate() {
+        let said = persons_messages(&run.events);
+        let count = said.len();
+        for (index, (id, words)) in said.into_iter().enumerate() {
             if !held.insert(id.clone()) {
                 continue;
             }
@@ -8196,9 +8186,7 @@ impl AppState {
             }
         }
         // After the replies, so a turn recovered just now has its bubble to put its question
-        // before. Every run is read for who said what first, hidden or not: a hidden turn's
-        // question is still the one its prompt opened with, and handing it to the next run would
-        // put it above the wrong answer.
+        // before.
         if let Some(conversation) = self
             .conversations
             .iter_mut()
@@ -18449,9 +18437,8 @@ mod tests {
 
     /// A thread that holds the coworker's replies and not the person's messages (one rebuilt
     /// before questions were drawn, or a question row that never reached the disk) gets them
-    /// back from the replay, even though no reply is missing. Each run's prompt is the whole
-    /// conversation so far, so a message belongs to the first run it appears in, and each goes
-    /// on its own millisecond before its reply, in the order it was said, whatever its id.
+    /// back from the replay, even though no reply is missing. Each goes on its own millisecond
+    /// before its reply, in the order it was said, whatever its id.
     #[test]
     fn a_thread_that_has_the_answers_gets_back_the_questions() {
         let messages = vec![
@@ -18469,7 +18456,6 @@ mod tests {
                 "run_2",
                 4_990,
                 &[
-                    ("client-q1", "What is on my calendar?"),
                     ("client-b", "Move the first one."),
                     ("client-a", "And tell Sam."),
                 ],
@@ -18527,20 +18513,22 @@ mod tests {
     }
 
     /// The device a message was typed on holds it under the id it was sent with and gets nothing
-    /// twice. A run with no reply here, or one the person hid, brings back no question. The oldest
-    /// run in the list gives only its own last message, not every question from before it.
+    /// twice. A run with no reply here, or one the person hid, brings back no question. A turn
+    /// that asked two things brings both back, in the order they were asked, even when it is the
+    /// only run there is.
     #[test]
     fn a_question_comes_back_only_where_its_answer_is_shown_and_it_is_not() {
         let run = answered_run(
             "run_9",
             8_990,
-            &[("client-old", "Earlier."), ("client-q9", "Now this.")],
+            &[("client-z", "First this."), ("client-q9", "Then this.")],
             "Sure.",
         );
         let runs = [run];
 
         let typed_here = vec![
-            at(message("client-q9", true, "Now this."), 8_000),
+            at(message("client-z", true, "First this."), 7_000),
+            at(message("client-q9", true, "Then this."), 8_000),
             from_run("0-reply-9", "Sure.", "run_9", 9_000),
         ];
         assert!(missing_questions(&typed_here, &runs, &HashSet::new()).is_empty());
@@ -18549,11 +18537,17 @@ mod tests {
         let ids_drawn = |questions: Vec<RecoveredQuestion>| -> Vec<String> {
             questions.into_iter().map(|question| question.id).collect()
         };
+        let questions = missing_questions(&answer_only, &runs, &HashSet::new());
+        let mut thread = answer_only.clone();
+        graft_questions(&mut thread, &questions);
         assert_eq!(
-            ids_drawn(missing_questions(&answer_only, &runs, &HashSet::new())),
-            vec!["client-q9"],
-            "only the oldest run's own last message, not the question before it"
+            ids_drawn(questions),
+            vec!["client-z", "client-q9"],
+            "both things the turn asked, not only the last"
         );
+        let order = vec!["client-z", "client-q9", "0-reply-9"];
+        assert_eq!(ids(&thread), order);
+        assert_eq!(by_disk_order(&thread), order);
 
         assert!(missing_questions(&[], &runs, &HashSet::new()).is_empty());
         let hidden: HashSet<&str> = ["run_9"].into_iter().collect();
