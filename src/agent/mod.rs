@@ -38,7 +38,8 @@
 //! `approval-{call}` (title = the card's own, states = reason, thread, tool),
 //! `recipe-run` (on the open recipe: value = the bot it plays on, disabled while it cannot run
 //! or a run is going; invoke `recipe.run {bot?}`), `recipe-run-result` (value `running` / `ok`
-//! / `failed` / `interrupted`), `recipe-history-runs` (value = count) with
+//! / `failed` / `interrupted`), `recipe-error` (what the page says went wrong, e.g. a
+//! refused Run), `recipe-history-runs` (value = count) with
 //! `recipe-history-run-{runId}` (value = `running` / `finished` / `interrupted`, state `ok`),
 //! `settings-computer-{machine}-exec` (a connected computer's local-exec mode, value `ask` /
 //! `bypass` / `never`, state `this-mac`) with `settings-computer-{machine}-exec-ask|bypass|never`,

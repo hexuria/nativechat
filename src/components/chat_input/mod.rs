@@ -350,7 +350,16 @@ impl MessageInput {
         self
     }
 
+    /// Put the caret where typing goes: the message, or the open panel's search while `/` or `@`
+    /// has one open. A person's keys go to that search the moment the panel opens; a caret put
+    /// back in the message under an open panel sends Enter, the arrows and Escape to a field that
+    /// ignores them while the panel waits (#94: a driver's `key composer Enter` did exactly that).
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        if self.panel.read(cx).is_open() {
+            self.panel
+                .update(cx, |panel, cx| panel.focus_search(window, cx));
+            return;
+        }
         self.input_state.update(cx, |state, cx| {
             state.focus_handle(cx).focus(window, cx);
         });

@@ -78,6 +78,7 @@ pub mod ids {
     pub const RECIPE_RUN: &str = "recipe-run";
     pub const RECIPE_RUN_RESULT: &str = "recipe-run-result";
     pub const RECIPE_HISTORY_RUNS: &str = "recipe-history-runs";
+    pub const RECIPE_ERROR: &str = "recipe-error";
     /// On a routine's thread: which routine (label) and what fires it (value, `schedule` or
     /// `webhook`), and the way back to the bot's own chat.
     pub const CHAT_ROUTINE_THREAD: &str = "chat-routine-thread";
@@ -1097,13 +1098,15 @@ struct RoutineSnap {
 /// how the run it started came out, and the history.
 #[derive(Clone, Default)]
 struct RecipeDetailSnap {
-    /// The bot Run plays on when nobody picked one: the first bot the recipe is granted to,
-    /// which is the page's own default. `None` when no bot can run it.
+    /// The bot Run plays on when nobody picked one: the page's own default, the first bot the
+    /// recipe is granted to or else the person's first bot. `None` when they have no bot.
     run_bot: Option<String>,
     runnable: bool,
     running: bool,
     /// `ok`, `failed` or `interrupted`, for the run this page started.
     result: Option<&'static str>,
+    /// What the page says went wrong, in its words: a Run the server refused, among others.
+    error: Option<String>,
     /// Run id and its state word (`running`, `finished`, `interrupted`), plus whether it
     /// succeeded, newest first as the server lists them.
     runs: Vec<(String, String, bool)>,
@@ -1972,10 +1975,13 @@ impl NativeChatHost {
                 .collect(),
             recipe_open: state.recipe_open_id.clone(),
             recipe_detail: state.recipe_open.as_ref().map(|detail| {
+                // The page's own default (`RecipesView::picked_bot`): the first bot the recipe is
+                // granted to, else the person's first bot.
                 let run_bot = detail
                     .my_bots
                     .iter()
                     .find(|bot| detail.is_granted(&bot.id))
+                    .or_else(|| detail.my_bots.first())
                     .map(|bot| bot.id.clone());
                 RecipeDetailSnap {
                     runnable: run_bot.is_some() && detail.runnable_version().is_some(),
@@ -1990,6 +1996,7 @@ impl NativeChatHost {
                             "failed"
                         }
                     }),
+                    error: state.recipe_error.clone(),
                     runs: detail
                         .runs
                         .iter()
@@ -2900,6 +2907,9 @@ impl NativeChatHost {
                     detail = detail.with_child(
                         UiNode::status(ids::RECIPE_RUN_RESULT, "Run").with_value(outcome),
                     );
+                }
+                if let Some(error) = &open.error {
+                    detail = detail.with_child(UiNode::status(ids::RECIPE_ERROR, error.clone()));
                 }
                 let mut history = UiNode::list(ids::RECIPE_HISTORY_RUNS, "Runs")
                     .with_value(open.runs.len().to_string());
@@ -7343,6 +7353,7 @@ mod tests {
             runnable: true,
             running: false,
             result: None,
+            error: None,
             runs: vec![
                 ("rrun_2".into(), "running".into(), false),
                 ("rrun_1".into(), "finished".into(), true),
@@ -7392,6 +7403,11 @@ mod tests {
                 .value
                 .as_deref(),
             Some("interrupted")
+        );
+        host.recipe_detail.as_mut().unwrap().error = Some("this recipe is not granted".into());
+        assert_eq!(
+            host.snapshot().find(ids::RECIPE_ERROR).unwrap().name,
+            "this recipe is not granted"
         );
         host.invoke("recipe.run", &serde_json::json!({ "bot": "cw_2" }))
             .unwrap();

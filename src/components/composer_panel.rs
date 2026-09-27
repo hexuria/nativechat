@@ -201,6 +201,11 @@ impl ComposerPanel {
         self.open
     }
 
+    /// The caret into the search, where the panel's keys are read.
+    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.update(cx, |input, cx| input.focus(window, cx));
+    }
+
     /// Show these rows, with the search empty so a query left over from last time is never
     /// quietly hiding half the list.
     pub fn open_with(
