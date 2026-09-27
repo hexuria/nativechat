@@ -13,6 +13,7 @@ pub mod find_text;
 pub mod icons;
 pub mod opengrok;
 pub mod prefs;
+pub mod private_file;
 pub mod reachability;
 pub mod root;
 pub mod send_policy;

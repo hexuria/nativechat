@@ -64,6 +64,22 @@ jobs:
       - name: cargo deny check
         run: cargo deny --locked check
 
+  release-features:
+    # The shipped app is built with default features (`build.sh`: `cargo bundle --release`). The
+    # `agent` feature compiles in gpui-agent, a TCP control plane that can click through the UI,
+    # approval cards included. It must never be in that build. cargo tree only reads the graph,
+    # so Ubuntu is enough.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: gpui-agent is not in the default build
+        run: |
+          if cargo tree --locked -p nativechat -e normal -i gpui-agent; then
+            echo "gpui-agent is reachable with default features; it must stay behind the agent feature." >&2
+            exit 1
+          fi
+          echo "gpui-agent is only in the agent build."
+
   test:
     # The crate links AppKit, CoreAudio and LocalAuthentication unconditionally, so it only builds
     # on a Mac. The image is pinned rather than macos-latest: a new image brings a new Xcode SDK

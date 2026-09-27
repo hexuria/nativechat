@@ -4,6 +4,7 @@
 //! The AG-UI card is the person's yes. Frames that arrive here already passed the
 //! server gate, so they run without a second prompt.
 
+use crate::private_file::write_private;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -365,25 +366,6 @@ fn save_credential(path: &Path, cred: &StoredDaemon) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = write_private(path, &json);
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        file.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
 }
 
 #[cfg(test)]

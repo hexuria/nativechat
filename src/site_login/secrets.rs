@@ -96,12 +96,10 @@ impl FileVault {
         }
         let bytes = serde_json::to_vec(map).map_err(|err| StoreError::Io(err.to_string()))?;
         let tmp = self.path.with_extension("vault.tmp");
-        fs::write(&tmp, bytes).map_err(|err| StoreError::Io(err.to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-        }
+        // Private from the moment it exists: written plainly and narrowed afterwards, the
+        // secrets sat readable by every account in between, and a failed narrowing was ignored.
+        crate::private_file::write_private(&tmp, &bytes)
+            .map_err(|err| StoreError::Io(err.to_string()))?;
         fs::rename(&tmp, &self.path).map_err(|err| StoreError::Io(err.to_string()))?;
         Ok(())
     }
