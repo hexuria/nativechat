@@ -447,6 +447,41 @@ impl PersonsText {
     }
 }
 
+/// The person's own messages in a run's replay, in the order they were said, as their message
+/// id and their words. The id is the one this app sent them under, so a thread that already
+/// holds a message knows it by that id.
+pub fn persons_messages(events: &[Value]) -> Vec<(String, String)> {
+    let mut persons = PersonsText::default();
+    let mut said: Vec<(String, String)> = Vec::new();
+    for event in events {
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if !kind.starts_with("TEXT_MESSAGE") || !persons.is_persons(event) {
+            continue;
+        }
+        let Some(id) = event
+            .get("messageId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let at = match said.iter().position(|(known, _)| known == id) {
+            Some(at) => at,
+            None => {
+                said.push((id.to_string(), String::new()));
+                said.len() - 1
+            }
+        };
+        if matches!(kind, "TEXT_MESSAGE_CONTENT" | "TEXT_MESSAGE_CHUNK")
+            && let Some(delta) = event.get("delta").and_then(Value::as_str)
+        {
+            said[at].1.push_str(delta);
+        }
+    }
+    said.retain(|(_, words)| !words.trim().is_empty());
+    said
+}
+
 impl TurnAssembler {
     pub fn push_event(&mut self, event: &Value) {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1735,6 +1770,31 @@ mod tests {
     /// A replay opens each run with the person's own words, as text frames with role user. They
     /// are the question, not the answer: the coworker's reply is only the coworker's words,
     /// whether the role comes on the message's opening frame or on a chunk that carries its own.
+    /// A replay names the person's messages by the ids they were sent under, their words joined
+    /// across deltas, in the order said; the coworker's words and an empty message are not them.
+    #[test]
+    fn a_replay_names_the_persons_messages_by_the_ids_they_were_sent_under() {
+        let events = [
+            json!({"type":"RUN_STARTED","runId":"r1","threadId":"cw_1"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"u1","role":"user"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"u1","delta":"What is "}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"u1","delta":"on today?"}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"u1"}),
+            json!({"type":"TEXT_MESSAGE_CHUNK","messageId":"u2","role":"user","delta":"And tomorrow?"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"m1","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Two meetings."}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"u3","role":"user"}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"u3"}),
+        ];
+        assert_eq!(
+            persons_messages(&events),
+            vec![
+                ("u1".to_string(), "What is on today?".to_string()),
+                ("u2".to_string(), "And tomorrow?".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn the_persons_words_in_a_replay_are_not_the_coworkers_reply() {
         let mut turn = TurnAssembler::default();

@@ -25,7 +25,7 @@ use crate::opengrok::{
     UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
     approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
+    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
     save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
 };
@@ -1109,6 +1109,10 @@ struct RecoveredReply {
     finished_at: Option<SystemTime>,
     /// Harness timing CUSTOM, when the journal carried one.
     run_timing: Option<TurnTiming>,
+    /// What the person said that turn, as the replay opens the run with it: message id and
+    /// words (opengrok-server `with_prompt_frames`). On a device that never held those messages
+    /// they are drawn before the reply; one this thread already has is left as it is.
+    asked: Vec<(String, String)>,
 }
 
 /// What a thread is missing, told by comparing the runs the server kept against the runs the
@@ -1170,6 +1174,7 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                 },
                 finished_at: recovered_finished_at(run),
                 run_timing: TurnTiming::from_events(&run.events),
+                asked: persons_messages(&run.events),
             })
         })
         .collect()
@@ -1280,6 +1285,57 @@ fn bubble_for_run(
         hidden: false,
     });
     messages.len() - 1
+}
+
+/// The person's side of a recovered turn, put in where it was said: each message the run opens
+/// with that this thread does not hold, as the person's own bubble, just before where the reply
+/// goes. Known by the id this app sent it under, so a device that already has the message (the
+/// one it was typed on) never gets it twice. Hands back what was drawn, to be written down.
+///
+/// Said a millisecond before its run began, in memory and on disk alike. At the run's own start
+/// it would tie with the reply, and a thread read back from disk breaks a tie by id: the reply's
+/// is a UUIDv7 (`01…`) and sorts ahead of the question's, so the answer came back above its
+/// question on every reload. A millisecond earlier, the question sorts first by time alone.
+fn graft_questions(messages: &mut Vec<Message>, reply: &RecoveredReply) -> Vec<(String, String)> {
+    let said_at = question_time(reply.started_at);
+    let mut drawn = Vec::new();
+    for (id, words) in &reply.asked {
+        if messages.iter().any(|message| &message.id == id) {
+            continue;
+        }
+        let at = messages
+            .iter()
+            .position(|message| message.sent_at > said_at)
+            .unwrap_or(messages.len());
+        messages.insert(
+            at,
+            Message {
+                id: id.clone(),
+                sender: "Me".to_string(),
+                content: words.clone(),
+                sent_at: said_at,
+                finished_at: None,
+                run_timing: None,
+                is_me: true,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: Vec::new(),
+                run_id: None,
+                hidden: false,
+            },
+        );
+        drawn.push((id.clone(), words.clone()));
+    }
+    drawn
+}
+
+/// When a question a replay brought back was said: just before the run it opened (see
+/// `graft_questions`).
+fn question_time(run_started_at: SystemTime) -> SystemTime {
+    run_started_at
+        .checked_sub(Duration::from_millis(1))
+        .unwrap_or(run_started_at)
 }
 
 fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
@@ -8050,7 +8106,14 @@ impl AppState {
             else {
                 return;
             };
+            let asked = graft_questions(&mut conversation.messages, &reply);
             let grafted_id = graft_reply(&mut conversation.messages, &reply);
+            self.persist_recovered_questions(
+                conversation_id,
+                asked,
+                question_time(reply.started_at),
+                cx,
+            );
             let message_id = grafted_id.clone();
             if reply.live {
                 // Whatever stopped watching this run, the run did not stop. Registering it makes
@@ -8375,6 +8438,53 @@ impl AppState {
     /// when the write lands, so that switching away in the moment between deciding and writing
     /// cannot lose it either.
     #[allow(clippy::too_many_arguments)]
+    /// Write down the person's messages a replay brought back (see `graft_questions`), under
+    /// their own ids and at the time their run began, as a typed message is written.
+    fn persist_recovered_questions(
+        &mut self,
+        conversation_id: &str,
+        asked: Vec<(String, String)>,
+        said_at: SystemTime,
+        cx: &mut Context<Self>,
+    ) {
+        if asked.is_empty() {
+            return;
+        }
+        let Some(db) = self.database_service.clone() else {
+            return;
+        };
+        let title = self.conversation_title(conversation_id);
+        let conversation_id = conversation_id.to_string();
+        cx.spawn(async move |_this, _cx| {
+            if let Err(error) = db.ensure_session(&conversation_id, &title).await {
+                eprintln!("NativeChat: a recovered question was not saved: {error}");
+                return;
+            }
+            for (id, words) in asked {
+                let saved = db
+                    .save_message(
+                        &id,
+                        &conversation_id,
+                        "user",
+                        &words,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        // The person's own message came out of no run: see `write_user_row`.
+                        None,
+                        false,
+                        SaveStamp::at(said_at),
+                    )
+                    .await;
+                if let Err(error) = saved {
+                    eprintln!("NativeChat: a recovered question was not saved: {error}");
+                }
+            }
+        })
+        .detach();
+    }
+
     fn persist_assistant_reply(
         &mut self,
         conversation_id: &str,
@@ -15995,8 +16105,8 @@ mod tests {
         SkillSummary, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun,
         TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages,
         apply_catalogue, apply_reload, apply_timing, bot_status_line, bubble_for_run, clock_label,
-        graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note,
-        mark_enabled, missing_replies, overlay_server_cards, parse_sql_time,
+        graft_questions, graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin,
+        is_unsent_turn_note, mark_enabled, missing_replies, overlay_server_cards, parse_sql_time,
         reads_as_gateway_unreachable, replayed_ending, reply_from_replay, restored_message,
         restored_parts, saved_parts, spec_from_queued, stamp_run_finished, stream_paint_due,
         stream_part_sig, streaming_message_mut, turn_ending, unheard_hidden_runs,
@@ -18214,6 +18324,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(2_000),
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(8_000)),
             run_timing: None,
+            asked: Vec::new(),
         };
 
         let id = graft_reply(&mut messages, &reply);
@@ -18226,6 +18337,74 @@ mod tests {
             messages[1].run_id.as_deref(),
             Some("run_1"),
             "and it says which run it came out of, so the next reconcile leaves it alone"
+        );
+    }
+
+    /// On a device that never held the question (a new install whose sidebar came from the
+    /// server), a recovered turn brings the person's side back too: the question above its
+    /// answer, under the id it was sent with. The device it was typed on already holds that id,
+    /// and gets nothing twice.
+    #[test]
+    fn a_recovered_turn_brings_its_question_back_only_where_it_is_missing() {
+        let reply = RecoveredReply {
+            run_id: "run_1".to_string(),
+            content: "Two meetings.".to_string(),
+            parts: vec![ChatPart::Text("Two meetings.".to_string())],
+            live: false,
+            started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(2_000),
+            finished_at: None,
+            run_timing: None,
+            asked: vec![(
+                "client-q1".to_string(),
+                "What is on my calendar?".to_string(),
+            )],
+        };
+
+        let mut new_device: Vec<Message> = Vec::new();
+        let drawn = graft_questions(&mut new_device, &reply);
+        let answer = graft_reply(&mut new_device, &reply);
+        assert_eq!(
+            drawn,
+            vec![(
+                "client-q1".to_string(),
+                "What is on my calendar?".to_string()
+            )]
+        );
+        assert_eq!(
+            ids(&new_device),
+            vec!["client-q1", answer.as_str()],
+            "the question, then its answer"
+        );
+        assert!(new_device[0].is_me && new_device[0].run_id.is_none());
+        // Read back from disk the thread is ordered by when, then by id (`get_messages`), and the
+        // reply's id sorts ahead of the question's: the question has to be earlier by time.
+        let mut from_disk = new_device.clone();
+        from_disk.sort_by(|a, b| a.sent_at.cmp(&b.sent_at).then_with(|| a.id.cmp(&b.id)));
+        assert_eq!(
+            ids(&from_disk),
+            vec!["client-q1", answer.as_str()],
+            "still the question first once read back from disk"
+        );
+        assert_eq!(new_device[0].content, "What is on my calendar?");
+        assert!(!new_device[1].is_me);
+
+        let mut typed_here = vec![at(
+            message("client-q1", true, "What is on my calendar?"),
+            1_000,
+        )];
+        assert!(graft_questions(&mut typed_here, &reply).is_empty());
+        assert_eq!(
+            typed_here.len(),
+            1,
+            "the device it was typed on gets nothing twice"
+        );
+
+        let mut said_later = vec![at(message("m_next", true, "And tomorrow?"), 9_000)];
+        graft_questions(&mut said_later, &reply);
+        assert_eq!(
+            ids(&said_later),
+            vec!["client-q1", "m_next"],
+            "at its own run, ahead of what was said after it"
         );
     }
 
