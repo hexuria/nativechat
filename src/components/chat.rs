@@ -281,6 +281,9 @@ struct ChatRow {
     source_id: String,
     tts_text: SharedString,
     reply_preview: Option<String>,
+    /// A line over the bubble saying whose words these are when they are not the person's own:
+    /// a routine's instruction in its thread.
+    caption: Option<String>,
     reaction: Option<String>,
     widget: Option<UiSpec>,
     approval: Option<ApprovalSpec>,
@@ -322,6 +325,7 @@ impl ChatRow {
             source_id,
             tts_text: SharedString::from(""),
             reply_preview: None,
+            caption: None,
             reaction: None,
             widget: None,
             approval: None,
@@ -448,6 +452,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 show_footer: true,
                 tts_text: SharedString::from(text),
                 reply_preview: msg.reply_preview.clone(),
+                caption: crate::state::routine_instruction_caption(conv, msg),
                 reaction: state.message_reactions.get(&msg.id).cloned(),
                 ..ChatRow::slot(id, msg.id.clone())
             });
@@ -1243,6 +1248,7 @@ impl Render for ChatTranscript {
                                 .use_markdown(row.use_markdown)
                                 .show_footer(show_footer)
                                 .reply_preview(row.reply_preview.clone())
+                                .caption(row.caption.clone())
                                 .reaction(row.reaction.clone())
                                 .picker_open(picker_open)
                                 .ts_peek(ts_peek)

@@ -48,6 +48,8 @@ pub struct MessageBubble {
     show_footer: bool,
     copy_text: String,
     reply_preview: Option<String>,
+    /// Whose words these are, when they are not the person's own (see `ChatRow::caption`).
+    caption: Option<String>,
     reaction: Option<String>,
     picker_open: bool,
     ts_peek: f32,
@@ -80,6 +82,7 @@ impl MessageBubble {
             use_markdown: true,
             show_footer: true,
             reply_preview: None,
+            caption: None,
             reaction: None,
             picker_open: false,
             ts_peek: 0.0,
@@ -106,6 +109,11 @@ impl MessageBubble {
 
     pub fn source_id(mut self, id: impl Into<String>) -> Self {
         self.source_id = id.into();
+        self
+    }
+
+    pub fn caption(mut self, caption: Option<String>) -> Self {
+        self.caption = caption;
         self
     }
 
@@ -366,6 +374,15 @@ impl RenderOnce for MessageBubble {
                 .into_any_element()
         });
 
+        let caption = self.caption.clone().map(|caption| {
+            div()
+                .mb(px(4.))
+                .text_xs()
+                .text_color(fg.opacity(0.7))
+                .child(caption)
+                .into_any_element()
+        });
+
         let bubble = div()
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
             .flex_shrink_0()
@@ -380,6 +397,7 @@ impl RenderOnce for MessageBubble {
             .text_color(fg)
             .child(
                 v_flex()
+                    .when_some(caption, |this, caption| this.child(caption))
                     .when_some(quote, |this, quote| this.child(quote))
                     .child(body),
             );
