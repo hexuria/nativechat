@@ -148,6 +148,18 @@ mod tests {
         zip.finish().expect("finish").into_inner()
     }
 
+    /// A real export is deflate-compressed, not stored. This one was written by macOS's own
+    /// `zip -9` (`fixtures/1pux/deflated.1pux`), so the reader is checked against a writer that is
+    /// not the crate reading it, on the compression 1Password actually uses.
+    #[test]
+    fn a_deflated_1pux_from_another_zip_writer_is_read() {
+        let report = read_1pux(include_bytes!("../../../fixtures/1pux/deflated.1pux"))
+            .expect("a deflated export reads");
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].label, "GitHub");
+        assert!(report.items[0].notes.starts_with("a note long enough"));
+    }
+
     /// Each way a 1PUX file can be wrong is its own sentence: not a ZIP, a ZIP without
     /// `export.data`, an `export.data` that is not text, and one that is not JSON.
     #[test]
