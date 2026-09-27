@@ -137,4 +137,36 @@ mod tests {
         assert!(report.items[0].otpauth.is_some());
         assert_eq!(report.skipped, 0);
     }
+
+    fn zip_with(name: &str, contents: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(name, options).expect("start");
+        zip.write_all(contents).expect("write");
+        zip.finish().expect("finish").into_inner()
+    }
+
+    /// Each way a 1PUX file can be wrong is its own sentence: not a ZIP, a ZIP without
+    /// `export.data`, an `export.data` that is not text, and one that is not JSON.
+    #[test]
+    fn a_1pux_that_cannot_be_read_says_which_part_is_wrong() {
+        let not_zip = read_1pux(b"id,name\n").unwrap_err();
+        assert!(not_zip.starts_with("not a 1PUX file: "), "{not_zip}");
+        assert_eq!(
+            read_1pux(&zip_with("files/photo.png", b"x")).unwrap_err(),
+            "not a 1PUX file: no export.data inside"
+        );
+        let not_text = read_1pux(&zip_with("export.data", &[0xff, 0xfe, 0x00])).unwrap_err();
+        assert!(
+            not_text.starts_with("could not read export.data: "),
+            "{not_text}"
+        );
+        let not_json = read_1pux(&zip_with("export.data", b"accounts:")).unwrap_err();
+        assert!(
+            not_json.starts_with("export.data is not JSON: "),
+            "{not_json}"
+        );
+    }
 }

@@ -74,4 +74,19 @@ mod tests {
         );
         assert!(read_json(r#"{"encrypted":true,"items":[]}"#).is_err());
     }
+
+    /// Something that is not a Bitwarden export says so, whether it is not JSON at all or JSON
+    /// with no `items`.
+    #[test]
+    fn something_that_is_not_a_bitwarden_export_is_refused_by_name() {
+        let not_json = read_json("id,name\n").unwrap_err();
+        assert!(
+            not_json.starts_with("not a Bitwarden export: "),
+            "{not_json}"
+        );
+        assert_eq!(
+            read_json("{\"folders\": []}").unwrap_err(),
+            "not a Bitwarden export: no items"
+        );
+    }
 }
