@@ -1945,13 +1945,20 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
-    pub async fn local_exec_mode(&self, machine_id: &str) -> Result<String, OpenGrokError> {
+    /// A machine's mode and the standing rules kept for it: see [`LocalExecPolicy`].
+    pub async fn local_exec_policy(
+        &self,
+        machine_id: &str,
+    ) -> Result<LocalExecPolicy, OpenGrokError> {
         let path = format!("/local-exec/policy?machine={machine_id}");
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
-        let body: LocalExecPolicyView = Self::json_or_error(response).await?;
-        Ok(body.mode)
+        Self::json_or_error(response).await
+    }
+
+    pub async fn local_exec_mode(&self, machine_id: &str) -> Result<String, OpenGrokError> {
+        Ok(self.local_exec_policy(machine_id).await?.mode)
     }
 
     pub async fn set_local_exec_mode(
@@ -1984,6 +1991,34 @@ impl OpenGrokClient {
         let response = self
             .send_json(
                 reqwest::Method::POST,
+                "/local-exec/policy/rule",
+                Some(&body),
+            )
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
+    /// Take one standing rule off a machine: the same body [`Self::add_local_exec_rule`] kept it
+    /// with, sent to `DELETE` (opengrok-server `remove_rule` in
+    /// `crates/opengrok-server/src/local_exec.rs`).
+    ///
+    /// The server deletes by exact match and answers `204` whether or not a row went, so
+    /// `pattern` is the command exactly as the listing gave it, and a rule that had already
+    /// gone is not an error. A store that failed answers `500` with a sentence of its own.
+    pub async fn remove_local_exec_rule(
+        &self,
+        machine_id: &str,
+        kind: &str,
+        pattern: &str,
+    ) -> Result<(), OpenGrokError> {
+        let body = json!({
+            "machineId": machine_id,
+            "kind": kind,
+            "pattern": pattern,
+        });
+        let response = self
+            .send_json(
+                reqwest::Method::DELETE,
                 "/local-exec/policy/rule",
                 Some(&body),
             )
@@ -2653,10 +2688,47 @@ pub struct DaemonEnrol {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct LocalExecPolicyView {
+/// A machine's reverse-exec policy as `GET /local-exec/policy?machine=<id>` lists it:
+/// `{machineId, mode, allow, deny, inert}`, transcribed from `policy_listing` in opengrok-server
+/// `crates/opengrok-server/src/local_exec.rs` (`inert` since PR #246).
+///
+/// Every field reads as empty when it is missing. The roster only ever wanted `mode`, and a
+/// server from before #246 sends no `inert`, which is the same as saying every allow it lists
+/// is in effect.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalExecPolicy {
     #[serde(default)]
-    mode: String,
+    pub machine_id: String,
+    /// `never`, `ask` or `bypass`, in the server's words: see [`LocalExecMode::from_stored`].
+    #[serde(default)]
+    pub mode: String,
+    /// Commands the gate lets through without asking while the machine is on `ask`: each one a
+    /// standing allow, the command exactly as it was kept.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Commands the gate refuses without asking while the machine is on `ask`. A deny matches
+    /// any simple command in a line, and wins over an allow.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Allows the gate can never match, each named again here with the reason the rule
+    /// endpoint would refuse it today: a rule kept before that refusal existed, or written
+    /// straight to the store. Every pattern here is also in `allow`. A sibling list rather than
+    /// a flag on each row because `allow` is an array of strings this app already read, and the
+    /// server kept it one.
+    #[serde(default)]
+    pub inert: Vec<InertRule>,
+}
+
+/// One allow the gate can never match: `{pattern, reason}` in [`LocalExecPolicy::inert`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct InertRule {
+    #[serde(default)]
+    pub pattern: String,
+    /// The server's sentence for why it is never read, as the rule endpoint would say it
+    /// (opengrok-server `standing_rule_refusal`), e.g. "sudo cannot be a standing allow".
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// What sets a schedule off: the clock, or somebody POSTing to a URL.
@@ -6152,6 +6224,108 @@ mod tests {
 
         assert_eq!(refused.status, Some(422));
         assert_eq!(refused.message, "sudo cannot be a standing allow");
+    }
+
+    /// The listing Settings → Computer draws this Mac's rules from, body for body as
+    /// opengrok-server `policy_listing` writes it: both lists in the server's order, and each
+    /// allow the gate can never match named again in `inert` with the server's reason (#246).
+    #[tokio::test]
+    async fn a_policy_lists_both_kinds_of_rule_and_the_allows_that_never_match() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/policy"))
+            .and(wiremock::matchers::query_param("machine", "mac_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machineId": "mac_1",
+                "mode": "ask",
+                "allow": ["ls -la", "sudo ls"],
+                "deny": ["rm -rf /tmp/x"],
+                "inert": [{ "pattern": "sudo ls", "reason": "sudo cannot be a standing allow" }]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let policy = client.local_exec_policy("mac_1").await.unwrap();
+
+        assert_eq!(
+            policy,
+            LocalExecPolicy {
+                machine_id: "mac_1".into(),
+                mode: "ask".into(),
+                allow: vec!["ls -la".into(), "sudo ls".into()],
+                deny: vec!["rm -rf /tmp/x".into()],
+                inert: vec![InertRule {
+                    pattern: "sudo ls".into(),
+                    reason: "sudo cannot be a standing allow".into(),
+                }],
+            }
+        );
+        // The roster reads the mode off the same listing.
+        assert_eq!(client.local_exec_mode("mac_1").await.unwrap(), "ask");
+    }
+
+    /// A server from before #246 names no inert allows, which reads as every allow being in
+    /// effect rather than as a listing that could not be read.
+    #[tokio::test]
+    async fn a_policy_from_before_inert_rules_has_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/policy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machineId": "mac_1",
+                "mode": "ask",
+                "allow": ["ls -la"],
+                "deny": []
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let policy = client.local_exec_policy("mac_1").await.unwrap();
+
+        assert_eq!(policy.allow, vec!["ls -la".to_string()]);
+        assert!(policy.inert.is_empty());
+    }
+
+    /// Remove sends back exactly what the listing gave, as the body opengrok-server
+    /// `remove_rule` reads (`RuleBody`: `{machineId, kind, pattern}`), and a store that failed
+    /// comes back with the server's own sentence.
+    #[tokio::test]
+    async fn removing_a_rule_names_it_exactly_and_a_failure_reads_back_why() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/local-exec/policy/rule"))
+            .and(body_json(
+                json!({ "machineId": "mac_1", "kind": "deny", "pattern": "rm -rf /tmp/x" }),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/local-exec/policy/rule"))
+            .and(body_json(
+                json!({ "machineId": "mac_1", "kind": "allow", "pattern": "ls -la" }),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("could not remove the rule"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        client
+            .remove_local_exec_rule("mac_1", "deny", "rm -rf /tmp/x")
+            .await
+            .unwrap();
+        let failed = client
+            .remove_local_exec_rule("mac_1", "allow", "ls -la")
+            .await
+            .unwrap_err();
+
+        assert_eq!(failed.status, Some(500));
+        assert_eq!(failed.message, "could not remove the rule");
     }
 
     fn computer(

@@ -14,16 +14,16 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
     Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, ImageVisibility,
-    LocalExecMode, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient,
-    OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate,
-    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult,
-    RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunRecipeResponse, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleKind,
-    ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary,
-    ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming,
-    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
-    UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay, approval_summary,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill,
+    OpenGrokClient, OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite,
+    ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunRecipeResponse,
+    RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
+    ScheduleKind, ScheduleRow, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
+    SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
+    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
@@ -2033,6 +2033,125 @@ pub enum RouteTrafficSurface {
     UserSettings,
 }
 
+/// Which of a machine's two standing lists a rule is on. Its word is what `POST` and `DELETE
+/// /local-exec/policy/rule` take as `kind` (opengrok-server `VALID_KINDS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RuleKind {
+    Allow,
+    Deny,
+}
+
+impl RuleKind {
+    /// Both, in the order Settings lists them.
+    pub const ALL: [Self; 2] = [Self::Allow, Self::Deny];
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// One of this Mac's standing rules as Settings → Computer lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRuleRow {
+    /// The command, exactly as the server keeps it. Remove sends it back byte for byte, because
+    /// the server deletes by exact match and a trimmed copy would take nothing off.
+    pub pattern: String,
+    /// The server's reason this allow can never match anything, for one it names in `inert`
+    /// (opengrok-server #246). `None` for a rule the gate reads.
+    pub inert: Option<String>,
+}
+
+/// The standing rules a local-shell card's Always allow and Never keep for this Mac, as
+/// `GET /local-exec/policy` last listed them, and what Settings → Computer is doing to them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalRules {
+    /// The machine these were read for. They are drawn only under the roster's row for this
+    /// same machine, so a list read before this Mac enrolled again is never shown as the new
+    /// machine's.
+    pub machine_id: String,
+    pub allow: Vec<LocalRuleRow>,
+    pub deny: Vec<LocalRuleRow>,
+    /// The lists above are the server's answer. False after a read that failed, when the page
+    /// says why instead of saying there are no rules.
+    pub listed: bool,
+    /// Why the lists could not be read.
+    pub error: Option<String>,
+    /// Rules whose Remove is with the server. A row's button stays dead until the server has
+    /// answered for it, so one press is one request.
+    pub removing: HashSet<(RuleKind, String)>,
+    /// Why a Remove did not go through, under the row it was pressed on, until it is pressed
+    /// again.
+    pub not_removed: HashMap<(RuleKind, String), String>,
+}
+
+impl LocalRules {
+    /// The two lists in the server's order, each allow the server names in `inert` carrying
+    /// its reason. An `inert` entry that names no allow names nothing on this page: the server
+    /// only ever lists allows there that are also in `allow`.
+    fn listed(machine_id: String, policy: &LocalExecPolicy) -> Self {
+        let inert = |pattern: &str| {
+            policy
+                .inert
+                .iter()
+                .find(|inert| inert.pattern == pattern)
+                .map(|inert| inert.reason.clone())
+        };
+        let row = |pattern: &String, inert: Option<String>| LocalRuleRow {
+            pattern: pattern.clone(),
+            inert,
+        };
+        Self {
+            machine_id,
+            allow: policy
+                .allow
+                .iter()
+                .map(|pattern| row(pattern, inert(pattern)))
+                .collect(),
+            deny: policy
+                .deny
+                .iter()
+                .map(|pattern| row(pattern, None))
+                .collect(),
+            listed: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn rows(&self, kind: RuleKind) -> &[LocalRuleRow] {
+        match kind {
+            RuleKind::Allow => &self.allow,
+            RuleKind::Deny => &self.deny,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
+
+    pub fn is_removing(&self, kind: RuleKind, pattern: &str) -> bool {
+        self.removing.contains(&(kind, pattern.to_string()))
+    }
+
+    pub fn not_removed(&self, kind: RuleKind, pattern: &str) -> Option<&str> {
+        self.not_removed
+            .get(&(kind, pattern.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Drop a rule the server has answered `204` for. Every row with that command goes, as
+    /// every such row went on the server.
+    fn forget(&mut self, kind: RuleKind, pattern: &str) {
+        let rows = match kind {
+            RuleKind::Allow => &mut self.allow,
+            RuleKind::Deny => &mut self.deny,
+        };
+        rows.retain(|row| row.pattern != pattern);
+    }
+}
+
 /// One frame of in-app navigation. GPUI has no browser history; we keep this stack
 /// so ⌘[ / ⌘] can walk agents, the right pane, and Settings the way macOS apps do.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2322,6 +2441,12 @@ pub struct AppState {
     local_exec_cancel: Option<Arc<AtomicBool>>,
     pub expanded_shell_output: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
+    /// This Mac's standing rules, as Settings → Computer last read them. See
+    /// [`Self::this_mac_rules`] for when they are drawn.
+    pub local_rules: Option<LocalRules>,
+    /// Which read of [`Self::local_rules`] is the newest. A read answered after a newer one
+    /// began, or after the person signed out, is dropped.
+    local_rules_epoch: u64,
     /// The active coworker's computer, as last polled. Cleared on a switch so a
     /// bot never shows the previous one's screen.
     pub coworker_computer: Option<CoworkerComputer>,
@@ -2824,6 +2949,8 @@ impl AppState {
             local_exec_cancel: None,
             expanded_shell_output: HashSet::new(),
             computers: Vec::new(),
+            local_rules: None,
+            local_rules_epoch: 0,
             coworker_computer: None,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
@@ -3836,6 +3963,9 @@ impl AppState {
         self.stop_local_exec();
         self.approval_decisions.clear();
         self.computers.clear();
+        // This Mac's rules were this account's, and so is any read of them still out.
+        self.local_rules = None;
+        self.local_rules_epoch += 1;
         self.host_egress_tunnel_available = false;
         self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
@@ -9140,15 +9270,22 @@ impl AppState {
             // word, and never for `sudo`, and answers anything else with a 422 and the reason
             // (opengrok-server `standing_rule_refusal`, PR #213); a write that never got there
             // reads the same way, with what stopped it.
-            if let Some(rule) = rule
-                && let Err(error) = client
+            if let Some(rule) = rule {
+                let kept = client
                     .add_local_exec_rule(&rule.machine_id, rule.kind, &rule.pattern)
-                    .await
-            {
+                    .await;
                 let _ = this.update(cx, |state, cx| {
-                    state
-                        .approval_decisions
-                        .insert(spec.call_id.clone(), rule_not_kept(approved, &error));
+                    match kept {
+                        // A rule kept is a row on Settings → Computer, which reads its lists
+                        // again if it is the page on screen: a card can be answered from the
+                        // notification while the person is there.
+                        Ok(()) => state.refresh_local_rules(cx),
+                        Err(error) => {
+                            state
+                                .approval_decisions
+                                .insert(spec.call_id.clone(), rule_not_kept(approved, &error));
+                        }
+                    }
                     cx.notify();
                 });
             }
@@ -13444,6 +13581,10 @@ impl AppState {
         };
         // A roster reload is the moment a server upgrade would show; ask again.
         self.computer_endpoint_missing = false;
+        // This Mac's rules are drawn under its row, so whatever reads the roster again for
+        // Settings → Computer reads them again too: opening the page, landing on it by back
+        // or forward, and this Mac enrolling while it is open.
+        self.refresh_local_rules(cx);
         let this_id = self.local_exec_machine_id.clone();
         cx.spawn(async move |this, cx| {
             let Ok(mut computers) = client.list_computers().await else {
@@ -13463,6 +13604,153 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// This Mac's standing rules where Settings → Computer draws them: under the roster's row
+    /// for this Mac, and only when they were read for that row's machine. `None` for every
+    /// other machine on the roster, whose rules this app does not keep, and before the roster
+    /// has a row for this Mac at all.
+    pub fn this_mac_rules(&self) -> Option<&LocalRules> {
+        let rules = self.local_rules.as_ref()?;
+        self.computers
+            .iter()
+            .any(|computer| computer.this_machine && computer.machine_id == rules.machine_id)
+            .then_some(rules)
+    }
+
+    /// Read this Mac's standing rules again, while Settings → Computer is on screen.
+    ///
+    /// Only then: nothing else shows them, and arriving on the page reads them afresh, so a
+    /// read made while nobody is looking would be out of date by the time anybody was.
+    fn refresh_local_rules(&mut self, cx: &mut Context<Self>) {
+        if !(self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Computer) {
+            return;
+        }
+        let (Some(client), Some(machine_id)) = (self.opengrok.clone(), self.this_mac_id()) else {
+            return;
+        };
+        self.local_rules_epoch += 1;
+        let epoch = self.local_rules_epoch;
+        cx.spawn(async move |this, cx| {
+            let listed = client.local_exec_policy(&machine_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.take_local_rules(epoch, machine_id, listed) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Take a read of this Mac's rules, unless a newer read has begun since. `false` when the
+    /// answer was overtaken and nothing was touched.
+    ///
+    /// A read that failed empties the lists, because a list left on screen under a line saying
+    /// it could not be read is a list somebody reads as current. What is being removed, and
+    /// why a Remove did not go through, stay with the machine they were about.
+    fn take_local_rules(
+        &mut self,
+        epoch: u64,
+        machine_id: String,
+        listed: Result<LocalExecPolicy, OpenGrokError>,
+    ) -> bool {
+        if self.local_rules_epoch != epoch {
+            return false;
+        }
+        let (removing, not_removed) = self
+            .local_rules
+            .take()
+            .filter(|rules| rules.machine_id == machine_id)
+            .map(|rules| (rules.removing, rules.not_removed))
+            .unwrap_or_default();
+        let mut rules = match listed {
+            Ok(policy) => LocalRules::listed(machine_id, &policy),
+            Err(error) => LocalRules {
+                machine_id,
+                error: Some(rules_refusal("This Mac's rules could not be read", &error)),
+                ..LocalRules::default()
+            },
+        };
+        rules.removing = removing;
+        // A note about a Remove is about a row, and a row the server no longer lists takes
+        // its note with it. One kept again later starts without it.
+        rules.not_removed = not_removed
+            .into_iter()
+            .filter(|((kind, pattern), _)| {
+                rules.rows(*kind).iter().any(|row| &row.pattern == pattern)
+            })
+            .collect();
+        self.local_rules = Some(rules);
+        true
+    }
+
+    /// Settings → Computer's Remove on one of this Mac's standing rules.
+    ///
+    /// The row stays until the server has answered, saying it is being removed, and goes when
+    /// the server says it has; then the lists are read again, which is what they are from then
+    /// on. A Remove that did not go through leaves the row where it was, with why under it.
+    pub fn remove_local_rule(&mut self, kind: RuleKind, pattern: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(rules) = self.local_rules.as_mut() else {
+            return;
+        };
+        let key = (kind, pattern.clone());
+        // The button is dead while its rule is with the server; a second press that got here
+        // anyway is the same request again, and the first one's answer is the one to wait for.
+        if !rules.removing.insert(key.clone()) {
+            return;
+        }
+        rules.not_removed.remove(&key);
+        let machine_id = rules.machine_id.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let removed = client
+                .remove_local_exec_rule(&machine_id, kind.word(), &pattern)
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if state.take_removal(&machine_id, kind, &pattern, removed) {
+                    state.refresh_local_rules(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What the server said to a Remove. `true` when it took the rule off, and the lists are
+    /// worth reading again.
+    fn take_removal(
+        &mut self,
+        machine_id: &str,
+        kind: RuleKind,
+        pattern: &str,
+        removed: Result<(), OpenGrokError>,
+    ) -> bool {
+        let key = (kind, pattern.to_string());
+        let rules = self
+            .local_rules
+            .as_mut()
+            .filter(|rules| rules.machine_id == machine_id);
+        match removed {
+            Ok(()) => {
+                if let Some(rules) = rules {
+                    rules.removing.remove(&key);
+                    rules.forget(kind, pattern);
+                }
+                true
+            }
+            Err(error) => {
+                if let Some(rules) = rules {
+                    rules.removing.remove(&key);
+                    rules
+                        .not_removed
+                        .insert(key, rules_refusal("Not removed", &error));
+                }
+                false
+            }
+        }
     }
 
     pub fn set_computer_exec_mode(
@@ -13891,6 +14179,21 @@ fn policy_not_kept(
         allowed: mode != LocalExecMode::Never,
         why,
     })
+}
+
+/// Something Settings → Computer could not do with this Mac's rules, as the page says it: what
+/// did not happen, then the server's own reason when it refused and gave one as a line of plain
+/// text (see [`plain_reason`]). A server out of reach or a session that has gone is already
+/// said by the reconnect pill and the signed-out banner, and here it is only that it did not
+/// happen.
+fn rules_refusal(what: &str, error: &OpenGrokError) -> String {
+    let reason = (error.failure() == Failure::Verdict)
+        .then(|| plain_reason(&error.message))
+        .flatten();
+    match reason {
+        Some(reason) => format!("{what}: {reason}"),
+        None => format!("{what}."),
+    }
 }
 
 /// The most of a refusal's own words that a card's line carries.
@@ -15695,14 +15998,14 @@ mod tests {
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
     use crate::opengrok::{
-        ApprovalSpec, ConnectedComputer, Failure, FormField, FormResolution, FormSpec,
-        LocalExecMode, LocalExecResolution, ModelEntry, OpenGrokClient, OpenGrokError,
-        QueuedApproval, USER_MACHINE_SHELL, UiSpec,
+        ApprovalSpec, ConnectedComputer, Failure, FormField, FormResolution, FormSpec, InertRule,
+        LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelEntry, OpenGrokClient,
+        OpenGrokError, QueuedApproval, USER_MACHINE_SHELL, UiSpec,
     };
     use crate::state::{
-        ApprovalDecision, Busy, MessagePart, PendingBoxHandoff, PendingSave, StandingRule,
-        card_answer, egress_answer, once_only_for, policy_not_kept, rule_not_kept,
-        settled_decision,
+        ApprovalDecision, Busy, LocalRuleRow, LocalRules, MessagePart, PendingBoxHandoff,
+        PendingSave, RuleKind, StandingRule, card_answer, egress_answer, once_only_for,
+        policy_not_kept, rule_not_kept, rules_refusal, settled_decision,
     };
     use chrono::{Local, TimeZone};
     use std::str::FromStr;
@@ -19909,6 +20212,303 @@ mod tests {
 
         state.local_exec_machine_id = Some("mac_daemon".into());
         assert_eq!(state.this_mac_id().as_deref(), Some("mac_daemon"));
+    }
+
+    /// A listing of this Mac's policy as `GET /local-exec/policy` sends it.
+    fn policy(allow: &[&str], deny: &[&str], inert: &[(&str, &str)]) -> LocalExecPolicy {
+        let commands = |list: &[&str]| list.iter().map(|command| command.to_string()).collect();
+        LocalExecPolicy {
+            machine_id: "mac_here".into(),
+            mode: "ask".into(),
+            allow: commands(allow),
+            deny: commands(deny),
+            inert: inert
+                .iter()
+                .map(|(pattern, reason)| InertRule {
+                    pattern: pattern.to_string(),
+                    reason: reason.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn rule(pattern: &str, inert: Option<&str>) -> LocalRuleRow {
+        LocalRuleRow {
+            pattern: pattern.into(),
+            inert: inert.map(str::to_string),
+        }
+    }
+
+    /// Settings lists this Mac's rules in the server's order, and an allow the server names in
+    /// `inert` carries the server's reason, matched on the command exactly. A deny is never
+    /// inert, even with the same command, and an `inert` entry that names no allow names
+    /// nothing on the page.
+    #[test]
+    fn an_allow_the_gate_never_reads_carries_the_servers_reason() {
+        let rules = LocalRules::listed(
+            "mac_here".into(),
+            &policy(
+                &["ls -la", "sudo ls"],
+                &["sudo ls"],
+                &[
+                    ("sudo ls", "sudo cannot be a standing allow"),
+                    ("git push", "not a rule on this Mac"),
+                ],
+            ),
+        );
+        assert!(rules.listed);
+        assert_eq!(rules.machine_id, "mac_here");
+        assert_eq!(
+            rules.allow,
+            vec![
+                rule("ls -la", None),
+                rule("sudo ls", Some("sudo cannot be a standing allow")),
+            ]
+        );
+        assert_eq!(rules.deny, vec![rule("sudo ls", None)]);
+    }
+
+    /// A read answered after a newer one began is dropped whole. A read that failed empties the
+    /// lists and says why, in the server's words when it gave some, rather than "no rules". What
+    /// is on its way off, and why a Remove did not go through, stay with the machine and the
+    /// rows they are about.
+    #[test]
+    fn a_read_of_this_macs_rules_is_taken_only_while_it_is_the_newest() {
+        let mut state = AppState::new();
+        state.local_rules_epoch = 2;
+        assert!(!state.take_local_rules(1, "mac_here".into(), Ok(policy(&["ls -la"], &[], &[]))));
+        assert_eq!(state.local_rules, None);
+
+        assert!(state.take_local_rules(
+            2,
+            "mac_here".into(),
+            Ok(policy(&["ls -la", "pwd"], &["rm -rf /tmp/x"], &[])),
+        ));
+        let rules = state.local_rules.as_mut().unwrap();
+        rules.removing.insert((RuleKind::Allow, "ls -la".into()));
+        rules
+            .not_removed
+            .insert((RuleKind::Allow, "pwd".into()), "Not removed.".into());
+        rules.not_removed.insert(
+            (RuleKind::Deny, "rm -rf /tmp/x".into()),
+            "Not removed.".into(),
+        );
+
+        // Read again with the deny gone (taken off from somewhere else): its note goes with it.
+        assert!(state.take_local_rules(
+            2,
+            "mac_here".into(),
+            Ok(policy(&["ls -la", "pwd"], &[], &[])),
+        ));
+        let rules = state.local_rules.as_ref().unwrap();
+        assert!(rules.is_removing(RuleKind::Allow, "ls -la"));
+        assert_eq!(
+            rules.not_removed(RuleKind::Allow, "pwd"),
+            Some("Not removed.")
+        );
+        assert_eq!(rules.not_removed(RuleKind::Deny, "rm -rf /tmp/x"), None);
+
+        assert!(state.take_local_rules(
+            2,
+            "mac_here".into(),
+            Err(OpenGrokError::from_server(
+                Some(403),
+                "that machine is not yours"
+            )),
+        ));
+        let rules = state.local_rules.as_ref().unwrap();
+        assert!(rules.is_empty());
+        assert!(
+            !rules.listed,
+            "a list that could not be read is not an empty one"
+        );
+        assert_eq!(
+            rules.error.as_deref(),
+            Some("This Mac's rules could not be read: that machine is not yours.")
+        );
+        assert!(
+            rules.is_removing(RuleKind::Allow, "ls -la"),
+            "that Remove is still with the server"
+        );
+
+        // Another machine's lists start with nothing of this one's.
+        assert!(state.take_local_rules(2, "mac_new".into(), Ok(policy(&[], &[], &[]))));
+        let rules = state.local_rules.as_ref().unwrap();
+        assert_eq!(rules.machine_id, "mac_new");
+        assert!(rules.listed && rules.error.is_none());
+        assert!(rules.removing.is_empty() && rules.not_removed.is_empty());
+    }
+
+    /// A Remove the server answered takes that rule off the page (every row of it, as the
+    /// server deletes by exact match) and asks for the lists again. One that did not go through
+    /// leaves the row where it was with why under it, in the server's words when they are a
+    /// line of plain text, and asks for nothing.
+    #[test]
+    fn a_removed_rule_goes_and_one_not_removed_stays_saying_why() {
+        let mut state = AppState::new();
+        state.local_rules = Some(LocalRules::listed(
+            "mac_here".into(),
+            &policy(&["ls -la", "pwd", "ls -la"], &["rm -rf /tmp/x"], &[]),
+        ));
+        let press = |state: &mut AppState, kind: RuleKind, pattern: &str| {
+            let rules = state.local_rules.as_mut().unwrap();
+            rules.removing.insert((kind, pattern.to_string()));
+        };
+
+        press(&mut state, RuleKind::Allow, "ls -la");
+        assert!(state.take_removal("mac_here", RuleKind::Allow, "ls -la", Ok(())));
+        let rules = state.local_rules.as_ref().unwrap();
+        assert_eq!(rules.allow, vec![rule("pwd", None)]);
+        assert!(!rules.is_removing(RuleKind::Allow, "ls -la"));
+
+        press(&mut state, RuleKind::Deny, "rm -rf /tmp/x");
+        assert!(!state.take_removal(
+            "mac_here",
+            RuleKind::Deny,
+            "rm -rf /tmp/x",
+            Err(OpenGrokError::from_server(
+                Some(500),
+                "could not remove the rule"
+            )),
+        ));
+        let rules = state.local_rules.as_ref().unwrap();
+        assert_eq!(rules.deny, vec![rule("rm -rf /tmp/x", None)]);
+        assert!(!rules.is_removing(RuleKind::Deny, "rm -rf /tmp/x"));
+        assert_eq!(
+            rules.not_removed(RuleKind::Deny, "rm -rf /tmp/x"),
+            Some("Not removed: could not remove the rule.")
+        );
+
+        // What stands in front of the server answering with a page of its own is no reason.
+        press(&mut state, RuleKind::Allow, "pwd");
+        assert!(!state.take_removal(
+            "mac_here",
+            RuleKind::Allow,
+            "pwd",
+            Err(OpenGrokError::from_server(
+                Some(500),
+                "<html><body>Internal Server Error</body></html>"
+            )),
+        ));
+        assert_eq!(
+            state
+                .local_rules
+                .as_ref()
+                .unwrap()
+                .not_removed(RuleKind::Allow, "pwd"),
+            Some("Not removed.")
+        );
+    }
+
+    /// The server's reason is given when it refused and said why. A server out of reach, or a
+    /// session that has gone, is said by the pill and the banner, and here is only that it did
+    /// not happen.
+    #[test]
+    fn a_rules_failure_gives_a_reason_only_when_the_server_gave_one() {
+        assert_eq!(
+            rules_refusal(
+                "Not removed",
+                &OpenGrokError::from_server(Some(500), "could not remove the rule")
+            ),
+            "Not removed: could not remove the rule."
+        );
+        assert_eq!(
+            rules_refusal(
+                "Not removed",
+                &OpenGrokError::from_server(Some(502), "Bad Gateway")
+            ),
+            "Not removed."
+        );
+        assert_eq!(
+            rules_refusal(
+                "Not removed",
+                &OpenGrokError::signed_out("the session has ended")
+            ),
+            "Not removed."
+        );
+    }
+
+    /// This Mac's rules are drawn under this Mac's row and nowhere else: not before the roster
+    /// has a row for this Mac, not under a row that is not this Mac's, and not when they were
+    /// read for a machine this Mac no longer is.
+    #[test]
+    fn this_macs_rules_show_only_under_this_macs_own_row() {
+        let mut state = AppState::new();
+        state.local_rules = Some(LocalRules::listed(
+            "mac_here".into(),
+            &policy(&["ls -la"], &[], &[]),
+        ));
+        assert!(state.this_mac_rules().is_none(), "no roster yet");
+
+        let not_this_mac = ConnectedComputer {
+            machine_id: "mac_here".into(),
+            label: "A Mac".into(),
+            mode: LocalExecMode::Ask,
+            this_machine: false,
+            online: true,
+        };
+        state.computers = vec![not_this_mac.clone()];
+        assert!(state.this_mac_rules().is_none());
+
+        state.computers = vec![ConnectedComputer {
+            this_machine: true,
+            ..not_this_mac.clone()
+        }];
+        assert_eq!(
+            state
+                .this_mac_rules()
+                .map(|rules| rules.machine_id.as_str()),
+            Some("mac_here")
+        );
+
+        state.computers = vec![ConnectedComputer {
+            machine_id: "mac_new".into(),
+            this_machine: true,
+            ..not_this_mac
+        }];
+        assert!(
+            state.this_mac_rules().is_none(),
+            "read for the machine this Mac used to be"
+        );
+    }
+
+    /// A driver reads this Mac's rules off Settings → Computer, as a person does, and off no
+    /// other page.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_driver_reads_this_macs_rules_off_settings_computer() {
+        use crate::agent::{NativeChatHost, ids};
+        use gpui_agent::prelude::AgentHost;
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.account = serde_json::from_value(serde_json::json!({
+            "id": "acct_1",
+            "email": "ada@example.com"
+        }))
+        .ok();
+        state.coworkers.push(bob());
+        state.computers = vec![ConnectedComputer {
+            machine_id: "mac_here".into(),
+            label: "NativeChat on this Mac".into(),
+            mode: LocalExecMode::Ask,
+            this_machine: true,
+            online: true,
+        }];
+        state.local_rules = Some(LocalRules::listed(
+            "mac_here".into(),
+            &policy(&["ls -la"], &["rm -rf /tmp/x"], &[]),
+        ));
+        let deny = |state: &AppState| {
+            NativeChatHost::from_app(state)
+                .snapshot()
+                .find(&ids::local_rule(RuleKind::Deny, 0))
+                .and_then(|node| node.value.clone())
+        };
+        assert_eq!(deny(&state), None, "Settings is not open on Computer");
+
+        state.is_app_settings_open = true;
+        state.app_settings_tab = super::AppSettingsTab::Computer;
+        assert_eq!(deny(&state).as_deref(), Some("rm -rf /tmp/x"));
     }
 
     /// The line a card is left with when the policy write for `mode` fails with `error` while
