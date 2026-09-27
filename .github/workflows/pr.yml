@@ -20,7 +20,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # rustup reads rust-toolchain.toml, so this is the same rustfmt as a laptop's.
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -32,7 +32,7 @@ jobs:
     # A schema change is always a new file.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Migrations are append-only
@@ -52,7 +52,7 @@ jobs:
     # cargo deny reads Cargo.lock and the crate graph; it builds nothing, so Ubuntu is enough.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install cargo-deny
         run: |
           mkdir -p "$HOME/.local/bin"
@@ -70,7 +70,7 @@ jobs:
     # underneath the pinned toolchain.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           # Pull requests read main's cache and never write their own, so the cache stays one

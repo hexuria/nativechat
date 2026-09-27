@@ -11,7 +11,7 @@ jobs:
     # it when the next pull request opens, so main is checked every day as well.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install cargo-deny
         run: |
           mkdir -p "$HOME/.local/bin"
