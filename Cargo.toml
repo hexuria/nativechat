@@ -76,6 +76,21 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 # and neither can be tested against a list of made-up paths.
 tempfile = "3"
 
+[lints.rust]
+# An unsafe fn does not make its body one big unsafe block: each unsafe operation inside it still
+# says so, and says why it holds.
+unsafe_op_in_unsafe_fn = "deny"
+# objc's msg_send!/class! expand to `cfg(feature = "cargo-clippy")` inside this crate. Naming the
+# value here keeps that one expansion from drowning every clippy run in warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[lints.clippy]
+# Every unsafe block says, in a `// SAFETY:` comment, what makes it sound.
+undocumented_unsafe_blocks = "deny"
+# The app's diagnostics go to stderr. stdout is not a log, and a print there once echoed every
+# message a person sent.
+print_stdout = "deny"
+
 [package.metadata.bundle]
 name = "NativeChat"
 identifier = "dev.goldcoders.nativechat"

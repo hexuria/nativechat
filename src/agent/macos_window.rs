@@ -13,6 +13,8 @@ pub fn cgwindow_id(window: &Window) -> Result<u32, String> {
         gpui_agent::screenshot_unavailable(format!("no native window handle: {err}"))
     })?;
     match handle.as_raw() {
+        // SAFETY: an AppKit handle's `ns_view` is the live NSView of this window, and we are on
+        // the UI thread that owns it for the whole call.
         RawWindowHandle::AppKit(appkit) => unsafe { window_number(appkit.ns_view.as_ptr()) },
         other => Err(gpui_agent::screenshot_unavailable(format!(
             "expected AppKit window handle, got {other:?}"
@@ -20,17 +22,24 @@ pub fn cgwindow_id(window: &Window) -> Result<u32, String> {
     }
 }
 
+/// # Safety
+///
+/// `ns_view` is null or a live NSView, messaged on the thread that owns it.
 unsafe fn window_number(ns_view: *mut c_void) -> Result<u32, String> {
     if ns_view.is_null() {
         return Err(gpui_agent::screenshot_unavailable("NSView pointer is null"));
     }
     let view: *mut Object = ns_view.cast();
+    // SAFETY: `view` is a non-null live NSView (this fn's contract); `window` returns its NSWindow
+    // or nil.
     let ns_window: *mut Object = unsafe { msg_send![view, window] };
     if ns_window.is_null() {
         return Err(gpui_agent::screenshot_unavailable(
             "NSView has no NSWindow yet",
         ));
     }
+    // SAFETY: `ns_window` is a non-null NSWindow the view belongs to; `windowNumber` returns an
+    // NSInteger.
     let number: isize = unsafe { msg_send![ns_window, windowNumber] };
     if number <= 0 {
         return Err(gpui_agent::screenshot_unavailable(format!(

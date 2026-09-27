@@ -93,14 +93,14 @@ fn render_idle(
     let can_post = spec.can_post(server_fill);
     let can_dismiss = spec.can_dismiss();
     let mut picks = values.clone();
-    if let Some(app) = &app {
-        if let Some(typed) = app.read(cx).user_form_typed.get(spec.card_key()) {
-            for (id, value) in typed {
-                picks
-                    .by_id
-                    .entry(id.clone())
-                    .or_insert_with(|| value.clone());
-            }
+    if let Some(app) = &app
+        && let Some(typed) = app.read(cx).user_form_typed.get(spec.card_key())
+    {
+        for (id, value) in typed {
+            picks
+                .by_id
+                .entry(id.clone())
+                .or_insert_with(|| value.clone());
         }
     }
     // Live InputState / TextareaState / picks / agent-typed — not a masked stub.
@@ -687,14 +687,14 @@ fn fill_failed_actions(
     // the agent typed, and enabled only when the required fields are present.
     // Gating on `can_post` alone let "Try again" go out with the password gone.
     let mut picks = values.clone();
-    if let Some(app) = &app {
-        if let Some(typed) = app.read(cx).user_form_typed.get(spec.card_key()) {
-            for (id, value) in typed {
-                picks
-                    .by_id
-                    .entry(id.clone())
-                    .or_insert_with(|| value.clone());
-            }
+    if let Some(app) = &app
+        && let Some(typed) = app.read(cx).user_form_typed.get(spec.card_key())
+    {
+        for (id, value) in typed {
+            picks
+                .by_id
+                .entry(id.clone())
+                .or_insert_with(|| value.clone());
         }
     }
     let live = collect_submit_values(spec, inputs, textareas, &picks, cx);
@@ -891,6 +891,7 @@ impl SavedLoginContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_field(
     spec: &UserFormSpec,
     field: &UserFormField,

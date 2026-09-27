@@ -274,6 +274,7 @@ impl Render for BotFinder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finder_row(
     index: usize,
     entry: FinderEntry,

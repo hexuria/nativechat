@@ -271,7 +271,7 @@ impl CommandPalette {
             }
         }
         if want_actions {
-            items.extend(action_catalog(&state).into_iter().filter(|item| {
+            items.extend(action_catalog(state).into_iter().filter(|item| {
                 needle.is_empty() || {
                     let PaletteItem::Action { title, hint, .. } = item else {
                         return false;
@@ -606,6 +606,7 @@ fn empty_state(tab: PaletteTab, muted: Hsla) -> AnyElement {
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn palette_row(
     index: usize,
     item: PaletteItem,

@@ -148,19 +148,10 @@ const FALLBACK_COLORS: [&str; 10] = [
     "brown", "red", "orange", "yellow", "green", "cyan", "blue", "violet", "magenta", "gray",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ResponsiveCollapse {
     pub preferred: bool,
     pub was_narrow: bool,
-}
-
-impl Default for ResponsiveCollapse {
-    fn default() -> Self {
-        Self {
-            preferred: false,
-            was_narrow: false,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,19 +314,19 @@ pub fn persona_shape_path(shape: &str) -> &'static str {
 }
 
 pub fn resolve_persona_shape(agent_id: &str, shape: Option<&str>) -> &'static str {
-    if let Some(shape) = shape {
-        if AVATAR_SHAPES.contains(&shape) {
-            return named_shape(shape);
-        }
+    if let Some(shape) = shape
+        && AVATAR_SHAPES.contains(&shape)
+    {
+        return named_shape(shape);
     }
     AVATAR_SHAPES[shipped_shape_hash(agent_id) as usize % AVATAR_SHAPES.len()]
 }
 
 pub fn resolve_persona_color(agent_id: &str, color: Option<&str>) -> &'static AvatarColor {
-    if let Some(color) = color {
-        if let Some(found) = AVATAR_COLORS.iter().find(|c| c.id == color) {
-            return found;
-        }
+    if let Some(color) = color
+        && let Some(found) = AVATAR_COLORS.iter().find(|c| c.id == color)
+    {
+        return found;
     }
     let index = shipped_color_index(agent_id) % FALLBACK_COLORS.len();
     let id = FALLBACK_COLORS[index];
@@ -366,7 +357,7 @@ fn shipped_random_next(value: &mut u32) -> f64 {
     *value = value.wrapping_add(1_831_565_813);
     let mut next = imul(*value ^ (*value >> 15), 1 | *value);
     next = next.wrapping_add(imul(next ^ (next >> 7), 61 | next)) ^ next;
-    f64::from((next ^ (next >> 14)) as u32) / 4_294_967_296.0
+    f64::from(next ^ (next >> 14)) / 4_294_967_296.0
 }
 
 fn imul(a: u32, b: u32) -> u32 {

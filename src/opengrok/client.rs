@@ -829,6 +829,7 @@ impl OpenGrokClient {
     /// client that only learns the id from the frames it already saw: the one moment the id is
     /// needed is the moment the stream has been lost. So it is minted before the turn is sent,
     /// by whoever will have to ask about it later.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_turn<F>(
         &self,
         coworker_id: &str,
@@ -923,10 +924,10 @@ impl OpenGrokClient {
                         // whether the model refused or the gateway was never reached.
                         return Err(OpenGrokError::from_server(None, message));
                     }
-                    if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
-                        if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                            assistant.push_str(delta);
-                        }
+                    if (kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK")
+                        && let Some(delta) = value.get("delta").and_then(|v| v.as_str())
+                    {
+                        assistant.push_str(delta);
                     }
                     on_event(&value);
                 }

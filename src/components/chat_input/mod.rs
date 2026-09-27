@@ -140,7 +140,7 @@ impl MessageInput {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input_state = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder(format!("Message {}", composer_bot_name(&state.read(cx))))
+                .placeholder(format!("Message {}", composer_bot_name(state.read(cx))))
                 .auto_grow(1, 20)
                 .submit_on_enter(true)
         });
@@ -154,7 +154,7 @@ impl MessageInput {
         let active_recipe = app_state.active_recipe.clone();
         let submit_chord = app_state.submit_chord;
         let reply_to = app_state.reply_to.clone();
-        let coworker_name = composer_bot_name(&app_state);
+        let coworker_name = composer_bot_name(app_state);
         let turn_in_flight = app_state.is_turn_in_flight();
 
         let this = Self {
@@ -199,7 +199,7 @@ impl MessageInput {
                     this.submit_chord = state.submit_chord;
                     changed = true;
                 }
-                let name = composer_bot_name(&state);
+                let name = composer_bot_name(state);
                 if this.coworker_name != name {
                     this.coworker_name = name;
                     changed = true;
@@ -391,7 +391,6 @@ impl MessageInput {
     }
 
     fn trigger_submit(&mut self, steer: bool, window: &mut Window, cx: &mut Context<Self>) {
-        println!("Triggering submit...");
         let text = self.input_state.read(cx).value();
         let trimmed = text.trim();
         if !trimmed.is_empty() {
@@ -409,7 +408,6 @@ impl MessageInput {
                 cx.notify();
                 return;
             }
-            println!("Submitting message: {}", trimmed);
             if let Some(handler) = &self.on_submit {
                 (handler)(trimmed.to_string(), steer, cx);
             }
@@ -440,8 +438,6 @@ impl MessageInput {
             }
             cx.notify();
             // Focus is handled by the input state usually, or we might need to re-focus
-        } else {
-            println!("Message is empty, ignoring.");
         }
     }
 

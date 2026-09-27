@@ -1,13 +1,13 @@
 use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
-    About, BranchInNewChat, ClearSearch, CloseBotFinder, CloseCommandPalette, CloseFind,
-    CloseLightbox, CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput,
-    Hide, HideOthers, LightboxNext, LightboxPrev, Minimize, NavBack, NavForward, NewChat,
-    OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab, PaletteSelectNext,
-    PaletteSelectPrev, PickFinderItem, Quit, ReadAloud, ReportMessage, Search, ShowAll,
-    ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar,
-    ToggleSidebar, ToggleTheme, Zoom,
+    About, BranchInNewChat, CloseBotFinder, CloseCommandPalette, CloseFind, CloseLightbox,
+    CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput, Hide, HideOthers,
+    LightboxNext, LightboxPrev, Minimize, NavBack, NavForward, NewChat, OpenCommandPalette,
+    OpenSettings, PaletteNextTab, PalettePrevTab, PaletteSelectNext, PaletteSelectPrev,
+    PickFinderItem, Quit, ReadAloud, ReportMessage, Search, ShowAll, ToggleAgentSettings,
+    ToggleComputerPane, ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar, ToggleSidebar,
+    ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::chrome::TITLE_BAR_H;
@@ -34,7 +34,7 @@ fn main() {
 
     let (config, db_service) = runtime.block_on(async {
         let config = Config::load().expect("Failed to load config");
-        println!("Debug: Database URL: {}", config.database_url);
+        eprintln!("Debug: Database URL: {}", config.database_url);
 
         let pool = create_pool(&config.database_url)
             .await
@@ -256,7 +256,7 @@ fn main() {
 
                     cx.on_action(|_: &CopyMessage, _cx: &mut App| {});
                     cx.on_action(|_: &BranchInNewChat, _cx: &mut App| {
-                        println!("Branch in new chat action triggered");
+                        eprintln!("Branch in new chat action triggered");
                     });
                     let state_read_aloud = state.clone();
                     cx.on_action(move |action: &ReadAloud, cx: &mut App| {
@@ -270,7 +270,7 @@ fn main() {
                         });
                     });
                     cx.on_action(|_: &ReportMessage, _cx: &mut App| {
-                        println!("Report message action triggered");
+                        eprintln!("Report message action triggered");
                     });
                     let view = cx.new(|cx| {
                         #[cfg(feature = "agent")]

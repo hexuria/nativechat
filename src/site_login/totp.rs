@@ -6,31 +6,31 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use totp_rs::TOTP;
+use totp_rs::Totp;
 
 /// A seed with fewer seconds than this left in its step is minted on the next step instead.
 pub const MIN_TTL_SECONDS: u64 = 8;
 
 /// Parse an `otpauth://totp/...` URI. The unchecked constructor, because many real seeds are
 /// shorter than the RFC's 16 bytes (GitHub's are 10) and the checked one refuses them.
-pub fn parse(uri: &str) -> Result<TOTP, String> {
-    TOTP::from_url_unchecked(uri).map_err(|e| format!("not an authenticator seed: {e}"))
+pub fn parse(uri: &str) -> Result<Totp, String> {
+    Totp::from_url_unchecked(uri).map_err(|e| format!("not an authenticator seed: {e}"))
 }
 
 /// The current code and the seconds it has left.
-pub fn current(totp: &TOTP) -> Result<(String, u64), String> {
+pub fn current(totp: &Totp) -> Result<(String, u64), String> {
     Ok((totp.generate_current().to_string(), totp.ttl()))
 }
 
 /// The seconds to wait before minting, so the code lands with time to spare: none when the
 /// step is fresh, the rest of the step when it is nearly over.
-pub fn wait_before_minting(totp: &TOTP) -> u64 {
+pub fn wait_before_minting(totp: &Totp) -> u64 {
     let ttl = totp.ttl();
     if ttl < MIN_TTL_SECONDS { ttl } else { 0 }
 }
 
 /// The code for a given moment, for tests and the detail pane's countdown.
-pub fn at(totp: &TOTP, unix_seconds: u64) -> String {
+pub fn at(totp: &Totp, unix_seconds: u64) -> String {
     totp.generate(unix_seconds).to_string()
 }
 

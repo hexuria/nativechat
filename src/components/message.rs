@@ -26,6 +26,7 @@ const PILL_PAD: f32 = 2.0;
 const PILL_OVERLAP: f32 = 4.0;
 
 #[derive(Clone, IntoElement)]
+#[allow(clippy::type_complexity)]
 pub struct MessageBubble {
     text: String,
     is_me: bool,

@@ -1128,6 +1128,7 @@ impl RecipesView {
     /// its owner; the steps, a run and the history for someone it is shared with; only Accept
     /// and Decline for someone it is offered to. Who else may have it is not a card at all —
     /// it is the share icon in the title bar, and the modal that opens under it.
+    #[allow(clippy::too_many_arguments)]
     fn sections(
         &self,
         detail: &RecipeDetail,
@@ -1584,6 +1585,7 @@ impl RecipesView {
 
     /// One row of the table: its number, what it does, and to what. In edit mode a double
     /// click on the details opens the step's modal, and the row carries move and delete.
+    #[allow(clippy::too_many_arguments)]
     fn step_row(
         &self,
         index: usize,
@@ -3844,6 +3846,7 @@ fn filter_chip(chip: RecipeFilter, current: RecipeFilter, app: Entity<AppState>)
 /// open, the title, what the page is doing, and — on an open recipe — the share icon at the
 /// far right. The app has ONE header row and it is the title bar, so the page itself draws
 /// none, and sharing belongs on the line the recipe's name is on rather than inside a card.
+#[allow(clippy::type_complexity)]
 pub fn recipes_header(
     app: Entity<AppState>,
     recipes: &Entity<RecipesView>,
@@ -3885,6 +3888,7 @@ pub fn recipes_header(
 
 /// The header's content: a back chevron when there is somewhere to go back to, the title, and
 /// what the page is doing and the share icon on the right.
+#[allow(clippy::type_complexity)]
 fn page_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: String,

@@ -80,3 +80,9 @@ jobs:
       # (src/agent/host.rs) only compile with it. Plain `cargo test` skips them.
       - name: cargo test
         run: cargo test --locked -p nativechat --all-features
+      # Clippy twice: the default build compiles code `agent` switches off (`main.rs`), and
+      # `agent` compiles code the default build never sees.
+      - name: cargo clippy (default features)
+        run: cargo clippy --locked -p nativechat --all-targets -- -D warnings
+      - name: cargo clippy (all features)
+        run: cargo clippy --locked -p nativechat --all-targets --all-features -- -D warnings

@@ -487,9 +487,9 @@ impl Render for CircularVoiceViz {
                             let seed3 = (i as f32 * 5.1234) + (rotation * 91.876);
 
                             // Create pseudo-random values using sine (classic shader noise)
-                            let noise1 = ((seed1.sin() * 43758.5453).fract() * 2.0 - 1.0).abs();
-                            let noise2 = ((seed2.sin() * 27183.1234).fract() * 2.0 - 1.0).abs();
-                            let noise3 = ((seed3.sin() * 12345.6789).fract() * 2.0 - 1.0).abs();
+                            let noise1 = ((seed1.sin() * 43_758.547).fract() * 2.0 - 1.0).abs();
+                            let noise2 = ((seed2.sin() * 27_183.123).fract() * 2.0 - 1.0).abs();
+                            let noise3 = ((seed3.sin() * 12_345.679).fract() * 2.0 - 1.0).abs();
 
                             // Combine noises for very erratic behavior
                             let combined_noise = noise1 * 0.5 + noise2 * 0.3 + noise3 * 0.2;

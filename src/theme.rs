@@ -180,7 +180,7 @@ pub fn apply_mode(mode: &str, cx: &mut App) {
 
 pub fn init(cx: &mut App) {
     let themes_path = themes_path();
-    println!("[THEME] Loading themes from: {:?}", themes_path);
+    eprintln!("[THEME] Loading themes from: {:?}", themes_path);
 
     // Apply the persisted choice immediately so a Dark pref is not stuck on
     // gpui-kit's startup Light until a new window opens.

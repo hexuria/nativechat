@@ -21,6 +21,8 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 pub use add_sheet::AddSheetInputs;
+// Only the gpui-agent host reads these, to say what the empty list says.
+#[cfg(feature = "agent")]
 pub(crate) use list::{NOT_YET_RECORDING, NOT_YET_WITH_BOT, empty_line};
 
 pub struct SkillsPage {

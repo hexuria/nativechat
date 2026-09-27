@@ -1435,7 +1435,6 @@ fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
 #[derive(Default)]
 pub struct NativeChatHost {
     ready: bool,
-    sidebar_collapsed: bool,
     theme_mode: String,
     sessions: Vec<SessionSnap>,
     account_open: bool,
@@ -1589,7 +1588,6 @@ impl NativeChatHost {
         };
         Self {
             ready: true,
-            sidebar_collapsed: state.sidebar_collapsed,
             theme_mode: state.theme_mode.clone(),
             sessions,
             account_open: state.is_app_settings_open,
@@ -2846,6 +2844,7 @@ impl NativeChatHost {
     /// skill", because that is a wrong address rather than an unknown control — and it is told
     /// apart by the `skl_` the server mints, the way a recipe row's id is (see
     /// [`recipe_row_target`]).
+    #[allow(clippy::type_complexity)]
     fn skill_target(&self, target: &str) -> Option<Result<Command, String>> {
         for side in SkillScope::ALL {
             if target == side.element_id() {
@@ -3089,10 +3088,9 @@ impl NativeChatHost {
             .user_forms
             .iter_mut()
             .find(|form| form.card_key == card_key)
+            && let Some(field) = form.fields.iter_mut().find(|field| field.id == field_id)
         {
-            if let Some(field) = form.fields.iter_mut().find(|field| field.id == field_id) {
-                field.value = value.clone();
-            }
+            field.value = value.clone();
         }
         self.pending = Some(Command::UserFormSetField {
             card_key,
@@ -3106,10 +3104,8 @@ impl NativeChatHost {
     fn recipe_answer_target(&self, target: &str) -> Option<(String, bool)> {
         let (rest, accept) = if let Some(rest) = target.strip_prefix("recipe-accept") {
             (rest, true)
-        } else if let Some(rest) = target.strip_prefix("recipe-decline") {
-            (rest, false)
         } else {
-            return None;
+            (target.strip_prefix("recipe-decline")?, false)
         };
         let id = match rest.strip_prefix('-') {
             Some(id) if !id.is_empty() => id.to_string(),
@@ -3496,6 +3492,7 @@ impl NativeChatHost {
     /// The id is the server's and can hold anything, dashes included, so this reads the tail
     /// first and takes what is left as the id — and then only if that id is a routine the open
     /// bot has. An id nobody is showing is a wrong address, not a click.
+    #[allow(clippy::type_complexity)]
     fn routine_command(&self, target: &str) -> Option<Command> {
         let rest = target.strip_prefix("routine-")?;
         let mut cmd: Option<(&str, fn(String) -> Command)> = None;
@@ -4848,12 +4845,12 @@ mod tests {
         let mut switching = open_skill("skl_1", "invoice-lookup");
         switching.switching = true;
         host.skill_open = Some(switching);
-        assert_eq!(
-            host.snapshot()
+        assert!(
+            !host
+                .snapshot()
                 .find(&ids::skill_enabled("skl_1"))
                 .unwrap()
-                .enabled,
-            false
+                .enabled
         );
         assert_eq!(
             host.click(&ids::skill_enabled("skl_1")).unwrap_err(),

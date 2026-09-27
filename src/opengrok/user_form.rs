@@ -413,6 +413,9 @@ impl UserFormDismissMode {
 /// What `POST /ag-ui/user-form/submit|dismiss` meant. Bind paint to a real
 /// `formResolution` ([`Settled`]). 200-null is [`Empty`] — disclosure, not a
 /// fill. A miss (404 / no POST) is never Submitted.
+// The card is carried in its own variant, unboxed: this is the answer to one HTTP call, made and
+// matched once and then dropped, so its size costs nothing and a Box would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserFormActionReply {
     Settled(UserFormSpec),
@@ -438,6 +441,9 @@ pub enum UserFormVerb {
 }
 
 /// What the idle card becomes after the fill HTTP returns.
+// The card is carried in its own variant, unboxed: this is the answer to one HTTP call, made and
+// matched once and then dropped, so its size costs nothing and a Box would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserFormHttpSettle {
     /// Body carried `formResolution` (or a parseable card).
@@ -1605,10 +1611,7 @@ fn bool_at(value: &Value, key: &str) -> Option<bool> {
 }
 
 fn normalize_name(name: &str) -> String {
-    name.trim()
-        .to_ascii_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-")
+    name.trim().to_ascii_lowercase().replace(['_', ' '], "-")
 }
 
 /// Continue's gates, for tests and for the renderer. Never "fill succeeded".
@@ -1914,7 +1917,7 @@ mod tests {
         filled.by_id.insert("email".into(), "you@gmail.com".into());
         filled.by_id.insert("password".into(), "s3cret-pass".into());
         assert!(continue_enabled(&spec, &filled, true));
-        assert!(USER_FORM_SERVER_FILL_AVAILABLE);
+        const { assert!(USER_FORM_SERVER_FILL_AVAILABLE) };
     }
 
     #[test]
@@ -2200,7 +2203,7 @@ mod tests {
             continue_enabled(&spec, &filled, false),
             "stacked open forms stay Continue-able if a sibling 404 flipped the old global lock"
         );
-        assert!(USER_FORM_SERVER_FILL_AVAILABLE);
+        const { assert!(USER_FORM_SERVER_FILL_AVAILABLE) };
     }
 
     #[test]

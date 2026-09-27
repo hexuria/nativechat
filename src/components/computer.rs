@@ -231,14 +231,12 @@ impl ComputerPane {
                         RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
                         _ => None,
                     })
-                }) {
-                    if let Some(row) = state.routine_mut(&coworker_id, &rid)
-                        && let Some(RoutineTrigger::Schedule { spec, .. }) =
-                            row.triggers.iter_mut().find(|t| t.id() == sid)
-                        && spec.mode == ScheduleUiMode::Custom
-                    {
-                        spec.expr = cron;
-                    }
+                }) && let Some(row) = state.routine_mut(&coworker_id, &rid)
+                    && let Some(RoutineTrigger::Schedule { spec, .. }) =
+                        row.triggers.iter_mut().find(|t| t.id() == sid)
+                    && spec.mode == ScheduleUiMode::Custom
+                {
+                    spec.expr = cron;
                 }
             });
         })
@@ -268,6 +266,7 @@ impl ComputerPane {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn overview(
         &self,
         agent_name: &str,
@@ -455,6 +454,7 @@ impl ComputerPane {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn editor(
         &self,
         id: Option<String>,
@@ -620,6 +620,7 @@ impl ComputerPane {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn triggers_box(
         &self,
         triggers: &[RoutineTrigger],
@@ -663,13 +664,13 @@ impl ComputerPane {
                         let theme = theme.clone();
                         let app = app.clone();
                         let coworker_id = coworker_id.to_string();
-                        triggers.iter().cloned().map(move |trigger| {
+                        triggers.iter().map(move |trigger| {
                             if let RoutineTrigger::Webhook {
                                 id,
                                 url,
                                 key,
                                 header,
-                            } = &trigger
+                            } = trigger
                             {
                                 webhook_popover_row(
                                     id.clone(),
@@ -684,7 +685,7 @@ impl ComputerPane {
                                     theme.clone(),
                                 )
                             } else {
-                                trigger_row(&trigger, muted)
+                                trigger_row(trigger, muted)
                             }
                         })
                     })
@@ -808,6 +809,7 @@ fn recipes_icon(app: Entity<AppState>, theme: &gpui_kit::component::Theme) -> im
 /// Glass: translucent peach/bronze over the sidebar (`theme.sidebar` shows
 /// through). GPUI has no element backdrop-filter; alpha + warm shadow is the
 /// frost. Orange is the title only — I'm done is a black (light) / white (dark) pill.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn computer_attention_banner(
     banner_id: impl Into<ElementId>,
     skip_id: impl Into<ElementId>,
@@ -1162,6 +1164,7 @@ fn route_traffic_icon(
         .child(Icon::default().path(icon).size(px(16.)).text_color(color))
 }
 
+#[allow(clippy::type_complexity)]
 fn pane_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: &'static str,
@@ -1375,6 +1378,7 @@ impl RenderOnce for WebhookRowTrigger {
 /// nothing had ever been told about. Now they are the server's, and a field somebody could
 /// type into would be a field somebody could believe they had changed. Each copies, and the
 /// key can be replaced by asking the server for another one.
+#[allow(clippy::too_many_arguments)]
 fn webhook_popover_row(
     routine_id: String,
     coworker_id: String,
@@ -1515,6 +1519,7 @@ fn copy_row(
         )
 }
 
+#[allow(clippy::type_complexity)]
 fn add_trigger_button(
     label: &'static str,
     coworker_id: String,
@@ -1584,6 +1589,7 @@ fn add_trigger_button(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn schedule_editor(
     coworker_id: String,
     routine_id: Option<String>,
@@ -1623,6 +1629,7 @@ fn schedule_editor(
         })
 }
 
+#[allow(clippy::type_complexity)]
 fn mode_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
     let label = match spec.mode {
         ScheduleUiMode::Interval => "Interval",
@@ -1674,6 +1681,7 @@ fn mode_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> im
         })
 }
 
+#[allow(clippy::type_complexity)]
 fn interval_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
     h_flex()
         .w_full()
@@ -1745,6 +1753,7 @@ fn interval_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -
         })
 }
 
+#[allow(clippy::type_complexity)]
 fn advanced_editor(
     spec: ScheduleSpec,
     patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
@@ -1814,6 +1823,7 @@ fn advanced_editor(
         )
 }
 
+#[allow(clippy::type_complexity)]
 fn months_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
     let label = if spec.months.is_empty() {
         "Any month"
@@ -1869,6 +1879,7 @@ fn months_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) ->
         })
 }
 
+#[allow(clippy::type_complexity)]
 fn days_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
     let label = match spec.day_kind {
         ScheduleDayKind::EveryDay => "Every day",
@@ -1910,6 +1921,7 @@ fn days_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> i
         })
 }
 
+#[allow(clippy::type_complexity)]
 fn month_day_menu(
     spec: ScheduleSpec,
     patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
@@ -1959,6 +1971,7 @@ fn month_day_menu(
         })
 }
 
+#[allow(clippy::type_complexity)]
 fn weekday_chips(
     spec: ScheduleSpec,
     patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
@@ -1989,6 +2002,7 @@ fn weekday_chips(
     }))
 }
 
+#[allow(clippy::type_complexity)]
 fn time_row(
     index: usize,
     hour: u8,

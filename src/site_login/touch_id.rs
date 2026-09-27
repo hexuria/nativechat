@@ -114,14 +114,20 @@ unsafe fn describe(error: id) -> String {
     if error == nil {
         return "no reason given".to_string();
     }
+    // SAFETY: `error` is a live NSError (the caller's contract; nil was handled above), and
+    // `localizedDescription` returns an NSString or nil.
     let text: id = unsafe { msg_send![error, localizedDescription] };
     if text == nil {
         return "no reason given".to_string();
     }
+    // SAFETY: `text` is a non-nil NSString, and `UTF8String` returns a NUL-terminated buffer it
+    // owns, or null.
     let bytes: *const std::os::raw::c_char = unsafe { msg_send![text, UTF8String] };
     if bytes.is_null() {
         return "no reason given".to_string();
     }
+    // SAFETY: `bytes` is non-null and NUL-terminated, and `text`, which owns it, is alive for
+    // this whole call; the String is copied out before we return.
     unsafe { std::ffi::CStr::from_ptr(bytes) }
         .to_string_lossy()
         .into_owned()
