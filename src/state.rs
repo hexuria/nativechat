@@ -1568,6 +1568,27 @@ fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
     }
 }
 
+/// A fresh read of the history, with any run this app was just told about and the history does
+/// not list yet kept on top (see `UNLISTED_RUN_MS`). It is still `running`, so the Computer pane
+/// keeps reading until the history has it.
+fn with_unlisted_runs(
+    shown: &[RoutineRun],
+    listed: Vec<RoutineRun>,
+    now_ms: i64,
+) -> Vec<RoutineRun> {
+    let mut runs: Vec<RoutineRun> = shown
+        .iter()
+        .filter(|run| {
+            run.unsettled()
+                && now_ms - run.started_at_ms < UNLISTED_RUN_MS
+                && !listed.iter().any(|listed| listed.run_id == run.run_id)
+        })
+        .cloned()
+        .collect();
+    runs.extend(listed);
+    runs
+}
+
 /// What an edit of a routine the server has should send: each field the person changed from
 /// what the server last said, and nothing else.
 ///
@@ -1668,9 +1689,15 @@ pub struct RoutineRun {
     pub run_id: String,
     /// When it started, as the row reads.
     pub at: String,
+    pub started_at_ms: i64,
     pub cause: RunCause,
     pub status: ScheduleRunStatus,
 }
+
+/// How long a Test run the server has named stays on screen before its history lists it. The
+/// server answers `202` and starts the run on its own task, so the read straight after can
+/// come back without it; a run the history never lists by then was not one worth showing.
+const UNLISTED_RUN_MS: i64 = 60_000;
 
 impl RoutineRun {
     fn from_server(run: ScheduleRun) -> Self {
@@ -1685,9 +1712,21 @@ impl RoutineRun {
         Self {
             run_id: run.run_id,
             at,
+            started_at_ms: run.started_at_ms,
             cause: run.cause,
             status: run.status,
         }
+    }
+
+    /// The run a Test run just started, before the history has it.
+    fn just_started(run_id: String) -> Self {
+        Self::from_server(ScheduleRun {
+            run_id,
+            cause: RunCause::Manual,
+            status: ScheduleRunStatus::Running,
+            started_at_ms: chrono::Utc::now().timestamp_millis(),
+            ended_at_ms: None,
+        })
     }
 
     /// Still going, or parked on a card: a later look can say how it ended.
@@ -6497,7 +6536,11 @@ impl AppState {
                 match result {
                     Ok(runs) => {
                         if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
-                            row.runs = runs.into_iter().map(RoutineRun::from_server).collect();
+                            row.runs = with_unlisted_runs(
+                                &row.runs,
+                                runs.into_iter().map(RoutineRun::from_server).collect(),
+                                chrono::Utc::now().timestamp_millis(),
+                            );
                         }
                     }
                     Err(error) => state.computer_action_error = Some(error.message),
@@ -6596,7 +6639,19 @@ impl AppState {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        routines.extend(rows.into_iter().map(routine_from_schedule));
+                        let before = state.routines.get(&coworker_id);
+                        routines.extend(rows.into_iter().map(|row| {
+                            let mut routine = routine_from_schedule(row);
+                            // The listing has no history in it, and a roster refresh re-lists
+                            // while a routine is open: the history already read stays until the
+                            // next read of its own replaces it.
+                            if let Some(listed) =
+                                before.and_then(|rows| rows.iter().find(|r| r.id == routine.id))
+                            {
+                                routine.runs = listed.runs.clone();
+                            }
+                            routine
+                        }));
                         state.routines.insert(coworker_id, routines);
                     }
                     Err(error) => state.computer_action_error = Some(error.message),
@@ -6767,8 +6822,11 @@ impl AppState {
             let result = client.run_schedule_now(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok(run_id) => {
                         state.computer_action_error = None;
+                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
+                            row.runs.insert(0, RoutineRun::just_started(run_id));
+                        }
                         state.load_routine_runs(&coworker_id, &routine_id, cx);
                     }
                     Err(error) => state.computer_action_error = Some(error.message),
@@ -15848,6 +15906,52 @@ mod tests {
         assert!(
             super::routine_edit(&hook).is_empty(),
             "a draft is not on the server"
+        );
+    }
+
+    /// A Test run's line stays on screen, still running, while the history has not caught up
+    /// with it, and gives way to the history's own line once it has. One the history never
+    /// lists is dropped after a minute rather than running for good.
+    #[test]
+    fn a_test_run_is_shown_before_the_history_lists_it() {
+        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        let started = super::RoutineRun::just_started("run_new".into());
+        let now = started.started_at_ms;
+        let old = super::RoutineRun::from_server(ScheduleRun {
+            run_id: "run_old".into(),
+            cause: RunCause::Clock,
+            status: ScheduleRunStatus::Ok,
+            started_at_ms: now - 86_400_000,
+            ended_at_ms: Some(now - 86_000_000),
+        });
+        let shown = vec![started.clone(), old.clone()];
+        let ids = |runs: &[super::RoutineRun]| -> Vec<String> {
+            runs.iter().map(|run| run.run_id.clone()).collect()
+        };
+
+        let behind = super::with_unlisted_runs(&shown, vec![old.clone()], now + 50);
+        assert_eq!(
+            ids(&behind),
+            ["run_new", "run_old"],
+            "not listed yet: kept on top"
+        );
+        assert!(behind[0].unsettled(), "and still read again");
+
+        let mut listed = started.clone();
+        listed.status = ScheduleRunStatus::Ok;
+        let caught_up = super::with_unlisted_runs(&shown, vec![listed, old.clone()], now + 50);
+        assert_eq!(ids(&caught_up), ["run_new", "run_old"]);
+        assert_eq!(
+            caught_up[0].status,
+            ScheduleRunStatus::Ok,
+            "the history's own line wins"
+        );
+
+        let never = super::with_unlisted_runs(&shown, vec![old], now + super::UNLISTED_RUN_MS);
+        assert_eq!(
+            ids(&never),
+            ["run_old"],
+            "a run the history never lists is let go"
         );
     }
 

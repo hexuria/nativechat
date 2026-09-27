@@ -48,7 +48,8 @@
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-test` (Test run, on a
 //! routine the server has), `routine-{id}-run-{runId}` (one Run history line: label `Test run` /
 //! `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`), `routine-{id}-delete`.
-//! Invoke `routine.run {id}` is Test run.
+//! Invoke `routine.run {id}` is Test run; `routine.edit {id, name?, prompt?}` saves an edit the
+//! way the editor does (a `PATCH` of what changed).
 //!
 //! A routine's `{id}` is the server's schedule id. The two trigger ids are in the tree only
 //! while the routine has no trigger, and the webhook's three only while it has one, so

@@ -487,6 +487,13 @@ pub enum Command {
     RunRoutineNow {
         routine_id: String,
     },
+    /// A routine's name or instruction changed the way the editor saves them, which is how a
+    /// driver edits one: the editor's fields are the pane's own text, not the app's.
+    EditRoutine {
+        routine_id: String,
+        name: Option<String>,
+        prompt: Option<String>,
+    },
     DeleteRoutine {
         routine_id: String,
     },
@@ -660,6 +667,19 @@ impl Command {
             Self::RunRoutineNow { routine_id } => {
                 if let Some(coworker_id) = state.active_coworker_id.clone() {
                     state.run_routine_now(&coworker_id, &routine_id, cx);
+                }
+            }
+            Self::EditRoutine {
+                routine_id,
+                name,
+                prompt,
+            } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone()
+                    && let Some(row) = state.routine_mut(&coworker_id, &routine_id)
+                {
+                    let name = name.unwrap_or_else(|| row.name.clone());
+                    let prompt = prompt.unwrap_or_else(|| row.instruction.clone());
+                    state.save_routine_fields(&coworker_id, &routine_id, name, prompt, cx);
                 }
             }
             Self::DeleteRoutine { routine_id } => {
@@ -4065,6 +4085,19 @@ impl NativeChatHost {
             "routine.run" => Command::RunRoutineNow {
                 routine_id: self.invoke_routine_id(args, "routine.run")?,
             },
+            "routine.edit" => {
+                let routine_id = self.invoke_routine_id(args, "routine.edit")?;
+                let name = invoke_arg_str(args, &["name"]);
+                let prompt = invoke_arg_str(args, &["prompt", "instruction"]);
+                if name.is_none() && prompt.is_none() {
+                    return Err("routine.edit requires arg name or prompt".to_string());
+                }
+                Command::EditRoutine {
+                    routine_id,
+                    name,
+                    prompt,
+                }
+            }
             other => return Err(format!("unknown invoke `{other}`")),
         };
         self.pending = Some(cmd);
