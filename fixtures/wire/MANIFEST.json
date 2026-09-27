@@ -155,7 +155,7 @@
     },
     {
       "file": "rest/GET__ag-ui_threads__thread_id_/200-a_thread_reads_oldest_first_with_every_frame_it_emitted.json",
-      "source": "crates/opengrok-server/src/agui/routes.rs:3910 replay_thread (ThreadRunReplay crates/opengrok-server/src/agui/routes.rs:3883; pending from crates/opengrok-server/src/agui/pending.rs:111), in the test crates/opengrok-server/tests/against_a_whole_thread.rs:358 a_thread_reads_oldest_first_with_every_frame_it_emitted"
+      "source": "crates/opengrok-server/src/agui/routes.rs:3910 replay_thread (ThreadRunReplay crates/opengrok-server/src/agui/routes.rs:3883; pending from crates/opengrok-server/src/agui/pending.rs:111), in the test crates/opengrok-server/tests/against_a_whole_thread.rs:358 a_thread_reads_oldest_first_with_every_frame_it_emitted; each run opens with the person's words as with_prompt_frames draws them (crates/opengrok-server/src/agui/history.rs:474, since 5814af1)"
     },
     {
       "file": "rest/GET__ag-ui_approvals/200-bypass_skips_the_card_and_a_deny_does_not_consent_the_run.json",

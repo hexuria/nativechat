@@ -400,6 +400,8 @@ pub struct CompletedUiTool {
 #[derive(Debug, Default)]
 pub struct TurnAssembler {
     committed: Vec<ChatPart>,
+    /// The person's own words in a replay, kept out of the coworker's text.
+    persons: PersonsText,
     text: String,
     tool: Option<OpenTool>,
     waiting_approval: bool,
@@ -419,11 +421,43 @@ struct OpenTool {
     args: String,
 }
 
+/// Which text messages are the person's own rather than the coworker's.
+///
+/// A replay (`GET /ag-ui/runs/{id}`, `GET /ag-ui/threads/{id}`) opens each run with what the
+/// person sent that turn, as `TEXT_MESSAGE_*` frames with `role: "user"` under the client's own
+/// message id (opengrok-server `agui/history.rs` `with_prompt_frames`, since 5814af1). Only the
+/// opening frame names the role; the rest of that message is known by its id.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PersonsText {
+    ids: std::collections::HashSet<String>,
+}
+
+impl PersonsText {
+    /// Whether this text frame is the person's. A frame that says `role: "user"` is, and its
+    /// message id is remembered, so the frames that carry that message's words after it are too.
+    pub(crate) fn is_persons(&mut self, event: &Value) -> bool {
+        let id = event.get("messageId").and_then(Value::as_str).unwrap_or("");
+        if event.get("role").and_then(Value::as_str) == Some("user") {
+            if !id.is_empty() {
+                self.ids.insert(id.to_string());
+            }
+            return true;
+        }
+        !id.is_empty() && self.ids.contains(id)
+    }
+}
+
 impl TurnAssembler {
     pub fn push_event(&mut self, event: &Value) {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
+            "TEXT_MESSAGE_START" => {
+                self.persons.is_persons(event);
+            }
             "TEXT_MESSAGE_CONTENT" | "TEXT_MESSAGE_CHUNK" => {
+                if self.persons.is_persons(event) {
+                    return;
+                }
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     self.text.push_str(delta);
                     if self.tool.is_none() {
@@ -1696,6 +1730,30 @@ mod tests {
         let (plain, parts) = turn.snapshot();
         assert_eq!(plain, "Hello ");
         assert_eq!(parts, vec![ChatPart::Text("Hello ".into())]);
+    }
+
+    /// A replay opens each run with the person's own words, as text frames with role user. They
+    /// are the question, not the answer: the coworker's reply is only the coworker's words,
+    /// whether the role comes on the message's opening frame or on a chunk that carries its own.
+    #[test]
+    fn the_persons_words_in_a_replay_are_not_the_coworkers_reply() {
+        let mut turn = TurnAssembler::default();
+        for event in [
+            json!({"type":"RUN_STARTED","runId":"r1","threadId":"cw_1"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"m1","role":"user"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"What is on my calendar?"}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"m1"}),
+            json!({"type":"TEXT_MESSAGE_CHUNK","messageId":"m2","role":"user","delta":"And tomorrow?"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"msg_r1_1","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_r1_1","delta":"Two meetings today."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"msg_r1_1"}),
+        ] {
+            turn.push_event(&event);
+        }
+        turn.finish();
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(plain, "Two meetings today.");
+        assert_eq!(parts, vec![ChatPart::Text("Two meetings today.".into())]);
     }
 
     #[test]
