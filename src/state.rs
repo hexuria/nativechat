@@ -38,8 +38,8 @@ use crate::services::tts_service::TtsService;
 use crate::session::Session;
 use crate::site_login::{
     CardTarget, KIND_PASSWORD, PendingSave, SavedLoginUse, SiteLoginRecord, SiteLoginVault,
-    card_target, login_fields, login_matches_request, login_origin, origins_match,
-    registrable_origin, save_candidate,
+    card_target, login_matches_request, login_origin, origins_match, registrable_origin,
+    save_candidate,
 };
 use crate::threads::conversation_for_thread;
 use chrono::{DateTime, Local, NaiveDateTime, Timelike};
@@ -1163,11 +1163,11 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                 // server, or a field left out — is placed now rather than at the start of the
                 // epoch, which would pin it above the message it answers for good, on screen
                 // and on disk.
-                started_at: (run.started_at_ms > 0)
-                    .then(|| {
-                        SystemTime::UNIX_EPOCH + Duration::from_millis(run.started_at_ms as u64)
-                    })
-                    .unwrap_or_else(SystemTime::now),
+                started_at: if run.started_at_ms > 0 {
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(run.started_at_ms as u64)
+                } else {
+                    SystemTime::now()
+                },
                 finished_at: recovered_finished_at(run),
                 run_timing: TurnTiming::from_events(&run.events),
             })
@@ -1516,16 +1516,13 @@ pub enum RightPane {
     Computer,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum ComputerView {
+    #[default]
     Overview,
-    Editor { id: Option<String> },
-}
-
-impl Default for ComputerView {
-    fn default() -> Self {
-        Self::Overview
-    }
+    Editor {
+        id: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2306,7 +2303,7 @@ pub struct AppState {
     pub user_form_list_open: HashSet<String>,
     /// The authenticator-code seeds this Mac holds, parsed, for the detail pane's ticker and
     /// the code card. Read off the keychain on each load.
-    pub site_login_codes: HashMap<String, totp_rs::TOTP>,
+    pub site_login_codes: HashMap<String, totp_rs::Totp>,
     /// What the last Add / Import / sync did, for Settings → Logins.
     pub site_login_notice: Option<String>,
     pub site_login_error: Option<String>,
@@ -2720,7 +2717,7 @@ pub type PatchDone = Box<dyn FnOnce(Option<String>, &mut App)>;
 
 impl AppState {
     pub fn new() -> Self {
-        let mut state = Self {
+        Self {
             conversations: Vec::new(),
             live_turns: HashMap::new(),
             reconciled_threads: HashSet::new(),
@@ -2881,9 +2878,7 @@ impl AppState {
             main_window: None,
             #[cfg(target_os = "macos")]
             computer_windows: std::collections::HashMap::new(),
-        };
-
-        state
+        }
     }
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
@@ -7009,11 +7004,11 @@ impl AppState {
                             state.take_sessions(sessions);
 
                             // If no active conversation, select the most recent one
-                            if state.active_conversation_id.is_none() {
-                                if let Some(first) = state.conversations.first() {
-                                    let id = first.id.clone();
-                                    state.select_conversation(id, cx);
-                                }
+                            if state.active_conversation_id.is_none()
+                                && let Some(first) = state.conversations.first()
+                            {
+                                let id = first.id.clone();
+                                state.select_conversation(id, cx);
                             }
                             cx.notify();
                         })
@@ -7408,7 +7403,7 @@ impl AppState {
     /// Most recent message first; idle bots (no messages) by created date, newest first.
     pub fn ranked_coworkers(&self) -> Vec<Coworker> {
         let mut list = self.coworkers.clone();
-        list.sort_by(|a, b| self.coworker_rank(b).cmp(&self.coworker_rank(a)));
+        list.sort_by_key(|coworker| std::cmp::Reverse(self.coworker_rank(coworker)));
         list
     }
 
@@ -7517,7 +7512,7 @@ impl AppState {
         };
         cx.spawn(async move |this, cx| {
             let result = client.patch_coworker(&id, &patch).await;
-            let _ = this.update(cx, |state, cx| {
+            let _ = this.update(cx, |_state, cx| {
                 if let Err(error) = result {
                     eprintln!("hide coworker: {}", error.message);
                 }
@@ -8395,7 +8390,7 @@ impl AppState {
     fn send_opengrok_turn_with(
         &mut self,
         conversation_id: String,
-        content: String,
+        _content: String,
         recipe: Option<TurnRecipe>,
         skill: Option<String>,
         stop_first: Option<String>,
@@ -8525,8 +8520,8 @@ impl AppState {
                                         });
                                     }
                                 }
-                                assembler.push_event(&event);
-                                let timing = TurnTiming::from_event(&event);
+                                assembler.push_event(event);
+                                let timing = TurnTiming::from_event(event);
                                 let (plain, parts) = assembler.snapshot();
                                 let box_shot = assembler.latest_screenshot().cloned();
                                 let sig = stream_part_sig(&parts);
@@ -8569,12 +8564,11 @@ impl AppState {
                                             ChatPart::Approval(spec) => Some(spec.clone()),
                                             _ => None,
                                         });
-                                        if let Some(spec) = open {
-                                            if let Some(resolution) =
+                                        if let Some(spec) = open
+                                            && let Some(resolution) =
                                                 state.auto_resolve_local_exec(&spec)
-                                            {
-                                                state.answer_approval_by_mode(spec, resolution, cx);
-                                            }
+                                        {
+                                            state.answer_approval_by_mode(spec, resolution, cx);
                                         }
                                     }
                                 });
@@ -9794,14 +9788,13 @@ impl AppState {
                     .copied();
                 spec.computer_handoff =
                     ComputerHandoffStatus::fold(spec.computer_handoff, local_handoff);
-                if spec.handoff_entry_id.is_none() {
-                    if let Some(id) = self
+                if spec.handoff_entry_id.is_none()
+                    && let Some(id) = self
                         .user_form_handoffs
                         .get(&spec.entry_id)
                         .or_else(|| self.user_form_handoffs.get(&key))
-                    {
-                        spec.handoff_entry_id = Some(id.clone());
-                    }
+                {
+                    spec.handoff_entry_id = Some(id.clone());
                 }
             }
         }
@@ -11679,10 +11672,8 @@ impl AppState {
                                         Some(WAITING_FOR_YOU_STATUS),
                                     );
                                     false
-                                } else if resolution == Some(FormResolution::FillFailed) {
-                                    false
                                 } else {
-                                    true
+                                    resolution != Some(FormResolution::FillFailed)
                                 };
                                 if follow && !run_id.is_empty() {
                                     state.begin_responding(Some(&conversation_id), "Working");
@@ -12120,18 +12111,18 @@ impl AppState {
     pub fn apply_responsive_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
         let result = collapse_for_width(self.sidebar_responsive, width, self.sidebar_collapsed);
         self.sidebar_responsive = result.next;
-        if let Some(apply) = result.apply {
-            if self.sidebar_collapsed != apply {
-                self.sidebar_collapsed = apply;
-                self.auto_collapsed = true;
-                cx.notify();
-            }
+        if let Some(apply) = result.apply
+            && self.sidebar_collapsed != apply
+        {
+            self.sidebar_collapsed = apply;
+            self.auto_collapsed = true;
+            cx.notify();
         }
     }
 
     pub fn toggle_debug_markdown(&mut self, cx: &mut Context<Self>) {
         self.debug_markdown_disabled = !self.debug_markdown_disabled;
-        println!(
+        eprintln!(
             "[DEBUG] Markdown rendering: {}",
             if self.debug_markdown_disabled {
                 "DISABLED (plain text)"
@@ -13296,13 +13287,10 @@ impl AppState {
     ) -> Option<QueuedBubbleSave> {
         let bubble_id = item.bubble_id().to_string();
         let reply = reply_from_pending(item.reply_to.as_ref());
-        let Some(conversation) = self
+        let conversation = self
             .conversations
             .iter_mut()
-            .find(|conversation| conversation.id == conversation_id)
-        else {
-            return None;
-        };
+            .find(|conversation| conversation.id == conversation_id)?;
         if let Some(message) = conversation
             .messages
             .iter_mut()
@@ -13644,7 +13632,7 @@ impl AppState {
                 cx.spawn(async move |this, cx| {
                     service.wait_until_finished_native().await;
                     if let Some(this) = this.upgrade() {
-                        let _ = this.update(cx, |state, cx| {
+                        this.update(cx, |state, cx| {
                             if state.native_tts.message_id.as_ref() == Some(&message_id) {
                                 state.native_tts.message_id = None;
                                 cx.notify();
@@ -15329,10 +15317,6 @@ mod tests {
         assert_eq!(PickedKind::of("run_recipe"), PickedKind::Tool);
         assert_eq!(PickedKind::of("gmail.api.send"), PickedKind::App);
     }
-    /// The values a turn carries are typed as the declaration said they would be, because that
-    /// is what the server validates them against — a number sent as the word "5" is a number
-    /// the server has every right to refuse.
-    #[test]
     /// Picking a workflow from `/` puts it on the draft the way a recipe goes, and the draft
     /// keeps the one thing that differs: what it is called. Everything else — the declaration,
     /// the defaults standing in their fields, what the turn carries — is the same machinery,
@@ -15375,6 +15359,9 @@ mod tests {
         assert!(!ActiveRecipe::from_summary(&old).is_workflow());
     }
 
+    /// The values a turn carries are typed as the declaration said they would be, because that
+    /// is what the server validates them against — a number sent as the word "5" is a number
+    /// the server has every right to refuse.
     #[test]
     fn a_recipe_on_the_draft_sends_each_value_as_the_kind_it_was_declared() {
         let recipe: RecipeSummary = serde_json::from_value(serde_json::json!({
@@ -18064,7 +18051,7 @@ mod tests {
         );
         assert!(state.turn_to_stop().is_none());
         assert!(
-            state.live_turns.get("cw_1").is_none(),
+            !state.live_turns.contains_key("cw_1"),
             "do not keep a local live-turn past the run"
         );
         assert_eq!(state.open_user_forms().len(), 1);
@@ -20214,10 +20201,10 @@ mod tests {
                 "boxId": "box_1",
                 "egress_tunnel": { "ready": true }
             });
-            if let serde_json::Value::Object(map) = extra {
-                if let Some(obj) = body.as_object_mut() {
-                    obj.extend(map);
-                }
+            if let serde_json::Value::Object(map) = extra
+                && let Some(obj) = body.as_object_mut()
+            {
+                obj.extend(map);
             }
             serde_json::from_value(body).unwrap()
         }

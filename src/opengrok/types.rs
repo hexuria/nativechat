@@ -204,10 +204,10 @@ pub fn assistant_text_from_sse(body: &str) -> Result<String, String> {
                     .unwrap_or("run failed");
                 return Err(message.to_string());
             }
-            if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
-                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                    out.push_str(delta);
-                }
+            if (kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK")
+                && let Some(delta) = value.get("delta").and_then(|v| v.as_str())
+            {
+                out.push_str(delta);
             }
         }
     }
@@ -215,12 +215,11 @@ pub fn assistant_text_from_sse(body: &str) -> Result<String, String> {
 }
 
 pub fn error_message_from_body(body: &str) -> String {
-    if let Ok(parsed) = serde_json::from_str::<ErrorBody>(body) {
-        if let Some(error) = parsed.error {
-            if !error.is_empty() {
-                return error;
-            }
-        }
+    if let Ok(parsed) = serde_json::from_str::<ErrorBody>(body)
+        && let Some(error) = parsed.error
+        && !error.is_empty()
+    {
+        return error;
     }
     let trimmed = body.trim();
     if trimmed.is_empty() {

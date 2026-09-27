@@ -231,14 +231,12 @@ impl ComputerPane {
                         RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
                         _ => None,
                     })
-                }) {
-                    if let Some(row) = state.routine_mut(&coworker_id, &rid)
-                        && let Some(RoutineTrigger::Schedule { spec, .. }) =
-                            row.triggers.iter_mut().find(|t| t.id() == sid)
-                        && spec.mode == ScheduleUiMode::Custom
-                    {
-                        spec.expr = cron;
-                    }
+                }) && let Some(row) = state.routine_mut(&coworker_id, &rid)
+                    && let Some(RoutineTrigger::Schedule { spec, .. }) =
+                        row.triggers.iter_mut().find(|t| t.id() == sid)
+                    && spec.mode == ScheduleUiMode::Custom
+                {
+                    spec.expr = cron;
                 }
             });
         })
@@ -663,13 +661,13 @@ impl ComputerPane {
                         let theme = theme.clone();
                         let app = app.clone();
                         let coworker_id = coworker_id.to_string();
-                        triggers.iter().cloned().map(move |trigger| {
+                        triggers.iter().map(move |trigger| {
                             if let RoutineTrigger::Webhook {
                                 id,
                                 url,
                                 key,
                                 header,
-                            } = &trigger
+                            } = trigger
                             {
                                 webhook_popover_row(
                                     id.clone(),
@@ -684,7 +682,7 @@ impl ComputerPane {
                                     theme.clone(),
                                 )
                             } else {
-                                trigger_row(&trigger, muted)
+                                trigger_row(trigger, muted)
                             }
                         })
                     })

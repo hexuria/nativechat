@@ -126,10 +126,10 @@ impl Layout {
         let app_settings = cx.new(|cx| AppSettings::new(state.clone(), cx));
         let bot_finder = cx.new(|cx| BotFinder::new(window, state.clone(), cx));
         let command_palette = cx.new(|cx| CommandPalette::new(window, state.clone(), cx));
-        let shell = ShellRev::from_state(&state.read(cx));
+        let shell = ShellRev::from_state(state.read(cx));
 
         cx.observe(&state, |this, state, cx| {
-            let shell = ShellRev::from_state(&state.read(cx));
+            let shell = ShellRev::from_state(state.read(cx));
             if this.shell != shell {
                 this.shell = shell;
                 cx.notify();

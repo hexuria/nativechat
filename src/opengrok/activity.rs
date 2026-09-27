@@ -261,9 +261,7 @@ pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTic
 }
 
 fn file_basename(path: &str) -> Option<&str> {
-    path.split(['/', '\\'])
-        .filter(|s| !s.is_empty())
-        .next_back()
+    path.split(['/', '\\']).rfind(|s| !s.is_empty())
 }
 
 /// First line of the command, cut so the status line stays one line.

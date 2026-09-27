@@ -21,8 +21,11 @@ struct MyNSRange {
     pub length: usize,
 }
 
+// SAFETY: MyNSRange is repr(C) with two usize fields, which is NSRange's layout on 64-bit macOS
+// (two NSUInteger), and "{_NSRange=QQ}" is the encoding the runtime gives NSRange.
 unsafe impl Encode for MyNSRange {
     fn encode() -> Encoding {
+        // SAFETY: the string is a well-formed Objective-C type encoding, NSRange's own.
         unsafe { Encoding::from_str("{_NSRange=QQ}") }
     }
 }
@@ -33,18 +36,34 @@ pub struct MacTtsBridge {
     callback: Arc<Mutex<Option<TtsCallback>>>,
 }
 
+// SAFETY: the two ids are only ever messaged, never dereferenced from Rust, and the callback they
+// reach is behind a Mutex and is itself Send + Sync. NSSpeechSynthesizer is not documented as
+// thread-safe, though: this relies on TtsService, the only owner, messaging it from the UI thread.
+// Nothing in the types enforces that.
 unsafe impl Send for MacTtsBridge {}
+// SAFETY: as for Send above.
 unsafe impl Sync for MacTtsBridge {}
+
+impl Default for MacTtsBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MacTtsBridge {
     pub fn new() -> Self {
+        // SAFETY: NSSpeechSynthesizer and NSObject exist on every macOS this app runs on, and each
+        // selector is sent with the signature AppKit declares. DELEGATE_CLASS is written once,
+        // inside `Once::call_once`, and read only after it. Messaging a nil synthesizer is a no-op
+        // in Objective-C. The delegate's ivar is set to null before the delegate is handed over, so
+        // a callback that arrives before `set_callback` sees null and does nothing.
         unsafe {
             let synthesizer: id = msg_send![class!(NSSpeechSynthesizer), new];
             if synthesizer.is_null() {
                 eprintln!("Failed to create NSSpeechSynthesizer");
             }
 
-            static mut DELEGATE_CLASS: *const Class = 0 as *const Class;
+            static mut DELEGATE_CLASS: *const Class = std::ptr::null::<Class>();
             static ONCE: std::sync::Once = std::sync::Once::new();
 
             ONCE.call_once(|| {
@@ -61,18 +80,20 @@ impl MacTtsBridge {
                     range: MyNSRange,
                     _string: id,
                 ) {
+                    // SAFETY: `_callback_ptr` is null or `Arc::as_ptr` of the bridge's callback
+                    // Mutex (see `set_callback`). That allocation lives as long as the bridge, and
+                    // the bridge's Drop clears this delegate before the allocation can be freed.
                     unsafe {
                         let callback_ptr: *mut c_void = *this.get_ivar("_callback_ptr");
                         if !callback_ptr.is_null() {
-                            let callback_arc =
-                                &*(callback_ptr as *const Arc<Mutex<Option<TtsCallback>>>);
-                            if let Ok(guard) = callback_arc.lock() {
-                                if let Some(cb) = &*guard {
-                                    cb(TtsEvent::Word {
-                                        start: range.location,
-                                        length: range.length,
-                                    });
-                                }
+                            let callback = &*(callback_ptr as *const Mutex<Option<TtsCallback>>);
+                            if let Ok(guard) = callback.lock()
+                                && let Some(cb) = &*guard
+                            {
+                                cb(TtsEvent::Word {
+                                    start: range.location,
+                                    length: range.length,
+                                });
                             }
                         }
                     }
@@ -85,15 +106,17 @@ impl MacTtsBridge {
                     _sender: id,
                     _finished: bool, // BOOL is i8/u8 logic usually, but here just bool works for logic
                 ) {
+                    // SAFETY: `_callback_ptr` is null or `Arc::as_ptr` of the bridge's callback
+                    // Mutex (see `set_callback`). That allocation lives as long as the bridge, and
+                    // the bridge's Drop clears this delegate before the allocation can be freed.
                     unsafe {
                         let callback_ptr: *mut c_void = *this.get_ivar("_callback_ptr");
                         if !callback_ptr.is_null() {
-                            let callback_arc =
-                                &*(callback_ptr as *const Arc<Mutex<Option<TtsCallback>>>);
-                            if let Ok(guard) = callback_arc.lock() {
-                                if let Some(cb) = &*guard {
-                                    cb(TtsEvent::Finish);
-                                }
+                            let callback = &*(callback_ptr as *const Mutex<Option<TtsCallback>>);
+                            if let Ok(guard) = callback.lock()
+                                && let Some(cb) = &*guard
+                            {
+                                cb(TtsEvent::Finish);
                             }
                         }
                     }
@@ -113,7 +136,7 @@ impl MacTtsBridge {
             });
 
             let delegate: id = msg_send![DELEGATE_CLASS, new];
-            (*delegate).set_ivar("_callback_ptr", 0 as *mut c_void);
+            (*delegate).set_ivar("_callback_ptr", std::ptr::null_mut::<c_void>());
 
             let _: () = msg_send![synthesizer, setDelegate:delegate];
 
@@ -132,13 +155,20 @@ impl MacTtsBridge {
         let mut guard = self.callback.lock().unwrap();
         *guard = Some(Box::new(callback));
 
+        // The heap allocation behind the Arc, not the address of the `callback` field: that one
+        // would dangle the moment the bridge moved, and a caller is free to move it.
+        let ptr = Arc::as_ptr(&self.callback) as *mut c_void;
+        // SAFETY: `delegate` is the RustTtsDelegate made in `new`, which declares `_callback_ptr`
+        // as a `*mut c_void` ivar. What the pointer points at outlives the delegate's use of it:
+        // see the callbacks in `new`.
         unsafe {
-            let ptr = &self.callback as *const Arc<Mutex<Option<TtsCallback>>> as *mut c_void;
             (*self.delegate).set_ivar("_callback_ptr", ptr);
         }
     }
 
     pub fn speak(&self, text: &str) {
+        // SAFETY: `synthesizer` is the NSSpeechSynthesizer made in `new`, or nil, which ignores
+        // messages; the selector exists on it with this signature.
         unsafe {
             let ns_string = NSString::alloc(nil).init_str(text);
             let success: bool = msg_send![self.synthesizer, startSpeakingString:ns_string];
@@ -152,6 +182,8 @@ impl MacTtsBridge {
     /// paused state across `stopSpeaking` / `startSpeakingString:`, so the next utterance starts
     /// and halts at once and `isSpeaking` stays YES forever; lifting the pause first is the cure.
     pub fn stop(&self) {
+        // SAFETY: `synthesizer` is the NSSpeechSynthesizer made in `new`, or nil, which ignores
+        // messages; the selector exists on it with this signature.
         unsafe {
             let _: () = msg_send![self.synthesizer, continueSpeaking];
             let _: () = msg_send![self.synthesizer, stopSpeaking];
@@ -159,18 +191,24 @@ impl MacTtsBridge {
     }
 
     pub fn pause(&self) {
+        // SAFETY: `synthesizer` is the NSSpeechSynthesizer made in `new`, or nil, which ignores
+        // messages; the selector exists on it with this signature.
         unsafe {
             let _: () = msg_send![self.synthesizer, pauseSpeakingAtBoundary:1]; // 0 = Immediate, 1 = Word, 2 = Sentence
         }
     }
 
     pub fn resume(&self) {
+        // SAFETY: `synthesizer` is the NSSpeechSynthesizer made in `new`, or nil, which ignores
+        // messages; the selector exists on it with this signature.
         unsafe {
             let _: () = msg_send![self.synthesizer, continueSpeaking];
         }
     }
 
     pub fn is_speaking(&self) -> bool {
+        // SAFETY: `synthesizer` is the NSSpeechSynthesizer made in `new`, or nil, which ignores
+        // messages; the selector exists on it with this signature.
         unsafe {
             let speaking: bool = msg_send![self.synthesizer, isSpeaking];
             speaking
@@ -180,6 +218,8 @@ impl MacTtsBridge {
 
 impl Drop for MacTtsBridge {
     fn drop(&mut self) {
+        // SAFETY: as for the other messages. Clearing the delegate here, before the fields drop,
+        // is what keeps a late callback from reaching the callback allocation after it is freed.
         unsafe {
             // Clear delegate to prevent use-after-free of callback ptr
             let _: () = msg_send![self.synthesizer, setDelegate:nil];

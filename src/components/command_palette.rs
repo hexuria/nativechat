@@ -271,7 +271,7 @@ impl CommandPalette {
             }
         }
         if want_actions {
-            items.extend(action_catalog(&state).into_iter().filter(|item| {
+            items.extend(action_catalog(state).into_iter().filter(|item| {
                 needle.is_empty() || {
                     let PaletteItem::Action { title, hint, .. } = item else {
                         return false;

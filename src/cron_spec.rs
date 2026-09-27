@@ -144,7 +144,7 @@ fn format_clock(hour: u8, minute: u8) -> String {
 }
 
 fn ordinal(n: u8) -> String {
-    let suffix = if matches!(n % 100, 11 | 12 | 13) {
+    let suffix = if matches!(n % 100, 11..=13) {
         "th"
     } else {
         match n % 10 {

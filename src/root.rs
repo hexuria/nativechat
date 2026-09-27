@@ -490,19 +490,19 @@ impl Render for RootView {
                 window.minimize_window();
             })
             .on_action(|_: &Zoom, _window: &mut Window, _cx: &mut App| {
-                println!("Zoom action triggered");
+                eprintln!("Zoom action triggered");
             })
             .on_action(|_: &Hide, _window: &mut Window, cx: &mut App| {
                 cx.hide();
             })
             .on_action(|_: &HideOthers, _window: &mut Window, _cx: &mut App| {
-                println!("Hide Others action triggered");
+                eprintln!("Hide Others action triggered");
             })
             .on_action(|_: &ShowAll, _window: &mut Window, _cx: &mut App| {
-                println!("Show All action triggered");
+                eprintln!("Show All action triggered");
             })
             .on_action(|_: &About, _window: &mut Window, _cx: &mut App| {
-                println!("About NativeChat");
+                eprintln!("About NativeChat");
             })
             .on_action({
                 let state = self.state.clone();

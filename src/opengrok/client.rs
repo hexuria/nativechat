@@ -923,10 +923,10 @@ impl OpenGrokClient {
                         // whether the model refused or the gateway was never reached.
                         return Err(OpenGrokError::from_server(None, message));
                     }
-                    if kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK" {
-                        if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                            assistant.push_str(delta);
-                        }
+                    if (kind == "TEXT_MESSAGE_CONTENT" || kind == "TEXT_MESSAGE_CHUNK")
+                        && let Some(delta) = value.get("delta").and_then(|v| v.as_str())
+                    {
+                        assistant.push_str(delta);
                     }
                     on_event(&value);
                 }

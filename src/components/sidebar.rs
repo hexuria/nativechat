@@ -9,7 +9,7 @@ use gpui_kit::assets::IconNamed;
 use gpui_kit::base::{Align, ElementExt as _, POPUP_PRIORITY, Placement, Positioner};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::time::{Duration, SystemTime};
@@ -119,9 +119,9 @@ impl SidebarView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
-        let rev = SidebarRev::from_state(&state.read(cx));
+        let rev = SidebarRev::from_state(state.read(cx));
         cx.observe(&state, |this, state, cx| {
-            let rev = SidebarRev::from_state(&state.read(cx));
+            let rev = SidebarRev::from_state(state.read(cx));
             if this.rev != rev {
                 this.rev = rev;
                 cx.notify();

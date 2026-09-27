@@ -15,6 +15,12 @@ pub struct TtsService {
     native_generation: Arc<AtomicU64>,
 }
 
+impl Default for TtsService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TtsService {
     pub fn new() -> Self {
         let native_completion = Arc::new(Notify::new());

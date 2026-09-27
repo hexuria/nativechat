@@ -528,7 +528,7 @@ impl ComputerScreen {
                 let app = self.app.downgrade();
                 cx.spawn(async move |_, cx| {
                     if let Some(app) = app.upgrade() {
-                        let _ = app.update(cx, |state, cx| state.set_taught_skill(None, cx));
+                        app.update(cx, |state, cx| state.set_taught_skill(None, cx));
                     }
                 })
                 .detach();

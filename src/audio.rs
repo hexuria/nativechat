@@ -19,8 +19,12 @@ struct InputContext {
 
 impl AudioInput {
     pub fn new(amplitude: Arc<AtomicU32>) -> anyhow::Result<Self> {
-        println!("[AudioInput] Creating new VoiceProcessingIO instance (sys)");
+        eprintln!("[AudioInput] Creating new VoiceProcessingIO instance (sys)");
 
+        // SAFETY: plain CoreAudio C calls. Every pointer passed in is to a local or to the boxed
+        // context, each valid for the call it is passed to. The context's address is handed to
+        // the audio unit as its refcon; the Box is kept in `_context`, so it stays put, and Drop
+        // disposes of the unit, stopping callbacks, before the Box is freed.
         unsafe {
             // 1. Describe the Audio Component (VoiceProcessingIO)
             let desc = sys::AudioComponentDescription {
@@ -163,6 +167,8 @@ impl AudioInput {
 
 impl Drop for AudioInput {
     fn drop(&mut self) {
+        // SAFETY: `audio_unit` is the instance `new` created and started, and it is disposed of
+        // exactly once, here.
         unsafe {
             sys::AudioOutputUnitStop(self.audio_unit);
             sys::AudioUnitUninitialize(self.audio_unit);
@@ -179,8 +185,11 @@ extern "C" fn input_callback(
     in_number_frames: u32,
     _io_data: *mut sys::AudioBufferList, // This is ignored for input callbacks
 ) -> sys::OSStatus {
+    // SAFETY: `in_ref_con` is the boxed InputContext `new` registered, alive until Drop disposes of
+    // the unit (see `new`). The callback only reads it and stores to an atomic, so it takes a
+    // shared reference: a `&mut` here would alias the Box that owns it.
     unsafe {
-        let context = &mut *(in_ref_con as *mut InputContext);
+        let context = &*(in_ref_con as *const InputContext);
 
         // Allocate buffer for data
         let mut data = vec![0.0f32; in_number_frames as usize];

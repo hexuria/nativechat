@@ -586,9 +586,9 @@ impl ChatTranscript {
     fn new(state: Entity<AppState>, input: Entity<MessageInput>, cx: &mut Context<Self>) -> Self {
         let (rows, feed_rev, debug_mode, can_read_aloud, last_conversation_id) = {
             let app = state.read(cx);
-            let feed_rev = ChatFeedRev::from_state(&app);
+            let feed_rev = ChatFeedRev::from_state(app);
             (
-                snapshot_rows(&app),
+                snapshot_rows(app),
                 feed_rev.clone(),
                 feed_rev.debug_mode,
                 feed_rev.can_read_aloud,
@@ -599,11 +599,11 @@ impl ChatTranscript {
         cx.observe(&state, |this, state, cx| {
             let (feed, rows) = {
                 let app = state.read(cx);
-                let feed = ChatFeedRev::from_state(&app);
+                let feed = ChatFeedRev::from_state(app);
                 if this.feed_rev == feed {
                     return;
                 }
-                (feed, snapshot_rows(&app))
+                (feed, snapshot_rows(app))
             };
             let conv_changed = this.feed_rev.conversation_id != feed.conversation_id;
             let is_ai_responding = feed.is_ai_responding;
@@ -739,10 +739,8 @@ impl ChatTranscript {
             self.find_current = Some(0);
         }
         self.find_hits = hits;
-        if land {
-            if let Some(index) = self.find_current {
-                self.scroll_to_hit(index, cx);
-            }
+        if land && let Some(index) = self.find_current {
+            self.scroll_to_hit(index, cx);
         }
         cx.notify();
     }
@@ -824,9 +822,9 @@ impl ChatTranscript {
                     .update(cx, |this, cx| {
                         let app = this.app_state.read(cx);
                         let speaking = app.native_tts.message_id.is_some();
-                        let feed = ChatFeedRev::from_state(&app);
+                        let feed = ChatFeedRev::from_state(app);
                         if this.feed_rev != feed {
-                            this.rows = snapshot_rows(&app);
+                            this.rows = snapshot_rows(app);
                             this.feed_rev = feed;
                             cx.notify();
                         }
@@ -1656,7 +1654,7 @@ impl Render for ChatView {
             .on_action({
                 let state = self.state.clone();
                 move |action: &ToggleReadAloud, _window: &mut Window, cx: &mut App| {
-                    println!(
+                    eprintln!(
                         "[Chat] ToggleReadAloud action received. ID: {}, Mode: {:?}",
                         action.message_id, action.mode
                     );

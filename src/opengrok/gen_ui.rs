@@ -431,10 +431,10 @@ impl TurnAssembler {
                     self.shell_args.entry(id.clone()).or_default();
                 }
                 if kind == "TOOL_CALL_CHUNK" {
-                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                        if let Some(buf) = self.shell_args.get_mut(&id) {
-                            buf.push_str(delta);
-                        }
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str)
+                        && let Some(buf) = self.shell_args.get_mut(&id)
+                    {
+                        buf.push_str(delta);
                     }
                     if let Some(args) = event.get("arguments") {
                         let command = command_from_args(args);
@@ -501,13 +501,13 @@ impl TurnAssembler {
                 } else if name == "run-awaiting-approval" {
                     self.flush_text();
                     if let Some(mut spec) = approval_from_event(event) {
-                        if spec.command.is_empty() {
-                            if let Some(raw) = self.shell_args.get(&spec.call_id) {
-                                if let Ok(value) = serde_json::from_str::<Value>(raw) {
-                                    spec.command = command_from_args(&value);
-                                } else if !raw.trim().is_empty() {
-                                    spec.command = raw.clone();
-                                }
+                        if spec.command.is_empty()
+                            && let Some(raw) = self.shell_args.get(&spec.call_id)
+                        {
+                            if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                                spec.command = command_from_args(&value);
+                            } else if !raw.trim().is_empty() {
+                                spec.command = raw.clone();
                             }
                         }
                         self.committed.retain(|part| {
@@ -569,11 +569,8 @@ impl TurnAssembler {
     /// Distinct from a permission card. Local Skip/Dismiss that already
     /// settled the grafted card is the AppState map's job, not this flag.
     pub fn waiting_user_form(&self) -> bool {
-        self.committed.iter().any(|part| match part {
-            ChatPart::UserForm(spec) if spec.is_unresolved() || spec.live_computer_handoff() => {
-                true
-            }
-            _ => false,
+        self.committed.iter().any(|part| {
+            matches!(part, ChatPart::UserForm(spec) if spec.is_unresolved() || spec.live_computer_handoff())
         })
     }
 
@@ -958,10 +955,7 @@ fn is_ui_tool(name: &str) -> bool {
 }
 
 fn normalize_name(name: &str) -> String {
-    name.trim()
-        .to_ascii_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-")
+    name.trim().to_ascii_lowercase().replace(['_', ' '], "-")
 }
 
 fn drain_complete_ui(buf: &mut String, out: &mut Vec<ChatPart>) {
@@ -3095,12 +3089,10 @@ mod tests {
         }
         place_hitl_cards_in_document_order(&mut settled);
         assert_eq!(
-            live.iter()
-                .map(|p| std::mem::discriminant(p))
-                .collect::<Vec<_>>(),
+            live.iter().map(std::mem::discriminant).collect::<Vec<_>>(),
             settled
                 .iter()
-                .map(|p| std::mem::discriminant(p))
+                .map(std::mem::discriminant)
                 .collect::<Vec<_>>(),
             "settle must not move the card"
         );
