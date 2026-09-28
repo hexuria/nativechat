@@ -90,6 +90,15 @@ pub mod ids {
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
     /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
     pub const ROUTINE_NEW: &str = "routine-new";
+    /// The newest coworker reply's steps (value = how many), in the tree only while it has
+    /// any, and its Thought rows (value = how many), only while it has any.
+    pub const REPLY_STEPS: &str = "reply-steps";
+    pub const REPLY_REASONING: &str = "reply-reasoning";
+
+    /// One step of the newest reply, by the call it was.
+    pub fn step(call_id: &str) -> String {
+        format!("step-{call_id}")
+    }
 
     pub fn session(id: &str) -> String {
         format!("session-{id}")
@@ -544,6 +553,12 @@ pub enum Command {
         kind: RuleKind,
         pattern: String,
     },
+    /// Open or shut rows of what the coworker did and thought, by their keys, which is what a
+    /// click on a step row or a Thought row does.
+    SetStepsOpen {
+        keys: Vec<String>,
+        open: bool,
+    },
     Shutdown,
 }
 
@@ -736,6 +751,7 @@ impl Command {
                 }
             }
             Self::RemoveLocalRule { kind, pattern } => state.remove_local_rule(kind, pattern, cx),
+            Self::SetStepsOpen { keys, open } => state.set_steps_open(&keys, open, cx),
             Self::Shutdown => {}
         }
     }
@@ -1112,6 +1128,56 @@ struct RecipeDetailSnap {
     /// Run id and its state word (`running`, `finished`, `interrupted`), plus whether it
     /// succeeded, newest first as the server lists them.
     runs: Vec<(String, String, bool)>,
+}
+
+/// What the newest coworker reply did and thought, as its rows show it.
+#[derive(Clone, Default)]
+struct ReplyRunSnap {
+    steps: Vec<StepSnap>,
+    /// Each Thought row's key, and whether it is open.
+    thoughts: Vec<(String, bool)>,
+}
+
+/// One step of that reply.
+#[derive(Clone)]
+struct StepSnap {
+    call_id: String,
+    /// The row's own words, from the function that draws them (`StepSpec::label`).
+    label: String,
+    status: crate::opengrok::StepStatus,
+    /// Its key in `AppState::expanded_steps`, and whether its row is open.
+    key: String,
+    open: bool,
+}
+
+impl ReplyRunSnap {
+    fn from_parts(
+        message_id: &str,
+        parts: &[ChatPart],
+        open: &std::collections::HashSet<String>,
+    ) -> Self {
+        let mut run = Self::default();
+        for part in parts {
+            match part {
+                ChatPart::Step(step) => {
+                    let key = crate::components::steps::step_key(message_id, &step.call_id);
+                    run.steps.push(StepSnap {
+                        call_id: step.call_id.clone(),
+                        label: step.label(),
+                        status: step.status(),
+                        open: open.contains(&key),
+                        key,
+                    });
+                }
+                ChatPart::Reasoning(_) => {
+                    let key = crate::components::steps::thought_key(message_id, run.thoughts.len());
+                    run.thoughts.push((key.clone(), open.contains(&key)));
+                }
+                _ => {}
+            }
+        }
+        run
+    }
 }
 
 /// An approval card still waiting on the person.
@@ -1688,6 +1754,8 @@ pub struct NativeChatHost {
     login_email: String,
     login_password: String,
     last_assistant: String,
+    /// The steps and thoughts of that same reply.
+    reply_run: ReplyRunSnap,
     /// The open thread's working line, which is that thread's own: it is kept per thread, like
     /// the live turn below, so a bot working next door cannot put a line here and cannot take
     /// this one away.
@@ -1870,6 +1938,13 @@ impl NativeChatHost {
                 .find(|c| Some(&c.id) == state.active_conversation_id.as_ref())
                 .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me && !m.hidden))
                 .map(|m| m.content.clone())
+                .unwrap_or_default(),
+            reply_run: state
+                .conversations
+                .iter()
+                .find(|c| Some(&c.id) == state.active_conversation_id.as_ref())
+                .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me && !m.hidden))
+                .map(|m| ReplyRunSnap::from_parts(&m.id, &m.parts, &state.expanded_steps))
                 .unwrap_or_default(),
             bot_status: state.visible_bot_status(),
             turn_in_flight: state.is_turn_in_flight(),
@@ -2395,6 +2470,9 @@ impl NativeChatHost {
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
         }
+        for node in self.reply_run_nodes() {
+            page = page.with_child(node);
+        }
         if let Some((name, word)) = &self.routine_thread {
             page = page
                 .with_child(
@@ -2698,6 +2776,73 @@ impl NativeChatHost {
                     )),
             ],
         }
+    }
+
+    /// The newest reply's steps, each with its row's words and how it came out, and a count of
+    /// its Thought rows. Each is in the tree only while the reply has some, so `assert --exists
+    /// false` is "this reply did nothing but talk". An open row has state `expanded`; for the
+    /// Thought rows that is all of them open, which is what a click on `reply-reasoning` asks for.
+    fn reply_run_nodes(&self) -> Vec<UiNode> {
+        let run = &self.reply_run;
+        let mut nodes = Vec::new();
+        if !run.steps.is_empty() {
+            nodes.push(
+                UiNode::list(ids::REPLY_STEPS, "Steps")
+                    .with_value(run.steps.len().to_string())
+                    .with_children(
+                        run.steps
+                            .iter()
+                            .map(|step| {
+                                let mut node =
+                                    UiNode::status(ids::step(&step.call_id), step.label.clone())
+                                        .with_value(step.status.word());
+                                if step.open {
+                                    node.states.push("expanded".into());
+                                }
+                                node
+                            })
+                            .collect(),
+                    ),
+            );
+        }
+        if !run.thoughts.is_empty() {
+            let mut node = UiNode::status(ids::REPLY_REASONING, "Thought")
+                .with_value(run.thoughts.len().to_string());
+            if run.thoughts.iter().all(|(_, open)| *open) {
+                node.states.push("expanded".into());
+            }
+            nodes.push(node);
+        }
+        nodes
+    }
+
+    /// A click on one of the newest reply's steps opens it, or shuts it if it is open. What
+    /// holds it opens with it: an open step keeps its "N steps" line open (see
+    /// `components::steps`). A click on `reply-reasoning` opens every Thought row, or shuts
+    /// them all once they all are.
+    fn reply_run_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::REPLY_REASONING {
+            let thoughts = &self.reply_run.thoughts;
+            if thoughts.is_empty() {
+                return Some(Err("the newest reply has no Thought row".to_string()));
+            }
+            return Some(Ok(Command::SetStepsOpen {
+                keys: thoughts.iter().map(|(key, _)| key.clone()).collect(),
+                open: !thoughts.iter().all(|(_, open)| *open),
+            }));
+        }
+        let call_id = target.strip_prefix("step-")?;
+        Some(
+            self.reply_run
+                .steps
+                .iter()
+                .find(|step| step.call_id == call_id)
+                .map(|step| Command::SetStepsOpen {
+                    keys: vec![step.key.clone()],
+                    open: !step.open,
+                })
+                .ok_or_else(|| format!("no step `{target}` in the newest reply")),
+        )
     }
 
     /// The reconnecting pill, while something cannot be reached.
@@ -3689,6 +3834,8 @@ impl NativeChatHost {
                 );
             }
             Command::RetryTurn
+        } else if let Some(cmd) = self.reply_run_command(target) {
+            cmd?
         } else if target == ids::COMPOSER_SEND {
             if !self.turn_in_flight {
                 // Sending belongs to the keyboard like the rest of the composer: `key composer
@@ -7341,6 +7488,144 @@ mod tests {
         );
         assert_eq!(card.name, "Allow Hex to run a command on its computer?");
         assert!(card.states.contains(&"shell".to_string()));
+    }
+
+    /// The newest reply's steps are on the tree with their rows' own words and how each came
+    /// out, and its thoughts are counted; an older reply's are not. A click opens a step, a
+    /// second shuts it, and `reply-reasoning` opens the thoughts.
+    #[test]
+    fn a_reply_s_steps_are_on_the_tree_and_open_on_click() {
+        use crate::opengrok::StepSpec;
+        let step = |call_id: &str, tool: &str, arguments: &str, result: Option<(&str, bool)>| {
+            ChatPart::Step(StepSpec {
+                call_id: call_id.into(),
+                tool: tool.into(),
+                arguments: arguments.into(),
+                result: result.map(|(content, _)| content.to_string()),
+                ok: result.map(|(_, ok)| ok),
+            })
+        };
+        let reply = |id: &str, is_me: bool, parts: Vec<ChatPart>| crate::state::Message {
+            id: id.into(),
+            sender: if is_me { "Me" } else { "AI" }.into(),
+            content: "words".into(),
+            sent_at: std::time::SystemTime::UNIX_EPOCH,
+            finished_at: None,
+            run_timing: None,
+            is_me,
+            reply_preview: None,
+            reply_to_id: None,
+            reply_is_me: false,
+            parts,
+            run_id: None,
+            hidden: false,
+        };
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Hex" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "Hex".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                reply(
+                    "m_old",
+                    false,
+                    vec![step(
+                        "c9",
+                        "shell",
+                        "{\"command\":\"pwd\"}",
+                        Some(("/", true)),
+                    )],
+                ),
+                reply("m_ask", true, Vec::new()),
+                reply(
+                    "m_new",
+                    false,
+                    vec![
+                        ChatPart::Reasoning("List it, then read it.".into()),
+                        ChatPart::Text("Let me look.".into()),
+                        step("c1", "shell", "{\"command\":\"ls\"}", Some(("a.txt", true))),
+                        step("c2", "read_file", "{\"path\":\"a.txt\"}", None),
+                        step(
+                            "c3",
+                            "open_url",
+                            "{\"url\":\"https://example.com/x\"}",
+                            Some(("refused", false)),
+                        ),
+                        ChatPart::Text("Done.".into()),
+                    ],
+                ),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        let host = |state: &AppState| {
+            let mut host = NativeChatHost::from_app(state);
+            host.signed_in = true;
+            host
+        };
+
+        let tree = host(&state).snapshot();
+        assert_eq!(
+            tree.find(ids::REPLY_STEPS).unwrap().value.as_deref(),
+            Some("3")
+        );
+        let said = |id: &str| {
+            let node = tree.find(&ids::step(id)).unwrap();
+            (node.name.clone(), node.value.clone().unwrap_or_default())
+        };
+        assert_eq!(said("c1"), ("Running `ls`".into(), "ok".into()));
+        assert_eq!(said("c2"), ("Reading a.txt".into(), "running".into()));
+        assert_eq!(said("c3"), ("Opening example.com".into(), "failed".into()));
+        assert!(tree.find(&ids::step("c9")).is_none(), "an older reply's");
+        assert!(
+            !tree
+                .find(&ids::step("c1"))
+                .unwrap()
+                .states
+                .contains(&"expanded".to_string())
+        );
+        let thoughts = tree.find(ids::REPLY_REASONING).unwrap();
+        assert_eq!(thoughts.value.as_deref(), Some("1"));
+        assert!(tree.ids_are_unique());
+
+        let click = |state: &mut AppState, target: &str| {
+            let mut driver = host(state);
+            driver.click(target).unwrap();
+            let Some(Command::SetStepsOpen { keys, open }) = driver.take_command() else {
+                panic!("a click on {target} opens or shuts rows");
+            };
+            state.mark_steps_open(&keys, open);
+        };
+        let expanded = |state: &AppState, id: &str| {
+            host(state)
+                .snapshot()
+                .find(id)
+                .unwrap()
+                .states
+                .contains(&"expanded".to_string())
+        };
+        click(&mut state, &ids::step("c1"));
+        assert!(expanded(&state, &ids::step("c1")));
+        assert!(!expanded(&state, &ids::step("c2")));
+        click(&mut state, &ids::step("c1"));
+        assert!(!expanded(&state, &ids::step("c1")));
+        click(&mut state, ids::REPLY_REASONING);
+        assert!(expanded(&state, ids::REPLY_REASONING));
+        assert!(host(&state).click(&ids::step("c9")).is_err());
+
+        // A reply that only talked has neither.
+        if let Some(newest) = state.conversations[0].messages.last_mut() {
+            newest.parts = vec![ChatPart::Text("Just words.".into())];
+        }
+        let tree = host(&state).snapshot();
+        assert!(tree.find(ids::REPLY_STEPS).is_none());
+        assert!(tree.find(ids::REPLY_REASONING).is_none());
     }
 
     /// Settings → Computer lists each connected computer's local-exec mode, marks this Mac, and

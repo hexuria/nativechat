@@ -93,7 +93,9 @@ impl Message {
                 | ChatPart::Approval(_)
                 | ChatPart::Screenshot(_)
                 | ChatPart::UserForm(_)
-                | ChatPart::SaveLogin(_) => true,
+                | ChatPart::SaveLogin(_)
+                | ChatPart::Step(_)
+                | ChatPart::Reasoning(_) => true,
             })
     }
 
@@ -107,7 +109,9 @@ impl Message {
                 | ChatPart::Approval(_)
                 | ChatPart::Screenshot(_)
                 | ChatPart::UserForm(_)
-                | ChatPart::SaveLogin(_) => false,
+                | ChatPart::SaveLogin(_)
+                | ChatPart::Step(_)
+                | ChatPart::Reasoning(_) => false,
             })
     }
 
@@ -168,6 +172,10 @@ pub fn clock_label(dt: DateTime<Local>) -> String {
 /// words on either side of one are kept apart by a blank line, the same break `content` gets,
 /// rather than running together into one sentence. A chart, which is cut out of the middle of
 /// a sentence, leaves that sentence whole.
+///
+/// The steps the coworker took and what it thought are kept where they happened, each cut to
+/// the size the turn kept them at, so a reopened thread shows what was done between the words
+/// and not only the words.
 fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
     let mut saved: Vec<MessagePart> = Vec::new();
     let mut words = String::new();
@@ -197,6 +205,17 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
                 saved.push(MessagePart::Ui {
                     spec: spec.to_value().to_string(),
                 });
+            }
+            ChatPart::Step(step) => {
+                close_text_run(&mut words, &mut saved);
+                saved.push(MessagePart::Step {
+                    call_id: step.call_id.clone(),
+                    spec: step.to_value().to_string(),
+                });
+            }
+            ChatPart::Reasoning(thought) => {
+                close_text_run(&mut words, &mut saved);
+                saved.push(MessagePart::Reasoning(thought.clone()));
             }
         }
     }
@@ -266,6 +285,13 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 height,
                 visibility: Some(ImageVisibility::Transcript),
             })),
+            // A step whose row does not read back is left out; the words either side of it
+            // are their own parts and still say what they said.
+            MessagePart::Step { call_id, spec } => serde_json::from_str::<serde_json::Value>(&spec)
+                .ok()
+                .and_then(|value| crate::opengrok::StepSpec::from_value(call_id, &value))
+                .map(ChatPart::Step),
+            MessagePart::Reasoning(thought) => Some(ChatPart::Reasoning(thought)),
         })
         .collect()
 }
@@ -1079,6 +1105,9 @@ fn restored_message(row: ChatMessage) -> Message {
 /// approval, generative UI) flush immediately so a card is not delayed a frame.
 const STREAM_PAINT_MIN: Duration = Duration::from_millis(16);
 
+/// A step coming back counts with the parts: its mark is how the person knows the call is done,
+/// and the frame that settles it is often the last one before the model goes quiet to think,
+/// which a frame held back by the rate would leave showing "…" until the next one.
 fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
     let flags = parts.iter().fold(0u8, |acc, part| {
         acc | match part {
@@ -1088,9 +1117,15 @@ fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
             ChatPart::Screenshot(_) => 4,
             ChatPart::UserForm(_) => 8,
             ChatPart::SaveLogin(_) => 16,
+            ChatPart::Step(_) => 32,
+            ChatPart::Reasoning(_) => 64,
         }
     });
-    (parts.len(), flags)
+    let settled = parts
+        .iter()
+        .filter(|part| matches!(part, ChatPart::Step(step) if step.result.is_some()))
+        .count();
+    (parts.len() + settled, flags)
 }
 
 fn stream_paint_due(
@@ -2737,6 +2772,10 @@ pub struct AppState {
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
     pub expanded_shell_output: HashSet<String>,
+    /// The step rows, groups of steps and Thought rows the person has opened, by the keys
+    /// `components::steps` gives them. Not saved: every one of them is shut when a thread is
+    /// opened again, which is how a reply is meant to be read.
+    pub expanded_steps: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
     /// This Mac's standing rules, as Settings → Computer last read them. See
     /// [`Self::this_mac_rules`] for when they are drawn.
@@ -3250,6 +3289,7 @@ impl AppState {
             local_exec_machine_id: None,
             local_exec_cancel: None,
             expanded_shell_output: HashSet::new(),
+            expanded_steps: HashSet::new(),
             computers: Vec::new(),
             local_rules: None,
             local_rules_epoch: 0,
@@ -10565,6 +10605,22 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open or shut step rows, groups of steps and Thought rows, by their keys.
+    pub fn set_steps_open(&mut self, keys: &[String], open: bool, cx: &mut Context<Self>) {
+        self.mark_steps_open(keys, open);
+        cx.notify();
+    }
+
+    pub(crate) fn mark_steps_open(&mut self, keys: &[String], open: bool) {
+        for key in keys {
+            if open {
+                self.expanded_steps.insert(key.clone());
+            } else {
+                self.expanded_steps.remove(key);
+            }
+        }
+    }
+
     pub fn pick_form_option(
         &mut self,
         message_id: String,
@@ -17440,6 +17496,11 @@ mod tests {
                 ChatPart::SaveLogin(spec) => {
                     format!("save-login {} {}", spec.origin, spec.username)
                 }
+                ChatPart::Step(step) => format!(
+                    "step {} {} {} {:?} {:?}",
+                    step.call_id, step.tool, step.arguments, step.result, step.ok
+                ),
+                ChatPart::Reasoning(thought) => format!("thought {thought}"),
             })
             .collect()
     }
@@ -19000,6 +19061,195 @@ mod tests {
             "the turn-end pin is kept: {:?}",
             saved_parts(&replayed_parts)
         );
+    }
+
+    /// A turn that thought, said a word, took two steps (one of which failed) and said what it
+    /// found, in the frames the server sends for it.
+    fn step_frames() -> Vec<serde_json::Value> {
+        vec![
+            json!({"type":"RUN_STARTED","threadId":"cw_1","runId":"run_s"}),
+            json!({"type":"REASONING_MESSAGE_START","messageId":"msg_run_s_1"}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"msg_run_s_1","delta":"Size the archive before reading its index."}),
+            json!({"type":"REASONING_MESSAGE_END","messageId":"msg_run_s_1"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"msg_run_s_2","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_run_s_2","delta":"Let me look."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"msg_run_s_2"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"command\":\"du -sh /srv/archive\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"4.0G\t/srv/archive","ok":true}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c2","toolCallName":"read_file"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c2","delta":"{\"path\":\"/srv/archive/INDEX\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c2"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c2","content":"permission denied","ok":false}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"msg_run_s_3","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_run_s_3","delta":"The archive is four gigabytes; its index would not open."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"msg_run_s_3"}),
+            json!({"type":"RUN_FINISHED","threadId":"cw_1","runId":"run_s"}),
+        ]
+    }
+
+    /// Steps and thoughts come to the same parts whether the turn was watched as it ran or
+    /// read back off the server afterwards, and are saved the same either way.
+    #[test]
+    fn a_run_watched_live_and_replayed_has_the_same_steps() {
+        let events = step_frames();
+        let (live_plain, live_parts) = watched_live(&events);
+        let (replayed_plain, replayed_parts) = reply_from_replay(&events, "finished");
+        assert_eq!(replayed_parts, live_parts);
+        assert_eq!(replayed_plain, live_plain);
+        assert_eq!(
+            shape(&live_parts),
+            vec![
+                "thought Size the archive before reading its index.".to_string(),
+                "text Let me look.".to_string(),
+                "step c1 shell {\"command\":\"du -sh /srv/archive\"} Some(\"4.0G\\t/srv/archive\") Some(true)".to_string(),
+                "step c2 read_file {\"path\":\"/srv/archive/INDEX\"} Some(\"permission denied\") Some(false)".to_string(),
+                "text The archive is four gigabytes; its index would not open.".to_string(),
+            ]
+        );
+        assert_eq!(saved_parts(&replayed_parts), saved_parts(&live_parts));
+    }
+
+    /// A turn's steps and thoughts are written down with its words and come back from the
+    /// database as they were, a step that never came back included.
+    #[tokio::test]
+    async fn steps_and_reasoning_survive_sqlite() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Steps").await.expect("a session");
+        let parts = vec![
+            ChatPart::Reasoning("Size the archive first.".into()),
+            ChatPart::Text("Let me look.".into()),
+            ChatPart::Step(crate::opengrok::StepSpec {
+                call_id: "c1".into(),
+                tool: "shell".into(),
+                arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
+                result: Some("4.0G\t/srv/archive".into()),
+                ok: Some(true),
+            }),
+            ChatPart::Step(crate::opengrok::StepSpec {
+                call_id: "c2".into(),
+                tool: "read_file".into(),
+                arguments: "{\"path\":\"/srv/archive/INDEX\"}".into(),
+                result: None,
+                ok: None,
+            }),
+            ChatPart::Text("The archive is four gigabytes.".into()),
+        ];
+        db.save_message(
+            "m1",
+            "s1",
+            "assistant",
+            "Let me look.\n\nThe archive is four gigabytes.",
+            None,
+            None,
+            None,
+            &saved_parts(&parts),
+            Some("run_s"),
+            false,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("the turn is saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            restored_parts(&rows[0].content, rows[0].parts.clone()),
+            parts
+        );
+    }
+
+    /// A part of a kind this build does not know — one a later build wrote — is left out, and
+    /// the rest of the message reads as it did. A message with nothing else is its words.
+    #[tokio::test]
+    async fn an_unknown_part_kind_is_dropped_not_fatal() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Steps").await.expect("a session");
+        let parts = vec![
+            ChatPart::Text("Before.".into()),
+            ChatPart::Step(crate::opengrok::StepSpec {
+                call_id: "c1".into(),
+                tool: "shell".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                result: Some("a.txt".into()),
+                ok: Some(true),
+            }),
+            ChatPart::Text("After.".into()),
+        ];
+        for (id, content, saved) in [
+            ("m1", "Before.\n\nAfter.", saved_parts(&parts)),
+            ("m2", "Just words.", Vec::new()),
+        ] {
+            db.save_message(
+                id,
+                "s1",
+                "assistant",
+                content,
+                None,
+                None,
+                None,
+                &saved,
+                None,
+                false,
+                SaveStamp::at(SystemTime::UNIX_EPOCH),
+            )
+            .await
+            .expect("saved");
+        }
+        for (id, ord) in [("m1", 3), ("m2", 0)] {
+            sqlx::query(
+                "INSERT INTO chat_message_parts (message_id, ord, kind, text) VALUES (?, ?, 'future-kind', 'drawn by a later build')",
+            )
+            .bind(id)
+            .bind(ord)
+            .execute(&db.pool())
+            .await
+            .expect("a later build's part");
+        }
+        let rows = db.get_messages("s1").await.expect("the thread still reads");
+        let restored: Vec<Vec<ChatPart>> = rows
+            .iter()
+            .map(|row| restored_parts(&row.content, row.parts.clone()))
+            .collect();
+        assert_eq!(
+            restored,
+            vec![parts, vec![ChatPart::Text("Just words.".into())]]
+        );
+    }
+
+    /// A reply's words are its words: what its tools were given and gave back, and what it
+    /// thought, stay out of what is sent back as the thread's history and what is copied or
+    /// read aloud from it. The words either side of a step are two things said.
+    #[test]
+    fn the_words_sent_back_and_copied_exclude_steps() {
+        let (plain, parts) = reply_from_replay(&step_frames(), "finished");
+        let mut reply = message("m2", false, &plain);
+        reply.parts = parts;
+        assert_eq!(
+            reply.content,
+            "Let me look.\n\nThe archive is four gigabytes; its index would not open."
+        );
+        let sent = agui_messages(&[
+            message("m1", true, "how big is the archive?"),
+            reply.clone(),
+        ]);
+        assert_eq!(sent[1].content, reply.content);
+        for kept_out in [
+            "du -sh",
+            "4.0G",
+            "INDEX",
+            "permission denied",
+            "Size the archive",
+            "Running",
+            "Reading",
+        ] {
+            assert!(
+                !sent[1].content.contains(kept_out),
+                "{kept_out:?} is not the coworker's words: {:?}",
+                sent[1].content
+            );
+        }
+        assert!(reply.has_text_body() && reply.has_visible_body());
     }
 
     /// Reconciling is a diff, not a rebuild: a run the thread already has a reply for was built

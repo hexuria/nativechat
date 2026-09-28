@@ -309,10 +309,10 @@ impl DatabaseService {
 
         let mut by_message: HashMap<String, Vec<MessagePart>> = HashMap::new();
         for row in part_rows {
-            by_message
-                .entry(row.message_id.clone())
-                .or_default()
-                .push(row.into_part());
+            let message_id = row.message_id.clone();
+            if let Some(part) = row.into_part() {
+                by_message.entry(message_id).or_default().push(part);
+            }
         }
         for row in &mut rows {
             row.parts = by_message.remove(&row.id).unwrap_or_default();
@@ -360,8 +360,8 @@ pub struct ChatMessage {
     pub parts: Vec<MessagePart>,
 }
 
-/// One piece of a saved message: the words of a bubble, or a picture of the box's screen with
-/// the caption the tool wrote under it.
+/// One piece of a saved message: the words of a bubble, a picture of the box's screen with the
+/// caption the tool wrote under it, a widget, a step the coworker took or a thought it had.
 ///
 /// A permission card is deliberately not one of these. It belongs to a run that is long over by
 /// the time the thread is opened again, and reviving it would ask the person to allow something
@@ -385,6 +385,15 @@ pub enum MessagePart {
         /// `{"component": "form" | "bar-chart", ...}` as `UiSpec::to_value` writes it.
         spec: String,
     },
+    /// A tool call the coworker made, as its step row showed it: without it a reopened thread
+    /// would show the words and lose what was done between them.
+    Step {
+        call_id: String,
+        /// `{"tool", "arguments", "result", "ok"}` as `StepSpec::to_value` writes it.
+        spec: String,
+    },
+    /// What the coworker thought on the way, as its "Thought" row showed it.
+    Reasoning(String),
 }
 
 impl MessagePart {
@@ -393,43 +402,45 @@ impl MessagePart {
             Self::Text(_) => "text",
             Self::Screenshot { .. } => "screenshot",
             Self::Ui { .. } => "ui",
+            Self::Step { .. } => "step",
+            Self::Reasoning(_) => "reasoning",
         }
     }
 
-    /// One text column serves all three: a text part's words, a screenshot's caption, a
-    /// widget's JSON.
+    /// One text column serves them all: a text part's words, a screenshot's caption, a
+    /// widget's or a step's JSON, a thought.
     fn text(&self) -> String {
         match self {
-            Self::Text(text) => text.clone(),
+            Self::Text(text) | Self::Reasoning(text) => text.clone(),
             Self::Screenshot { caption, .. } => caption.clone(),
-            Self::Ui { spec } => spec.clone(),
+            Self::Ui { spec } | Self::Step { spec, .. } => spec.clone(),
         }
     }
 
     fn call_id(&self) -> Option<String> {
         match self {
-            Self::Text(_) | Self::Ui { .. } => None,
-            Self::Screenshot { call_id, .. } => Some(call_id.clone()),
+            Self::Text(_) | Self::Ui { .. } | Self::Reasoning(_) => None,
+            Self::Screenshot { call_id, .. } | Self::Step { call_id, .. } => Some(call_id.clone()),
         }
     }
 
     fn image(&self) -> Option<Vec<u8>> {
         match self {
-            Self::Text(_) | Self::Ui { .. } => None,
+            Self::Text(_) | Self::Ui { .. } | Self::Step { .. } | Self::Reasoning(_) => None,
             Self::Screenshot { image, .. } => Some(image.clone()),
         }
     }
 
     fn width(&self) -> Option<i64> {
         match self {
-            Self::Text(_) | Self::Ui { .. } => None,
+            Self::Text(_) | Self::Ui { .. } | Self::Step { .. } | Self::Reasoning(_) => None,
             Self::Screenshot { width, .. } => Some(i64::from(*width)),
         }
     }
 
     fn height(&self) -> Option<i64> {
         match self {
-            Self::Text(_) | Self::Ui { .. } => None,
+            Self::Text(_) | Self::Ui { .. } | Self::Step { .. } | Self::Reasoning(_) => None,
             Self::Screenshot { height, .. } => Some(i64::from(*height)),
         }
     }
@@ -447,26 +458,35 @@ struct PartRow {
 }
 
 impl PartRow {
-    /// A row this build cannot paint as a picture — an unknown kind, or a screenshot whose bytes
-    /// are gone — still has words on it, so it comes back as text rather than as nothing.
-    fn into_part(self) -> MessagePart {
+    /// A screenshot whose bytes are gone still has its caption, so it comes back as text rather
+    /// than as nothing.
+    ///
+    /// A kind this build does not know is one a later build wrote, and it is left out rather
+    /// than shown as whatever its text column holds, which for a step is its JSON. The message's
+    /// words are in its other parts and in its own text, so a thread read by an older build
+    /// still says everything that was said.
+    fn into_part(self) -> Option<MessagePart> {
         let text = self.text.unwrap_or_default();
-        if self.kind == "screenshot"
-            && let Some(image) = self.image
-            && let (Some(width), Some(height)) = (self.width, self.height)
-        {
-            return MessagePart::Screenshot {
+        match self.kind.as_str() {
+            "text" => Some(MessagePart::Text(text)),
+            "screenshot" => match (self.image, self.width, self.height) {
+                (Some(image), Some(width), Some(height)) => Some(MessagePart::Screenshot {
+                    call_id: self.call_id.unwrap_or_default(),
+                    caption: text,
+                    image,
+                    width: width.max(0) as u32,
+                    height: height.max(0) as u32,
+                }),
+                _ => Some(MessagePart::Text(text)),
+            },
+            "ui" => Some(MessagePart::Ui { spec: text }),
+            "step" => Some(MessagePart::Step {
                 call_id: self.call_id.unwrap_or_default(),
-                caption: text,
-                image,
-                width: width.max(0) as u32,
-                height: height.max(0) as u32,
-            };
+                spec: text,
+            }),
+            "reasoning" => Some(MessagePart::Reasoning(text)),
+            _ => None,
         }
-        if self.kind == "ui" {
-            return MessagePart::Ui { spec: text };
-        }
-        MessagePart::Text(text)
     }
 }
 
