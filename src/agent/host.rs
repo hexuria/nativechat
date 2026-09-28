@@ -4248,13 +4248,20 @@ impl NativeChatHost {
         }
         // A letter pressed at a choice card is the letter on its keycap. It goes to the window
         // the way a person's does: the caret leaves the composer (a click on the card does
-        // that) and the key goes down the window's own path, where the root answers the newest
-        // open card. Pressed at an older card it answers nothing, which is the point.
-        if self
+        // that) and the key goes down the window's own path, where the root answers the card
+        // a letter answers. That is only ever one card, so a key aimed at any other is refused
+        // rather than pressed: pressed, it would answer the other card.
+        if let Some(choice) = self
             .choices
             .iter()
-            .any(|choice| choice_card_id(&choice.message_id) == target)
+            .find(|choice| choice_card_id(&choice.message_id) == target)
         {
+            if !choice.keyed {
+                return Err(format!(
+                    "`{target}` takes no letter: a letter answers only the newest open card \
+                     with one question"
+                ));
+            }
             return self.plan(ComposePlan {
                 focus_composer: false,
                 release_caret: true,
@@ -8359,6 +8366,10 @@ mod tests {
             other => panic!("expected m-1's pick, got {other:?}"),
         }
 
+        assert!(
+            host.dispatch(&Op::key("choice-m", "a")).is_err(),
+            "a letter aimed at a card it would not answer is refused, not pressed"
+        );
         let plan = keys(&mut host, Op::key("choice-m-1", "b"));
         assert!(plan.release_caret && !plan.focus_composer);
         assert_eq!(plan.keys, vec!["b"]);

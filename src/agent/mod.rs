@@ -83,7 +83,9 @@
 //! `choice-{messageId}-dismiss`, and `choice-{messageId}-submit` on a card of several questions.
 //! Answered: `choice-{messageId}-answer` (label = what was sent, title aside). `key
 //! choice-{messageId} <letter>` takes the caret out of the composer and presses the letter at
-//! the window, the way a person does after clicking the card.
+//! the window, the way a person does after clicking the card. Only the card in state `keyboard`
+//! takes it; a letter aimed at any other card is refused. A card the bot followed with another
+//! card is `not-answered`: only the newest card asks.
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab

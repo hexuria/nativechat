@@ -622,30 +622,46 @@ pub struct ThreadOrigin {
     pub coworker_id: String,
 }
 
-/// Where the choice card on `message_id` stands. The person's first message after the card
-/// decides it: that message is the card's answer ([`FormSpec::answer_in`]) or it is not, and
-/// then the thread has moved past the card. With nothing written since, the card is open unless
-/// it was put away this session.
+/// Where the choice card on `message_id` stands.
+///
+/// Only the newest card asks. A card the bot followed with another card before the person
+/// said anything has been asked again, so it takes no answer and nothing later is read as its
+/// answer: the person's next words belong to the newer card. Otherwise the person's first
+/// message after the card decides it: that message is the card's answer
+/// ([`FormSpec::answer_in`]) or it is not, and then the thread has moved past the card. With
+/// nothing written since, the card is open unless it was put away this session.
 pub fn choice_card_in(
     messages: &[Message],
     message_id: &str,
     spec: &FormSpec,
     dismissed: bool,
 ) -> ChoiceCard {
-    let next = messages
+    let later = messages
         .iter()
         .position(|message| message.id == message_id)
-        .and_then(|at| messages[at + 1..].iter().find(|message| message.is_me));
-    if let Some(picks) = next.and_then(|message| spec.answer_in(&message.content)) {
+        .map_or(&[][..], |at| &messages[at + 1..]);
+    let asked_again = later
+        .iter()
+        .take_while(|message| !message.is_me)
+        .any(carries_choice_card);
+    let next = later.iter().find(|message| message.is_me);
+    if !asked_again && let Some(picks) = next.and_then(|message| spec.answer_in(&message.content)) {
         return ChoiceCard::Answered(picks);
     }
     if dismissed {
         ChoiceCard::Dismissed
-    } else if next.is_some() {
+    } else if asked_again || next.is_some() {
         ChoiceCard::MovedOn
     } else {
         ChoiceCard::Open
     }
+}
+
+fn carries_choice_card(message: &Message) -> bool {
+    message
+        .parts
+        .iter()
+        .any(|part| matches!(part, ChatPart::Ui(crate::opengrok::UiSpec::Form(_))))
 }
 
 /// The line over a routine's own instruction in its thread, where one is.
@@ -24712,6 +24728,34 @@ mod tests {
             choice_card_in(&own_words, "m_1", &spec, false),
             ChoiceCard::MovedOn,
             "the person's own sentence is not an answer, and the card no longer asks"
+        );
+    }
+
+    /// Two cards open at once: the older was asked again by the newer, so it takes no answer,
+    /// and answering the newer never paints the older as answered too.
+    #[test]
+    fn only_the_newest_of_two_cards_is_open_and_answered() {
+        let spec = choice(Some("Pick"), &[("Go", &["Yes", "No"])]);
+        let older = carrying(message("m_1", false, ""), &spec);
+        let newer = carrying(message("m_2", false, ""), &spec);
+        let open = vec![older.clone(), newer.clone()];
+        assert_eq!(
+            choice_card_in(&open, "m_1", &spec, false),
+            ChoiceCard::MovedOn
+        );
+        assert_eq!(choice_card_in(&open, "m_2", &spec, false), ChoiceCard::Open);
+
+        let answered = vec![older, newer, message("m_3", true, "Pick\nGo: No")];
+        assert_eq!(
+            choice_card_in(&answered, "m_1", &spec, false),
+            ChoiceCard::MovedOn,
+            "the answer was the newer card's"
+        );
+        let expected: std::collections::HashMap<String, String> =
+            [("go".to_string(), "No".to_string())].into();
+        assert_eq!(
+            choice_card_in(&answered, "m_2", &spec, false),
+            ChoiceCard::Answered(expected)
         );
     }
 
