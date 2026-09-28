@@ -592,8 +592,8 @@ pub fn agui_messages(messages: &[Message]) -> Vec<AguiMessage> {
                 },
                 tool_call_id: None,
                 reply_to,
-                // Attachments are not sent yet: the composer has no way to add one until
-                // opengrok-server#259 lands and the 📎 is turned on (#90).
+                // Attachments are not sent yet: the server takes them (opengrok-server#259), and
+                // the composer's 📎 that adds them is the next change (#90).
                 attachments: Vec::new(),
             }
         })

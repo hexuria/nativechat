@@ -1387,9 +1387,18 @@ impl OpenGrokClient {
         bytes: &[u8],
     ) -> Result<crate::opengrok::Attachment, OpenGrokError> {
         use base64::Engine as _;
+        // Over the server's cap the body is refused before its handler runs, with the web
+        // framework's words or a dropped connection rather than the server's sentence: say the
+        // sentence here, before a large file is encoded at all.
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(OpenGrokError::from_server(
+                Some(413),
+                "artifacts must be under 25 MiB",
+            ));
+        }
         let body = json!({
             "kind": "attachment",
-            "mime": mime,
+            "mime": upload_mime(mime),
             "filename": upload_filename(filename),
             "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
             "threadId": thread_id,
@@ -2450,6 +2459,20 @@ impl BoxShareScope {
             _ => None,
         }
     }
+}
+
+/// The most an upload may weigh: opengrok-server `artifacts.rs` `MAX_ARTIFACT_BYTES` (25 MiB).
+pub(crate) const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
+/// A file's type as the server will take it: a plain lowercase `type/subtype`. The server
+/// refuses parameters (`; charset=utf-8`) and reads its accepted kinds in lowercase, so a
+/// type from the system or an extension table is trimmed, cut at `;` and lowercased first.
+pub(crate) fn upload_mime(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// A file's name as the server will take it. opengrok-server#259 (merged at 68ace2e) refuses a
@@ -6083,6 +6106,29 @@ mod tests {
         assert_eq!(error.status, Some(404));
     }
 
+    /// A type with parameters or capitals is sent as the plain lowercase type the server reads.
+    #[test]
+    fn a_file_type_is_sent_plain() {
+        assert_eq!(super::upload_mime("IMAGE/PNG"), "image/png");
+        assert_eq!(
+            super::upload_mime(" text/plain; charset=utf-8"),
+            "text/plain"
+        );
+    }
+
+    /// A file over the server's cap is refused here with the server's own sentence.
+    #[tokio::test]
+    async fn a_file_over_the_cap_is_refused_before_it_is_sent() {
+        let client = OpenGrokClient::new("http://127.0.0.1:9").unwrap();
+        let big = vec![0u8; super::MAX_ATTACHMENT_BYTES + 1];
+        let error = client
+            .upload_attachment("th_1", "big.png", "image/png", &big)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(413));
+        assert!(error.message.contains("25 MiB"), "{}", error.message);
+    }
+
     /// A name the server would refuse is cleaned rather than losing the upload.
     #[test]
     fn a_file_name_the_server_refuses_is_cleaned() {
@@ -6102,7 +6148,7 @@ mod tests {
             .and(wiremock::matchers::body_partial_json(json!({
                 "kind": "attachment",
                 "mime": "text/plain",
-                "filename": "notes.txt",
+                "filename": "q3 _final_.txt",
                 "base64": "aGk=",
                 "threadId": "th_1"
             })))
@@ -6116,7 +6162,12 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let file = client
-            .upload_attachment("th_1", "notes.txt", "text/plain", b"hi")
+            .upload_attachment(
+                "th_1",
+                "q3 \"final\".txt",
+                "Text/Plain; charset=utf-8",
+                b"hi",
+            )
             .await
             .unwrap();
         assert_eq!((file.id.as_str(), file.size_bytes), ("art_1", 2));
