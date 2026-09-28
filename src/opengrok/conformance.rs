@@ -1315,6 +1315,7 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("POST__ag-ui_user-form_submit", user_form_answer),
     ("POST__ag-ui_user-form_dismiss", user_form_answer),
     ("POST__ag-ui_box-handoff_resolve", box_handoff),
+    ("GET__coworkers__coworker_id__tools", coworker_tools),
 ];
 
 fn parse<T: DeserializeOwned>(body: &Value) -> Result<T, String> {
@@ -1798,6 +1799,35 @@ fn account(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// A bot's tools (opengrok-server `agui/routes.rs` `list_tools`): every tool the server lists
+/// comes through by the name the model is told, with its words and its kind. A refusal is a
+/// plain sentence, and the app reads only its status (a 404 is "not this person's bot"), so
+/// one must never read as a list.
+fn coworker_tools(status: u16, body: &Value) -> Check {
+    if status != 200 {
+        must!(
+            body.get("tools").is_none(),
+            "a refused listing should not carry tools: {body}"
+        );
+        return Ok(());
+    }
+    let listing: super::client::ToolListing = parse(body)?;
+    let raw = body["tools"]
+        .as_array()
+        .ok_or("a listing should carry a tools array")?;
+    same_len(&listing.tools, raw)?;
+    for (tool, raw) in listing.tools.iter().zip(raw) {
+        must!(
+            tool.name == str_at(raw, "name")
+                && tool.description == str_at(raw, "description")
+                && tool.kind == str_at(raw, "kind")
+                && tool.is_builtin() == (str_at(raw, "kind") == "builtin"),
+            "each tool should come through as sent: {tool:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
 /// A sign-in answers with the session in cookies, and this app reads only the status off a
 /// success. A refusal is read for the server's own sentence.
 fn login(status: u16, body: &Value) -> Check {
@@ -2221,5 +2251,28 @@ fn the_ledger_types_are_the_types_the_source_matches() {
         unlisted.is_empty() && unmatched.is_empty(),
         "matched in the source and missing from AGUI_TYPES: {unlisted:?}; in AGUI_TYPES and \
          matched nowhere: {unmatched:?}"
+    );
+}
+
+/// The tools listing is in the ledger before its recording is vendored, so the corpus test has
+/// a reading for it the day it arrives. Fed the two bodies the server recorded
+/// (`GET__coworkers__coworker_id__tools/200-…` trimmed, `404-…` whole): the list comes through,
+/// the refusal is not read as one, and a body that drops a tool's kind is caught.
+#[test]
+fn a_bots_tool_listing_has_a_reading_in_the_ledger() {
+    let (_, check) = REST_ROUTES
+        .iter()
+        .find(|(route, _)| *route == "GET__coworkers__coworker_id__tools")
+        .expect("the tools route is in the ledger");
+    let listed = serde_json::json!({"tools": [
+        {"name": "shell", "description": "Run a shell command.", "kind": "builtin"},
+        {"name": "gmail_api_send", "description": "", "kind": "plugin"}
+    ]});
+    check(200, &listed).unwrap();
+    check(404, &Value::String("no such coworker".into())).unwrap();
+    assert!(check(404, &listed).is_err(), "a refusal carrying tools");
+    assert!(
+        check(200, &serde_json::json!({})).is_err(),
+        "no tools array"
     );
 }

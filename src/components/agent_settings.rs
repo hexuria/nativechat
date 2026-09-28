@@ -1559,6 +1559,22 @@ pub(crate) fn tools_summary(list: &ToolList) -> String {
     }
 }
 
+/// A tool's words as its row shows them: the first line, cut at a word near 160 characters so
+/// one long description cannot fill the pane.
+fn first_line_of(description: &str) -> String {
+    const MOST: usize = 160;
+    let line = description.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= MOST {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(MOST).collect();
+    let at_word = cut
+        .rfind(' ')
+        .filter(|at| *at > MOST / 2)
+        .unwrap_or(cut.len());
+    format!("{}…", cut[..at_word].trim_end())
+}
+
 /// The list itself: each tool by its wire name, which is what the model is told, with the
 /// first line of what the server says it does. Nothing here can be switched: choosing a bot's
 /// tools is not on the server yet (opengrok-server#84), and a switch that only lived in this
@@ -1569,15 +1585,12 @@ fn tools_body(all: &[CoworkerTool], muted: Hsla) -> impl IntoElement {
         v_flex()
             .gap(px(6.))
             .child(div().text_xs().text_color(muted).child(title))
-            .children(tools.into_iter().map(|tool| {
-                let first_line = tool
-                    .description
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
+            .children(tools.into_iter().enumerate().map(|(at, tool)| {
+                let first_line = first_line_of(&tool.description);
+                // By place, not by name: the server's names are unique per turn, but a row's id
+                // must not depend on that holding.
                 v_flex()
-                    .id(SharedString::from(format!("agent-tool-{}", tool.name)))
+                    .id(SharedString::from(format!("agent-tool-{title}-{at}")))
                     .gap(px(1.))
                     .child(
                         div()
@@ -1605,7 +1618,7 @@ fn tools_body(all: &[CoworkerTool], muted: Hsla) -> impl IntoElement {
 
 #[cfg(test)]
 mod tools_tests {
-    use super::tools_summary;
+    use super::{first_line_of, tools_summary};
     use crate::opengrok::CoworkerTool;
     use crate::state::ToolList;
 
@@ -1645,6 +1658,24 @@ mod tools_tests {
                 "Only this bot's owner can see its tools.".into()
             )),
             "Only this bot's owner can see its tools."
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_cut_at_a_word() {
+        assert_eq!(first_line_of("Short.\nMore below."), "Short.");
+        let long = "word ".repeat(60);
+        let shown = first_line_of(&long);
+        assert!(
+            shown.ends_with('…') && shown.chars().count() <= 161,
+            "{shown}"
+        );
+        assert!(!shown.contains("wor…"), "not mid-word: {shown}");
+        let cjk = "字".repeat(300);
+        assert_eq!(
+            first_line_of(&cjk).chars().count(),
+            161,
+            "no spaces: cut on a char"
         );
     }
 }

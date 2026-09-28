@@ -2434,10 +2434,11 @@ impl CoworkerTool {
     }
 }
 
+/// The envelope `GET /coworkers/{id}/tools` answers in; see [`CoworkerTool`].
 #[derive(Debug, Deserialize)]
-struct ToolListing {
+pub(crate) struct ToolListing {
     #[serde(default)]
-    tools: Vec<CoworkerTool>,
+    pub(crate) tools: Vec<CoworkerTool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

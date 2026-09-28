@@ -2913,6 +2913,9 @@ pub struct AppState {
     pub coworker_tools: Option<(String, ToolList)>,
     /// The bot settings' Tools card is open to its list.
     pub agent_tools_open: bool,
+    /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
+    /// same bot can come back out of order, and the older must not replace the newer.
+    tools_generation: u64,
     /// `egressTunnelAvailable` on `GET /ag-ui/host-settings`: host intent AND the open
     /// coworker's box advertising the tunnel.
     pub host_egress_tunnel_available: bool,
@@ -3424,6 +3427,7 @@ impl AppState {
             coworker_computer: None,
             coworker_tools: None,
             agent_tools_open: false,
+            tools_generation: 0,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
             network_policy_open: false,
@@ -4783,10 +4787,14 @@ impl AppState {
         if !listed {
             self.coworker_tools = Some((coworker_id.clone(), ToolList::Loading));
         }
+        self.tools_generation += 1;
+        let generation = self.tools_generation;
         cx.spawn(async move |this, cx| {
             let result = client.coworker_tools(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+                if state.tools_generation != generation
+                    || state.active_coworker_id.as_deref() != Some(coworker_id.as_str())
+                {
                     return;
                 }
                 let list = match result {
@@ -8150,6 +8158,7 @@ impl AppState {
         self.computer_action_error = None;
         // The last bot's tools must not be listed under this one's name.
         self.coworker_tools = None;
+        self.agent_tools_open = false;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
         }
@@ -24886,6 +24895,13 @@ mod tests {
         assert_eq!(
             super::tools_unavailable(&owner),
             "Only this bot's owner can see its tools."
+        );
+        assert_eq!(
+            super::tools_unavailable(&crate::opengrok::OpenGrokError::status(
+                401,
+                "sign in first"
+            )),
+            "Sign in again to see this bot's tools."
         );
         let down = crate::opengrok::OpenGrokError::status(503, "busy");
         assert_eq!(
