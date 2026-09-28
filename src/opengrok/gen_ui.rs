@@ -736,6 +736,10 @@ impl PersonsText {
 pub fn persons_messages(events: &[Value]) -> Vec<(String, String)> {
     let mut persons = PersonsText::default();
     let mut said: Vec<(String, String)> = Vec::new();
+    // Messages the replay opened and closed. A message of files alone replays as a START and an
+    // END with no words between (opengrok-server#259), and it is still the person's message:
+    // its files are drawn under it.
+    let mut closed: HashSet<String> = HashSet::new();
     for event in events {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         if !kind.starts_with("TEXT_MESSAGE") || !persons.is_persons(event) {
@@ -760,8 +764,11 @@ pub fn persons_messages(events: &[Value]) -> Vec<(String, String)> {
         {
             said[at].1.push_str(delta);
         }
+        if kind == "TEXT_MESSAGE_END" {
+            closed.insert(id.to_string());
+        }
     }
-    said.retain(|(_, words)| !words.trim().is_empty());
+    said.retain(|(id, words)| !words.trim().is_empty() || closed.contains(id));
     said
 }
 
@@ -2264,7 +2271,9 @@ mod tests {
     /// are the question, not the answer: the coworker's reply is only the coworker's words,
     /// whether the role comes on the message's opening frame or on a chunk that carries its own.
     /// A replay names the person's messages by the ids they were sent under, their words joined
-    /// across deltas, in the order said; the coworker's words and an empty message are not them.
+    /// across deltas, in the order said; the coworker's words are not them. A message opened and
+    /// closed with no words is a message of files alone (opengrok-server#259), and it is kept, so
+    /// its files have a bubble to be drawn under (#90).
     #[test]
     fn a_replay_names_the_persons_messages_by_the_ids_they_were_sent_under() {
         let events = [
@@ -2284,8 +2293,12 @@ mod tests {
             vec![
                 ("u1".to_string(), "What is on today?".to_string()),
                 ("u2".to_string(), "And tomorrow?".to_string()),
+                ("u3".to_string(), String::new()),
             ]
         );
+        // Opened and never closed, with no words: a message cut off, not a message.
+        let cut = [json!({"type":"TEXT_MESSAGE_START","messageId":"u4","role":"user"})];
+        assert!(persons_messages(&cut).is_empty());
     }
 
     #[test]

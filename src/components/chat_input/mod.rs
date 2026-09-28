@@ -44,12 +44,123 @@ actions!(
     ]
 );
 
-/// The text, and whether the person asked for it to go now (⌘⇧↵) rather than queue.
-type SubmitCallback = Box<dyn Fn(String, bool, &mut Context<MessageInput>)>;
+/// The text, whether the person asked for it to go now (⌘⇧↵) rather than queue, and the files
+/// already uploaded for it.
+type SubmitCallback =
+    Box<dyn Fn(String, bool, Vec<crate::opengrok::Attachment>, &mut Context<MessageInput>)>;
 
-/// The images that may be attached. The picker itself cannot be told to show only these — GPUI's
-/// path prompt has no type filter — so the list is applied to what comes back.
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+/// How a notice that the send is waiting on uploads begins, so settling the last upload can
+/// replace it.
+const WAITING: &str = "Not sent:";
+
+/// A file on the draft (#90). It is uploaded the moment it is picked, so a file the server
+/// refuses says so on its tile while the draft is still being written, and sending names what
+/// is already there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftFile {
+    /// Unique on this draft: an upload's answer lands on the tile it was started for, even when
+    /// the same file was removed and picked again meanwhile (review of #135).
+    pub key: u64,
+    pub path: PathBuf,
+    /// The file's size on disk when it was picked.
+    pub size: u64,
+    pub name: String,
+    pub mime: String,
+    pub state: FileState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileState {
+    Uploading,
+    Ready(crate::opengrok::Attachment),
+    /// The server's sentence, or why the file could not be read.
+    Failed(String),
+}
+
+impl FileState {
+    /// The word a driver reads for it.
+    pub fn word(&self) -> &'static str {
+        match self {
+            FileState::Uploading => "uploading",
+            FileState::Ready(_) => "ready",
+            FileState::Failed(_) => "failed",
+        }
+    }
+}
+
+/// The type a picked file is sent as, from its extension, or `None` for a kind the server does
+/// not take. The server takes images, videos, PDFs and `text/*` (opengrok-server#259); a JSON or
+/// source file is text to the model, so it goes as `text/plain` rather than being refused.
+pub fn file_mime(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "txt" | "log" | "json" | "yaml" | "yml" | "toml" | "xml" | "rs" | "py" | "js" | "ts"
+        | "swift" | "go" | "sh" | "sql" => "text/plain",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        _ => return None,
+    })
+}
+
+/// What the server does with a file, said on the composer before the message goes, so nobody
+/// learns it from the bot's reply. From opengrok-server `docs/setup/nativechat.md` ("Attachments:
+/// what the server accepts and what the model sees").
+pub fn file_caveat(files: &[DraftFile]) -> Option<String> {
+    const SHOWN: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+    const PICTURE_MAX: u64 = 10 * 1024 * 1024;
+    let pdf = files.iter().any(|file| file.mime == "application/pdf");
+    let video = files.iter().any(|file| file.mime.starts_with("video/"));
+    let named_picture = files.iter().any(|file| {
+        file.mime.starts_with("image/")
+            && (!SHOWN.contains(&file.mime.as_str()) || file.size > PICTURE_MAX)
+    });
+    // The pictures the model is shown, in order, until 8 of them or 20 MiB between them: the
+    // server's per-turn budget (`docs/setup/nativechat.md`). The rest go by name.
+    const TURN_BUDGET: u64 = 20 * 1024 * 1024;
+    let shown: Vec<&DraftFile> = files
+        .iter()
+        .filter(|file| SHOWN.contains(&file.mime.as_str()) && file.size <= PICTURE_MAX)
+        .collect();
+    let pictures = shown.len();
+    let mut spent = 0u64;
+    let over_budget = shown.iter().take(8).any(|file| {
+        spent += file.size;
+        spent > TURN_BUDGET
+    });
+    let mut lines = Vec::new();
+    if pdf {
+        lines.push("The bot sees a PDF's name, not its text yet.");
+    }
+    if video {
+        lines.push("The bot sees a video's name, not the video.");
+    }
+    if named_picture {
+        lines.push(
+            "The bot is shown PNG, JPEG, GIF and WebP pictures up to 10 MB; others go by name.",
+        );
+    }
+    if pictures > 8 {
+        lines.push("The bot is shown 8 pictures a message; the rest go by name.");
+    }
+    if over_budget {
+        lines.push("The bot is shown 20 MB of pictures a message; the rest go by name.");
+    }
+    if files.iter().any(|file| file.mime.starts_with("text/")) {
+        lines.push("A text file is read up to its first 20,000 characters.");
+    }
+    (!lines.is_empty()).then(|| lines.join(" "))
+}
 
 /// Which list the open panel is showing, and therefore what a picked row means.
 ///
@@ -118,7 +229,8 @@ pub struct MessageInput {
     /// decision reads the state itself, so a value filled in a moment ago is never missed.
     active_recipe: Option<ActiveRecipe>,
     /// Images to send with the message, shown as thumbnails above the text.
-    attachments: Vec<PathBuf>,
+    attachments: Vec<DraftFile>,
+    next_file_key: u64,
     /// A line above the field for something the person needs told: a file that was not an image,
     /// a picker that would not open.
     notice: Option<String>,
@@ -171,6 +283,7 @@ impl MessageInput {
             tokens: Vec::new(),
             active_recipe,
             attachments: Vec::new(),
+            next_file_key: 0,
             notice: None,
             dismissed_at: None,
             turn_in_flight,
@@ -181,6 +294,25 @@ impl MessageInput {
         // ask the window what keys are bound, the same as rows built when the panel opened.
         cx.observe_in(&state, window, |this: &mut Self, state, window, cx| {
             let mut changed = false;
+            // A driver's attach: the paths it would have picked in the OS picker.
+            let requested = state.update(cx, |state, _| std::mem::take(&mut state.attach_requests));
+            if !requested.is_empty() {
+                this.add_attachments(requested, cx);
+            }
+            // A driver's ✕, by the file's place on the draft.
+            let detached = state.update(cx, |state, _| std::mem::take(&mut state.detach_requests));
+            if !detached.is_empty() {
+                let mut detached = detached;
+                detached.sort_unstable();
+                detached.dedup();
+                for index in detached.into_iter().rev() {
+                    if index < this.attachments.len() {
+                        this.attachments.remove(index);
+                        this.notice = None;
+                    }
+                }
+                this.publish_files(cx);
+            }
             {
                 let state = state.read(cx);
                 sync_field_clone!(this, state, picked_tools, changed);
@@ -341,7 +473,7 @@ impl MessageInput {
 
     pub fn on_submit(
         mut self,
-        handler: impl Fn(String, bool, &mut Context<Self>) + 'static,
+        handler: impl Fn(String, bool, Vec<crate::opengrok::Attachment>, &mut Context<Self>) + 'static,
     ) -> Self {
         self.on_submit = Some(Box::new(handler));
         self
@@ -369,7 +501,7 @@ impl MessageInput {
     }
 
     /// The images waiting on the draft. Nothing sends them yet — see `trigger_submit`.
-    pub fn attachments(&self) -> &[PathBuf] {
+    pub fn attachments(&self) -> &[DraftFile] {
         &self.attachments
     }
 
@@ -399,7 +531,54 @@ impl MessageInput {
     fn trigger_submit(&mut self, steer: bool, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value();
         let trimmed = text.trim();
-        if !trimmed.is_empty() {
+        // A file still going up, or one the server refused, holds the send: the message would
+        // otherwise leave without it and nothing would say so.
+        let uploading = self
+            .attachments
+            .iter()
+            .filter(|file| file.state == FileState::Uploading)
+            .count();
+        if uploading > 0 {
+            // Said as what it is: nothing is sent later on its own, the person sends again.
+            self.notice = Some(if uploading == 1 {
+                format!("{WAITING} a file is still uploading. Send again when it is ready.")
+            } else {
+                format!(
+                    "{WAITING} {uploading} files are still uploading. Send again when they are ready."
+                )
+            });
+            cx.notify();
+            return;
+        }
+        if self
+            .attachments
+            .iter()
+            .any(|file| matches!(file.state, FileState::Failed(_)))
+        {
+            self.notice = Some("Remove the file that did not upload, then send.".to_string());
+            cx.notify();
+            return;
+        }
+        let files: Vec<crate::opengrok::Attachment> = self
+            .attachments
+            .iter()
+            .filter_map(|file| match &file.state {
+                FileState::Ready(uploaded) => Some(uploaded.clone()),
+                _ => None,
+            })
+            .collect();
+        // Files cannot wait in the queue behind a running turn: the server's queue holds words
+        // only, and files kept in this session alone would be lost to a restart. The draft stays
+        // as it is (review of #135).
+        if !files.is_empty() && self.state.read(cx).would_queue(steer) {
+            self.notice = Some(
+                "Files cannot wait in the queue. Send them when the bot is done, or now with ⌘⇧↵."
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        if !trimmed.is_empty() || !files.is_empty() {
             // A recipe that has not been told what it needs cannot run, and the server would
             // refuse the turn. Say which parameter here, before anything is sent and while the
             // draft is still on screen to fix.
@@ -415,7 +594,7 @@ impl MessageInput {
                 return;
             }
             if let Some(handler) = &self.on_submit {
-                (handler)(trimmed.to_string(), steer, cx);
+                (handler)(trimmed.to_string(), steer, files, cx);
             }
             self.input_state.update(cx, |state, cx| {
                 state.set_value("".to_string(), window, cx);
@@ -435,13 +614,10 @@ impl MessageInput {
             // been cleared away.
             self.state
                 .update(cx, |state, cx| state.clear_active_skill(cx));
-            // The images are not on their way anywhere: nothing carries them yet, so saying so
-            // is better than leaving them over an empty composer as if they had gone with it.
-            if !self.attachments.is_empty() {
-                self.attachments.clear();
-                self.notice =
-                    Some("Images are not sent yet, so that message went without them.".into());
-            }
+            // The files went with the message (#90).
+            self.attachments.clear();
+            self.notice = None;
+            self.publish_files(cx);
             cx.notify();
             // Focus is handled by the input state usually, or we might need to re-focus
         }
@@ -1304,7 +1480,7 @@ impl MessageInput {
             let chosen = answer.await;
             let _ = this.update(cx, |this, cx| {
                 match chosen {
-                    Ok(Ok(Some(paths))) => this.add_attachments(paths),
+                    Ok(Ok(Some(paths))) => this.add_attachments(paths, cx),
                     Ok(Ok(None)) => {}
                     Ok(Err(error)) => {
                         this.notice = Some(format!("The file picker would not open: {error}"));
@@ -1317,89 +1493,303 @@ impl MessageInput {
         .detach();
     }
 
-    /// Keep the images and say so when something else was picked: the prompt cannot be told to
-    /// offer images only, so this is the only place the answer is narrowed.
-    fn add_attachments(&mut self, paths: Vec<PathBuf>) {
-        let before = self.attachments.len();
+    /// Take the files the server can take, upload each at once, and say so when something else
+    /// was picked: the prompt cannot be told which kinds to offer, so this is where the answer is
+    /// narrowed.
+    fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut refused = 0;
         for path in paths {
-            if is_image(&path) {
-                if !self.attachments.contains(&path) {
-                    self.attachments.push(path);
+            // A file already on the draft is not added twice; one that failed is tried again.
+            if let Some(at) = self.attachments.iter().position(|file| file.path == path) {
+                if matches!(self.attachments[at].state, FileState::Failed(_)) {
+                    self.attachments.remove(at);
+                } else {
+                    continue;
                 }
-            } else {
+            }
+            let Some(mime) = file_mime(&path) else {
                 refused += 1;
+                continue;
+            };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            // A file whose size cannot be read is not read either: reading it whole is exactly
+            // what the size check exists to avoid.
+            let size = std::fs::metadata(&path).map(|meta| meta.len());
+            self.next_file_key += 1;
+            let key = self.next_file_key;
+            // Over the server's cap the file is refused here, before it is read into memory: a
+            // screen recording can be gigabytes (review of #135).
+            let state = match &size {
+                Err(error) => FileState::Failed(format!("The file could not be read: {error}")),
+                Ok(size) if *size > crate::opengrok::MAX_ATTACHMENT_BYTES as u64 => {
+                    FileState::Failed("artifacts must be under 25 MiB".to_string())
+                }
+                Ok(_) => FileState::Uploading,
+            };
+            let size = size.unwrap_or(0);
+            let upload = state == FileState::Uploading;
+            self.attachments.push(DraftFile {
+                key,
+                path: path.clone(),
+                size,
+                name,
+                mime: mime.to_string(),
+                state,
+            });
+            if upload {
+                self.upload(key, path, mime, cx);
             }
         }
         self.notice = (refused > 0).then(|| {
-            if self.attachments.len() == before {
-                "Only images can be attached: PNG, JPEG, WebP or GIF.".to_string()
+            if refused == 1 {
+                "That kind of file cannot be attached: images, videos, PDFs and text files can."
+                    .to_string()
             } else {
-                format!("{refused} of those were not images, so they were left out.")
+                format!(
+                    "{refused} of those cannot be attached: images, videos, PDFs and text files can."
+                )
             }
         });
+        self.publish_files(cx);
+        cx.notify();
+    }
+
+    /// Upload one picked file to the open thread. The answer lands on that file's tile, found
+    /// by its path, since other files may have been added or removed meanwhile.
+    fn upload(&mut self, key: u64, path: PathBuf, mime: &'static str, cx: &mut Context<Self>) {
+        let (client, thread) = {
+            let state = self.state.read(cx);
+            (state.opengrok.clone(), state.active_conversation_id.clone())
+        };
+        let (Some(client), Some(thread)) = (client, thread) else {
+            self.settle_file(
+                key,
+                FileState::Failed("Sign in and open a bot first.".into()),
+            );
+            return;
+        };
+        let read = {
+            let path = path.clone();
+            cx.background_executor()
+                .spawn(async move { std::fs::read(&path) })
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = match read.await {
+                Err(error) => FileState::Failed(format!("The file could not be read: {error}")),
+                Ok(bytes) => {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "file".to_string());
+                    match client.upload_attachment(&thread, &name, mime, &bytes).await {
+                        Ok(uploaded) => FileState::Ready(uploaded),
+                        Err(error) => FileState::Failed(error.message),
+                    }
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.settle_file(key, outcome);
+                this.publish_files(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Put an upload's answer on the tile it was started for. When the last upload lands, a
+    /// "not sent" notice is replaced by what to do next: the send is the person's to press again.
+    fn settle_file(&mut self, key: u64, state: FileState) {
+        if let Some(file) = self
+            .attachments
+            .iter_mut()
+            .find(|file| file.key == key && file.state == FileState::Uploading)
+        {
+            file.state = state;
+        }
+        let uploading = self
+            .attachments
+            .iter()
+            .any(|file| file.state == FileState::Uploading);
+        if !uploading
+            && self
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with(WAITING))
+        {
+            self.notice = Some(
+                if self
+                    .attachments
+                    .iter()
+                    .any(|file| matches!(file.state, FileState::Failed(_)))
+                {
+                    "A file did not upload. Remove it, then send."
+                } else {
+                    "The files are ready. Press Send."
+                }
+                .to_string(),
+            );
+        }
+    }
+
+    /// Say on the state what the draft is carrying, for a driver: the draft is this view's.
+    fn publish_files(&self, cx: &mut Context<Self>) {
+        let files = self
+            .attachments
+            .iter()
+            .map(|file| (file.name.clone(), file.state.word()))
+            .collect();
+        self.state
+            .update(cx, |state, cx| state.set_composer_files(files, cx));
     }
 
     fn thumbnails(&self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
+        let caveat = file_caveat(&self.attachments);
+        v_flex()
             .id("composer-attachments")
             .w_full()
-            .flex_wrap()
-            .gap(px(8.))
-            .px(px(2.))
-            .pb(px(2.))
-            .children(self.attachments.iter().enumerate().map(|(index, path)| {
-                let group = SharedString::from(format!("composer-attachment-{index}"));
-                div()
-                    .id(SharedString::from(format!("composer-attachment-{index}")))
-                    .group(group.clone())
-                    .relative()
-                    .size(px(56.))
-                    .flex_shrink_0()
-                    .rounded(px(10.))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.secondary)
-                    .child(
-                        img(path.clone())
-                            .size_full()
-                            .object_fit(ObjectFit::Cover)
-                            .rounded(px(10.)),
-                    )
-                    .child(
+            .gap(px(4.))
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap(px(8.))
+                    .px(px(2.))
+                    .pb(px(2.))
+                    .children(self.attachments.iter().enumerate().map(|(index, file)| {
+                        let group = SharedString::from(format!("composer-attachment-{index}"));
+                        let failed = matches!(file.state, FileState::Failed(_));
+                        // Drawn as a thumbnail only when the image can be decoded here; HEIC and SVG
+                        // are named tiles.
+                        let picture = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+                            .contains(&file.mime.as_str());
                         div()
-                            .id(SharedString::from(format!(
-                                "composer-attachment-remove-{index}"
-                            )))
-                            .absolute()
-                            .top(px(2.))
-                            .right(px(2.))
-                            .size(px(18.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(theme.background.opacity(0.85))
-                            .cursor_pointer()
-                            .opacity(0.)
-                            .group_hover(group, |style| style.opacity(1.))
-                            .child(
-                                Icon::new(NativeIcon::Close)
-                                    .size(px(10.))
-                                    .text_color(theme.secondary_foreground),
+                            .id(SharedString::from(format!("composer-attachment-{index}")))
+                            .group(group.clone())
+                            .relative()
+                            .h(px(56.))
+                            .when(picture, |this| this.w(px(56.)))
+                            .when(!picture, |this| this.max_w(px(180.)).px(px(10.)))
+                            .flex_shrink_0()
+                            .rounded(px(10.))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(if failed { theme.danger } else { theme.border })
+                            .bg(theme.secondary)
+                            .when_some(
+                                match &file.state {
+                                    FileState::Failed(why) => Some(why.clone()),
+                                    _ => None,
+                                },
+                                |this, why| {
+                                    this.tooltip(move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(why.clone())
+                                            .build(window, cx)
+                                    })
+                                },
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                if index < this.attachments.len() {
-                                    this.attachments.remove(index);
-                                    this.notice = None;
-                                    cx.notify();
-                                }
-                            })),
-                    )
-            }))
+                            .when(picture, |this| {
+                                this.child(
+                                    img(file.path.clone())
+                                        .size_full()
+                                        .object_fit(ObjectFit::Cover)
+                                        .rounded(px(10.)),
+                                )
+                            })
+                            .when(!picture, |this| {
+                                this.child(
+                                    v_flex()
+                                        .h_full()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.secondary_foreground)
+                                                .truncate()
+                                                .child(file.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(kind_word(&file.mime)),
+                                        ),
+                                )
+                            })
+                            .when(file.state == FileState::Uploading, |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .bg(theme.background.opacity(0.55))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Uploading…"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "composer-attachment-remove-{index}"
+                                    )))
+                                    .absolute()
+                                    .top(px(2.))
+                                    .right(px(2.))
+                                    .size(px(18.))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(theme.background.opacity(0.85))
+                                    .cursor_pointer()
+                                    .opacity(if failed { 1. } else { 0. })
+                                    .group_hover(group, |style| style.opacity(1.))
+                                    .child(
+                                        Icon::new(NativeIcon::Close)
+                                            .size(px(10.))
+                                            .text_color(theme.secondary_foreground),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if index < this.attachments.len() {
+                                            this.attachments.remove(index);
+                                            this.notice = None;
+                                            this.publish_files(cx);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                    })),
+            )
+            .when_some(caveat, |this, caveat| {
+                this.child(
+                    div()
+                        .id("composer-attachments-caveat")
+                        .px(px(2.))
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(caveat),
+                )
+            })
             .into_any_element()
+    }
+}
+
+/// A file's kind in a word, for its tile.
+fn kind_word(mime: &str) -> &'static str {
+    if mime == "application/pdf" {
+        "PDF"
+    } else if mime.starts_with("video/") {
+        "Video"
+    } else if mime.starts_with("image/") {
+        "Image"
+    } else {
+        "Text"
     }
 }
 
@@ -1610,13 +2000,6 @@ fn mouse_down_at(event: &ClickEvent) -> Option<Point<Pixels>> {
     }
 }
 
-fn is_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .is_some_and(|extension| IMAGE_EXTENSIONS.contains(&extension.as_str()))
-}
-
 impl Render for MessageInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state_model = self.state.clone();
@@ -1686,6 +2069,10 @@ impl Render for MessageInput {
             // Input container - rounded pill shape with shadow
             v_flex()
                 .key_context("MessageInput")
+                // A file dropped on the composer is picked, the way the + picks one.
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                    this.add_attachments(paths.paths().to_vec(), cx);
+                }))
                 .w_full()
                 .gap_2()
                 .when(compact, |this| this.px_3().py(px(6.)))
@@ -2243,8 +2630,8 @@ fn composer_bot_name(state: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerToken, TokenKind, held_skill_chip, is_image, join_names, missing_note,
-        opens_on_pick, parameters_hint, skill_chip, starts_token,
+        ComposerToken, TokenKind, held_skill_chip, join_names, missing_note, opens_on_pick,
+        parameters_hint, skill_chip, starts_token,
     };
     use crate::opengrok::RecipeSummary;
     use crate::state::ActiveRecipe;
@@ -2424,13 +2811,69 @@ mod tests {
         assert_eq!(skill_chip(&tokens, "skl_2"), None);
     }
 
+    /// A picked file goes as the type the server reads, and a kind it does not take is refused
+    /// here, before an upload that could only fail.
     #[test]
-    fn only_image_files_are_attached() {
-        for name in ["shot.PNG", "a.jpg", "b.jpeg", "c.webp", "d.gif"] {
-            assert!(is_image(&PathBuf::from(name)), "{name} is an image");
+    fn a_picked_file_goes_as_a_type_the_server_takes() {
+        use super::file_mime;
+        for (name, mime) in [
+            ("shot.PNG", Some("image/png")),
+            ("photo.jpeg", Some("image/jpeg")),
+            ("q3.pdf", Some("application/pdf")),
+            ("notes.md", Some("text/markdown")),
+            ("data.json", Some("text/plain")),
+            ("clip.mov", Some("video/quicktime")),
+            ("archive.zip", None),
+            ("noextension", None),
+        ] {
+            assert_eq!(file_mime(&PathBuf::from(name)), mime, "{name}");
         }
-        for name in ["notes.pdf", "clip.mov", "noextension"] {
-            assert!(!is_image(&PathBuf::from(name)), "{name} is not an image");
-        }
+    }
+
+    /// What the server will not show the bot is said on the composer before sending.
+    #[test]
+    fn what_the_bot_will_not_see_is_said_first() {
+        use super::{DraftFile, FileState, file_caveat};
+        let file = |name: &str, mime: &str| DraftFile {
+            key: 0,
+            size: 1,
+            path: PathBuf::from(name),
+            name: name.into(),
+            mime: mime.into(),
+            state: FileState::Uploading,
+        };
+        assert_eq!(file_caveat(&[file("a.png", "image/png")]), None);
+        let said = file_caveat(&[file("q3.pdf", "application/pdf")]).unwrap();
+        assert!(said.contains("PDF's name"), "{said}");
+        let many: Vec<DraftFile> = (0..9)
+            .map(|i| file(&format!("{i}.png"), "image/png"))
+            .collect();
+        assert!(file_caveat(&many).unwrap().contains("8 pictures"));
+        // A picture the model is not shown is said to be named (review of #135).
+        let heic = file_caveat(&[file("photo.heic", "image/heic")]).unwrap();
+        assert!(heic.contains("go by name"), "{heic}");
+        let big = DraftFile {
+            size: 11 * 1024 * 1024,
+            ..file("big.png", "image/png")
+        };
+        assert!(file_caveat(&[big]).unwrap().contains("up to 10 MB"));
+        assert!(
+            file_caveat(&[file("n.txt", "text/plain")])
+                .unwrap()
+                .contains("20,000")
+        );
+        // Three 8 MB pictures pass the 20 MB a message; the third goes by name (Cursor on #135).
+        let eight_mb = |name: &str| DraftFile {
+            size: 8 * 1024 * 1024,
+            ..file(name, "image/png")
+        };
+        let two = file_caveat(&[eight_mb("a.png"), eight_mb("b.png")]);
+        assert!(
+            two.as_deref().is_none_or(|said| !said.contains("20 MB")),
+            "{two:?}"
+        );
+        let three =
+            file_caveat(&[eight_mb("a.png"), eight_mb("b.png"), eight_mb("c.png")]).unwrap();
+        assert!(three.contains("20 MB of pictures"), "{three}");
     }
 }

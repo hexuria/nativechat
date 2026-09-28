@@ -56,6 +56,9 @@ struct ChatFeedRev {
     user_form_verbs: bool,
     user_form_handoffs: Vec<(String, String, bool)>,
     save_logins: Vec<(String, String)>,
+    /// How many files the thread's messages carry: the list of them arrives after the replay,
+    /// and a feed that did not count them would never draw them.
+    files: usize,
     box_screen: bool,
     is_ai_responding: bool,
     debug_mode: bool,
@@ -193,6 +196,15 @@ impl ChatFeedRev {
                 rows.sort();
                 rows
             },
+            files: conv
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .filter_map(|m| state.message_files.get(&m.id))
+                        .map(Vec::len)
+                        .sum()
+                })
+                .unwrap_or(0),
             save_logins: {
                 let mut cards: Vec<(String, String)> = conv
                     .map(|c| {
@@ -335,6 +347,8 @@ struct ChatRow {
     /// A step, a stretch of steps or a thought. Its `content` stays empty: none of it is words,
     /// so find, copy and read aloud pass it by.
     run: Option<RunRow>,
+    /// The files one of the person's messages carried (#90), drawn as tiles under it.
+    files: Vec<crate::opengrok::Attachment>,
 }
 
 impl ChatRow {
@@ -370,6 +384,7 @@ impl ChatRow {
             status_line: None,
             status_failed: false,
             status_retry: false,
+            files: Vec::new(),
             screenshots: Vec::new(),
             user_form: None,
             save_login: None,
@@ -600,6 +615,15 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             }
         }
         flush_text(&mut rows, &mut text_buf, &mut text_n);
+        if msg.is_me
+            && let Some(files) = state.message_files.get(&msg.id)
+            && !files.is_empty()
+        {
+            rows.push(ChatRow {
+                files: files.clone(),
+                ..ChatRow::slot(format!("{}-files", msg.id), msg.id.clone())
+            });
+        }
     }
     Arc::new(rows)
 }
@@ -1160,6 +1184,16 @@ impl Render for ChatTranscript {
                                     .child(render_run_row(run, app_state.clone(), cx))
                                     .into_any_element();
                             }
+                            if !row.files.is_empty() {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_end()
+                                    .py(px(2.))
+                                    .child(render_sent_files(&row.files, &palette))
+                                    .into_any_element();
+                            }
                             if let Some(spec) = &row.widget {
                                 return div()
                                     .id(ElementId::Name(row.id.clone().into()))
@@ -1608,11 +1642,11 @@ impl ChatView {
         let input = cx.new(|cx| {
             MessageInput::new(window, state.clone(), cx).on_submit({
                 let state = state.clone();
-                move |text, steer, cx| {
+                move |text, steer, files, cx| {
                     state.update(cx, |state, cx| {
                         // The draft's own door: these are the words in the composer, so what
                         // the composer is holding goes with them and comes off it here.
-                        state.send_draft(text, steer, cx);
+                        state.send_draft(text, steer, files, cx);
                     });
                 }
             })
@@ -1945,6 +1979,61 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
         msg_id.to_string()
     } else {
         format!("{msg_id}-t{n}")
+    }
+}
+
+/// A sent message's files, each a tile with its name and what kind of file it is (#90). The
+/// file itself stays on the server; the tile is drawn from the listing, not the bytes.
+fn render_sent_files(files: &[crate::opengrok::Attachment], palette: &ChatPalette) -> AnyElement {
+    h_flex()
+        .max_w(px(CHAT_CONTENT_MAX * 0.72))
+        .flex_wrap()
+        .justify_end()
+        .gap(px(6.))
+        .children(files.iter().map(|file| {
+            let kind = if file.mime == "application/pdf" {
+                "PDF"
+            } else if file.mime.starts_with("image/") {
+                "Image"
+            } else if file.mime.starts_with("video/") {
+                "Video"
+            } else {
+                "Text"
+            };
+            v_flex()
+                .id(ElementId::Name(format!("message-file-{}", file.id).into()))
+                .max_w(px(220.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(10.))
+                .bg(palette.secondary)
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(palette.secondary_foreground)
+                        .truncate()
+                        .child(file.filename.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.secondary_foreground.opacity(0.7))
+                        .child(format!("{kind} · {}", human_size(file.size_bytes))),
+                )
+        }))
+        .into_any_element()
+}
+
+/// A file's size the way a person reads it.
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.;
+    let b = bytes as f64;
+    if b < KIB {
+        format!("{bytes} B")
+    } else if b < KIB * KIB {
+        format!("{:.0} KB", b / KIB)
+    } else {
+        format!("{:.1} MB", b / KIB / KIB)
     }
 }
 

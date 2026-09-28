@@ -687,6 +687,20 @@ fn tools_unavailable(error: &OpenGrokError) -> String {
     }
 }
 
+/// A thread's sent files, grouped under the message each rode on, in the server's order.
+pub fn files_by_message(
+    files: Vec<crate::opengrok::SentAttachment>,
+) -> HashMap<String, Vec<crate::opengrok::Attachment>> {
+    let mut by_message: HashMap<String, Vec<crate::opengrok::Attachment>> = HashMap::new();
+    for sent in files {
+        by_message
+            .entry(sent.message_id)
+            .or_default()
+            .push(sent.file);
+    }
+    by_message
+}
+
 /// The line over a routine's own instruction in its thread, where one is.
 ///
 /// A routine's run opens with the instruction it was given, journaled as a `user` message under
@@ -2714,6 +2728,14 @@ pub struct AppState {
     /// The chips in the draft, in order, as (kind, label). Published by the composer for the same
     /// reason as [`Self::composer_panel`]: the field is the view's, and a driver sees the state.
     pub composer_chips: Vec<(crate::components::chat_input::TokenKind, String)>,
+    /// The files on the draft, as (name, `uploading` / `ready` / `failed`), published by the
+    /// composer for a driver like its chips.
+    pub composer_files: Vec<(String, &'static str)>,
+    /// Files a driver asked the composer to attach, by path: the OS picker is not something a
+    /// driver can work, so it hands the composer the paths it would have picked.
+    pub attach_requests: Vec<std::path::PathBuf>,
+    /// Files a driver asked the composer to take off the draft, by their place on it.
+    pub detach_requests: Vec<usize>,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -2752,6 +2774,12 @@ pub struct AppState {
     pending_read_aloud: Option<(String, String)>,
     pub native_tts: SourceTtsState,
     pub opengrok: Option<OpenGrokClient>,
+    /// The files each of the person's messages carried, by message id (#90). Filled when a
+    /// message is sent with files, and from the server's list of a thread's files when the
+    /// thread is replayed: the replayed frames carry a message's words, not its files.
+    pub message_files: HashMap<String, Vec<crate::opengrok::Attachment>>,
+    /// The files the composer handed over with the draft, taken by the send that follows.
+    draft_files: Vec<crate::opengrok::Attachment>,
     pub account: Option<Account>,
     pub auth_status: AuthStatus,
     /// What the server refused, and why. Verdicts only: a sign-in that was turned down, a patch
@@ -3335,6 +3363,9 @@ impl AppState {
             picked_tools: Vec::new(),
             active_recipe: None,
             active_skill: None,
+            composer_files: Vec::new(),
+            attach_requests: Vec::new(),
+            detach_requests: Vec::new(),
             composer_chips: Vec::new(),
             composer_panel: None,
             is_app_settings_open: false,
@@ -3364,6 +3395,8 @@ impl AppState {
             pending_read_aloud: None,
             native_tts: SourceTtsState::default(),
             opengrok: None,
+            message_files: HashMap::new(),
+            draft_files: Vec::new(),
             account: None,
             auth_status: AuthStatus::SignedOut,
             auth_error: None,
@@ -4240,6 +4273,16 @@ impl AppState {
     /// The thread as the composer finds it. Parked wins over running: a card
     /// painted mid-stream is already waiting on the person even though the
     /// stream that painted it is still open.
+    /// Whether a send now would wait in the queue behind a running turn. Files cannot wait there
+    /// (#90): a queued message's files live only in this session, and the server's queue takes
+    /// words only, so the composer asks before sending files.
+    pub fn would_queue(&self, force_steer: bool) -> bool {
+        let Some(conversation_id) = self.active_conversation_id.as_deref() else {
+            return false;
+        };
+        plan_send(self.busy_state(conversation_id), self.on_send, force_steer) == SendPlan::Queue
+    }
+
     fn busy_state(&self, conversation_id: &str) -> Busy {
         if self.has_sending_form(conversation_id) {
             // A submit is on the wire and the run resumes the moment it lands: the thread
@@ -7494,6 +7537,29 @@ impl AppState {
         true
     }
 
+    pub fn set_composer_files(
+        &mut self,
+        files: Vec<(String, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_files != files {
+            self.composer_files = files;
+            cx.notify();
+        }
+    }
+
+    /// Ask the composer to take a file off the draft, as its ✕ would.
+    pub fn request_detach(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.detach_requests.push(index);
+        cx.notify();
+    }
+
+    /// Ask the composer to attach a file, as picking it would.
+    pub fn request_attach(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.attach_requests.push(path);
+        cx.notify();
+    }
+
     /// Say which chips the draft holds, for a driver: the field is the composer's own.
     pub fn set_composer_chips(
         &mut self,
@@ -8824,7 +8890,13 @@ impl AppState {
         let conversation_id = conversation_id.to_string();
         cx.spawn(async move |this, cx| {
             let thread = client.replay_thread(&conversation_id, RECONCILE_RUNS).await;
+            let files = client.sent_attachments(&conversation_id).await;
             let _ = this.update(cx, |state, cx| {
+                // What the server says each message carried is the answer, message by message;
+                // a thread it cannot list keeps what this session already knows.
+                if let Ok(files) = files {
+                    state.message_files.extend(files_by_message(files));
+                }
                 match thread {
                     Ok(thread) => {
                         state.reconciled_threads.insert(conversation_id.clone());
@@ -9453,6 +9525,30 @@ impl AppState {
             .find(|c| c.id == conversation_id)
             .map(|c| agui_messages(&c.messages))
             .unwrap_or_default();
+        // Each of the person's messages names the files it carried, every turn: the server
+        // names an earlier message's files to the model rather than sending them again.
+        // A message the person deleted or took back to edit is not theirs to send any more, and
+        // neither are its files (review of #135).
+        let hidden: HashSet<&str> = self
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| {
+                c.messages
+                    .iter()
+                    .filter(|m| m.hidden)
+                    .map(|m| m.id.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for message in &mut history {
+            if hidden.contains(message.id.as_str()) {
+                continue;
+            }
+            if let Some(files) = self.message_files.get(&message.id) {
+                message.attachments = files.clone();
+            }
+        }
         let Some(held) = drained else {
             return history;
         };
@@ -13032,7 +13128,16 @@ impl AppState {
     /// off the draft. It is taken before the guards below rather than after, which is what the
     /// composer does with the chip: a send the app refuses empties the field and the chip with
     /// it, so a skill left attached would be one nothing on screen still mentions.
-    pub fn send_draft(&mut self, content: String, force_steer: bool, cx: &mut Context<Self>) {
+    pub fn send_draft(
+        &mut self,
+        content: String,
+        force_steer: bool,
+        files: Vec<crate::opengrok::Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        // Already uploaded (the composer uploads a file the moment it is picked); what goes with
+        // the message is the ids.
+        self.draft_files = files;
         let skill = self.take_draft_skill();
         self.send_message_with(content, force_steer, skill, cx);
     }
@@ -13047,6 +13152,8 @@ impl AppState {
         skill: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // Taken first, so a send refused below does not leave them to ride on the next one.
+        let files = std::mem::take(&mut self.draft_files);
         if !self.is_signed_in() {
             self.auth_error = Some("Sign in first".to_string());
             cx.notify();
@@ -13084,6 +13191,9 @@ impl AppState {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
 
         let local_id = uuid::Uuid::now_v7().to_string();
+        if !files.is_empty() {
+            self.message_files.insert(local_id.clone(), files);
+        }
         // The bubble and its row are stamped with one moment, so the thread reads back in the
         // order it was said in.
         let said_at = SystemTime::now();
@@ -13679,6 +13789,11 @@ impl AppState {
         }
         if !skill_kept {
             lost.push("The skill on that message is no longer in your list, so it was not kept.");
+        }
+        // The server's queue holds words, not files, and a refill puts back words: a queued
+        // message's files do not come back with it, and saying so beats a silent loss.
+        if self.message_files.remove(message_id).is_some() {
+            lost.push("The files on that message were not kept.");
         }
         let notice = (!lost.is_empty()).then(|| lost.join(" "));
         Ok(EditRefill {
@@ -20798,6 +20913,39 @@ mod tests {
         );
     }
 
+    /// Files cannot wait in the queue, so a send with files asks first; and a held message whose
+    /// files would not come back with Edit says so and forgets them (review of #135).
+    #[test]
+    fn files_never_wait_in_the_queue_and_edit_says_they_went() {
+        let mut state = holding("m_held", "see these");
+        assert!(
+            state.would_queue(false),
+            "a running turn: a send would wait"
+        );
+        assert!(!state.would_queue(true), "⌘⇧↵ sends now, so files may go");
+        state.message_files.insert(
+            "m_held".into(),
+            vec![crate::opengrok::Attachment {
+                id: "art_1".into(),
+                mime: "image/png".into(),
+                filename: "a.png".into(),
+                size_bytes: 1,
+            }],
+        );
+        let refill = state
+            .take_hold_for_edit("m_held", "")
+            .expect("the hold comes back");
+        assert!(
+            refill
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("files on that message were not kept")),
+            "{:?}",
+            refill.notice
+        );
+        assert!(!state.message_files.contains_key("m_held"));
+    }
+
     /// The draft after Edit is the held message as it was sent: its reply or none, its skill
     /// or none, and no recipe the composer had picked up since.
     #[test]
@@ -24927,5 +25075,60 @@ mod tests {
             super::tools_unavailable(&down),
             "Could not load this bot's tools: busy"
         );
+    }
+
+    fn sent(id: &str, message: &str) -> crate::opengrok::SentAttachment {
+        crate::opengrok::SentAttachment {
+            file: crate::opengrok::Attachment {
+                id: id.into(),
+                mime: "image/png".into(),
+                filename: format!("{id}.png"),
+                size_bytes: 1,
+            },
+            message_id: message.into(),
+        }
+    }
+
+    /// A replay's file list is grouped under the messages the files rode on, in order.
+    #[test]
+    fn a_threads_files_are_grouped_by_their_message() {
+        let grouped =
+            super::files_by_message(vec![sent("a", "m1"), sent("b", "m2"), sent("c", "m1")]);
+        let ids =
+            |m: &str| -> Vec<String> { grouped[m].iter().map(|file| file.id.clone()).collect() };
+        assert_eq!(ids("m1"), ["a", "c"]);
+        assert_eq!(ids("m2"), ["b"]);
+    }
+
+    /// Every turn names the files each of the person's messages carried, and a message they
+    /// deleted or took back sends none (review of #135).
+    #[test]
+    fn a_turn_names_each_messages_files_but_not_a_hidden_ones() {
+        let mut state = AppState::new();
+        let mut gone = message("m2", true, "wrong one");
+        gone.hidden = true;
+        state.conversations = vec![thread(
+            "cw_1",
+            vec![
+                message("m1", true, "see this"),
+                gone,
+                message("m3", true, "and this"),
+            ],
+        )];
+        for id in ["m1", "m2"] {
+            state
+                .message_files
+                .insert(id.into(), vec![sent(&format!("art_{id}"), id).file]);
+        }
+        let history = state.turn_history("cw_1", None);
+        let files = |id: &str| {
+            history
+                .iter()
+                .find(|m| m.id == id)
+                .map_or(0, |m| m.attachments.len())
+        };
+        assert_eq!(files("m1"), 1);
+        assert_eq!(files("m2"), 0, "a hidden message sends no files");
+        assert_eq!(files("m3"), 0);
     }
 }

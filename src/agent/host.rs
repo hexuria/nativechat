@@ -492,6 +492,10 @@ pub enum Command {
         message_id: String,
     },
     ToggleAgentTools,
+    /// Attach a file to the draft by path, as the + would (#90).
+    AttachFile(std::path::PathBuf),
+    /// Take a file off the draft by its place, as its ✕ would.
+    DetachFile(usize),
     UserFormDismiss {
         card_key: String,
     },
@@ -703,6 +707,8 @@ impl Command {
             }
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
+            Self::AttachFile(path) => state.request_attach(path, cx),
+            Self::DetachFile(index) => state.request_detach(index, cx),
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -2017,6 +2023,10 @@ pub struct NativeChatHost {
     composer_panel: Option<PanelMode>,
     /// The draft's chips, in order: (kind, label).
     composer_chips: Vec<(crate::components::chat_input::TokenKind, String)>,
+    /// The draft's files: (name, `uploading` / `ready` / `failed`).
+    composer_files: Vec<(String, &'static str)>,
+    /// The files the open thread's messages carried, in order: (art id, filename, message id).
+    sent_files: Vec<(String, String, String)>,
     panel_rows: Vec<PanelRow>,
     /// The recipe the next message runs, as the composer's bar shows it.
     recipe_bar: Option<RecipeBarSnap>,
@@ -2333,6 +2343,22 @@ impl NativeChatHost {
                 .collect(),
             composer_panel: state.composer_panel,
             composer_chips: state.composer_chips.clone(),
+            composer_files: state.composer_files.clone(),
+            sent_files: state
+                .active_thread_messages()
+                .iter()
+                .filter_map(|message| {
+                    state
+                        .message_files
+                        .get(&message.id)
+                        .map(|files| (message.id.clone(), files))
+                })
+                .flat_map(|(message, files)| {
+                    files
+                        .iter()
+                        .map(move |file| (file.id.clone(), file.filename.clone(), message.clone()))
+                })
+                .collect(),
             panel_rows: state
                 .composer_panel
                 .map(|mode| {
@@ -2681,6 +2707,12 @@ impl NativeChatHost {
             ));
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
+        }
+        for (id, filename, message) in &self.sent_files {
+            page = page.with_child(
+                UiNode::status(format!("message-file-{id}"), filename.clone())
+                    .with_value(message.clone()),
+            );
         }
         for node in self.reply_run_nodes() {
             page = page.with_child(node);
@@ -3354,6 +3386,11 @@ impl NativeChatHost {
             };
             node = node.with_child(
                 UiNode::status(format!("composer-chip-{i}"), label.clone()).with_value(kind),
+            );
+        }
+        for (i, (name, state)) in self.composer_files.iter().enumerate() {
+            node = node.with_child(
+                UiNode::status(format!("composer-file-{i}"), name.clone()).with_value(*state),
             );
         }
         node
@@ -4543,6 +4580,36 @@ impl NativeChatHost {
                 Command::SetAvatarColor(id)
             }
             "theme.toggle" => Command::ToggleTheme,
+            "composer.attach" => {
+                let path = std::path::PathBuf::from(
+                    invoke_arg_str(args, &["path"]).ok_or("composer.attach requires arg path")?,
+                );
+                // Said here rather than only on the composer's notice, which is not on the tree:
+                // a driver learns at once that the path is not one the app can attach.
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "composer.attach needs an absolute path: {} would resolve against the app's \
+                         directory, not yours",
+                        path.display()
+                    ));
+                }
+                if crate::components::chat_input::file_mime(&path).is_none() {
+                    return Err(format!(
+                        "{} cannot be attached: images, videos, PDFs and text files can",
+                        path.display()
+                    ));
+                }
+                Command::AttachFile(path)
+            }
+            "composer.detach" => {
+                let index = invoke_arg_str(args, &["index"])
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .ok_or("composer.detach requires arg index (the N of composer-file-N)")?;
+                if index >= self.composer_files.len() {
+                    return Err(format!("no composer-file-{index} on the draft"));
+                }
+                Command::DetachFile(index)
+            }
             "computer.toggle" => Command::ToggleComputerPane,
             "computer.open" => Command::OpenCoworkerScreen,
             "computer.update" => Command::OpenComputerConfirm(crate::state::ComputerAction::Update),
@@ -8509,5 +8576,59 @@ mod tests {
             Some("skill")
         );
         assert!(tree.find("composer-chip-2").is_none());
+    }
+
+    /// The draft's files and a thread's sent files are on the tree, and a driver can attach one.
+    #[test]
+    fn files_are_on_the_tree_and_a_driver_can_attach_one() {
+        let mut host = host();
+        host.composer_files = vec![("q3.pdf".into(), "uploading"), ("a.png".into(), "ready")];
+        host.sent_files = vec![("art_1".into(), "notes.txt".into(), "msg_1".into())];
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("composer-file-0").unwrap().value.as_deref(),
+            Some("uploading")
+        );
+        assert_eq!(tree.find("composer-file-1").unwrap().name, "a.png");
+        let sent = tree.find("message-file-art_1").unwrap();
+        assert_eq!(
+            (sent.name.as_str(), sent.value.as_deref()),
+            ("notes.txt", Some("msg_1"))
+        );
+        host.invoke(
+            "composer.attach",
+            &serde_json::json!({"path": "/tmp/q3.pdf"}),
+        )
+        .unwrap();
+        match host.take_command() {
+            Some(Command::AttachFile(path)) => {
+                assert_eq!(path, std::path::PathBuf::from("/tmp/q3.pdf"))
+            }
+            other => panic!("expected an attach, got {other:?}"),
+        }
+        assert!(
+            host.invoke("composer.attach", &serde_json::json!({}))
+                .is_err()
+        );
+        assert!(
+            host.invoke("composer.attach", &serde_json::json!({"path": "q3.pdf"}))
+                .is_err(),
+            "a relative path would resolve against the app's directory"
+        );
+        assert!(
+            host.invoke(
+                "composer.attach",
+                &serde_json::json!({"path": "/tmp/a.zip"})
+            )
+            .is_err(),
+            "a kind the server does not take is refused at once"
+        );
+        host.invoke("composer.detach", &serde_json::json!({"index": "1"}))
+            .unwrap();
+        assert!(matches!(host.take_command(), Some(Command::DetachFile(1))));
+        assert!(
+            host.invoke("composer.detach", &serde_json::json!({"index": "5"}))
+                .is_err()
+        );
     }
 }
