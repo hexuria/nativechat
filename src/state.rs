@@ -50,6 +50,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+/// The open bot's tools, as far as the settings pane knows them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolList {
+    Loading,
+    Listed(Vec<crate::opengrok::CoworkerTool>),
+    /// The server would not list them, in its words or the app's.
+    Unavailable(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct Message {
     pub id: String,
@@ -662,6 +671,17 @@ fn carries_choice_card(message: &Message) -> bool {
         .parts
         .iter()
         .any(|part| matches!(part, ChatPart::Ui(crate::opengrok::UiSpec::Form(_))))
+}
+
+/// Why the open bot's tools are not listed, in words for its settings. A 404 is the server
+/// saying this person does not own the bot (a bot shared with the org answers it that way), and
+/// a server older than the route says the same; neither is a fault to report.
+fn tools_unavailable(error: &OpenGrokError) -> String {
+    match error.status {
+        Some(404) => "Only this bot's owner can see its tools.".to_string(),
+        Some(401) => "Sign in again to see this bot's tools.".to_string(),
+        _ => format!("Could not load this bot's tools: {}", error.message),
+    }
 }
 
 /// The line over a routine's own instruction in its thread, where one is.
@@ -2887,6 +2907,15 @@ pub struct AppState {
     /// The active coworker's computer, as last polled. Cleared on a switch so a
     /// bot never shows the previous one's screen.
     pub coworker_computer: Option<CoworkerComputer>,
+    /// What the open bot is offered on its next turn, as its settings list it: the bot's id
+    /// and the answer, so a late answer for a bot the person has left is never shown as this
+    /// one's.
+    pub coworker_tools: Option<(String, ToolList)>,
+    /// The bot settings' Tools card is open to its list.
+    pub agent_tools_open: bool,
+    /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
+    /// same bot can come back out of order, and the older must not replace the newer.
+    tools_generation: u64,
     /// `egressTunnelAvailable` on `GET /ag-ui/host-settings`: host intent AND the open
     /// coworker's box advertising the tunnel.
     pub host_egress_tunnel_available: bool,
@@ -3396,6 +3425,9 @@ impl AppState {
             local_rules: None,
             local_rules_epoch: 0,
             coworker_computer: None,
+            coworker_tools: None,
+            agent_tools_open: false,
+            tools_generation: 0,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
             network_policy_open: false,
@@ -4732,7 +4764,53 @@ impl AppState {
             // A dedicated box's network choice lives on this sidebar and reads the computer
             // record; opening the sidebar is the moment to make sure it is this bot's and fresh.
             self.refresh_coworker_computer_quietly(cx);
+            self.refresh_coworker_tools(cx);
         }
+    }
+
+    /// Ask the server what the open bot is offered on a turn. Asked each time its settings
+    /// open, and on a switch while they are open: the set follows the bot's grant, computer and
+    /// plugins, any of which can change between looks.
+    pub fn refresh_coworker_tools(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            self.coworker_tools = None;
+            return;
+        };
+        // What was listed for this bot stays on screen while it is asked again, so the list
+        // does not blink out every time the pane opens.
+        let listed = matches!(
+            &self.coworker_tools,
+            Some((id, ToolList::Listed(_))) if *id == coworker_id
+        );
+        if !listed {
+            self.coworker_tools = Some((coworker_id.clone(), ToolList::Loading));
+        }
+        self.tools_generation += 1;
+        let generation = self.tools_generation;
+        cx.spawn(async move |this, cx| {
+            let result = client.coworker_tools(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.tools_generation != generation
+                    || state.active_coworker_id.as_deref() != Some(coworker_id.as_str())
+                {
+                    return;
+                }
+                let list = match result {
+                    Ok(tools) => ToolList::Listed(tools),
+                    Err(error) => ToolList::Unavailable(tools_unavailable(&error)),
+                };
+                state.coworker_tools = Some((coworker_id, list));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn toggle_agent_tools(&mut self, cx: &mut Context<Self>) {
+        self.agent_tools_open = !self.agent_tools_open;
+        cx.notify();
     }
 
     pub fn close_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -8078,6 +8156,12 @@ impl AppState {
         self.last_box_shot = None;
         self.computer_confirm = None;
         self.computer_action_error = None;
+        // The last bot's tools must not be listed under this one's name.
+        self.coworker_tools = None;
+        self.agent_tools_open = false;
+        if self.right_pane == RightPane::Settings {
+            self.refresh_coworker_tools(cx);
+        }
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(
                 0,
@@ -24801,5 +24885,28 @@ mod tests {
         with(&mut state, vec![carrying(message("m_1", false, ""), &one)]);
         state.dismissed_choices.insert("m_1".into());
         assert_eq!(state.keyed_choice(), None, "a dismissed card takes no key");
+    }
+
+    /// A bot the person does not own answers 404, and that is said as what it is, not as a
+    /// failure; anything else keeps the server's own words.
+    #[test]
+    fn a_tool_list_the_server_will_not_give_says_why() {
+        let owner = crate::opengrok::OpenGrokError::status(404, "no such coworker");
+        assert_eq!(
+            super::tools_unavailable(&owner),
+            "Only this bot's owner can see its tools."
+        );
+        assert_eq!(
+            super::tools_unavailable(&crate::opengrok::OpenGrokError::status(
+                401,
+                "sign in first"
+            )),
+            "Sign in again to see this bot's tools."
+        );
+        let down = crate::opengrok::OpenGrokError::status(503, "busy");
+        assert_eq!(
+            super::tools_unavailable(&down),
+            "Could not load this bot's tools: busy"
+        );
     }
 }

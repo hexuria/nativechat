@@ -1,6 +1,7 @@
 use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
+use crate::components::agent_settings::tools_summary;
 use crate::components::app_settings::{
     NO_LOCAL_RULES, not_in_effect_line, remove_label, rule_list_title,
 };
@@ -27,7 +28,7 @@ use crate::opengrok::{
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
     ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, LocalRuleRow, LocalRules, RuleKind,
-    SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, WRITING_A_LESSON,
+    SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, ToolList, WRITING_A_LESSON,
 };
 
 pub mod ids {
@@ -490,6 +491,7 @@ pub enum Command {
     ChoiceDismiss {
         message_id: String,
     },
+    ToggleAgentTools,
     UserFormDismiss {
         card_key: String,
     },
@@ -700,6 +702,7 @@ impl Command {
                 }
             }
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
+            Self::ToggleAgentTools => state.toggle_agent_tools(cx),
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -1434,6 +1437,34 @@ fn choice_node(choice: &ChoiceSnap) -> UiNode {
     ))
 }
 
+/// `agent-tools` (value = the card's second line: counts, "Asking the server…", or why there
+/// is no list), with `agent-tools-toggle` while there are tools to show, and one
+/// `agent-tool-{name}` per tool (value `builtin` / `plugin`, the server's `kind`) visible while
+/// the card is open. Read-only: nothing here chooses a bot's tools.
+fn agent_tools_node(tools: &ToolList, open: bool) -> UiNode {
+    let mut card = UiNode::new("agent-tools", "list", "Tools").with_value(tools_summary(tools));
+    if let ToolList::Listed(all) = tools
+        && !all.is_empty()
+    {
+        card = card.with_child(UiNode::button(
+            "agent-tools-toggle",
+            if open { "Hide" } else { "Show" },
+        ));
+        for tool in all {
+            card = card.with_child(
+                UiNode::listitem(format!("agent-tool-{}", tool.name), tool.name.clone())
+                    .with_value(if tool.is_builtin() {
+                        "builtin"
+                    } else {
+                        "plugin"
+                    })
+                    .with_visible(open),
+            );
+        }
+    }
+    card
+}
+
 fn user_form_node(form: &UserFormSnap) -> UiNode {
     let key = &form.card_key;
     let mut card = UiNode::dialog(user_form_card_id(key), form.title.clone());
@@ -1934,6 +1965,9 @@ pub struct NativeChatHost {
     /// Messages the open thread is holding until it is idle.
     queued_sends: usize,
     agent_settings_open: bool,
+    /// The open bot's tools as its settings list them, and whether the card is open to them.
+    agent_tools: Option<crate::state::ToolList>,
+    agent_tools_open: bool,
     model_picker_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
@@ -2118,6 +2152,12 @@ impl NativeChatHost {
             turn_in_flight: state.is_turn_in_flight(),
             queued_sends: state.queued_send_count(),
             agent_settings_open: state.is_agent_settings_open(),
+            agent_tools: state
+                .coworker_tools
+                .as_ref()
+                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+                .map(|(_, list)| list.clone()),
+            agent_tools_open: state.agent_tools_open,
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
             approvals: state
@@ -2847,6 +2887,9 @@ impl NativeChatHost {
                     .with_value(self.model_count.to_string())
                     .with_visible(self.model_picker_open),
             );
+        if let Some(tools) = &self.agent_tools {
+            settings = settings.with_child(agent_tools_node(tools, self.agent_tools_open));
+        }
         if let Some(note) = &self.model_note {
             // The server's word about why the list is not fuller, under the field, exactly where
             // the person read it. In the tree only while there is one, so its absence is the
@@ -3954,6 +3997,13 @@ impl NativeChatHost {
                 return Err("the open thread is the bot's own chat already".to_string());
             }
             Command::BackToBotChat
+        } else if target == "agent-tools-toggle" {
+            if !matches!(&self.agent_tools, Some(ToolList::Listed(all)) if !all.is_empty()) {
+                return Err(
+                    "`agent-tools-toggle` is only there while the bot has tools listed".into(),
+                );
+            }
+            Command::ToggleAgentTools
         } else if target == "agent-model-field" || target == "agent-model-dismiss" {
             Command::ToggleModelPicker
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
@@ -8373,5 +8423,49 @@ mod tests {
         let plan = keys(&mut host, Op::key("choice-m-1", "b"));
         assert!(plan.release_caret && !plan.focus_composer);
         assert_eq!(plan.keys, vec!["b"]);
+    }
+
+    /// The bot's tools are on the tree as its settings show them: the count always, the rows
+    /// only while the card is open, and the toggle only while there is something to show.
+    #[test]
+    fn a_bots_tools_are_on_the_tree_and_open_from_it() {
+        use crate::opengrok::CoworkerTool;
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_tools = Some(ToolList::Loading);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-tools").unwrap().value.as_deref(),
+            Some("Asking the server…")
+        );
+        assert!(host.dispatch(&Op::click("agent-tools-toggle")).is_err());
+
+        host.agent_tools = Some(ToolList::Listed(vec![
+            CoworkerTool {
+                name: "shell".into(),
+                description: "Run a shell command.".into(),
+                kind: "builtin".into(),
+            },
+            CoworkerTool {
+                name: "gmail_api_send".into(),
+                description: String::new(),
+                kind: "plugin".into(),
+            },
+        ]));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-tools").unwrap().value.as_deref(),
+            Some("1 built in · 1 from plugins")
+        );
+        let row = tree.find("agent-tool-gmail_api_send").unwrap();
+        assert_eq!(row.value.as_deref(), Some("plugin"));
+        assert!(!row.visible, "closed card: the rows are not on screen");
+        host.dispatch(&Op::click("agent-tools-toggle")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleAgentTools)
+        ));
+        host.agent_tools_open = true;
+        assert!(host.snapshot().find("agent-tool-shell").unwrap().visible);
     }
 }

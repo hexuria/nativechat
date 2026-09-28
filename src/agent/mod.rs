@@ -87,6 +87,12 @@
 //! takes it; a letter aimed at any other card is refused. A card the bot followed with another
 //! card is `not-answered`: only the newest card asks.
 //!
+//! In the bot's settings: `agent-tools` (value = the Tools card's second line: `2 built in · 1
+//! from plugins`, `Asking the server…`, or why there is no list), `agent-tools-toggle` (Show /
+//! Hide, only while tools are listed), and `agent-tool-{name}` per tool (value `builtin` /
+//! `plugin`; visible while the card is open). Read-only: what the server's
+//! `GET /coworkers/{id}/tools` says the bot is offered on its next turn.
+//!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /

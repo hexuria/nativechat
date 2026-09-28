@@ -1359,6 +1359,21 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// `GET /coworkers/{id}/tools` — exactly what the model is offered on this bot's next turn,
+    /// assembled from its grant, its computer and its plugins. Read-only: nothing on the server
+    /// changes the set yet (opengrok-server#84), so the app only shows it.
+    pub async fn coworker_tools(
+        &self,
+        coworker_id: &str,
+    ) -> Result<Vec<CoworkerTool>, OpenGrokError> {
+        let path = format!("/coworkers/{}/tools", path_segment(coworker_id));
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        let listing: ToolListing = Self::json_or_error(response).await?;
+        Ok(listing.tools)
+    }
+
     /// The coworker's screen right now: `{mime, base64, width, height, visibility?}`,
     /// the same shape as `TOOL_CALL_RESULT.image`. `GET /coworkers/{id}/screen`
     /// is the `transcript` observe pin; `ScreenshotSpec::from_frame` decodes both.
@@ -2393,6 +2408,37 @@ impl BoxShareScope {
             _ => None,
         }
     }
+}
+
+/// One tool the bot is offered on a turn right now, as `GET /coworkers/{id}/tools` lists it.
+///
+/// Transcribed from opengrok-server `crates/opengrok-server/src/agui/routes.rs` `list_tools`
+/// and its recorded answer
+/// `tests/fixtures/wire/rest/GET__coworkers__coworker_id__tools/200-…json` (server #84's read
+/// half): `{"tools": [{"name", "description", "kind": "builtin" | "plugin"}]}`, where `kind`
+/// is "builtin" for the executor's own tools and `user_machine_shell`, and "plugin" for the rest.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CoworkerTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub kind: String,
+}
+
+impl CoworkerTool {
+    /// One of the server's own tools rather than one a plugin brought. A kind this app does not
+    /// know yet is listed with the plugins' rather than claimed as built in.
+    pub fn is_builtin(&self) -> bool {
+        self.kind == "builtin"
+    }
+}
+
+/// The envelope `GET /coworkers/{id}/tools` answers in; see [`CoworkerTool`].
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolListing {
+    #[serde(default)]
+    pub(crate) tools: Vec<CoworkerTool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -5919,6 +5965,53 @@ mod tests {
             queue[1].why.as_deref(),
             Some("Reading a file outside the workspace.")
         );
+    }
+
+    /// The recorded answer (opengrok-server wire corpus,
+    /// `GET__coworkers__coworker_id__tools/200-…`), trimmed to one tool of each kind.
+    #[tokio::test]
+    async fn a_bots_tools_are_read_as_the_server_lists_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [
+                    {
+                        "name": "shell",
+                        "description": "Run a shell command on THIS BOT'S OWN computer.",
+                        "kind": "builtin"
+                    },
+                    {"name": "gmail_api_send", "description": "Send mail.", "kind": "plugin"},
+                    {"name": "later_kind", "kind": "connector"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let tools = client.coworker_tools("cw_1").await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, ["shell", "gmail_api_send", "later_kind"]);
+        assert!(tools[0].is_builtin());
+        assert!(!tools[1].is_builtin());
+        assert!(
+            !tools[2].is_builtin() && tools[2].description.is_empty(),
+            "a kind this app does not know is not claimed as built in"
+        );
+    }
+
+    /// A bot on the person's roster that they do not own answers 404 (the recorded
+    /// `404-an_org_visible_coworker_…`), which is an answer and not a list.
+    #[tokio::test]
+    async fn a_bot_the_person_does_not_own_has_no_tool_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/tools"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such coworker"))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.coworker_tools("cw_1").await.unwrap_err();
+        assert_eq!(error.status, Some(404));
     }
 
     #[tokio::test]

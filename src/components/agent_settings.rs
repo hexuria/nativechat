@@ -4,8 +4,8 @@ use crate::chrome::{
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
-use crate::opengrok::{CoworkerPatch, ModelEntry};
-use crate::state::AppState;
+use crate::opengrok::{CoworkerPatch, CoworkerTool, ModelEntry};
+use crate::state::{AppState, ToolList};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
@@ -487,6 +487,15 @@ impl Render for AgentSettings {
         let saving = self.saving;
         let usage_open = self.usage_open;
         let auto_review_open = self.auto_review_open;
+        let tools_open = self.state.read(cx).agent_tools_open;
+        let tools = {
+            let state = self.state.read(cx);
+            state
+                .coworker_tools
+                .as_ref()
+                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+                .map(|(_, list)| list.clone())
+        };
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
@@ -866,6 +875,73 @@ impl Render for AgentSettings {
                                                 this.child(self.auto_review_body(auto_review_mode, cx))
                                             }),
                                     )
+                                    .when_some(tools, |this, tools| {
+                                        this.child(
+                                            div()
+                                                .id("agent-tools")
+                                                .mb(px(16.))
+                                                .px(px(14.))
+                                                .py(px(12.))
+                                                .rounded(px(10.))
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap(px(10.))
+                                                        .child(
+                                                            v_flex()
+                                                                .gap(px(2.))
+                                                                .child(div().text_sm().child("Tools"))
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(muted)
+                                                                        .child(tools_summary(&tools)),
+                                                                ),
+                                                        )
+                                                        .when(
+                                                            matches!(tools, ToolList::Listed(ref all) if !all.is_empty()),
+                                                            |this| {
+                                                                this.child(
+                                                                    div()
+                                                                        .id("agent-tools-toggle")
+                                                                        .px(px(11.))
+                                                                        .py(px(5.))
+                                                                        .rounded(px(8.))
+                                                                        .border_1()
+                                                                        .border_color(
+                                                                            rgb(0x7f7f7f).opacity(0.4),
+                                                                        )
+                                                                        .text_xs()
+                                                                        .cursor_pointer()
+                                                                        .on_mouse_down(
+                                                                            MouseButton::Left,
+                                                                            {
+                                                                                let app = app.clone();
+                                                                                move |_, _, cx| {
+                                                                                    app.update(cx, |state, cx| state.toggle_agent_tools(cx));
+                                                                                }
+                                                                            },
+                                                                        )
+                                                                        .child(if tools_open { "Hide" } else { "Show" }),
+                                                                )
+                                                            },
+                                                        ),
+                                                )
+                                                .when(tools_open, |this| {
+                                                    this.when_some(
+                                                        match &tools {
+                                                            ToolList::Listed(all) => Some(all.clone()),
+                                                            _ => None,
+                                                        },
+                                                        |this, all| this.child(tools_body(&all, muted)),
+                                                    )
+                                                }),
+                                        )
+                                    })
                                     .when_some(error, |this, message| {
                                         this.child(
                                             div()
@@ -1460,6 +1536,146 @@ mod tests {
         assert_eq!(
             highlighted_model(&catalogue, "fast", FIRST_MATCH).unwrap(),
             "OAG/Fast"
+        );
+    }
+}
+
+/// The Tools card's second line: how many the bot is offered, and from where, or why the app
+/// cannot say.
+pub(crate) fn tools_summary(list: &ToolList) -> String {
+    match list {
+        ToolList::Loading => "Asking the server…".to_string(),
+        ToolList::Unavailable(why) => why.clone(),
+        ToolList::Listed(all) if all.is_empty() => "Offered no tools on its next turn.".to_string(),
+        ToolList::Listed(all) => {
+            let built_in = all.iter().filter(|tool| tool.is_builtin()).count();
+            let plugins = all.len() - built_in;
+            match (built_in, plugins) {
+                (_, 0) => format!("{built_in} built in"),
+                (0, _) => format!("{plugins} from plugins"),
+                _ => format!("{built_in} built in · {plugins} from plugins"),
+            }
+        }
+    }
+}
+
+/// A tool's words as its row shows them: the first line, cut at a word near 160 characters so
+/// one long description cannot fill the pane.
+fn first_line_of(description: &str) -> String {
+    const MOST: usize = 160;
+    let line = description.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= MOST {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(MOST).collect();
+    let at_word = cut
+        .rfind(' ')
+        .filter(|at| *at > MOST / 2)
+        .unwrap_or(cut.len());
+    format!("{}…", cut[..at_word].trim_end())
+}
+
+/// The list itself: each tool by its wire name, which is what the model is told, with the
+/// first line of what the server says it does. Nothing here can be switched: choosing a bot's
+/// tools is not on the server yet (opengrok-server#84), and a switch that only lived in this
+/// app would not change what the bot is offered.
+fn tools_body(all: &[CoworkerTool], muted: Hsla) -> impl IntoElement {
+    let (built_in, plugins): (Vec<_>, Vec<_>) = all.iter().partition(|tool| tool.is_builtin());
+    let group = |title: &'static str, tools: Vec<&CoworkerTool>| {
+        v_flex()
+            .gap(px(6.))
+            .child(div().text_xs().text_color(muted).child(title))
+            .children(tools.into_iter().enumerate().map(|(at, tool)| {
+                let first_line = first_line_of(&tool.description);
+                // By place, not by name: the server's names are unique per turn, but a row's id
+                // must not depend on that holding.
+                v_flex()
+                    .id(SharedString::from(format!("agent-tool-{title}-{at}")))
+                    .gap(px(1.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family("Menlo")
+                            .child(tool.name.clone()),
+                    )
+                    .when(!first_line.is_empty(), |this| {
+                        this.child(div().text_xs().text_color(muted).child(first_line))
+                    })
+            }))
+    };
+    v_flex()
+        .pt(px(12.))
+        .gap(px(12.))
+        .when(!built_in.is_empty(), |this| this.child(group("Built in", built_in)))
+        .when(!plugins.is_empty(), |this| this.child(group("From plugins", plugins)))
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("What this bot is offered on its next turn. Choosing which tools it gets is not on the server yet."),
+        )
+}
+
+#[cfg(test)]
+mod tools_tests {
+    use super::{first_line_of, tools_summary};
+    use crate::opengrok::CoworkerTool;
+    use crate::state::ToolList;
+
+    fn tool(name: &str, kind: &str) -> CoworkerTool {
+        CoworkerTool {
+            name: name.into(),
+            description: String::new(),
+            kind: kind.into(),
+        }
+    }
+
+    /// The card's second line says where the bot's tools come from, and says so plainly when
+    /// there is no list rather than showing an empty card.
+    #[test]
+    fn the_tools_card_says_what_the_bot_is_offered() {
+        let both = ToolList::Listed(vec![
+            tool("shell", "builtin"),
+            tool("read_file", "builtin"),
+            tool("gmail_api_send", "plugin"),
+        ]);
+        assert_eq!(tools_summary(&both), "2 built in · 1 from plugins");
+        assert_eq!(
+            tools_summary(&ToolList::Listed(vec![tool("shell", "builtin")])),
+            "1 built in"
+        );
+        assert_eq!(
+            tools_summary(&ToolList::Listed(vec![tool("x", "connector")])),
+            "1 from plugins"
+        );
+        assert_eq!(
+            tools_summary(&ToolList::Listed(Vec::new())),
+            "Offered no tools on its next turn."
+        );
+        assert_eq!(tools_summary(&ToolList::Loading), "Asking the server…");
+        assert_eq!(
+            tools_summary(&ToolList::Unavailable(
+                "Only this bot's owner can see its tools.".into()
+            )),
+            "Only this bot's owner can see its tools."
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_cut_at_a_word() {
+        assert_eq!(first_line_of("Short.\nMore below."), "Short.");
+        let long = "word ".repeat(60);
+        let shown = first_line_of(&long);
+        assert!(
+            shown.ends_with('…') && shown.chars().count() <= 161,
+            "{shown}"
+        );
+        assert!(!shown.contains("wor…"), "not mid-word: {shown}");
+        let cjk = "字".repeat(300);
+        assert_eq!(
+            first_line_of(&cjk).chars().count(),
+            161,
+            "no spaces: cut on a char"
         );
     }
 }
