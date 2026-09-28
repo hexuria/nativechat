@@ -168,9 +168,20 @@ pub struct ComposerEditor {
     /// Plain Enter sends (the composer's default). With it off, as when the person chose ⌘↵ to
     /// send, plain Enter is a new line, the way gpui-base's field treats the same setting.
     submit_on_enter: bool,
-    /// What the last paint laid out, where, and with which font: hit tests and the platform's
-    /// questions about where text is are answered from it.
-    last: Option<(Layout, Bounds<Pixels>, Widths)>,
+    /// What the last paint laid out and where: hit tests and the platform's questions about
+    /// where text is are answered from it once it is brought up to date with [`Self::fresh`].
+    last: Option<Laid>,
+    /// Widths in the field's font, kept across frames: the same words are measured on every
+    /// frame and every hit test, and a cache that lived one layout saved nothing.
+    widths: Option<Widths>,
+    /// Counts edits, so a layout knows whether it was made from the document as it is now.
+    revision: u64,
+    /// Bring the caret into view on the next paint: set by an edit or a caret move, and only
+    /// then, so a draft scrolled by the wheel stays where it was put.
+    autoscroll: bool,
+    /// The last change was an undo or redo, which can bring back a chip whose recipe or skill
+    /// has since gone; the composer asks with [`Self::take_restored`].
+    restored: bool,
     /// How far the text is scrolled up once it is taller than the field.
     scroll: f32,
     /// The column Up and Down keep, set by the first of a run of them.
@@ -182,6 +193,15 @@ pub struct ComposerEditor {
     /// person is typing or moving it.
     caret_hold: u8,
     _blink: Task<()>,
+}
+
+/// A layout and what it was made with, so it can be made again for a newer document.
+#[derive(Clone)]
+struct Laid {
+    layout: Layout,
+    revision: u64,
+    bounds: Bounds<Pixels>,
+    chip: ChipMetrics,
 }
 
 impl EventEmitter<InputEvent> for ComposerEditor {}
@@ -203,7 +223,9 @@ impl ComposerEditor {
             loop {
                 cx.background_executor().timer(BLINK).await;
                 let alive = this.update_in(cx, |this, window, cx| {
-                    if !this.focus_handle.is_focused(window) {
+                    // Unfocused, or the window in the background: nothing blinks and nothing is
+                    // drawn, so an idle composer costs a timer and no frames.
+                    if !this.focus_handle.is_focused(window) || !window.is_window_active() {
                         this.caret_on = true;
                         return;
                     }
@@ -228,6 +250,10 @@ impl ComposerEditor {
             max_rows: 20,
             submit_on_enter: true,
             last: None,
+            widths: None,
+            revision: 0,
+            autoscroll: true,
+            restored: false,
             scroll: 0.,
             goal_x: None,
             selecting: false,
@@ -271,9 +297,27 @@ impl ComposerEditor {
         self.editor.doc.is_empty()
     }
 
+    /// Replace the whole draft. Like the old field's `set_value`, it clears the undo history
+    /// and emits no Change: the composer, which called it, already knows.
     pub fn set_value(&mut self, value: impl Into<String>, _: &mut Window, cx: &mut Context<Self>) {
         self.editor.set_doc(Doc::from_plain(&value.into()));
-        self.changed(cx);
+        self.revision += 1;
+        self.goal_x = None;
+        self.autoscroll = true;
+        self.wake_caret();
+        cx.notify();
+    }
+
+    /// Whether the last change was an undo or redo, clearing the answer.
+    pub fn take_restored(&mut self) -> bool {
+        std::mem::take(&mut self.restored)
+    }
+
+    /// Turn a chip back into its words, as when what it stood for is no longer on the draft.
+    pub fn unchip(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.editor.unchip(index) {
+            self.changed(cx);
+        }
     }
 
     pub fn cursor(&self) -> usize {
@@ -368,6 +412,8 @@ impl ComposerEditor {
 
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.goal_x = None;
+        self.revision += 1;
+        self.autoscroll = true;
         self.wake_caret();
         cx.emit(InputEvent::Change);
         cx.notify();
@@ -375,6 +421,7 @@ impl ComposerEditor {
 
     fn moved(&mut self, cx: &mut Context<Self>) {
         self.goal_x = None;
+        self.autoscroll = true;
         self.wake_caret();
         cx.notify();
     }
@@ -418,10 +465,10 @@ impl ComposerEditor {
     fn delete_to_line_start(
         &mut self,
         _: &DeleteToBeginningOfLine,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let to = self.visual_line_edge(false);
+        let to = self.visual_line_edge(false, window);
         if self.editor.delete_to(to) {
             self.changed(cx);
         }
@@ -430,10 +477,10 @@ impl ComposerEditor {
     fn delete_to_line_end(
         &mut self,
         _: &DeleteToEndOfLine,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let to = self.visual_line_edge(true);
+        let to = self.visual_line_edge(true, window);
         if self.editor.delete_to(to) {
             self.changed(cx);
         }
@@ -446,6 +493,10 @@ impl ComposerEditor {
         if !action.secondary && (action.shift || !self.submit_on_enter) {
             self.editor.type_text("\n");
             self.changed(cx);
+        } else {
+            // An Enter that is not a new line goes on to the composer's own bindings, as the old
+            // field let it: that is how ⌘↵ reaches `SendDraft` (review of #133).
+            cx.propagate();
         }
         cx.emit(InputEvent::PressEnter {
             secondary: action.secondary,
@@ -475,52 +526,57 @@ impl ComposerEditor {
         self.moved(cx);
     }
 
-    fn vertical_target(&mut self, down: bool) -> usize {
+    fn vertical_target(&mut self, down: bool, window: &Window) -> usize {
         let head = self.editor.head();
-        let Some((layout, _, widths)) = &self.last else {
+        let Some((layout, _, widths)) = self.fresh(window) else {
             return if down { self.editor.doc.len() } else { 0 };
         };
         let doc = &self.editor.doc;
         let goal = *self
             .goal_x
-            .get_or_insert_with(|| layout.caret(doc, widths, head).0);
+            .get_or_insert_with(|| layout.caret(doc, &widths, head).0);
         layout
-            .vertical(doc, widths, head, goal, down)
+            .vertical(doc, &widths, head, goal, down)
             .unwrap_or(if down { doc.len() } else { 0 })
     }
 
-    fn up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+    fn up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
         let goal = self.goal_x;
-        let to = self.vertical_target(false);
+        let to = self.vertical_target(false, window);
         self.editor.move_to(to);
+        self.autoscroll = true;
         cx.notify();
         self.goal_x = self.goal_x.or(goal);
     }
 
-    fn down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        let to = self.vertical_target(true);
+    fn down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.vertical_target(true, window);
         self.editor.move_to(to);
+        self.autoscroll = true;
         cx.notify();
     }
 
-    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        let to = self.vertical_target(false);
+    fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.vertical_target(false, window);
         self.editor.select_to(to);
+        self.autoscroll = true;
         cx.notify();
     }
 
-    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        let to = self.vertical_target(true);
+    fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.vertical_target(true, window);
         self.editor.select_to(to);
+        self.autoscroll = true;
         cx.notify();
     }
 
     /// The start or end of the line the caret is on as it is drawn, so Home and End go where the
     /// eye says the line ends even when it wrapped.
-    fn visual_line_edge(&self, end: bool) -> usize {
+    fn visual_line_edge(&mut self, end: bool, window: &Window) -> usize {
         let head = self.editor.head();
+        let fresh = self.fresh(window);
         let doc = &self.editor.doc;
-        let Some((layout, _, _)) = &self.last else {
+        let Some((layout, _, _)) = fresh else {
             return if end {
                 doc.line_end(head)
             } else {
@@ -532,26 +588,25 @@ impl ComposerEditor {
         if !end {
             return line.range.start;
         }
-        // At a wrap, the end is before the space the wrap left behind.
         let wrapped = layout
             .lines
             .get(row + 1)
             .is_some_and(|next| next.range.start == line.range.end);
-        if wrapped && line.range.end > line.range.start {
-            doc.prev_boundary(line.range.end)
+        if wrapped {
+            layout.wrap_end(doc, row)
         } else {
             line.range.end
         }
     }
 
-    fn home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
-        let to = self.visual_line_edge(false);
+    fn home(&mut self, _: &MoveHome, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.visual_line_edge(false, window);
         self.editor.move_to(to);
         self.moved(cx);
     }
 
-    fn end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
-        let to = self.visual_line_edge(true);
+    fn end(&mut self, _: &MoveEnd, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.visual_line_edge(true, window);
         self.editor.move_to(to);
         self.moved(cx);
     }
@@ -559,10 +614,10 @@ impl ComposerEditor {
     fn select_to_line_start(
         &mut self,
         _: &SelectToStartOfLine,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let to = self.visual_line_edge(false);
+        let to = self.visual_line_edge(false, window);
         self.editor.select_to(to);
         self.moved(cx);
     }
@@ -570,10 +625,10 @@ impl ComposerEditor {
     fn select_to_line_end(
         &mut self,
         _: &SelectToEndOfLine,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let to = self.visual_line_edge(true);
+        let to = self.visual_line_edge(true, window);
         self.editor.select_to(to);
         self.moved(cx);
     }
@@ -662,12 +717,14 @@ impl ComposerEditor {
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if self.editor.undo() {
+            self.restored = true;
             self.changed(cx);
         }
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         if self.editor.redo() {
+            self.restored = true;
             self.changed(cx);
         }
     }
@@ -683,39 +740,66 @@ impl ComposerEditor {
 
     // The mouse.
 
-    /// The offset under a window position, from the last paint.
-    fn offset_at(&self, position: Point<Pixels>) -> usize {
-        let Some((layout, bounds, widths)) = &self.last else {
+    /// The last paint's layout, made again first if the document has changed since: macOS asks
+    /// where the composing text is straight after changing it, before anything is drawn, and an
+    /// answer from the old layout is wrong at best (review of #133).
+    fn fresh(&mut self, window: &Window) -> Option<(Layout, Bounds<Pixels>, Widths)> {
+        let widths = self.widths_for(window);
+        let laid = self.last.as_mut()?;
+        if laid.revision != self.revision {
+            laid.layout = layout::lay_out(
+                &self.editor.doc,
+                &widths,
+                f32::from(laid.bounds.size.width),
+                laid.layout.line_height,
+                laid.chip,
+            );
+            laid.revision = self.revision;
+        }
+        Some((laid.layout.clone(), laid.bounds, widths))
+    }
+
+    /// The field's widths, made once and kept while the font stays the same.
+    fn widths_for(&mut self, window: &Window) -> Widths {
+        let fresh = widths(window);
+        match &self.widths {
+            Some(kept) if kept.font == fresh.font && kept.size == fresh.size => kept.clone(),
+            _ => {
+                self.widths = Some(fresh.clone());
+                fresh
+            }
+        }
+    }
+
+    /// The offset under a window position.
+    fn offset_at(&mut self, position: Point<Pixels>, window: &Window) -> usize {
+        let Some((layout, bounds, widths)) = self.fresh(window) else {
             return self.editor.doc.len();
         };
         let x = f32::from(position.x - bounds.left());
         let y = f32::from(position.y - bounds.top()) + self.scroll;
-        layout.offset_at(&self.editor.doc, widths, x, y)
+        layout.offset_at(&self.editor.doc, &widths, x, y)
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
         self.selecting = true;
-        let at = self.offset_at(event.position);
+        let at = self.offset_at(event.position, window);
         if event.modifiers.shift {
             self.editor.select_to(at);
         } else if event.click_count >= 2 {
-            let doc = &self.editor.doc;
-            let (start, end) = (
-                doc.prev_word_start(doc.next_boundary(at)),
-                doc.next_word_end(at),
-            );
-            self.editor.move_to(start);
-            self.editor.select_to(end);
+            let word = self.editor.doc.word_at(at);
+            self.editor.move_to(word.start);
+            self.editor.select_to(word.end);
         } else {
             self.editor.move_to(at);
         }
         self.moved(cx);
     }
 
-    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.selecting {
-            let at = self.offset_at(event.position);
+            let at = self.offset_at(event.position, window);
             self.editor.select_to(at);
             cx.notify();
         }
@@ -733,6 +817,7 @@ impl ComposerEditor {
     ) {
         let delta = f32::from(event.delta.pixel_delta(window.line_height()).y);
         self.scroll = (self.scroll - delta).max(0.);
+        self.autoscroll = false;
         cx.notify();
     }
 }
@@ -816,14 +901,14 @@ impl EntityInputHandler for ComposerEditor {
         &mut self,
         range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let (layout, _, widths) = self.last.as_ref()?;
+        let (layout, _, widths) = self.fresh(window)?;
         let range = self.editor.range_from_utf16(&range_utf16);
         let doc = &self.editor.doc;
-        let (x, row) = layout.caret(doc, widths, range.start);
-        let (end_x, end_row) = layout.caret(doc, widths, range.end);
+        let (x, row) = layout.caret(doc, &widths, range.start);
+        let (end_x, end_row) = layout.caret(doc, &widths, range.end);
         let end_x = if end_row == row { end_x } else { x + 1. };
         let top = element_bounds.top() + px(row as f32 * layout.line_height - self.scroll);
         Some(Bounds::from_corners(
@@ -838,10 +923,10 @@ impl EntityInputHandler for ComposerEditor {
     fn character_index_for_point(
         &mut self,
         position: Point<Pixels>,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let at = self.offset_at(position);
+        let at = self.offset_at(position, window);
         Some(self.editor.to_utf16(at))
     }
 }
@@ -959,28 +1044,31 @@ impl Element for ComposerElement {
         let editor = self.editor.clone();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
+        // The font, line height and chip sizes are read here, where this element's inherited
+        // text style is in force. The closure below runs later, from the root's layout pass,
+        // when that style has been popped, and reading them there measured the field in the
+        // default font (review of #133).
+        let measure = self.editor.update(cx, |this, _| this.widths_for(window));
+        let line_height = f32::from(window.line_height());
+        let chip = chip_metrics(window);
         // The field is as tall as its lines, between the composer's minimum and maximum, and
         // that depends on the width it is given, so it is measured once the width is known.
-        let layout_id =
-            window.request_measured_layout(style, move |known, available, window, cx| {
-                let width = known.width.unwrap_or(match available.width {
-                    AvailableSpace::Definite(width) => width,
-                    _ => px(600.),
-                });
-                let line_height = f32::from(window.line_height());
-                let this = editor.read(cx);
-                let measure = widths(window);
-                let laid = layout::lay_out(
-                    &this.editor.doc,
-                    &measure,
-                    f32::from(width),
-                    line_height,
-                    chip_metrics(window),
-                );
-                let rows = laid.lines.len().clamp(this.min_rows, this.max_rows);
-                size(width, px(rows as f32 * line_height))
+        let layout_id = window.request_measured_layout(style, move |known, available, _, cx| {
+            let width = known.width.unwrap_or(match available.width {
+                AvailableSpace::Definite(width) => width,
+                _ => px(600.),
             });
-        let _ = cx;
+            let this = editor.read(cx);
+            let laid = layout::lay_out(
+                &this.editor.doc,
+                &measure,
+                f32::from(width),
+                line_height,
+                chip,
+            );
+            let rows = laid.lines.len().clamp(this.min_rows, this.max_rows);
+            size(width, px(rows as f32 * line_height))
+        });
         (layout_id, ())
     }
 
@@ -993,18 +1081,29 @@ impl Element for ComposerElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
-        let measure = widths(window);
+        let measure = self.editor.update(cx, |this, _| this.widths_for(window));
         let chip = chip_metrics(window);
         let line_height = f32::from(window.line_height());
+        // The last paint's layout is used again when nothing it was made from has changed: a
+        // blinking caret redraws twice a second and lays nothing out.
         let layout = {
             let this = self.editor.read(cx);
-            layout::lay_out(
-                &this.editor.doc,
-                &measure,
-                f32::from(bounds.size.width),
-                line_height,
-                chip,
-            )
+            match &this.last {
+                Some(laid)
+                    if laid.revision == this.revision
+                        && laid.bounds.size.width == bounds.size.width
+                        && laid.layout.line_height == line_height =>
+                {
+                    laid.layout.clone()
+                }
+                _ => layout::lay_out(
+                    &this.editor.doc,
+                    &measure,
+                    f32::from(bounds.size.width),
+                    line_height,
+                    chip,
+                ),
+            }
         };
         Prepaint {
             layout,
@@ -1040,7 +1139,7 @@ impl Element for ComposerElement {
         } = prepaint;
 
         // Keep the caret in view once the text is taller than the field.
-        let (doc, selection, marked, placeholder, mut scroll, caret_on) = {
+        let (doc, selection, marked, placeholder, mut scroll, caret_on, autoscroll, revision) = {
             let this = self.editor.read(cx);
             (
                 this.editor.doc.clone(),
@@ -1049,16 +1148,21 @@ impl Element for ComposerElement {
                 this.placeholder.clone(),
                 this.scroll,
                 this.caret_on,
+                this.autoscroll,
+                this.revision,
             )
         };
         let view_h = f32::from(bounds.size.height);
         let (caret_x, caret_row) = layout.caret(&doc, widths, selection.head());
         let caret_top = caret_row as f32 * layout.line_height;
         let max_scroll = (layout.height() - view_h).max(0.);
-        if caret_top < scroll {
-            scroll = caret_top;
-        } else if caret_top + layout.line_height > scroll + view_h {
-            scroll = caret_top + layout.line_height - view_h;
+        // Only after an edit or a caret move: a draft the person scrolled stays where they put it.
+        if autoscroll {
+            if caret_top < scroll {
+                scroll = caret_top;
+            } else if caret_top + layout.line_height > scroll + view_h {
+                scroll = caret_top + layout.line_height - view_h;
+            }
         }
         scroll = scroll.clamp(0., max_scroll);
         let origin = |x: f32, row: usize| {
@@ -1157,9 +1261,17 @@ impl Element for ComposerElement {
             }
         });
 
+        let chip = *chip;
+        let layout = layout.clone();
         self.editor.update(cx, |this, _| {
             this.scroll = scroll;
-            this.last = Some((layout.clone(), bounds, widths.clone()));
+            this.autoscroll = false;
+            this.last = Some(Laid {
+                layout,
+                revision,
+                bounds,
+                chip,
+            });
         });
     }
 }

@@ -308,8 +308,13 @@ impl Layout {
             }
             if offset < range.end {
                 return match piece {
+                    // `get`, not indexing: a layout from before an edit can be asked about the
+                    // document after it, and a stale range must never panic (review of #133).
                     Piece::Text { range, x, .. } => {
-                        x + measure.width(&doc.text()[range.start..offset])
+                        x + doc
+                            .text()
+                            .get(range.start..offset)
+                            .map_or(0., |text| measure.width(text))
                     }
                     // Inside a chip's marker cannot happen on a character boundary; before it is
                     // its left edge.
@@ -347,7 +352,9 @@ impl Layout {
                     }
                 }
                 Piece::Text { range, x: px, .. } => {
-                    let text = &doc.text()[range.clone()];
+                    let Some(text) = doc.text().get(range.clone()) else {
+                        return range.start.min(doc.len());
+                    };
                     let mut best = range.start;
                     let mut best_d = f32::MAX;
                     for (offset, _) in text
@@ -368,6 +375,26 @@ impl Layout {
         // caret does not appear at the start of the next line.
         let end = line.range.end;
         if row + 1 < self.lines.len() && self.lines[row + 1].range.start == end {
+            self.wrap_end(doc, row)
+        } else {
+            end
+        }
+    }
+
+    /// Where a wrapped line ends for the caret: before the space the wrap left at its end, so the
+    /// caret stays on this line, and at the end itself when the wrap broke a word or came before
+    /// a chip — stepping back there would leave the last letter behind (review of #133).
+    pub fn wrap_end(&self, doc: &Doc, row: usize) -> usize {
+        let Some(line) = self.lines.get(row) else {
+            return doc.len();
+        };
+        let end = line.range.end.min(doc.len());
+        let trailing_space = doc
+            .text()
+            .get(line.range.start.min(end)..end)
+            .and_then(|text| text.chars().next_back())
+            .is_some_and(char::is_whitespace);
+        if trailing_space {
             doc.prev_boundary(end).max(line.range.start)
         } else {
             end
@@ -548,6 +575,36 @@ mod tests {
         assert_eq!(layout.vertical(&d, &Mono, 2, 20., true), Some(9));
         assert_eq!(layout.vertical(&d, &Mono, 9, 20., false), Some(2));
         assert_eq!(layout.vertical(&d, &Mono, 9, 20., true), None);
+    }
+
+    /// End on a line that wrapped inside a word goes to the line's real end, and on a line that
+    /// wrapped at a space, to before the space.
+    #[test]
+    fn a_wrapped_line_ends_where_its_letters_do() {
+        let d = doc("abcdefghij", None);
+        let layout = lay_out(&d, &Mono, 40., 20., CHROME);
+        assert_eq!(
+            layout.wrap_end(&d, 0),
+            4,
+            "no space: nothing is left behind"
+        );
+        let d = doc("abc defg", None);
+        let layout = lay_out(&d, &Mono, 50., 20., CHROME);
+        assert_eq!(layout.wrap_end(&d, 0), 3, "before the space the wrap left");
+    }
+
+    /// A layout asked about a document it was not made from answers without panicking.
+    #[test]
+    fn a_stale_layout_never_panics() {
+        let before = doc("中文中文sh中文", None);
+        let layout = lay_out(&before, &Mono, 60., 20., CHROME);
+        let after = doc("中文中文し中文", None);
+        for offset in 0..=after.len() {
+            let offset = after.floor_char(offset);
+            let _ = layout.caret(&after, &Mono, offset);
+            let _ = layout.rects(&after, &Mono, 0..offset);
+        }
+        let _ = layout.offset_at(&after, &Mono, 35., 25.);
     }
 
     /// A word longer than a line is broken inside, and nothing is lost.

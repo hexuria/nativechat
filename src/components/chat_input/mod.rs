@@ -300,6 +300,15 @@ impl MessageInput {
                     }
                 }
                 InputEvent::Change => {
+                    // Undo and redo can bring back a chip whose recipe or skill has since been
+                    // taken off the draft. A chip that runs nothing must not look as if it does,
+                    // so it goes back to being its words (review of #133).
+                    if this
+                        .input_state
+                        .update(cx, |input, _| input.take_restored())
+                    {
+                        this.unchip_the_unattached(cx);
+                    }
                     this.sync_tokens(cx);
                     this.drop_recipe_without_its_chip(window, cx);
                     this.drop_skill_without_its_chip(cx);
@@ -1013,6 +1022,29 @@ impl MessageInput {
             .collect();
         self.state
             .update(cx, |state, cx| state.set_composer_chips(chips, cx));
+    }
+
+    /// Turn every recipe, workflow or skill chip whose thing is not on the draft back into words.
+    fn unchip_the_unattached(&mut self, cx: &mut Context<Self>) {
+        let (recipe, skill) = {
+            let state = self.state.read(cx);
+            (
+                state.active_recipe.as_ref().map(|recipe| recipe.id.clone()),
+                state.active_skill.as_ref().map(|skill| skill.id.clone()),
+            )
+        };
+        let chips = self.input_state.read(cx).chips().to_vec();
+        for (index, chip) in chips.iter().enumerate().rev() {
+            let attached = match chip.kind {
+                kind if kind.is_mode() => recipe.as_deref() == Some(chip.id.as_str()),
+                TokenKind::Skill => skill.as_deref() == Some(chip.id.as_str()),
+                _ => true,
+            };
+            if !attached {
+                self.input_state
+                    .update(cx, |input, cx| input.unchip(index, cx));
+            }
+        }
     }
 
     /// Take the chip at `index` out of the field, with the space it came with, and keep the

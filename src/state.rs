@@ -7491,8 +7491,7 @@ impl AppState {
         true
     }
 
-    /// Say which of the composer's lists is open, or that none is. Called by the composer, and
-    /// read by anything that cannot see into the composer's own view.
+    /// Say which chips the draft holds, for a driver: the field is the composer's own.
     pub fn set_composer_chips(
         &mut self,
         chips: Vec<(crate::components::chat_input::TokenKind, String)>,
@@ -7504,6 +7503,8 @@ impl AppState {
         }
     }
 
+    /// Say which of the composer's lists is open, or that none is. Called by the composer, and
+    /// read by anything that cannot see into the composer's own view.
     pub fn set_composer_panel(
         &mut self,
         panel: Option<crate::components::chat_input::PanelMode>,

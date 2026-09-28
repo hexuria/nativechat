@@ -58,6 +58,9 @@ impl Selection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Typing,
+    /// A run of single Backspaces or Deletes: one step, as a run of typing is, rather than a
+    /// copy of the whole draft per key held down.
+    Deleting,
     Other,
 }
 
@@ -91,7 +94,7 @@ impl Editor {
     fn remember(&mut self, kind: Kind) {
         // A run of typed letters is one step: the snapshot before the first letter is the one
         // Undo goes back to. Anything else starts a new step.
-        if kind == Kind::Typing && self.last == Some(Kind::Typing) {
+        if kind != Kind::Other && self.last == Some(kind) {
             return;
         }
         self.undo.push(Snapshot {
@@ -136,10 +139,13 @@ impl Editor {
         true
     }
 
-    /// Put the whole draft back, as a queued send refilled into the field does. It is one undo
-    /// step, so the person can take it back.
+    /// Replace the whole draft, as sending it (with nothing), dictation or a refilled queued
+    /// send does. The undo history goes with it, as the old field's `set_value` cleared it: ⌘Z
+    /// after sending must not bring back the message that has just gone.
     pub fn set_doc(&mut self, doc: Doc) {
-        self.remember(Kind::Other);
+        self.undo.clear();
+        self.redo.clear();
+        self.last = None;
         let end = doc.len();
         self.doc = doc;
         self.selection = Selection::caret(end);
@@ -153,6 +159,10 @@ impl Editor {
         } else {
             Kind::Other
         };
+        self.type_as(text, kind);
+    }
+
+    fn type_as(&mut self, text: &str, kind: Kind) {
         self.remember(kind);
         let range = self.selection.range.clone();
         let placed = self.doc.replace(range, text);
@@ -216,8 +226,29 @@ impl Editor {
         true
     }
 
+    /// Turn a chip back into the words it read as: what it stood for is gone, and a chip that
+    /// means nothing would say otherwise. One undo step.
+    pub fn unchip(&mut self, index: usize) -> bool {
+        let Some(&at) = self.doc.mark_offsets().get(index) else {
+            return false;
+        };
+        let label = self.doc.chips()[index].label.clone();
+        self.remember(Kind::Other);
+        let head = self.selection.head();
+        let placed = self.doc.replace(at..at + MARK.len_utf8(), &label);
+        let grow = placed.len().saturating_sub(MARK.len_utf8());
+        let shift = |offset: usize| if offset > at { offset + grow } else { offset };
+        self.selection = Selection::caret(shift(head));
+        self.marked = None;
+        true
+    }
+
     /// Delete the selection, or with none, from the caret to `to` (a boundary on either side).
     fn delete_toward(&mut self, to: usize) -> bool {
+        self.delete_as(to, Kind::Other)
+    }
+
+    fn delete_as(&mut self, to: usize, kind: Kind) -> bool {
         let range = if self.selection.range.is_empty() {
             let head = self.selection.head();
             head.min(to)..head.max(to)
@@ -227,7 +258,12 @@ impl Editor {
         if range.is_empty() {
             return false;
         }
-        self.remember(Kind::Other);
+        let kind = if self.selection.range.is_empty() {
+            kind
+        } else {
+            Kind::Other
+        };
+        self.remember(kind);
         let placed = self.doc.replace(range, "");
         self.selection = Selection::caret(placed.start);
         self.marked = None;
@@ -236,12 +272,12 @@ impl Editor {
 
     pub fn backspace(&mut self) -> bool {
         let to = self.doc.prev_boundary(self.head());
-        self.delete_toward(to)
+        self.delete_as(to, Kind::Deleting)
     }
 
     pub fn delete(&mut self) -> bool {
         let to = self.doc.next_boundary(self.head());
-        self.delete_toward(to)
+        self.delete_as(to, Kind::Deleting)
     }
 
     pub fn delete_word_back(&mut self) -> bool {
@@ -335,6 +371,7 @@ impl Editor {
     /// phrase, an accent picked from the press-and-hold menu. With no range it replaces the
     /// composing text, or else the selection.
     pub fn ime_replace(&mut self, range: Option<Range<usize>>, text: &str) {
+        let composing = self.marked.is_some();
         let range = range
             .or_else(|| self.marked.clone())
             .unwrap_or_else(|| self.selection.range.clone());
@@ -343,7 +380,14 @@ impl Editor {
             reversed: false,
         };
         self.marked = None;
-        self.type_text(text);
+        if composing {
+            // A commit is the end of the composition it replaces, and the composition's first
+            // keystroke already remembered the draft from before it: one undo takes both away,
+            // rather than leaving the uncommitted letters behind as text.
+            self.type_as(text, Kind::Typing);
+        } else {
+            self.type_text(text);
+        }
     }
 
     /// The IME's composing text: it replaces the range and stays marked until it is committed.
@@ -507,6 +551,53 @@ mod tests {
         assert_eq!(ed.doc.plain(), "run now");
         assert_eq!(ed.head(), before - M - 1);
         assert!(!ed.remove_chip(0), "nothing left to remove");
+    }
+
+    /// Undo after a committed composition goes back to before it, not to the letters that were
+    /// being composed (review of #133).
+    #[test]
+    fn undo_after_a_composition_leaves_no_composing_letters() {
+        let mut ed = editor("a ");
+        ed.ime_mark(None, "n", None);
+        ed.ime_mark(None, "ni", None);
+        ed.ime_replace(None, "你");
+        assert_eq!(ed.doc.text(), "a 你");
+        ed.undo();
+        assert_eq!(ed.doc.text(), "a ");
+    }
+
+    /// Holding Backspace is one undo step, not a copy of the draft per key.
+    #[test]
+    fn a_run_of_backspaces_is_one_undo_step() {
+        let mut ed = editor("hello");
+        for _ in 0..3 {
+            ed.backspace();
+        }
+        assert_eq!(ed.doc.text(), "he");
+        ed.undo();
+        assert_eq!(ed.doc.text(), "hello");
+    }
+
+    /// Replacing the draft wholesale (a send, dictation) takes the undo history with it.
+    #[test]
+    fn replacing_the_draft_forgets_its_history() {
+        let mut ed = editor("");
+        ed.type_text("sent");
+        ed.set_doc(Doc::default());
+        assert!(!ed.undo(), "nothing to bring back after a send");
+        assert_eq!(ed.doc.text(), "");
+    }
+
+    /// A chip whose recipe is gone becomes its words again, and the caret keeps its place.
+    #[test]
+    fn a_chip_can_become_its_words_again() {
+        let mut ed = editor("run ");
+        ed.insert_chip(chip(TokenKind::Recipe, "Weekly"));
+        ed.type_text("now");
+        assert!(ed.unchip(0));
+        assert_eq!(ed.doc.text(), "run Weekly now");
+        assert!(ed.doc.chips().is_empty());
+        assert_eq!(ed.head(), ed.doc.len());
     }
 
     /// A word delete stops at a chip, and a second one takes the chip.

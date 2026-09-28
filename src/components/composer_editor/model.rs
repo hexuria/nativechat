@@ -293,6 +293,38 @@ impl Doc {
         end
     }
 
+    /// The word a double-click at `offset` means: the word the offset is in or touches, with a
+    /// chip as a word of its own. A click on the right half of a word's last letter lands at the
+    /// word's end and still means that word, not the one after the space.
+    pub fn word_at(&self, offset: usize) -> Range<usize> {
+        let offset = self.floor_char(offset);
+        let is_word = |ch: char| !ch.is_whitespace() && ch != MARK;
+        let after = self.text[offset..].chars().next();
+        let before = self.text[..offset].chars().next_back();
+        let at = match (before, after) {
+            (_, Some(MARK)) => return offset..offset + MARK_LEN,
+            (_, Some(ch)) if is_word(ch) => offset,
+            (Some(MARK), _) => return offset - MARK_LEN..offset,
+            (Some(ch), _) if is_word(ch) => offset - ch.len_utf8(),
+            _ => return offset..offset,
+        };
+        let mut start = at;
+        for (i, ch) in self.text[..at].char_indices().rev() {
+            if !is_word(ch) {
+                break;
+            }
+            start = i;
+        }
+        let mut end = at;
+        for (i, ch) in self.text[at..].char_indices() {
+            if !is_word(ch) {
+                break;
+            }
+            end = at + i + ch.len_utf8();
+        }
+        start..end
+    }
+
     /// The start of the logical line (after the last newline) that `offset` is on.
     pub fn line_start(&self, offset: usize) -> usize {
         self.text[..offset.min(self.text.len())]
@@ -413,6 +445,27 @@ mod tests {
         assert_eq!(doc.plain(), "a b Secondc");
         assert_eq!(doc.chips()[0].label, "Second");
         assert!(doc.is_consistent());
+    }
+
+    /// A double-click means one word, whichever half of its last letter was hit, and a chip is a
+    /// word of its own (review of #133).
+    #[test]
+    fn a_double_click_means_one_word() {
+        let doc = Doc::from_plain("hello world");
+        assert_eq!(
+            doc.word_at(5),
+            0..5,
+            "the right half of 'o' is still 'hello'"
+        );
+        assert_eq!(doc.word_at(6), 6..11);
+        assert_eq!(doc.word_at(2), 0..5);
+        let doc = doc_with_chip();
+        assert_eq!(doc.word_at(4), 4..4 + MARK_LEN);
+        assert_eq!(
+            doc.word_at(4 + MARK_LEN),
+            4..4 + MARK_LEN,
+            "just after the chip: the chip"
+        );
     }
 
     /// A combining mark typed straight after a chip does not fuse with it: the chip stays its own
