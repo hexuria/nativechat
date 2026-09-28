@@ -592,6 +592,9 @@ pub fn agui_messages(messages: &[Message]) -> Vec<AguiMessage> {
                 },
                 tool_call_id: None,
                 reply_to,
+                // Attachments are not sent yet: the server takes them (opengrok-server#259), and
+                // the composer's 📎 that adds them is the next change (#90).
+                attachments: Vec::new(),
             }
         })
         .collect()

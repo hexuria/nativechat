@@ -1374,6 +1374,57 @@ impl OpenGrokClient {
         Ok(listing.tools)
     }
 
+    /// `POST /artifacts` for a file the person attaches to a message (#90): the bytes go up first,
+    /// and the message then names the returned `art_` id. `threadId` is the conversation's own
+    /// thread, the one `POST /ag-ui` sends. Transcribed from opengrok-server `artifacts.rs`
+    /// `create` (the body) and #259, merged at 68ace2e (`kind: "attachment"`; image, video, PDF and text accepted,
+    /// 25 MiB at most, a 400 or 413 with a sentence otherwise).
+    pub async fn upload_attachment(
+        &self,
+        thread_id: &str,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<crate::opengrok::Attachment, OpenGrokError> {
+        use base64::Engine as _;
+        // Over the server's cap the body is refused before its handler runs, with the web
+        // framework's words or a dropped connection rather than the server's sentence: say the
+        // sentence here, before a large file is encoded at all.
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(OpenGrokError::from_server(
+                Some(413),
+                "artifacts must be under 25 MiB",
+            ));
+        }
+        let body = json!({
+            "kind": "attachment",
+            "mime": upload_mime(mime),
+            "filename": upload_filename(filename),
+            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "threadId": thread_id,
+        });
+        let response = self
+            .send_json(reqwest::Method::POST, "/artifacts", Some(&body))
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `GET /artifacts?threadId=` — the files sent on a thread, and which message each rode on
+    /// (opengrok-server#259 `list_for_thread`). A replay draws them from this: the replayed
+    /// frames carry a message's words, not its files. A file uploaded and never sent is left out.
+    pub async fn sent_attachments(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<crate::opengrok::SentAttachment>, OpenGrokError> {
+        let path = format!("/artifacts?threadId={}", path_segment(thread_id));
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        let rows: Vec<crate::opengrok::types::ArtifactListing> =
+            Self::json_or_error(response).await?;
+        Ok(rows.into_iter().filter_map(|row| row.sent()).collect())
+    }
+
     /// The coworker's screen right now: `{mime, base64, width, height, visibility?}`,
     /// the same shape as `TOOL_CALL_RESULT.image`. `GET /coworkers/{id}/screen`
     /// is the `transcript` observe pin; `ScreenshotSpec::from_frame` decodes both.
@@ -2407,6 +2458,42 @@ impl BoxShareScope {
             "org" | "organization" | "organisation" => Some(Self::Org),
             _ => None,
         }
+    }
+}
+
+/// The most an upload may weigh: opengrok-server `artifacts.rs` `MAX_ARTIFACT_BYTES` (25 MiB).
+pub(crate) const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
+/// A file's type as the server will take it: a plain lowercase `type/subtype`. The server
+/// refuses parameters (`; charset=utf-8`) and reads its accepted kinds in lowercase, so a
+/// type from the system or an extension table is trimmed, cut at `;` and lowercased first.
+pub(crate) fn upload_mime(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// A file's name as the server will take it. opengrok-server#259 (merged at 68ace2e) refuses a
+/// name with a control character, U+2028, U+2029 or a `"` with a 400; a real file can be called
+/// that, and the person should not lose the upload over it, so those become `_`. An empty result
+/// is named `file`.
+pub(crate) fn upload_filename(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}' || ch == '"' {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    if clean.trim().is_empty() {
+        "file".to_string()
+    } else {
+        clean
     }
 }
 
@@ -4710,6 +4797,7 @@ mod tests {
                     content: "later".into(),
                     tool_call_id: None,
                     reply_to: None,
+                    attachments: Vec::new(),
                 }],
                 None,
                 None,
@@ -5364,6 +5452,7 @@ mod tests {
                     content: "hi".into(),
                     tool_call_id: None,
                     reply_to: None,
+                    attachments: Vec::new(),
                 }],
                 None,
                 None,
@@ -5418,6 +5507,7 @@ mod tests {
             content: "find me something".into(),
             tool_call_id: None,
             reply_to: None,
+            attachments: Vec::new(),
         };
         let recipe = TurnRecipe {
             id: "rcp_1".to_string(),
@@ -5473,6 +5563,7 @@ mod tests {
                     content: "hello".into(),
                     tool_call_id: None,
                     reply_to: None,
+                    attachments: Vec::new(),
                 }],
                 None,
                 None,
@@ -5522,6 +5613,7 @@ mod tests {
             content: "expense-report file this one".into(),
             tool_call_id: None,
             reply_to: None,
+            attachments: Vec::new(),
         };
 
         client
@@ -6012,6 +6104,125 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client.coworker_tools("cw_1").await.unwrap_err();
         assert_eq!(error.status, Some(404));
+    }
+
+    /// A type with parameters or capitals is sent as the plain lowercase type the server reads.
+    #[test]
+    fn a_file_type_is_sent_plain() {
+        assert_eq!(super::upload_mime("IMAGE/PNG"), "image/png");
+        assert_eq!(
+            super::upload_mime(" text/plain; charset=utf-8"),
+            "text/plain"
+        );
+    }
+
+    /// A file over the server's cap is refused here with the server's own sentence.
+    #[tokio::test]
+    async fn a_file_over_the_cap_is_refused_before_it_is_sent() {
+        let client = OpenGrokClient::new("http://127.0.0.1:9").unwrap();
+        let big = vec![0u8; super::MAX_ATTACHMENT_BYTES + 1];
+        let error = client
+            .upload_attachment("th_1", "big.png", "image/png", &big)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(413));
+        assert!(error.message.contains("25 MiB"), "{}", error.message);
+    }
+
+    /// A name the server would refuse is cleaned rather than losing the upload.
+    #[test]
+    fn a_file_name_the_server_refuses_is_cleaned() {
+        assert_eq!(super::upload_filename("q3 \"final\".pdf"), "q3 _final_.pdf");
+        assert_eq!(super::upload_filename("a\u{2028}b\tc"), "a_b_c");
+        assert_eq!(super::upload_filename("报告.pdf"), "报告.pdf");
+        assert_eq!(super::upload_filename(" "), "file");
+    }
+
+    /// An upload goes as the server's `POST /artifacts` body with `kind: "attachment"` and the
+    /// conversation's thread, and its row answers with the `art_` id (opengrok-server#259).
+    #[tokio::test]
+    async fn an_attachment_uploads_and_answers_its_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/artifacts"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "kind": "attachment",
+                "mime": "text/plain",
+                "filename": "q3 _final_.txt",
+                "base64": "aGk=",
+                "threadId": "th_1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "art_1", "accountId": "acct_1", "kind": "attachment",
+                "mime": "text/plain", "filename": "notes.txt", "sizeBytes": 2,
+                "recipeId": null, "runId": null, "stepIndex": null, "threadId": "th_1",
+                "meta": {}, "createdAtMs": 1, "deletedAtMs": null
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let file = client
+            .upload_attachment(
+                "th_1",
+                "q3 \"final\".txt",
+                "Text/Plain; charset=utf-8",
+                b"hi",
+            )
+            .await
+            .unwrap();
+        assert_eq!((file.id.as_str(), file.size_bytes), ("art_1", 2));
+    }
+
+    /// A refused upload keeps the server's sentence: a 400 for a kind of file it does not take.
+    #[tokio::test]
+    async fn a_refused_upload_says_why() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/artifacts"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("only images, videos, PDFs and text files are accepted"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client
+            .upload_attachment("th_1", "a.zip", "application/zip", b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(400));
+        assert!(error.message.contains("PDFs"), "{}", error.message);
+    }
+
+    /// The thread's files, each with the message it rode on; one uploaded and never sent has no
+    /// `meta.messageId` and is left out.
+    #[tokio::test]
+    async fn a_threads_sent_files_carry_their_message() {
+        let server = MockServer::start().await;
+        let row = |id: &str, meta: serde_json::Value| {
+            json!({
+                "id": id, "accountId": "acct_1", "kind": "attachment",
+                "mime": "image/png", "filename": "s.png", "sizeBytes": 9,
+                "recipeId": null, "runId": null, "stepIndex": null, "threadId": "th_1",
+                "meta": meta, "createdAtMs": 1, "deletedAtMs": null
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/artifacts"))
+            .and(wiremock::matchers::query_param("threadId", "th_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                row("art_1", json!({"messageId": "msg_1"})),
+                row("art_2", json!({}))
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let sent = client.sent_attachments("th_1").await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            (sent[0].file.id.as_str(), sent[0].message_id.as_str()),
+            ("art_1", "msg_1")
+        );
     }
 
     #[tokio::test]
