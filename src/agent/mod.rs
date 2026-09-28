@@ -76,6 +76,11 @@
 //! while the routine has no trigger, and the webhook's three only while it has one, so
 //! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
 //!
+//! Files (#90): `composer-file-{i}` under `composer` (label = the file's name, value `uploading`
+//! / `ready` / `failed`); `message-file-{artId}` on the chat page for each file a message in the
+//! open thread carried (label = filename, value = the message id). Invoke `composer.attach --arg
+//! path=…` attaches a file by path, as picking it with the + would; it uploads at once.
+//!
 //! The draft's chips: `composer-chip-{i}` under `composer`, in order (label = what the chip reads
 //! as, value `tool` / `recipe` / `workflow` / `skill`). A chip is one object in the field (#40):
 //! one Backspace after it removes it whole.

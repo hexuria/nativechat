@@ -2714,6 +2714,12 @@ pub struct AppState {
     /// The chips in the draft, in order, as (kind, label). Published by the composer for the same
     /// reason as [`Self::composer_panel`]: the field is the view's, and a driver sees the state.
     pub composer_chips: Vec<(crate::components::chat_input::TokenKind, String)>,
+    /// The files on the draft, as (name, `uploading` / `ready` / `failed`), published by the
+    /// composer for a driver like its chips.
+    pub composer_files: Vec<(String, &'static str)>,
+    /// Files a driver asked the composer to attach, by path: the OS picker is not something a
+    /// driver can work, so it hands the composer the paths it would have picked.
+    pub attach_requests: Vec<std::path::PathBuf>,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -2752,6 +2758,12 @@ pub struct AppState {
     pending_read_aloud: Option<(String, String)>,
     pub native_tts: SourceTtsState,
     pub opengrok: Option<OpenGrokClient>,
+    /// The files each of the person's messages carried, by message id (#90). Filled when a
+    /// message is sent with files, and from the server's list of a thread's files when the
+    /// thread is replayed: the replayed frames carry a message's words, not its files.
+    pub message_files: HashMap<String, Vec<crate::opengrok::Attachment>>,
+    /// The files the composer handed over with the draft, taken by the send that follows.
+    draft_files: Vec<crate::opengrok::Attachment>,
     pub account: Option<Account>,
     pub auth_status: AuthStatus,
     /// What the server refused, and why. Verdicts only: a sign-in that was turned down, a patch
@@ -3335,6 +3347,8 @@ impl AppState {
             picked_tools: Vec::new(),
             active_recipe: None,
             active_skill: None,
+            composer_files: Vec::new(),
+            attach_requests: Vec::new(),
             composer_chips: Vec::new(),
             composer_panel: None,
             is_app_settings_open: false,
@@ -3364,6 +3378,8 @@ impl AppState {
             pending_read_aloud: None,
             native_tts: SourceTtsState::default(),
             opengrok: None,
+            message_files: HashMap::new(),
+            draft_files: Vec::new(),
             account: None,
             auth_status: AuthStatus::SignedOut,
             auth_error: None,
@@ -7494,6 +7510,23 @@ impl AppState {
         true
     }
 
+    pub fn set_composer_files(
+        &mut self,
+        files: Vec<(String, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_files != files {
+            self.composer_files = files;
+            cx.notify();
+        }
+    }
+
+    /// Ask the composer to attach a file, as picking it would.
+    pub fn request_attach(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.attach_requests.push(path);
+        cx.notify();
+    }
+
     /// Say which chips the draft holds, for a driver: the field is the composer's own.
     pub fn set_composer_chips(
         &mut self,
@@ -8824,7 +8857,21 @@ impl AppState {
         let conversation_id = conversation_id.to_string();
         cx.spawn(async move |this, cx| {
             let thread = client.replay_thread(&conversation_id, RECONCILE_RUNS).await;
+            let files = client.sent_attachments(&conversation_id).await;
             let _ = this.update(cx, |state, cx| {
+                // What the server says each message carried is the answer, message by message;
+                // a thread it cannot list keeps what this session already knows.
+                if let Ok(files) = files {
+                    let mut by_message: HashMap<String, Vec<crate::opengrok::Attachment>> =
+                        HashMap::new();
+                    for sent in files {
+                        by_message
+                            .entry(sent.message_id)
+                            .or_default()
+                            .push(sent.file);
+                    }
+                    state.message_files.extend(by_message);
+                }
                 match thread {
                     Ok(thread) => {
                         state.reconciled_threads.insert(conversation_id.clone());
@@ -9453,6 +9500,13 @@ impl AppState {
             .find(|c| c.id == conversation_id)
             .map(|c| agui_messages(&c.messages))
             .unwrap_or_default();
+        // Each of the person's messages names the files it carried, every turn: the server
+        // names an earlier message's files to the model rather than sending them again.
+        for message in &mut history {
+            if let Some(files) = self.message_files.get(&message.id) {
+                message.attachments = files.clone();
+            }
+        }
         let Some(held) = drained else {
             return history;
         };
@@ -13032,7 +13086,16 @@ impl AppState {
     /// off the draft. It is taken before the guards below rather than after, which is what the
     /// composer does with the chip: a send the app refuses empties the field and the chip with
     /// it, so a skill left attached would be one nothing on screen still mentions.
-    pub fn send_draft(&mut self, content: String, force_steer: bool, cx: &mut Context<Self>) {
+    pub fn send_draft(
+        &mut self,
+        content: String,
+        force_steer: bool,
+        files: Vec<crate::opengrok::Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        // Already uploaded (the composer uploads a file the moment it is picked); what goes with
+        // the message is the ids.
+        self.draft_files = files;
         let skill = self.take_draft_skill();
         self.send_message_with(content, force_steer, skill, cx);
     }
@@ -13047,6 +13110,8 @@ impl AppState {
         skill: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        // Taken first, so a send refused below does not leave them to ride on the next one.
+        let files = std::mem::take(&mut self.draft_files);
         if !self.is_signed_in() {
             self.auth_error = Some("Sign in first".to_string());
             cx.notify();
@@ -13084,6 +13149,9 @@ impl AppState {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
 
         let local_id = uuid::Uuid::now_v7().to_string();
+        if !files.is_empty() {
+            self.message_files.insert(local_id.clone(), files);
+        }
         // The bubble and its row are stamped with one moment, so the thread reads back in the
         // order it was said in.
         let said_at = SystemTime::now();

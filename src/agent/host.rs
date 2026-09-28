@@ -492,6 +492,8 @@ pub enum Command {
         message_id: String,
     },
     ToggleAgentTools,
+    /// Attach a file to the draft by path, as the + would (#90).
+    AttachFile(std::path::PathBuf),
     UserFormDismiss {
         card_key: String,
     },
@@ -703,6 +705,7 @@ impl Command {
             }
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
+            Self::AttachFile(path) => state.request_attach(path, cx),
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -2017,6 +2020,10 @@ pub struct NativeChatHost {
     composer_panel: Option<PanelMode>,
     /// The draft's chips, in order: (kind, label).
     composer_chips: Vec<(crate::components::chat_input::TokenKind, String)>,
+    /// The draft's files: (name, `uploading` / `ready` / `failed`).
+    composer_files: Vec<(String, &'static str)>,
+    /// The files the open thread's messages carried, in order: (art id, filename, message id).
+    sent_files: Vec<(String, String, String)>,
     panel_rows: Vec<PanelRow>,
     /// The recipe the next message runs, as the composer's bar shows it.
     recipe_bar: Option<RecipeBarSnap>,
@@ -2333,6 +2340,22 @@ impl NativeChatHost {
                 .collect(),
             composer_panel: state.composer_panel,
             composer_chips: state.composer_chips.clone(),
+            composer_files: state.composer_files.clone(),
+            sent_files: state
+                .active_thread_messages()
+                .iter()
+                .filter_map(|message| {
+                    state
+                        .message_files
+                        .get(&message.id)
+                        .map(|files| (message.id.clone(), files))
+                })
+                .flat_map(|(message, files)| {
+                    files
+                        .iter()
+                        .map(move |file| (file.id.clone(), file.filename.clone(), message.clone()))
+                })
+                .collect(),
             panel_rows: state
                 .composer_panel
                 .map(|mode| {
@@ -2681,6 +2704,12 @@ impl NativeChatHost {
             ));
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
+        }
+        for (id, filename, message) in &self.sent_files {
+            page = page.with_child(
+                UiNode::status(format!("message-file-{id}"), filename.clone())
+                    .with_value(message.clone()),
+            );
         }
         for node in self.reply_run_nodes() {
             page = page.with_child(node);
@@ -3354,6 +3383,11 @@ impl NativeChatHost {
             };
             node = node.with_child(
                 UiNode::status(format!("composer-chip-{i}"), label.clone()).with_value(kind),
+            );
+        }
+        for (i, (name, state)) in self.composer_files.iter().enumerate() {
+            node = node.with_child(
+                UiNode::status(format!("composer-file-{i}"), name.clone()).with_value(*state),
             );
         }
         node
@@ -4543,6 +4577,11 @@ impl NativeChatHost {
                 Command::SetAvatarColor(id)
             }
             "theme.toggle" => Command::ToggleTheme,
+            "composer.attach" => Command::AttachFile(
+                invoke_arg_str(args, &["path"])
+                    .ok_or("composer.attach requires arg path")?
+                    .into(),
+            ),
             "computer.toggle" => Command::ToggleComputerPane,
             "computer.open" => Command::OpenCoworkerScreen,
             "computer.update" => Command::OpenComputerConfirm(crate::state::ComputerAction::Update),
@@ -8509,5 +8548,39 @@ mod tests {
             Some("skill")
         );
         assert!(tree.find("composer-chip-2").is_none());
+    }
+
+    /// The draft's files and a thread's sent files are on the tree, and a driver can attach one.
+    #[test]
+    fn files_are_on_the_tree_and_a_driver_can_attach_one() {
+        let mut host = host();
+        host.composer_files = vec![("q3.pdf".into(), "uploading"), ("a.png".into(), "ready")];
+        host.sent_files = vec![("art_1".into(), "notes.txt".into(), "msg_1".into())];
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("composer-file-0").unwrap().value.as_deref(),
+            Some("uploading")
+        );
+        assert_eq!(tree.find("composer-file-1").unwrap().name, "a.png");
+        let sent = tree.find("message-file-art_1").unwrap();
+        assert_eq!(
+            (sent.name.as_str(), sent.value.as_deref()),
+            ("notes.txt", Some("msg_1"))
+        );
+        host.invoke(
+            "composer.attach",
+            &serde_json::json!({"path": "/tmp/q3.pdf"}),
+        )
+        .unwrap();
+        match host.take_command() {
+            Some(Command::AttachFile(path)) => {
+                assert_eq!(path, std::path::PathBuf::from("/tmp/q3.pdf"))
+            }
+            other => panic!("expected an attach, got {other:?}"),
+        }
+        assert!(
+            host.invoke("composer.attach", &serde_json::json!({}))
+                .is_err()
+        );
     }
 }
