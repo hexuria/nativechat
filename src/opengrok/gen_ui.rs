@@ -573,6 +573,91 @@ pub struct FormField {
     pub options: Vec<String>,
 }
 
+/// Where a choice card stands. Nothing about it is kept: it is read off the thread, so it
+/// survives a restart and a replay, and a card answered from another Mac reads as answered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChoiceCard {
+    /// Still asking, and the person has said nothing since.
+    Open,
+    /// The person's next message is this card's answer: what they picked, by field id.
+    Answered(std::collections::HashMap<String, String>),
+    /// The person wrote something else after it. The bot has moved on with them, so the card
+    /// no longer takes an answer: one sent now would answer a question nobody is asking.
+    MovedOn,
+    /// Put away with its ✕ in this session. Nothing is sent: the server acknowledged the form
+    /// when it was drawn and the run did not wait on it, so there is nothing to tell it.
+    Dismissed,
+}
+
+/// The letter a choice's keycap wears and the key that picks it: A for the first.
+pub fn choice_letter(index: usize) -> Option<char> {
+    u8::try_from(index)
+        .ok()
+        .filter(|at| *at < 26)
+        .map(|at| char::from(b'A' + at))
+}
+
+/// Which choice a key picks: `a` or `A` is the first. Anything else picks nothing.
+pub fn choice_index(key: &str) -> Option<usize> {
+    let mut chars = key.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    ch.is_ascii_alphabetic()
+        .then(|| usize::from(ch.to_ascii_uppercase() as u8 - b'A'))
+}
+
+impl FormSpec {
+    /// A one-question card answers the moment a choice is picked, the way Grok Bot's does;
+    /// a card with several questions keeps its button, since one pick is not the whole answer.
+    pub fn answers_on_pick(&self) -> bool {
+        matches!(self.fields.as_slice(), [field] if !field.options.is_empty())
+    }
+
+    /// The words an answer is sent as: the card's title, then one `Label: choice` line per
+    /// question answered. This is what the model has always been sent for a form.
+    pub fn answer_text(&self, picks: &std::collections::HashMap<String, String>) -> String {
+        let mut lines = Vec::new();
+        if let Some(title) = &self.title {
+            lines.push(title.clone());
+        }
+        for field in &self.fields {
+            if let Some(value) = picks.get(&field.id) {
+                lines.push(format!("{}: {value}", field.label));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// The picks a message holds when it is this card's answer, read back from
+    /// [`Self::answer_text`]'s words. Every line has to be the title or one of the card's own
+    /// choices, so a person's own sentence after the card is never taken for an answer.
+    pub fn answer_in(&self, text: &str) -> Option<std::collections::HashMap<String, String>> {
+        let lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let mut picks = std::collections::HashMap::new();
+        let mut first = true;
+        for line in lines {
+            if first && self.title.as_deref().map(str::trim) == Some(line) {
+                first = false;
+                continue;
+            }
+            first = false;
+            let (id, value) = self.fields.iter().find_map(|field| {
+                let value = line.strip_prefix(&format!("{}:", field.label))?.trim();
+                field
+                    .options
+                    .iter()
+                    .find(|option| option.trim() == value)
+                    .map(|option| (field.id.clone(), option.clone()))
+            })?;
+            if picks.insert(id, value).is_some() {
+                return None;
+            }
+        }
+        (!picks.is_empty()).then_some(picks)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedUiTool {
     pub id: String,
@@ -4251,6 +4336,85 @@ mod tests {
                 ] if before == "Size it first." && step.call_id == "c1" && after == "Then say so."
             ),
             "{parts:?}"
+        );
+    }
+
+    fn two_questions() -> FormSpec {
+        FormSpec {
+            title: Some("Setup".into()),
+            prompt: None,
+            fields: vec![
+                FormField {
+                    id: "size".into(),
+                    label: "Size".into(),
+                    options: vec!["Small".into(), "Large".into()],
+                },
+                FormField {
+                    id: "colour".into(),
+                    label: "Colour".into(),
+                    options: vec!["Red: dark".into(), "Blue".into()],
+                },
+            ],
+            submit: "Send".into(),
+        }
+    }
+
+    /// What a card sends is what reads back as its answer, choice for choice, including a
+    /// choice with a colon in it.
+    #[test]
+    fn a_choice_answer_reads_back_as_what_was_picked() {
+        let spec = two_questions();
+        let picks: std::collections::HashMap<String, String> = [
+            ("size".to_string(), "Large".to_string()),
+            ("colour".to_string(), "Red: dark".to_string()),
+        ]
+        .into();
+        let sent = spec.answer_text(&picks);
+        assert_eq!(sent, "Setup\nSize: Large\nColour: Red: dark");
+        assert_eq!(spec.answer_in(&sent), Some(picks));
+        let partial: std::collections::HashMap<String, String> =
+            [("size".to_string(), "Small".to_string())].into();
+        assert_eq!(
+            spec.answer_in("Size: Small"),
+            Some(partial),
+            "no title is fine"
+        );
+    }
+
+    /// Words that are not the card's own choices are the person talking, not an answer.
+    #[test]
+    fn words_that_are_not_the_cards_choices_are_not_its_answer() {
+        let spec = two_questions();
+        for text in [
+            "",
+            "Setup",
+            "Size: Medium",
+            "Size: Large\nand hurry",
+            "Size: Large\nSize: Small",
+            "I think Size: Large is best",
+        ] {
+            assert_eq!(spec.answer_in(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_choices_letter_is_its_key() {
+        assert_eq!(choice_letter(0), Some('A'));
+        assert_eq!(choice_letter(5), Some('F'));
+        assert_eq!(choice_letter(26), None);
+        assert_eq!(choice_index("a"), Some(0));
+        assert_eq!(choice_index("F"), Some(5));
+        for key in ["", "ab", "1", "enter", "é"] {
+            assert_eq!(choice_index(key), None, "{key:?}");
+        }
+        assert!(!two_questions().answers_on_pick());
+        let mut one = two_questions();
+        one.fields.truncate(1);
+        assert!(one.answers_on_pick());
+        one.fields[0].options.clear();
+        assert!(
+            !one.answers_on_pick(),
+            "a question with no choices has nothing to pick"
         );
     }
 }

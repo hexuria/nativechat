@@ -12,19 +12,19 @@ pub use crate::cron_spec::{
 };
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
-    BoxHandoffResolution, BoxShareScope, ChatPart, ComputerHandoffStatus, ConnectedComputer,
-    Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution, FormSpec, ImageVisibility,
-    LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue, NewSchedule, NewSkill,
-    OpenGrokClient, OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite,
-    ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun,
-    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, ReplyQuote, RunCause,
-    RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT,
-    SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus,
-    ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing,
-    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming,
-    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
-    UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay, approval_summary,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
+    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution,
+    FormSpec, ImageVisibility, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
+    NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
+    PendingUserMessage, PendingWrite, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
+    RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary,
+    ReplyQuote, RunCause, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
+    SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun,
+    ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
+    SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
+    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
+    approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
@@ -620,6 +620,48 @@ pub struct ThreadOrigin {
     /// this one: the thread's id is the schedule's, and the server answers a form posted under
     /// a coworker id it does not know with `null`, which reads as "Not filled".
     pub coworker_id: String,
+}
+
+/// Where the choice card on `message_id` stands.
+///
+/// Only the newest card asks. A card the bot followed with another card before the person
+/// said anything has been asked again, so it takes no answer and nothing later is read as its
+/// answer: the person's next words belong to the newer card. Otherwise the person's first
+/// message after the card decides it: that message is the card's answer
+/// ([`FormSpec::answer_in`]) or it is not, and then the thread has moved past the card. With
+/// nothing written since, the card is open unless it was put away this session.
+pub fn choice_card_in(
+    messages: &[Message],
+    message_id: &str,
+    spec: &FormSpec,
+    dismissed: bool,
+) -> ChoiceCard {
+    let later = messages
+        .iter()
+        .position(|message| message.id == message_id)
+        .map_or(&[][..], |at| &messages[at + 1..]);
+    let asked_again = later
+        .iter()
+        .take_while(|message| !message.is_me)
+        .any(carries_choice_card);
+    let next = later.iter().find(|message| message.is_me);
+    if !asked_again && let Some(picks) = next.and_then(|message| spec.answer_in(&message.content)) {
+        return ChoiceCard::Answered(picks);
+    }
+    if dismissed {
+        ChoiceCard::Dismissed
+    } else if asked_again || next.is_some() {
+        ChoiceCard::MovedOn
+    } else {
+        ChoiceCard::Open
+    }
+}
+
+fn carries_choice_card(message: &Message) -> bool {
+    message
+        .parts
+        .iter()
+        .any(|part| matches!(part, ChatPart::Ui(crate::opengrok::UiSpec::Form(_))))
 }
 
 /// The line over a routine's own instruction in its thread, where one is.
@@ -2758,6 +2800,9 @@ pub struct AppState {
     pub message_reactions: HashMap<String, String>,
     pub emoji_picker: Option<EmojiPickerOpen>,
     pub form_picks: HashMap<String, HashMap<String, String>>,
+    /// Choice cards put away with their ✕ this session, by message id. See
+    /// [`AppState::dismiss_choice`] for why nothing more lasting keeps them.
+    pub dismissed_choices: HashSet<String>,
     /// Checkbox / select picks on a user-form. Never passwords or other secrets —
     /// those stay in the transcript view's input state and are never written here.
     /// Keyed by [`crate::opengrok::UserFormSpec::card_key`].
@@ -3316,6 +3361,7 @@ impl AppState {
             message_reactions: HashMap::new(),
             emoji_picker: None,
             form_picks: HashMap::new(),
+            dismissed_choices: HashSet::new(),
             user_form_picks: HashMap::new(),
             user_form_typed: HashMap::new(),
             user_form_verbs_available: USER_FORM_SERVER_FILL_AVAILABLE,
@@ -12735,25 +12781,140 @@ impl AppState {
     pub fn submit_form(&mut self, message_id: String, spec: FormSpec, cx: &mut Context<Self>) {
         // Generative UI only. User-form secrets must never take this path:
         // it concatenates values into `send_message` / AG-UI `content`.
+        //
+        // A card that is not open takes no answer: sending it twice, or answering a question the
+        // thread has moved past, would put words in the person's mouth the bot then acts on.
+        if self.choice_card(&message_id, &spec) != ChoiceCard::Open {
+            return;
+        }
         let picks = self
             .form_picks
             .get(&message_id)
             .cloned()
             .unwrap_or_default();
-        let mut lines = Vec::new();
-        if let Some(title) = &spec.title {
-            lines.push(title.clone());
+        // Nothing picked is nothing to say: the card's title alone reads to the bot as an
+        // answer that chose nothing.
+        if picks.is_empty() {
+            return;
         }
-        for field in &spec.fields {
-            if let Some(value) = picks.get(&field.id) {
-                lines.push(format!("{}: {value}", field.label));
-            }
-        }
-        let body = lines.join("\n");
+        let body = spec.answer_text(&picks);
         if body.trim().is_empty() {
             return;
         }
+        self.form_picks.remove(&message_id);
         self.send_message(body, cx);
+    }
+
+    /// The open thread's messages, oldest first; none while no thread is open.
+    pub(crate) fn active_thread_messages(&self) -> &[Message] {
+        self.active_conversation_id
+            .as_ref()
+            .and_then(|id| self.conversations.iter().find(|c| &c.id == id))
+            .map_or(&[], |conversation| conversation.messages.as_slice())
+    }
+
+    /// The choice card a message in the open thread carries: its last form, as drawn.
+    pub fn choice_spec(&self, message_id: &str) -> Option<FormSpec> {
+        self.active_thread_messages()
+            .iter()
+            .find(|message| message.id == message_id)?
+            .parts
+            .iter()
+            .rev()
+            .find_map(|part| match part {
+                ChatPart::Ui(crate::opengrok::UiSpec::Form(spec)) => Some(spec.clone()),
+                _ => None,
+            })
+    }
+
+    /// Where the card on `message_id` stands, read off the open thread: see [`choice_card_in`].
+    pub fn choice_card(&self, message_id: &str, spec: &FormSpec) -> ChoiceCard {
+        choice_card_in(
+            self.active_thread_messages(),
+            message_id,
+            spec,
+            self.dismissed_choices.contains(message_id),
+        )
+    }
+
+    /// The card a letter key answers: the newest card in the open thread, while it is open and
+    /// is one question. Only the newest, the way Grok Bot does it — an older card still open
+    /// is one the bot asked before it asked again, and a key should not reach past the newer.
+    pub fn keyed_choice(&self) -> Option<String> {
+        let messages = self.active_thread_messages();
+        let (message, spec) = messages.iter().rev().find_map(|message| {
+            message.parts.iter().rev().find_map(|part| match part {
+                ChatPart::Ui(crate::opengrok::UiSpec::Form(spec)) => Some((message, spec)),
+                _ => None,
+            })
+        })?;
+        (spec.answers_on_pick() && self.choice_card(&message.id, spec) == ChoiceCard::Open)
+            .then(|| message.id.clone())
+    }
+
+    /// A choice picked on a card, by a click or a driver. A one-question card sends the answer
+    /// there and then; a card with several questions holds the pick until its button is pressed.
+    pub fn choose(
+        &mut self,
+        message_id: String,
+        field_index: usize,
+        option_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(spec) = self.choice_spec(&message_id) else {
+            return;
+        };
+        if self.choice_card(&message_id, &spec) != ChoiceCard::Open {
+            return;
+        }
+        let Some(field) = spec.fields.get(field_index) else {
+            return;
+        };
+        let Some(value) = field.options.get(option_index).cloned() else {
+            return;
+        };
+        let field_id = field.id.clone();
+        if spec.answers_on_pick() {
+            self.form_picks
+                .entry(message_id.clone())
+                .or_default()
+                .insert(field_id, value);
+            self.submit_form(message_id, spec, cx);
+        } else {
+            self.pick_form_option(message_id, field_id, value, cx);
+        }
+    }
+
+    /// A letter key pressed while no field has the caret: the choice with that letter on the
+    /// newest open card. Says whether it answered, so a key that did nothing goes on its way.
+    pub fn answer_keyed_choice(&mut self, option_index: usize, cx: &mut Context<Self>) -> bool {
+        let Some(message_id) = self.keyed_choice() else {
+            return false;
+        };
+        let Some(spec) = self.choice_spec(&message_id) else {
+            return false;
+        };
+        if spec.fields.first().map_or(0, |field| field.options.len()) <= option_index {
+            return false;
+        }
+        self.choose(message_id, 0, option_index, cx);
+        true
+    }
+
+    /// The card's ✕: put it away without answering. Nothing is sent and the bot is not woken —
+    /// the server acknowledged the form when it drew it (`chat_ui.rs` in opengrok-server) and
+    /// the run went on without waiting, so there is no one to tell. It lasts this session: no
+    /// server route keeps it, and the thread reads it as moved past once the person writes.
+    pub fn dismiss_choice(&mut self, message_id: String, cx: &mut Context<Self>) {
+        let Some(spec) = self.choice_spec(&message_id) else {
+            return;
+        };
+        if self.choice_card(&message_id, &spec) != ChoiceCard::Open {
+            return;
+        }
+        self.form_picks.remove(&message_id);
+        self.dismissed_choices.insert(message_id);
+        cx.notify();
     }
 
     /// Words from somewhere other than the composer: a form's answer, a driver's `chat.send`.
@@ -17032,18 +17193,19 @@ mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
         ActiveRecipe, ActivityTick, AfterRefusal, AppState, BotActivity, ChatMessage, ChatPart,
-        Conversation, DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message, ModelCatalogue,
-        PickedKind, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredQuestion,
-        RecoveredReply, RouteTrafficSurface, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SaveStamp,
-        SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill,
-        ThreadRun, TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS,
-        agui_messages, apply_catalogue, apply_reload, apply_timing, bot_status_line,
-        bubble_for_run, clock_label, graft_questions, graft_reply, hide_messages_of_runs,
-        is_status_line, is_tool_standin, is_unsent_turn_note, keep_reply, mark_enabled,
-        missing_questions, missing_replies, overlay_server_cards, parse_sql_time,
-        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, reply_to_keep,
-        restored_message, restored_parts, saved_parts, spec_from_queued, stamp_run_finished,
-        stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending, unheard_hidden_runs,
+        ChoiceCard, Conversation, DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message,
+        ModelCatalogue, PickedKind, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary,
+        RecoveredQuestion, RecoveredReply, RouteTrafficSurface, STOP_UNSENT_NOTE,
+        STOPPED_TURN_NOTE, SaveStamp, SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE,
+        TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun, TurnAssembler, TurnEnding,
+        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
+        apply_reload, apply_timing, bot_status_line, bubble_for_run, choice_card_in, clock_label,
+        graft_questions, graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin,
+        is_unsent_turn_note, keep_reply, mark_enabled, missing_questions, missing_replies,
+        overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable, replayed_ending,
+        reply_from_replay, reply_to_keep, restored_message, restored_parts, saved_parts,
+        spec_from_queued, stamp_run_finished, stream_paint_due, stream_part_sig,
+        streaming_message_mut, turn_ending, unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -24502,5 +24664,142 @@ mod tests {
         assert_eq!(next, super::AfterRun::Done);
         assert_eq!(state.recipe_error.as_deref(), Some(busy));
         assert_eq!(state.recipe_busy, None);
+    }
+
+    fn choice(title: Option<&str>, fields: &[(&str, &[&str])]) -> FormSpec {
+        FormSpec {
+            title: title.map(str::to_string),
+            prompt: None,
+            fields: fields
+                .iter()
+                .map(|(label, options)| crate::opengrok::FormField {
+                    id: label.to_lowercase(),
+                    label: label.to_string(),
+                    options: options.iter().map(|option| option.to_string()).collect(),
+                })
+                .collect(),
+            submit: "Send".into(),
+        }
+    }
+
+    fn carrying(mut message: Message, spec: &FormSpec) -> Message {
+        message
+            .parts
+            .push(ChatPart::Ui(crate::opengrok::UiSpec::Form(spec.clone())));
+        message
+    }
+
+    /// The card is answered by the words it sent, read back off the thread, so a restart or a
+    /// replay still shows it answered and it cannot be sent a second time.
+    #[test]
+    fn a_choice_card_reads_its_answer_off_the_thread() {
+        let spec = choice(
+            Some("How do you want to continue?"),
+            &[("Next", &["Try again", "Try another way"])],
+        );
+        let asked = carrying(message("m_1", false, ""), &spec);
+        let answer = message(
+            "m_2",
+            true,
+            "How do you want to continue?\nNext: Try another way",
+        );
+        let messages = vec![asked.clone(), answer];
+        let expected: std::collections::HashMap<String, String> =
+            [("next".to_string(), "Try another way".to_string())].into();
+        assert_eq!(
+            choice_card_in(&messages, "m_1", &spec, false),
+            ChoiceCard::Answered(expected.clone())
+        );
+        assert_eq!(
+            choice_card_in(&messages, "m_1", &spec, true),
+            ChoiceCard::Answered(expected),
+            "an answer outlasts a ✕ pressed before it"
+        );
+        assert_eq!(
+            choice_card_in(std::slice::from_ref(&asked), "m_1", &spec, false),
+            ChoiceCard::Open
+        );
+        assert_eq!(
+            choice_card_in(std::slice::from_ref(&asked), "m_1", &spec, true),
+            ChoiceCard::Dismissed
+        );
+        let own_words = vec![asked, message("m_2", true, "Actually, stop there.")];
+        assert_eq!(
+            choice_card_in(&own_words, "m_1", &spec, false),
+            ChoiceCard::MovedOn,
+            "the person's own sentence is not an answer, and the card no longer asks"
+        );
+    }
+
+    /// Two cards open at once: the older was asked again by the newer, so it takes no answer,
+    /// and answering the newer never paints the older as answered too.
+    #[test]
+    fn only_the_newest_of_two_cards_is_open_and_answered() {
+        let spec = choice(Some("Pick"), &[("Go", &["Yes", "No"])]);
+        let older = carrying(message("m_1", false, ""), &spec);
+        let newer = carrying(message("m_2", false, ""), &spec);
+        let open = vec![older.clone(), newer.clone()];
+        assert_eq!(
+            choice_card_in(&open, "m_1", &spec, false),
+            ChoiceCard::MovedOn
+        );
+        assert_eq!(choice_card_in(&open, "m_2", &spec, false), ChoiceCard::Open);
+
+        let answered = vec![older, newer, message("m_3", true, "Pick\nGo: No")];
+        assert_eq!(
+            choice_card_in(&answered, "m_1", &spec, false),
+            ChoiceCard::MovedOn,
+            "the answer was the newer card's"
+        );
+        let expected: std::collections::HashMap<String, String> =
+            [("go".to_string(), "No".to_string())].into();
+        assert_eq!(
+            choice_card_in(&answered, "m_2", &spec, false),
+            ChoiceCard::Answered(expected)
+        );
+    }
+
+    /// Only the newest card takes a letter, and only while it is open and one question: a key
+    /// must never reach past a newer card to answer an older one.
+    #[test]
+    fn a_letter_answers_only_the_newest_open_one_question_card() {
+        let one = choice(Some("Pick"), &[("Go", &["Yes", "No"])]);
+        let two = choice(
+            Some("Setup"),
+            &[("Size", &["S", "M"]), ("Colour", &["Red"])],
+        );
+        let mut state = AppState::new();
+        let with = |state: &mut AppState, messages: Vec<Message>| {
+            state.conversations = vec![thread("cw_1", messages)];
+            state.active_conversation_id = Some("cw_1".into());
+        };
+        with(&mut state, vec![carrying(message("m_1", false, ""), &one)]);
+        assert_eq!(state.keyed_choice().as_deref(), Some("m_1"));
+
+        with(
+            &mut state,
+            vec![
+                carrying(message("m_1", false, ""), &one),
+                carrying(message("m_2", false, ""), &two),
+            ],
+        );
+        assert_eq!(
+            state.keyed_choice(),
+            None,
+            "the newest card has two questions, and the older one is not reached past it"
+        );
+
+        with(
+            &mut state,
+            vec![
+                carrying(message("m_1", false, ""), &one),
+                message("m_2", true, "Pick\nGo: No"),
+            ],
+        );
+        assert_eq!(state.keyed_choice(), None, "an answered card takes no key");
+
+        with(&mut state, vec![carrying(message("m_1", false, ""), &one)]);
+        state.dismissed_choices.insert("m_1".into());
+        assert_eq!(state.keyed_choice(), None, "a dismissed card takes no key");
     }
 }

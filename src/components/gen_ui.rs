@@ -1,7 +1,8 @@
 //! Native AG-UI widgets. Not markdown, not KaTeX.
 
 use crate::opengrok::{
-    ApprovalSpec, BarChartSpec, FormSpec, LocalExecResolution, ScreenshotSpec, UiSpec,
+    ApprovalSpec, BarChartSpec, ChoiceCard, FormSpec, LocalExecResolution, ScreenshotSpec, UiSpec,
+    choice_letter,
 };
 use crate::state::{AppState, ApprovalDecision};
 use gpui_kit::component::tooltip::Tooltip;
@@ -528,50 +529,166 @@ fn render_form(
     app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
-    // Generative choice chips → `submit_form` → `send_message`. Never used for
-    // passwords; those are `render_user_form`.
+    // Generative choice card → `send_message`. Never used for passwords; those are
+    // `render_user_form`.
     let theme = cx.theme();
-    let picks = app
-        .as_ref()
-        .map(|entity| entity.read(cx).form_picks.clone());
-    let mut body = v_flex().w_full().gap(px(10.));
-    if let Some(title) = &form.title {
-        body = body.child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title.clone()),
-        );
+    let (card, picks, keyed) = match app.as_ref() {
+        Some(entity) => {
+            let state = entity.read(cx);
+            (
+                state.choice_card(message_id, form),
+                state
+                    .form_picks
+                    .get(message_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                state.keyed_choice().as_deref() == Some(message_id),
+            )
+        }
+        None => (ChoiceCard::Open, Default::default(), false),
+    };
+    let heading = form.title.clone().or_else(|| form.prompt.clone());
+    let subtitle = form.title.as_ref().and(form.prompt.clone());
+    let title_el = |muted: bool| {
+        div()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .when(muted, |this| this.text_color(theme.muted_foreground))
+            .child(heading.clone().unwrap_or_default())
+    };
+    let pill = |words: &'static str| {
+        div()
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(999.))
+            .bg(theme.muted)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(words)
+    };
+    let shell = || {
+        v_flex()
+            .id(ElementId::Name(format!("choice-{message_id}").into()))
+            .w_full()
+            .gap(px(10.))
+    };
+    match card {
+        ChoiceCard::Dismissed | ChoiceCard::MovedOn => {
+            let words = if card == ChoiceCard::Dismissed {
+                "Dismissed"
+            } else {
+                "Not answered"
+            };
+            return shell()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap(px(8.))
+                        .items_center()
+                        .child(div().flex_1().child(title_el(true)))
+                        .child(pill(words)),
+                )
+                .into_any_element();
+        }
+        ChoiceCard::Answered(answer) => {
+            let mut body = shell().child(title_el(false));
+            for field in &form.fields {
+                let Some(value) = answer.get(&field.id) else {
+                    continue;
+                };
+                let letter = form
+                    .answers_on_pick()
+                    .then(|| field.options.iter().position(|option| option == value))
+                    .flatten()
+                    .and_then(choice_letter);
+                body = body.child(
+                    h_flex()
+                        .gap(px(8.))
+                        .items_center()
+                        .text_xs()
+                        .when_some(letter, |this, letter| this.child(keycap(letter, false, cx)))
+                        .when(!form.answers_on_pick(), |this| {
+                            this.child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("{}:", field.label)),
+                            )
+                        })
+                        .child(value.clone())
+                        .child(div().text_color(theme.primary).child("✓")),
+                );
+            }
+            return body.into_any_element();
+        }
+        ChoiceCard::Open => {}
     }
-    if let Some(prompt) = &form.prompt {
-        body = body.child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(prompt.clone()),
-        );
-    }
-    for field in &form.fields {
-        let selected = picks
-            .as_ref()
-            .and_then(|all| all.get(message_id))
-            .and_then(|fields| fields.get(&field.id))
-            .cloned();
-        let mut chips = h_flex().gap(px(6.)).flex_wrap();
-        for option in &field.options {
+
+    // Clicking the card itself takes the caret out of the composer, so the letters on the
+    // keycaps work: a letter typed into a field is the person's words, never an answer.
+    let mut body = shell().on_mouse_down(MouseButton::Left, |_, window, cx| window.blur(cx));
+    let dismiss = app.clone().map(|app| {
+        let message_id = message_id.to_string();
+        div()
+            .id(ElementId::Name(
+                format!("choice-{message_id}-dismiss").into(),
+            ))
+            .px(px(6.))
+            .rounded(px(6.))
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .cursor_pointer()
+            .hover(|this| this.bg(theme.muted))
+            .tooltip(|window, cx| Tooltip::new("Dismiss without answering").build(window, cx))
+            .child("✕")
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                app.update(cx, |state, cx| state.dismiss_choice(message_id.clone(), cx));
+            })
+    });
+    body = body.child(
+        h_flex()
+            .w_full()
+            .gap(px(8.))
+            .items_start()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .gap(px(4.))
+                    .child(title_el(false))
+                    .when_some(subtitle, |this, prompt| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(prompt),
+                        )
+                    }),
+            )
+            .children(dismiss),
+    );
+    let one_question = form.answers_on_pick();
+    for (field_index, field) in form.fields.iter().enumerate() {
+        let selected = picks.get(&field.id).cloned();
+        let mut options = if one_question {
+            v_flex().gap(px(6.))
+        } else {
+            h_flex().gap(px(6.)).flex_wrap()
+        };
+        for (option_index, option) in field.options.iter().enumerate() {
             let on = selected.as_deref() == Some(option.as_str());
             let message_id = message_id.to_string();
-            let field_id = field.id.clone();
-            let value = option.clone();
             let app = app.clone();
-            chips = chips.child(
-                div()
+            let letter = one_question.then(|| choice_letter(option_index)).flatten();
+            options = options.child(
+                h_flex()
                     .id(ElementId::Name(
-                        format!("form-{message_id}-{field_id}-{option}").into(),
+                        format!("choice-{message_id}-{field_index}-{option_index}").into(),
                     ))
+                    .gap(px(8.))
+                    .items_center()
                     .px(px(10.))
-                    .py(px(4.))
-                    .rounded(px(999.))
+                    .py(px(if one_question { 6. } else { 4. }))
+                    .rounded(px(if one_question { 8. } else { 999. }))
                     .border_1()
                     .border_color(if on { theme.primary } else { theme.border })
                     .bg(if on { theme.primary } else { theme.background })
@@ -582,16 +699,13 @@ fn render_form(
                     })
                     .text_xs()
                     .cursor_pointer()
+                    .hover(|this| this.border_color(theme.primary))
+                    .when_some(letter, |this, letter| this.child(keycap(letter, keyed, cx)))
                     .child(option.clone())
                     .when_some(app, |this, app| {
                         this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
                             app.update(cx, |state, cx| {
-                                state.pick_form_option(
-                                    message_id.clone(),
-                                    field_id.clone(),
-                                    value.clone(),
-                                    cx,
-                                );
+                                state.choose(message_id.clone(), field_index, option_index, cx);
                             });
                         })
                     }),
@@ -600,38 +714,70 @@ fn render_form(
         body = body.child(
             v_flex()
                 .gap(px(6.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(field.label.clone()),
-                )
-                .child(chips),
+                .when(!one_question, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(field.label.clone()),
+                    )
+                })
+                .child(options),
         );
+    }
+    if one_question {
+        return body.into_any_element();
     }
     let spec = form.clone();
     let message_id = message_id.to_string();
-    let app_submit = app.clone();
+    // In a row of its own so it is as wide as its word, not as the card.
     body.child(
-        div()
-            .id(ElementId::Name(format!("form-submit-{message_id}").into()))
-            .px(px(12.))
-            .py(px(6.))
-            .rounded(px(8.))
-            .bg(theme.primary)
-            .text_color(theme.primary_foreground)
-            .text_xs()
-            .cursor_pointer()
-            .child(form.submit.clone())
-            .when_some(app_submit, |this, app| {
-                this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    app.update(cx, |state, cx| {
-                        state.submit_form(message_id.clone(), spec.clone(), cx);
-                    });
-                })
-            }),
+        h_flex().child(
+            div()
+                .id(ElementId::Name(
+                    format!("choice-{message_id}-submit").into(),
+                ))
+                .px(px(12.))
+                .py(px(6.))
+                .rounded(px(8.))
+                .bg(theme.primary)
+                .text_color(theme.primary_foreground)
+                .text_xs()
+                .cursor_pointer()
+                .child(form.submit.clone())
+                .when_some(app, |this, app| {
+                    this.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        app.update(cx, |state, cx| {
+                            state.submit_form(message_id.clone(), spec.clone(), cx);
+                        });
+                    })
+                }),
+        ),
     )
     .into_any_element()
+}
+
+/// A choice's letter in a key-shaped box. Bright while the letter key answers this card, dim
+/// once it does not: on an older card, or on the answer the card settled on.
+fn keycap(letter: char, live: bool, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(18.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .text_color(if live {
+            theme.secondary_foreground
+        } else {
+            theme.muted_foreground
+        })
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .child(letter.to_string())
 }
 
 #[cfg(test)]
