@@ -107,6 +107,9 @@ const AGUI_TYPES: &[&str] = &[
     "TEXT_MESSAGE_START",
     "TEXT_MESSAGE_CONTENT",
     "TEXT_MESSAGE_CHUNK",
+    // Read in a replay: the person's message that closes with no words between is a message of
+    // files alone (opengrok-server#259), kept so its files have a bubble (`persons_messages`).
+    "TEXT_MESSAGE_END",
     "TOOL_CALL_START",
     "TOOL_CALL_ARGS",
     "TOOL_CALL_END",
@@ -421,12 +424,6 @@ const NOT_SENT_BY_SERVER: &[(Slot, &str, &str)] = &[
 /// Words the server sends that this app has no arm for, each with what happens instead.
 const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
     (
-        Slot::AguiType,
-        "TEXT_MESSAGE_END",
-        "Words are painted delta by delta and a turn ends on RUN_FINISHED or RUN_ERROR, so the \
-         end of one message changes nothing on screen.",
-    ),
-    (
         Slot::CustomName,
         "run-stopped",
         "The RUN_FINISHED the server always sends right after it (projection.rs stopped) ends \
@@ -719,6 +716,7 @@ fn check_frame(corpus: &Corpus, frame: &Value) -> Check {
             Ok(())
         }
         "TEXT_MESSAGE_CONTENT" => text_content(corpus, frame),
+        "TEXT_MESSAGE_END" => text_end(corpus, frame),
         "TOOL_CALL_START" => tool_call_start(frame),
         "TOOL_CALL_ARGS" => tool_call_args(corpus, frame),
         "TOOL_CALL_END" => tool_call_end(corpus, frame),
@@ -752,6 +750,35 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
         must!(
             said == Err(str_at(frame, "message").to_string()),
             "RUN_ERROR should end the turn with the server's sentence, got {said:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The end of a message closes it and paints nothing. It is read in one place: a person's message
+/// the replay opens and closes with no words between is kept, since that is a message of files
+/// alone (opengrok-server#259). So the end of a message with a known start must close it without
+/// adding a word to the coworker's reply, and a person's message closed on no words must survive.
+fn text_end(corpus: &Corpus, frame: &Value) -> Check {
+    let id = str_at(frame, "messageId");
+    must!(!id.is_empty(), "a TEXT_MESSAGE_END names no message");
+    let Some(start) = corpus
+        .frames_of("TEXT_MESSAGE_START")
+        .find(|start| start.get("messageId") == frame.get("messageId"))
+    else {
+        return Ok(());
+    };
+    let (before, _) = assembled(&[start]).snapshot();
+    let (after, _) = assembled(&[start, frame]).snapshot();
+    must!(
+        before == after,
+        "closing a message changed the words: {before:?} became {after:?}"
+    );
+    if str_at(start, "role") == "user" {
+        let kept = super::gen_ui::persons_messages(&[start.clone(), frame.clone()]);
+        must!(
+            kept.iter().any(|(said, _)| said == id),
+            "the person's message {id} closed on no words was dropped"
         );
     }
     Ok(())
