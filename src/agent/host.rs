@@ -2015,6 +2015,8 @@ pub struct NativeChatHost {
     routine_instructions: usize,
     /// The composer's panel, when one is open: which list it is, and the rows in it.
     composer_panel: Option<PanelMode>,
+    /// The draft's chips, in order: (kind, label).
+    composer_chips: Vec<(crate::components::chat_input::TokenKind, String)>,
     panel_rows: Vec<PanelRow>,
     /// The recipe the next message runs, as the composer's bar shows it.
     recipe_bar: Option<RecipeBarSnap>,
@@ -2330,6 +2332,7 @@ impl NativeChatHost {
                 .map(routine_snap)
                 .collect(),
             composer_panel: state.composer_panel,
+            composer_chips: state.composer_chips.clone(),
             panel_rows: state
                 .composer_panel
                 .map(|mode| {
@@ -2665,7 +2668,7 @@ impl NativeChatHost {
                 .with_child(UiNode::button(ids::FOOTER_SIGN_OUT, "Sign Out"));
 
         let mut page = UiNode::page(ids::PAGE, "Chat")
-            .with_child(UiNode::textbox(ids::COMPOSER, "Type a message..."))
+            .with_child(self.composer_node())
             .with_child(self.composer_send_node())
             .with_child(UiNode::new(
                 "transcript-tail",
@@ -3335,6 +3338,25 @@ impl NativeChatHost {
             }
         }
         None
+    }
+
+    /// `composer`, with a `composer-chip-{i}` per chip in the draft (label = what it reads as,
+    /// value = its kind: `tool` / `recipe` / `workflow` / `skill`), so a driver sees a chip as
+    /// the one object it is.
+    fn composer_node(&self) -> UiNode {
+        let mut node = UiNode::textbox(ids::COMPOSER, "Type a message...");
+        for (i, (kind, label)) in self.composer_chips.iter().enumerate() {
+            let kind = match kind {
+                crate::components::chat_input::TokenKind::Tool => "tool",
+                crate::components::chat_input::TokenKind::Recipe => "recipe",
+                crate::components::chat_input::TokenKind::Workflow => "workflow",
+                crate::components::chat_input::TokenKind::Skill => "skill",
+            };
+            node = node.with_child(
+                UiNode::status(format!("composer-chip-{i}"), label.clone()).with_value(kind),
+            );
+        }
+        node
     }
 
     fn user_form_command(&self, target: &str) -> Option<Command> {
@@ -8467,5 +8489,25 @@ mod tests {
         ));
         host.agent_tools_open = true;
         assert!(host.snapshot().find("agent-tool-shell").unwrap().visible);
+    }
+
+    /// The draft's chips are on the tree as objects under the composer, in order, with their kind.
+    #[test]
+    fn a_drafts_chips_are_on_the_tree() {
+        use crate::components::chat_input::TokenKind;
+        let mut host = host();
+        host.composer_chips = vec![
+            (TokenKind::Recipe, "Weekly report".into()),
+            (TokenKind::Skill, "Tone".into()),
+        ];
+        let tree = host.snapshot();
+        let recipe = tree.find("composer-chip-0").unwrap();
+        assert_eq!(recipe.name, "Weekly report");
+        assert_eq!(recipe.value.as_deref(), Some("recipe"));
+        assert_eq!(
+            tree.find("composer-chip-1").unwrap().value.as_deref(),
+            Some("skill")
+        );
+        assert!(tree.find("composer-chip-2").is_none());
     }
 }

@@ -31,6 +31,9 @@ agent = ["dep:gpui-agent"]
 
 [dependencies]
 gpui-kit = "0.6"
+# Grapheme boundaries for the composer's caret and deletes (#40): one press of Backspace is one
+# thing a person sees, an emoji with its modifiers or a letter with its accent.
+unicode-segmentation = "1.12"
 gpui-fps = "0.6"
 # Pinned to a commit: a git dependency with no rev follows whatever its branch says today, so
 # two builds of the same tree could get two different agents.

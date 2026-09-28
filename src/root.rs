@@ -193,7 +193,11 @@ impl RootView {
         // a panel that is about to open as shut. The flag is read first because pressing a key
         // can draw the window, and that draw comes back through here.
         if self.agent_pressing || self.type_for_agent(window, cx) {
-            cx.notify();
+            // This runs inside the window's draw, where a notify is dropped: ask for the next
+            // frame outright. The driver used to get it from the old text field's blinking caret,
+            // which drew a frame every half second; without that, a `type` waiting its one frame
+            // with the caret in the composer waited for ever (#40).
+            window.request_animation_frame();
             return;
         }
         while let Some(posted) = self.agent_backlog.pop_front() {
@@ -266,6 +270,8 @@ impl RootView {
                 cx.quit();
             }
             cx.notify();
+            // Inside the draw, so the notify above is not enough on its own (see above).
+            window.request_animation_frame();
             // The rest of the backlog waits for those keys: the op after a `type` is nearly
             // always the one asking what the typing did.
             if !self.agent_keys.is_empty() {

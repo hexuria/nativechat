@@ -220,6 +220,8 @@ fn main() {
             cx.on_action(quit);
 
             gpui_kit::init(cx);
+            // The composer's own field and its keys (#40).
+            nativechat::components::composer_editor::init(cx);
             theme::init(cx);
 
             set_menus(cx);
