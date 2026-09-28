@@ -20913,6 +20913,39 @@ mod tests {
         );
     }
 
+    /// Files cannot wait in the queue, so a send with files asks first; and a held message whose
+    /// files would not come back with Edit says so and forgets them (review of #135).
+    #[test]
+    fn files_never_wait_in_the_queue_and_edit_says_they_went() {
+        let mut state = holding("m_held", "see these");
+        assert!(
+            state.would_queue(false),
+            "a running turn: a send would wait"
+        );
+        assert!(!state.would_queue(true), "⌘⇧↵ sends now, so files may go");
+        state.message_files.insert(
+            "m_held".into(),
+            vec![crate::opengrok::Attachment {
+                id: "art_1".into(),
+                mime: "image/png".into(),
+                filename: "a.png".into(),
+                size_bytes: 1,
+            }],
+        );
+        let refill = state
+            .take_hold_for_edit("m_held", "")
+            .expect("the hold comes back");
+        assert!(
+            refill
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("files on that message were not kept")),
+            "{:?}",
+            refill.notice
+        );
+        assert!(!state.message_files.contains_key("m_held"));
+    }
+
     /// The draft after Edit is the held message as it was sent: its reply or none, its skill
     /// or none, and no recipe the composer had picked up since.
     #[test]

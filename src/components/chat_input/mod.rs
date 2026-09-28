@@ -125,10 +125,19 @@ pub fn file_caveat(files: &[DraftFile]) -> Option<String> {
         file.mime.starts_with("image/")
             && (!SHOWN.contains(&file.mime.as_str()) || file.size > PICTURE_MAX)
     });
-    let pictures = files
+    // The pictures the model is shown, in order, until 8 of them or 20 MiB between them: the
+    // server's per-turn budget (`docs/setup/nativechat.md`). The rest go by name.
+    const TURN_BUDGET: u64 = 20 * 1024 * 1024;
+    let shown: Vec<&DraftFile> = files
         .iter()
         .filter(|file| SHOWN.contains(&file.mime.as_str()) && file.size <= PICTURE_MAX)
-        .count();
+        .collect();
+    let pictures = shown.len();
+    let mut spent = 0u64;
+    let over_budget = shown.iter().take(8).any(|file| {
+        spent += file.size;
+        spent > TURN_BUDGET
+    });
     let mut lines = Vec::new();
     if pdf {
         lines.push("The bot sees a PDF's name, not its text yet.");
@@ -143,6 +152,9 @@ pub fn file_caveat(files: &[DraftFile]) -> Option<String> {
     }
     if pictures > 8 {
         lines.push("The bot is shown 8 pictures a message; the rest go by name.");
+    }
+    if over_budget {
+        lines.push("The bot is shown 20 MB of pictures a message; the rest go by name.");
     }
     if files.iter().any(|file| file.mime.starts_with("text/")) {
         lines.push("A text file is read up to its first 20,000 characters.");
@@ -1503,16 +1515,21 @@ impl MessageInput {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".to_string());
-            let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+            // A file whose size cannot be read is not read either: reading it whole is exactly
+            // what the size check exists to avoid.
+            let size = std::fs::metadata(&path).map(|meta| meta.len());
             self.next_file_key += 1;
             let key = self.next_file_key;
             // Over the server's cap the file is refused here, before it is read into memory: a
             // screen recording can be gigabytes (review of #135).
-            let state = if size > crate::opengrok::MAX_ATTACHMENT_BYTES as u64 {
-                FileState::Failed("artifacts must be under 25 MiB".to_string())
-            } else {
-                FileState::Uploading
+            let state = match &size {
+                Err(error) => FileState::Failed(format!("The file could not be read: {error}")),
+                Ok(size) if *size > crate::opengrok::MAX_ATTACHMENT_BYTES as u64 => {
+                    FileState::Failed("artifacts must be under 25 MiB".to_string())
+                }
+                Ok(_) => FileState::Uploading,
             };
+            let size = size.unwrap_or(0);
             let upload = state == FileState::Uploading;
             self.attachments.push(DraftFile {
                 key,
@@ -2845,5 +2862,18 @@ mod tests {
                 .unwrap()
                 .contains("20,000")
         );
+        // Three 8 MB pictures pass the 20 MB a message; the third goes by name (Cursor on #135).
+        let eight_mb = |name: &str| DraftFile {
+            size: 8 * 1024 * 1024,
+            ..file(name, "image/png")
+        };
+        let two = file_caveat(&[eight_mb("a.png"), eight_mb("b.png")]);
+        assert!(
+            two.as_deref().is_none_or(|said| !said.contains("20 MB")),
+            "{two:?}"
+        );
+        let three =
+            file_caveat(&[eight_mb("a.png"), eight_mb("b.png"), eight_mb("c.png")]).unwrap();
+        assert!(three.contains("20 MB of pictures"), "{three}");
     }
 }
