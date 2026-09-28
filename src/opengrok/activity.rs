@@ -281,7 +281,9 @@ fn short_command(command: &str) -> String {
     out
 }
 
-fn describe_tool(name: &str, args: Option<&str>) -> String {
+/// What a call is doing, in a line: the status strip says it while the call runs, and the call's
+/// step row in the reply says it afterwards.
+pub(crate) fn describe_tool(name: &str, args: Option<&str>) -> String {
     let parsed = args.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
     let path = parsed
         .as_ref()
@@ -340,6 +342,30 @@ fn describe_tool(name: &str, args: Option<&str>) -> String {
         "" => "Working".into(),
         other => format!("Using {other}"),
     }
+}
+
+/// A call's arguments as its opened step row shows them, by the tools [`describe_tool`] names:
+/// a shell's command and a file tool's path, which are what those calls mean, and any other
+/// call's arguments as JSON laid out to be read. Arguments that do not parse — cut at the cap,
+/// or never JSON — are shown as they came. Nothing is decoded: typed text the server has
+/// already kept off the wire reads `«redacted»` here as it does there.
+pub(crate) fn describe_arguments(name: &str, args: &str) -> Option<String> {
+    if args.trim().is_empty() {
+        return None;
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(args) else {
+        return Some(args.to_string());
+    };
+    let field = |key: &str| parsed.get(key).and_then(Value::as_str).map(str::to_string);
+    let said = match name {
+        "shell" | "Shell" | "BoxShell" | "shellToolCall" | "ExternalShell" => field("command"),
+        super::gen_ui::USER_MACHINE_SHELL => field("command"),
+        "Read" | "ExternalRead" | "BoxRead" | "readToolCall" | "read_file" | "write_file" => {
+            field("path")
+        }
+        _ => None,
+    };
+    said.or_else(|| serde_json::to_string_pretty(&parsed).ok())
 }
 
 #[cfg(test)]

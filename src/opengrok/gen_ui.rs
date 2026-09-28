@@ -31,6 +31,188 @@ pub enum ChatPart {
     UserForm(UserFormSpec),
     /// Opt-in save prompt after Continue. Origin + username only — never a password.
     SaveLogin(SaveLoginSpec),
+    /// A tool call the coworker made, where it made it: a collapsed row between the words
+    /// around it. A chart, a form and a user-form are not steps; they are drawn as themselves.
+    Step(StepSpec),
+    /// What the coworker thought on the way (`REASONING_MESSAGE_*`), as a collapsed "Thought"
+    /// row. It is never part of the reply's words.
+    Reasoning(String),
+}
+
+/// One tool call as the reply shows it, from what the server sent for it: `TOOL_CALL_START`
+/// `{toolCallId, toolCallName}`, `TOOL_CALL_ARGS` `{toolCallId, delta}` and `TOOL_CALL_RESULT`
+/// `{toolCallId, content, ok}` (opengrok-harness `projection.rs` `push` and `push_tool_result`,
+/// as `fixtures/wire/agui/TOOL_CALL_*` carries them).
+///
+/// What the row says is not kept. It is worked out from `tool` and `arguments` when the row is
+/// drawn, by the words the status line uses for the same call, so the two cannot disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepSpec {
+    pub call_id: String,
+    /// `toolCallName`, as sent.
+    pub tool: String,
+    /// The arguments as JSON, once they have all arrived, held to what the approval card may
+    /// say of the call ([`step_arguments`]) and kept to [`STEP_TEXT_CAP`]. Empty until then.
+    pub arguments: String,
+    /// `TOOL_CALL_RESULT.content`, kept to [`STEP_TEXT_CAP`]. `None` until it arrives.
+    pub result: Option<String>,
+    /// `TOOL_CALL_RESULT.ok`. `None` until it arrives.
+    pub ok: Option<bool>,
+}
+
+/// How much of a step's arguments and of its result, and of a thought, is kept: a step row is
+/// cloned into every repaint of a turn that can run to hundreds of them, a shell's output can
+/// be megabytes, and so can a model's reasoning.
+pub(crate) const STEP_TEXT_CAP: usize = 4 * 1024;
+
+/// How a step came out, as its row marks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    /// No result yet.
+    Running,
+    Ok,
+    Failed,
+}
+
+impl StepStatus {
+    /// The word gpui-agent reads.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// The mark at the front of the row.
+    pub fn mark(self) -> &'static str {
+        match self {
+            Self::Running => "…",
+            Self::Ok => "✓",
+            Self::Failed => "✗",
+        }
+    }
+}
+
+impl StepSpec {
+    /// What the row says the call did: "Running `cargo test`", "Reading main.rs", "Using
+    /// <tool>". The status line's own words for the call.
+    pub fn label(&self) -> String {
+        super::activity::describe_tool(&self.tool, Some(&self.arguments))
+    }
+
+    pub fn status(&self) -> StepStatus {
+        match (&self.result, self.ok) {
+            (None, _) => StepStatus::Running,
+            (Some(_), Some(false)) => StepStatus::Failed,
+            (Some(_), _) => StepStatus::Ok,
+        }
+    }
+
+    /// The arguments as the opened row shows them. See [`super::activity::describe_arguments`].
+    pub fn shown_arguments(&self) -> Option<String> {
+        super::activity::describe_arguments(&self.tool, &self.arguments)
+    }
+
+    /// The step as its database row keeps it (`chat_message_parts.text` of a `step` row), for
+    /// [`Self::from_value`] to read back unchanged. The call id has a column of its own.
+    pub fn to_value(&self) -> Value {
+        serde_json::json!({
+            "tool": self.tool,
+            "arguments": self.arguments,
+            "result": self.result,
+            "ok": self.ok,
+        })
+    }
+
+    /// A row read back is held to the same rules as a step kept as it happened, which changes
+    /// nothing for a row this build wrote and keeps a secret an earlier one wrote off the screen.
+    /// Arguments that are not JSON were cut at the cap after they were kept, and stay as they are.
+    pub fn from_value(call_id: String, value: &Value) -> Option<Self> {
+        let tool = value.get("tool")?.as_str()?.to_string();
+        let stored = value
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arguments = serde_json::from_str::<Value>(stored)
+            .map(|arguments| capped(&step_arguments(&tool, &arguments).to_string()))
+            .unwrap_or_else(|_| stored.to_string());
+        Some(Self {
+            call_id,
+            tool,
+            arguments,
+            result: value
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ok: value.get("ok").and_then(Value::as_bool),
+        })
+    }
+}
+
+/// `text` kept to [`STEP_TEXT_CAP`] bytes: a longer one is cut on a character boundary and ends
+/// with "…", which counts toward the cap.
+pub(crate) fn capped(text: &str) -> String {
+    if text.len() <= STEP_TEXT_CAP {
+        return text.to_string();
+    }
+    let mut end = STEP_TEXT_CAP - '…'.len_utf8();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// Adds a delta of a thought to what is kept of it. `seen` is every byte that has arrived for
+/// it, kept or not: once it has gone past the cap it was cut there, and a later delta is
+/// dropped rather than written after the "…". Kept this way, it is the same however the deltas
+/// were split, live or replayed.
+fn push_capped(kept: &mut String, seen: &mut usize, delta: &str) {
+    let before = *seen;
+    *seen += delta.len();
+    if before > STEP_TEXT_CAP {
+        return;
+    }
+    kept.push_str(delta);
+    if *seen > STEP_TEXT_CAP {
+        *kept = capped(kept);
+    }
+}
+
+/// The step for `call_id`, wherever it is in the turn. Searched from the end, where an open
+/// call is.
+fn step_mut<'a>(parts: &'a mut [ChatPart], call_id: &str) -> Option<&'a mut StepSpec> {
+    parts.iter_mut().rev().find_map(|part| match part {
+        ChatPart::Step(step) if step.call_id == call_id => Some(step),
+        _ => None,
+    })
+}
+
+/// A call waiting on a yes is drawn once, as its card. Its step comes back when its result
+/// does, and from then on the card is only the line saying how it was answered.
+fn hide_steps_behind_cards(parts: &mut Vec<ChatPart>) {
+    let asked: HashSet<&str> = parts
+        .iter()
+        .filter_map(|part| match part {
+            ChatPart::Approval(spec) => Some(spec.call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    if asked.is_empty() {
+        return;
+    }
+    let hidden: HashSet<String> = parts
+        .iter()
+        .filter_map(|part| match part {
+            ChatPart::Step(step)
+                if step.result.is_none() && asked.contains(step.call_id.as_str()) =>
+            {
+                Some(step.call_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    parts.retain(|part| !matches!(part, ChatPart::Step(step) if hidden.contains(&step.call_id)));
 }
 
 fn is_hitl_card(part: &ChatPart) -> bool {
@@ -412,6 +594,22 @@ pub struct TurnAssembler {
     form_args: std::collections::HashMap<String, String>,
     /// Newest tool PNG. Computer pane / last-screen thumb; chat only on pin.
     latest_shot: Option<ScreenshotSpec>,
+    /// The argument text of each step whose arguments are still arriving, by call id. The step
+    /// holds none of it: when the call's arguments end, the step keeps what [`step_arguments`]
+    /// lets it say of them, and the text here goes.
+    step_args: std::collections::HashMap<String, String>,
+    /// Thoughts still being said, in the order they began. Each becomes a part when its message
+    /// ends, when a call starts while it is being said, or when the run ends.
+    reasoning: Vec<OpenThought>,
+}
+
+/// A thought still being said: its message id, and as much of it as is kept (see
+/// `push_capped`).
+#[derive(Debug, Default)]
+struct OpenThought {
+    id: String,
+    said: String,
+    seen: usize,
 }
 
 #[derive(Debug)]
@@ -514,6 +712,11 @@ impl TurnAssembler {
                 if name == USER_MACHINE_SHELL && !id.is_empty() {
                     self.shell_args.entry(id.clone()).or_default();
                 }
+                // The model reached for a tool: what it thought up to here came before the
+                // call, and what it goes on to think comes after.
+                if !name.is_empty() {
+                    self.settle_thoughts();
+                }
                 if kind == "TOOL_CALL_CHUNK" {
                     if let Some(delta) = event.get("delta").and_then(Value::as_str)
                         && let Some(buf) = self.shell_args.get_mut(&id)
@@ -537,6 +740,17 @@ impl TurnAssembler {
                         name: name.to_string(),
                         args: String::new(),
                     });
+                } else {
+                    // Every other call is a step. A chunk that goes on with a call names no
+                    // tool, and adds to the step its first chunk opened.
+                    if !name.is_empty() && !id.is_empty() {
+                        self.open_step(&id, name);
+                    }
+                    if kind == "TOOL_CALL_CHUNK"
+                        && let Some(delta) = event.get("delta").and_then(Value::as_str)
+                    {
+                        self.push_step_arguments(&id, delta);
+                    }
                 }
             }
             "TOOL_CALL_ARGS" => {
@@ -553,6 +767,7 @@ impl TurnAssembler {
                         if let Some(buf) = self.form_args.get_mut(id) {
                             buf.push_str(delta);
                         }
+                        self.push_step_arguments(id, delta);
                     }
                     if let Some(tool) = self.tool.as_mut() {
                         tool.args.push_str(delta);
@@ -561,6 +776,9 @@ impl TurnAssembler {
             }
             "TOOL_CALL_END" => {
                 self.flush_text();
+                if let Some(id) = event.get("toolCallId").and_then(Value::as_str) {
+                    self.settle_step_arguments(id);
+                }
                 if let Some(tool) = self.tool.take() {
                     self.close_tool(tool);
                 }
@@ -622,27 +840,132 @@ impl TurnAssembler {
                 self.flush_text();
                 self.attach_tool_result(event);
             }
+            "REASONING_MESSAGE_START" => {
+                self.flush_text();
+                let id = message_id(event);
+                if !self.reasoning.iter().any(|thought| thought.id == id) {
+                    self.reasoning.push(OpenThought {
+                        id,
+                        ..OpenThought::default()
+                    });
+                }
+            }
+            "REASONING_MESSAGE_CONTENT" => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    let id = message_id(event);
+                    if !self.reasoning.iter().any(|thought| thought.id == id) {
+                        // Its opening never came: the words still belong to a thought.
+                        self.flush_text();
+                        self.reasoning.push(OpenThought {
+                            id: id.clone(),
+                            ..OpenThought::default()
+                        });
+                    }
+                    if let Some(thought) =
+                        self.reasoning.iter_mut().find(|thought| thought.id == id)
+                    {
+                        push_capped(&mut thought.said, &mut thought.seen, delta);
+                    }
+                }
+            }
+            "REASONING_MESSAGE_END" => {
+                let id = message_id(event);
+                if let Some(at) = self.reasoning.iter().position(|thought| thought.id == id) {
+                    let thought = self.reasoning.remove(at);
+                    self.push_reasoning(&thought.said);
+                }
+            }
             "RUN_FINISHED" | "RUN_ERROR" => {
                 self.waiting_approval = false;
+                self.close_reasoning();
             }
             _ => {}
         }
     }
 
     pub fn snapshot(&self) -> (String, Vec<ChatPart>) {
-        if self.holding_ui() {
-            let mut parts = self.committed.clone();
-            place_hitl_cards_in_document_order(&mut parts);
-            let plain = plain_text(&parts);
-            return (plain, parts);
-        }
         let mut parts = self.committed.clone();
-        if !self.text.is_empty() {
+        if !self.holding_ui() && !self.text.is_empty() {
             parts.push(ChatPart::Text(self.text.clone()));
         }
+        hide_steps_behind_cards(&mut parts);
         place_hitl_cards_in_document_order(&mut parts);
         let plain = plain_text(&parts);
         (plain, parts)
+    }
+
+    /// A call that is not a chart, a form or a user-form becomes a step where it starts, so it
+    /// sits between the words before it and the words after.
+    fn open_step(&mut self, call_id: &str, tool: &str) {
+        if step_mut(&mut self.committed, call_id).is_some() {
+            return;
+        }
+        self.flush_text();
+        self.committed.push(ChatPart::Step(StepSpec {
+            call_id: call_id.to_string(),
+            tool: tool.to_string(),
+            arguments: String::new(),
+            result: None,
+            ok: None,
+        }));
+        self.step_args.insert(call_id.to_string(), String::new());
+    }
+
+    /// Several calls can be open at once, so each delta finds its own call's text by id.
+    fn push_step_arguments(&mut self, call_id: &str, delta: &str) {
+        if let Some(raw) = self.step_args.get_mut(call_id) {
+            raw.push_str(delta);
+        }
+    }
+
+    /// A call's arguments are all in (its `TOOL_CALL_END`, or its result if that came first):
+    /// the step keeps what the card's rules let it say of them, and the text they came as goes.
+    fn settle_step_arguments(&mut self, call_id: &str) {
+        let Some(raw) = self.step_args.remove(call_id) else {
+            return;
+        };
+        if let Some(step) = step_mut(&mut self.committed, call_id) {
+            step.arguments = kept_arguments(&step.tool, &raw);
+        }
+    }
+
+    /// A thought that has ended joins the thought just before it, if that is where it ends up:
+    /// two blocks back to back are one thing the coworker thought, and one row. Kept to the cap
+    /// either way.
+    fn push_reasoning(&mut self, said: &str) {
+        let said = said.trim();
+        if said.is_empty() {
+            return;
+        }
+        if let Some(ChatPart::Reasoning(before)) = self.committed.last_mut() {
+            *before = capped(&format!("{before}\n\n{said}"));
+            return;
+        }
+        self.committed.push(ChatPart::Reasoning(capped(said)));
+    }
+
+    /// Whatever the coworker is in the middle of thinking goes into the reply as far as it has
+    /// got, where it has got to. A thought still being said stays open, and what it goes on to
+    /// say is kept as a thought of its own.
+    fn settle_thoughts(&mut self) {
+        let settled: Vec<String> = self
+            .reasoning
+            .iter_mut()
+            .map(|thought| {
+                thought.seen = 0;
+                std::mem::take(&mut thought.said)
+            })
+            .collect();
+        for said in settled {
+            self.push_reasoning(&said);
+        }
+    }
+
+    /// The run is over: a thought it was still in the middle of is kept as far as it got.
+    fn close_reasoning(&mut self) {
+        for thought in std::mem::take(&mut self.reasoning) {
+            self.push_reasoning(&thought.said);
+        }
     }
 
     pub fn waiting_approval(&self) -> bool {
@@ -678,6 +1001,11 @@ impl TurnAssembler {
         ) {
             spec.output = Some(content.clone());
             spec.ok = ok;
+        }
+        self.settle_step_arguments(&call_id);
+        if let Some(step) = step_mut(&mut self.committed, &call_id) {
+            step.result = Some(capped(&content));
+            step.ok = ok;
         }
         // Keep every PNG with bytes for the Computer pane / last-screen thumb.
         // Chat row follows `image.visibility` (opengrok-server#139). Untagged
@@ -734,6 +1062,12 @@ impl TurnAssembler {
     /// Pins the last computer PNG when `image.visibility` is not `agent` (turn-end
     /// `end` / untagged heuristic). Tagged `agent` stays Computer-pane only.
     pub fn finish(&mut self) {
+        self.close_reasoning();
+        // A call whose end never came keeps what of its arguments did.
+        let unsettled: Vec<String> = self.step_args.keys().cloned().collect();
+        for call_id in unsettled {
+            self.settle_step_arguments(&call_id);
+        }
         // Nothing more is coming, so nothing is held back: an object that never closed is words.
         drain_complete_ui(&mut self.text, &mut self.committed, Held::Release);
         if let Some(tool) = self.tool.take() {
@@ -828,7 +1162,9 @@ impl TurnAssembler {
             | ChatPart::Approval(_)
             | ChatPart::Screenshot(_)
             | ChatPart::UserForm(_)
-            | ChatPart::SaveLogin(_) => true,
+            | ChatPart::SaveLogin(_)
+            | ChatPart::Step(_)
+            | ChatPart::Reasoning(_) => true,
         });
         self.committed.push(ChatPart::Ui(spec));
         self.completed_ui.retain(|tool| tool.name != name);
@@ -1044,7 +1380,7 @@ fn ui_kind(value: &Value) -> Option<String> {
     Some(normalize_name(ty))
 }
 
-fn is_ui_tool(name: &str) -> bool {
+pub(crate) fn is_ui_tool(name: &str) -> bool {
     matches!(
         normalize_name(name).as_str(),
         "bar-chart"
@@ -1198,6 +1534,10 @@ fn complete_json_len(s: &str) -> Option<usize> {
 ///
 /// A chart is the exception: it is cut out of the middle of a sentence that was streamed whole,
 /// and "See this <chart> and more" is one sentence with a picture in it.
+///
+/// A step and a thought are drawn between the words either side of them, like a card, and part
+/// them like one. Nothing of either is words: what a tool was given or gave back, and what the
+/// coworker thought, stay out of what is copied, read aloud, searched and sent back as history.
 fn plain_text(parts: &[ChatPart]) -> String {
     let mut out = String::new();
     let mut run = String::new();
@@ -1208,7 +1548,9 @@ fn plain_text(parts: &[ChatPart]) -> String {
             ChatPart::Approval(_)
             | ChatPart::Screenshot(_)
             | ChatPart::UserForm(_)
-            | ChatPart::SaveLogin(_) => push_run(&mut out, std::mem::take(&mut run)),
+            | ChatPart::SaveLogin(_)
+            | ChatPart::Step(_)
+            | ChatPart::Reasoning(_) => push_run(&mut out, std::mem::take(&mut run)),
         }
     }
     push_run(&mut out, run);
@@ -1306,6 +1648,63 @@ pub fn approval_summary(tool: &str, arguments: &Value) -> String {
             clip(&redacted_arguments(arguments), 160)
         ),
     }
+}
+
+/// A call's arguments as its step keeps them, with what the approval card for the same call
+/// keeps off it kept off here too, by the card's own rules (see [`approval_summary`]): a
+/// shell's command as it is; a file named and what is written into it only counted; typed
+/// text and keys that look like secrets as `«redacted»`; a page without its query or
+/// fragment; a recipe without its `values`, since a login recipe is handed a password; and a
+/// plugin call with its identity keys dropped and its secrets redacted.
+///
+/// A step is on screen, opened and written to disk long after its card would have been
+/// answered, and it is shown for every call, card or none, so it is held to at least the
+/// card's rules. The assembler applies this when a call's arguments are complete, and keeps
+/// nothing else of them: neither the part in memory nor its row on disk holds the raw text.
+/// Applied twice it changes nothing, so a row read back is held to the same rules.
+pub(crate) fn step_arguments(tool: &str, arguments: &Value) -> Value {
+    if !arguments.is_object() {
+        return match tool {
+            USER_MACHINE_SHELL | "shell" => arguments.clone(),
+            _ => redact_value(arguments, None),
+        };
+    }
+    let mut kept = arguments.clone();
+    match tool {
+        USER_MACHINE_SHELL | "shell" | "read_file" => {}
+        "write_file" => {
+            if let Some(content) = string_arg(arguments, "content") {
+                kept["content"] = Value::from(content.len());
+            }
+        }
+        "computer" => {
+            for (key, max) in [("text", 60), ("key", 40)] {
+                if let Some(said) = string_arg(arguments, key) {
+                    kept[key] = Value::String(shown(said, max));
+                }
+            }
+        }
+        "open_url" => {
+            if string_arg(arguments, "url").is_some() {
+                kept["url"] = Value::String(page_of(arguments).to_string());
+            }
+        }
+        "run_recipe" => {
+            if let Some(object) = kept.as_object_mut() {
+                object.remove("values");
+            }
+        }
+        _ => kept = redact_value(arguments, None),
+    }
+    kept
+}
+
+/// What a step keeps of a call's argument text: [`step_arguments`] of it, cut to the cap.
+/// Nothing, for text that is not JSON — there is no telling what in it is a secret.
+fn kept_arguments(tool: &str, raw: &str) -> String {
+    serde_json::from_str::<Value>(raw)
+        .map(|arguments| capped(&step_arguments(tool, &arguments).to_string()))
+        .unwrap_or_default()
 }
 
 /// A `computer` call in words, from the fields the server's `screen_summary` reads. An action
@@ -1556,6 +1955,15 @@ pub fn command_from_args(arguments: &Value) -> String {
         return String::new();
     }
     arguments.to_string()
+}
+
+/// A reasoning frame's `messageId`, which is how its blocks are told apart.
+fn message_id(event: &Value) -> String {
+    event
+        .get("messageId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn string_at(event: &Value, key: &str) -> Option<String> {
@@ -3437,5 +3845,412 @@ mod tests {
             }
             other => panic!("expected Computer handoff card, got {other:?}"),
         }
+    }
+
+    fn assembled(events: &[Value]) -> TurnAssembler {
+        let mut turn = TurnAssembler::default();
+        for event in events {
+            turn.push_event(event);
+        }
+        turn
+    }
+
+    fn steps_in(parts: &[ChatPart]) -> Vec<&StepSpec> {
+        parts
+            .iter()
+            .filter_map(|part| match part {
+                ChatPart::Step(step) => Some(step),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tool call is a step of the reply, drawn where it was made: after the words the
+    /// coworker said before it and before the words it said after, with how it came out once
+    /// its result is in. Its arguments arrive in pieces and are kept whole.
+    #[test]
+    fn a_tool_call_is_a_step_between_the_words_around_it() {
+        let mut turn = assembled(&[
+            json!({"type":"TEXT_MESSAGE_START","messageId":"m1","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Let me run the tests."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"m1"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"command\":"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"\"cargo test\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"exit 0\ntest result: ok","ok":true}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"m2","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m2","delta":"All green."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"m2"}),
+            json!({"type":"RUN_FINISHED"}),
+        ]);
+        turn.finish();
+        let (plain, parts) = turn.snapshot();
+        let step = StepSpec {
+            call_id: "c1".into(),
+            tool: "shell".into(),
+            arguments: "{\"command\":\"cargo test\"}".into(),
+            result: Some("exit 0\ntest result: ok".into()),
+            ok: Some(true),
+        };
+        assert_eq!(
+            parts,
+            vec![
+                ChatPart::Text("Let me run the tests.".into()),
+                ChatPart::Step(step.clone()),
+                ChatPart::Text("All green.".into()),
+            ]
+        );
+        assert_eq!(step.label(), "Running `cargo test`");
+        assert_eq!(step.status(), StepStatus::Ok);
+        assert_eq!(step.shown_arguments().as_deref(), Some("cargo test"));
+        // The words either side are two things said, as they are two bubbles.
+        assert_eq!(plain, "Let me run the tests.\n\nAll green.");
+    }
+
+    /// Until its result comes back a step is still going, and says what it is doing.
+    #[test]
+    fn a_step_without_a_result_yet_is_still_going() {
+        let turn = assembled(&[
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"read_file"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"path\":\"src/main.rs\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+        ]);
+        let (_, parts) = turn.snapshot();
+        match parts.as_slice() {
+            [ChatPart::Step(step)] => {
+                assert_eq!(step.result, None);
+                assert_eq!(step.ok, None);
+                assert_eq!(step.status(), StepStatus::Running);
+                assert_eq!(step.status().word(), "running");
+                assert_eq!(step.label(), "Reading main.rs");
+                assert_eq!(step.shown_arguments().as_deref(), Some("src/main.rs"));
+            }
+            other => panic!("expected one step still going, got {other:?}"),
+        }
+    }
+
+    /// Reasoning is a part of its own, drawn as a thought, and none of it is the reply's words.
+    /// Two blocks back to back are one thought, and a run that ends in the middle of one keeps
+    /// what it had thought so far.
+    #[test]
+    fn reasoning_is_its_own_part_and_not_the_reply() {
+        let turn = assembled(&[
+            json!({"type":"RUN_STARTED","threadId":"cw_1","runId":"r1"}),
+            json!({"type":"REASONING_MESSAGE_START","messageId":"msg_r1_1"}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"msg_r1_1","delta":"The person wants the build checked."}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"msg_r1_1","delta":" Tests first."}),
+            json!({"type":"REASONING_MESSAGE_END","messageId":"msg_r1_1"}),
+            json!({"type":"REASONING_MESSAGE_START","messageId":"msg_r1_2"}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"msg_r1_2","delta":"Then say so."}),
+            json!({"type":"REASONING_MESSAGE_END","messageId":"msg_r1_2"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"msg_r1_3","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_r1_3","delta":"Checking the build."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"msg_r1_3"}),
+        ]);
+        let (plain, parts) = turn.snapshot();
+        assert_eq!(
+            parts,
+            vec![
+                ChatPart::Reasoning(
+                    "The person wants the build checked. Tests first.\n\nThen say so.".into()
+                ),
+                ChatPart::Text("Checking the build.".into()),
+            ]
+        );
+        assert_eq!(plain, "Checking the build.");
+
+        // Nothing is drawn while the thought is still being said; the status line says
+        // "Thinking" meanwhile. Then the run stops mid-thought, one way or the other.
+        let open = [
+            json!({"type":"REASONING_MESSAGE_START","messageId":"msg_r2_1"}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"msg_r2_1","delta":"Half a"}),
+        ];
+        assert!(assembled(&open).snapshot().1.is_empty());
+        let mut failed = assembled(&open);
+        failed.push_event(&json!({"type":"RUN_ERROR","message":"the model went away"}));
+        let mut finished = assembled(&open);
+        finished.finish();
+        for turn in [failed, finished] {
+            let (plain, parts) = turn.snapshot();
+            assert_eq!(parts, vec![ChatPart::Reasoning("Half a".into())]);
+            assert_eq!(plain, "");
+        }
+    }
+
+    /// A chart, a form and a user-form are drawn as themselves and are not steps, and a call
+    /// waiting on the person's yes is drawn as its card and not also as a step. Once the card
+    /// is answered and the call has run, the call is a step like any other.
+    #[test]
+    fn ui_and_user_form_tools_are_not_steps() {
+        let mut turn = assembled(&[
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"bar_chart"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"title\":\"Q3\",\"bars\":[{\"label\":\"A\",\"value\":3}]}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c2","toolCallName":"form"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c2","delta":"{\"fields\":[{\"id\":\"go\",\"label\":\"Go\",\"options\":[\"Yes\",\"No\"]}]}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c2"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c3","toolCallName":"request_user_form"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c3","delta":"{\"formRequest\":{\"title\":\"Code\",\"fields\":[{\"id\":\"otp\",\"label\":\"Code\",\"type\":\"otp\",\"required\":true,\"value\":\"654321\"}]}}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c3"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c4","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c4","delta":"{\"command\":\"rm -rf build\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c4"}),
+            json!({
+                "type": "CUSTOM", "name": "run-awaiting-approval", "runId": "r1", "callId": "c4",
+                "tool": "shell", "arguments": {"command": "rm -rf build"}, "reason": "exec-consent"
+            }),
+        ]);
+        let (_, parts) = turn.snapshot();
+        assert!(
+            steps_in(&parts).is_empty(),
+            "a chart, a form, a user-form and a call waiting on its card are not steps: {parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Ui(UiSpec::BarChart(_))))
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Ui(UiSpec::Form(_))))
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::UserForm(_)))
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Approval(spec) if spec.call_id == "c4"))
+        );
+
+        turn.push_event(&json!({
+            "type": "TOOL_CALL_RESULT", "toolCallId": "c4", "content": "exit 0", "ok": true
+        }));
+        let (_, parts) = turn.snapshot();
+        let steps = steps_in(&parts);
+        assert_eq!(steps.len(), 1, "{parts:?}");
+        assert_eq!(steps[0].call_id, "c4");
+        assert_eq!(steps[0].result.as_deref(), Some("exit 0"));
+        assert!(!format!("{parts:?}").contains("654321"));
+    }
+
+    /// A result, or arguments, longer than a step keeps are cut to the cap on a character
+    /// boundary and end with "…", once: arguments are kept when all of them are in.
+    #[test]
+    fn a_long_result_is_cut_on_a_char_boundary() {
+        // Three bytes to a character, so the cap falls inside one.
+        let content = "界".repeat(3_500);
+        // Eighteen bytes, then four to a character, so the cut backs off three bytes into the
+        // room the "…" needs.
+        let mut events = vec![
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"command\":\"echo: "}),
+        ];
+        // A thousand bytes to a delta, ten of them.
+        for _ in 0..10 {
+            events
+                .push(json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"🦀".repeat(250)}));
+        }
+        events.push(json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"\"}"}));
+        events.push(json!({"type":"TOOL_CALL_END","toolCallId":"c1"}));
+        events
+            .push(json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":content,"ok":true}));
+        let (_, parts) = assembled(&events).snapshot();
+        let steps = steps_in(&parts);
+        let [step] = steps.as_slice() else {
+            panic!("expected one step, got {parts:?}");
+        };
+        let result = step.result.as_deref().expect("a result");
+        assert!(result.len() <= STEP_TEXT_CAP, "{}", result.len());
+        assert!(result.len() > STEP_TEXT_CAP - 8, "{}", result.len());
+        assert!(result.ends_with('…'));
+        assert!(result.trim_end_matches('…').chars().all(|c| c == '界'));
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+
+        let arguments = &step.arguments;
+        assert!(arguments.len() <= STEP_TEXT_CAP, "{}", arguments.len());
+        assert!(arguments.ends_with('…'), "nothing is added after the cut");
+        assert!(arguments.starts_with("{\"command\":\"echo: 🦀"));
+        assert!(arguments.trim_end_matches('…').ends_with('🦀'));
+        assert_eq!(arguments.matches('…').count(), 1);
+    }
+
+    /// What the server kept off the wire stays off the step: typed text it redacted reads
+    /// `«redacted»` on the row, opened, as it came.
+    #[test]
+    fn redacted_arguments_stay_redacted() {
+        let (_, parts) = assembled(&[
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"computer"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"action\":\"type\",\"text\":\"«redacted»\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"typed «redacted»","ok":true}),
+        ])
+        .snapshot();
+        let steps = steps_in(&parts);
+        let [step] = steps.as_slice() else {
+            panic!("expected one step, got {parts:?}");
+        };
+        assert_eq!(step.label(), "Typing on its computer");
+        assert_eq!(
+            step.arguments,
+            "{\"action\":\"type\",\"text\":\"«redacted»\"}"
+        );
+        let shown = step.shown_arguments().expect("the arguments are shown");
+        assert!(shown.contains("\"text\": \"«redacted»\""), "{shown}");
+        assert_eq!(step.result.as_deref(), Some("typed «redacted»"));
+    }
+
+    /// The four calls whose arguments carry what the approval card keeps off it: a login
+    /// recipe's password, a link's token, a key typed on the screen, and a plugin's key.
+    fn secret_calls() -> Vec<Value> {
+        let typed = format!("sk-live-{}", "a1".repeat(24));
+        let mut frames = Vec::new();
+        for (id, tool, arguments) in [
+            (
+                "c1",
+                "run_recipe",
+                json!({"recipe": "Gmail login", "values": {"email": "ada@example.com", "password": "hunter2-horse-battery"}}),
+            ),
+            (
+                "c2",
+                "open_url",
+                json!({"url": "https://example.com/inbox?token=tok_live_q8x7#settings"}),
+            ),
+            ("c3", "computer", json!({"action": "type", "text": typed})),
+            (
+                "c4",
+                "gmail.api.send",
+                json!({"to": "bo@example.com", "api_key": "plugin-key-9f8e7d", "coworkerId": "cw_1"}),
+            ),
+        ] {
+            frames.push(json!({"type":"TOOL_CALL_START","toolCallId":id,"toolCallName":tool}));
+            frames.push(
+                json!({"type":"TOOL_CALL_ARGS","toolCallId":id,"delta":arguments.to_string()}),
+            );
+            frames.push(json!({"type":"TOOL_CALL_END","toolCallId":id}));
+            frames.push(
+                json!({"type":"TOOL_CALL_RESULT","toolCallId":id,"content":"done","ok":true}),
+            );
+        }
+        frames
+    }
+
+    /// What the card keeps off, as it would be found in a step's text.
+    const SECRETS: &[&str] = &[
+        "hunter2-horse-battery",
+        "tok_live_q8x7",
+        "token=",
+        "a1a1a1a1a1a1",
+        "plugin-key-9f8e7d",
+        "cw_1",
+    ];
+
+    /// A step keeps off what the approval card for the same call keeps off, from the moment it
+    /// is drawn: while its arguments are still arriving, once they have, and opened.
+    #[test]
+    fn a_steps_arguments_keep_off_what_the_card_keeps_off() {
+        let frames = secret_calls();
+        let mut turn = TurnAssembler::default();
+        for frame in &frames {
+            turn.push_event(frame);
+            let (_, parts) = turn.snapshot();
+            for step in steps_in(&parts) {
+                let said = format!("{} {:?}", step.arguments, step.shown_arguments());
+                for secret in SECRETS {
+                    assert!(
+                        !said.contains(secret),
+                        "{secret:?} in {} as {said}",
+                        step.tool
+                    );
+                }
+            }
+        }
+        let (_, parts) = turn.snapshot();
+        let steps = steps_in(&parts);
+        assert_eq!(steps.len(), 4);
+        // What the card says of each call is still there to read.
+        assert!(steps[0].arguments.contains("Gmail login"));
+        assert!(steps[1].arguments.contains("https://example.com/inbox"));
+        assert_eq!(steps[1].label(), "Opening example.com");
+        assert!(steps[2].arguments.contains(REDACTED));
+        assert_eq!(steps[2].label(), "Typing on its computer");
+        assert!(steps[3].arguments.contains("bo@example.com"));
+        assert!(steps[3].arguments.contains(REDACTED));
+    }
+
+    /// Words of one message on either side of a tool's result are one run of words, not two.
+    #[test]
+    fn a_result_does_not_split_the_words_around_it() {
+        let turn = assembled(&[
+            json!({"type":"TEXT_MESSAGE_START","messageId":"m1","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Let me run it."}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"command\":\"ls\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"a.txt","ok":true}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"It listed one file."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"m1"}),
+        ]);
+        let (_, parts) = turn.snapshot();
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [ChatPart::Text(before), ChatPart::Step(_), ChatPart::Text(after)]
+                    if before == "Let me run it." && after == "It listed one file."
+            ),
+            "{parts:?}"
+        );
+    }
+
+    /// A thought is kept to the size a step's result is, however much of it the model said.
+    #[test]
+    fn a_long_thought_is_cut_like_a_result() {
+        let thought = "思".repeat(3_500);
+        let (_, parts) = assembled(&[
+            json!({"type":"REASONING_MESSAGE_START","messageId":"r1"}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"r1","delta":thought}),
+            json!({"type":"REASONING_MESSAGE_END","messageId":"r1"}),
+        ])
+        .snapshot();
+        let [ChatPart::Reasoning(kept)] = parts.as_slice() else {
+            panic!("expected one thought, got {} parts", parts.len());
+        };
+        assert!(kept.len() <= STEP_TEXT_CAP, "{}", kept.len());
+        assert!(kept.ends_with('…'));
+        assert!(kept.trim_end_matches('…').chars().all(|c| c == '思'));
+    }
+
+    /// A thought the model was in the middle of when it reached for a tool comes before that
+    /// call, and what it thought after the call comes after it.
+    #[test]
+    fn a_thought_open_when_a_call_starts_comes_before_the_call() {
+        let (_, parts) = assembled(&[
+            json!({"type":"REASONING_MESSAGE_START","messageId":"r1"}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"r1","delta":"Size it first."}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"command\":\"du -sh .\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"4.0G","ok":true}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"r1","delta":"Then say so."}),
+            json!({"type":"REASONING_MESSAGE_END","messageId":"r1"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Four gigabytes."}),
+        ])
+        .snapshot();
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [
+                    ChatPart::Reasoning(before),
+                    ChatPart::Step(step),
+                    ChatPart::Reasoning(after),
+                    ChatPart::Text(_),
+                ] if before == "Size it first." && step.call_id == "c1" && after == "Then say so."
+            ),
+            "{parts:?}"
+        );
     }
 }

@@ -93,7 +93,9 @@ impl Message {
                 | ChatPart::Approval(_)
                 | ChatPart::Screenshot(_)
                 | ChatPart::UserForm(_)
-                | ChatPart::SaveLogin(_) => true,
+                | ChatPart::SaveLogin(_)
+                | ChatPart::Step(_)
+                | ChatPart::Reasoning(_) => true,
             })
     }
 
@@ -107,7 +109,9 @@ impl Message {
                 | ChatPart::Approval(_)
                 | ChatPart::Screenshot(_)
                 | ChatPart::UserForm(_)
-                | ChatPart::SaveLogin(_) => false,
+                | ChatPart::SaveLogin(_)
+                | ChatPart::Step(_)
+                | ChatPart::Reasoning(_) => false,
             })
     }
 
@@ -168,6 +172,10 @@ pub fn clock_label(dt: DateTime<Local>) -> String {
 /// words on either side of one are kept apart by a blank line, the same break `content` gets,
 /// rather than running together into one sentence. A chart, which is cut out of the middle of
 /// a sentence, leaves that sentence whole.
+///
+/// The steps the coworker took and what it thought are kept where they happened, each cut to
+/// the size the turn kept them at, so a reopened thread shows what was done between the words
+/// and not only the words.
 fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
     let mut saved: Vec<MessagePart> = Vec::new();
     let mut words = String::new();
@@ -197,6 +205,17 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
                 saved.push(MessagePart::Ui {
                     spec: spec.to_value().to_string(),
                 });
+            }
+            ChatPart::Step(step) => {
+                close_text_run(&mut words, &mut saved);
+                saved.push(MessagePart::Step {
+                    call_id: step.call_id.clone(),
+                    spec: step.to_value().to_string(),
+                });
+            }
+            ChatPart::Reasoning(thought) => {
+                close_text_run(&mut words, &mut saved);
+                saved.push(MessagePart::Reasoning(thought.clone()));
             }
         }
     }
@@ -266,8 +285,71 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 height,
                 visibility: Some(ImageVisibility::Transcript),
             })),
+            // A step whose row does not read back is left out; the words either side of it
+            // are their own parts and still say what they said.
+            MessagePart::Step { call_id, spec } => serde_json::from_str::<serde_json::Value>(&spec)
+                .ok()
+                .and_then(|value| crate::opengrok::StepSpec::from_value(call_id, &value))
+                .map(ChatPart::Step),
+            // Held to the size a thought is kept at, whichever build wrote it.
+            MessagePart::Reasoning(thought) => {
+                Some(ChatPart::Reasoning(crate::opengrok::capped(&thought)))
+            }
         })
         .collect()
+}
+
+/// What of a coworker's reply is written down, if anything: the words it keeps, and the pieces
+/// it was made of (see [`saved_parts`]).
+///
+/// A reply is kept when the coworker said something, or did something: a turn that only ran
+/// tools, or that failed after they ran, or that was stopped between two of them, has steps
+/// that are worth as much on the next launch as they were on screen. Such a reply keeps the
+/// line it was shown with — the app's line about why the run failed, or none — and that line is
+/// still never words: [`is_status_line`] reads it off the content wherever it comes from, so it
+/// is painted as a status line and left out of the history the coworker is sent.
+///
+/// A turn that never left is never kept (see [`is_unsent_turn_note`]): it is offered again.
+fn reply_to_keep(content: &str, parts: &[ChatPart]) -> Option<(String, Vec<MessagePart>)> {
+    if is_unsent_turn_note(content) {
+        return None;
+    }
+    let saved = saved_parts(parts);
+    let said = !content.trim().is_empty() && !is_status_line(content);
+    (said || !saved.is_empty()).then(|| (content.to_string(), saved))
+}
+
+/// A reply written down under its bubble's own name, in the session its thread is kept under:
+/// the write `persist_assistant_reply` hands off, whole, so it runs the same wherever it is run.
+#[allow(clippy::too_many_arguments)]
+async fn keep_reply(
+    db: &DatabaseService,
+    conversation_id: &str,
+    title: &str,
+    message_id: &str,
+    content: &str,
+    parts: &[MessagePart],
+    run_id: Option<&str>,
+    hidden: bool,
+    stamp: SaveStamp,
+) -> anyhow::Result<()> {
+    db.ensure_session(conversation_id, title).await?;
+    // The row is the bubble's, by its own name. Two paths settling one run write the same row
+    // twice rather than two rows that say the same thing.
+    db.save_message(
+        message_id,
+        conversation_id,
+        "assistant",
+        content,
+        None,
+        None,
+        None,
+        parts,
+        run_id,
+        hidden,
+        stamp,
+    )
+    .await
 }
 
 /// Fold OpenGrok-owned cards onto a sqlite row that dropped them.
@@ -1079,6 +1161,9 @@ fn restored_message(row: ChatMessage) -> Message {
 /// approval, generative UI) flush immediately so a card is not delayed a frame.
 const STREAM_PAINT_MIN: Duration = Duration::from_millis(16);
 
+/// A step coming back counts with the parts: its mark is how the person knows the call is done,
+/// and the frame that settles it is often the last one before the model goes quiet to think,
+/// which a frame held back by the rate would leave showing "…" until the next one.
 fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
     let flags = parts.iter().fold(0u8, |acc, part| {
         acc | match part {
@@ -1088,9 +1173,15 @@ fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
             ChatPart::Screenshot(_) => 4,
             ChatPart::UserForm(_) => 8,
             ChatPart::SaveLogin(_) => 16,
+            ChatPart::Step(_) => 32,
+            ChatPart::Reasoning(_) => 64,
         }
     });
-    (parts.len(), flags)
+    let settled = parts
+        .iter()
+        .filter(|part| matches!(part, ChatPart::Step(step) if step.result.is_some()))
+        .count();
+    (parts.len() + settled, flags)
 }
 
 fn stream_paint_due(
@@ -2737,6 +2828,10 @@ pub struct AppState {
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
     pub expanded_shell_output: HashSet<String>,
+    /// The step rows, groups of steps and Thought rows the person has opened, by the keys
+    /// `components::steps` gives them. Not saved: every one of them is shut when a thread is
+    /// opened again, which is how a reply is meant to be read.
+    pub expanded_steps: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
     /// This Mac's standing rules, as Settings → Computer last read them. See
     /// [`Self::this_mac_rules`] for when they are drawn.
@@ -3250,6 +3345,7 @@ impl AppState {
             local_exec_machine_id: None,
             local_exec_cancel: None,
             expanded_shell_output: HashSet::new(),
+            expanded_steps: HashSet::new(),
             computers: Vec::new(),
             local_rules: None,
             local_rules_epoch: 0,
@@ -8955,7 +9051,20 @@ impl AppState {
             }
             "failed" => {
                 self.finish_responding(Some(conversation_id), false);
-                self.release_live_turn(conversation_id, &turn.run_id);
+                // A failed run is written down for what it did before it failed, when nobody has
+                // written it down yet; writing it down is what lets the thread go.
+                if self.turn_is_unsettled(conversation_id, &turn.run_id) {
+                    self.persist_assistant_reply(
+                        conversation_id,
+                        &turn.message_id,
+                        plain,
+                        &parts,
+                        Some(&turn.run_id),
+                        cx,
+                    );
+                } else {
+                    self.release_live_turn(conversation_id, &turn.run_id);
+                }
             }
             _ => {}
         }
@@ -9064,8 +9173,10 @@ impl AppState {
 
     /// Keep the coworker's reply so the thread survives a relaunch.
     ///
-    /// Only what the coworker actually said: a status line is the app's own words about the turn,
-    /// and saving it would put a line nobody spoke into the history every later turn is sent.
+    /// What the coworker said, and what it did (see [`reply_to_keep`]). A status line on its own
+    /// is the app's words about a turn in which nothing happened, and is not kept; one under
+    /// steps is kept as the line they are shown with, and it is still never sent back as the
+    /// coworker's words, because the history reads it off the content as a status line.
     ///
     /// The pieces go with it. A recipe run is several bubbles with pictures of the box's screen
     /// between them, and a reply flattened to its text would come back as one long paragraph.
@@ -9076,8 +9187,9 @@ impl AppState {
     ///
     /// This is also where a turn stops being in flight, because that is the same event: the
     /// thread is held out of reload exactly while the database does not yet have the turn. A
-    /// reply this refuses — the app's own status line, or nothing at all — is never going to
-    /// reach the database, so the thread is let go at once; a reply on its way down is let go
+    /// reply this refuses — a turn that never left, a line of the app's own with nothing done
+    /// under it, or nothing at all — is never going to reach the database, so the thread is let
+    /// go at once; a reply on its way down is let go
     /// when the write lands, so that switching away in the moment between deciding and writing
     /// cannot lose it either.
     #[allow(clippy::too_many_arguments)]
@@ -9095,12 +9207,12 @@ impl AppState {
                 .get(conversation_id)
                 .is_some_and(|turn| turn.run_id == run_id)
         });
-        if content.trim().is_empty() || is_status_line(&content) {
+        let Some((content, parts)) = reply_to_keep(&content, parts) else {
             if settles {
                 self.live_turns.remove(conversation_id);
             }
             return;
-        }
+        };
         let Some(db) = self
             .database_service
             .clone()
@@ -9130,29 +9242,19 @@ impl AppState {
         let conversation_id = conversation_id.to_string();
         let message_id = message_id.to_string();
         let run_id = run_id.map(str::to_string);
-        let parts = saved_parts(parts);
         cx.spawn(async move |this, cx| {
-            let saved = match db.ensure_session(&conversation_id, &title).await {
-                // The row is the bubble's, by its own name. Two paths settling one run write
-                // the same row twice rather than two rows that say the same thing.
-                Ok(()) => {
-                    db.save_message(
-                        &message_id,
-                        &conversation_id,
-                        "assistant",
-                        &content,
-                        None,
-                        None,
-                        None,
-                        &parts,
-                        run_id.as_deref(),
-                        hidden,
-                        stamp,
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
+            let saved = keep_reply(
+                &db,
+                &conversation_id,
+                &title,
+                &message_id,
+                &content,
+                &parts,
+                run_id.as_deref(),
+                hidden,
+                stamp,
+            )
+            .await;
             if let Err(error) = saved {
                 eprintln!("Failed to save assistant message: {error}");
             }
@@ -9570,33 +9672,37 @@ impl AppState {
                         stamp_run_finished(message, SystemTime::now());
                     }
                 }
-                if !waiting_approval && !waiting_user_form && result.is_ok() {
-                    // The run is final; a run parked on a card is saved when it finishes.
-                    // A status line is painted, never saved: `persist_assistant_reply` refuses
-                    // it, so it cannot become history the model is shown next turn. Settling the
-                    // reply is also what lets the thread go: from here it reads from the
-                    // database again, because from here the database has the turn.
-                    let reply = state
-                        .conversations
-                        .iter()
-                        .find(|c| c.id == conversation_id)
-                        .and_then(|c| c.messages.iter().find(|m| m.id == reply_id))
-                        .map(|m| (m.content.clone(), m.parts.clone()));
-                    if let Some((content, parts)) = reply {
-                        state.persist_assistant_reply(
-                            &conversation_id,
-                            &reply_id,
-                            content,
-                            &parts,
-                            Some(&run_id),
-                            cx,
-                        );
-                    }
-                }
-                if result.is_err() {
-                    // A run that failed leaves the app's own words in the feed and those are
-                    // never written down, so there is nothing to wait for: the thread is let go
-                    // here instead.
+                let parked = waiting_approval || waiting_user_form;
+                let reply = (!parked)
+                    .then(|| {
+                        state
+                            .conversations
+                            .iter()
+                            .find(|c| c.id == conversation_id)
+                            .and_then(|c| c.messages.iter().find(|m| m.id == reply_id))
+                            .map(|m| (m.content.clone(), m.parts.clone()))
+                    })
+                    .flatten();
+                if let Some((content, parts)) = reply {
+                    // The run is final, whether it finished or failed; a run parked on a card is
+                    // saved when it finishes. A failed run is kept for what it did before it
+                    // failed, and its line about why is kept only as the line those steps are
+                    // shown with: `persist_assistant_reply` keeps it out of the words and out of
+                    // the history the model is shown next turn. Settling the reply is also what
+                    // lets the thread go: from here it reads from the database again, because
+                    // from here the database has the turn — or, when there is nothing to keep,
+                    // at once.
+                    state.persist_assistant_reply(
+                        &conversation_id,
+                        &reply_id,
+                        content,
+                        &parts,
+                        Some(&run_id),
+                        cx,
+                    );
+                } else if result.is_err() {
+                    // Nothing of a failed run is being written down, so there is nothing to
+                    // wait for: the thread is let go here instead.
                     state.release_live_turn(&conversation_id, &run_id);
                 }
                 if waiting_user_form {
@@ -10267,8 +10373,21 @@ impl AppState {
                                     }
                                     "failed" => {
                                         state.finish_responding(conversation_id.as_deref(), false);
-                                        if let Some(id) = conversation_id.as_ref() {
-                                            state.release_live_turn(id, &run_id);
+                                        // Written down for what it did before it failed, into
+                                        // the bubble it painted; writing it down is what lets
+                                        // the thread go.
+                                        if let Some(id) = conversation_id.as_deref() {
+                                            match painted.as_deref() {
+                                                Some(painted) => state.persist_assistant_reply(
+                                                    id,
+                                                    painted,
+                                                    plain.clone(),
+                                                    &parts,
+                                                    Some(&run_id),
+                                                    cx,
+                                                ),
+                                                None => state.release_live_turn(id, &run_id),
+                                            }
                                         }
                                     }
                                     _ => {}
@@ -10563,6 +10682,22 @@ impl AppState {
             self.expanded_shell_output.insert(call_id);
         }
         cx.notify();
+    }
+
+    /// Open or shut step rows, groups of steps and Thought rows, by their keys.
+    pub fn set_steps_open(&mut self, keys: &[String], open: bool, cx: &mut Context<Self>) {
+        self.mark_steps_open(keys, open);
+        cx.notify();
+    }
+
+    pub(crate) fn mark_steps_open(&mut self, keys: &[String], open: bool) {
+        for key in keys {
+            if open {
+                self.expanded_steps.insert(key.clone());
+            } else {
+                self.expanded_steps.remove(key);
+            }
+        }
     }
 
     pub fn pick_form_option(
@@ -16904,11 +17039,11 @@ mod tests {
         ThreadRun, TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS,
         agui_messages, apply_catalogue, apply_reload, apply_timing, bot_status_line,
         bubble_for_run, clock_label, graft_questions, graft_reply, hide_messages_of_runs,
-        is_status_line, is_tool_standin, is_unsent_turn_note, mark_enabled, missing_questions,
-        missing_replies, overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable,
-        replayed_ending, reply_from_replay, restored_message, restored_parts, saved_parts,
-        spec_from_queued, stamp_run_finished, stream_paint_due, stream_part_sig,
-        streaming_message_mut, turn_ending, unheard_hidden_runs,
+        is_status_line, is_tool_standin, is_unsent_turn_note, keep_reply, mark_enabled,
+        missing_questions, missing_replies, overlay_server_cards, parse_sql_time,
+        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, reply_to_keep,
+        restored_message, restored_parts, saved_parts, spec_from_queued, stamp_run_finished,
+        stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending, unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -17440,6 +17575,11 @@ mod tests {
                 ChatPart::SaveLogin(spec) => {
                     format!("save-login {} {}", spec.origin, spec.username)
                 }
+                ChatPart::Step(step) => format!(
+                    "step {} {} {} {:?} {:?}",
+                    step.call_id, step.tool, step.arguments, step.result, step.ok
+                ),
+                ChatPart::Reasoning(thought) => format!("thought {thought}"),
             })
             .collect()
     }
@@ -19000,6 +19140,418 @@ mod tests {
             "the turn-end pin is kept: {:?}",
             saved_parts(&replayed_parts)
         );
+    }
+
+    /// A turn that thought, said a word, took two steps (one of which failed) and said what it
+    /// found, in the frames the server sends for it.
+    fn step_frames() -> Vec<serde_json::Value> {
+        vec![
+            json!({"type":"RUN_STARTED","threadId":"cw_1","runId":"run_s"}),
+            json!({"type":"REASONING_MESSAGE_START","messageId":"msg_run_s_1"}),
+            json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"msg_run_s_1","delta":"Size the archive before reading its index."}),
+            json!({"type":"REASONING_MESSAGE_END","messageId":"msg_run_s_1"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"msg_run_s_2","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_run_s_2","delta":"Let me look."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"msg_run_s_2"}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":"{\"command\":\"du -sh /srv/archive\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"4.0G\t/srv/archive","ok":true}),
+            json!({"type":"TOOL_CALL_START","toolCallId":"c2","toolCallName":"read_file"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c2","delta":"{\"path\":\"/srv/archive/INDEX\"}"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c2"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c2","content":"permission denied","ok":false}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"msg_run_s_3","role":"assistant"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_run_s_3","delta":"The archive is four gigabytes; its index would not open."}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"msg_run_s_3"}),
+            json!({"type":"RUN_FINISHED","threadId":"cw_1","runId":"run_s"}),
+        ]
+    }
+
+    /// Steps and thoughts come to the same parts whether the turn was watched as it ran or
+    /// read back off the server afterwards, and are saved the same either way.
+    #[test]
+    fn a_run_watched_live_and_replayed_has_the_same_steps() {
+        let events = step_frames();
+        let (live_plain, live_parts) = watched_live(&events);
+        let (replayed_plain, replayed_parts) = reply_from_replay(&events, "finished");
+        assert_eq!(replayed_parts, live_parts);
+        assert_eq!(replayed_plain, live_plain);
+        assert_eq!(
+            shape(&live_parts),
+            vec![
+                "thought Size the archive before reading its index.".to_string(),
+                "text Let me look.".to_string(),
+                "step c1 shell {\"command\":\"du -sh /srv/archive\"} Some(\"4.0G\\t/srv/archive\") Some(true)".to_string(),
+                "step c2 read_file {\"path\":\"/srv/archive/INDEX\"} Some(\"permission denied\") Some(false)".to_string(),
+                "text The archive is four gigabytes; its index would not open.".to_string(),
+            ]
+        );
+        assert_eq!(saved_parts(&replayed_parts), saved_parts(&live_parts));
+    }
+
+    /// A turn's steps and thoughts are written down with its words and come back from the
+    /// database as they were, a step that never came back included.
+    #[tokio::test]
+    async fn steps_and_reasoning_survive_sqlite() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Steps").await.expect("a session");
+        let parts = vec![
+            ChatPart::Reasoning("Size the archive first.".into()),
+            ChatPart::Text("Let me look.".into()),
+            ChatPart::Step(crate::opengrok::StepSpec {
+                call_id: "c1".into(),
+                tool: "shell".into(),
+                arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
+                result: Some("4.0G\t/srv/archive".into()),
+                ok: Some(true),
+            }),
+            ChatPart::Step(crate::opengrok::StepSpec {
+                call_id: "c2".into(),
+                tool: "read_file".into(),
+                arguments: "{\"path\":\"/srv/archive/INDEX\"}".into(),
+                result: None,
+                ok: None,
+            }),
+            ChatPart::Text("The archive is four gigabytes.".into()),
+        ];
+        db.save_message(
+            "m1",
+            "s1",
+            "assistant",
+            "Let me look.\n\nThe archive is four gigabytes.",
+            None,
+            None,
+            None,
+            &saved_parts(&parts),
+            Some("run_s"),
+            false,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("the turn is saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            restored_parts(&rows[0].content, rows[0].parts.clone()),
+            parts
+        );
+    }
+
+    /// A part of a kind this build does not know — one a later build wrote — is left out, and
+    /// the rest of the message reads as it did. A message with nothing else is its words.
+    #[tokio::test]
+    async fn an_unknown_part_kind_is_dropped_not_fatal() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Steps").await.expect("a session");
+        let parts = vec![
+            ChatPart::Text("Before.".into()),
+            ChatPart::Step(crate::opengrok::StepSpec {
+                call_id: "c1".into(),
+                tool: "shell".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+                result: Some("a.txt".into()),
+                ok: Some(true),
+            }),
+            ChatPart::Text("After.".into()),
+        ];
+        for (id, content, saved) in [
+            ("m1", "Before.\n\nAfter.", saved_parts(&parts)),
+            ("m2", "Just words.", Vec::new()),
+        ] {
+            db.save_message(
+                id,
+                "s1",
+                "assistant",
+                content,
+                None,
+                None,
+                None,
+                &saved,
+                None,
+                false,
+                SaveStamp::at(SystemTime::UNIX_EPOCH),
+            )
+            .await
+            .expect("saved");
+        }
+        for (id, ord) in [("m1", 3), ("m2", 0)] {
+            sqlx::query(
+                "INSERT INTO chat_message_parts (message_id, ord, kind, text) VALUES (?, ?, 'future-kind', 'drawn by a later build')",
+            )
+            .bind(id)
+            .bind(ord)
+            .execute(&db.pool())
+            .await
+            .expect("a later build's part");
+        }
+        let rows = db.get_messages("s1").await.expect("the thread still reads");
+        let restored: Vec<Vec<ChatPart>> = rows
+            .iter()
+            .map(|row| restored_parts(&row.content, row.parts.clone()))
+            .collect();
+        assert_eq!(
+            restored,
+            vec![parts, vec![ChatPart::Text("Just words.".into())]]
+        );
+    }
+
+    /// A reply's words are its words: what its tools were given and gave back, and what it
+    /// thought, stay out of what is sent back as the thread's history and what is copied or
+    /// read aloud from it. The words either side of a step are two things said.
+    #[test]
+    fn the_words_sent_back_and_copied_exclude_steps() {
+        let (plain, parts) = reply_from_replay(&step_frames(), "finished");
+        let mut reply = message("m2", false, &plain);
+        reply.parts = parts;
+        assert_eq!(
+            reply.content,
+            "Let me look.\n\nThe archive is four gigabytes; its index would not open."
+        );
+        let sent = agui_messages(&[
+            message("m1", true, "how big is the archive?"),
+            reply.clone(),
+        ]);
+        assert_eq!(sent[1].content, reply.content);
+        for kept_out in [
+            "du -sh",
+            "4.0G",
+            "INDEX",
+            "permission denied",
+            "Size the archive",
+            "Running",
+            "Reading",
+        ] {
+            assert!(
+                !sent[1].content.contains(kept_out),
+                "{kept_out:?} is not the coworker's words: {:?}",
+                sent[1].content
+            );
+        }
+        assert!(reply.has_text_body() && reply.has_visible_body());
+    }
+
+    /// A turn that called four tools whose arguments carry what the approval card keeps off
+    /// it: a login recipe's password, a link's token, a key typed on the screen, and a
+    /// plugin's key and the coworker id the server fills in.
+    fn secret_frames() -> (Vec<serde_json::Value>, Vec<&'static str>) {
+        let typed = format!("sk-live-{}", "a1".repeat(24));
+        let mut frames = vec![json!({"type":"RUN_STARTED","threadId":"cw_1","runId":"run_k"})];
+        for (id, tool, arguments) in [
+            (
+                "c1",
+                "run_recipe",
+                json!({"recipe": "Gmail login", "values": {"password": "hunter2-horse-battery"}}),
+            ),
+            (
+                "c2",
+                "open_url",
+                json!({"url": "https://example.com/inbox?token=tok_live_q8x7#settings"}),
+            ),
+            ("c3", "computer", json!({"action": "type", "text": typed})),
+            (
+                "c4",
+                "gmail.api.send",
+                json!({"to": "bo@example.com", "api_key": "plugin-key-9f8e7d", "coworkerId": "cw_1"}),
+            ),
+        ] {
+            frames.push(json!({"type":"TOOL_CALL_START","toolCallId":id,"toolCallName":tool}));
+            frames.push(
+                json!({"type":"TOOL_CALL_ARGS","toolCallId":id,"delta":arguments.to_string()}),
+            );
+            frames.push(json!({"type":"TOOL_CALL_END","toolCallId":id}));
+            frames.push(
+                json!({"type":"TOOL_CALL_RESULT","toolCallId":id,"content":"done","ok":true}),
+            );
+        }
+        frames.push(json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Signed in."}));
+        frames.push(json!({"type":"RUN_FINISHED","threadId":"cw_1","runId":"run_k"}));
+        let secrets = vec![
+            "hunter2-horse-battery",
+            "tok_live_q8x7",
+            "token=",
+            "a1a1a1a1a1a1",
+            "plugin-key-9f8e7d",
+            "\"cw_1\"",
+        ];
+        (frames, secrets)
+    }
+
+    /// What the approval card keeps off a call is kept off its step on disk and on the row the
+    /// thread shows when it is opened again: the database never holds it.
+    #[tokio::test]
+    async fn a_steps_secrets_stay_off_the_database_and_the_opened_row() {
+        let (frames, secrets) = secret_frames();
+        let (plain, parts) = reply_from_replay(&frames, "finished");
+        let (content, saved) = reply_to_keep(&plain, &parts).expect("a reply with words");
+        let db = test_db().await;
+        keep_reply(
+            &db,
+            "cw_1",
+            "Hex",
+            "m_reply",
+            &content,
+            &saved,
+            Some("run_k"),
+            false,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("written down");
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT kind, text FROM chat_message_parts ORDER BY ord")
+                .fetch_all(&db.pool())
+                .await
+                .expect("the part rows");
+        assert_eq!(rows.iter().filter(|(kind, _)| kind == "step").count(), 4);
+        for (kind, text) in &rows {
+            for secret in &secrets {
+                assert!(
+                    !text.as_deref().unwrap_or("").contains(secret),
+                    "{secret:?} on disk in a {kind} row: {text:?}"
+                );
+            }
+        }
+        let restored = restored_message(db.get_messages("cw_1").await.expect("reopened").remove(0));
+        for part in &restored.parts {
+            if let ChatPart::Step(step) = part {
+                let opened = format!(
+                    "{} {} {:?}",
+                    step.label(),
+                    step.arguments,
+                    step.shown_arguments()
+                );
+                for secret in &secrets {
+                    assert!(!opened.contains(secret), "{secret:?} opened: {opened}");
+                }
+            }
+        }
+
+        // A row an earlier build wrote with the arguments as they came is held to the same
+        // rules when it is read back, and a thought to the same size.
+        let raw = restored_parts(
+            "",
+            vec![
+                MessagePart::Step {
+                    call_id: "c1".into(),
+                    spec: json!({
+                        "tool": "run_recipe",
+                        "arguments": "{\"recipe\":\"Gmail login\",\"values\":{\"password\":\"hunter2-horse-battery\"}}",
+                        "result": "done",
+                        "ok": true
+                    })
+                    .to_string(),
+                },
+                MessagePart::Reasoning("思".repeat(3_500)),
+            ],
+        );
+        match raw.as_slice() {
+            [ChatPart::Step(step), ChatPart::Reasoning(thought)] => {
+                assert_eq!(step.arguments, "{\"recipe\":\"Gmail login\"}");
+                assert!(thought.len() < "思".repeat(3_500).len());
+                assert_eq!(
+                    &crate::opengrok::capped(thought),
+                    thought,
+                    "read back already kept to the cap"
+                );
+                assert!(thought.ends_with('…'));
+            }
+            other => panic!("expected a step and a thought, got {other:?}"),
+        }
+    }
+
+    /// A run that failed after its tools ran, and said nothing before it did, comes back from
+    /// the database with its steps and the line saying why it failed — and that line is still
+    /// the app's, never history the coworker is sent.
+    #[tokio::test]
+    async fn a_wordless_failed_run_keeps_its_steps_and_its_line_after_reload() {
+        let mut frames = step_frames();
+        frames.retain(|frame| {
+            let kind = frame["type"].as_str().unwrap_or("");
+            !kind.starts_with("TEXT_MESSAGE")
+                && !kind.starts_with("REASONING")
+                && kind != "RUN_FINISHED"
+        });
+        frames.push(json!({"type":"RUN_ERROR","message":"the model gateway went away"}));
+        let (plain, parts) = reply_from_replay(&frames, "failed");
+        let content = replayed_ending(
+            &frames,
+            "failed",
+            Some("the model gateway went away"),
+            &plain,
+        )
+        .unwrap_or(plain);
+        assert_eq!(content, "OpenGrok: the model gateway went away");
+        let (content, saved) =
+            reply_to_keep(&content, &parts).expect("the steps are worth writing down");
+        let db = test_db().await;
+        keep_reply(
+            &db,
+            "cw_1",
+            "Hex",
+            "m_failed",
+            &content,
+            &saved,
+            Some("run_s"),
+            false,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("written down");
+
+        let restored = restored_message(db.get_messages("cw_1").await.expect("reopened").remove(0));
+        assert_eq!(restored.parts, parts, "its steps");
+        assert!(
+            restored
+                .parts
+                .iter()
+                .all(|part| matches!(part, ChatPart::Step(_))),
+            "the line is not saved as words: {:?}",
+            restored.parts
+        );
+        assert!(is_status_line(&restored.content), "its red line");
+        assert!(
+            agui_messages(&[message("m_ask", true, "how big?"), restored])
+                .iter()
+                .all(|sent| sent.role == "user"),
+            "the app's line is never sent back as the coworker's"
+        );
+    }
+
+    /// A reply that did something and said nothing — the one a stop leaves when it lands
+    /// between two tool calls — is written down with the steps it took.
+    #[tokio::test]
+    async fn a_reply_of_only_steps_is_written_down() {
+        let parts = vec![ChatPart::Step(crate::opengrok::StepSpec {
+            call_id: "c1".into(),
+            tool: "shell".into(),
+            arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
+            result: Some("4.0G\t/srv/archive".into()),
+            ok: Some(true),
+        })];
+        let (content, saved) = reply_to_keep("", &parts).expect("the step is worth keeping");
+        let db = test_db().await;
+        keep_reply(
+            &db,
+            "cw_1",
+            "Hex",
+            "m_stopped",
+            &content,
+            &saved,
+            Some("run_s"),
+            false,
+            SaveStamp::at(SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("written down");
+        let restored = restored_message(db.get_messages("cw_1").await.expect("reopened").remove(0));
+        assert_eq!(restored.parts, parts);
+        assert_eq!(restored.run_id.as_deref(), Some("run_s"));
+        // A turn that never left is still never written down: it is offered again instead.
+        assert!(reply_to_keep(TURN_UNREACHED_NOTE, &parts).is_none());
+        assert!(reply_to_keep(TURN_SIGNED_OUT_NOTE, &parts).is_none());
+        // Nor is a line of the app's own with nothing done under it.
+        assert!(reply_to_keep("OpenGrok: the model gateway went away", &[]).is_none());
     }
 
     /// Reconciling is a diff, not a rebuild: a run the thread already has a reply for was built

@@ -44,8 +44,8 @@ use super::client::{
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::gen_ui::{
     BAR_CHART_NAMES, ChatPart, EGRESS_TUNNEL_ASK_REASON, FORM_NAMES, REVIEW_AN_ACTION_REASONS,
-    RUN_AWAITING_APPROVAL, TurnAssembler, UI_CUSTOM_NAME, USER_MACHINE_SHELL, approval_from_event,
-    command_from_replay_events,
+    RUN_AWAITING_APPROVAL, StepSpec, TurnAssembler, UI_CUSTOM_NAME, USER_MACHINE_SHELL,
+    approval_from_event, command_from_replay_events, is_ui_tool, step_arguments,
 };
 use super::pending::{CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingOp};
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
@@ -56,7 +56,8 @@ use super::user_form::{
     BoxHandoffReply, COMPUTER_HANDOFF_NAMES, ComputerHandoffStatus, FORM_ENTRY_MISSING,
     FORM_RESOLUTION_WORDS, FormResolution, USER_FORM_CUSTOM, USER_FORM_CUSTOM_NAMES,
     USER_FORM_REASON, UserFormActionReply, UserFormSpec, WAITING_FOR_YOU,
-    box_handoff_action_from_http, is_user_form_awaiting, user_form_action_from_http,
+    box_handoff_action_from_http, is_user_form_awaiting, is_user_form_tool,
+    user_form_action_from_http,
 };
 use super::visibility::ImageVisibility;
 
@@ -114,6 +115,7 @@ const AGUI_TYPES: &[&str] = &[
     "REASONING_START",
     "REASONING_MESSAGE_START",
     "REASONING_MESSAGE_CONTENT",
+    "REASONING_MESSAGE_END",
     "REASONING_MESSAGE_CHUNK",
     "CUSTOM",
     "custom",
@@ -425,11 +427,6 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
          end of one message changes nothing on screen.",
     ),
     (
-        Slot::AguiType,
-        "REASONING_MESSAGE_END",
-        "Reasoning only puts Thinking on the status line, and the next frame replaces it.",
-    ),
-    (
         Slot::CustomName,
         "run-stopped",
         "The RUN_FINISHED the server always sends right after it (projection.rs stopped) ends \
@@ -560,6 +557,34 @@ impl Corpus {
             .clone();
         card["callId"] = Value::String(call_id.to_string());
         Some(card)
+    }
+
+    /// The call's own opening when the corpus has it, else the corpus's opening re-aimed at
+    /// `call_id`, for the frames whose meaning is what they do to a step.
+    fn tool_call_start_for(&self, call_id: &str) -> Option<Value> {
+        let own = self
+            .frames_of("TOOL_CALL_START")
+            .find(|start| str_at(start, "toolCallId") == call_id);
+        let mut start = own
+            .or_else(|| self.frames_of("TOOL_CALL_START").next())?
+            .clone();
+        start["toolCallId"] = Value::String(call_id.to_string());
+        Some(start)
+    }
+
+    /// Every frame of the reasoning message `message_id`, in the order a run sends them.
+    fn reasoning_frames(&self, message_id: &str) -> Vec<&Value> {
+        [
+            "REASONING_MESSAGE_START",
+            "REASONING_MESSAGE_CONTENT",
+            "REASONING_MESSAGE_END",
+        ]
+        .into_iter()
+        .flat_map(|kind| {
+            self.frames_of(kind)
+                .filter(move |frame| str_at(frame, "messageId") == message_id)
+        })
+        .collect()
     }
 }
 
@@ -695,23 +720,11 @@ fn check_frame(corpus: &Corpus, frame: &Value) -> Check {
         }
         "TEXT_MESSAGE_CONTENT" => text_content(corpus, frame),
         "TOOL_CALL_START" => tool_call_start(frame),
-        "TOOL_CALL_ARGS" => tool_call_args(frame),
-        "TOOL_CALL_END" => {
-            must!(
-                tick(frame) == label("Thinking"),
-                "TOOL_CALL_END should say Thinking, not {:?}",
-                tick(frame)
-            );
-            Ok(())
-        }
+        "TOOL_CALL_ARGS" => tool_call_args(corpus, frame),
+        "TOOL_CALL_END" => tool_call_end(corpus, frame),
         "TOOL_CALL_RESULT" => tool_call_result(corpus, frame),
-        "REASONING_MESSAGE_START" | "REASONING_MESSAGE_CONTENT" => {
-            must!(
-                tick(frame) == label("Thinking"),
-                "reasoning should say Thinking, not {:?}",
-                tick(frame)
-            );
-            Ok(())
+        "REASONING_MESSAGE_START" | "REASONING_MESSAGE_CONTENT" | "REASONING_MESSAGE_END" => {
+            reasoning(corpus, frame)
         }
         "CUSTOM" => custom(frame),
         kind if is_excused(CLIENT_IGNORES, Slot::AguiType, kind) => ignored(frame),
@@ -793,10 +806,28 @@ fn tool_call_start(frame: &Value) -> Check {
         "the call should be one thing the turn did, got {:?}",
         tracker.deeds()
     );
+    // A call is a step of the reply from the moment it starts, unless it is drawn as itself.
+    let call_id = str_at(frame, "toolCallId");
+    let (_, parts) = assembled(&[frame]).snapshot();
+    let expected = if is_ui_tool(tool) || is_user_form_tool(tool) {
+        Vec::new()
+    } else {
+        vec![ChatPart::Step(StepSpec {
+            call_id: call_id.to_string(),
+            tool: tool.to_string(),
+            arguments: String::new(),
+            result: None,
+            ok: None,
+        })]
+    };
+    must!(
+        parts == expected,
+        "TOOL_CALL_START for {tool:?} should draw {expected:?}, got {parts:?}"
+    );
     Ok(())
 }
 
-fn tool_call_args(frame: &Value) -> Check {
+fn tool_call_args(corpus: &Corpus, frame: &Value) -> Check {
     let call_id = str_at(frame, "toolCallId");
     let delta = str_at(frame, "delta");
     let command = command_from_replay_events(std::slice::from_ref(frame), call_id);
@@ -812,6 +843,55 @@ fn tool_call_args(frame: &Value) -> Check {
     must!(
         Some(&command) == sent.as_ref(),
         "the command of {call_id:?} should read back as {sent:?}, got {command:?}"
+    );
+    // The step holds none of the text the arguments come as while they are coming: what it
+    // keeps of them is decided when they end (see `tool_call_end`).
+    let start = corpus
+        .tool_call_start_for(call_id)
+        .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
+    let (_, parts) = assembled(&[&start, frame]).snapshot();
+    must!(
+        parts.iter().any(
+            |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments.is_empty())
+        ),
+        "the step for {call_id:?} should hold none of its argument text before its end: {parts:?}"
+    );
+    Ok(())
+}
+
+/// The end of a call says Thinking, and is where its step keeps its arguments: as the
+/// approval card's rules let it say them (`step_arguments`), which for this shell call is the
+/// arguments as they came.
+fn tool_call_end(corpus: &Corpus, frame: &Value) -> Check {
+    must!(
+        tick(frame) == label("Thinking"),
+        "TOOL_CALL_END should say Thinking, not {:?}",
+        tick(frame)
+    );
+    let call_id = str_at(frame, "toolCallId");
+    let start = corpus
+        .tool_call_start_for(call_id)
+        .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
+    let args = corpus
+        .frames_of("TOOL_CALL_ARGS")
+        .find(|args| str_at(args, "toolCallId") == call_id)
+        .ok_or("the corpus has no TOOL_CALL_ARGS for the call")?;
+    let delta = str_at(args, "delta");
+    let tool = str_at(&start, "toolCallName");
+    let sent: Value = serde_json::from_str(delta)
+        .map_err(|error| format!("the fixture's arguments are not JSON: {error}"))?;
+    let kept = step_arguments(tool, &sent);
+    must!(
+        kept == sent,
+        "a {tool} call's arguments are what its card shows, as sent: {kept}"
+    );
+    let kept = kept.to_string();
+    let (_, parts) = assembled(&[&start, args, frame]).snapshot();
+    must!(
+        parts.iter().any(
+            |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments == kept)
+        ),
+        "the step for {call_id:?} should keep {kept:?} once its arguments end: {parts:?}"
     );
     Ok(())
 }
@@ -838,6 +918,35 @@ fn tool_call_result(corpus: &Corpus, frame: &Value) -> Check {
             .any(|part| matches!(part, ChatPart::Approval(spec) if answered(spec))),
         "the result should land on the card for {call_id:?}: {parts:?}"
     );
+    // The result lands on the call's step, as sent. While the card waits the call is drawn as
+    // the card alone; once its result is in, it is a step again.
+    let start = corpus
+        .tool_call_start_for(call_id)
+        .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
+    let came_back = |step: &StepSpec| {
+        step.call_id == call_id && step.result.as_deref() == Some(content) && step.ok == ok
+    };
+    let (_, stepped) = assembled(&[&start, frame]).snapshot();
+    must!(
+        stepped
+            .iter()
+            .any(|part| matches!(part, ChatPart::Step(step) if came_back(step))),
+        "the result should land on the step for {call_id:?}: {stepped:?}"
+    );
+    let (_, waiting) = assembled(&[&start, &card]).snapshot();
+    must!(
+        !waiting
+            .iter()
+            .any(|part| matches!(part, ChatPart::Step(step) if step.call_id == call_id)),
+        "a call waiting on its card is drawn as the card and not also as a step: {waiting:?}"
+    );
+    let (_, answered) = assembled(&[&start, &card, frame]).snapshot();
+    must!(
+        answered
+            .iter()
+            .any(|part| matches!(part, ChatPart::Step(step) if came_back(step))),
+        "a call whose card was answered is a step with its result: {answered:?}"
+    );
     if let Some(image) = frame.get("image") {
         let shot = assembler
             .latest_screenshot()
@@ -861,6 +970,54 @@ fn tool_call_result(corpus: &Corpus, frame: &Value) -> Check {
         must!(
             pinned != (visibility == Some(ImageVisibility::Agent)),
             "an agent picture stays in the Computer pane and any other goes in the feed"
+        );
+    }
+    Ok(())
+}
+
+/// A reasoning frame puts Thinking on the status line while the coworker thinks and leaves it
+/// alone when the thought ends, and the message it belongs to is one thought in the reply that
+/// reads as the fixture's words and is none of the reply's own. The end is what closes it.
+fn reasoning(corpus: &Corpus, frame: &Value) -> Check {
+    let kind = str_at(frame, "type");
+    let status = if kind == "REASONING_MESSAGE_END" {
+        ActivityTick::Keep
+    } else {
+        label("Thinking")
+    };
+    must!(
+        tick(frame) == status,
+        "{kind} should leave the status line at {status:?}, not {:?}",
+        tick(frame)
+    );
+    let message = corpus.reasoning_frames(str_at(frame, "messageId"));
+    let said: String = message
+        .iter()
+        .filter(|frame| str_at(frame, "type") == "REASONING_MESSAGE_CONTENT")
+        .map(|frame| str_at(frame, "delta"))
+        .collect();
+    must!(
+        !said.trim().is_empty(),
+        "the corpus has no words for the reasoning message of {kind}"
+    );
+    let (plain, parts) = assembled(&message).snapshot();
+    must!(
+        parts == vec![ChatPart::Reasoning(said.trim().to_string())],
+        "the reasoning should be one thought reading {said:?}, got {parts:?}"
+    );
+    must!(
+        plain.is_empty(),
+        "a thought is not the reply's words: {plain:?}"
+    );
+    if kind == "REASONING_MESSAGE_END" {
+        let still_open: Vec<&Value> = message
+            .iter()
+            .copied()
+            .filter(|frame| str_at(frame, "type") != "REASONING_MESSAGE_END")
+            .collect();
+        must!(
+            assembled(&still_open).snapshot().1.is_empty(),
+            "a thought is drawn once its message ends, not while it is still being said"
         );
     }
     Ok(())

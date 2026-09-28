@@ -12,6 +12,7 @@ use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_s
 use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::components::save_login::render_save_login;
+use crate::components::steps::{RunLayout, RunRow, render_run_row};
 use crate::components::user_form::{
     UserFormInputMap, UserFormTextareaMap, field_key, render_user_form,
 };
@@ -67,6 +68,11 @@ struct ChatFeedRev {
     approvals: Vec<(String, String)>,
     last_output: usize,
     expanded_output: Vec<String>,
+    /// How much the thread's steps and thoughts hold, and how many steps have come back. A
+    /// step's arguments and result arrive into a part that is already there, so the part count
+    /// alone would leave its row saying "…" after the call was done.
+    steps: (usize, usize),
+    expanded_steps: Vec<String>,
     show_turn_timing: bool,
     /// Every row's, not the last one's: a resumed run finishes on a bubble that a later
     /// message may already sit below.
@@ -244,6 +250,27 @@ impl ChatFeedRev {
                 ids.sort();
                 ids
             },
+            steps: conv
+                .map(|c| {
+                    c.messages.iter().flat_map(|m| m.parts.iter()).fold(
+                        (0, 0),
+                        |(held, settled), part| match part {
+                            ChatPart::Step(step) => (
+                                held + step.arguments.len()
+                                    + step.result.as_ref().map_or(0, String::len),
+                                settled + usize::from(step.result.is_some()),
+                            ),
+                            ChatPart::Reasoning(thought) => (held + thought.len(), settled),
+                            _ => (held, settled),
+                        },
+                    )
+                })
+                .unwrap_or_default(),
+            expanded_steps: {
+                let mut keys: Vec<String> = state.expanded_steps.iter().cloned().collect();
+                keys.sort();
+                keys
+            },
             show_turn_timing: state.show_turn_timing,
             clocks: conv
                 .map(|c| {
@@ -297,6 +324,9 @@ struct ChatRow {
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
     save_login: Option<SaveLoginSpec>,
+    /// A step, a stretch of steps or a thought. Its `content` stays empty: none of it is words,
+    /// so find, copy and read aloud pass it by.
+    run: Option<RunRow>,
 }
 
 impl ChatRow {
@@ -335,8 +365,34 @@ impl ChatRow {
             screenshots: Vec::new(),
             user_form: None,
             save_login: None,
+            run: None,
         }
     }
+
+    /// Whether this is the same row, drawn the same way, as `other`: an opened step is a
+    /// different row from the shut one, because it is taller.
+    fn same_as(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.run.as_ref().map(RunRow::is_open) == other.run.as_ref().map(RunRow::is_open)
+    }
+}
+
+/// The rows that changed between `old` and `new`, as the span of `old` to replace and how many
+/// rows of `new` replace it: everything between the rows the two begin with and the rows they
+/// end with.
+fn changed_rows(old: &[ChatRow], new: &[ChatRow]) -> (std::ops::Range<usize>, usize) {
+    let head = old
+        .iter()
+        .zip(new)
+        .take_while(|(old, new)| old.same_as(new))
+        .count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(old, new)| old.same_as(new))
+        .count();
+    (head..old.len() - tail, new.len() - tail - head)
 }
 
 /// Whether a picture belongs to the strip the row before it already holds. Pictures are one
@@ -402,10 +458,24 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     _ => None,
                 })
                 .collect();
-            collapse_open_approvals(&msg.parts, &open)
+            let mut display = collapse_open_approvals(&msg.parts, &open);
+            // A turn that stopped short of saying anything has the app's line about why as its
+            // text. The steps it took do not say that, and drawn alone they would be all there
+            // was to see of a run that failed after its tools ran, so the line goes under them.
+            let said_nothing = !display
+                .iter()
+                .any(|part| matches!(part, ChatPart::Text(text) if !text.trim().is_empty()));
+            let acted = display
+                .iter()
+                .any(|part| matches!(part, ChatPart::Step(_) | ChatPart::Reasoning(_)));
+            if !msg.is_me && acted && said_nothing && is_status_line(&msg.content) {
+                display.push(ChatPart::Text(msg.content.clone()));
+            }
+            display
         } else {
             vec![ChatPart::Text(msg.content.clone())]
         };
+        let runs = RunLayout::new(&msg.id, &display, &state.expanded_steps);
         let mut text_buf = String::new();
         let mut ui_n = 0usize;
         let mut text_n = 0usize;
@@ -457,9 +527,19 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 ..ChatRow::slot(id, msg.id.clone())
             });
         };
-        for part in display {
+        for (at, part) in display.into_iter().enumerate() {
             match part {
                 ChatPart::Text(text) => text_buf.push_str(&text),
+                ChatPart::Step(_) | ChatPart::Reasoning(_) => {
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    for run in runs.rows(at, part) {
+                        let id = run.key().to_string();
+                        rows.push(ChatRow {
+                            run: Some(run),
+                            ..ChatRow::slot(id, msg.id.clone())
+                        });
+                    }
+                }
                 ChatPart::Ui(spec) => {
                     flush_text(&mut rows, &mut text_buf, &mut text_n);
                     rows.push(ChatRow {
@@ -611,6 +691,12 @@ impl ChatTranscript {
                 (feed, snapshot_rows(app))
             };
             let conv_changed = this.feed_rev.conversation_id != feed.conversation_id;
+            // A step opened or shut in the middle of the thread adds or takes away rows there,
+            // and a list reset for that would carry the person off to the bottom of the thread,
+            // away from the very row they clicked. Only the rows that changed are replaced.
+            let opened = (!conv_changed && this.feed_rev.expanded_steps != feed.expanded_steps)
+                .then(|| changed_rows(&this.rows, &rows));
+            let was = this.rows.len();
             let is_ai_responding = feed.is_ai_responding;
             this.rows = rows;
             this.debug_mode = feed.debug_mode;
@@ -621,7 +707,9 @@ impl ChatTranscript {
             let count = this.rows.len();
             this.scroller.update(cx, |scroller, cx| {
                 let old = scroller.item_count();
-                if conv_changed || count != old {
+                if let Some((span, added)) = opened.filter(|_| old == was) {
+                    scroller.splice(span, added, cx);
+                } else if conv_changed || count != old {
                     scroller.reset(count, cx);
                 } else if is_ai_responding && count > 0 {
                     scroller.remeasure_items(count - 1..count, cx);
@@ -1054,6 +1142,16 @@ impl Render for ChatTranscript {
                             let Some(row) = rows.get(ix) else {
                                 return div().into_any_element();
                             };
+                            if let Some(run) = &row.run {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(1.))
+                                    .child(render_run_row(run, app_state.clone(), cx))
+                                    .into_any_element();
+                            }
                             if let Some(spec) = &row.widget {
                                 return div()
                                     .id(ElementId::Name(row.id.clone().into()))
@@ -1845,8 +1943,12 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, joins_previous_set, tail_room, text_row_id,
+        ChatFeedRev, ChatRow, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, changed_rows,
+        joins_previous_set, snapshot_rows, tail_room, text_row_id,
     };
+    use crate::components::steps::step_key;
+    use crate::opengrok::{ChatPart, StepSpec};
+    use crate::state::AppState;
     use gpui_kit::px;
 
     /// The room is the last bubble's alone: give it to every row and the transcript would be
@@ -1937,5 +2039,315 @@ mod tests {
     #[test]
     fn the_first_picture_of_the_transcript_has_nothing_to_join() {
         assert!(!joins_previous_set(&[], "m1"));
+    }
+
+    fn step(call_id: &str, result: Option<(&str, bool)>) -> ChatPart {
+        ChatPart::Step(StepSpec {
+            call_id: call_id.to_string(),
+            tool: "shell".to_string(),
+            arguments: format!("{{\"command\":\"echo {call_id}\"}}"),
+            result: result.map(|(content, _)| content.to_string()),
+            ok: result.map(|(_, ok)| ok),
+        })
+    }
+
+    fn one_reply(parts: Vec<ChatPart>) -> AppState {
+        let mut state = AppState::new();
+        state.active_conversation_id = Some("cw_1".into());
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "Hex".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![crate::state::Message {
+                id: "m1".into(),
+                sender: "AI".into(),
+                content: "Let me look.\n\nDone.".into(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts,
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        state
+    }
+
+    /// What each row is, in a word, so a test can say the feed in one line.
+    fn feed(state: &AppState) -> Vec<String> {
+        snapshot_rows(state)
+            .iter()
+            .map(|row| match &row.run {
+                Some(RunRow::Steps {
+                    count,
+                    open,
+                    status,
+                    ..
+                }) => format!("{count} steps {} {}", status.mark(), open_word(*open)),
+                Some(RunRow::Step {
+                    step, open, group, ..
+                }) => format!(
+                    "{}step {} {}",
+                    if group.is_some() { "  " } else { "" },
+                    step.call_id,
+                    open_word(*open)
+                ),
+                Some(RunRow::Thought { open, group, .. }) => format!(
+                    "{}thought {}",
+                    if group.is_some() { "  " } else { "" },
+                    open_word(*open)
+                ),
+                None => format!("words {}", row.content),
+            })
+            .collect()
+    }
+
+    fn open_word(open: bool) -> &'static str {
+        if open { "open" } else { "shut" }
+    }
+
+    /// Steps with no words between them are one "N steps" row until it is opened, a thought
+    /// between them does not split them, and a stretch of one step is that step. None of those
+    /// rows has words in it for find, copy or read aloud to take. A step opened inside a shut
+    /// stretch opens the stretch; shutting the stretch shuts what is in it.
+    #[test]
+    fn consecutive_steps_are_one_row_until_opened() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            step("c1", Some(("a", true))),
+            ChatPart::Reasoning("Now the other one.".into()),
+            step("c2", None),
+            ChatPart::Text("Done.".into()),
+            step("c3", Some(("no", false))),
+        ]);
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "2 steps … shut",
+                "words Done.",
+                "step c3 shut"
+            ]
+        );
+        let rows = snapshot_rows(&state);
+        assert!(
+            rows.iter()
+                .filter(|row| row.run.is_some())
+                .all(|row| row.content.is_empty() && row.tts_text.is_empty()),
+            "a step's row has no words in it"
+        );
+
+        state.mark_steps_open(&[step_key("m1", "c2")], true);
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "2 steps … open",
+                "  step c1 shut",
+                "  thought shut",
+                "  step c2 open",
+                "words Done.",
+                "step c3 shut",
+            ]
+        );
+
+        let Some(RunRow::Steps { key, members, .. }) =
+            snapshot_rows(&state).iter().find_map(|row| {
+                row.run
+                    .clone()
+                    .filter(|run| matches!(run, RunRow::Steps { .. }))
+            })
+        else {
+            panic!("the stretch has its line");
+        };
+        let shut: Vec<String> = std::iter::once(key).chain(members).collect();
+        state.mark_steps_open(&shut, false);
+        assert_eq!(feed(&state)[1], "2 steps … shut");
+        assert_eq!(feed(&state).len(), 4);
+    }
+
+    /// A run that failed after its tools ran said nothing, and the app's line saying why is
+    /// drawn under its steps rather than hidden behind them.
+    #[test]
+    fn a_run_that_failed_after_its_steps_still_says_why() {
+        let mut state = one_reply(vec![
+            step("c1", Some(("a", true))),
+            step("c2", Some(("no", false))),
+        ]);
+        state.conversations[0].messages[0].content = "OpenGrok: the model gateway went away".into();
+        assert_eq!(
+            feed(&state),
+            vec![
+                "2 steps ✗ shut",
+                "words OpenGrok: the model gateway went away"
+            ]
+        );
+        let rows = snapshot_rows(&state);
+        assert!(rows.last().is_some_and(|row| row.status_failed));
+    }
+
+    /// Opening a row in the middle of the thread replaces only the rows that changed, so the
+    /// list keeps its place instead of being reset to the bottom.
+    #[test]
+    fn opening_a_step_changes_only_its_own_rows() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            step("c1", Some(("a", true))),
+            step("c2", Some(("b", true))),
+            ChatPart::Text("Done.".into()),
+        ]);
+        let shut = snapshot_rows(&state);
+        state.mark_steps_open(&[step_key("m1", "c1")], true);
+        let open = snapshot_rows(&state);
+        // The line stays, opened; its two steps come in under it; the words either side stay.
+        assert_eq!(changed_rows(&shut, &open), (1..2, 3));
+        assert_eq!(changed_rows(&open, &shut), (1..4, 1));
+        assert_eq!(changed_rows(&open, &open), (5..5, 0));
+    }
+
+    /// A driver's click opens the very row the feed draws: the keys the host's click hands the
+    /// app open a step standing alone, with what it was given and what came back; a step in a
+    /// stretch, whose line opens with it; and the Thought rows. A second click shuts the step.
+    ///
+    /// This is the contract between the tree and the feed, not the whole of the bug a driver
+    /// found on 28 Sep 2026: these rows were already right then. The window went on drawing
+    /// the old ones because the click was applied in the middle of a frame, where GPUI does not
+    /// tell the state's observers, and the transcript builds its rows in one. That half is in
+    /// `RootView::drain_agent`, and only a live window shows it.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_drivers_click_opens_the_row_the_feed_draws() {
+        use gpui_agent::{AgentHost, Op};
+        let mut state = one_reply(vec![
+            ChatPart::Reasoning("Size it first.".into()),
+            ChatPart::Text("Let me look.".into()),
+            step("c1", Some(("4.0G", true))),
+            ChatPart::Text("Now the index.".into()),
+            step("c2", Some(("a", true))),
+            ChatPart::Reasoning("Then read it.".into()),
+            step("c3", Some(("denied", false))),
+            ChatPart::Text("Done.".into()),
+        ]);
+        let click = |state: &mut AppState, target: &str| {
+            let mut host = crate::agent::NativeChatHost::from_app(state);
+            host.dispatch(&Op::click(target))
+                .expect("the host takes the click");
+            let Some(crate::agent::Command::SetStepsOpen { keys, open }) = host.take_command()
+            else {
+                panic!("a click on {target} opens or shuts rows");
+            };
+            state.mark_steps_open(&keys, open);
+        };
+        let row = |state: &AppState, call_id: &str| {
+            snapshot_rows(state)
+                .iter()
+                .find_map(|row| match &row.run {
+                    Some(RunRow::Step {
+                        step, open, group, ..
+                    }) if step.call_id == call_id => Some((step.clone(), *open, group.is_some())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no row for {call_id} in {:?}", feed(state)))
+        };
+
+        click(&mut state, "step-c1");
+        let (lone, open, grouped) = row(&state, "c1");
+        assert!(open && !grouped, "the step standing alone is open, alone");
+        assert_eq!(lone.shown_arguments().as_deref(), Some("echo c1"));
+        assert_eq!(lone.result.as_deref(), Some("4.0G"));
+
+        click(&mut state, "step-c3");
+        assert_eq!(
+            feed(&state),
+            vec![
+                "thought shut",
+                "words Let me look.",
+                "step c1 open",
+                "words Now the index.",
+                "2 steps ✗ open",
+                "  step c2 shut",
+                "  thought shut",
+                "  step c3 open",
+                "words Done.",
+            ]
+        );
+
+        click(&mut state, "reply-reasoning");
+        let thoughts: Vec<bool> = snapshot_rows(&state)
+            .iter()
+            .filter_map(|row| match &row.run {
+                Some(RunRow::Thought { open, .. }) => Some(*open),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thoughts,
+            vec![true, true],
+            "both thoughts, in the stretch too"
+        );
+
+        click(&mut state, "step-c1");
+        assert!(!row(&state, "c1").1, "a second click shuts it");
+    }
+
+    /// A step's result landing after its row was drawn is a change the feed sees, and the rows
+    /// it rebuilds say how the call came out: the step's mark, an opened step's result, and the
+    /// mark on the "N steps" line it sits in. `ChatRow::same_as` never decides what is drawn,
+    /// only which rows the list measures again when one is opened or shut.
+    #[test]
+    fn a_result_landing_late_redraws_its_row() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            step("c1", None),
+            ChatPart::Text("Now the two others.".into()),
+            step("c2", Some(("a", true))),
+            step("c3", None),
+        ]);
+        state.mark_steps_open(&[step_key("m1", "c1")], true);
+        let before = ChatFeedRev::from_state(&state);
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 open",
+                "words Now the two others.",
+                "2 steps … shut",
+            ]
+        );
+        let settle = |state: &mut AppState, call_id: &str, content: &str, ok: bool| {
+            for part in &mut state.conversations[0].messages[0].parts {
+                if let ChatPart::Step(step) = part
+                    && step.call_id == call_id
+                {
+                    step.result = Some(content.to_string());
+                    step.ok = Some(ok);
+                }
+            }
+        };
+        settle(&mut state, "c1", "4.0G", true);
+        settle(&mut state, "c3", "denied", false);
+        assert!(
+            ChatFeedRev::from_state(&state) != before,
+            "the feed sees the results land, so it rebuilds its rows"
+        );
+        let rows = snapshot_rows(&state);
+        let opened = rows
+            .iter()
+            .find_map(|row| match &row.run {
+                Some(RunRow::Step { step, open, .. }) if step.call_id == "c1" => {
+                    Some((step.status().mark(), *open, step.result.clone()))
+                }
+                _ => None,
+            })
+            .expect("c1's row");
+        assert_eq!(opened, ("✓", true, Some("4.0G".to_string())));
+        assert_eq!(feed(&state)[3], "2 steps ✗ shut");
     }
 }

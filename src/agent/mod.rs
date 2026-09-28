@@ -36,6 +36,12 @@
 //! `coworker-{id}` (a sidebar row: value = the last thing said in the bot's thread, state
 //! `listed` when that thread came from the server's list and not this Mac),
 //! `approval-{call}` (title = the card's own, states = reason, thread, tool),
+//! `reply-steps` (the newest coworker reply's steps, a list with value = how many; in the tree
+//! only while it has any) with `step-{call_id}` under it (label = the step row's own words,
+//! value `running` / `ok` / `failed`, state `expanded` while its row is open; a click opens or
+//! shuts it, and an open step holds its "N steps" line open), `reply-reasoning` (value = how
+//! many Thought rows that reply has, in the tree only while it has any; state `expanded` while
+//! all are open; a click opens them all, or shuts them once they all are),
 //! `recipe-run` (on the open recipe: value = the bot it plays on, disabled while it cannot run
 //! or a run is going; invoke `recipe.run {bot?}`), `recipe-run-result` (value `running` / `ok`
 //! / `failed` / `interrupted`), `recipe-error` (what the page says went wrong, e.g. a
