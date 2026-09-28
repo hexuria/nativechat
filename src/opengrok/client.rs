@@ -2462,7 +2462,7 @@ impl BoxShareScope {
 }
 
 /// The most an upload may weigh: opengrok-server `artifacts.rs` `MAX_ARTIFACT_BYTES` (25 MiB).
-pub(crate) const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 
 /// A file's type as the server will take it: a plain lowercase `type/subtype`. The server
 /// refuses parameters (`; charset=utf-8`) and reads its accepted kinds in lowercase, so a

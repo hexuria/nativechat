@@ -49,12 +49,21 @@ actions!(
 type SubmitCallback =
     Box<dyn Fn(String, bool, Vec<crate::opengrok::Attachment>, &mut Context<MessageInput>)>;
 
+/// How a notice that the send is waiting on uploads begins, so settling the last upload can
+/// replace it.
+const WAITING: &str = "Not sent:";
+
 /// A file on the draft (#90). It is uploaded the moment it is picked, so a file the server
 /// refuses says so on its tile while the draft is still being written, and sending names what
 /// is already there.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DraftFile {
+    /// Unique on this draft: an upload's answer lands on the tile it was started for, even when
+    /// the same file was removed and picked again meanwhile (review of #135).
+    pub key: u64,
     pub path: PathBuf,
+    /// The file's size on disk when it was picked.
+    pub size: u64,
     pub name: String,
     pub mime: String,
     pub state: FileState,
@@ -108,11 +117,17 @@ pub fn file_mime(path: &Path) -> Option<&'static str> {
 /// learns it from the bot's reply. From opengrok-server `docs/setup/nativechat.md` ("Attachments:
 /// what the server accepts and what the model sees").
 pub fn file_caveat(files: &[DraftFile]) -> Option<String> {
+    const SHOWN: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+    const PICTURE_MAX: u64 = 10 * 1024 * 1024;
     let pdf = files.iter().any(|file| file.mime == "application/pdf");
     let video = files.iter().any(|file| file.mime.starts_with("video/"));
+    let named_picture = files.iter().any(|file| {
+        file.mime.starts_with("image/")
+            && (!SHOWN.contains(&file.mime.as_str()) || file.size > PICTURE_MAX)
+    });
     let pictures = files
         .iter()
-        .filter(|file| file.mime.starts_with("image/"))
+        .filter(|file| SHOWN.contains(&file.mime.as_str()) && file.size <= PICTURE_MAX)
         .count();
     let mut lines = Vec::new();
     if pdf {
@@ -121,8 +136,16 @@ pub fn file_caveat(files: &[DraftFile]) -> Option<String> {
     if video {
         lines.push("The bot sees a video's name, not the video.");
     }
+    if named_picture {
+        lines.push(
+            "The bot is shown PNG, JPEG, GIF and WebP pictures up to 10 MB; others go by name.",
+        );
+    }
     if pictures > 8 {
         lines.push("The bot is shown 8 pictures a message; the rest go by name.");
+    }
+    if files.iter().any(|file| file.mime.starts_with("text/")) {
+        lines.push("A text file is read up to its first 20,000 characters.");
     }
     (!lines.is_empty()).then(|| lines.join(" "))
 }
@@ -195,6 +218,7 @@ pub struct MessageInput {
     active_recipe: Option<ActiveRecipe>,
     /// Images to send with the message, shown as thumbnails above the text.
     attachments: Vec<DraftFile>,
+    next_file_key: u64,
     /// A line above the field for something the person needs told: a file that was not an image,
     /// a picker that would not open.
     notice: Option<String>,
@@ -247,6 +271,7 @@ impl MessageInput {
             tokens: Vec::new(),
             active_recipe,
             attachments: Vec::new(),
+            next_file_key: 0,
             notice: None,
             dismissed_at: None,
             turn_in_flight,
@@ -261,6 +286,20 @@ impl MessageInput {
             let requested = state.update(cx, |state, _| std::mem::take(&mut state.attach_requests));
             if !requested.is_empty() {
                 this.add_attachments(requested, cx);
+            }
+            // A driver's ✕, by the file's place on the draft.
+            let detached = state.update(cx, |state, _| std::mem::take(&mut state.detach_requests));
+            if !detached.is_empty() {
+                let mut detached = detached;
+                detached.sort_unstable();
+                detached.dedup();
+                for index in detached.into_iter().rev() {
+                    if index < this.attachments.len() {
+                        this.attachments.remove(index);
+                        this.notice = None;
+                    }
+                }
+                this.publish_files(cx);
             }
             {
                 let state = state.read(cx);
@@ -488,10 +527,13 @@ impl MessageInput {
             .filter(|file| file.state == FileState::Uploading)
             .count();
         if uploading > 0 {
+            // Said as what it is: nothing is sent later on its own, the person sends again.
             self.notice = Some(if uploading == 1 {
-                "Waiting for a file to finish uploading.".to_string()
+                format!("{WAITING} a file is still uploading. Send again when it is ready.")
             } else {
-                format!("Waiting for {uploading} files to finish uploading.")
+                format!(
+                    "{WAITING} {uploading} files are still uploading. Send again when they are ready."
+                )
             });
             cx.notify();
             return;
@@ -513,6 +555,17 @@ impl MessageInput {
                 _ => None,
             })
             .collect();
+        // Files cannot wait in the queue behind a running turn: the server's queue holds words
+        // only, and files kept in this session alone would be lost to a restart. The draft stays
+        // as it is (review of #135).
+        if !files.is_empty() && self.state.read(cx).would_queue(steer) {
+            self.notice = Some(
+                "Files cannot wait in the queue. Send them when the bot is done, or now with ⌘⇧↵."
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         if !trimmed.is_empty() || !files.is_empty() {
             // A recipe that has not been told what it needs cannot run, and the server would
             // refuse the turn. Say which parameter here, before anything is sent and while the
@@ -1434,8 +1487,13 @@ impl MessageInput {
     fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut refused = 0;
         for path in paths {
-            if self.attachments.iter().any(|file| file.path == path) {
-                continue;
+            // A file already on the draft is not added twice; one that failed is tried again.
+            if let Some(at) = self.attachments.iter().position(|file| file.path == path) {
+                if matches!(self.attachments[at].state, FileState::Failed(_)) {
+                    self.attachments.remove(at);
+                } else {
+                    continue;
+                }
             }
             let Some(mime) = file_mime(&path) else {
                 refused += 1;
@@ -1445,13 +1503,28 @@ impl MessageInput {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".to_string());
+            let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+            self.next_file_key += 1;
+            let key = self.next_file_key;
+            // Over the server's cap the file is refused here, before it is read into memory: a
+            // screen recording can be gigabytes (review of #135).
+            let state = if size > crate::opengrok::MAX_ATTACHMENT_BYTES as u64 {
+                FileState::Failed("artifacts must be under 25 MiB".to_string())
+            } else {
+                FileState::Uploading
+            };
+            let upload = state == FileState::Uploading;
             self.attachments.push(DraftFile {
+                key,
                 path: path.clone(),
+                size,
                 name,
                 mime: mime.to_string(),
-                state: FileState::Uploading,
+                state,
             });
-            self.upload(path, mime, cx);
+            if upload {
+                self.upload(key, path, mime, cx);
+            }
         }
         self.notice = (refused > 0).then(|| {
             if refused == 1 {
@@ -1469,14 +1542,14 @@ impl MessageInput {
 
     /// Upload one picked file to the open thread. The answer lands on that file's tile, found
     /// by its path, since other files may have been added or removed meanwhile.
-    fn upload(&mut self, path: PathBuf, mime: &'static str, cx: &mut Context<Self>) {
+    fn upload(&mut self, key: u64, path: PathBuf, mime: &'static str, cx: &mut Context<Self>) {
         let (client, thread) = {
             let state = self.state.read(cx);
             (state.opengrok.clone(), state.active_conversation_id.clone())
         };
         let (Some(client), Some(thread)) = (client, thread) else {
             self.settle_file(
-                &path,
+                key,
                 FileState::Failed("Sign in and open a bot first.".into()),
             );
             return;
@@ -1501,7 +1574,7 @@ impl MessageInput {
                 }
             };
             let _ = this.update(cx, |this, cx| {
-                this.settle_file(&path, outcome);
+                this.settle_file(key, outcome);
                 this.publish_files(cx);
                 cx.notify();
             });
@@ -1509,13 +1582,38 @@ impl MessageInput {
         .detach();
     }
 
-    fn settle_file(&mut self, path: &Path, state: FileState) {
+    /// Put an upload's answer on the tile it was started for. When the last upload lands, a
+    /// "not sent" notice is replaced by what to do next: the send is the person's to press again.
+    fn settle_file(&mut self, key: u64, state: FileState) {
         if let Some(file) = self
             .attachments
             .iter_mut()
-            .find(|file| file.path == path && file.state == FileState::Uploading)
+            .find(|file| file.key == key && file.state == FileState::Uploading)
         {
             file.state = state;
+        }
+        let uploading = self
+            .attachments
+            .iter()
+            .any(|file| file.state == FileState::Uploading);
+        if !uploading
+            && self
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with(WAITING))
+        {
+            self.notice = Some(
+                if self
+                    .attachments
+                    .iter()
+                    .any(|file| matches!(file.state, FileState::Failed(_)))
+                {
+                    "A file did not upload. Remove it, then send."
+                } else {
+                    "The files are ready. Press Send."
+                }
+                .to_string(),
+            );
         }
     }
 
@@ -1546,8 +1644,10 @@ impl MessageInput {
                     .children(self.attachments.iter().enumerate().map(|(index, file)| {
                         let group = SharedString::from(format!("composer-attachment-{index}"));
                         let failed = matches!(file.state, FileState::Failed(_));
-                        let picture =
-                            file.mime.starts_with("image/") && file.mime != "image/svg+xml";
+                        // Drawn as a thumbnail only when the image can be decoded here; HEIC and SVG
+                        // are named tiles.
+                        let picture = ["image/png", "image/jpeg", "image/gif", "image/webp"]
+                            .contains(&file.mime.as_str());
                         div()
                             .id(SharedString::from(format!("composer-attachment-{index}")))
                             .group(group.clone())
@@ -2718,6 +2818,8 @@ mod tests {
     fn what_the_bot_will_not_see_is_said_first() {
         use super::{DraftFile, FileState, file_caveat};
         let file = |name: &str, mime: &str| DraftFile {
+            key: 0,
+            size: 1,
             path: PathBuf::from(name),
             name: name.into(),
             mime: mime.into(),
@@ -2730,5 +2832,18 @@ mod tests {
             .map(|i| file(&format!("{i}.png"), "image/png"))
             .collect();
         assert!(file_caveat(&many).unwrap().contains("8 pictures"));
+        // A picture the model is not shown is said to be named (review of #135).
+        let heic = file_caveat(&[file("photo.heic", "image/heic")]).unwrap();
+        assert!(heic.contains("go by name"), "{heic}");
+        let big = DraftFile {
+            size: 11 * 1024 * 1024,
+            ..file("big.png", "image/png")
+        };
+        assert!(file_caveat(&[big]).unwrap().contains("up to 10 MB"));
+        assert!(
+            file_caveat(&[file("n.txt", "text/plain")])
+                .unwrap()
+                .contains("20,000")
+        );
     }
 }

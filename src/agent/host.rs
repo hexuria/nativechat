@@ -494,6 +494,8 @@ pub enum Command {
     ToggleAgentTools,
     /// Attach a file to the draft by path, as the + would (#90).
     AttachFile(std::path::PathBuf),
+    /// Take a file off the draft by its place, as its ✕ would.
+    DetachFile(usize),
     UserFormDismiss {
         card_key: String,
     },
@@ -706,6 +708,7 @@ impl Command {
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
             Self::AttachFile(path) => state.request_attach(path, cx),
+            Self::DetachFile(index) => state.request_detach(index, cx),
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -4577,11 +4580,36 @@ impl NativeChatHost {
                 Command::SetAvatarColor(id)
             }
             "theme.toggle" => Command::ToggleTheme,
-            "composer.attach" => Command::AttachFile(
-                invoke_arg_str(args, &["path"])
-                    .ok_or("composer.attach requires arg path")?
-                    .into(),
-            ),
+            "composer.attach" => {
+                let path = std::path::PathBuf::from(
+                    invoke_arg_str(args, &["path"]).ok_or("composer.attach requires arg path")?,
+                );
+                // Said here rather than only on the composer's notice, which is not on the tree:
+                // a driver learns at once that the path is not one the app can attach.
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "composer.attach needs an absolute path: {} would resolve against the app's \
+                         directory, not yours",
+                        path.display()
+                    ));
+                }
+                if crate::components::chat_input::file_mime(&path).is_none() {
+                    return Err(format!(
+                        "{} cannot be attached: images, videos, PDFs and text files can",
+                        path.display()
+                    ));
+                }
+                Command::AttachFile(path)
+            }
+            "composer.detach" => {
+                let index = invoke_arg_str(args, &["index"])
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .ok_or("composer.detach requires arg index (the N of composer-file-N)")?;
+                if index >= self.composer_files.len() {
+                    return Err(format!("no composer-file-{index} on the draft"));
+                }
+                Command::DetachFile(index)
+            }
             "computer.toggle" => Command::ToggleComputerPane,
             "computer.open" => Command::OpenCoworkerScreen,
             "computer.update" => Command::OpenComputerConfirm(crate::state::ComputerAction::Update),
@@ -8580,6 +8608,26 @@ mod tests {
         }
         assert!(
             host.invoke("composer.attach", &serde_json::json!({}))
+                .is_err()
+        );
+        assert!(
+            host.invoke("composer.attach", &serde_json::json!({"path": "q3.pdf"}))
+                .is_err(),
+            "a relative path would resolve against the app's directory"
+        );
+        assert!(
+            host.invoke(
+                "composer.attach",
+                &serde_json::json!({"path": "/tmp/a.zip"})
+            )
+            .is_err(),
+            "a kind the server does not take is refused at once"
+        );
+        host.invoke("composer.detach", &serde_json::json!({"index": "1"}))
+            .unwrap();
+        assert!(matches!(host.take_command(), Some(Command::DetachFile(1))));
+        assert!(
+            host.invoke("composer.detach", &serde_json::json!({"index": "5"}))
                 .is_err()
         );
     }

@@ -79,7 +79,9 @@
 //! Files (#90): `composer-file-{i}` under `composer` (label = the file's name, value `uploading`
 //! / `ready` / `failed`); `message-file-{artId}` on the chat page for each file a message in the
 //! open thread carried (label = filename, value = the message id). Invoke `composer.attach --arg
-//! path=…` attaches a file by path, as picking it with the + would; it uploads at once.
+//! path=/absolute/path` attaches a file, as picking it with the + would; it uploads at once, and a
+//! relative path or a kind the server does not take is refused. `composer.detach --arg index=N`
+//! takes `composer-file-N` off the draft, as its ✕ would.
 //!
 //! The draft's chips: `composer-chip-{i}` under `composer`, in order (label = what the chip reads
 //! as, value `tool` / `recipe` / `workflow` / `skill`). A chip is one object in the field (#40):

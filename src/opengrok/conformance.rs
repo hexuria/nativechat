@@ -768,8 +768,16 @@ fn text_end(corpus: &Corpus, frame: &Value) -> Check {
     else {
         return Ok(());
     };
-    let (before, _) = assembled(&[start]).snapshot();
-    let (after, _) = assembled(&[start, frame]).snapshot();
+    // The whole message, its words included, so an END that dropped or cleared them is caught.
+    let mut frames: Vec<&Value> = vec![start];
+    frames.extend(
+        corpus
+            .frames_of("TEXT_MESSAGE_CONTENT")
+            .filter(|content| content.get("messageId") == frame.get("messageId")),
+    );
+    let (before, _) = assembled(&frames).snapshot();
+    frames.push(frame);
+    let (after, _) = assembled(&frames).snapshot();
     must!(
         before == after,
         "closing a message changed the words: {before:?} became {after:?}"
