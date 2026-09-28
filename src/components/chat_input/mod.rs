@@ -936,13 +936,6 @@ impl MessageInput {
     /// stronger reason: the chip is the only place the app says this message carries a skill. A
     /// draft that kept the skill after the word was deleted would be sending something with the
     /// message that nothing on screen mentions.
-    ///
-    /// One hole in that, older than skills and not closed here: a chip whose words wrap across a
-    /// line is painted with no fill at all (see [`Self::chip_fills`], which has no one rectangle
-    /// to put there), so a skill whose name straddles a wrap rides out with nothing drawn around
-    /// it. The word is still in the message and the chip is still a chip — it is the paint that
-    /// is missing, not the attachment — but the argument above is weaker there than everywhere
-    /// else, and it is the fill that would have to learn to be two rectangles.
     fn drop_skill_without_its_chip(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self
             .state
@@ -1159,37 +1152,6 @@ impl MessageInput {
         true
     }
 
-    /// Where each chip's fill goes, in the window's own coordinates.
-    ///
-    /// The field paints its text in one style and hosts no elements of its own, so a chip cannot
-    /// be an element in the text flow. What it can be is this: the field says where a byte range
-    /// ended up in the window, and a fill goes there, under the glyphs the field paints over it.
-    /// The chip therefore reads inline and wraps with the text, because it is the text.
-    fn chip_fills(&self, cx: &App) -> Vec<Bounds<Pixels>> {
-        if self.tokens.is_empty() {
-            return Vec::new();
-        }
-        let input = self.input_state.read(cx);
-        let line_height = input.line_height();
-        self.tokens
-            .iter()
-            .filter_map(|token| {
-                let bounds = input.range_to_bounds(&token.range)?;
-                // A chip that wrapped onto a second line has no one rectangle to sit in; leave
-                // it plain rather than fill the whole box the two lines make between them.
-                let wrapped = line_height.is_some_and(|line| bounds.size.height > line * 1.5);
-                if wrapped || bounds.size.width <= px(0.) {
-                    return None;
-                }
-                // A little more than the glyphs, so the fill reads as a chip around the word.
-                Some(Bounds::new(
-                    bounds.origin - point(px(3.), px(1.)),
-                    bounds.size + size(px(6.), px(2.)),
-                ))
-            })
-            .collect()
-    }
-
     /// The text field, with the chips' fills under it.
     ///
     /// The fills are painted rather than placed as elements because the field's text does not
@@ -1199,17 +1161,23 @@ impl MessageInput {
     /// reports is a rectangle in the window, so the window is where it is painted. The canvas
     /// covers this box and clips to it, which keeps a chip that has scrolled out of a tall draft
     /// from being painted over whatever is above the composer.
-    fn field(&self, theme: &gpui_kit::component::Theme, cx: &App) -> AnyElement {
-        let fills = self.chip_fills(cx);
+    fn field(&self, theme: &gpui_kit::component::Theme, _cx: &App) -> AnyElement {
         let color = theme.primary.opacity(0.16);
+        let input = self.input_state.clone();
+        let tokens: Vec<Range<usize>> = self.tokens.iter().map(|t| t.range.clone()).collect();
         div()
             .relative()
             .w_full()
-            .when(!fills.is_empty(), |this| {
+            .when(!tokens.is_empty(), |this| {
                 this.child(
                     canvas(
                         |_, _, _| {},
-                        move |bounds, _, window, _| {
+                        move |bounds, _, window, cx| {
+                            // Worked out here rather than when the view renders: the field lays
+                            // its text out in its own paint, and measures glyphs in the text
+                            // style it inherits from this box, which is the style the window
+                            // has here too.
+                            let fills = chip_fills(&input, &tokens, window, cx);
                             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                                 for chip in fills {
                                     window.paint_quad(
@@ -2413,15 +2381,235 @@ fn composer_bot_name(state: &AppState) -> String {
         .unwrap_or_else(|| "bot".into())
 }
 
+/// Where each chip's fill goes, in the window's own coordinates: a rectangle on every line the
+/// chip covers.
+///
+/// The field paints its text in one style and hosts no elements of its own, so a chip cannot be
+/// an element in the text flow. What it can be is a fill painted under the glyphs, where the
+/// field says they are. The field has one rectangle for a range, which for a chip that wraps is
+/// the box both lines make between them, so each character is placed on its own: its caret,
+/// which is where it starts on its own line (a continuation line's indent included), and its
+/// advance in the field's font. Where the field puts the caret that sits exactly on a soft wrap
+/// does not matter, because no character's position is read from a caret on another line.
+fn chip_fills(
+    input: &Entity<TextareaState>,
+    tokens: &[Range<usize>],
+    window: &Window,
+    cx: &App,
+) -> Vec<Bounds<Pixels>> {
+    let input = input.read(cx);
+    let Some(line_height) = input.line_height() else {
+        return Vec::new();
+    };
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let text_system = window.text_system();
+    let text = input.value();
+    tokens
+        .iter()
+        .flat_map(|range| {
+            let glyphs: Vec<(Point<Pixels>, Pixels)> = text
+                .get(range.clone())
+                .map(|word| {
+                    word.char_indices()
+                        .filter_map(|(at, ch)| {
+                            let start =
+                                input.range_to_bounds(&(range.start + at..range.start + at))?;
+                            // Shaped the way the field shapes it, font fallback included: a
+                            // character the primary font lacks (CJK, an emoji) is drawn from
+                            // another font, and its width is that font's. Asking the primary
+                            // font alone would call it zero.
+                            let glyph = ch.to_string();
+                            let advance = text_system
+                                .layout_line(&glyph, font_size, &[style.to_run(glyph.len())], None)
+                                .width;
+                            Some((start.origin, advance))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            chip_rows(&glyphs, line_height)
+                .into_iter()
+                // A little more than the glyphs, so the fill reads as a chip around the word.
+                .map(|row| {
+                    Bounds::new(
+                        row.origin - point(px(3.), px(1.)),
+                        row.size + size(px(6.), px(2.)),
+                    )
+                })
+        })
+        .collect()
+}
+
+/// A chip's rectangle on each line it runs across, from where each of its characters starts and
+/// how wide it is (`glyphs`, in order). A character lower than the line so far starts the next
+/// row; a row runs from its first character's start to the end of its last one, so the last
+/// glyph before a wrap is inside the fill, and a line that holds only that glyph still gets one.
+///
+/// A width that came back as nothing (a font that could not measure the character) is not
+/// taken at its word: it is the average of the chip's other widths, or half a line for a chip
+/// that has none, so the character is still inside the fill rather than cut off at its start.
+fn chip_rows(glyphs: &[(Point<Pixels>, Pixels)], line_height: Pixels) -> Vec<Bounds<Pixels>> {
+    let measured: Vec<Pixels> = glyphs
+        .iter()
+        .map(|(_, advance)| *advance)
+        .filter(|advance| *advance > Pixels::ZERO)
+        .collect();
+    let fallback = if measured.is_empty() {
+        line_height * 0.5
+    } else {
+        measured.iter().fold(Pixels::ZERO, |sum, w| sum + *w) / measured.len() as f32
+    };
+    let mut rows: Vec<(Pixels, Pixels, Pixels)> = Vec::new();
+    for (start, advance) in glyphs {
+        let advance = if *advance > Pixels::ZERO {
+            *advance
+        } else {
+            fallback
+        };
+        let end = start.x + advance;
+        match rows.last_mut() {
+            Some((from, to, top)) if start.y < *top + line_height * 0.5 => {
+                *from = (*from).min(start.x);
+                *to = (*to).max(end);
+            }
+            _ => rows.push((start.x, end, start.y)),
+        }
+    }
+    rows.into_iter()
+        .filter(|(from, to, _)| to > from)
+        .map(|(from, to, top)| Bounds::new(point(from, top), size(to - from, line_height)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerToken, TokenKind, held_skill_chip, is_image, join_names, missing_note,
+        ComposerToken, TokenKind, chip_rows, held_skill_chip, is_image, join_names, missing_note,
         opens_on_pick, parameters_hint, remap_tokens, shift_tokens, skill_chip, starts_token,
     };
     use crate::opengrok::RecipeSummary;
     use crate::state::ActiveRecipe;
     use std::path::PathBuf;
+
+    fn glyph(x: f32, y: f32, w: f32) -> (gpui_kit::Point<gpui_kit::Pixels>, gpui_kit::Pixels) {
+        (
+            gpui_kit::point(gpui_kit::px(x), gpui_kit::px(y)),
+            gpui_kit::px(w),
+        )
+    }
+
+    /// Each rectangle as (left, right, top), which is what the painting depends on.
+    fn spans(lines: Vec<gpui_kit::Bounds<gpui_kit::Pixels>>) -> Vec<(f32, f32, f32)> {
+        lines
+            .into_iter()
+            .map(|b| {
+                (
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.x + b.size.width),
+                    f32::from(b.origin.y),
+                )
+            })
+            .collect()
+    }
+
+    const LINE: f32 = 20.;
+
+    /// A chip on one line is one rectangle from its first character to the end of its last.
+    #[test]
+    fn a_chip_on_one_line_is_one_rectangle() {
+        let glyphs = [glyph(40., 0., 8.), glyph(48., 0., 8.), glyph(56., 0., 8.)];
+        assert_eq!(
+            spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
+            vec![(40., 64., 0.)]
+        );
+    }
+
+    /// A chip that wraps in the middle of a word is drawn on every line it covers (#40), and the
+    /// row it leaves ends at the end of its last glyph, not where that glyph starts: the caret on
+    /// a soft wrap belongs to the next line (gpui-base `line_end_affinity: false`), so no caret
+    /// on the row above marks where it ends.
+    #[test]
+    fn a_chip_that_wraps_mid_word_covers_its_last_glyph_on_each_line() {
+        let glyphs = [
+            glyph(300., 0., 8.),
+            glyph(308., 0., 8.),
+            glyph(316., 0., 9.), // the last glyph before the wrap
+            glyph(10., LINE, 8.),
+            glyph(18., LINE, 8.),
+        ];
+        assert_eq!(
+            spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
+            vec![(300., 325., 0.), (10., 26., LINE)]
+        );
+    }
+
+    /// A line that holds only one glyph of the chip still gets its fill, and a continuation line
+    /// starts where its own first glyph does, which is where the field's wrapping indent put it.
+    #[test]
+    fn a_one_glyph_row_and_an_indented_continuation_are_both_filled() {
+        let glyphs = [
+            glyph(330., 0., 7.),
+            glyph(24., LINE, 8.),
+            glyph(32., LINE, 8.),
+        ];
+        assert_eq!(
+            spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
+            vec![(330., 337., 0.), (24., 40., LINE)]
+        );
+        let three = [
+            glyph(300., 0., 8.),
+            glyph(10., LINE, 8.),
+            glyph(400., LINE, 8.),
+            glyph(10., 2. * LINE, 8.),
+        ];
+        assert_eq!(
+            spans(chip_rows(&three, gpui_kit::px(LINE))),
+            vec![(300., 308., 0.), (10., 408., LINE), (10., 18., 2. * LINE)],
+            "a chip across three lines is three rectangles"
+        );
+    }
+
+    /// A right-to-left name comes back in reading order with each glyph further left than the
+    /// last. The row still runs from the leftmost start to the rightmost end, so it is filled
+    /// rather than dropped as a rectangle with its ends the wrong way round.
+    #[test]
+    fn a_right_to_left_chip_is_filled() {
+        let glyphs = [glyph(56., 0., 8.), glyph(48., 0., 8.), glyph(40., 0., 8.)];
+        assert_eq!(
+            spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
+            vec![(40., 64., 0.)]
+        );
+    }
+
+    /// A character whose width came back as zero (a font that could not measure it) is still
+    /// inside the fill: it gets the chip's average width, or half a line if nothing in the chip
+    /// was measured, so a wrapped CJK or emoji row keeps its last glyph and a one-glyph row is
+    /// not dropped.
+    #[test]
+    fn an_unmeasured_glyph_still_gets_a_width() {
+        let glyphs = [
+            glyph(300., 0., 16.),
+            glyph(316., 0., 0.),
+            glyph(10., LINE, 16.),
+        ];
+        assert_eq!(
+            spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
+            vec![(300., 332., 0.), (10., 26., LINE)]
+        );
+        let lone = [glyph(330., 0., 0.), glyph(10., LINE, 0.)];
+        assert_eq!(
+            spans(chip_rows(&lone, gpui_kit::px(LINE))),
+            vec![(330., 340., 0.), (10., 20., LINE)],
+            "nothing measured: half a line each, and neither row is dropped"
+        );
+    }
+
+    /// Nothing laid out is nothing drawn.
+    #[test]
+    fn a_chip_with_nothing_laid_out_draws_nothing() {
+        assert!(chip_rows(&[], gpui_kit::px(LINE)).is_empty());
+    }
 
     /// A chip for a skill, where the words sit in the message.
     fn chip(id: &str, text: &str, at: usize) -> ComposerToken {
