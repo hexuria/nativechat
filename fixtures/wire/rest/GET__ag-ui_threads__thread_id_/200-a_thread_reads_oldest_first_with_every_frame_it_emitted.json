@@ -1,101 +1,59 @@
 {
   "method": "GET",
-  "path": "/ag-ui/threads/th-0199bb4e000070008000000000000501",
+  "path": "/ag-ui/threads/th-0199bb4e000070008000000000000001",
   "status": 200,
   "body": {
-    "threadId": "th-0199bb4e000070008000000000000501",
+    "threadId": "th-0199bb4e000070008000000000000001",
     "runs": [
       {
-        "runId": "run_0199bb4e-0000-7000-8000-000000000511",
+        "runId": "run_0199bb4e-0000-7000-8000-000000000002",
         "status": "awaiting-approval",
-        "startedAtMs": 1790413221000,
-        "updatedAtMs": 1790413229000,
+        "startedAtMs": 1790000000000,
+        "updatedAtMs": 1790000001000,
         "failure": null,
         "events": [
           {
-            "type": "TEXT_MESSAGE_START",
-            "messageId": "client-msg-1",
-            "role": "user"
+            "type": "TEXT_MESSAGE_CONTENT",
+            "delta": "hello ",
+            "messageId": "msg-1"
           },
           {
             "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "client-msg-1",
-            "delta": "question 1"
-          },
-          {
-            "type": "TEXT_MESSAGE_END",
-            "messageId": "client-msg-1"
+            "delta": "world",
+            "messageId": "msg-1"
           },
           {
             "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "msg-1",
-            "delta": "hello "
-          },
-          {
-            "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "msg-1",
-            "delta": "world"
-          },
-          {
-            "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "msg-1",
-            "delta": " (still here)"
+            "delta": " (still here)",
+            "messageId": "msg-1"
           }
         ]
       },
       {
-        "runId": "run_0199bb4e-0000-7000-8000-000000000512",
+        "runId": "run_0199bb4e-0000-7000-8000-000000000003",
         "status": "finished",
-        "startedAtMs": 1790413222000,
-        "updatedAtMs": 1790413222000,
+        "startedAtMs": 1790000002000,
+        "updatedAtMs": 1790000002000,
         "failure": null,
         "events": [
           {
-            "type": "TEXT_MESSAGE_START",
-            "messageId": "client-msg-2",
-            "role": "user"
-          },
-          {
             "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "client-msg-2",
-            "delta": "question 2"
-          },
-          {
-            "type": "TEXT_MESSAGE_END",
-            "messageId": "client-msg-2"
-          },
-          {
-            "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "msg-1",
-            "delta": "the second turn"
+            "delta": "the second turn",
+            "messageId": "msg-1"
           }
         ]
       },
       {
-        "runId": "run_0199bb4e-0000-7000-8000-000000000513",
+        "runId": "run_0199bb4e-0000-7000-8000-000000000004",
         "status": "failed",
-        "startedAtMs": 1790413223000,
-        "updatedAtMs": 1790413223000,
+        "startedAtMs": 1790000003000,
+        "updatedAtMs": 1790000003000,
         "failure": "the model gateway refused",
         "events": [
           {
-            "type": "TEXT_MESSAGE_START",
-            "messageId": "client-msg-3",
-            "role": "user"
-          },
-          {
             "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "client-msg-3",
-            "delta": "question 3"
-          },
-          {
-            "type": "TEXT_MESSAGE_END",
-            "messageId": "client-msg-3"
-          },
-          {
-            "type": "TEXT_MESSAGE_CONTENT",
-            "messageId": "msg-1",
-            "delta": "the third turn"
+            "delta": "the third turn",
+            "messageId": "msg-1"
           }
         ]
       }

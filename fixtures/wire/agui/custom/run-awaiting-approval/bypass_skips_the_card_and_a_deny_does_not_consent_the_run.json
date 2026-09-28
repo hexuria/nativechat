@@ -1,9 +1,9 @@
 {
   "type": "CUSTOM",
-  "timestamp": 1790413201000,
+  "timestamp": 100,
   "name": "run-awaiting-approval",
-  "threadId": "thr-0199bb4e-0000-7000-8000-000000000201",
-  "runId": "0199bb4e-0000-7000-8000-000000000202",
+  "threadId": "thr-0199bb4e-0000-7000-8000-000000000001",
+  "runId": "0199bb4e-0000-7000-8000-000000000002",
   "callId": "look-1",
   "tool": "computer",
   "arguments": {

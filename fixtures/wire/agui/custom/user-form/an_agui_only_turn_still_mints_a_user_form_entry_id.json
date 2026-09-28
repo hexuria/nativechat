@@ -1,87 +1,40 @@
 {
-  "type": "CUSTOM",
   "name": "user-form",
-  "entryId": "e_0199bb4e-0000-7000-8000-000000000303",
-  "callId": "mock-form-1",
-  "formRequest": {
-    "title": "Google account",
-    "instruction": "Enter the address and password.",
-    "fields": [
-      {
-        "id": "email",
-        "label": "Email",
-        "type": "email",
-        "required": true,
-        "secret": false
-      },
-      {
-        "id": "password",
-        "label": "Password",
-        "type": "password",
-        "required": true,
-        "secret": false
-      }
-    ],
-    "liveHost": "accounts.google.com"
-  },
-  "formResolution": "submitted",
-  "message": {
-    "type": "user-form",
-    "formRequest": {
-      "title": "Google account",
-      "instruction": "Enter the address and password.",
-      "fields": [
-        {
-          "id": "email",
-          "label": "Email",
-          "type": "email",
-          "required": true,
-          "secret": false
-        },
-        {
-          "id": "password",
-          "label": "Password",
-          "type": "password",
-          "required": true,
-          "secret": false
-        }
-      ],
-      "liveHost": "accounts.google.com"
-    }
-  },
+  "type": "CUSTOM",
+  "runId": "0199bb4e-0000-7000-8000-000000000001",
   "value": {
+    "id": "e_0199bb4e-0000-7000-8000-000000000002",
     "kind": "send-message",
-    "id": "e_0199bb4e-0000-7000-8000-000000000303",
-    "timestampMs": 1790413202000,
+    "callId": "mock-form-1",
     "message": {
       "type": "user-form",
       "formRequest": {
         "title": "Google account",
-        "instruction": "Enter the address and password.",
         "fields": [
           {
             "id": "email",
-            "label": "Email",
             "type": "email",
-            "required": true,
-            "secret": false
+            "label": "Email",
+            "secret": false,
+            "required": true
           },
           {
             "id": "password",
-            "label": "Password",
             "type": "password",
-            "required": true,
-            "secret": false
+            "label": "Password",
+            "secret": false,
+            "required": true
           }
         ],
-        "liveHost": "accounts.google.com"
+        "liveHost": "accounts.google.com",
+        "instruction": "Enter the address and password."
       }
     },
-    "callId": "mock-form-1",
-    "formResolution": "submitted",
+    "timestampMs": 1790000000000,
     "sharedValues": {
       "email": "ada@example.com"
     },
+    "formResolution": "submitted",
     "formFieldOutcomes": [
       {
         "id": "email",
@@ -95,7 +48,54 @@
       }
     ]
   },
-  "threadId": "thr-0199bb4e-0000-7000-8000-000000000301",
-  "runId": "0199bb4e-0000-7000-8000-000000000302",
-  "timestamp": 1790413205000
+  "callId": "mock-form-1",
+  "entryId": "e_0199bb4e-0000-7000-8000-000000000002",
+  "message": {
+    "type": "user-form",
+    "formRequest": {
+      "title": "Google account",
+      "fields": [
+        {
+          "id": "email",
+          "type": "email",
+          "label": "Email",
+          "secret": false,
+          "required": true
+        },
+        {
+          "id": "password",
+          "type": "password",
+          "label": "Password",
+          "secret": false,
+          "required": true
+        }
+      ],
+      "liveHost": "accounts.google.com",
+      "instruction": "Enter the address and password."
+    }
+  },
+  "threadId": "thr-0199bb4e-0000-7000-8000-000000000003",
+  "timestamp": 100,
+  "formRequest": {
+    "title": "Google account",
+    "fields": [
+      {
+        "id": "email",
+        "type": "email",
+        "label": "Email",
+        "secret": false,
+        "required": true
+      },
+      {
+        "id": "password",
+        "type": "password",
+        "label": "Password",
+        "secret": false,
+        "required": true
+      }
+    ],
+    "liveHost": "accounts.google.com",
+    "instruction": "Enter the address and password."
+  },
+  "formResolution": "submitted"
 }

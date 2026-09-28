@@ -417,28 +417,41 @@ mod tests {
         }
     }
 
-    /// The same, from the frames the server sent for one shell call (`fixtures/wire`, the start
-    /// and the arguments of `a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it`).
+    /// The same, from the frames the server sent for one shell call: the start and the
+    /// arguments of the `shell` call in the run the server replayed for
+    /// `fixtures/wire/rest/GET__ag-ui_runs__run_id_/200-a_form_raised_after_an_answer_has_its_card_and_entry_id.json`.
     #[test]
     fn a_shell_call_off_the_wire_reads_as_the_command_it_runs() {
-        let frame = |kind: &str| -> Value {
-            let path = format!(
-                "{}/fixtures/wire/agui/{kind}/a_turn_says_it_is_waking_the_box_once_before_the_first_tool_that_needs_it.json",
-                env!("CARGO_MANIFEST_DIR")
-            );
-            serde_json::from_str(&std::fs::read_to_string(&path).expect(&path)).expect(&path)
-        };
+        let path = format!(
+            "{}/fixtures/wire/rest/GET__ag-ui_runs__run_id_/200-a_form_raised_after_an_answer_has_its_card_and_entry_id.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect(&path)).expect(&path);
+        let events = fixture["body"]["events"]
+            .as_array()
+            .expect("a replay's frames");
+        let start = events
+            .iter()
+            .find(|frame| frame["type"] == "TOOL_CALL_START" && frame["toolCallName"] == "shell")
+            .expect("the run opens a shell call");
+        let args = events
+            .iter()
+            .find(|frame| {
+                frame["type"] == "TOOL_CALL_ARGS" && frame["toolCallId"] == start["toolCallId"]
+            })
+            .expect("and sends its arguments");
         let mut tracker = ToolCallTracker::default();
         assert_eq!(
-            tracker.tick(&frame("TOOL_CALL_START")),
+            tracker.tick(start),
             ActivityTick::Set(BotActivity {
                 label: "Running commands".into()
             })
         );
         assert_eq!(
-            tracker.tick(&frame("TOOL_CALL_ARGS")),
+            tracker.tick(args),
             ActivityTick::Set(BotActivity {
-                label: "Running `whoami`".into()
+                label: "Running `echo hi`".into()
             })
         );
     }

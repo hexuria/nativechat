@@ -91,6 +91,7 @@
 use serde_json::{Value, json};
 
 use super::gen_ui::RUN_AWAITING_APPROVAL;
+use super::types::refusal_words;
 
 /// Settled/replay CUSTOM `name`. Live #139 HITL is `run-awaiting-approval`
 /// with `reason: "user-form"` — see [`is_user_form_awaiting`].
@@ -1327,13 +1328,13 @@ pub fn resolve_handoff_request_body(
 /// Prefer a body with `formResolution`.
 pub fn user_form_action_from_http(status: u16, body: &Value) -> UserFormActionReply {
     if status == 403 {
-        let message = body
-            .get("message")
-            .or_else(|| body.get("error"))
-            .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or("The server would not fill this form on that computer.");
-        return UserFormActionReply::Refused(message.to_string());
+        // The server's sentence, read by the one rule every refusal is (`refusal_words`): under
+        // `message` beside the `shared-computer` code under `error`, as it is recorded, or under
+        // `error` beside a `code`, the shape the server writes a code in otherwise.
+        let message = refusal_words(body)
+            .sentence
+            .unwrap_or_else(|| "The server would not fill this form on that computer.".to_string());
+        return UserFormActionReply::Refused(message);
     }
     if status == 404 {
         if is_form_entry_missing(body) {
@@ -2877,6 +2878,14 @@ mod tests {
 
     #[test]
     fn a_403_keeps_the_card_open_with_the_servers_reason() {
+        // A code under `code` with the sentence under `error`, and the code under `error` with the
+        // sentence under `message`, as it is recorded: one rule reads both.
+        let moved =
+            serde_json::json!({ "error": "This computer is shared.", "code": "shared-computer" });
+        assert_eq!(
+            user_form_action_from_http(403, &moved),
+            UserFormActionReply::Refused("This computer is shared.".to_string())
+        );
         let body = serde_json::json!({ "error": "shared-computer", "message": "This computer is shared." });
         let reply = user_form_action_from_http(403, &body);
         assert_eq!(

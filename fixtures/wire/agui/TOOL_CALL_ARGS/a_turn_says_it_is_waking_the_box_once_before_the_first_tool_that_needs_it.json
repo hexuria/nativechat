@@ -1,6 +1,0 @@
-{
-  "type": "TOOL_CALL_ARGS",
-  "timestamp": 1,
-  "toolCallId": "c1",
-  "delta": "{\"command\":\"whoami\"}"
-}

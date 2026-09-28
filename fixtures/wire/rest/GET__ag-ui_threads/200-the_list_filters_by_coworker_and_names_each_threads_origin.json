@@ -4,67 +4,13 @@
   "status": 200,
   "body": [
     {
-      "threadId": "sched_0199bb4e-0000-7000-8000-000000000407",
-      "coworkerId": "cw_a",
-      "origin": "chat",
-      "title": "my own words",
-      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000417",
-      "lastStatus": "finished",
-      "updatedAtMs": 1790413210007
-    },
-    {
-      "threadId": "mon_0199bb4e-0000-7000-8000-000000000406",
-      "coworkerId": "cw_a",
-      "origin": "monitor",
-      "title": "a run failed; find out why",
-      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000416",
-      "lastStatus": "finished",
-      "updatedAtMs": 1790413210006
-    },
-    {
-      "threadId": "sched_0199bb4e-0000-7000-8000-000000000405",
-      "coworkerId": "cw_a",
-      "origin": "schedule",
-      "title": "nameless",
-      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000415",
-      "lastStatus": "finished",
-      "updatedAtMs": 1790413210005
-    },
-    {
-      "threadId": "sched_0199bb4e-0000-7000-8000-000000000404",
-      "coworkerId": "cw_a",
-      "origin": "webhook",
-      "title": "Deploy hook",
-      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000414",
-      "lastStatus": "finished",
-      "updatedAtMs": 1790413210004
-    },
-    {
-      "threadId": "sched_0199bb4e-0000-7000-8000-000000000403",
-      "coworkerId": "cw_a",
-      "origin": "schedule",
-      "title": "Morning digest",
-      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000413",
-      "lastStatus": "finished",
-      "updatedAtMs": 1790413210003
-    },
-    {
       "threadId": "chat-b",
       "coworkerId": "cw_b",
       "origin": "chat",
       "title": "to b",
-      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000412",
+      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000001",
       "lastStatus": "finished",
-      "updatedAtMs": 1790413210002
-    },
-    {
-      "threadId": "chat-a",
-      "coworkerId": "cw_a",
-      "origin": "chat",
-      "title": "to a",
-      "lastRunId": "run_0199bb4e-0000-7000-8000-000000000411",
-      "lastStatus": "finished",
-      "updatedAtMs": 1790413210001
+      "updatedAtMs": 1790000000000
     }
   ]
 }

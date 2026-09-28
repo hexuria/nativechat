@@ -1,24 +1,30 @@
 //! Wire conformance: the frames and bodies opengrok-server sends, read by this app's own code.
 //!
 //! This app transcribes the server's wire by hand, and nothing else checks that the two still
-//! agree. `fixtures/wire/` is the server's side of that: AG-UI frames exactly as `POST
-//! /ag-ui` and the replays send them, and REST bodies exactly as the routes this app reads answer
-//! them, in the layout of opengrok-server#255 (`agui/<type>/<slug>.json`, a CUSTOM under
-//! `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json`). `MANIFEST.json`
-//! names the server commit the corpus was taken from, the server test or builder behind every
-//! file, and every `type`, CUSTOM `name`, approval `reason` and `formResolution` word the server's
-//! code can send.
+//! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
+//! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
+//! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
+//! from the server's `tests/fixtures/wire/` at f190933 (#260), which re-recorded it on main so
+//! that `MANIFEST.json` names 7c5d026, the commit whose code produced it. The layout is
+//! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
+//! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
+//! per distinct shape, named after the first test that produced it. `MANIFEST.json` names the
+//! server commit, the test behind every file, and every `type`, CUSTOM `name`, approval `reason`
+//! and `formResolution` word the server's code can send. Ids and clocks the tests mint at run
+//! time are placeholders in the server's own formats, and secrets read `«redacted»`.
 //!
-//! Until the server's recorder lands the corpus is `recorded_by: "hand-copied"`: each file was
-//! copied from the test or builder its manifest entry names. Ids and clocks those tests mint at
-//! run time are placeholders in the server's own formats; everything a test fixes is as written.
-//! The recorded corpus is meant to drop in over this one and be read by these tests unchanged.
+//! A newer recording is taken by copying the server's `tests/fixtures/wire/` over this one
+//! whole, never by editing a file here: the files are the server's evidence, and one fixed by
+//! hand would say what the server does not.
 //!
 //! What is held here:
 //!
-//! - every frame is fed to the code that handles its type and name, and every body is parsed
-//!   with the type this app reads that route with, and each must come out the way the app means
-//!   to read it, not merely without a panic;
+//! - every frame is fed to the code that handles its type and name, and every body is read the
+//!   way this app reads its route: a success parsed with the very type the client parses it
+//!   with, and a refusal with the client's own error reading. Each must come out the way the app
+//!   means to read it, not merely without a panic;
+//! - every route the corpus records has that reading, or is excused in [`REST_NOT_READ`] with
+//!   why this app never asks it;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
 //!   server sends or excused in [`NOT_SENT_BY_SERVER`], with the evidence;
 //! - every word the server sends is either in the ledger or excused in [`CLIENT_IGNORES`], so a
@@ -37,20 +43,26 @@ use super::activity::{
     ActivityTick, BOX_WAKING, BotActivity, ToolCallTracker, WAKING_COMPUTER, activity_from_agui,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, LocalExecMode, LocalExecPolicy, QueuedApproval, RecipeDetail,
-    RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, ScheduleKind, ScheduleRow,
-    ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, ThreadReplay,
+    AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerComputer, DaemonEnrol, DaemonList,
+    LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail, RecipeList,
+    RecipeParameterKind, RecipeRunResult, RunCause, RunReplay, ScheduleKind, ScheduleRow,
+    ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion,
+    StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
+use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
 use super::gen_ui::{
     BAR_CHART_NAMES, ChatPart, EGRESS_TUNNEL_ASK_REASON, FORM_NAMES, REVIEW_AN_ACTION_REASONS,
-    RUN_AWAITING_APPROVAL, StepSpec, TurnAssembler, UI_CUSTOM_NAME, USER_MACHINE_SHELL,
-    approval_from_event, command_from_replay_events, is_ui_tool, step_arguments,
+    RUN_AWAITING_APPROVAL, ScreenshotSpec, StepSpec, TurnAssembler, UI_CUSTOM_NAME,
+    USER_MACHINE_SHELL, approval_from_event, capped, command_from_replay_events, is_ui_tool,
 };
-use super::pending::{CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingOp};
+use super::pending::{
+    CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
+    PendingUserMessage,
+};
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
 use super::types::{
-    Account, Coworker, ThreadListing, assistant_text_from_sse, error_message_from_body,
+    Account, ArtifactListing, Attachment, Coworker, ThreadListing, assistant_text_from_sse,
 };
 use super::user_form::{
     BoxHandoffReply, COMPUTER_HANDOFF_NAMES, ComputerHandoffStatus, FORM_ENTRY_MISSING,
@@ -448,7 +460,164 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
+    (
+        "rest/POST__recipes/503-a_recipe_whose_tape_cannot_be_stored_is_not_a_200.json",
+        FIVE_HUNDRED_SHAPE,
+        "A tape the database will not store is refused the same way every time, and this \
+         recording answers it as a 503 in plain text, which this app cannot tell from a proxy's: \
+         it reads the server as out of reach and offers the tape again. With opengrok-server's \
+         error-bodies change a tape holding a NUL is refused with a 422 in plain text, \"the tape \
+         holds a NUL character (U+0000), which cannot be stored; teach it again\", and this 503 \
+         is no longer sent.",
+    ),
+    (
+        "rest/POST__recipes__id__run/502-failed_runs_are_pruned_like_played_ones.json",
+        FIVE_HUNDRED_SHAPE,
+        "This recording answers a box that is down as a plain-text 502, which this app cannot \
+         tell from a proxy's: it reads the server as out of reach and reloads the recipe as if \
+         the run might have started. With opengrok-server's error-bodies change every 502, 503 \
+         and 504 the server writes itself is JSON, {\"error\": sentence}, which this app reads \
+         as the server's verdict.",
+    ),
+    (
+        "rest/POST__skills_from-tape/502-a_lesson_over_the_cap_is_refused_rather_than_cut.json",
+        FIVE_HUNDRED_SHAPE,
+        "Plain text, the shape opengrok-server's error-bodies change retires for every 502, 503 \
+         and 504 it writes itself, which are JSON, {\"error\": sentence}, from it on. This app \
+         reads this one right either way, since tape_error takes this route's every refusal as \
+         the server's own; the entry keeps the old shape from being blessed.",
+    ),
+    (
+        "rest/POST__ag-ui/409-another_account_cannot_take_a_run_by_its_id.json",
+        CODE_UNDER_CODE,
+        "Recorded with the code under error and the sentence under message. With \
+         opengrok-server's error-bodies change this refusal is {\"error\": \"this run id already \
+         has a run; a new turn needs a new run id\", \"code\": \"run-exists\"}. This app reads \
+         both shapes the same way, the sentence shown and the code kept; the queue's 409s keep \
+         the old shape and are not listed here.",
+    ),
+];
+
+/// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
+/// that says so.
+const FIVE_HUNDRED_SHAPE: &str = "should carry its sentence under error, as JSON";
+
+/// Routes the server records and this app never asks, by the directory #255 files them under,
+/// with the route as the server's router writes it and why. Their bodies are read by nothing
+/// here, so nothing here can say whether they would be read right: a route that starts being
+/// asked comes off this list and gets a reading in [`REST_ROUTES`] in the same change, and
+/// [`every_route_this_app_does_not_read_is_recorded_and_says_why`] fails until it does.
+const REST_NOT_READ: &[(&str, &str, &str)] = &[
+    (
+        "GET__auth_cursor_dev_session_token",
+        "/auth/cursor_dev_session_token",
+        "The dev sign-in that stands in for Cursor's OAuth (opengrok-server auth/routes.rs). This \
+         app signs in with an email and a password on POST /auth/login.",
+    ),
+    (
+        "GET__auth_poll",
+        "/auth/poll",
+        "The polling half of the browser login a desktop client starts at /loginDeepControl, \
+         asking for its token with a PKCE verifier (auth/routes.rs auth_poll). This app signs in \
+         with an email and a password on POST /auth/login, and polls for nothing.",
+    ),
+    (
+        "GET__auth_verify",
+        "/auth/verify",
+        "The link in a verification email: an HTML page a browser opens, never a body an app \
+         reads.",
+    ),
+    (
+        "POST__auth_signup",
+        "/auth/signup",
+        "Makes an account (auth/identity.rs signup). This app offers no way to make one: its \
+         sign-in takes an email and a password for an account that already exists.",
+    ),
+    (
+        "POST__auth_verify_resend",
+        "/auth/verify/resend",
+        "The web console's login page asks for a new verification link here (auth/routes.rs, \
+         identity.rs resend_json). This app's sign-in has no such request: a refusal for an \
+         unverified address is shown as the server's own sentence, which says where to ask.",
+    ),
+    (
+        "POST__auth_password_forgot",
+        "/auth/password/forgot",
+        "The web console's login page asks for a password reset here, as the server's own \
+         /forgot-password page does by form (auth/password_reset.rs). This app's sign-in offers \
+         no reset.",
+    ),
+    (
+        "POST__coworkers__coworker_id__keys",
+        "/coworkers/{coworker_id}/keys",
+        "Mints a bot key, the long-lived credential another client (Claude Code, at the MCP \
+         door) uses to act as the coworker (agui/routes.rs mint_bot_key). This app talks to the \
+         server as the signed-in person, and makes, lists and revokes no bot keys.",
+    ),
+    (
+        "GET__coworkers__coworker_id__keys",
+        "/coworkers/{coworker_id}/keys",
+        "Lists a coworker's bot keys; see POST /coworkers/{id}/keys.",
+    ),
+    (
+        "DELETE__coworkers__coworker_id__keys__jti_",
+        "/coworkers/{coworker_id}/keys/{jti}",
+        "Revokes a bot key; see POST /coworkers/{id}/keys.",
+    ),
+    (
+        "GET__coworkers__coworker_id__mcp-calls",
+        "/coworkers/{coworker_id}/mcp-calls",
+        "What a coworker's bot keys were used for at the MCP door. This app shows no MCP \
+         history: a call there that needs a yes reaches it as a card on GET /ag-ui/approvals.",
+    ),
+    (
+        "POST__coworkers__coworker_id__approvals",
+        "/coworkers/{coworker_id}/approvals",
+        "Which of a coworker's tools need a person's yes, kept on the caller's grant \
+         (agui/routes.rs set_approvals). This app has no control for it; it answers the cards \
+         the server raises.",
+    ),
+    (
+        "GET__coworkers__coworker_id__computer_egress-policy",
+        "/coworkers/{coworker_id}/computer/egress-policy",
+        "The same standing answer, read from the same store, reaches this app as egressPolicy on \
+         GET /coworkers/{id}/computer (CoworkerComputer::egress_policy), which is what the \
+         control on the bot's pane or in Settings shows (AppState::egress_policy). The app only \
+         ever PUTs this route.",
+    ),
+    (
+        "GET__coworkers__coworker_id__limit",
+        "/coworkers/{coworker_id}/limit",
+        "A coworker's points cap for the month and its brake for the day, with what it has used \
+         (agui/routes.rs get_limit, points.rs). This app shows neither and sets neither.",
+    ),
+    (
+        "PUT__coworkers__coworker_id__limit",
+        "/coworkers/{coworker_id}/limit",
+        "Sets that cap and that brake; see GET /coworkers/{id}/limit.",
+    ),
+    (
+        "GET__coworkers__coworker_id__spend",
+        "/coworkers/{coworker_id}/spend",
+        "A coworker's three spend meters and the limits an admin set; no page in this app shows \
+         them.",
+    ),
+    (
+        "GET__coworkers__coworker_id__usage",
+        "/coworkers/{coworker_id}/usage",
+        "Usage per model for a window (agui/routes.rs get_usage). A bot's settings have a Usage \
+         card, but it asks the server nothing: it says \"No usage this month\", or \"No \
+         requests this month\" once opened, whatever the bot has used.",
+    ),
+    (
+        "GET__local-exec_audit",
+        "/local-exec/audit",
+        "This account's recent reverse-exec commands and their outcomes (local_exec.rs \
+         audit_log). Settings shows each machine's mode and standing rules from GET \
+         /local-exec/policy, and no log.",
+    ),
+];
 
 // ---- the corpus ----
 
@@ -548,27 +717,61 @@ impl Corpus {
             .filter(move |frame| str_at(frame, "name") == name)
     }
 
-    /// A permission card from the corpus, re-aimed at `call_id`, for the frames whose meaning is
-    /// what they do to a card.
+    /// The call's own permission card when the corpus has one, else a permission card from the
+    /// corpus re-aimed at `call_id`, for the frames whose meaning is what they do to a card.
     fn approval_card_for(&self, call_id: &str) -> Option<Value> {
-        let mut card = self
-            .customs_named(RUN_AWAITING_APPROVAL)
-            .find(|frame| str_at(frame, "reason") != USER_FORM_REASON)?
-            .clone();
+        let cards = || {
+            self.customs_named(RUN_AWAITING_APPROVAL)
+                .filter(|frame| str_at(frame, "reason") != USER_FORM_REASON)
+        };
+        if let Some(own) = cards().find(|card| str_at(card, "callId") == call_id) {
+            return Some(own.clone());
+        }
+        let mut card = cards().next()?.clone();
         card["callId"] = Value::String(call_id.to_string());
         Some(card)
     }
 
-    /// The call's own opening when the corpus has it, else the corpus's opening re-aimed at
-    /// `call_id`, for the frames whose meaning is what they do to a step.
+    /// The frame of `kind` that belongs to the call `call_id`.
+    fn call_frame<'a>(&'a self, kind: &'a str, call_id: &str) -> Option<&'a Value> {
+        self.frames_of(kind)
+            .find(|frame| str_at(frame, "toolCallId") == call_id)
+    }
+
+    /// The tool a call was made with: the `toolCallName` its own opening says, else the `tool` on
+    /// its own permission card.
+    fn tool_of(&self, call_id: &str) -> Option<&str> {
+        self.call_frame("TOOL_CALL_START", call_id)
+            .map(|start| str_at(start, "toolCallName"))
+            .or_else(|| {
+                self.customs_named(RUN_AWAITING_APPROVAL)
+                    .find(|card| str_at(card, "callId") == call_id)
+                    .map(|card| str_at(card, "tool"))
+            })
+            .filter(|tool| !tool.is_empty())
+    }
+
+    /// The call's own opening when the corpus has it. Otherwise an opening from the corpus
+    /// re-aimed at `call_id` and at the tool its card names, for the frames whose meaning is what
+    /// they do to a call of that tool: the server opens every call before it asks about it
+    /// (opengrok-harness `projection.rs` `push`), so a call with a card had an opening even where
+    /// the recording kept only the card. A call with neither says nothing about what it is.
     fn tool_call_start_for(&self, call_id: &str) -> Option<Value> {
-        let own = self
+        if let Some(own) = self.call_frame("TOOL_CALL_START", call_id) {
+            return Some(own.clone());
+        }
+        let tool = self.tool_of(call_id)?;
+        let mut start = self
             .frames_of("TOOL_CALL_START")
-            .find(|start| str_at(start, "toolCallId") == call_id);
-        let mut start = own
+            .find(|start| str_at(start, "toolCallName") == tool)
             .or_else(|| self.frames_of("TOOL_CALL_START").next())?
             .clone();
         start["toolCallId"] = Value::String(call_id.to_string());
+        start["toolCallName"] = Value::String(tool.to_string());
+        // A form's gateway id belongs to the call it was minted for, not to this one.
+        if let Some(start) = start.as_object_mut() {
+            start.remove("entryId");
+        }
         Some(start)
     }
 
@@ -792,6 +995,205 @@ fn text_content(corpus: &Corpus, frame: &Value) -> Check {
     Ok(())
 }
 
+/// What this app draws a call as, which its tool decides (`TurnAssembler::push_event`): a chart
+/// or a generative form is a widget drawn as itself, a `request_user_form` is the card the person
+/// fills in, and every other call is a step in the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drawn {
+    Widget,
+    UserForm,
+    Step,
+}
+
+fn drawn_as(tool: &str) -> Drawn {
+    if is_user_form_tool(tool) {
+        Drawn::UserForm
+    } else if is_ui_tool(tool) {
+        Drawn::Widget
+    } else {
+        Drawn::Step
+    }
+}
+
+/// The two shells, whose command is what their permission card shows.
+fn is_shell(tool: &str) -> bool {
+    matches!(tool, "shell" | USER_MACHINE_SHELL)
+}
+
+fn no_opening(call_id: &str) -> String {
+    format!("the corpus has neither the opening of {call_id:?} nor a card naming its tool")
+}
+
+/// How a step keeps an argument its tool's card withholds.
+#[derive(Debug, Clone, Copy)]
+enum Withheld {
+    /// As its size in bytes.
+    Counted,
+    /// Whole up to this many characters, cut there with "…" past them, or as the redaction mark
+    /// when it looks like a key.
+    Clipped(usize),
+    /// Without its query or fragment, where a link's token rides.
+    PageOnly,
+    /// Not at all.
+    Dropped,
+    /// As the redaction mark.
+    Marked,
+}
+
+/// The arguments the server's own tools withhold from a step, and how: the approval card's
+/// rules, which `step_arguments` and `redact_value` in `gen_ui.rs` apply after opengrok-server
+/// `cards.rs` `summary_for` and opengrok-tools `review.rs` `redact_arguments`. Written out here
+/// rather than read from there, so a step is held to the rules and not to whatever that code
+/// does; a rule changed there is changed here too, on purpose.
+const WITHHELD_ARGUMENTS: &[(&str, &str, Withheld)] = &[
+    ("write_file", "content", Withheld::Counted),
+    ("computer", "text", Withheld::Clipped(60)),
+    ("computer", "key", Withheld::Clipped(40)),
+    ("open_url", "url", Withheld::PageOnly),
+    ("run_recipe", "values", Withheld::Dropped),
+];
+
+/// The server's own tools, which withhold only what [`WITHHELD_ARGUMENTS`] names. Any other tool
+/// is a plugin's.
+const SERVERS_TOOLS: &[&str] = &[
+    "shell",
+    USER_MACHINE_SHELL,
+    "read_file",
+    "write_file",
+    "computer",
+    "open_url",
+    "run_recipe",
+];
+
+/// The keys a plugin's card leaves off, which the server fills in itself (`redact_value`).
+const PLUGIN_IDENTITY_KEYS: &[&str] = &[
+    "account_id",
+    "accountId",
+    "coworker_id",
+    "coworkerId",
+    "box_id",
+    "boxId",
+];
+
+/// The words that make a plugin's argument a secret wherever they are in its name, in any case
+/// (`redact_value`).
+const PLUGIN_SECRET_NAMES: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "api_key",
+    "apikey",
+    "credential",
+    "cookie",
+];
+
+/// What a withheld value reads as (`REDACTED` in `gen_ui.rs`, after opengrok-tools `review.rs`).
+const REDACTION_MARK: &str = "«redacted»";
+
+/// How a tool's card withholds one argument, or `None` for one it keeps as sent.
+fn withheld(tool: &str, key: &str) -> Option<Withheld> {
+    if let Some((_, _, how)) = WITHHELD_ARGUMENTS
+        .iter()
+        .find(|(named_tool, named_key, _)| *named_tool == tool && *named_key == key)
+    {
+        return Some(*how);
+    }
+    if SERVERS_TOOLS.contains(&tool) {
+        return None;
+    }
+    if PLUGIN_IDENTITY_KEYS.contains(&key) {
+        return Some(Withheld::Dropped);
+    }
+    let name = key.to_ascii_lowercase();
+    PLUGIN_SECRET_NAMES
+        .iter()
+        .any(|secret| name.contains(secret))
+        .then_some(Withheld::Marked)
+}
+
+/// Whether `kept` is `sent` as `how` withholds it. A value the rule is not about (a count where a
+/// text was expected) is kept as sent, as the card keeps it.
+fn withheld_as(how: Withheld, sent: &Value, kept: Option<&Value>) -> bool {
+    match (how, sent.as_str(), kept) {
+        (Withheld::Dropped, _, kept) => kept.is_none(),
+        (Withheld::Marked, _, kept) => kept.and_then(Value::as_str) == Some(REDACTION_MARK),
+        (_, None, kept) => kept == Some(sent),
+        (Withheld::Counted, Some(text), kept) => {
+            kept.and_then(Value::as_u64) == u64::try_from(text.len()).ok()
+        }
+        (Withheld::Clipped(max), Some(text), Some(Value::String(kept))) => {
+            let whole = kept == text && text.chars().count() <= max;
+            let cut = kept
+                .strip_suffix('…')
+                .is_some_and(|shown| shown.chars().count() == max && text.starts_with(shown));
+            whole || cut || kept == REDACTION_MARK
+        }
+        (Withheld::PageOnly, Some(url), Some(Value::String(kept))) => {
+            url.split(['?', '#']).next() == Some(kept.as_str())
+        }
+        _ => false,
+    }
+}
+
+/// Whether `kept` is `sent` changed only as a plugin's card changes a value it does not name: an
+/// identity key gone from an object inside it, and a value named or shaped like a secret read as
+/// the redaction mark.
+fn marked_copy(sent: &Value, kept: &Value) -> bool {
+    match (sent, kept) {
+        (_, Value::String(kept)) if kept == REDACTION_MARK => true,
+        (Value::Object(sent), Value::Object(kept)) => {
+            kept.keys().all(|key| sent.contains_key(key))
+                && sent.iter().all(|(key, value)| match kept.get(key) {
+                    Some(kept) => marked_copy(value, kept),
+                    None => PLUGIN_IDENTITY_KEYS.contains(&key.as_str()),
+                })
+        }
+        (Value::Array(sent), Value::Array(kept)) => {
+            sent.len() == kept.len()
+                && sent
+                    .iter()
+                    .zip(kept)
+                    .all(|(sent, kept)| marked_copy(sent, kept))
+        }
+        (sent, kept) => sent == kept,
+    }
+}
+
+/// A step's arguments held to the card's rules as stated above, not as `step_arguments` computes
+/// them: every key comes through as sent, except one the rules withhold, which comes through cut
+/// to the rule's bound or not at all; and nothing is kept that was not sent.
+fn kept_as_the_card_allows(tool: &str, sent: &Value, kept: &Value) -> Check {
+    let (Some(sent), Some(kept)) = (sent.as_object(), kept.as_object()) else {
+        return Err(format!(
+            "a {tool} call's arguments, and what its step keeps of them, are objects: {sent} kept \
+             as {kept}"
+        ));
+    };
+    let plugin = !SERVERS_TOOLS.contains(&tool);
+    for (key, value) in sent {
+        let held = kept.get(key);
+        match withheld(tool, key) {
+            Some(how) => must!(
+                withheld_as(how, value, held),
+                "a {tool} call's {key:?} should be kept {how:?}, not as {held:?}"
+            ),
+            None => must!(
+                held == Some(value)
+                    || (plugin && held.is_some_and(|held| marked_copy(value, held))),
+                "a {tool} call's {key:?} should be kept as sent, {value}, not as {held:?}"
+            ),
+        }
+    }
+    let invented: Vec<&String> = kept.keys().filter(|key| !sent.contains_key(*key)).collect();
+    must!(
+        invented.is_empty(),
+        "the step for a {tool} call keeps {invented:?}, which the call never sent"
+    );
+    Ok(())
+}
+
 fn tool_call_start(frame: &Value) -> Check {
     let mut tracker = ToolCallTracker::default();
     let status = tracker.tick(frame);
@@ -806,19 +1208,19 @@ fn tool_call_start(frame: &Value) -> Check {
         "the call should be one thing the turn did, got {:?}",
         tracker.deeds()
     );
-    // A call is a step of the reply from the moment it starts, unless it is drawn as itself.
+    // A call is a step of the reply from the moment it starts, unless it is drawn as itself,
+    // which it is once its arguments are all in.
     let call_id = str_at(frame, "toolCallId");
     let (_, parts) = assembled(&[frame]).snapshot();
-    let expected = if is_ui_tool(tool) || is_user_form_tool(tool) {
-        Vec::new()
-    } else {
-        vec![ChatPart::Step(StepSpec {
+    let expected = match drawn_as(tool) {
+        Drawn::Step => vec![ChatPart::Step(StepSpec {
             call_id: call_id.to_string(),
             tool: tool.to_string(),
             arguments: String::new(),
             result: None,
             ok: None,
-        })]
+        })],
+        Drawn::Widget | Drawn::UserForm => Vec::new(),
     };
     must!(
         parts == expected,
@@ -827,41 +1229,60 @@ fn tool_call_start(frame: &Value) -> Check {
     Ok(())
 }
 
+/// Arguments on their way. With them in, the status line says what the call does in its own
+/// words; nothing of them is drawn yet, whatever the call is drawn as; and a shell's command
+/// reads back as sent, which is what its permission card shows.
 fn tool_call_args(corpus: &Corpus, frame: &Value) -> Check {
     let call_id = str_at(frame, "toolCallId");
     let delta = str_at(frame, "delta");
-    let command = command_from_replay_events(std::slice::from_ref(frame), call_id);
-    let sent = serde_json::from_str::<Value>(delta).ok().and_then(|args| {
-        args.get("command")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    });
-    must!(
-        sent.is_some(),
-        "the fixture's delta should be a shell call's arguments with a command: {delta:?}"
-    );
-    must!(
-        Some(&command) == sent.as_ref(),
-        "the command of {call_id:?} should read back as {sent:?}, got {command:?}"
-    );
-    // The step holds none of the text the arguments come as while they are coming: what it
-    // keeps of them is decided when they end (see `tool_call_end`).
     let start = corpus
         .tool_call_start_for(call_id)
-        .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
-    let (_, parts) = assembled(&[&start, frame]).snapshot();
+        .ok_or_else(|| no_opening(call_id))?;
+    let tool = str_at(&start, "toolCallName");
+    // A delta may be a fragment of the arguments; this recording sends each call's whole.
+    let sent = serde_json::from_str::<Value>(delta).ok();
+    let mut tracker = ToolCallTracker::default();
+    tracker.tick(&start);
+    let status = tracker.tick(frame);
     must!(
-        parts.iter().any(
-            |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments.is_empty())
-        ),
-        "the step for {call_id:?} should hold none of its argument text before its end: {parts:?}"
+        matches!(&status, ActivityTick::Set(activity)
+            if activity.label != "Working" && activity.label != format!("Using {tool}")),
+        "with its arguments in, a {tool} call should say what it does, not {status:?}"
     );
+    if is_shell(tool) {
+        let command = command_from_replay_events(std::slice::from_ref(frame), call_id);
+        let sent = sent
+            .as_ref()
+            .and_then(|arguments| arguments.get("command"))
+            .and_then(Value::as_str);
+        must!(
+            sent.is_some() && sent == Some(command.as_str()),
+            "the command of {call_id:?} should read back as {sent:?}, got {command:?}"
+        );
+    }
+    let (_, parts) = assembled(&[&start, frame]).snapshot();
+    match drawn_as(tool) {
+        // The step holds none of the text the arguments come as while they are coming: what it
+        // keeps of them is decided when they end (see `tool_call_end`).
+        Drawn::Step => must!(
+            parts.iter().any(
+                |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments.is_empty())
+            ),
+            "the step for {call_id:?} should hold none of its argument text before its end: {parts:?}"
+        ),
+        // A widget or a form is drawn from its whole arguments, never from half of them.
+        Drawn::Widget | Drawn::UserForm => must!(
+            parts.is_empty(),
+            "a {tool} call draws nothing before its arguments end: {parts:?}"
+        ),
+    }
     Ok(())
 }
 
-/// The end of a call says Thinking, and is where its step keeps its arguments: as the
-/// approval card's rules let it say them (`step_arguments`), which for this shell call is the
-/// arguments as they came.
+/// The end of a call says Thinking, and is where the call is drawn from its whole arguments. A
+/// step keeps them as the approval card's rules let it say them, which for a shell is the
+/// arguments as they came and for any other tool is [`kept_as_the_card_allows`]; a user-form
+/// becomes the card it asks for; a widget mounts.
 fn tool_call_end(corpus: &Corpus, frame: &Value) -> Check {
     must!(
         tick(frame) == label("Thinking"),
@@ -871,32 +1292,105 @@ fn tool_call_end(corpus: &Corpus, frame: &Value) -> Check {
     let call_id = str_at(frame, "toolCallId");
     let start = corpus
         .tool_call_start_for(call_id)
-        .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
+        .ok_or_else(|| no_opening(call_id))?;
     let args = corpus
-        .frames_of("TOOL_CALL_ARGS")
-        .find(|args| str_at(args, "toolCallId") == call_id)
+        .call_frame("TOOL_CALL_ARGS", call_id)
         .ok_or("the corpus has no TOOL_CALL_ARGS for the call")?;
-    let delta = str_at(args, "delta");
     let tool = str_at(&start, "toolCallName");
-    let sent: Value = serde_json::from_str(delta)
+    let sent: Value = serde_json::from_str(str_at(args, "delta"))
         .map_err(|error| format!("the fixture's arguments are not JSON: {error}"))?;
-    let kept = step_arguments(tool, &sent);
-    must!(
-        kept == sent,
-        "a {tool} call's arguments are what its card shows, as sent: {kept}"
-    );
-    let kept = kept.to_string();
-    let (_, parts) = assembled(&[&start, args, frame]).snapshot();
-    must!(
-        parts.iter().any(
-            |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments == kept)
+    let assembler = assembled(&[&start, args, frame]);
+    let (_, parts) = assembler.snapshot();
+    match drawn_as(tool) {
+        Drawn::Step => {
+            let step = parts
+                .iter()
+                .find_map(|part| match part {
+                    ChatPart::Step(step) if step.call_id == call_id => Some(step),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "the call {call_id:?} should be a step once its arguments end: {parts:?}"
+                    )
+                })?;
+            if is_shell(tool) {
+                // A shell's command is what its card shows, so its step keeps the arguments as
+                // they came, to the step's cap.
+                let sent = capped(&sent.to_string());
+                must!(
+                    step.arguments == sent,
+                    "the step for {call_id:?} should keep {sent:?} once its arguments end, not \
+                     {:?}",
+                    step.arguments
+                );
+            } else {
+                let kept: Value = serde_json::from_str(&step.arguments).map_err(|error| {
+                    format!(
+                        "the step for {call_id:?} keeps arguments that do not read back ({error}): \
+                         {:?}",
+                        step.arguments
+                    )
+                })?;
+                kept_as_the_card_allows(tool, &sent, &kept)?;
+            }
+        }
+        // Keyed by its call: the call's frames carry the gateway `entryId` too, and the card
+        // takes its id from the `run-awaiting-approval` the server sends right after them
+        // (opengrok-server `agui/routes.rs` `AgUiSink::emit` releases a form's held call frames
+        // just before its stamped CUSTOM), folding the two into one card by the call id.
+        Drawn::UserForm => {
+            let fields = sent
+                .get("fields")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let asked = |part: &ChatPart| {
+                matches!(part, ChatPart::UserForm(card)
+                    if card.call_id == call_id
+                        && card.title == str_at(&sent, "title")
+                        && card.fields.len() == fields
+                        && card.is_unresolved())
+            };
+            must!(
+                parts.len() == 1 && parts.iter().any(asked),
+                "a {tool} call should be drawn as the open card it asks for, and nothing else: \
+                 {parts:?}"
+            );
+            must!(
+                assembler.waiting_user_form(),
+                "the card waits on the person"
+            );
+        }
+        Drawn::Widget => must!(
+            parts.iter().any(|part| matches!(part, ChatPart::Ui(_)))
+                && !parts.iter().any(|part| matches!(part, ChatPart::Step(_))),
+            "a {tool} call should mount as its widget and not as a step: {parts:?}"
         ),
-        "the step for {call_id:?} should keep {kept:?} once its arguments end: {parts:?}"
-    );
+    }
     Ok(())
 }
 
+/// A result leaves the status line as it was, and lands where its call is drawn.
 fn tool_call_result(corpus: &Corpus, frame: &Value) -> Check {
+    must!(
+        tick(frame) == ActivityTick::Keep,
+        "a result should leave the status line as it was, not {:?}",
+        tick(frame)
+    );
+    let call_id = str_at(frame, "toolCallId");
+    let start = corpus
+        .tool_call_start_for(call_id)
+        .ok_or_else(|| no_opening(call_id))?;
+    match drawn_as(str_at(&start, "toolCallName")) {
+        Drawn::Step => step_result(corpus, frame, &start),
+        Drawn::Widget | Drawn::UserForm => drawn_result(corpus, frame, &start),
+    }
+}
+
+/// A step's result lands on the step, as sent, and on the permission card the call waited on,
+/// which it answers. While the card waits the call is drawn as the card alone; once its result
+/// is in, it is a step again. A picture on the result goes where its visibility says.
+fn step_result(corpus: &Corpus, frame: &Value, start: &Value) -> Check {
     let call_id = str_at(frame, "toolCallId");
     let content = str_at(frame, "content");
     let card = corpus
@@ -918,29 +1412,24 @@ fn tool_call_result(corpus: &Corpus, frame: &Value) -> Check {
             .any(|part| matches!(part, ChatPart::Approval(spec) if answered(spec))),
         "the result should land on the card for {call_id:?}: {parts:?}"
     );
-    // The result lands on the call's step, as sent. While the card waits the call is drawn as
-    // the card alone; once its result is in, it is a step again.
-    let start = corpus
-        .tool_call_start_for(call_id)
-        .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
     let came_back = |step: &StepSpec| {
         step.call_id == call_id && step.result.as_deref() == Some(content) && step.ok == ok
     };
-    let (_, stepped) = assembled(&[&start, frame]).snapshot();
+    let (_, stepped) = assembled(&[start, frame]).snapshot();
     must!(
         stepped
             .iter()
             .any(|part| matches!(part, ChatPart::Step(step) if came_back(step))),
         "the result should land on the step for {call_id:?}: {stepped:?}"
     );
-    let (_, waiting) = assembled(&[&start, &card]).snapshot();
+    let (_, waiting) = assembled(&[start, &card]).snapshot();
     must!(
         !waiting
             .iter()
             .any(|part| matches!(part, ChatPart::Step(step) if step.call_id == call_id)),
         "a call waiting on its card is drawn as the card and not also as a step: {waiting:?}"
     );
-    let (_, answered) = assembled(&[&start, &card, frame]).snapshot();
+    let (_, answered) = assembled(&[start, &card, frame]).snapshot();
     must!(
         answered
             .iter()
@@ -970,6 +1459,42 @@ fn tool_call_result(corpus: &Corpus, frame: &Value) -> Check {
         must!(
             pinned != (visibility == Some(ImageVisibility::Agent)),
             "an agent picture stays in the Computer pane and any other goes in the feed"
+        );
+    }
+    Ok(())
+}
+
+/// The result of a call drawn as itself changes nothing drawn. For a user-form it is the
+/// server's word that the run is parked on the person ("waiting for approval: …"), and the card
+/// stays open and waiting; for a widget it is this app's own answer coming back. Either way the
+/// call is no step and the result no permission card.
+fn drawn_result(corpus: &Corpus, frame: &Value, start: &Value) -> Check {
+    let call_id = str_at(frame, "toolCallId");
+    let tool = str_at(start, "toolCallName");
+    let mut frames: Vec<&Value> = vec![start];
+    frames.extend(corpus.call_frame("TOOL_CALL_ARGS", call_id));
+    frames.extend(corpus.call_frame("TOOL_CALL_END", call_id));
+    let (_, before) = assembled(&frames).snapshot();
+    frames.push(frame);
+    let assembler = assembled(&frames);
+    let (_, after) = assembler.snapshot();
+    must!(
+        after == before,
+        "the result of a {tool} call should leave what it drew as it was: {before:?} became \
+         {after:?}"
+    );
+    must!(
+        !after
+            .iter()
+            .any(|part| matches!(part, ChatPart::Step(_) | ChatPart::Approval(_))),
+        "a {tool} call is neither a step nor a permission card: {after:?}"
+    );
+    if drawn_as(tool) == Drawn::UserForm {
+        must!(
+            after.iter().any(
+                |part| matches!(part, ChatPart::UserForm(card) if card.call_id == call_id && card.is_unresolved())
+            ) && assembler.waiting_user_form(),
+            "the card for {call_id:?} should still be open and waiting on the person: {after:?}"
         );
     }
     Ok(())
@@ -1100,6 +1625,11 @@ fn awaiting(frame: &Value) -> Check {
             "every field should show, and every secret one masked: {:?}",
             spec.fields
         );
+        // Open, whatever the frame says. A replay lays the card's settled `formResolution` over
+        // its park (opengrok-server `agui/user_form.rs` `overlay_form`), and the app does not
+        // read it there: the settlement reaches it as the `user-form` CUSTOM the server
+        // journals onto the run when the card settles (`journal_settled_form`), and
+        // `reads_back` holds every recorded replay to ending with the card settled.
         must!(
             spec.title == str_at(&frame["arguments"], "title") && spec.is_unresolved(),
             "an open card titled as the form: {spec:?}"
@@ -1203,6 +1733,9 @@ fn run_timing(frame: &Value) -> Check {
     nothing_painted(frame)
 }
 
+/// A queue mutation, as `apply_pending_event` takes it: what was done, on which thread, and the
+/// send as it now stands, which every op but a cancel carries (opengrok-server
+/// `agui/pending.rs` `custom_event`; a cancel omits the text of a send taken back).
 fn pending(frame: &Value) -> Check {
     let custom = PendingCustom::from_agui(frame).ok_or("the pending frame did not parse")?;
     let value = &frame["value"];
@@ -1212,19 +1745,45 @@ fn pending(frame: &Value) -> Check {
         "the op and the thread should come through: {custom:?}"
     );
     match (value.get("message"), &custom.message) {
-        (Some(raw), Some(message)) => must!(
-            message.id == str_at(raw, "id")
-                && message.content == str_at(raw, "content")
-                && message.bubble_id() == str_at(raw, "clientMessageId"),
-            "the row should come through: {message:?}"
+        (Some(raw), Some(message)) => held_as_sent(message, raw)?,
+        (None, None) => must!(
+            custom.op == PendingOp::Canceled,
+            "only a cancel comes without the send: {custom:?}"
         ),
-        (None, None) => {}
         (raw, message) => {
             return Err(format!(
                 "the row and its parse disagree: {raw:?} against {message:?}"
             ));
         }
     }
+    Ok(())
+}
+
+/// One pending row, read as the queue holds it (`hold_from_row` in `state.rs`): the server's id,
+/// the bubble it is — the client's own `clientMessageId`, or the server's id for a row minted
+/// without one, which `bubble_id` falls back to — its words, the recipe and the values it runs
+/// with, the skill, and the message it answers. The status and the drained stamps are the
+/// server's bookkeeping, and the queue reads none of them.
+fn held_as_sent(message: &PendingUserMessage, raw: &Value) -> Check {
+    let bubble = opt_str(raw, "clientMessageId")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| str_at(raw, "id"));
+    must!(
+        !message.id.is_empty()
+            && message.id == str_at(raw, "id")
+            && message.content == str_at(raw, "content")
+            && message.bubble_id() == bubble,
+        "the row should be the same bubble with the same words: {message:?}"
+    );
+    let given = |key: &str| raw.get(key).filter(|value| !value.is_null());
+    must!(
+        message.recipe_id.as_deref() == opt_str(raw, "recipeId")
+            && message.recipe_values.as_ref() == given("recipeValues")
+            && message.skill_id.as_deref() == opt_str(raw, "skillId")
+            && message.reply_to.as_ref() == given("replyTo"),
+        "the send's recipe, skill and reply should come through as sent: {message:?}"
+    );
     Ok(())
 }
 
@@ -1290,33 +1849,151 @@ fn offer_save(frame: &Value) -> Check {
 
 // ---- what each REST body is read as ----
 
-/// A route's fixtures, by the directory #255 files them under, and how this app reads them.
+/// How this app reads one recorded answer, from its status and its body.
 type RestCheck = fn(u16, &Value) -> Check;
 
+/// Every route the corpus records that this app asks, by the directory #255 files it under, and
+/// how the app reads a success from it: parsed with the very type the client parses it with, and
+/// the fields the app goes on to use held to what the server sent. A refusal from any of them is
+/// read the way the client reads one, in [`read_fixture`].
 const REST_ROUTES: &[(&str, RestCheck)] = &[
+    // Signing in, and the account.
+    ("POST__auth_login", session_in_cookies),
+    ("POST__auth_refresh", session_in_cookies),
+    ("POST__auth_logout", read_as_done),
+    ("GET__account", account),
+    // Turns, threads and the queue of sends waiting on a busy coworker.
+    ("POST__ag-ui", turn_stream),
     ("GET__ag-ui_threads", thread_list),
     ("GET__ag-ui_threads__thread_id_", thread_replay),
+    ("GET__ag-ui_runs__run_id_", run_replay),
+    ("POST__ag-ui_runs__run_id__stop", stopped),
+    ("POST__ag-ui_runs__run_id__hide", read_as_done),
+    ("GET__ag-ui_threads__thread_id__pending", pending_list),
+    ("POST__ag-ui_threads__thread_id__pending", pending_created),
+    (
+        "PATCH__ag-ui_threads__thread_id__pending__id_",
+        pending_edited,
+    ),
+    (
+        "DELETE__ag-ui_threads__thread_id__pending__id_",
+        pending_canceled,
+    ),
+    ("GET__artifacts", sent_files),
+    ("POST__artifacts", uploaded),
+    // Cards, and the host settings the tunnel's card is gated on.
     ("GET__ag-ui_approvals", approvals),
     ("POST__ag-ui_runs__run_id__answer", answer),
-    ("GET__local-exec_policy", local_exec_policy),
-    ("GET__coworkers", coworkers),
-    ("POST__coworkers", hired),
-    ("GET__recipes", recipes),
-    ("GET__recipes__id_", recipe_detail),
-    ("POST__recipes__id__run", recipe_run),
-    ("GET__schedules", schedules),
-    ("GET__schedules__id__runs", schedule_runs),
-    ("POST__schedules__id__run", schedule_run_started),
-    ("PATCH__schedules__id_", schedule_edited),
-    ("GET__skills", skills),
-    ("GET__skills__id_", skill_detail),
-    ("GET__account", account),
-    ("POST__auth_login", login),
     ("POST__ag-ui_user-form_submit", user_form_answer),
     ("POST__ag-ui_user-form_dismiss", user_form_answer),
     ("POST__ag-ui_box-handoff_resolve", box_handoff),
+    ("GET__ag-ui_host-settings", host_settings),
+    ("PUT__ag-ui_host-settings", host_settings),
+    // Coworkers and their computers.
+    ("GET__coworkers", coworkers),
+    ("POST__coworkers", coworker_row),
+    ("PATCH__coworkers__coworker_id_", coworker_row),
+    ("DELETE__coworkers__coworker_id_", coworker_deleted),
     ("GET__coworkers__coworker_id__tools", coworker_tools),
+    ("GET__coworkers__coworker_id__computer", computer),
+    ("GET__coworkers__coworker_id__screen", screen),
+    (
+        "PUT__coworkers__coworker_id__computer_egress-policy",
+        read_as_done,
+    ),
+    // This Mac, as a machine a coworker may run commands on.
+    ("GET__local-exec_daemon", daemons),
+    ("POST__local-exec_daemon", enrolled),
+    ("GET__local-exec_policy", local_exec_policy),
+    ("PUT__local-exec_policy", read_as_done),
+    ("POST__local-exec_policy_rule", read_as_done),
+    ("DELETE__local-exec_policy_rule", read_as_done),
+    // Recipes: every write answers with the recipe's whole detail.
+    ("GET__recipes", recipes),
+    ("POST__recipes", recipe_detail),
+    ("GET__recipes__id_", recipe_detail),
+    ("POST__recipes__id__versions", recipe_detail),
+    ("POST__recipes__id__share", recipe_detail),
+    (
+        "DELETE__recipes__id__share__scope___scope_id_",
+        recipe_detail,
+    ),
+    ("POST__recipes__id__accept", recipe_detail),
+    ("POST__recipes__id__decline", recipe_detail),
+    ("POST__recipes__id__grants", recipe_detail),
+    ("POST__recipes__id__run", recipe_run),
+    // Routines, which are schedules on the server.
+    ("GET__schedules", schedules),
+    ("POST__schedules", one_routine),
+    ("PATCH__schedules__id_", one_routine),
+    ("POST__schedules__id__pause", read_as_done),
+    ("POST__schedules__id__resume", read_as_done),
+    ("POST__schedules__id__rotate-key", rotated_key),
+    ("POST__schedules__id__run", schedule_run_started),
+    ("GET__schedules__id__runs", schedule_runs),
+    // Skills.
+    ("GET__skills", skills),
+    ("POST__skills", skill_detail),
+    ("POST__skills_from-tape", skill_detail),
+    ("GET__skills__id_", skill_detail),
+    ("PUT__skills__id_", skill_detail),
+    ("DELETE__skills__id_", read_as_done),
+    ("POST__skills__id__versions", skill_version),
 ];
+
+/// Routes whose refusals the client reads its own way rather than with `read_error`, and how.
+/// Every other refusal is [`refusal`].
+const REFUSALS: &[(&str, RestCheck)] = &[
+    ("POST__ag-ui", turn_refused),
+    ("DELETE__coworkers__coworker_id_", coworker_delete_refused),
+    ("GET__coworkers__coworker_id__tools", tools_refused),
+    ("POST__ag-ui_user-form_submit", form_refused),
+    ("POST__ag-ui_user-form_dismiss", form_refused),
+    ("POST__ag-ui_box-handoff_resolve", handoff_refused),
+    ("POST__recipes__id__run", run_refused),
+    ("POST__skills_from-tape", tape_refused),
+];
+
+/// One recorded answer, read the way this app reads it: not at all from a route it never asks
+/// ([`REST_NOT_READ`]), with its route's reading for a success, and for anything else the way
+/// the client takes a refusal.
+fn read_fixture(route: &str, fixture: &Value) -> Check {
+    if REST_NOT_READ
+        .iter()
+        .any(|(excused, _, _)| *excused == route)
+    {
+        return Ok(());
+    }
+    let (_, read) = REST_ROUTES
+        .iter()
+        .find(|(dir, _)| *dir == route)
+        .ok_or_else(|| {
+            format!(
+                "no reading for {route}: add it to REST_ROUTES, or say in REST_NOT_READ why this \
+                 app never asks it"
+            )
+        })?;
+    let status = fixture
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .ok_or("no status")?;
+    let body = &fixture["body"];
+    if (200..300).contains(&status) {
+        return read(status, body);
+    }
+    // `send_json_within`: a 401 on any route but `/auth/` is the session gone, whatever the route
+    // would have made of the refusal, because the one refresh the app can do on its own has been
+    // tried. On `/auth/login` the same status is a wrong password, a verdict like any other.
+    if status == 401 && !str_at(fixture, "path").starts_with("/auth/") {
+        return signed_out(body);
+    }
+    let refused = REFUSALS
+        .iter()
+        .find(|(dir, _)| *dir == route)
+        .map_or(refusal as RestCheck, |(_, check)| *check);
+    refused(status, body)
+}
 
 fn parse<T: DeserializeOwned>(body: &Value) -> Result<T, String> {
     serde_json::from_value(body.clone())
@@ -1342,6 +2019,375 @@ fn opt_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+/// A recorded body as the client has it off the wire: a text body is its text, and a JSON one
+/// its JSON.
+fn body_text(body: &Value) -> String {
+    match body {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A body as the user-form routes parse it (`user_form_action_response`): JSON, or `null` for
+/// anything that is not.
+fn body_json(body: &Value) -> Value {
+    let text = body_text(body);
+    if text.trim().is_empty() {
+        return Value::Null;
+    }
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// What a refusal says, read off the recording by the rule this app is held to, stated here
+/// case by case rather than borrowed from the client (`refusal_words` in `types.rs`), so the
+/// check is not the code it checks: the sentence the person is shown, and the server's code
+/// word when the body names one.
+///
+/// The rule is the one opengrok-server writes its refusals to (its error-bodies change): with a
+/// `code`, the code is `code` and the sentence is `error`; without one, a bare code word under
+/// `error` with a `message` beside it is the code and the `message` the sentence (the queue's
+/// 409s); otherwise `error` is the sentence and there is no code. A bare code word with nothing
+/// beside it (the queue's `already-consumed` and `not-pending`) is kept as the code and is all
+/// there is to show, which the queue needs. A body with nothing under `error`, or not JSON, is
+/// its own text. A code word is one lowercase token of letters and digits joined by `-` or `_`,
+/// with no spaces.
+fn said_by(body: &Value) -> (String, Option<String>) {
+    let code_word = |text: &str| {
+        text.starts_with(|c: char| c.is_ascii_lowercase())
+            && text
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    };
+    let Value::Object(_) = body else {
+        return (body_text(body).trim().to_string(), None);
+    };
+    let field = |key: &str| {
+        opt_str(body, key)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let owned = |text: &str| text.to_string();
+    let own_text = || body.to_string();
+    match (field("error"), field("code"), field("message")) {
+        (error, Some(code), message) => (
+            error.or(message).map_or_else(own_text, owned),
+            Some(owned(code)),
+        ),
+        (Some(error), None, Some(message)) if code_word(error) => {
+            (owned(message), Some(owned(error)))
+        }
+        (Some(error), None, None) if code_word(error) => (owned(error), Some(owned(error))),
+        (Some(error), None, _) => (owned(error), None),
+        (None, None, _) => (own_text(), None),
+    }
+}
+
+// ---- refusals ----
+
+/// A refusal as `read_error` reads one (`OpenGrokClient::refusal`). What it says is what the
+/// person is shown, so it must be the server's own sentence ([`said_by`]), and there must be
+/// one; the server's code word, when the body names one, is kept apart for the callers that
+/// branch on it. A refusal from the send queue carries the `pending-user-message` CUSTOM the
+/// queue applies, and its conflict word is one the queue branches on.
+///
+/// Every refusal recorded here was written by the server, so each reads as its verdict, or as
+/// its word that the gateway is out of reach, and never as the server itself out of reach. A
+/// 502, 503 or 504 the server writes says it wrote it by its shape, JSON with the sentence under
+/// `error`: nothing in front of the server writes that, and it is the one way this app can tell
+/// a box that is down from a server it cannot reach.
+fn refusal(status: u16, body: &Value) -> Check {
+    let error = OpenGrokClient::refusal(status, &body_text(body));
+    let (sentence, code) = said_by(body);
+    if (502..=504).contains(&status) {
+        must!(
+            opt_str(body, "error").is_some_and(|error| !error.trim().is_empty()),
+            "a {status} the server writes {FIVE_HUNDRED_SHAPE}, not {body}"
+        );
+    }
+    let expected = if reads_as_gateway_unreachable(&sentence) {
+        Failure::OutOfReach(Unreachable::Gateway)
+    } else {
+        Failure::Verdict
+    };
+    must!(
+        error.failure() == expected,
+        "a {status} the server wrote should read as {expected:?}, not {:?}",
+        error.failure()
+    );
+    must!(
+        !error.message.trim().is_empty(),
+        "a refusal with nothing to show the person: {body}"
+    );
+    if let Some(code) = code.as_deref().filter(|code| *code != sentence) {
+        must!(
+            error.message != code,
+            "a refusal that names its code {code:?} and says a sentence beside it should be \
+             shown the sentence, not the code"
+        );
+    }
+    must!(
+        error.status == Some(status) && error.message == sentence,
+        "the refusal should read as the server's sentence {sentence:?}, not {:?}",
+        error.message
+    );
+    must!(
+        error.code() == code.as_deref(),
+        "the refusal's code should be kept as {code:?}, not {:?}",
+        error.code()
+    );
+    if let Some(event) = body.get("event") {
+        let custom = error.pending_custom().ok_or_else(|| {
+            format!("the queue's CUSTOM on the refusal did not reach it: {event}")
+        })?;
+        must!(
+            custom.thread_id == str_at(&event["value"], "threadId"),
+            "the queue's CUSTOM should name its thread: {custom:?}"
+        );
+        let word = code.as_deref().unwrap_or_default();
+        must!(
+            error.is_already_consumed() == (status == 409 && word == "already-consumed")
+                && error.is_not_pending() == (status == 409 && word == "not-pending")
+                && error.is_stale_pending() == (status == 409 && word == "stale-pending-message"),
+            "the queue should know the conflict {word:?} by its word: {error:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The queue's words (`OpenGrokError::is_already_consumed`, `is_not_pending`,
+/// `is_stale_pending`), which opengrok-server keeps under `error` on its queue's 409s
+/// (`agui/pending.rs`).
+const QUEUE_CODES: &[&str] = &["already-consumed", "not-pending", "stale-pending-message"];
+
+/// How a refusal of a turn fails [`turn_refused`] when it names a code in the shape the server
+/// has retired for it.
+const CODE_UNDER_CODE: &str = "should name its code under code, with its sentence under error";
+
+/// `run_turn`'s refusals, read as `read_error` reads them. The queue's conflicts keep their code
+/// under `error`, with the sentence under `message` where they say one; every other code this
+/// route names rides under `code`, with the sentence under `error` (opengrok-server's
+/// error-bodies change, for `run-exists`). A code under `error` that is not one of the queue's
+/// is the shape that change retired.
+fn turn_refused(status: u16, body: &Value) -> Check {
+    let (_, code) = said_by(body);
+    if let Some(code) = code.as_deref()
+        && opt_str(body, "error").map(str::trim) == Some(code)
+    {
+        must!(
+            QUEUE_CODES.contains(&code),
+            "a turn refused as {code:?} {CODE_UNDER_CODE}; only the queue's words stay under \
+             error: {body}"
+        );
+    }
+    refusal(status, body)
+}
+
+/// A 401 on any route but `/auth/` (`signed_out_error`): the session is gone, which only the
+/// person signing in again mends, and the sentence the person is told is the server's.
+fn signed_out(body: &Value) -> Check {
+    let error = OpenGrokClient::signed_out_refusal(&body_text(body));
+    let (sentence, _) = said_by(body);
+    must!(
+        error.is_signed_out(),
+        "a 401 should read as the session gone: {error:?}"
+    );
+    must!(
+        !sentence.is_empty() && error.message == sentence,
+        "the person should be told {sentence:?}, not {:?}",
+        error.message
+    );
+    Ok(())
+}
+
+/// `delete_coworker`: a coworker the server no longer has is as gone as one it just deleted, so
+/// the client must read a 404 as done (`OpenGrokClient::gone_after_delete`) and show nothing of
+/// it. Any other refusal is read as anywhere else.
+fn coworker_delete_refused(status: u16, body: &Value) -> Check {
+    let gone = OpenGrokClient::gone_after_delete(status);
+    must!(
+        gone == (status == 404),
+        "a delete refused with {status} should read as {}, and the client reads it as {}",
+        if status == 404 { "gone" } else { "refused" },
+        if gone { "gone" } else { "refused" }
+    );
+    if gone {
+        return Ok(());
+    }
+    refusal(status, body)
+}
+
+/// A refused tool listing is the server's sentence, and the app reads it as a refusal (a 404 is
+/// "not this person's bot"), so one must never read as a list.
+fn tools_refused(status: u16, body: &Value) -> Check {
+    must!(
+        body.get("tools").is_none(),
+        "a refused listing should not carry tools: {body}"
+    );
+    refusal(status, body)
+}
+
+/// `user_form_action_response`: a 403 is the server declining to fill on that computer, with its
+/// sentence under `message` before `error`, which is a code; a 404 is the card gone (`form entry
+/// missing`) or no such route. Every other refusal is read as anywhere else.
+fn form_refused(status: u16, body: &Value) -> Check {
+    let parsed = body_json(body);
+    let reply = user_form_action_from_http(status, &parsed);
+    match status {
+        404 => {
+            let expected = if str_at(&parsed, "error").eq_ignore_ascii_case(FORM_ENTRY_MISSING) {
+                UserFormActionReply::MissingEntry
+            } else {
+                UserFormActionReply::MissingRoute
+            };
+            must!(
+                reply == expected,
+                "a 404 should read as {expected:?}, not {reply:?}"
+            );
+        }
+        // The form's refusal is read by the one rule every refusal is, in either shape.
+        403 if parsed.is_object() => {
+            let (said, _) = said_by(&parsed);
+            must!(
+                !said.is_empty() && reply == UserFormActionReply::Refused(said),
+                "a refusal should carry the server's sentence, not {reply:?}"
+            );
+        }
+        // One the client cannot read still keeps the card open with a sentence of its own.
+        403 => must!(
+            matches!(&reply, UserFormActionReply::Refused(said) if !said.trim().is_empty()),
+            "a refusal should keep the card open with a sentence, not {reply:?}"
+        ),
+        _ => return refusal(status, body),
+    }
+    Ok(())
+}
+
+/// `box_handoff_action_response`: a 404 is the handoff gone (`form entry missing`, nothing left
+/// to settle) or no such route, and never a hand-back. Every other refusal is read as anywhere
+/// else.
+fn handoff_refused(status: u16, body: &Value) -> Check {
+    if status != 404 {
+        return refusal(status, body);
+    }
+    let parsed = body_json(body);
+    let reply = box_handoff_action_from_http(status, &parsed);
+    let expected = if str_at(&parsed, "error").eq_ignore_ascii_case(FORM_ENTRY_MISSING) {
+        BoxHandoffReply::Empty
+    } else {
+        BoxHandoffReply::MissingRoute
+    };
+    must!(
+        reply == expected,
+        "a 404 should read as {expected:?}, not {reply:?}"
+    );
+    Ok(())
+}
+
+/// `run_error`: a refusal that carries `historyMissed` is a run that played and could not be
+/// written into the history, and that sentence is what it says; every other refusal is the
+/// server's sentence, as anywhere else.
+fn run_refused(status: u16, body: &Value) -> Check {
+    let error = OpenGrokClient::run_refusal(status, &body_text(body));
+    match opt_str(body, "historyMissed")
+        .map(str::trim)
+        .filter(|missed| !missed.is_empty())
+    {
+        Some(missed) => {
+            must!(
+                error.history_missed() && error.message == missed,
+                "a run the history missed should say so: {error:?}"
+            );
+            Ok(())
+        }
+        None => {
+            must!(
+                !error.history_missed(),
+                "a plain refusal is not a missed history: {error:?}"
+            );
+            refusal(status, body)
+        }
+    }
+}
+
+/// `tape_error`: the server's sentence, as anywhere else, read as a verdict about the recording
+/// whatever its status, because this route answers 502 and 504 itself, for a model that wrote
+/// nothing that can be kept or overran. Only the server saying the gateway could not be reached
+/// is a machine out of reach.
+fn tape_refused(status: u16, body: &Value) -> Check {
+    refusal(status, body)?;
+    let error = OpenGrokClient::tape_refusal(status, &body_text(body));
+    let expected = if reads_as_gateway_unreachable(&error.message) {
+        Failure::OutOfReach(Unreachable::Gateway)
+    } else {
+        Failure::Verdict
+    };
+    must!(
+        error.failure() == expected,
+        "a {status} from a tape should read as {expected:?}, not {:?}",
+        error.failure()
+    );
+    Ok(())
+}
+
+// ---- successes ----
+
+/// A success this app reads only as done (`empty_or_error`, or its status alone): a pause, a
+/// delete, a rule kept, a sign-out. Nothing in the body is taken, so there is nothing in it to
+/// hold to anything.
+fn read_as_done(_: u16, _: &Value) -> Check {
+    Ok(())
+}
+
+/// A deleted coworker is gone by the client's own rule (`OpenGrokClient::gone_after_delete`),
+/// which it reads off the status alone.
+fn coworker_deleted(status: u16, _: &Value) -> Check {
+    must!(
+        OpenGrokClient::gone_after_delete(status),
+        "a delete answered {status} should read as done"
+    );
+    Ok(())
+}
+
+/// A sign-in and a refresh answer with the session in cookies, and this app reads only the
+/// status off a success.
+fn session_in_cookies(_: u16, body: &Value) -> Check {
+    for token in [
+        "accessToken",
+        "refreshToken",
+        "access_token",
+        "refresh_token",
+    ] {
+        must!(
+            body.get(token).is_none(),
+            "a sign-in body should not carry {token}; the session is in the cookies"
+        );
+    }
+    Ok(())
+}
+
+/// A turn's success is its event stream, read frame by frame (`run_turn`). NO RECORDED FIXTURE
+/// REACHES THIS: the recorder files a stream's frames under `agui/`, where [`check_frame`] reads
+/// each one, and every `POST__ag-ui` body it keeps is a refusal, read in [`read_fixture`]. The
+/// route is listed for those refusals. This reading stands for the day a 2xx body is recorded
+/// here, which would be the stream's text, `data:` lines the stream reader takes as the
+/// coworker's words or the run's error; until then it covers nothing.
+fn turn_stream(_: u16, body: &Value) -> Check {
+    let stream = body
+        .as_str()
+        .ok_or("a turn answers with its event stream, not a JSON body")?;
+    must!(
+        stream.lines().any(|line| line.starts_with("data:")),
+        "a turn's stream is `data:` lines: {stream:?}"
+    );
+    if let Err(error) = assistant_text_from_sse(stream) {
+        must!(
+            !error.trim().is_empty(),
+            "a stream that ends in an error should say what it was"
+        );
+    }
+    Ok(())
+}
+
 fn thread_list(_: u16, body: &Value) -> Check {
     let listed: Vec<ThreadListing> = parse(body)?;
     let raw = rows(body)?;
@@ -1356,6 +2402,65 @@ fn thread_list(_: u16, body: &Value) -> Check {
                 && row.last_status == str_at(raw, "lastStatus")
                 && Some(row.updated_at_ms) == raw.get("updatedAtMs").and_then(Value::as_i64),
             "a thread row came through changed: {row:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A run's frames read back to the words the coworker said, as the transcript rebuilds them: the
+/// person's own words, which a replay opens each run with, are none of them. And a card the
+/// replay says is settled ends settled: the server lays the card's `formResolution` over its park
+/// (`overlay_form`), which the app does not read there, and journals the settled card after it
+/// (`journal_settled_form`), which is where the app takes the settlement from. A replay without
+/// the second would rebuild a settled card as open.
+fn reads_back(run_id: &str, events: &[Value]) -> Check {
+    let persons: BTreeSet<&str> = events
+        .iter()
+        .filter(|frame| {
+            str_at(frame, "type") == "TEXT_MESSAGE_START" && str_at(frame, "role") == "user"
+        })
+        .map(|frame| str_at(frame, "messageId"))
+        .collect();
+    let said: String = events
+        .iter()
+        .filter(|frame| str_at(frame, "type") == "TEXT_MESSAGE_CONTENT")
+        .filter(|frame| !persons.contains(str_at(frame, "messageId")))
+        .map(|frame| str_at(frame, "delta"))
+        .collect();
+    let mut assembler = TurnAssembler::default();
+    for frame in events {
+        assembler.push_event(frame);
+    }
+    assembler.finish();
+    let (plain, parts) = assembler.snapshot();
+    // Blank lines are the transcript's own, put between the words a card or a picture splits.
+    // Compared word by word: a space lost between two deltas joins two words and fails.
+    let words =
+        |text: &str| -> Vec<String> { text.split_whitespace().map(str::to_string).collect() };
+    must!(
+        words(&plain) == words(&said),
+        "run {run_id:?} should read {said:?}, not {plain:?}"
+    );
+    for park in events.iter().filter(|frame| is_user_form_awaiting(frame)) {
+        let Some(word) = opt_str(park, "formResolution") else {
+            continue;
+        };
+        let call = str_at(park, "callId");
+        let resolution = FormResolution::parse(word);
+        let settled = |card: &UserFormSpec| {
+            card.call_id == call
+                && if resolution == FormResolution::Escalated {
+                    card.computer_handoff.is_some()
+                } else {
+                    card.effective_resolution() == Some(resolution)
+                }
+        };
+        must!(
+            parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::UserForm(card) if settled(card))),
+            "run {run_id:?} replays the card for {call:?} as {word}, and the app rebuilds it \
+             otherwise: {parts:?}"
         );
     }
     Ok(())
@@ -1384,37 +2489,7 @@ fn thread_replay(_: u16, body: &Value) -> Check {
             "a run came through changed: {:?} {status}",
             run.run_id
         );
-        // The frames read back to the words the coworker said, as the transcript rebuilds them.
-        let persons: BTreeSet<&str> = run
-            .events
-            .iter()
-            .filter(|frame| {
-                str_at(frame, "type") == "TEXT_MESSAGE_START" && str_at(frame, "role") == "user"
-            })
-            .map(|frame| str_at(frame, "messageId"))
-            .collect();
-        let said: String = run
-            .events
-            .iter()
-            .filter(|frame| str_at(frame, "type") == "TEXT_MESSAGE_CONTENT")
-            .filter(|frame| !persons.contains(str_at(frame, "messageId")))
-            .map(|frame| str_at(frame, "delta"))
-            .collect();
-        let mut assembler = TurnAssembler::default();
-        for frame in &run.events {
-            assembler.push_event(frame);
-        }
-        assembler.finish();
-        let (plain, _) = assembler.snapshot();
-        // Blank lines are the transcript's own, put between the words a card or a picture splits.
-        // Compared word by word: a space lost between two deltas joins two words and fails.
-        let words =
-            |text: &str| -> Vec<String> { text.split_whitespace().map(str::to_string).collect() };
-        must!(
-            words(&plain) == words(&said),
-            "run {:?} should read {said:?}, not {plain:?}",
-            run.run_id
-        );
+        reads_back(&run.run_id, &run.events)?;
     }
     let hidden: Vec<&str> = body
         .get("hiddenRunIds")
@@ -1435,6 +2510,168 @@ fn thread_replay(_: u16, body: &Value) -> Check {
             "every pending snapshot should be a live row: {live:?}"
         );
     }
+    Ok(())
+}
+
+/// One run as `GET /ag-ui/runs/{run_id}` replays it (`replay_run`), which is how a turn whose
+/// stream was lost is picked up again: its status, when it began, why it failed, and every frame
+/// it emitted, which read back to the coworker's words. A run parked on a card names the call it
+/// waits on and that call's arguments, which fill a card whose command the frames did not carry.
+fn run_replay(_: u16, body: &Value) -> Check {
+    let replay: RunReplay = parse(body)?;
+    must!(
+        replay.run_id == str_at(body, "runId")
+            && replay.status == str_at(body, "status")
+            && Some(replay.started_at_ms) == body.get("startedAtMs").and_then(Value::as_i64)
+            && replay.failure.as_deref() == opt_str(body, "failure"),
+        "the run came through changed: {:?} {:?}",
+        replay.run_id,
+        replay.status
+    );
+    let parked = body.get("pending").filter(|pending| !pending.is_null());
+    must!(
+        replay.pending.as_ref() == parked,
+        "the call the run is parked on should come through: {:?}",
+        replay.pending
+    );
+    if let Some(pending) = &replay.pending {
+        must!(
+            opt_str(pending, "call_id").is_some_and(|id| !id.is_empty())
+                && pending.get("arguments").is_some(),
+            "a parked run should name its call and that call's arguments: {pending}"
+        );
+    }
+    let events = body
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or("a replay with no events array")?;
+    same_len(&replay.events, events)?;
+    reads_back(&replay.run_id, &replay.events)
+}
+
+/// `stop_run`: the run, and what it is now. The route is idempotent, so a run that had already
+/// ended is `stopped` too; the words about when it takes effect are the server's, for a person
+/// reading its API, and the app shows its own.
+fn stopped(_: u16, body: &Value) -> Check {
+    let reply: StopReply = parse(body)?;
+    must!(
+        !reply.run_id.is_empty()
+            && reply.run_id == str_at(body, "runId")
+            && reply.status == "stopped",
+        "a stop should name the run and say it is stopped: {reply:?}"
+    );
+    Ok(())
+}
+
+/// The live queue on a thread (`list_pending_user_messages`), read as the app hydrates it:
+/// from the snapshot CUSTOMs, which the server sends beside the rows (`PendingList::
+/// live_messages`), each one the same send as the row it stands for.
+fn pending_list(_: u16, body: &Value) -> Check {
+    let list: PendingList = parse(body)?;
+    must!(
+        list.thread_id == str_at(body, "threadId"),
+        "the queue should name its thread"
+    );
+    let raw = body
+        .get("pendingUserMessages")
+        .and_then(Value::as_array)
+        .ok_or("the rows sit under pendingUserMessages")?;
+    same_len(&list.pending_user_messages, raw)?;
+    for (row, raw) in list.pending_user_messages.iter().zip(raw) {
+        held_as_sent(row, raw)?;
+    }
+    must!(
+        list.pending_events.is_some(),
+        "the server sends the snapshots, so the live queue is known"
+    );
+    let live = list.live_messages();
+    must!(
+        live == list.pending_user_messages,
+        "every snapshot should be the row it stands for: {live:?}"
+    );
+    Ok(())
+}
+
+fn pending_created(_: u16, body: &Value) -> Check {
+    pending_mutation(body, PendingOp::Created)
+}
+
+fn pending_edited(_: u16, body: &Value) -> Check {
+    pending_mutation(body, PendingOp::Edited)
+}
+
+fn pending_canceled(_: u16, body: &Value) -> Check {
+    pending_mutation(body, PendingOp::Canceled)
+}
+
+/// A queue write's answer (`PendingMutation`): the CUSTOM the app applies to its queue, saying
+/// the op the route performed, and the send as it now stands, beside the CUSTOM or inside it. A
+/// cancel carries no send: the text of one taken back is not sent back.
+fn pending_mutation(body: &Value, op: PendingOp) -> Check {
+    let mutation: PendingMutation = parse(body)?;
+    let custom = mutation
+        .custom()
+        .ok_or("the answer's CUSTOM did not parse")?;
+    must!(
+        custom.op == op
+            && mutation.thread_id == str_at(body, "threadId")
+            && custom.thread_id == mutation.thread_id,
+        "the answer should say {} on its thread, not {custom:?}",
+        op.as_str()
+    );
+    let raw = body
+        .get("pendingUserMessage")
+        .filter(|row| !row.is_null())
+        .or_else(|| body.pointer("/event/value/message"));
+    match (mutation.row(), raw) {
+        (Some(row), Some(raw)) => held_as_sent(&row, raw)?,
+        (None, None) => must!(
+            op == PendingOp::Canceled,
+            "only a cancel answers without the send"
+        ),
+        (row, raw) => {
+            return Err(format!(
+                "the row and its parse disagree: {raw:?} against {row:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The files sent on a thread (`sent_attachments`), which a replay draws on the messages they
+/// rode on: every row reads as the file it is, and one that names no message (`meta.messageId`)
+/// was uploaded and never sent, so it is left out.
+fn sent_files(_: u16, body: &Value) -> Check {
+    let listed: Vec<ArtifactListing> = parse(body)?;
+    let raw = rows(body)?;
+    same_len(&listed, raw)?;
+    for (row, raw) in listed.into_iter().zip(raw) {
+        file_as_sent(&row.file, raw)?;
+        let message = raw.pointer("/meta/messageId").and_then(Value::as_str);
+        let sent = row.sent();
+        must!(
+            sent.as_ref().map(|sent| sent.message_id.as_str()) == message,
+            "a file should be drawn on the message it rode on, and only then: {sent:?}"
+        );
+    }
+    Ok(())
+}
+
+/// An upload (`upload_attachment`) answers with the file, whose `art_` id the message then names.
+fn uploaded(_: u16, body: &Value) -> Check {
+    let file: Attachment = parse(body)?;
+    file_as_sent(&file, body)
+}
+
+fn file_as_sent(file: &Attachment, raw: &Value) -> Check {
+    must!(
+        file.id.starts_with("art_")
+            && file.id == str_at(raw, "id")
+            && file.mime == str_at(raw, "mime")
+            && file.filename == str_at(raw, "filename")
+            && Some(file.size_bytes) == raw.get("sizeBytes").and_then(Value::as_u64),
+        "a file came through changed: {file:?}"
+    );
     Ok(())
 }
 
@@ -1468,6 +2705,91 @@ fn answer(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// A settled card on a success (`user_form_action_from_http`), or the server's
+/// `{alreadyAnswered: true}` for a card that had settled before and whose run no longer waits on
+/// it (opengrok-server `agui/user_form.rs` `heal_or_already`), or `null` for a coworker the
+/// caller may not use (`load_owned_entry`), which settles nothing.
+fn user_form_answer(status: u16, body: &Value) -> Check {
+    let body = &body_json(body);
+    let reply = user_form_action_from_http(status, body);
+    if body.is_null() {
+        must!(
+            reply == UserFormActionReply::Empty,
+            "a null settles nothing, not {reply:?}"
+        );
+        return Ok(());
+    }
+    if body.get("formResolution").is_none()
+        && body.get("alreadyAnswered").and_then(Value::as_bool) == Some(true)
+    {
+        must!(
+            reply == UserFormActionReply::AlreadyAnswered,
+            "a card answered before should read as that, not {reply:?}"
+        );
+        return Ok(());
+    }
+    let UserFormActionReply::Settled(spec) = &reply else {
+        return Err(format!(
+            "a settled card should read as settled, not {reply:?}"
+        ));
+    };
+    let entry = opt_str(body, "entryId").unwrap_or_else(|| str_at(body, "id"));
+    must!(
+        spec.entry_id == entry,
+        "the card should keep its id: {spec:?}"
+    );
+    let word = str_at(body, "formResolution");
+    if FormResolution::parse(word) == FormResolution::Escalated {
+        must!(
+            spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded)
+                && spec.handoff_entry_id.as_deref() == opt_str(body, "handoffEntryId"),
+            "Open the screen should bring back the Computer card's id: {spec:?}"
+        );
+    } else {
+        must!(
+            spec.effective_resolution() == Some(FormResolution::parse(word)),
+            "the card should settle as {word:?}: {spec:?}"
+        );
+    }
+    Ok(())
+}
+
+fn box_handoff(status: u16, body: &Value) -> Check {
+    let body = &body_json(body);
+    let reply = box_handoff_action_from_http(status, body);
+    let expected = if body.is_null() {
+        BoxHandoffReply::Empty
+    } else if body.get("alreadyAnswered").and_then(Value::as_bool) == Some(true) {
+        BoxHandoffReply::AlreadyAnswered
+    } else {
+        BoxHandoffReply::Settled
+    };
+    must!(
+        reply == expected,
+        "a hand-back should read as {expected:?}, not {reply:?}"
+    );
+    Ok(())
+}
+
+/// The host's settings record (`host_settings`, `patch_host_settings`), which the app reads two
+/// facts off for the egress tunnel: the host's intent (`egressTunnelEnabled`) and whether the
+/// tunnel is live for the coworker asked about (`egressTunnelAvailable`, which the server puts on
+/// every answer, false when it cannot say). A key the host did not send changes nothing, so each
+/// must read as exactly what was sent.
+fn host_settings(_: u16, body: &Value) -> Check {
+    must!(body.is_object(), "the settings are a record: {body}");
+    let available = body.get("egressTunnelAvailable").and_then(Value::as_bool);
+    must!(
+        available.is_some() && host_egress_tunnel_available(body) == available,
+        "whether the tunnel is live should read as sent: {available:?}"
+    );
+    must!(
+        host_egress_tunnel_flag(body) == body.get("egressTunnelEnabled").and_then(Value::as_bool),
+        "the host's intent should read as sent"
+    );
+    Ok(())
+}
+
 fn local_exec_policy(_: u16, body: &Value) -> Check {
     let view: LocalExecPolicy = parse(body)?;
     must!(
@@ -1495,27 +2817,22 @@ fn local_exec_policy(_: u16, body: &Value) -> Check {
         view.allow == listed("allow") && view.deny == listed("deny"),
         "the rule lists should read as sent: {view:?}"
     );
-    // This fixture is here to lock `inert` (#93, server #246): it must carry some, and they must
-    // read back exactly, pattern and reason, so a parse that drops the field (it defaults to
-    // empty) fails rather than agreeing with an empty list.
+    // The allows the gate can never match (#93, server #246). The server lists them on every
+    // answer, an empty list when there are none (`policy_listing` in opengrok-server
+    // `local_exec.rs`), so a listing without the field is not the server's; and what it lists
+    // reads back exactly, pattern and reason, each one an allow.
     let sent: Vec<(String, String)> = body
         .get("inert")
         .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .map(|row| {
-                    (
-                        str_at(row, "pattern").to_string(),
-                        str_at(row, "reason").to_string(),
-                    )
-                })
-                .collect()
+        .ok_or("the listing should say which allows are inert, even when none are")?
+        .iter()
+        .map(|row| {
+            (
+                str_at(row, "pattern").to_string(),
+                str_at(row, "reason").to_string(),
+            )
         })
-        .unwrap_or_default();
-    must!(
-        !sent.is_empty(),
-        "the policy fixture should carry inert rules to lock: {body}"
-    );
+        .collect();
     let read: Vec<(String, String)> = view
         .inert
         .iter()
@@ -1528,8 +2845,44 @@ fn local_exec_policy(_: u16, body: &Value) -> Check {
     must!(
         view.inert
             .iter()
-            .all(|rule| view.allow.contains(&rule.pattern)),
-        "every inert rule should be one of the allows: {view:?}"
+            .all(|rule| !rule.reason.is_empty() && view.allow.contains(&rule.pattern)),
+        "every inert rule should be one of the allows, with its reason: {view:?}"
+    );
+    Ok(())
+}
+
+/// The machines enrolled to run commands for the coworkers (`list_daemons`), which is how this
+/// Mac finds itself on the roster rather than enrolling a second time.
+fn daemons(_: u16, body: &Value) -> Check {
+    let list: DaemonList = parse(body)?;
+    let raw = body
+        .get("machines")
+        .and_then(Value::as_array)
+        .ok_or("the machines sit under machines")?;
+    same_len(&list.machines, raw)?;
+    for (machine, raw) in list.machines.iter().zip(raw) {
+        must!(
+            !machine.machine_id.is_empty()
+                && machine.machine_id == str_at(raw, "machineId")
+                && machine.label == str_at(raw, "label")
+                && Some(machine.revoked) == raw.get("revoked").and_then(Value::as_bool)
+                && Some(machine.connected) == raw.get("connected").and_then(Value::as_bool),
+            "a machine came through changed: {machine:?}"
+        );
+    }
+    Ok(())
+}
+
+/// An enrol (`enrol_daemon`) answers with the machine's id and the token this Mac keeps to take
+/// commands with.
+fn enrolled(_: u16, body: &Value) -> Check {
+    let enrol: DaemonEnrol = parse(body)?;
+    must!(
+        !enrol.machine_id.is_empty()
+            && enrol.machine_id == str_at(body, "machineId")
+            && !enrol.token.is_empty()
+            && enrol.token == str_at(body, "token"),
+        "an enrol should name the machine and hand over its token"
     );
     Ok(())
 }
@@ -1562,8 +2915,101 @@ fn coworkers(_: u16, body: &Value) -> Check {
         .try_for_each(|(coworker, raw)| coworker_matches(coworker, raw))
 }
 
-fn hired(_: u16, body: &Value) -> Check {
+/// A hire and an edit answer with the coworker as it now is, which is the row the roster keeps.
+fn coworker_row(_: u16, body: &Value) -> Check {
     coworker_matches(&parse(body)?, body)
+}
+
+/// A bot's tools (opengrok-server `agui/routes.rs` `list_tools`): every tool the server lists
+/// comes through by the name the model is told, with its words and its kind. The kind is what
+/// sorts a tool under the server's own or a plugin's, and the parse defaults a missing one to
+/// empty, so a row that says none is caught here rather than filed as a plugin's.
+fn coworker_tools(_: u16, body: &Value) -> Check {
+    let listing: ToolListing = parse(body)?;
+    let raw = body["tools"]
+        .as_array()
+        .ok_or("a listing should carry a tools array")?;
+    same_len(&listing.tools, raw)?;
+    for (tool, raw) in listing.tools.iter().zip(raw) {
+        let kind = str_at(raw, "kind");
+        must!(
+            !kind.is_empty(),
+            "each tool should say what kind it is: {raw}"
+        );
+        must!(
+            tool.name == str_at(raw, "name")
+                && tool.description == str_at(raw, "description")
+                && tool.kind == kind
+                && tool.is_builtin() == (kind == "builtin"),
+            "each tool should come through as sent: {tool:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
+/// A coworker's computer (`coworker_computer`), which the Computer pane and the tunnel's chrome
+/// are drawn from: whose box it is and where it is shared, its state and its screen, the
+/// person's standing answer to the tunnel's card, and the tunnel's own readiness. A share scope
+/// or an egress policy in a word this app does not know hides its control, so each one sent must
+/// be a word it knows.
+fn computer(_: u16, body: &Value) -> Check {
+    let status: CoworkerComputer = parse(body)?;
+    let given = |key: &str| body.get(key).filter(|value| !value.is_null());
+    must!(
+        status.agent_id == str_at(body, "agentId")
+            && status.state == str_at(body, "state")
+            && status.vnc_url.as_deref() == opt_str(body, "vncUrl")
+            && status.box_id.as_deref() == opt_str(body, "boxId")
+            && status.group_id() == opt_str(body, "groupId")
+            && status.image.is_some() == given("image").is_some()
+            && status.update.is_some() == given("update").is_some()
+            && status.is_egress_tunnel_available
+                == body
+                    .get("isEgressTunnelAvailable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+        "the computer came through changed: {status:?}"
+    );
+    let scope = opt_str(body, "shareScope");
+    must!(
+        status.share_scope == scope.and_then(BoxShareScope::parse)
+            && (scope.is_none() || status.share_scope.is_some()),
+        "the share scope should be a word this app knows, not {scope:?}"
+    );
+    let policy = opt_str(body, "egressPolicy");
+    must!(
+        status.egress_policy == policy.and_then(LocalExecMode::parse)
+            && (policy.is_none() || status.egress_policy.is_some()),
+        "the egress policy should be a word this app knows, not {policy:?}"
+    );
+    let tunnel = given("egress_tunnel");
+    must!(
+        status.box_egress_ready()
+            == tunnel.map(|tunnel| tunnel.get("ready").and_then(Value::as_bool) == Some(true))
+            && status
+                .egress_tunnel
+                .as_ref()
+                .and_then(|tunnel| tunnel.enabled)
+                == tunnel.and_then(|tunnel| tunnel.get("enabled").and_then(Value::as_bool)),
+        "the tunnel should come through as the box reported it: {:?}",
+        status.egress_tunnel
+    );
+    Ok(())
+}
+
+/// The coworker's screen right now (`coworker_screen`): the picture a `TOOL_CALL_RESULT` carries,
+/// decoded the same way (`ScreenshotSpec::from_frame`).
+fn screen(_: u16, body: &Value) -> Check {
+    let shot = ScreenshotSpec::from_frame("screen", "", body)
+        .ok_or("the screen did not decode as a picture")?;
+    must!(
+        Some(u64::from(shot.width)) == body.get("width").and_then(Value::as_u64)
+            && Some(u64::from(shot.height)) == body.get("height").and_then(Value::as_u64),
+        "the screen is {}x{}, not what the answer says",
+        shot.width,
+        shot.height
+    );
+    Ok(())
 }
 
 fn parameter_kind(word: &str) -> RecipeParameterKind {
@@ -1609,11 +3055,17 @@ fn recipes(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// A recipe's whole detail, which `GET /recipes/{id}` and every write to a recipe answer with.
+/// A version's steps are a tape's sequence; a workflow's version carries its decision tree there
+/// instead, as named branches, and reads as a version with no tape steps (see `tape_steps` in
+/// `client.rs`).
 fn recipe_detail(_: u16, body: &Value) -> Check {
     let detail: RecipeDetail = parse(body)?;
     must!(
-        detail.recipe.id == str_at(&body["recipe"], "id"),
-        "the recipe changed"
+        detail.recipe.id == str_at(&body["recipe"], "id")
+            && detail.recipe.is_workflow() == (str_at(&body["recipe"], "kind") == "workflow"),
+        "the recipe changed: {:?}",
+        detail.recipe
     );
     let versions = body["versions"].as_array().ok_or("no versions array")?;
     same_len(&detail.versions, versions)?;
@@ -1704,8 +3156,9 @@ fn schedule_run_started(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
-/// An edit answers with the routine as it now is, which is what the editor draws next.
-fn schedule_edited(status: u16, body: &Value) -> Check {
+/// A create and an edit answer with the routine as it now is, which is what the editor draws
+/// next.
+fn one_routine(status: u16, body: &Value) -> Check {
     schedules(status, &Value::Array(vec![body.clone()]))
 }
 
@@ -1741,6 +3194,30 @@ fn schedules(_: u16, body: &Value) -> Check {
             );
         }
     }
+    Ok(())
+}
+
+/// A rotated key (`rotate_webhook_key`) answers with the routine's webhook, and that is all the
+/// app takes from it: the trigger it redraws (`trigger_from_schedule` in `state.rs`) is the id,
+/// the kind and the URL, key and header, so a row that names nothing else still replaces the
+/// trigger whole and leaves the routine's prompt and clock where they were.
+fn rotated_key(_: u16, body: &Value) -> Check {
+    let row: ScheduleRow = parse(body)?;
+    let hook = row
+        .webhook
+        .as_ref()
+        .ok_or("a rotated key comes back on the webhook")?;
+    let raw = &body["webhook"];
+    must!(
+        row.id == str_at(body, "id")
+            && row.kind == ScheduleKind::Webhook
+            && !hook.url.is_empty()
+            && hook.url == str_at(raw, "url")
+            && !hook.key.is_empty()
+            && hook.key == str_at(raw, "key")
+            && hook.header == str_at(raw, "header"),
+        "the new key should come through on the webhook: {row:?}"
+    );
     Ok(())
 }
 
@@ -1783,6 +3260,19 @@ fn skill_detail(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// A new version of a skill (`add_skill_version`): its number, where its prose came from, and
+/// its note.
+fn skill_version(_: u16, body: &Value) -> Check {
+    let version: SkillVersion = parse(body)?;
+    must!(
+        Some(u64::from(version.version)) == body.get("version").and_then(Value::as_u64)
+            && version.kind.word() == str_at(body, "kind")
+            && version.note == str_at(body, "note"),
+        "the version came through changed: {version:?}"
+    );
+    Ok(())
+}
+
 fn account(_: u16, body: &Value) -> Check {
     let me: Account = parse(body)?;
     must!(
@@ -1795,132 +3285,6 @@ fn account(_: u16, body: &Value) -> Check {
             && Some(me.enabled) == body.get("enabled").and_then(Value::as_bool)
             && me.is_admin == body.get("isAdmin").and_then(Value::as_bool),
         "the account came through changed: {me:?}"
-    );
-    Ok(())
-}
-
-/// A bot's tools (opengrok-server `agui/routes.rs` `list_tools`): every tool the server lists
-/// comes through by the name the model is told, with its words and its kind. A refusal is a
-/// plain sentence, and the app reads only its status (a 404 is "not this person's bot"), so
-/// one must never read as a list.
-fn coworker_tools(status: u16, body: &Value) -> Check {
-    if status != 200 {
-        must!(
-            body.get("tools").is_none(),
-            "a refused listing should not carry tools: {body}"
-        );
-        return Ok(());
-    }
-    let listing: super::client::ToolListing = parse(body)?;
-    let raw = body["tools"]
-        .as_array()
-        .ok_or("a listing should carry a tools array")?;
-    same_len(&listing.tools, raw)?;
-    for (tool, raw) in listing.tools.iter().zip(raw) {
-        must!(
-            tool.name == str_at(raw, "name")
-                && tool.description == str_at(raw, "description")
-                && tool.kind == str_at(raw, "kind")
-                && tool.is_builtin() == (str_at(raw, "kind") == "builtin"),
-            "each tool should come through as sent: {tool:?} from {raw}"
-        );
-    }
-    Ok(())
-}
-
-/// A sign-in answers with the session in cookies, and this app reads only the status off a
-/// success. A refusal is read for the server's own sentence.
-fn login(status: u16, body: &Value) -> Check {
-    if status == 200 {
-        for token in [
-            "accessToken",
-            "refreshToken",
-            "access_token",
-            "refresh_token",
-        ] {
-            must!(
-                body.get(token).is_none(),
-                "a sign-in body should not carry {token}; the session is in the cookies"
-            );
-        }
-        return Ok(());
-    }
-    let text = match body {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    };
-    let said = error_message_from_body(&text);
-    let expected = opt_str(body, "error").or(body.as_str()).unwrap_or("");
-    must!(
-        said == expected,
-        "a refused sign-in should read {expected:?}, not {said:?}"
-    );
-    Ok(())
-}
-
-fn user_form_answer(status: u16, body: &Value) -> Check {
-    let reply = user_form_action_from_http(status, body);
-    match status {
-        200 => {
-            let UserFormActionReply::Settled(spec) = &reply else {
-                return Err(format!(
-                    "a settled card should read as settled, not {reply:?}"
-                ));
-            };
-            let entry = opt_str(body, "entryId").unwrap_or_else(|| str_at(body, "id"));
-            must!(
-                spec.entry_id == entry,
-                "the card should keep its id: {spec:?}"
-            );
-            let word = str_at(body, "formResolution");
-            if FormResolution::parse(word) == FormResolution::Escalated {
-                must!(
-                    spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded)
-                        && spec.handoff_entry_id.as_deref() == opt_str(body, "handoffEntryId"),
-                    "Open the screen should bring back the Computer card's id: {spec:?}"
-                );
-            } else {
-                must!(
-                    spec.effective_resolution() == Some(FormResolution::parse(word)),
-                    "the card should settle as {word:?}: {spec:?}"
-                );
-            }
-        }
-        404 => {
-            let expected = if str_at(body, "error").eq_ignore_ascii_case(FORM_ENTRY_MISSING) {
-                UserFormActionReply::MissingEntry
-            } else {
-                UserFormActionReply::MissingRoute
-            };
-            must!(
-                reply == expected,
-                "a 404 should read as {expected:?}, not {reply:?}"
-            );
-        }
-        403 => {
-            let said = opt_str(body, "message")
-                .or_else(|| opt_str(body, "error"))
-                .unwrap_or_default();
-            must!(
-                reply == UserFormActionReply::Refused(said.to_string()),
-                "a refusal should carry the server's sentence, not {reply:?}"
-            );
-        }
-        other => return Err(format!("no reading for a {other} from a card")),
-    }
-    Ok(())
-}
-
-fn box_handoff(status: u16, body: &Value) -> Check {
-    let reply = box_handoff_action_from_http(status, body);
-    let expected = if body.get("alreadyAnswered").and_then(Value::as_bool) == Some(true) {
-        BoxHandoffReply::AlreadyAnswered
-    } else {
-        BoxHandoffReply::Settled
-    };
-    must!(
-        status == 200 && reply == expected,
-        "a hand-back should read as {expected:?}, not {reply:?}"
     );
     Ok(())
 }
@@ -1939,10 +3303,11 @@ fn the_manifest_names_every_fixture_and_every_fixture_is_in_it() {
         "server_sha should be the opengrok-server commit, not {:?}",
         manifest.server_sha
     );
-    assert!(
-        ["hand-copied", "opengrok-server recorder"].contains(&manifest.recorded_by.as_str()),
-        "recorded_by {:?} is neither the hand copy nor the recorder",
-        manifest.recorded_by
+    // The corpus is the server's own recording now. A copy made by hand would say what somebody
+    // read in the server's code, which is the transcription these tests exist to check.
+    assert_eq!(
+        manifest.recorded_by, "opengrok-server recorder",
+        "the corpus should be the server's own recording"
     );
     let files: BTreeSet<&str> = corpus
         .frames
@@ -2029,24 +3394,87 @@ fn every_frame_the_server_sends_is_read_as_intended() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
-/// Every body parses with the type this app reads its route with, and the fields it reads come
-/// through as the server sent them.
+/// Every body is read the way this app reads its route: a success parses with the type the
+/// client parses it with and the fields the app uses come through as the server sent them, and
+/// a refusal reads as the server's own sentence, the way the client takes one. A route the app
+/// never asks is excused in [`REST_NOT_READ`], and any other route with no reading fails.
 #[test]
 fn every_body_parses_with_the_type_this_app_reads_it_with() {
     let corpus = Corpus::load();
     let problems = verdicts(corpus.bodies.iter(), |file, fixture| {
-        let route = file.split('/').nth(1).unwrap_or("");
-        let (_, check) = REST_ROUTES
-            .iter()
-            .find(|(dir, _)| *dir == route)
-            .ok_or_else(|| format!("no reading for {route}: add it to REST_ROUTES"))?;
-        let status = fixture
-            .get("status")
-            .and_then(Value::as_u64)
-            .and_then(|status| u16::try_from(status).ok())
-            .ok_or("no status")?;
-        check(status, &fixture["body"])
+        read_fixture(file.split('/').nth(1).unwrap_or(""), fixture)
     });
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The REST ledger holds together: no route is read twice or both read and excused, every
+/// excuse is for a route the corpus records, under the route the server's router writes, and
+/// says why, and a route whose refusals are read its own way has a reading. An excuse for a
+/// route nobody records any more, or for one the shipped source asks ([`source_asks`]), has
+/// gone stale.
+#[test]
+fn every_route_this_app_does_not_read_is_recorded_and_says_why() {
+    let corpus = Corpus::load();
+    let recorded: BTreeSet<&str> = corpus
+        .bodies
+        .keys()
+        .filter_map(|file| file.split('/').nth(1))
+        .collect();
+    let read = |route: &str| REST_ROUTES.iter().filter(|(dir, _)| *dir == route).count();
+    let mut problems = Vec::new();
+    for (route, _) in REST_ROUTES {
+        if read(route) > 1 {
+            problems.push(format!("{route} is in REST_ROUTES more than once"));
+        }
+    }
+    for (route, pattern, why) in REST_NOT_READ {
+        if !recorded.contains(route) {
+            problems.push(format!(
+                "REST_NOT_READ excuses {route}, which the corpus does not record"
+            ));
+        }
+        if read(route) > 0 {
+            problems.push(format!(
+                "{route} is read and excused at once: take it off REST_NOT_READ"
+            ));
+        }
+        if why.trim().is_empty() {
+            problems.push(format!("REST_NOT_READ gives no reason for {route}"));
+        }
+        // The recorder files a route under its method and its pattern with `/`, `{` and `}` as
+        // `_`, so the directory says whether the pattern is the server's.
+        let method = route.split('_').next().unwrap_or("");
+        let filed = format!("{method}_{}", pattern.replace(['/', '{', '}'], "_"));
+        if filed != *route {
+            problems.push(format!(
+                "REST_NOT_READ names {route} as {method} {pattern}, which the recorder files as \
+                 {filed}"
+            ));
+        }
+        let asked = source_asks(method, pattern);
+        if !asked.is_empty() {
+            problems.push(format!(
+                "the app now asks {method} {pattern} ({route}), in {}: give it a reading in \
+                 REST_ROUTES and take it off REST_NOT_READ",
+                asked.join("; ")
+            ));
+        }
+    }
+    // The scan sees what the client does ask, and tells one method from another: the computer's
+    // egress policy is set with PUT and never read with GET.
+    let pattern = "/coworkers/{coworker_id}/computer/egress-policy";
+    if source_asks("PUT", pattern).is_empty() || !source_asks("GET", pattern).is_empty() {
+        problems.push(format!(
+            "the source scan is blind: it should find PUT {pattern} and not GET"
+        ));
+    }
+    for (route, _) in REFUSALS {
+        if read(route) == 0 {
+            problems.push(format!(
+                "REFUSALS reads the refusals of {route}, which has no reading in REST_ROUTES"
+            ));
+        }
+    }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -2210,6 +3638,81 @@ fn shipped_lines(source: &str) -> Vec<&str> {
     kept
 }
 
+/// `text` with every `{…}` placeholder as `{}`, so the server's `{coworker_id}` and a format
+/// string's `{}` or `{id}` read alike.
+fn placeholders_folded(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    let mut inside = false;
+    for c in text.chars() {
+        match c {
+            '{' if !inside => {
+                folded.push_str("{}");
+                inside = true;
+            }
+            '}' if inside => inside = false,
+            _ if inside => {}
+            c => folded.push(c),
+        }
+    }
+    folded
+}
+
+/// Where the shipped source asks `method` `route` (the server's pattern, an id as `{…}`), as
+/// `file: the first line of the function`. A function asks it when it writes the path as a whole
+/// string literal, alone or before a query, and names that method, or names none because it
+/// hands the path to a helper that does. Every source is read, not only `client.rs`, since a
+/// path can be a constant kept beside the code that uses it (`user_form.rs` keeps the form's).
+fn source_asks(method: &str, route: &str) -> Vec<String> {
+    const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+    let route = placeholders_folded(route);
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_sources(&src, &mut files);
+    let this_file = Path::new("opengrok").join("conformance.rs");
+    let mut asked = Vec::new();
+    for file in files.iter().filter(|file| !file.ends_with(&this_file)) {
+        let source = std::fs::read_to_string(file)
+            .unwrap_or_else(|error| panic!("read {}: {error}", file.display()));
+        let mut functions: Vec<Vec<&str>> = Vec::new();
+        for line in shipped_lines(&source) {
+            let head = line.trim_start();
+            let opens = head.starts_with("fn ")
+                || head.starts_with("async fn ")
+                || (head.starts_with("pub") && head.contains(" fn "));
+            if opens || functions.is_empty() {
+                functions.push(Vec::new());
+            }
+            if let Some(function) = functions.last_mut() {
+                function.push(line);
+            }
+        }
+        for function in functions {
+            // The pieces between quotes are a line's string literals, for any line whose quotes
+            // are all its strings' own.
+            let writes_path = function.iter().any(|line| {
+                line.split('"').skip(1).step_by(2).any(|literal| {
+                    let literal = placeholders_folded(literal);
+                    literal == route || literal.starts_with(&format!("{route}?"))
+                })
+            });
+            let named: Vec<&str> = METHODS
+                .into_iter()
+                .filter(|named| {
+                    function.iter().any(|line| {
+                        line.contains(&format!("Method::{named}"))
+                            || line.contains(&format!("http.{}(", named.to_ascii_lowercase()))
+                    })
+                })
+                .collect();
+            if writes_path && (named.is_empty() || named.contains(&method)) {
+                let at = file.strip_prefix(&src).unwrap_or(file);
+                asked.push(format!("{}: {}", at.display(), function[0].trim()));
+            }
+        }
+    }
+    asked
+}
+
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries =
         std::fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
@@ -2254,25 +3757,222 @@ fn the_ledger_types_are_the_types_the_source_matches() {
     );
 }
 
-/// The tools listing is in the ledger before its recording is vendored, so the corpus test has
-/// a reading for it the day it arrives. Fed the two bodies the server recorded
-/// (`GET__coworkers__coworker_id__tools/200-…` trimmed, `404-…` whole): the list comes through,
-/// the refusal is not read as one, and a body that drops a tool's kind is caught.
+/// The rule a step's arguments are held to, fed calls the corpus does not record yet: each
+/// withheld argument of the server's own tools and of a plugin's, run through the assembler as
+/// the stream brings them, passes as the card's rules state it; and each way a step could keep
+/// too much fails.
+#[test]
+fn a_steps_arguments_are_held_to_the_cards_rules_as_stated() {
+    use serde_json::json;
+    let long = "a sentence typed into a page that runs well past the sixty characters a card shows";
+    let calls = [
+        ("computer", json!({"action": "type", "text": "hello"})),
+        ("computer", json!({"action": "type", "text": long})),
+        (
+            "computer",
+            json!({"action": "key", "key": "sk-live-0123456789"}),
+        ),
+        (
+            "write_file",
+            json!({"path": "notes/todo.md", "content": "milk, eggs"}),
+        ),
+        (
+            "open_url",
+            json!({"url": "https://example.com/inbox?token=abc#top"}),
+        ),
+        (
+            "run_recipe",
+            json!({"recipe": "Log in", "values": {"password": "hunter2"}}),
+        ),
+        (
+            "gmail_api_send",
+            json!({
+                "to": "ada@example.com",
+                "accountId": "acct_1",
+                "api_key": "k",
+                "auth": {"token": "t", "coworkerId": "cw_1", "note": "kept"},
+                "signature": "Bearer abc",
+            }),
+        ),
+    ];
+    for (tool, sent) in &calls {
+        let start = json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": tool});
+        let args = json!({"type": "TOOL_CALL_ARGS", "toolCallId": "c1", "delta": sent.to_string()});
+        let end = json!({"type": "TOOL_CALL_END", "toolCallId": "c1"});
+        let (_, parts) = assembled(&[&start, &args, &end]).snapshot();
+        let Some(ChatPart::Step(step)) = parts.first() else {
+            panic!("a {tool} call is a step: {parts:?}");
+        };
+        let kept: Value =
+            serde_json::from_str(&step.arguments).expect("a step's arguments read back");
+        kept_as_the_card_allows(tool, sent, &kept)
+            .unwrap_or_else(|why| panic!("{tool} {sent} kept as {kept}: {why}"));
+    }
+    let leaks = [
+        (
+            "write_file",
+            json!({"content": "milk"}),
+            json!({"content": "milk"}),
+        ),
+        ("computer", json!({"text": long}), json!({"text": long})),
+        (
+            "open_url",
+            json!({"url": "https://example.com/?token=abc"}),
+            json!({"url": "https://example.com/?token=abc"}),
+        ),
+        (
+            "run_recipe",
+            json!({"values": {"q": "x"}}),
+            json!({"values": {"q": "x"}}),
+        ),
+        (
+            "gmail_api_send",
+            json!({"api_key": "k"}),
+            json!({"api_key": "k"}),
+        ),
+        (
+            "gmail_api_send",
+            json!({"boxId": "bx_1"}),
+            json!({"boxId": "bx_1"}),
+        ),
+        ("read_file", json!({"path": "a"}), json!({"path": "b"})),
+        (
+            "read_file",
+            json!({"path": "a"}),
+            json!({"path": "a", "extra": 1}),
+        ),
+    ];
+    for (tool, sent, kept) in &leaks {
+        assert!(
+            kept_as_the_card_allows(tool, sent, kept).is_err(),
+            "{tool} {sent} kept as {kept} should fail"
+        );
+    }
+}
+
+/// The readings of a refusal hold for the shapes opengrok-server's error-bodies change writes as
+/// well as the ones recorded today, so the new recording is read the day it lands: `run-exists`
+/// under `code`, the queue's codes under `error` (which stay) or under `code`, a 502 or a 503 of
+/// the server's own as JSON, and a form's refusal in either shape. A plain-text 502, and
+/// `run-exists` under `error`, the shapes the change retires, fail the way [`KNOWN_DRIFT`] says
+/// the recorded ones do.
+#[test]
+fn a_refusal_reads_in_the_shape_the_server_sends_and_the_one_it_is_moving_to() {
+    use serde_json::json;
+    let read = |route: &str, path: &str, status: u16, body: Value| {
+        read_fixture(
+            route,
+            &json!({ "method": "POST", "path": path, "status": status, "body": body }),
+        )
+    };
+    let said = "this run id already has a run; a new turn needs a new run id";
+    read(
+        "POST__ag-ui",
+        "/ag-ui",
+        409,
+        json!({ "error": said, "code": "run-exists" }),
+    )
+    .unwrap();
+    let old = read(
+        "POST__ag-ui",
+        "/ag-ui",
+        409,
+        json!({ "error": "run-exists", "message": said }),
+    );
+    assert!(
+        old.as_ref().is_err_and(|why| why.contains(CODE_UNDER_CODE)),
+        "run-exists under error is the shape the server retired for it: {old:?}"
+    );
+    let stale = "This queued message changed. Refresh it before sending again.";
+    let event = json!({
+        "type": "CUSTOM",
+        "name": "pending-user-message",
+        "value": { "v": 1, "op": "edited", "threadId": "th_1" },
+    });
+    for body in [
+        json!({ "v": 1, "error": "stale-pending-message", "message": stale, "event": event.clone() }),
+        json!({ "v": 1, "error": stale, "code": "stale-pending-message", "event": event }),
+    ] {
+        read("POST__ag-ui", "/ag-ui", 409, body.clone())
+            .unwrap_or_else(|why| panic!("{body}: {why}"));
+    }
+    let shared = "This computer is shared with other bots or people.";
+    for body in [
+        json!({ "error": "shared-computer", "message": shared }),
+        json!({ "error": shared, "code": "shared-computer" }),
+    ] {
+        read(
+            "POST__ag-ui_user-form_submit",
+            "/ag-ui/user-form/submit",
+            403,
+            body.clone(),
+        )
+        .unwrap_or_else(|why| panic!("{body}: {why}"));
+    }
+    let down = "the box is unreachable: the stand-in box is down";
+    read(
+        "POST__recipes__id__run",
+        "/recipes/rcp_1/run",
+        502,
+        json!({ "error": down }),
+    )
+    .unwrap();
+    read(
+        "POST__recipes",
+        "/recipes",
+        503,
+        json!({ "error": "the recipe was not kept: its raw version could not be stored" }),
+    )
+    .unwrap();
+    read(
+        "POST__skills_from-tape",
+        "/skills/from-tape",
+        502,
+        json!({ "error": "the model wrote more than a skill can hold" }),
+    )
+    .unwrap();
+    let retired = read(
+        "POST__recipes__id__run",
+        "/recipes/rcp_1/run",
+        502,
+        Value::String(down.into()),
+    );
+    assert!(
+        retired
+            .as_ref()
+            .is_err_and(|why| why.contains(FIVE_HUNDRED_SHAPE)),
+        "a plain-text 502 is the shape being retired: {retired:?}"
+    );
+}
+
+/// The tools listing's reading, fed the two bodies the server recorded
+/// (`GET__coworkers__coworker_id__tools/200-…` trimmed, `404-…` whole) and the ways a body could
+/// go wrong: the list comes through, the refusal is not read as one, and a body with no list or
+/// a tool that drops its kind is caught.
 #[test]
 fn a_bots_tool_listing_has_a_reading_in_the_ledger() {
-    let (_, check) = REST_ROUTES
-        .iter()
-        .find(|(route, _)| *route == "GET__coworkers__coworker_id__tools")
-        .expect("the tools route is in the ledger");
+    let read = |status: u16, body: Value| {
+        read_fixture(
+            "GET__coworkers__coworker_id__tools",
+            &serde_json::json!({
+                "method": "GET", "path": "/coworkers/cw_1/tools", "status": status, "body": body
+            }),
+        )
+    };
     let listed = serde_json::json!({"tools": [
         {"name": "shell", "description": "Run a shell command.", "kind": "builtin"},
         {"name": "gmail_api_send", "description": "", "kind": "plugin"}
     ]});
-    check(200, &listed).unwrap();
-    check(404, &Value::String("no such coworker".into())).unwrap();
-    assert!(check(404, &listed).is_err(), "a refusal carrying tools");
+    read(200, listed.clone()).unwrap();
+    read(404, Value::String("no such coworker".into())).unwrap();
+    assert!(read(404, listed).is_err(), "a refusal carrying tools");
+    assert!(read(200, serde_json::json!({})).is_err(), "no tools array");
     assert!(
-        check(200, &serde_json::json!({})).is_err(),
-        "no tools array"
+        read(
+            200,
+            serde_json::json!({"tools": [{"name": "shell", "description": "Run a shell command."}]})
+        )
+        .is_err(),
+        "a tool that drops its kind"
     );
 }
