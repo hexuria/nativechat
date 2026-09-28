@@ -48,6 +48,9 @@ struct ChatFeedRev {
     last_len: usize,
     last_ui: usize,
     form_picks: Vec<(String, String, String)>,
+    /// A card put away with its ✕ changes nothing else here: the thread and its parts stay
+    /// as they were, so without this the card would keep asking.
+    dismissed_choices: Vec<String>,
     user_form_picks: Vec<(String, String, String)>,
     user_forms: Vec<(String, String, String)>,
     user_form_verbs: bool,
@@ -113,6 +116,11 @@ impl ChatFeedRev {
                     .collect();
                 picks.sort();
                 picks
+            },
+            dismissed_choices: {
+                let mut dismissed: Vec<String> = state.dismissed_choices.iter().cloned().collect();
+                dismissed.sort();
+                dismissed
             },
             user_form_picks: {
                 let mut picks: Vec<(String, String, String)> = state

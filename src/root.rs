@@ -140,6 +140,11 @@ impl RootView {
         let Some(plan) = self.agent_keys.front() else {
             return false;
         };
+        if plan.release_caret && !self.agent_focused {
+            self.agent_focused = true;
+            click_away(window, &self.focus_handle, cx);
+            return true;
+        }
         if plan.focus_composer && !self.agent_focused {
             self.agent_focused = true;
             let state = self.state.clone();
@@ -312,6 +317,31 @@ impl Render for RootView {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("Root")
+            // A letter answers the newest open choice card while no field has the caret, the
+            // way Grok Bot's keycaps work. With the caret in a field the letter is the person's
+            // words and the field takes it; a modifier makes it a shortcut, not an answer.
+            .on_key_down({
+                let state = self.state.clone();
+                let root_focus = self.focus_handle.clone();
+                move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
+                    let typing = window
+                        .focused(cx)
+                        .is_some_and(|focused| focused != root_focus);
+                    let keys = &event.keystroke;
+                    if typing || keys.modifiers.modified() {
+                        return;
+                    }
+                    let Some(index) = crate::opengrok::choice_index(&keys.key) else {
+                        return;
+                    };
+                    let answered = state.update(cx, |state, cx| {
+                        state.lightbox.is_none() && state.answer_keyed_choice(index, cx)
+                    });
+                    if answered {
+                        cx.stop_propagation();
+                    }
+                }
+            })
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             // The title bar the app paints (see components/title_bar.rs), then the sidebar,

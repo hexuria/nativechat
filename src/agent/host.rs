@@ -14,15 +14,15 @@ use crate::components::skills::{
     short_relative_time, skill_matches, waiting_to_be_read,
 };
 use crate::opengrok::{
-    BoxHandoffResolution, ChatPart, ComputerHandoffStatus, CoworkerPatch, LocalExecResolution,
-    RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode, UserFormFieldKind,
-    computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
-    computer_handoff_card_id, computer_handoff_done_id, computer_handoff_skip_id,
-    computer_handoff_takeover_id, computer_window_attention_done_id, computer_window_attention_id,
-    computer_window_attention_skip_id, save_login_card_id, save_login_save_id, save_login_skip_id,
-    user_form_card_id, user_form_continue_id, user_form_dismiss_id, user_form_field_id,
-    user_form_pill_id, user_form_saved_clear_id, user_form_saved_note_id, user_form_screen_id,
-    user_form_use_saved_id,
+    BoxHandoffResolution, ChatPart, ChoiceCard, ComputerHandoffStatus, CoworkerPatch,
+    LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode,
+    UserFormFieldKind, choice_letter, computer_attention_done_id, computer_attention_id,
+    computer_attention_skip_id, computer_handoff_card_id, computer_handoff_done_id,
+    computer_handoff_skip_id, computer_handoff_takeover_id, computer_window_attention_done_id,
+    computer_window_attention_id, computer_window_attention_skip_id, save_login_card_id,
+    save_login_save_id, save_login_skip_id, user_form_card_id, user_form_continue_id,
+    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_clear_id,
+    user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
@@ -478,6 +478,18 @@ pub enum Command {
         id: String,
         notes: String,
     },
+    /// A choice picked on a choice card: see [`AppState::choose`].
+    Choose {
+        message_id: String,
+        field_index: usize,
+        option_index: usize,
+    },
+    ChoiceSubmit {
+        message_id: String,
+    },
+    ChoiceDismiss {
+        message_id: String,
+    },
     UserFormDismiss {
         card_key: String,
     },
@@ -677,6 +689,17 @@ impl Command {
             Self::OpenSiteLoginAdd => state.open_site_login_add(cx),
             Self::CloseSiteLoginAdd => state.close_site_login_add(cx),
             Self::SetSiteLoginNotes { id, notes } => state.update_site_login_notes(id, notes, cx),
+            Self::Choose {
+                message_id,
+                field_index,
+                option_index,
+            } => state.choose(message_id, field_index, option_index, cx),
+            Self::ChoiceSubmit { message_id } => {
+                if let Some(spec) = state.choice_spec(&message_id) {
+                    state.submit_form(message_id, spec, cx);
+                }
+            }
+            Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::UserFormDismiss { card_key } => {
                 state.dismiss_user_form(card_key, UserFormDismissMode::Dismissed, cx)
             }
@@ -769,6 +792,9 @@ pub struct ComposePlan {
     /// Put the caret in the composer before pressing anything. `false` means "whatever holds
     /// the caret now", which is how the panel's own search field is reached.
     pub focus_composer: bool,
+    /// Take the caret out of every field first, the way a click on a choice card does, so
+    /// the keys reach the window rather than a field's text. See [`NativeChatHost::key`].
+    pub release_caret: bool,
     /// GPUI keystroke tokens, in order: `a`, `space`, `enter`, `escape`, `up`, `cmd-a`.
     pub keys: Vec<String>,
 }
@@ -823,6 +849,7 @@ fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> 
     match target {
         ids::COMPOSER => Ok(ComposePlan {
             focus_composer: true,
+            release_caret: false,
             keys,
         }),
         // The protocol's own "the focused editable widget". It is how everything the composer
@@ -830,6 +857,7 @@ fn compose_plan(target: &str, keys: Vec<String>) -> Result<ComposePlan, String> 
         // that filter and pick a row are meant for that field rather than for the message.
         "" | "focused" => Ok(ComposePlan {
             focus_composer: false,
+            release_caret: false,
             keys,
         }),
         other => Err(not_editable(other)),
@@ -1266,6 +1294,144 @@ struct SiteLoginSnap {
     on_this_mac: bool,
     /// An authenticator-code seed is on this Mac: the pane shows a live code.
     has_code: bool,
+}
+
+/// A choice card in the open thread, as [`crate::components::gen_ui`] draws it.
+#[derive(Clone, Default)]
+struct ChoiceSnap {
+    message_id: String,
+    title: String,
+    /// `open`, `answered`, `not-answered` (the thread moved past it) or `dismissed`.
+    state: &'static str,
+    /// One question: a pick answers it, and its choices wear letters.
+    one_question: bool,
+    /// The newest open one-question card, which a letter key answers.
+    keyed: bool,
+    fields: Vec<ChoiceFieldSnap>,
+    /// What the answer said, `Label: choice` per line, once there is one.
+    answer: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct ChoiceFieldSnap {
+    label: String,
+    options: Vec<String>,
+    picked: Option<String>,
+}
+
+fn choice_card_id(message_id: &str) -> String {
+    format!("choice-{message_id}")
+}
+
+fn choice_option_id(message_id: &str, field_index: usize, option_index: usize) -> String {
+    format!("choice-{message_id}-{field_index}-{option_index}")
+}
+
+fn choice_dismiss_id(message_id: &str) -> String {
+    format!("choice-{message_id}-dismiss")
+}
+
+fn choice_submit_id(message_id: &str) -> String {
+    format!("choice-{message_id}-submit")
+}
+
+fn choice_snaps(state: &AppState) -> Vec<ChoiceSnap> {
+    let keyed = state.keyed_choice();
+    let mut snaps = Vec::new();
+    for message in state.active_thread_messages() {
+        let Some(spec) = message.parts.iter().rev().find_map(|part| match part {
+            ChatPart::Ui(crate::opengrok::UiSpec::Form(spec)) => Some(spec),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let card = state.choice_card(&message.id, spec);
+        let picks = state.form_picks.get(&message.id);
+        let (label, answer) = match &card {
+            ChoiceCard::Open => ("open", None),
+            ChoiceCard::Answered(answer) => ("answered", Some(answer)),
+            ChoiceCard::MovedOn => ("not-answered", None),
+            ChoiceCard::Dismissed => ("dismissed", None),
+        };
+        snaps.push(ChoiceSnap {
+            message_id: message.id.clone(),
+            title: spec
+                .title
+                .clone()
+                .or_else(|| spec.prompt.clone())
+                .unwrap_or_default(),
+            state: label,
+            one_question: spec.answers_on_pick(),
+            keyed: keyed.as_deref() == Some(message.id.as_str()),
+            fields: spec
+                .fields
+                .iter()
+                .map(|field| ChoiceFieldSnap {
+                    label: field.label.clone(),
+                    options: field.options.clone(),
+                    picked: picks.and_then(|picks| picks.get(&field.id)).cloned(),
+                })
+                .collect(),
+            answer: answer.map(|picks| {
+                let mut only = spec.clone();
+                only.title = None;
+                only.answer_text(picks)
+            }),
+        });
+    }
+    snaps
+}
+
+/// `choice-{messageId}` (value = its state; state `keyboard` on the card a letter answers),
+/// with `choice-{messageId}-{field}-{option}` per choice (value = its letter on a one-question
+/// card; state `selected` when picked), `choice-{messageId}-dismiss`, and on a card of several
+/// questions `choice-{messageId}-submit`, while it is open; `choice-{messageId}-answer` once
+/// answered.
+fn choice_node(choice: &ChoiceSnap) -> UiNode {
+    let id = choice_card_id(&choice.message_id);
+    let mut card = UiNode::dialog(id, choice.title.clone()).with_value(choice.state);
+    if choice.keyed {
+        card.states.push("keyboard".into());
+    }
+    if let Some(answer) = &choice.answer {
+        return card.with_child(UiNode::status(
+            format!("choice-{}-answer", choice.message_id),
+            answer.clone(),
+        ));
+    }
+    if choice.state != "open" {
+        return card;
+    }
+    for (field_index, field) in choice.fields.iter().enumerate() {
+        for (option_index, option) in field.options.iter().enumerate() {
+            let mut node = UiNode::button(
+                choice_option_id(&choice.message_id, field_index, option_index),
+                if choice.one_question {
+                    option.clone()
+                } else {
+                    format!("{}: {option}", field.label)
+                },
+            );
+            if let Some(letter) = choice
+                .one_question
+                .then(|| choice_letter(option_index))
+                .flatten()
+            {
+                node = node.with_value(letter.to_string());
+            }
+            if field.picked.as_deref() == Some(option.as_str()) {
+                node.states.push("selected".into());
+            }
+            card = card.with_child(node);
+        }
+    }
+    if !choice.one_question {
+        card = card.with_child(UiNode::button(choice_submit_id(&choice.message_id), "Send"));
+    }
+    card.with_child(UiNode::button(
+        choice_dismiss_id(&choice.message_id),
+        "Dismiss",
+    ))
 }
 
 fn user_form_node(form: &UserFormSnap) -> UiNode {
@@ -1824,6 +1990,8 @@ pub struct NativeChatHost {
     thumbs: Vec<String>,
     /// The picture overlay, while it is open.
     lightbox: Option<LightboxSnap>,
+    /// The choice cards in the open thread, oldest first.
+    choices: Vec<ChoiceSnap>,
     /// Idle user-form cards in the open thread.
     user_forms: Vec<UserFormSnap>,
     /// Open the screen → Grok Computer chrome (Take over / I'm done / Skip).
@@ -2163,6 +2331,7 @@ impl NativeChatHost {
                     .map(|shot| shot.caption.clone())
                     .unwrap_or_default(),
             }),
+            choices: choice_snaps(state),
             user_forms: state
                 .visible_user_forms()
                 .into_iter()
@@ -2543,6 +2712,9 @@ impl NativeChatHost {
                 card = card.with_child(UiNode::button(format!("{id}-never"), "Never"));
             }
             page = page.with_child(card);
+        }
+        for choice in &self.choices {
+            page = page.with_child(choice_node(choice));
         }
         for form in &self.user_forms {
             page = page.with_child(user_form_node(form));
@@ -3094,6 +3266,36 @@ impl NativeChatHost {
             page = page.with_child(detail);
         }
         page
+    }
+
+    fn choice_command(&self, target: &str) -> Option<Command> {
+        let choice = self.choices.iter().find(|choice| {
+            target
+                .strip_prefix(&choice_card_id(&choice.message_id))
+                .is_some_and(|rest| rest.starts_with('-'))
+        })?;
+        let message_id = choice.message_id.clone();
+        if choice.state != "open" {
+            return None;
+        }
+        if target == choice_dismiss_id(&message_id) {
+            return Some(Command::ChoiceDismiss { message_id });
+        }
+        if !choice.one_question && target == choice_submit_id(&message_id) {
+            return Some(Command::ChoiceSubmit { message_id });
+        }
+        for (field_index, field) in choice.fields.iter().enumerate() {
+            for option_index in 0..field.options.len() {
+                if target == choice_option_id(&message_id, field_index, option_index) {
+                    return Some(Command::Choose {
+                        message_id,
+                        field_index,
+                        option_index,
+                    });
+                }
+            }
+        }
+        None
     }
 
     fn user_form_command(&self, target: &str) -> Option<Command> {
@@ -3857,6 +4059,8 @@ impl NativeChatHost {
                  (`type composer /`, then `type \"\" <words>` to filter and `key \"\" Enter` \
                  to take the row)"
             ));
+        } else if let Some(cmd) = self.choice_command(target) {
+            cmd
         } else if let Some(cmd) = self.user_form_command(target) {
             cmd
         } else if let Some(cmd) = self.computer_handoff_command(target) {
@@ -4045,6 +4249,21 @@ impl NativeChatHost {
                     ));
                 }
             }
+        }
+        // A letter pressed at a choice card is the letter on its keycap. It goes to the window
+        // the way a person's does: the caret leaves the composer (a click on the card does
+        // that) and the key goes down the window's own path, where the root answers the newest
+        // open card. Pressed at an older card it answers nothing, which is the point.
+        if self
+            .choices
+            .iter()
+            .any(|choice| choice_card_id(&choice.message_id) == target)
+        {
+            return self.plan(ComposePlan {
+                focus_composer: false,
+                release_caret: true,
+                keys: vec![key_token(key)?],
+            });
         }
         let plan = compose_plan(target, Vec::new())?;
         self.plan(ComposePlan {
@@ -8062,5 +8281,77 @@ mod tests {
             "Not removed: could not remove the rule."
         );
         assert!(tree.find("settings-local-rule-error-allow-0").is_none());
+    }
+
+    fn open_choice(message_id: &str, keyed: bool) -> ChoiceSnap {
+        ChoiceSnap {
+            message_id: message_id.into(),
+            title: "How do you want to continue?".into(),
+            state: "open",
+            one_question: true,
+            keyed,
+            fields: vec![ChoiceFieldSnap {
+                label: "Next".into(),
+                options: vec!["Try again".into(), "Hand me the screen".into()],
+                picked: None,
+            }],
+            answer: None,
+        }
+    }
+
+    /// A choice card can be read, picked and put away from a snapshot, and a letter pressed at
+    /// it goes to the window with the caret out of the composer, the way a person's does.
+    #[test]
+    fn a_choice_card_is_on_the_tree_and_works_from_it() {
+        let mut host = host();
+        host.choices = vec![
+            ChoiceSnap {
+                state: "answered",
+                answer: Some("Next: Try again".into()),
+                ..open_choice("m_1", false)
+            },
+            open_choice("m_2", true),
+        ];
+        let tree = host.snapshot();
+        let card = tree.find("choice-m_2").unwrap();
+        assert_eq!(card.value.as_deref(), Some("open"));
+        assert!(card.states.iter().any(|state| state == "keyboard"));
+        assert_eq!(
+            tree.find("choice-m_2-0-1").unwrap().value.as_deref(),
+            Some("B")
+        );
+        assert!(tree.find("choice-m_2-dismiss").is_some());
+        assert!(
+            tree.find("choice-m_2-submit").is_none(),
+            "one question answers on the pick"
+        );
+        assert_eq!(
+            tree.find("choice-m_1-answer").unwrap().name,
+            "Next: Try again"
+        );
+        assert!(
+            tree.find("choice-m_1-0-0").is_none(),
+            "an answered card offers nothing"
+        );
+
+        host.click("choice-m_2-0-1").unwrap();
+        match host.take_command() {
+            Some(Command::Choose {
+                message_id,
+                field_index: 0,
+                option_index: 1,
+            }) => assert_eq!(message_id, "m_2"),
+            other => panic!("expected a pick, got {other:?}"),
+        }
+        host.click("choice-m_2-dismiss").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ChoiceDismiss { .. })
+        ));
+        assert!(host.click("choice-m_1-0-0").is_err());
+
+        let plan = keys(&mut host, Op::key("choice-m_2", "b"));
+        assert!(plan.release_caret && !plan.focus_composer);
+        assert_eq!(plan.keys, vec!["b"]);
     }
 }

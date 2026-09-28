@@ -76,6 +76,15 @@
 //! while the routine has no trigger, and the webhook's three only while it has one, so
 //! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
 //!
+//! Choice cards (the server's `form` tool) in the open thread: `choice-{messageId}` (value
+//! `open` / `answered` / `not-answered` / `dismissed`; state `keyboard` on the one card a letter
+//! answers). While open: `choice-{messageId}-{field}-{option}` (value = its keycap letter on a
+//! one-question card, where a click sends the answer; state `selected` when picked),
+//! `choice-{messageId}-dismiss`, and `choice-{messageId}-submit` on a card of several questions.
+//! Answered: `choice-{messageId}-answer` (label = what was sent, title aside). `key
+//! choice-{messageId} <letter>` takes the caret out of the composer and presses the letter at
+//! the window, the way a person does after clicking the card.
+//!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /
