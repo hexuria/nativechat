@@ -936,13 +936,6 @@ impl MessageInput {
     /// stronger reason: the chip is the only place the app says this message carries a skill. A
     /// draft that kept the skill after the word was deleted would be sending something with the
     /// message that nothing on screen mentions.
-    ///
-    /// One hole in that, older than skills and not closed here: a chip whose words wrap across a
-    /// line is painted with no fill at all (see [`Self::chip_fills`], which has no one rectangle
-    /// to put there), so a skill whose name straddles a wrap rides out with nothing drawn around
-    /// it. The word is still in the message and the chip is still a chip — it is the paint that
-    /// is missing, not the attachment — but the argument above is weaker there than everywhere
-    /// else, and it is the fill that would have to learn to be two rectangles.
     fn drop_skill_without_its_chip(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self
             .state
@@ -1170,22 +1163,41 @@ impl MessageInput {
             return Vec::new();
         }
         let input = self.input_state.read(cx);
-        let line_height = input.line_height();
+        let Some(line_height) = input.line_height() else {
+            return Vec::new();
+        };
+        // Offset 0 always begins a line, so where it sits is the left edge every line after a
+        // wrap starts from.
+        let Some(left) = input.range_to_bounds(&(0..0)).map(|b| b.origin.x) else {
+            return Vec::new();
+        };
+        let text = input.value();
         self.tokens
             .iter()
-            .filter_map(|token| {
-                let bounds = input.range_to_bounds(&token.range)?;
-                // A chip that wrapped onto a second line has no one rectangle to sit in; leave
-                // it plain rather than fill the whole box the two lines make between them.
-                let wrapped = line_height.is_some_and(|line| bounds.size.height > line * 1.5);
-                if wrapped || bounds.size.width <= px(0.) {
-                    return None;
-                }
-                // A little more than the glyphs, so the fill reads as a chip around the word.
-                Some(Bounds::new(
-                    bounds.origin - point(px(3.), px(1.)),
-                    bounds.size + size(px(6.), px(2.)),
-                ))
+            .flat_map(|token| {
+                // Where the caret would sit before each character of the chip and after its
+                // last one. The field has one rectangle for a range, which for a chip that wraps
+                // is the box both lines make between them; the caret positions say where each
+                // line of it actually is.
+                let carets: Vec<Point<Pixels>> = text
+                    .get(token.range.clone())
+                    .map(|word| {
+                        word.char_indices()
+                            .map(|(at, _)| token.range.start + at)
+                            .chain([token.range.end])
+                            .filter_map(|at| input.range_to_bounds(&(at..at)).map(|b| b.origin))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                chip_lines(&carets, left, line_height)
+                    .into_iter()
+                    // A little more than the glyphs, so the fill reads as a chip around the word.
+                    .map(|line| {
+                        Bounds::new(
+                            line.origin - point(px(3.), px(1.)),
+                            line.size + size(px(6.), px(2.)),
+                        )
+                    })
             })
             .collect()
     }
@@ -2413,15 +2425,124 @@ fn composer_bot_name(state: &AppState) -> String {
         .unwrap_or_else(|| "bot".into())
 }
 
+/// The rectangle a chip covers on each line it runs across, from the caret positions before each
+/// of its characters and after its last (`carets`, in order).
+///
+/// The text field places an offset that falls exactly on a soft wrap at the end of the line it
+/// wraps from, so a step down between two neighbouring carets is where the chip breaks: the line
+/// above ends at the earlier caret, and the next line begins at the field's left edge (`left`),
+/// which is where the character that wrapped is drawn. A chip on one line is one rectangle, as
+/// it always was; one that wraps is one per line, rather than none.
+fn chip_lines(carets: &[Point<Pixels>], left: Pixels, line_height: Pixels) -> Vec<Bounds<Pixels>> {
+    let Some(first) = carets.first() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let mut start = first.x;
+    let mut top = first.y;
+    let mut last = first.x;
+    for caret in &carets[1..] {
+        if caret.y > top + line_height * 0.5 {
+            lines.push((start, last, top));
+            start = left;
+            top = caret.y;
+        }
+        last = caret.x;
+    }
+    lines.push((start, last, top));
+    lines
+        .into_iter()
+        .filter(|(from, to, _)| to > from)
+        .map(|(from, to, top)| Bounds::new(point(from, top), size(to - from, line_height)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerToken, TokenKind, held_skill_chip, is_image, join_names, missing_note,
+        ComposerToken, TokenKind, chip_lines, held_skill_chip, is_image, join_names, missing_note,
         opens_on_pick, parameters_hint, remap_tokens, shift_tokens, skill_chip, starts_token,
     };
     use crate::opengrok::RecipeSummary;
     use crate::state::ActiveRecipe;
     use std::path::PathBuf;
+
+    fn caret(x: f32, y: f32) -> gpui_kit::Point<gpui_kit::Pixels> {
+        gpui_kit::point(gpui_kit::px(x), gpui_kit::px(y))
+    }
+
+    /// Each rectangle as (left, right, top), which is what the painting depends on.
+    fn spans(lines: Vec<gpui_kit::Bounds<gpui_kit::Pixels>>) -> Vec<(f32, f32, f32)> {
+        lines
+            .into_iter()
+            .map(|b| {
+                (
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.x + b.size.width),
+                    f32::from(b.origin.y),
+                )
+            })
+            .collect()
+    }
+
+    /// A chip on one line is one rectangle from its first caret to its last, as it always was.
+    #[test]
+    fn a_chip_on_one_line_is_one_rectangle() {
+        let carets = [
+            caret(40., 0.),
+            caret(48., 0.),
+            caret(56., 0.),
+            caret(64., 0.),
+        ];
+        let lines = chip_lines(&carets, gpui_kit::px(10.), gpui_kit::px(20.));
+        assert_eq!(spans(lines), vec![(40., 64., 0.)]);
+    }
+
+    /// A chip that wraps is drawn on every line it covers, not left plain (#40). The caret at the
+    /// wrap is reported at the end of the line it leaves, so the line above ends there and the
+    /// next one starts at the field's left edge, where the wrapped character is drawn.
+    #[test]
+    fn a_chip_that_wraps_is_drawn_on_every_line() {
+        let carets = [
+            caret(300., 0.),
+            caret(308., 0.),
+            caret(316., 0.), // the wrap: reported at the end of the first line
+            caret(18., 20.),
+            caret(26., 20.),
+        ];
+        let lines = chip_lines(&carets, gpui_kit::px(10.), gpui_kit::px(20.));
+        assert_eq!(spans(lines), vec![(300., 316., 0.), (10., 26., 20.)]);
+
+        let three = [
+            caret(300., 0.),
+            caret(316., 0.),
+            caret(400., 20.),
+            caret(416., 20.),
+            caret(30., 40.),
+        ];
+        assert_eq!(
+            spans(chip_lines(&three, gpui_kit::px(10.), gpui_kit::px(20.))),
+            vec![(300., 316., 0.), (10., 416., 20.), (10., 30., 40.)],
+            "a chip across three lines is three rectangles, the middle one the whole line it fills"
+        );
+    }
+
+    /// Nothing to draw is nothing drawn: no carets (the field has not laid the text out yet),
+    /// or a line where the chip has no width.
+    #[test]
+    fn a_chip_with_nothing_laid_out_draws_nothing() {
+        assert!(chip_lines(&[], gpui_kit::px(10.), gpui_kit::px(20.)).is_empty());
+        let at_the_wrap = [caret(316., 0.), caret(18., 20.)];
+        assert_eq!(
+            spans(chip_lines(
+                &at_the_wrap,
+                gpui_kit::px(10.),
+                gpui_kit::px(20.)
+            )),
+            vec![(10., 18., 20.)],
+            "a chip that starts right at the wrap has no width on the line above"
+        );
+    }
 
     /// A chip for a skill, where the words sit in the message.
     fn chip(id: &str, text: &str, at: usize) -> ComposerToken {
