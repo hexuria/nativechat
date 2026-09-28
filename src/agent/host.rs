@@ -3269,29 +3269,25 @@ impl NativeChatHost {
     }
 
     fn choice_command(&self, target: &str) -> Option<Command> {
-        let choice = self.choices.iter().find(|choice| {
-            target
-                .strip_prefix(&choice_card_id(&choice.message_id))
-                .is_some_and(|rest| rest.starts_with('-'))
-        })?;
-        let message_id = choice.message_id.clone();
-        if choice.state != "open" {
-            return None;
-        }
-        if target == choice_dismiss_id(&message_id) {
-            return Some(Command::ChoiceDismiss { message_id });
-        }
-        if !choice.one_question && target == choice_submit_id(&message_id) {
-            return Some(Command::ChoiceSubmit { message_id });
-        }
-        for (field_index, field) in choice.fields.iter().enumerate() {
-            for option_index in 0..field.options.len() {
-                if target == choice_option_id(&message_id, field_index, option_index) {
-                    return Some(Command::Choose {
-                        message_id,
-                        field_index,
-                        option_index,
-                    });
+        // Every id is compared whole. A message id may carry dashes, so matching the card by
+        // its prefix could take `choice-m` for the card of `choice-m-1-0-0` and lose the click.
+        for choice in self.choices.iter().filter(|choice| choice.state == "open") {
+            let message_id = choice.message_id.clone();
+            if target == choice_dismiss_id(&message_id) {
+                return Some(Command::ChoiceDismiss { message_id });
+            }
+            if !choice.one_question && target == choice_submit_id(&message_id) {
+                return Some(Command::ChoiceSubmit { message_id });
+            }
+            for (field_index, field) in choice.fields.iter().enumerate() {
+                for option_index in 0..field.options.len() {
+                    if target == choice_option_id(&message_id, field_index, option_index) {
+                        return Some(Command::Choose {
+                            message_id,
+                            field_index,
+                            option_index,
+                        });
+                    }
                 }
             }
         }
@@ -8350,7 +8346,20 @@ mod tests {
         ));
         assert!(host.click("choice-m_1-0-0").is_err());
 
-        let plan = keys(&mut host, Op::key("choice-m_2", "b"));
+        // One message id may be another's with a dash and more after it; each card's
+        // choices still answer to their own card.
+        host.choices = vec![open_choice("m", false), open_choice("m-1", true)];
+        host.click("choice-m-1-0-0").unwrap();
+        match host.take_command() {
+            Some(Command::Choose {
+                message_id,
+                option_index: 0,
+                ..
+            }) => assert_eq!(message_id, "m-1"),
+            other => panic!("expected m-1's pick, got {other:?}"),
+        }
+
+        let plan = keys(&mut host, Op::key("choice-m-1", "b"));
         assert!(plan.release_caret && !plan.focus_composer);
         assert_eq!(plan.keys, vec!["b"]);
     }

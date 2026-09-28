@@ -771,7 +771,7 @@ fn keycap(letter: char, live: bool, cx: &App) -> impl IntoElement {
         .border_color(theme.border)
         .bg(theme.secondary)
         .text_color(if live {
-            theme.foreground
+            theme.secondary_foreground
         } else {
             theme.muted_foreground
         })
