@@ -67,10 +67,14 @@ pub struct OpenGrokError {
     /// What kind of failure this is. Private so the invariant holds — a failure is exactly one
     /// of the three, never two of them at once.
     failure: Failure,
-    /// The `pending-user-message` CUSTOM a pending-route refusal carried.
-    pending_event: Option<serde_json::Value>,
+    /// The `pending-user-message` CUSTOM a pending-route refusal carried. Boxed, because only the
+    /// queue's refusals carry one, and every other failure passed up through a `Result` would
+    /// otherwise carry room for a whole JSON value too.
+    pending_event: Option<Box<serde_json::Value>>,
     /// A run route's `503` carried `historyMissed`: see [`Self::history_missed`].
     history_missed: bool,
+    /// The server's code word for the refusal, when its body named one: see [`Self::code`].
+    code: Option<String>,
 }
 
 impl OpenGrokError {
@@ -81,6 +85,7 @@ impl OpenGrokError {
             failure: Failure::Verdict,
             pending_event: None,
             history_missed: false,
+            code: None,
         }
     }
 
@@ -91,6 +96,7 @@ impl OpenGrokError {
             failure: Failure::Verdict,
             pending_event: None,
             history_missed: false,
+            code: None,
         }
     }
 
@@ -107,6 +113,7 @@ impl OpenGrokError {
             failure: Failure::SignedOut,
             pending_event: None,
             history_missed: false,
+            code: None,
         }
     }
 
@@ -129,10 +136,14 @@ impl OpenGrokError {
             },
             pending_event: None,
             history_missed: false,
+            code: None,
         }
     }
 
-    /// Something the server said, read for whether it is saying the gateway is out of reach.
+    /// Something said in answer, with nothing to say who wrote it: read for whether it is the
+    /// server saying the gateway is out of reach, and a `502`–`504` as something in front of the
+    /// server that could not reach it. A refusal whose body shows the server wrote it is
+    /// [`Self::from_opengrok`].
     pub fn from_server(status: Option<u16>, message: impl Into<String>) -> Self {
         let message = message.into();
         let failure = if reads_as_gateway_unreachable(&message) {
@@ -151,6 +162,30 @@ impl OpenGrokError {
             failure,
             pending_event: None,
             history_missed: false,
+            code: None,
+        }
+    }
+
+    /// A refusal OpenGrok wrote itself, as its body shows (`written_by_opengrok`). Whatever its
+    /// status it is a verdict about the request, not the server out of reach: the server is what
+    /// answered. So a `502` or a `503` it writes about a box that is down or a store that refused
+    /// says what happened, and is not offered again as if the wire had dropped, which is what
+    /// reading its status alone did. Only its own words for the gateway being out of reach
+    /// ([`reads_as_gateway_unreachable`]) still read as a machine out of reach.
+    pub fn from_opengrok(status: u16, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let failure = if reads_as_gateway_unreachable(&message) {
+            Failure::OutOfReach(Unreachable::Gateway)
+        } else {
+            Failure::Verdict
+        };
+        Self {
+            status: Some(status),
+            message,
+            failure,
+            pending_event: None,
+            history_missed: false,
+            code: None,
         }
     }
 
@@ -187,25 +222,43 @@ impl OpenGrokError {
         self.status == Some(404)
     }
 
+    /// The server's code word for this refusal: the body's `code`, or its `error` when that is a
+    /// bare code word (`already-consumed`, `stale-pending-message`). It is what a caller branches
+    /// on. The person is shown [`Self::message`], which is the sentence the server wrote beside
+    /// the code when it wrote one, so the two are not the same string.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
+    pub(super) fn with_code(mut self, code: Option<String>) -> Self {
+        self.code = code;
+        self
+    }
+
     /// `POST /ag-ui` (or a retry enqueue) for a follow-up that already became a run.
     pub fn is_already_consumed(&self) -> bool {
-        self.status == Some(409) && self.message == "already-consumed"
+        self.status == Some(409) && self.code() == Some("already-consumed")
     }
 
     /// `POST /ag-ui` named a pending id that was canceled (or never heard of).
     pub fn is_not_pending(&self) -> bool {
-        self.status == Some(409) && self.message == "not-pending"
+        self.status == Some(409) && self.code() == Some("not-pending")
     }
 
     /// `POST /ag-ui` fired a queued send that no longer matches its row. The row is left
-    /// queued, and [`Self::pending_custom`] is the row as it stands now.
+    /// queued, and [`Self::pending_custom`] is the row as it stands now. Read off the code: the
+    /// body's sentence ("This queued message changed. Refresh it before sending again.") is what
+    /// the person is shown.
     pub fn is_stale_pending(&self) -> bool {
-        self.status == Some(409) && self.message == "stale-pending-message"
+        self.status == Some(409) && self.code() == Some("stale-pending-message")
     }
 
     /// `POST /pending` lost the race the server describes as "another writer got there
     /// first; retry". The insert collided and the winning row was gone before it could be
     /// read, so the same POST is worth one more try. Any other 409 is a decision.
+    ///
+    /// Read off the sentence, because that is all this refusal carries: the server answers it
+    /// as plain text (opengrok-server `agui/pending.rs` `create`), with no code beside it.
     pub fn is_enqueue_conflict(&self) -> bool {
         self.status == Some(409) && self.message == "another writer got there first; retry"
     }
@@ -213,12 +266,12 @@ impl OpenGrokError {
     /// The `pending-user-message` CUSTOM a pending refusal carried.
     pub fn pending_custom(&self) -> Option<PendingCustom> {
         self.pending_event
-            .as_ref()
+            .as_deref()
             .and_then(PendingCustom::from_agui)
     }
 
     pub(super) fn with_pending_event(mut self, event: Option<serde_json::Value>) -> Self {
-        self.pending_event = event;
+        self.pending_event = event.map(Box::new);
         self
     }
 
@@ -304,6 +357,22 @@ mod tests {
         assert_eq!(in_front.unreachable(), Some(Unreachable::Server));
     }
 
+    /// A 502 or 503 the server wrote is its verdict, and only one from something in front of it
+    /// (read with nothing to say who wrote it) is the server out of reach.
+    #[test]
+    fn a_five_hundred_the_server_wrote_is_a_verdict_and_not_the_server_out_of_reach() {
+        let down = OpenGrokError::from_opengrok(502, "the box is unreachable: the box is down");
+        assert_eq!(down.failure(), Failure::Verdict);
+        assert_eq!(down.unreachable(), None);
+        let refused = OpenGrokError::from_opengrok(503, "the recipe was not kept");
+        assert_eq!(refused.failure(), Failure::Verdict);
+        let gateway =
+            OpenGrokError::from_opengrok(502, "the model gateway is unreachable: refused");
+        assert_eq!(gateway.unreachable(), Some(Unreachable::Gateway));
+        let in_front = OpenGrokError::from_server(Some(502), "<html>502 Bad Gateway</html>");
+        assert_eq!(in_front.unreachable(), Some(Unreachable::Server));
+    }
+
     #[test]
     fn the_models_note_reads_as_the_gateway_being_down() {
         assert!(reads_as_gateway_unreachable(
@@ -354,16 +423,36 @@ mod tests {
         assert_eq!(refused.unreachable(), None);
     }
 
+    /// A 409 from the queue, as the client reads one off its body: the sentence to show, and
+    /// the code apart from it.
+    fn coded(code: &str, message: &str) -> OpenGrokError {
+        OpenGrokError::from_server(Some(409), message).with_code(Some(code.to_string()))
+    }
+
     #[test]
     fn a_pending_conflict_is_a_verdict_about_that_id() {
-        let consumed = OpenGrokError::from_server(Some(409), "already-consumed");
+        let consumed = coded("already-consumed", "already-consumed");
         assert!(consumed.is_already_consumed());
         assert!(!consumed.is_not_pending());
         assert_eq!(consumed.failure(), Failure::Verdict);
 
-        let canceled = OpenGrokError::from_server(Some(409), "not-pending");
+        let canceled = coded("not-pending", "not-pending");
         assert!(canceled.is_not_pending());
         assert!(!canceled.is_already_consumed());
+
+        // The queue's words are read off the code and never off the sentence the person is
+        // shown, which for a stale send is the server's own sentence and not the word.
+        let stale = coded(
+            "stale-pending-message",
+            "This queued message changed. Refresh it before sending again.",
+        );
+        assert!(stale.is_stale_pending());
+        assert!(!stale.is_already_consumed() && !stale.is_not_pending());
+        let worded = OpenGrokError::from_server(Some(409), "stale-pending-message");
+        assert!(
+            !worded.is_stale_pending(),
+            "a sentence that happens to be the word names no code"
+        );
 
         let missing = OpenGrokError::from_server(Some(404), "no such thread");
         assert!(missing.is_not_found());

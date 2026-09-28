@@ -45,12 +45,6 @@ pub struct ProfileUpdate {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ErrorBody {
-    #[serde(default)]
-    error: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Coworker {
@@ -311,12 +305,64 @@ pub fn assistant_text_from_sse(body: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// What a refusal's JSON body says: the sentence the person is shown, and the server's code word
+/// for the refusal, which is what a caller branches on. Either may be missing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RefusalWords {
+    pub(crate) sentence: Option<String>,
+    pub(crate) code: Option<String>,
+}
+
+/// Reads both of a refusal's fields, by the rule opengrok-server writes them to (its
+/// error-bodies change):
+///
+/// - with a `code`, the code is `code` and the sentence is `error`: `{"error": "this run id
+///   already has a run; a new turn needs a new run id", "code": "run-exists"}`;
+/// - without one, a bare code word under `error` with a `message` beside it is the code, and the
+///   `message` is the sentence: the queue's 409s, which keep that shape (`agui/pending.rs`
+///   `stale-pending-message`);
+/// - otherwise `error` is the sentence, and there is no code.
+///
+/// One case the rule leaves open is read so the queue still works: a bare code word with nothing
+/// beside it (the queue's `already-consumed` and `not-pending`, which carry no `message`) is kept
+/// as the code, and is all there is to show. A body with nothing under `error` gives no sentence,
+/// and is shown as its own text. Shown `run-exists`, a person is shown the server's name for the
+/// problem rather than the problem, which is why the sentence is read wherever it sits.
+pub(crate) fn refusal_words(body: &serde_json::Value) -> RefusalWords {
+    let field = |key: &str| {
+        body.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let error = field("error");
+    let message = field("message");
+    if let Some(code) = field("code") {
+        return RefusalWords {
+            sentence: error.or(message).map(str::to_string),
+            code: Some(code.to_string()),
+        };
+    }
+    match error {
+        Some(code) if is_error_code(code) => RefusalWords {
+            sentence: Some(message.unwrap_or(code).to_string()),
+            code: Some(code.to_string()),
+        },
+        error => RefusalWords {
+            sentence: error.map(str::to_string),
+            code: None,
+        },
+    }
+}
+
+/// What a refusal says to the person: the sentence of a JSON body ([`refusal_words`]), or a text
+/// body's own text.
 pub fn error_message_from_body(body: &str) -> String {
-    if let Ok(parsed) = serde_json::from_str::<ErrorBody>(body)
-        && let Some(error) = parsed.error
-        && !error.is_empty()
+    if let Some(sentence) = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| refusal_words(&body).sentence)
     {
-        return error;
+        return sentence;
     }
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -324,6 +370,37 @@ pub fn error_message_from_body(body: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// The server's code word for a refusal, when its body names one ([`refusal_words`]).
+pub(crate) fn error_code_from_body(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| refusal_words(&body).code)
+}
+
+/// Whether OpenGrok wrote this refusal itself, which it says by its shape: a JSON object with its
+/// sentence under `error`. Nothing standing in front of the server writes that (a proxy answers
+/// with its own page, or with nothing), so it is how a `502` the server wrote about a box that is
+/// down is told from a `502` that means the server itself could not be reached.
+pub(crate) fn written_by_opengrok(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|body| {
+            body.get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(|error| !error.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// A code word rather than a sentence: one lowercase token of letters and digits joined by `-`
+/// or `_`, with no spaces (`run-exists`, `stale-pending-message`, `shared-computer`).
+fn is_error_code(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_lowercase())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 #[cfg(test)]
@@ -450,5 +527,89 @@ mod tests {
         assert_eq!(json["replyTo"]["messageId"], "m1");
         assert_eq!(json["replyTo"]["preview"], "The build is green.");
         assert_eq!(json["replyTo"]["isMe"], false);
+    }
+
+    /// A refusal with a code and a sentence is shown as the sentence, with the code kept apart,
+    /// in the shape the server sends today (the code under `error`, the sentence under `message`,
+    /// as `fixtures/wire/rest/POST__ag-ui/409-…` records it) and in the one it is moving to (the
+    /// sentence under `error`, the code under `code`). `run-exists` used to reach the person as
+    /// it was.
+    #[test]
+    fn a_code_beside_a_sentence_is_shown_as_the_sentence() {
+        let said = "this run id already has a run; a new turn needs a new run id";
+        let taken = r#"{"error": "run-exists", "message": "this run id already has a run; a new turn needs a new run id"}"#;
+        let moved = r#"{"error": "this run id already has a run; a new turn needs a new run id", "code": "run-exists"}"#;
+        for body in [taken, moved] {
+            assert_eq!(error_message_from_body(body), said, "{body}");
+            assert_eq!(
+                error_code_from_body(body).as_deref(),
+                Some("run-exists"),
+                "{body}"
+            );
+            assert!(written_by_opengrok(body), "{body}");
+        }
+
+        let stale = r#"{"v": 1, "error": "stale-pending-message", "id": "pum_1", "message": "This queued message changed. Refresh it before sending again."}"#;
+        assert_eq!(
+            error_message_from_body(stale),
+            "This queued message changed. Refresh it before sending again."
+        );
+        assert_eq!(
+            error_code_from_body(stale).as_deref(),
+            Some("stale-pending-message")
+        );
+
+        // A code with no sentence beside it is all the body says.
+        let consumed = r#"{"v": 1, "error": "already-consumed", "id": "pum_1"}"#;
+        assert_eq!(error_message_from_body(consumed), "already-consumed");
+        assert_eq!(
+            error_code_from_body(consumed).as_deref(),
+            Some("already-consumed")
+        );
+        for alone in [
+            r#"{"error": "run-exists", "message": ""}"#,
+            r#"{"error": "run-exists", "message": "   "}"#,
+            r#"{"error": "run-exists", "message": 7}"#,
+        ] {
+            assert_eq!(error_message_from_body(alone), "run-exists", "{alone}");
+        }
+
+        // A sentence under `error` is the sentence, whatever else the body carries, and names no
+        // code.
+        let sentence = r#"{"error": "form entry missing", "message": "something else"}"#;
+        assert_eq!(error_message_from_body(sentence), "form entry missing");
+        assert_eq!(error_code_from_body(sentence), None);
+        let capital = r#"{"error": "Wrong email or password."}"#;
+        assert_eq!(error_message_from_body(capital), "Wrong email or password.");
+        assert_eq!(error_code_from_body(capital), None);
+
+        // Whatever sits under `message` beside a bare code is its sentence.
+        assert_eq!(
+            error_message_from_body(r#"{"error": "run-exists", "message": "retry"}"#),
+            "retry"
+        );
+        // Nothing under `error` is nothing the rule reads: the body is its own text, and
+        // nothing says OpenGrok wrote it, which is a proxy's shape as much as the server's.
+        let bare = r#"{"message": "Internal server error"}"#;
+        assert_eq!(error_message_from_body(bare), bare);
+        assert_eq!(error_code_from_body(bare), None);
+        assert!(!written_by_opengrok(bare));
+        let coded = r#"{"code": "run-exists"}"#;
+        assert_eq!(error_message_from_body(coded), coded);
+        assert_eq!(error_code_from_body(coded).as_deref(), Some("run-exists"));
+
+        // A body that is not JSON, or has no string to say, is its own text.
+        assert_eq!(error_message_from_body("  no such run \n"), "no such run");
+        assert_eq!(error_code_from_body("no-such-run"), None);
+        assert!(!written_by_opengrok("the box is unreachable"));
+        assert!(!written_by_opengrok(
+            "<html><body>502 Bad Gateway</body></html>"
+        ));
+        assert!(!written_by_opengrok(""));
+        assert_eq!(
+            error_message_from_body(r#"{"error": {"message": "nested"}}"#),
+            r#"{"error": {"message": "nested"}}"#
+        );
+        assert_eq!(error_message_from_body(""), "request failed");
     }
 }

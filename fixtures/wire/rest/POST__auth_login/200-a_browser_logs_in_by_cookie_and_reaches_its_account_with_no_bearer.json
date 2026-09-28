@@ -3,6 +3,6 @@
   "path": "/auth/login",
   "status": 200,
   "body": {
-    "email": "cookie-0199bb4e000070008000000000001101@og.local"
+    "email": "cookie-0199bb4e000070008000000000000001@og.local"
   }
 }

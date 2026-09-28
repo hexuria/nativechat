@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::error::{OpenGrokError, reads_as_gateway_unreachable};
+use super::error::OpenGrokError;
 use super::pending::{
     PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
 };
 use super::types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate, ThreadListing,
-    error_message_from_body,
+    error_code_from_body, error_message_from_body, written_by_opengrok,
 };
 use crate::private_file::write_private;
 use crate::threads::conversation_for_thread;
@@ -394,24 +394,49 @@ impl OpenGrokClient {
     /// the route, both of which the caller already knows.
     async fn signed_out_error(response: reqwest::Response) -> OpenGrokError {
         let body = response.text().await.unwrap_or_default();
-        let message = error_message_from_body(&body);
-        if message.trim().is_empty() {
+        Self::signed_out_refusal(&body)
+    }
+
+    /// [`Self::signed_out_error`] on a body already read, for the wire conformance tests.
+    pub(super) fn signed_out_refusal(body: &str) -> OpenGrokError {
+        let message = error_message_from_body(body);
+        let error = if message.trim().is_empty() {
             OpenGrokError::signed_out(SIGNED_OUT_MESSAGE)
         } else {
             OpenGrokError::signed_out(message)
-        }
+        };
+        error.with_code(error_code_from_body(body))
     }
 
     async fn read_error(response: reqwest::Response) -> OpenGrokError {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        // `from_server` rather than `status`, because some of what the server refuses with is
-        // not a refusal at all: "the gateway could not be reached" is the server reporting a
-        // machine it could not get to, which is a state and not a verdict about the request.
-        let event = serde_json::from_str::<Value>(&body)
+        Self::refusal(status, &body)
+    }
+
+    /// [`Self::read_error`] on a status and a body already read. Apart from the response so the
+    /// wire conformance tests read a recorded refusal with this very code.
+    ///
+    /// The person is shown the server's sentence and a caller branches on its code word, which
+    /// are kept apart: see [`error_message_from_body`] and [`OpenGrokError::code`]. What kind of
+    /// failure it is comes from who wrote it, which the body says and the status does not: a
+    /// `502` or a `503` the server wrote itself is its verdict, and only one nothing says the
+    /// server wrote is something in front of it that could not reach it.
+    pub(super) fn refusal(status: u16, body: &str) -> OpenGrokError {
+        let event = serde_json::from_str::<Value>(body)
             .ok()
             .and_then(|body| body.get("event").cloned());
-        OpenGrokError::from_server(Some(status), error_message_from_body(&body))
+        let message = error_message_from_body(body);
+        // Neither reading takes a refusal at its word alone: "the gateway could not be reached"
+        // is the server reporting a machine it could not get to, which is a state and not a
+        // verdict about the request.
+        let error = if written_by_opengrok(body) {
+            OpenGrokError::from_opengrok(status, message)
+        } else {
+            OpenGrokError::from_server(Some(status), message)
+        };
+        error
+            .with_code(error_code_from_body(body))
             .with_pending_event(event)
     }
 
@@ -805,10 +830,18 @@ impl OpenGrokClient {
         let response = self
             .send_json::<()>(reqwest::Method::DELETE, &path, None)
             .await?;
-        if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+        if Self::gone_after_delete(response.status().as_u16()) {
             return Ok(());
         }
         Err(Self::read_error(response).await)
+    }
+
+    /// Whether a delete that answered `status` left the coworker gone. A coworker the server no
+    /// longer has is as gone as one it has just deleted (a second click, or another machine that
+    /// got there first), so a 404 is done and not an error to show. Apart from the response so
+    /// the wire conformance tests read a recorded answer with this very rule.
+    pub(super) fn gone_after_delete(status: u16) -> bool {
+        (200..300).contains(&status) || status == StatusCode::NOT_FOUND.as_u16()
     }
 
     pub async fn patch_coworker(
@@ -1061,10 +1094,7 @@ impl OpenGrokClient {
             return Ok(super::user_form::user_form_action_from_http(status, &value));
         }
         if !(200..300).contains(&status) {
-            return Err(OpenGrokError::from_server(
-                Some(status),
-                error_message_from_body(&text),
-            ));
+            return Err(Self::refusal(status, &text));
         }
         Ok(super::user_form::user_form_action_from_http(status, &value))
     }
@@ -1088,10 +1118,7 @@ impl OpenGrokClient {
             ));
         }
         if !(200..300).contains(&status) {
-            return Err(OpenGrokError::from_server(
-                Some(status),
-                error_message_from_body(&text),
-            ));
+            return Err(Self::refusal(status, &text));
         }
         Ok(super::user_form::box_handoff_action_from_http(
             status, &value,
@@ -1696,13 +1723,18 @@ impl OpenGrokClient {
     async fn run_error(response: reqwest::Response) -> OpenGrokError {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        let missed = serde_json::from_str::<Value>(&body)
+        Self::run_refusal(status, &body)
+    }
+
+    /// [`Self::run_error`] on a status and a body already read, for the wire conformance tests.
+    pub(super) fn run_refusal(status: u16, body: &str) -> OpenGrokError {
+        let missed = serde_json::from_str::<Value>(body)
             .ok()
             .and_then(|body| Some(body.get("historyMissed")?.as_str()?.trim().to_string()))
             .filter(|missed| !missed.is_empty());
         match missed {
             Some(missed) => OpenGrokError::status(status, missed).with_history_missed(),
-            None => OpenGrokError::from_server(Some(status), error_message_from_body(&body)),
+            None => Self::refusal(status, body),
         }
     }
 
@@ -1865,11 +1897,15 @@ impl OpenGrokClient {
     async fn tape_error(response: reqwest::Response) -> OpenGrokError {
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
-        let message = error_message_from_body(&body);
-        if reads_as_gateway_unreachable(&message) {
-            return OpenGrokError::from_server(Some(status), message);
-        }
-        OpenGrokError::status(status, message)
+        Self::tape_refusal(status, &body)
+    }
+
+    /// [`Self::tape_error`] on a status and a body already read, for the wire conformance tests.
+    /// Every answer from this route is read as the server's own, whatever its shape, for the
+    /// reason above.
+    pub(super) fn tape_refusal(status: u16, body: &str) -> OpenGrokError {
+        OpenGrokError::from_opengrok(status, error_message_from_body(body))
+            .with_code(error_code_from_body(body))
     }
 
     pub async fn skill(&self, id: &str) -> Result<SkillDetail, OpenGrokError> {
@@ -2376,10 +2412,12 @@ impl QueuedApproval {
     }
 }
 
+/// `GET /local-exec/daemon`: the machines sit under `machines`. `pub(super)` for the wire
+/// conformance tests.
 #[derive(Debug, Clone, Deserialize)]
-struct DaemonList {
+pub(super) struct DaemonList {
     #[serde(default)]
-    machines: Vec<DaemonMachine>,
+    pub(super) machines: Vec<DaemonMachine>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3418,9 +3456,9 @@ pub struct TurnRecipe {
 }
 
 /// One version of a recipe: the tape (v1), the steps the server filtered from it (v2), or
-/// steps a person edited.
+/// steps a person edited; or, on a workflow's row, the decision tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "WireRecipeVersion")]
 pub struct RecipeVersion {
     pub version: u32,
     /// `raw`, `filtered` or `edited`.
@@ -3497,6 +3535,8 @@ pub struct RecipeVersionBody {
     pub tape: Vec<RecipeTapeEvent>,
     #[serde(default)]
     pub truncated: bool,
+    /// The steps a taught or edited version plays, in order. A workflow's version has none: its
+    /// `steps` are the decision tree, which this app does not read (see `WireRecipeVersion`).
     #[serde(default)]
     pub steps: Vec<RecipeStep>,
     /// The version's declaration, when the server writes it inside the body rather than beside
@@ -3507,6 +3547,71 @@ pub struct RecipeVersionBody {
     pub stop_on_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<Value>,
+}
+
+/// The kind of version that is a workflow's decision tree (opengrok-tools `workflow.rs` `KIND`).
+const WORKFLOW_VERSION: &str = "workflow";
+
+/// A recipe version as the wire carries it, before its body is read by what kind of version it
+/// is.
+///
+/// A workflow is a recipe row too, and its version's body is the tree the server walks: `steps`
+/// there is an object of named branches (`{"look": {"do": "observe", …}, …}`, opengrok-tools
+/// `workflow.rs`, sent as stored by opengrok-server `recipes.rs` `detail_body`), not a sequence
+/// to play. Read as a sequence it failed the whole of `GET /recipes/{id}`, and with it the
+/// recipe's history, its grants and every answer that carries the detail, over a tree this app
+/// draws nowhere. So a workflow's version is read without its tree, and it has no tape steps.
+/// Any other version's steps are a tape and are read strictly, whatever shape they come in: an
+/// object there, or a step this client cannot read, is a tape it would show and play wrong.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRecipeVersion {
+    version: u32,
+    #[serde(default, deserialize_with = "null_as_default")]
+    kind: String,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    created_by: Option<String>,
+    #[serde(default)]
+    created_at_ms: i64,
+    #[serde(default)]
+    parameters: Vec<RecipeParameter>,
+    #[serde(default)]
+    body: Value,
+}
+
+impl TryFrom<WireRecipeVersion> for RecipeVersion {
+    type Error = String;
+
+    fn try_from(wire: WireRecipeVersion) -> Result<Self, Self::Error> {
+        let mut body = wire.body;
+        if wire.kind == WORKFLOW_VERSION
+            && let Some(fields) = body.as_object_mut()
+            && fields.get("steps").is_some_and(Value::is_object)
+        {
+            fields.remove("steps");
+        }
+        let body = if body.is_null() {
+            RecipeVersionBody::default()
+        } else {
+            serde_json::from_value(body).map_err(|error| {
+                format!(
+                    "version {} ({}) has a body this app cannot read: {error}",
+                    wire.version, wire.kind
+                )
+            })?
+        };
+        Ok(Self {
+            version: wire.version,
+            kind: wire.kind,
+            note: wire.note,
+            created_by: wire.created_by,
+            created_at_ms: wire.created_at_ms,
+            parameters: wire.parameters,
+            body,
+        })
+    }
 }
 
 /// What a raw version carries under `events`: how many events were taped, or the tape itself.
@@ -4815,18 +4920,38 @@ mod tests {
         assert_eq!(body["messages"][0]["id"], "msg_1");
     }
 
-    /// OpenGrok's 409 for a queued send whose row changed carries the row as it stands now.
+    /// OpenGrok's 409 for a queued send whose row changed carries the row as it stands now. The
+    /// queue knows it by its code, and the person is told the server's sentence: in the shape the
+    /// server keeps for the queue's refusals (the code under `error`, the sentence under
+    /// `message`), and in the one it writes every other code in (the sentence under `error`, the
+    /// code under `code`), so the queue does not hang on which of the two it is sent.
     #[tokio::test]
     async fn a_stale_queued_turn_keeps_the_row_the_server_answered_with() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/ag-ui"))
-            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+        let said = "This queued message changed. Refresh it before sending again.";
+        for (error, words) in [
+            ("stale-pending-message", json!({ "message": said })),
+            (said, json!({ "code": "stale-pending-message" })),
+        ] {
+            let error = stale_turn(error, words).await;
+            assert!(error.is_stale_pending(), "{error:?}");
+            assert_eq!(error.code(), Some("stale-pending-message"));
+            assert_eq!(error.message, said);
+            let custom = error.pending_custom().expect("the row as it stands");
+            assert_eq!(custom.op, crate::opengrok::PendingOp::Edited);
+            assert_eq!(
+                custom.message.map(|row| row.content).as_deref(),
+                Some("the laptop's words")
+            );
+        }
+    }
+
+    /// A turn refused as stale, with `error` and the rest of `words` as the body's other fields.
+    async fn stale_turn(error: &str, words: Value) -> OpenGrokError {
+        let mut body = json!({
                 "v": 1,
-                "error": "stale-pending-message",
+                "error": error,
                 "id": "pum_1",
                 "runId": null,
-                "message": "This queued message changed. Refresh it before sending again.",
                 "event": {
                     "type": "CUSTOM",
                     "timestamp": 1710000000000i64,
@@ -4845,12 +4970,19 @@ mod tests {
                         },
                     },
                 },
-            })))
+        });
+        if let (Some(body), Some(words)) = (body.as_object_mut(), words.as_object()) {
+            body.extend(words.clone());
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(body))
             .mount(&server)
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
-        let error = client
+        client
             .run_turn(
                 "cw_1",
                 "th_1",
@@ -4862,14 +4994,101 @@ mod tests {
                 |_| {},
             )
             .await
-            .expect_err("refused");
-        assert!(error.is_stale_pending());
-        let custom = error.pending_custom().expect("the row as it stands");
-        assert_eq!(custom.op, crate::opengrok::PendingOp::Edited);
+            .expect_err("refused")
+    }
+
+    /// A turn sent under a run id that already has a run is refused with a code and a sentence
+    /// beside it: `{"error": sentence, "code": "run-exists"}` from opengrok-server's error-bodies
+    /// change on, and the code under `error` with the sentence under `message` before it
+    /// (`agui/routes.rs` `run_taken`, as `fixtures/wire/rest/POST__ag-ui/409-another_account_cannot_take_a_run_by_its_id`
+    /// records it). The person used to be shown the code, `run-exists`; in either shape they are
+    /// shown the sentence, and the code is kept for a caller, and read as none of the queue's
+    /// words.
+    #[tokio::test]
+    async fn a_refusal_with_a_code_and_a_sentence_shows_the_sentence() {
+        let said = "this run id already has a run; a new turn needs a new run id";
+        for body in [
+            json!({ "error": "run-exists", "message": said }),
+            json!({ "error": said, "code": "run-exists" }),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/ag-ui"))
+                .respond_with(ResponseTemplate::new(409).set_body_json(&body))
+                .mount(&server)
+                .await;
+            let client = OpenGrokClient::new(&server.uri()).unwrap();
+            put_cookie(&client, &live_session());
+            let error = client
+                .run_turn("cw_1", "th_1", "run_1", &[], None, None, None, |_| {})
+                .await
+                .expect_err("refused");
+            assert_eq!(error.status, Some(409));
+            assert_eq!(error.message, said, "{body}");
+            assert_eq!(error.code(), Some("run-exists"), "{body}");
+            assert!(
+                !error.is_stale_pending()
+                    && !error.is_already_consumed()
+                    && !error.is_not_pending()
+            );
+        }
+    }
+
+    /// A 502 or 503 the server writes itself carries its sentence as JSON, and is its verdict
+    /// about the request, told apart from one nothing says the server wrote. The box being down
+    /// (`POST /recipes/{id}/run`, recorded as the 502 in
+    /// `fixtures/wire/rest/POST__recipes__id__run/`) used to read as the server out of reach,
+    /// so the recipe page offered it again and reloaded as if the run might have started.
+    #[tokio::test]
+    async fn a_five_hundred_the_server_wrote_is_its_verdict_and_a_proxys_is_not() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_down/run"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "error": "the box is unreachable: the stand-in box is down"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/recipes"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "the recipe was not kept: its raw version could not be stored"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_proxy/run"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .set_body_string("<html><body>502 Bad Gateway</body></html>"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/recipes/rcp_quiet/run"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let down = client.run_recipe("rcp_down", "cw_1").await.unwrap_err();
+        assert_eq!(down.status, Some(502));
         assert_eq!(
-            custom.message.map(|row| row.content).as_deref(),
-            Some("the laptop's words")
+            down.message,
+            "the box is unreachable: the stand-in box is down"
         );
+        assert_eq!(down.failure(), Failure::Verdict, "the server answered");
+        let kept = client.create_recipe("Pay", "", &[]).await.unwrap_err();
+        assert_eq!(kept.failure(), Failure::Verdict, "{kept:?}");
+
+        for id in ["rcp_proxy", "rcp_quiet"] {
+            let lost = client.run_recipe(id, "cw_1").await.unwrap_err();
+            assert_eq!(
+                lost.unreachable(),
+                Some(Unreachable::Server),
+                "nothing says the server wrote this: {lost:?}"
+            );
+        }
     }
 
     /// This is today's bug end to end. The app looks signed in, has nothing to put in the
@@ -7169,6 +7388,83 @@ mod tests {
             detail.versions[0].tape_events().is_none(),
             "a count is not a tape"
         );
+    }
+
+    /// A workflow's detail, as opengrok-server `recipes.rs` `detail_body` sends it (recorded in
+    /// `fixtures/wire/rest/GET__recipes__id_/200-a_workflow_walk_survives_its_caller_hanging_up-2`):
+    /// its version's body is the decision tree, whose `steps` are named branches rather than a
+    /// sequence. The detail used to fail to read over that one field, taking the history, the
+    /// grants and the bots down with it; now the tree is a version with no tape steps and the
+    /// rest reads as it always did.
+    #[tokio::test]
+    async fn a_workflows_detail_reads_its_tree_as_no_tape_steps() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/recipes/rcp_tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "recipe": {"id": "rcp_tree", "ownerId": "acct_1", "name": "Month end",
+                           "latestVersion": 1, "relation": "mine", "kind": "workflow",
+                           "parameters": []},
+                "versions": [{
+                    "version": 1, "kind": "workflow", "note": "the tree as written",
+                    "createdBy": "acct_1", "createdAtMs": 1,
+                    "body": {
+                        "workflow": 1, "start": "export", "parameters": [],
+                        "budget": {"steps": 40, "seconds": 600},
+                        "steps": {
+                            "export": {"do": "run", "recipe": "rcp_export", "then": "done"},
+                            "done": {"do": "stop", "say": "", "outcome": "done"}
+                        }
+                    }
+                }],
+                "shares": [], "grants": [],
+                "runs": [{"id": "rrun_1", "recipeId": "rcp_tree", "version": 1,
+                          "coworkerId": "cw_1", "runId": "rrun_1", "ok": true,
+                          "stoppedAt": null, "atMs": 2, "leaseUntilMs": null,
+                          "state": "finished", "artifacts": [],
+                          "receipt": {"ok": true, "outcome": "done", "steps": 2,
+                                      "trail": [{"do": "stop", "step": "done"}]}}],
+                "myBots": [{"id": "cw_1", "name": "Ada"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let detail = client
+            .recipe("rcp_tree")
+            .await
+            .expect("a workflow's detail reads");
+        assert!(detail.recipe.is_workflow());
+        assert_eq!(detail.versions[0].kind, "workflow");
+        assert!(
+            detail.versions[0].body.steps.is_empty(),
+            "a tree is not a tape"
+        );
+        assert_eq!(detail.runs[0].id, "rrun_1");
+        assert!(detail.runs[0].is_over());
+        assert_eq!(detail.bot_name("cw_1"), "Ada");
+
+        // Only a workflow's version carries a tree. Any other version's steps are a tape, read
+        // strictly: an object there, a step this client cannot read, or steps that are neither
+        // is a tape it would show and play wrong.
+        for kind in ["filtered", "edited", "raw", ""] {
+            let tree: Result<RecipeVersion, _> = serde_json::from_value(json!({
+                "version": 2, "kind": kind,
+                "body": {"steps": {"done": {"do": "stop", "outcome": "done"}}}
+            }));
+            assert!(tree.is_err(), "a tree under a {kind:?} version is an error");
+        }
+        let odd: Result<RecipeVersion, _> = serde_json::from_value(json!({
+            "version": 2, "kind": "edited", "body": {"steps": [{"op": "teleport"}]}
+        }));
+        assert!(odd.is_err(), "an unreadable tape step is an error");
+        let neither: Result<RecipeVersion, _> =
+            serde_json::from_value(json!({"version": 2, "kind": "edited", "body": {"steps": 3}}));
+        assert!(neither.is_err(), "steps that are neither a tape nor a tree");
+        let tape: RecipeVersion = serde_json::from_value(json!({
+            "version": 2, "kind": "filtered", "body": {"steps": [{"op": "wait", "ms": 5}]}
+        }))
+        .expect("a tape reads");
+        assert_eq!(tape.body.steps, vec![RecipeStep::Wait { ms: 5 }]);
     }
 
     /// Run rows exactly as `GET /recipes/{id}` sends them since opengrok-server #217: the

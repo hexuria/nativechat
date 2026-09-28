@@ -1,16 +1,16 @@
 {
-  "type": "CUSTOM",
   "name": "credential.offer_save",
-  "origin": "accounts.google.com",
-  "username": "ada@example.com",
-  "formEntryId": "e_0199bb4e-0000-7000-8000-000000000303",
+  "type": "CUSTOM",
+  "runId": "0199bb4e-0000-7000-8000-000000000001",
   "value": {
     "origin": "accounts.google.com",
     "username": "ada@example.com",
-    "formEntryId": "e_0199bb4e-0000-7000-8000-000000000303"
+    "formEntryId": "e_0199bb4e-0000-7000-8000-000000000002"
   },
-  "threadId": "thr-0199bb4e-0000-7000-8000-000000000301",
-  "runId": "0199bb4e-0000-7000-8000-000000000302",
   "callId": "mock-form-1",
-  "timestamp": 1790413205000
+  "origin": "accounts.google.com",
+  "threadId": "thr-0199bb4e-0000-7000-8000-000000000003",
+  "username": "ada@example.com",
+  "timestamp": 100,
+  "formEntryId": "e_0199bb4e-0000-7000-8000-000000000002"
 }
