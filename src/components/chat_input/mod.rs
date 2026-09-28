@@ -2404,7 +2404,6 @@ fn chip_fills(
     let style = window.text_style();
     let font_size = style.font_size.to_pixels(window.rem_size());
     let text_system = window.text_system();
-    let font = text_system.resolve_font(&style.font());
     let text = input.value();
     tokens
         .iter()
@@ -2414,13 +2413,17 @@ fn chip_fills(
                 .map(|word| {
                     word.char_indices()
                         .filter_map(|(at, ch)| {
-                            let at = range.start + at;
-                            let start = input.range_to_bounds(&(at..at))?.origin;
+                            let start =
+                                input.range_to_bounds(&(range.start + at..range.start + at))?;
+                            // Shaped the way the field shapes it, font fallback included: a
+                            // character the primary font lacks (CJK, an emoji) is drawn from
+                            // another font, and its width is that font's. Asking the primary
+                            // font alone would call it zero.
+                            let glyph = ch.to_string();
                             let advance = text_system
-                                .advance(font, font_size, ch)
-                                .map(|size| size.width)
-                                .unwrap_or_default();
-                            Some((start, advance))
+                                .layout_line(&glyph, font_size, &[style.to_run(glyph.len())], None)
+                                .width;
+                            Some((start.origin, advance))
                         })
                         .collect()
                 })
@@ -2442,10 +2445,29 @@ fn chip_fills(
 /// how wide it is (`glyphs`, in order). A character lower than the line so far starts the next
 /// row; a row runs from its first character's start to the end of its last one, so the last
 /// glyph before a wrap is inside the fill, and a line that holds only that glyph still gets one.
+///
+/// A width that came back as nothing (a font that could not measure the character) is not
+/// taken at its word: it is the average of the chip's other widths, or half a line for a chip
+/// that has none, so the character is still inside the fill rather than cut off at its start.
 fn chip_rows(glyphs: &[(Point<Pixels>, Pixels)], line_height: Pixels) -> Vec<Bounds<Pixels>> {
+    let measured: Vec<Pixels> = glyphs
+        .iter()
+        .map(|(_, advance)| *advance)
+        .filter(|advance| *advance > Pixels::ZERO)
+        .collect();
+    let fallback = if measured.is_empty() {
+        line_height * 0.5
+    } else {
+        measured.iter().fold(Pixels::ZERO, |sum, w| sum + *w) / measured.len() as f32
+    };
     let mut rows: Vec<(Pixels, Pixels, Pixels)> = Vec::new();
     for (start, advance) in glyphs {
-        let end = start.x + *advance;
+        let advance = if *advance > Pixels::ZERO {
+            *advance
+        } else {
+            fallback
+        };
+        let end = start.x + advance;
         match rows.last_mut() {
             Some((from, to, top)) if start.y < *top + line_height * 0.5 => {
                 *from = (*from).min(start.x);
@@ -2557,6 +2579,29 @@ mod tests {
         assert_eq!(
             spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
             vec![(40., 64., 0.)]
+        );
+    }
+
+    /// A character whose width came back as zero (a font that could not measure it) is still
+    /// inside the fill: it gets the chip's average width, or half a line if nothing in the chip
+    /// was measured, so a wrapped CJK or emoji row keeps its last glyph and a one-glyph row is
+    /// not dropped.
+    #[test]
+    fn an_unmeasured_glyph_still_gets_a_width() {
+        let glyphs = [
+            glyph(300., 0., 16.),
+            glyph(316., 0., 0.),
+            glyph(10., LINE, 16.),
+        ];
+        assert_eq!(
+            spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
+            vec![(300., 332., 0.), (10., 26., LINE)]
+        );
+        let lone = [glyph(330., 0., 0.), glyph(10., LINE, 0.)];
+        assert_eq!(
+            spans(chip_rows(&lone, gpui_kit::px(LINE))),
+            vec![(330., 340., 0.), (10., 20., LINE)],
+            "nothing measured: half a line each, and neither row is dropped"
         );
     }
 
