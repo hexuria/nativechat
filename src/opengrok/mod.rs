@@ -23,6 +23,7 @@ pub use credential::{
     CREDENTIAL_OFFER_SAVE, SaveLoginSpec, keep_local_save_offer, save_login_card_id,
     save_login_from_local, save_login_save_id, save_login_skip_id,
 };
+pub(crate) use gen_ui::capped;
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, CompletedUiTool, FormField, FormSpec,
     LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec, StepStatus, TurnAssembler,

@@ -45,7 +45,7 @@ use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::gen_ui::{
     BAR_CHART_NAMES, ChatPart, EGRESS_TUNNEL_ASK_REASON, FORM_NAMES, REVIEW_AN_ACTION_REASONS,
     RUN_AWAITING_APPROVAL, StepSpec, TurnAssembler, UI_CUSTOM_NAME, USER_MACHINE_SHELL,
-    approval_from_event, command_from_replay_events, is_ui_tool,
+    approval_from_event, command_from_replay_events, is_ui_tool, step_arguments,
 };
 use super::pending::{CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingOp};
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
@@ -721,14 +721,7 @@ fn check_frame(corpus: &Corpus, frame: &Value) -> Check {
         "TEXT_MESSAGE_CONTENT" => text_content(corpus, frame),
         "TOOL_CALL_START" => tool_call_start(frame),
         "TOOL_CALL_ARGS" => tool_call_args(corpus, frame),
-        "TOOL_CALL_END" => {
-            must!(
-                tick(frame) == label("Thinking"),
-                "TOOL_CALL_END should say Thinking, not {:?}",
-                tick(frame)
-            );
-            Ok(())
-        }
+        "TOOL_CALL_END" => tool_call_end(corpus, frame),
         "TOOL_CALL_RESULT" => tool_call_result(corpus, frame),
         "REASONING_MESSAGE_START" | "REASONING_MESSAGE_CONTENT" | "REASONING_MESSAGE_END" => {
             reasoning(corpus, frame)
@@ -851,16 +844,54 @@ fn tool_call_args(corpus: &Corpus, frame: &Value) -> Check {
         Some(&command) == sent.as_ref(),
         "the command of {call_id:?} should read back as {sent:?}, got {command:?}"
     );
-    // The call's step keeps its arguments as they came.
+    // The step holds none of the text the arguments come as while they are coming: what it
+    // keeps of them is decided when they end (see `tool_call_end`).
     let start = corpus
         .tool_call_start_for(call_id)
         .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
     let (_, parts) = assembled(&[&start, frame]).snapshot();
     must!(
         parts.iter().any(
-            |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments == delta)
+            |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments.is_empty())
         ),
-        "the step for {call_id:?} should hold its arguments {delta:?}: {parts:?}"
+        "the step for {call_id:?} should hold none of its argument text before its end: {parts:?}"
+    );
+    Ok(())
+}
+
+/// The end of a call says Thinking, and is where its step keeps its arguments: as the
+/// approval card's rules let it say them (`step_arguments`), which for this shell call is the
+/// arguments as they came.
+fn tool_call_end(corpus: &Corpus, frame: &Value) -> Check {
+    must!(
+        tick(frame) == label("Thinking"),
+        "TOOL_CALL_END should say Thinking, not {:?}",
+        tick(frame)
+    );
+    let call_id = str_at(frame, "toolCallId");
+    let start = corpus
+        .tool_call_start_for(call_id)
+        .ok_or("the corpus has no TOOL_CALL_START to open the call")?;
+    let args = corpus
+        .frames_of("TOOL_CALL_ARGS")
+        .find(|args| str_at(args, "toolCallId") == call_id)
+        .ok_or("the corpus has no TOOL_CALL_ARGS for the call")?;
+    let delta = str_at(args, "delta");
+    let tool = str_at(&start, "toolCallName");
+    let sent: Value = serde_json::from_str(delta)
+        .map_err(|error| format!("the fixture's arguments are not JSON: {error}"))?;
+    let kept = step_arguments(tool, &sent);
+    must!(
+        kept == sent,
+        "a {tool} call's arguments are what its card shows, as sent: {kept}"
+    );
+    let kept = kept.to_string();
+    let (_, parts) = assembled(&[&start, args, frame]).snapshot();
+    must!(
+        parts.iter().any(
+            |part| matches!(part, ChatPart::Step(step) if step.call_id == call_id && step.arguments == kept)
+        ),
+        "the step for {call_id:?} should keep {kept:?} once its arguments end: {parts:?}"
     );
     Ok(())
 }

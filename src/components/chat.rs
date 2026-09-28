@@ -1943,8 +1943,8 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatRow, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, changed_rows, joins_previous_set,
-        snapshot_rows, tail_room, text_row_id,
+        ChatFeedRev, ChatRow, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, changed_rows,
+        joins_previous_set, snapshot_rows, tail_room, text_row_id,
     };
     use crate::components::steps::step_key;
     use crate::opengrok::{ChatPart, StepSpec};
@@ -2295,5 +2295,59 @@ mod tests {
 
         click(&mut state, "step-c1");
         assert!(!row(&state, "c1").1, "a second click shuts it");
+    }
+
+    /// A step's result landing after its row was drawn is a change the feed sees, and the rows
+    /// it rebuilds say how the call came out: the step's mark, an opened step's result, and the
+    /// mark on the "N steps" line it sits in. `ChatRow::same_as` never decides what is drawn,
+    /// only which rows the list measures again when one is opened or shut.
+    #[test]
+    fn a_result_landing_late_redraws_its_row() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            step("c1", None),
+            ChatPart::Text("Now the two others.".into()),
+            step("c2", Some(("a", true))),
+            step("c3", None),
+        ]);
+        state.mark_steps_open(&[step_key("m1", "c1")], true);
+        let before = ChatFeedRev::from_state(&state);
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 open",
+                "words Now the two others.",
+                "2 steps … shut",
+            ]
+        );
+        let settle = |state: &mut AppState, call_id: &str, content: &str, ok: bool| {
+            for part in &mut state.conversations[0].messages[0].parts {
+                if let ChatPart::Step(step) = part
+                    && step.call_id == call_id
+                {
+                    step.result = Some(content.to_string());
+                    step.ok = Some(ok);
+                }
+            }
+        };
+        settle(&mut state, "c1", "4.0G", true);
+        settle(&mut state, "c3", "denied", false);
+        assert!(
+            ChatFeedRev::from_state(&state) != before,
+            "the feed sees the results land, so it rebuilds its rows"
+        );
+        let rows = snapshot_rows(&state);
+        let opened = rows
+            .iter()
+            .find_map(|row| match &row.run {
+                Some(RunRow::Step { step, open, .. }) if step.call_id == "c1" => {
+                    Some((step.status().mark(), *open, step.result.clone()))
+                }
+                _ => None,
+            })
+            .expect("c1's row");
+        assert_eq!(opened, ("✓", true, Some("4.0G".to_string())));
+        assert_eq!(feed(&state)[3], "2 steps ✗ shut");
     }
 }
