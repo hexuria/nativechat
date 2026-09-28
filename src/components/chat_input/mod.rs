@@ -2548,6 +2548,18 @@ mod tests {
         );
     }
 
+    /// A right-to-left name comes back in reading order with each glyph further left than the
+    /// last. The row still runs from the leftmost start to the rightmost end, so it is filled
+    /// rather than dropped as a rectangle with its ends the wrong way round.
+    #[test]
+    fn a_right_to_left_chip_is_filled() {
+        let glyphs = [glyph(56., 0., 8.), glyph(48., 0., 8.), glyph(40., 0., 8.)];
+        assert_eq!(
+            spans(chip_rows(&glyphs, gpui_kit::px(LINE))),
+            vec![(40., 64., 0.)]
+        );
+    }
+
     /// Nothing laid out is nothing drawn.
     #[test]
     fn a_chip_with_nothing_laid_out_draws_nothing() {
