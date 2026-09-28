@@ -76,6 +76,10 @@
 //! while the routine has no trigger, and the webhook's three only while it has one, so
 //! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
 //!
+//! The draft's chips: `composer-chip-{i}` under `composer`, in order (label = what the chip reads
+//! as, value `tool` / `recipe` / `workflow` / `skill`). A chip is one object in the field (#40):
+//! one Backspace after it removes it whole.
+//!
 //! Choice cards (the server's `form` tool) in the open thread: `choice-{messageId}` (value
 //! `open` / `answered` / `not-answered` / `dismissed`; state `keyboard` on the one card a letter
 //! answers). While open: `choice-{messageId}-{field}-{option}` (value = its keycap letter on a

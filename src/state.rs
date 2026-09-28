@@ -2708,6 +2708,9 @@ pub struct AppState {
     /// anything. The rows are not copied here: they are rebuilt from the same sources the panel
     /// draws them from.
     pub composer_panel: Option<crate::components::chat_input::PanelMode>,
+    /// The chips in the draft, in order, as (kind, label). Published by the composer for the same
+    /// reason as [`Self::composer_panel`]: the field is the view's, and a driver sees the state.
+    pub composer_chips: Vec<(crate::components::chat_input::TokenKind, String)>,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -3329,6 +3332,7 @@ impl AppState {
             picked_tools: Vec::new(),
             active_recipe: None,
             active_skill: None,
+            composer_chips: Vec::new(),
             composer_panel: None,
             is_app_settings_open: false,
             bot_finder_open: false,
@@ -7485,6 +7489,18 @@ impl AppState {
         self.active_recipe = Some(ActiveRecipe::from_summary(recipe));
         cx.notify();
         true
+    }
+
+    /// Say which chips the draft holds, for a driver: the field is the composer's own.
+    pub fn set_composer_chips(
+        &mut self,
+        chips: Vec<(crate::components::chat_input::TokenKind, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_chips != chips {
+            self.composer_chips = chips;
+            cx.notify();
+        }
     }
 
     /// Say which of the composer's lists is open, or that none is. Called by the composer, and
