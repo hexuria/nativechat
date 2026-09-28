@@ -166,15 +166,110 @@ pub struct ReplyQuote {
     pub is_me: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct AguiMessage {
     pub id: String,
     pub role: String,
     pub content: String,
-    #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(rename = "replyTo", skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<ReplyQuote>,
+    /// Files the person attached to this message, already uploaded (#90). With none, `content`
+    /// goes as the plain string it always was.
+    pub attachments: Vec<Attachment>,
+}
+
+/// A message goes as `{id, role, content, toolCallId?, replyTo?}`. `content` is the words, or,
+/// when files ride along, an array of AG-UI 1.0 parts: a `text` part for the words and one part
+/// per file (see [`Attachment::part`]). Transcribed from opengrok-server#259
+/// (`crates/opengrok-wire/src/agui.rs` `Content`), which reads either.
+impl Serialize for AguiMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("role", &self.role)?;
+        if self.attachments.is_empty() {
+            map.serialize_entry("content", &self.content)?;
+        } else {
+            let mut parts = Vec::with_capacity(self.attachments.len() + 1);
+            if !self.content.is_empty() {
+                parts.push(serde_json::json!({"type": "text", "text": self.content}));
+            }
+            parts.extend(self.attachments.iter().map(Attachment::part));
+            map.serialize_entry("content", &parts)?;
+        }
+        if let Some(id) = &self.tool_call_id {
+            map.serialize_entry("toolCallId", id)?;
+        }
+        if let Some(quote) = &self.reply_to {
+            map.serialize_entry("replyTo", quote)?;
+        }
+        map.end()
+    }
+}
+
+/// A file uploaded to `POST /artifacts` for a message, as the upload answers it (the server's
+/// `ArtifactRow`, camelCase, opengrok-store `postgres.rs`). Only what the app uses is read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attachment {
+    pub id: String,
+    pub mime: String,
+    pub filename: String,
+    pub size_bytes: u64,
+}
+
+impl Attachment {
+    /// The part that names this file in a message: AG-UI 1.0 `ImagePartSchema` for a picture and
+    /// `DocumentPartSchema` for anything else, each with a `FileSourceSchema` source whose
+    /// provider is the server that issued the `art_` id (`ag-ui-protocol/ag-ui`
+    /// `sdks/typescript/packages/core/src/generated/schemas.ts` at `b8ebd02c84`; the shape agreed
+    /// on hexuria/nativechat#90).
+    pub fn part(&self) -> serde_json::Value {
+        let kind = if self.mime.starts_with("image/") {
+            "image"
+        } else {
+            "document"
+        };
+        serde_json::json!({
+            "type": kind,
+            "source": {
+                "type": "file",
+                "value": self.id,
+                "provider": "opengrok",
+                "mimeType": self.mime,
+            },
+            "metadata": {"filename": self.filename, "sizeBytes": self.size_bytes},
+        })
+    }
+}
+
+/// A file sent on a thread, as `GET /artifacts?threadId=` lists it (opengrok-server#259
+/// `artifacts.rs` `list_for_thread`): the row, with `meta.messageId` saying which message it
+/// rode on. A row without one was uploaded and never sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentAttachment {
+    pub file: Attachment,
+    pub message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArtifactListing {
+    #[serde(flatten)]
+    pub file: Attachment,
+    #[serde(default)]
+    pub meta: serde_json::Value,
+}
+
+impl ArtifactListing {
+    pub(crate) fn sent(self) -> Option<SentAttachment> {
+        let message_id = self.meta.get("messageId")?.as_str()?.to_string();
+        Some(SentAttachment {
+            file: self.file,
+            message_id,
+        })
+    }
 }
 
 /// Pull assistant `delta` fields out of an AG-UI SSE body (desktop Seam A
@@ -284,11 +379,57 @@ mod tests {
             content: "hi".into(),
             tool_call_id: None,
             reply_to: None,
+            attachments: Vec::new(),
         };
         let json = serde_json::to_value(&message).expect("serialises");
         assert_eq!(json["content"], "hi");
         assert!(json.get("replyTo").is_none(), "{json}");
         assert!(json.get("toolCallId").is_none(), "{json}");
+    }
+
+    /// With files, `content` is the AG-UI parts: the words first, then one part per file, a
+    /// picture as `image` and anything else as `document`, each naming its `art_` id as a file
+    /// the opengrok server issued (hexuria/nativechat#90, opengrok-server#259).
+    #[test]
+    fn files_ride_as_parts_after_the_words() {
+        let file = |id: &str, mime: &str, name: &str| Attachment {
+            id: id.into(),
+            mime: mime.into(),
+            filename: name.into(),
+            size_bytes: 42,
+        };
+        let message = AguiMessage {
+            id: "m1".into(),
+            role: "user".into(),
+            content: "What changed in Q3?".into(),
+            tool_call_id: None,
+            reply_to: None,
+            attachments: vec![
+                file("art_1", "application/pdf", "q3.pdf"),
+                file("art_2", "image/png", "screen.png"),
+            ],
+        };
+        let json = serde_json::to_value(&message).expect("serialises");
+        assert_eq!(
+            json["content"],
+            serde_json::json!([
+                {"type": "text", "text": "What changed in Q3?"},
+                {"type": "document",
+                 "source": {"type": "file", "value": "art_1", "provider": "opengrok", "mimeType": "application/pdf"},
+                 "metadata": {"filename": "q3.pdf", "sizeBytes": 42}},
+                {"type": "image",
+                 "source": {"type": "file", "value": "art_2", "provider": "opengrok", "mimeType": "image/png"},
+                 "metadata": {"filename": "screen.png", "sizeBytes": 42}}
+            ])
+        );
+        // Files alone: no empty text part.
+        let alone = AguiMessage {
+            content: String::new(),
+            ..message
+        };
+        let json = serde_json::to_value(&alone).expect("serialises");
+        assert_eq!(json["content"].as_array().map(Vec::len), Some(2));
+        assert_eq!(json["content"][0]["type"], "document");
     }
 
     #[test]
@@ -303,6 +444,7 @@ mod tests {
                 preview: "The build is green.".into(),
                 is_me: false,
             }),
+            attachments: Vec::new(),
         };
         let json = serde_json::to_value(&message).expect("serialises");
         assert_eq!(json["replyTo"]["messageId"], "m1");

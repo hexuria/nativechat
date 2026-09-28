@@ -74,6 +74,6 @@ pub use pending::{
 };
 pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
-    Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry, ProfileUpdate,
-    ReplyQuote, ThreadListing, assistant_text_from_sse,
+    Account, AguiMessage, Attachment, Coworker, CoworkerPatch, ModelCatalogue, ModelEntry,
+    ProfileUpdate, ReplyQuote, SentAttachment, ThreadListing, assistant_text_from_sse,
 };
