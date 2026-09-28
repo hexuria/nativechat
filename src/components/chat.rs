@@ -2211,4 +2211,89 @@ mod tests {
         assert_eq!(changed_rows(&open, &shut), (1..4, 1));
         assert_eq!(changed_rows(&open, &open), (5..5, 0));
     }
+
+    /// A driver's click opens the very row the feed draws: the keys the host's click hands the
+    /// app open a step standing alone, with what it was given and what came back; a step in a
+    /// stretch, whose line opens with it; and the Thought rows. A second click shuts the step.
+    ///
+    /// This is the contract between the tree and the feed, not the whole of the bug a driver
+    /// found on 28 Sep 2026: these rows were already right then. The window went on drawing
+    /// the old ones because the click was applied in the middle of a frame, where GPUI does not
+    /// tell the state's observers, and the transcript builds its rows in one. That half is in
+    /// `RootView::drain_agent`, and only a live window shows it.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_drivers_click_opens_the_row_the_feed_draws() {
+        use gpui_agent::{AgentHost, Op};
+        let mut state = one_reply(vec![
+            ChatPart::Reasoning("Size it first.".into()),
+            ChatPart::Text("Let me look.".into()),
+            step("c1", Some(("4.0G", true))),
+            ChatPart::Text("Now the index.".into()),
+            step("c2", Some(("a", true))),
+            ChatPart::Reasoning("Then read it.".into()),
+            step("c3", Some(("denied", false))),
+            ChatPart::Text("Done.".into()),
+        ]);
+        let click = |state: &mut AppState, target: &str| {
+            let mut host = crate::agent::NativeChatHost::from_app(state);
+            host.dispatch(&Op::click(target))
+                .expect("the host takes the click");
+            let Some(crate::agent::Command::SetStepsOpen { keys, open }) = host.take_command()
+            else {
+                panic!("a click on {target} opens or shuts rows");
+            };
+            state.mark_steps_open(&keys, open);
+        };
+        let row = |state: &AppState, call_id: &str| {
+            snapshot_rows(state)
+                .iter()
+                .find_map(|row| match &row.run {
+                    Some(RunRow::Step {
+                        step, open, group, ..
+                    }) if step.call_id == call_id => Some((step.clone(), *open, group.is_some())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no row for {call_id} in {:?}", feed(state)))
+        };
+
+        click(&mut state, "step-c1");
+        let (lone, open, grouped) = row(&state, "c1");
+        assert!(open && !grouped, "the step standing alone is open, alone");
+        assert_eq!(lone.shown_arguments().as_deref(), Some("echo c1"));
+        assert_eq!(lone.result.as_deref(), Some("4.0G"));
+
+        click(&mut state, "step-c3");
+        assert_eq!(
+            feed(&state),
+            vec![
+                "thought shut",
+                "words Let me look.",
+                "step c1 open",
+                "words Now the index.",
+                "2 steps ✗ open",
+                "  step c2 shut",
+                "  thought shut",
+                "  step c3 open",
+                "words Done.",
+            ]
+        );
+
+        click(&mut state, "reply-reasoning");
+        let thoughts: Vec<bool> = snapshot_rows(&state)
+            .iter()
+            .filter_map(|row| match &row.run {
+                Some(RunRow::Thought { open, .. }) => Some(*open),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thoughts,
+            vec![true, true],
+            "both thoughts, in the stretch too"
+        );
+
+        click(&mut state, "step-c1");
+        assert!(!row(&state, "c1").1, "a second click shuts it");
+    }
 }

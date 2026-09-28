@@ -239,6 +239,16 @@ impl RootView {
             if let Some(cmd) = host.take_command() {
                 let quit = matches!(cmd, crate::agent::Command::Shutdown);
                 self.state.update(cx, |state, cx| cmd.apply(state, cx));
+                // The command is applied here, in the middle of a frame, so that the op after
+                // it in this drain reads what it did. But GPUI does not pass on a notify raised
+                // while it draws (`WindowInvalidator::invalidate_view` only notes the entity),
+                // so the state's observers never heard of the change — and a view that keeps
+                // its own copy of the state went on drawing the old one. The transcript builds
+                // its rows in its observer: a step opened from here stayed shut on screen while
+                // the tree said it was open, until something else happened to change the
+                // state. Said again once the frame is done, it reaches them.
+                let state = self.state.clone();
+                cx.defer(move |cx| state.update(cx, |_, cx| cx.notify()));
                 if quit {
                     cx.quit();
                 }
