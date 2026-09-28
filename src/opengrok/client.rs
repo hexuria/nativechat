@@ -1377,7 +1377,7 @@ impl OpenGrokClient {
     /// `POST /artifacts` for a file the person attaches to a message (#90): the bytes go up first,
     /// and the message then names the returned `art_` id. `threadId` is the conversation's own
     /// thread, the one `POST /ag-ui` sends. Transcribed from opengrok-server `artifacts.rs`
-    /// `create` (the body) and #259 (`kind: "attachment"`; image, video, PDF and text accepted,
+    /// `create` (the body) and #259, merged at 68ace2e (`kind: "attachment"`; image, video, PDF and text accepted,
     /// 25 MiB at most, a 400 or 413 with a sentence otherwise).
     pub async fn upload_attachment(
         &self,
@@ -1390,7 +1390,7 @@ impl OpenGrokClient {
         let body = json!({
             "kind": "attachment",
             "mime": mime,
-            "filename": filename,
+            "filename": upload_filename(filename),
             "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
             "threadId": thread_id,
         });
@@ -2449,6 +2449,28 @@ impl BoxShareScope {
             "org" | "organization" | "organisation" => Some(Self::Org),
             _ => None,
         }
+    }
+}
+
+/// A file's name as the server will take it. opengrok-server#259 (merged at 68ace2e) refuses a
+/// name with a control character, U+2028, U+2029 or a `"` with a 400; a real file can be called
+/// that, and the person should not lose the upload over it, so those become `_`. An empty result
+/// is named `file`.
+pub(crate) fn upload_filename(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}' || ch == '"' {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    if clean.trim().is_empty() {
+        "file".to_string()
+    } else {
+        clean
     }
 }
 
@@ -6059,6 +6081,15 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client.coworker_tools("cw_1").await.unwrap_err();
         assert_eq!(error.status, Some(404));
+    }
+
+    /// A name the server would refuse is cleaned rather than losing the upload.
+    #[test]
+    fn a_file_name_the_server_refuses_is_cleaned() {
+        assert_eq!(super::upload_filename("q3 \"final\".pdf"), "q3 _final_.pdf");
+        assert_eq!(super::upload_filename("a\u{2028}b\tc"), "a_b_c");
+        assert_eq!(super::upload_filename("报告.pdf"), "报告.pdf");
+        assert_eq!(super::upload_filename(" "), "file");
     }
 
     /// An upload goes as the server's `POST /artifacts` body with `kind: "attachment"` and the
