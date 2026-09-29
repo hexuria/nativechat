@@ -42,7 +42,7 @@ pub(crate) fn disconnect_id(connection_id: &str) -> String {
     format!("settings-connection-disconnect-{connection_id}")
 }
 
-/// Why that row's last change did not go through.
+/// Why that row's last Disconnect did not go through.
 pub(crate) fn row_error_id(connection_id: &str) -> String {
     format!("settings-connection-error-{connection_id}")
 }
@@ -62,7 +62,7 @@ pub(crate) fn lend_id(connection_id: &str) -> String {
     format!("agent-connection-lend-{connection_id}")
 }
 
-/// Why that switch's last change did not go through.
+/// Why that switch's last lend or revoke did not go through, on the card of the Bot it was about.
 pub(crate) fn lend_error_id(connection_id: &str) -> String {
     format!("agent-connection-error-{connection_id}")
 }
@@ -117,19 +117,22 @@ pub(crate) fn lent_line(loans: &[String], name_of: impl Fn(&str) -> Option<Strin
     }
 }
 
-/// A Bot's Connections card's second line: how many of the person's connections are lent to
-/// it, or why there is nothing to count.
+/// A Bot's Connections card's second line: how many of the person's own connections are lent
+/// to it, or why there is nothing to count.
 pub(crate) fn agent_summary(connections: &AccountConnections, coworker_id: &str) -> String {
     match &connections.list {
         None | Some(ConnectionList::Loading) => ASKING.to_string(),
         Some(ConnectionList::Unavailable(why)) => why.clone(),
-        Some(ConnectionList::Listed(rows)) if rows.is_empty() => NOTHING_TO_LEND.to_string(),
-        Some(ConnectionList::Listed(rows)) => {
-            let lent = rows
+        Some(ConnectionList::Listed(_)) => {
+            let own = connections.own_rows();
+            if own.is_empty() {
+                return NOTHING_TO_LEND.to_string();
+            }
+            let lent = own
                 .iter()
                 .filter(|row| connections.shows_lent(row, coworker_id))
                 .count();
-            format!("{lent} of {} lent to this Bot", rows.len())
+            format!("{lent} of {} lent to this Bot", own.len())
         }
     }
 }
@@ -194,7 +197,8 @@ pub(crate) fn disconnect_label(
     }
 }
 
-/// The line under a connected service's name: the service, and who it is lent to.
+/// The line under a connected service's name: the service, and who it is lent to, with a lend
+/// or a revoke that is with the server shown as asked, the way the Bot's switch shows it.
 pub(crate) fn row_detail(
     connections: &AccountConnections,
     row: &ConnectionView,
@@ -203,7 +207,7 @@ pub(crate) fn row_detail(
     format!(
         "{} · {}",
         connections.connector_label(&row.connector),
-        lent_line(&row.loans, name_of)
+        lent_line(&connections.shown_loans(row), name_of)
     )
 }
 
@@ -236,6 +240,8 @@ pub(crate) fn connections_page(app: Entity<AppState>, cx: &App) -> impl IntoElem
             .map(|coworker| coworker.name.clone())
     };
 
+    // Only the person's own: nothing of another scope is theirs to disconnect.
+    let own = connections.own_rows();
     let connected: AnyElement = match &connections.list {
         None | Some(ConnectionList::Loading) => div()
             .text_sm()
@@ -248,15 +254,15 @@ pub(crate) fn connections_page(app: Entity<AppState>, cx: &App) -> impl IntoElem
             .text_color(danger)
             .child(why.clone())
             .into_any_element(),
-        Some(ConnectionList::Listed(rows)) if rows.is_empty() => div()
+        Some(ConnectionList::Listed(_)) if own.is_empty() => div()
             .id(LIST_EMPTY)
             .text_sm()
             .text_color(muted)
             .child(NOTHING_CONNECTED)
             .into_any_element(),
-        Some(ConnectionList::Listed(rows)) => {
+        Some(ConnectionList::Listed(_)) => {
             let mut list = card().id(LIST).flex().flex_col();
-            for (at, row) in rows.iter().enumerate() {
+            for (at, row) in own.iter().enumerate() {
                 if at > 0 {
                     list = list.child(divider());
                 }
@@ -285,7 +291,7 @@ pub(crate) fn connections_page(app: Entity<AppState>, cx: &App) -> impl IntoElem
                                     row,
                                     name_of,
                                 )))
-                                .when_some(connections.refusal(&row.id), |this, why| {
+                                .when_some(connections.disconnect_refusal(&row.id), |this, why| {
                                     this.child(
                                         div()
                                             .id(SharedString::from(row_error_id(&row.id)))
@@ -347,7 +353,7 @@ pub(crate) fn connections_page(app: Entity<AppState>, cx: &App) -> impl IntoElem
                     list = list.child(divider());
                 }
                 let name = connector.name.clone();
-                let waiting = connections.waiting.as_deref() == Some(name.as_str());
+                let waiting = connections.is_waiting(&name, std::time::Instant::now());
                 let refused = connections
                     .connect_refused
                     .as_ref()
@@ -453,9 +459,10 @@ pub(crate) fn agent_card(app: Entity<AppState>, coworker_id: &str, cx: &App) -> 
     let danger = theme.danger;
     let connections = &app.read(cx).connections;
     let bot_name = app.read(cx).active_bot_name();
+    // Only the person's own: nothing of another scope is theirs to lend.
     let rows: Vec<AnyElement> = connections
-        .rows()
-        .iter()
+        .own_rows()
+        .into_iter()
         .map(|row| {
             let lent = connections.shows_lent(row, coworker_id);
             let changing = connections.is_changing(&row.id);
@@ -491,15 +498,19 @@ pub(crate) fn agent_card(app: Entity<AppState>, coworker_id: &str, cx: &App) -> 
                                 }),
                         ),
                 )
-                .when_some(connections.refusal(&row.id), |this, why| {
-                    this.child(
-                        div()
-                            .id(SharedString::from(lend_error_id(&row.id)))
-                            .text_xs()
-                            .text_color(danger)
-                            .child(why.to_string()),
-                    )
-                })
+                // A refusal about lending it to another Bot is that Bot's card's to say.
+                .when_some(
+                    connections.lend_refusal(&row.id, coworker_id),
+                    |this, why| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(lend_error_id(&row.id)))
+                                .text_xs()
+                                .text_color(danger)
+                                .child(why.to_string()),
+                        )
+                    },
+                )
                 .into_any_element()
         })
         .collect();
@@ -541,7 +552,7 @@ mod tests {
     // attribute would stand in for the standard one.
     use super::{
         ALL_CONNECTED, ASKING, ConnectOffer, NO_CONNECTORS, NOTHING_TO_LEND, agent_summary,
-        connect_label, connect_offer, lent_line,
+        connect_label, connect_offer, lent_line, row_detail,
     };
     use crate::opengrok::{ConnectionOwner, ConnectionView, Connector};
     use crate::state::{AccountConnections, ConnectionChange, ConnectionList, ConnectorList};
@@ -586,17 +597,26 @@ mod tests {
         assert_eq!(lent(&["cw_x", "cw_y"]), "Lent to 2 Bots not on your list");
     }
 
-    /// A Bot's card counts what is lent to it, the switch that is with the server counted as it
-    /// was asked, and says why there is nothing to count.
+    /// A Bot's card counts what of the person's own is lent to it, the switch that is with the
+    /// server counted as it was asked, and says why there is nothing to count.
     #[test]
     fn a_bots_card_counts_what_is_lent_to_it() {
         let mut connections = AccountConnections::default();
         assert_eq!(agent_summary(&connections, "cw_1"), ASKING);
-        connections.list = Some(ConnectionList::Listed(Vec::new()));
-        assert_eq!(agent_summary(&connections, "cw_1"), NOTHING_TO_LEND);
+        let bots_own = ConnectionView {
+            owner: ConnectionOwner::Bot("cw_1".into()),
+            ..row("conn_3", "drive", &["cw_1"])
+        };
+        connections.list = Some(ConnectionList::Listed(vec![bots_own.clone()]));
+        assert_eq!(
+            agent_summary(&connections, "cw_1"),
+            NOTHING_TO_LEND,
+            "a bot's own sign-in is not the person's to lend"
+        );
         connections.list = Some(ConnectionList::Listed(vec![
             row("conn_1", "gmail", &["cw_1"]),
             row("conn_2", "github", &[]),
+            bots_own,
         ]));
         assert_eq!(
             agent_summary(&connections, "cw_1"),
@@ -619,6 +639,41 @@ mod tests {
         assert_eq!(
             agent_summary(&connections, "cw_1"),
             "Your connections could not be read."
+        );
+    }
+
+    /// Settings → Connections says who a connection is lent to as the Bot's switch does: a lend
+    /// or a revoke that is with the server is shown as asked, and only for the Bot it is about.
+    #[test]
+    fn a_settings_row_shows_a_change_in_flight_as_the_bots_switch_does() {
+        let mut connections = AccountConnections::default();
+        let gmail = row("conn_1", "gmail", &["cw_1"]);
+        connections.list = Some(ConnectionList::Listed(vec![gmail.clone()]));
+        assert_eq!(
+            row_detail(&connections, &gmail, names),
+            "gmail · Lent to Ada"
+        );
+        connections
+            .changing
+            .insert("conn_1".into(), ConnectionChange::Lend("cw_2".into()));
+        assert_eq!(
+            row_detail(&connections, &gmail, names),
+            "gmail · Lent to Ada and Bo"
+        );
+        connections
+            .changing
+            .insert("conn_1".into(), ConnectionChange::Revoke("cw_1".into()));
+        assert_eq!(
+            row_detail(&connections, &gmail, names),
+            "gmail · Not lent to any Bot"
+        );
+        connections
+            .changing
+            .insert("conn_1".into(), ConnectionChange::Disconnect);
+        assert_eq!(
+            row_detail(&connections, &gmail, names),
+            "gmail · Lent to Ada",
+            "the loans go with a disconnect once the server says so"
         );
     }
 

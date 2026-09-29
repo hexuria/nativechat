@@ -601,20 +601,21 @@ const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
     (
         "POST__connections__id__lend",
         "/connections/{id}/lend",
-        "A bot's Connections switch. opengrok-server#267 records a lend, and a lend refused with \
-         404 for another account's connection.",
+        "A bot's Connections switch. opengrok-server#267 records a lend, answered with the \
+         list's own row, and a lend refused with a JSON 404 for another account's connection.",
     ),
     (
         "POST__connections__id__revoke",
         "/connections/{id}/revoke",
-        "A bot's Connections switch, the other way. opengrok-server#267 records a revoke.",
+        "A bot's Connections switch, the other way. opengrok-server#267 records a revoke, \
+         answered with the list's own row.",
     ),
     (
         "DELETE__connections__id_",
         "/connections/{id}",
-        "Settings → Connections' Disconnect. No server issue promises its recording yet: \
-         opengrok-server#267 records the list, a lend and a revoke. Read as a lend's reply is, \
-         or as nothing left to list when it has no body.",
+        "Settings → Connections' Disconnect. opengrok-server#267 records one: a 204 with no \
+         body, after which the list no longer names the connection. Any 2xx is read as the \
+         connection gone.",
     ),
     (
         "GET__connectors",
