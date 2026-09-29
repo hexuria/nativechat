@@ -3416,6 +3416,100 @@ mod tests {
         }
     }
 
+    /// #139: a card settled after its run stopped waiting gets no settled `user-form` frame of
+    /// its own (the server journals none onto a run that no longer waits). On replay the server
+    /// folds the settled entry onto the card's own frame instead (`hydrate_agui_events` /
+    /// `overlay_form` in opengrok-server `agui/user_form.rs`): `formResolution` beside the
+    /// arguments, and the whole entry, `widgetDismissed` too, in `value`. The card must be
+    /// drawn settled from that frame alone, not asked again.
+    #[test]
+    fn a_replayed_card_settled_on_its_own_frame_is_not_asked_again() {
+        let frame = |resolution: Value, entry: Value| {
+            json!({
+                "type": "CUSTOM",
+                "name": "run-awaiting-approval",
+                "runId": "run-1",
+                "callId": "call-9",
+                "tool": "request_user_form",
+                "reason": "user-form",
+                "why": "Waiting for you",
+                "entryId": "entry-1",
+                "arguments": {
+                    "title": "Google account email",
+                    "fields": [{"id": "email", "label": "Email", "type": "email", "required": true}]
+                },
+                "formResolution": resolution,
+                "value": entry
+            })
+        };
+        let submitted = frame(
+            json!("submitted"),
+            json!({"id": "entry-1", "callId": "call-9", "formResolution": "submitted"}),
+        );
+        // Closed without an answer: no resolution word, only the entry's dismissal.
+        let dismissed = frame(
+            Value::Null,
+            json!({"id": "entry-1", "callId": "call-9", "widgetDismissed": true}),
+        );
+        for (event, settled) in [
+            (submitted, Some(crate::opengrok::FormResolution::Submitted)),
+            (dismissed, Some(crate::opengrok::FormResolution::Dismissed)),
+        ] {
+            let mut turn = TurnAssembler::default();
+            turn.push_event(&event);
+            let (_, parts) = turn.snapshot();
+            match parts.as_slice() {
+                [ChatPart::UserForm(spec)] => {
+                    assert_eq!(spec.title, "Google account email", "still the card it was");
+                    assert!(!spec.is_unresolved(), "settled on its frame: {spec:?}");
+                    assert_eq!(spec.effective_resolution(), settled);
+                }
+                other => panic!("expected the card, got {other:?}"),
+            }
+            assert!(!turn.waiting_user_form(), "nothing is being asked");
+            assert_eq!(
+                crate::opengrok::activity_from_agui(&event, None),
+                crate::opengrok::ActivityTick::Clear,
+                "an answered card is not waiting on anyone"
+            );
+        }
+
+        // Escalated to the computer: the escalation wins over a dismissal beside it, whether
+        // both are on the entry or split between the frame and the entry. The form stays in
+        // place and the computer is what now needs the person.
+        let escalated_entry = frame(
+            json!("escalated"),
+            json!({"id": "entry-1", "callId": "call-9", "formResolution": "escalated",
+                   "widgetDismissed": true}),
+        );
+        let split = frame(
+            json!("escalated"),
+            json!({"id": "entry-1", "callId": "call-9", "widgetDismissed": true}),
+        );
+        // A fallback parse that took a dismissal off the frame does not outvote the escalation.
+        let mut fallback = frame(
+            Value::Null,
+            json!({"id": "entry-1", "callId": "call-9", "formResolution": "escalated"}),
+        );
+        fallback["widgetDismissed"] = json!(true);
+        for event in [escalated_entry, split, fallback] {
+            let mut turn = TurnAssembler::default();
+            turn.push_event(&event);
+            let (_, parts) = turn.snapshot();
+            match parts.as_slice() {
+                [ChatPart::UserForm(spec)] => {
+                    assert!(spec.is_unresolved(), "escalated is not settled: {spec:?}");
+                    assert_eq!(
+                        spec.computer_handoff,
+                        Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded)
+                    );
+                }
+                other => panic!("expected the card, got {other:?}"),
+            }
+            assert!(turn.waiting_user_form());
+        }
+    }
+
     #[test]
     fn live_awaiting_user_form_is_not_an_approval_card() {
         let mut turn = TurnAssembler::default();

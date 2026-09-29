@@ -230,9 +230,17 @@ pub fn activity_from_agui(event: &Value, tool_args: Option<&str>) -> ActivityTic
         "RUN_FINISHED" | "RUN_ERROR" => ActivityTick::Clear,
         "CUSTOM" => {
             if super::user_form::is_user_form_awaiting(event) {
-                ActivityTick::Set(BotActivity {
-                    label: super::user_form::WAITING_FOR_YOU.into(),
-                })
+                // A replayed park can carry its card's settlement (#139); a card that is
+                // answered is not waiting on anyone.
+                let settled = super::user_form::UserFormSpec::from_awaiting_event(event, None)
+                    .is_some_and(|spec| !spec.is_unresolved() && !spec.live_computer_handoff());
+                if settled {
+                    ActivityTick::Clear
+                } else {
+                    ActivityTick::Set(BotActivity {
+                        label: super::user_form::WAITING_FOR_YOU.into(),
+                    })
+                }
             } else if event.get("name").and_then(Value::as_str)
                 == Some(super::gen_ui::RUN_AWAITING_APPROVAL)
             {

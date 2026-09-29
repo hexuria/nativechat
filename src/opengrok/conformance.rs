@@ -1654,27 +1654,72 @@ fn awaiting(frame: &Value) -> Check {
             "every field should show, and every secret one masked: {:?}",
             spec.fields
         );
-        // Open, whatever the frame says. A replay lays the card's settled `formResolution` over
-        // its park (opengrok-server `agui/user_form.rs` `overlay_form`), and the app does not
-        // read it there: the settlement reaches it as the `user-form` CUSTOM the server
-        // journals onto the run when the card settles (`journal_settled_form`), and
-        // `reads_back` holds every recorded replay to ending with the card settled.
+        // Open unless the frame itself says the card was settled. A replay lays the card's
+        // entry over its park (opengrok-server `agui/user_form.rs` `overlay_form`):
+        // `formResolution` beside the arguments and the entry, `widgetDismissed` too, in
+        // `value`. A card settled after its run stopped waiting gets no later `user-form` frame
+        // (`journal_agui_custom` journals none onto a run that no longer waits), so the park is
+        // the only place its settlement is said (#139). An escalation is the computer's
+        // sibling, not a settlement of the form.
+        // The entry folded into `value` speaks for this card only when it names this call or
+        // none: the server can match another card's entry by title and fields alone.
+        let ours = str_at(frame, "callId");
+        let entry = frame.get("value").filter(|entry| {
+            let theirs = str_at(entry, "callId");
+            theirs.is_empty() || ours.is_empty() || theirs == ours
+        });
+        // Each object's word as the client reads it: its own `formResolution` (a null there
+        // says none, as the client takes it), else its message's, through the client's own
+        // spelling rules.
+        let word = |object: &Value| {
+            object
+                .get("formResolution")
+                .or_else(|| object.pointer("/message/formResolution"))
+                .and_then(Value::as_str)
+                .map(FormResolution::parse)
+        };
+        let flag = |object: &Value| match object.get("widgetDismissed") {
+            Some(Value::Bool(on)) => *on,
+            Some(Value::String(text)) => text.eq_ignore_ascii_case("true") || text == "1",
+            _ => false,
+        };
+        let objects: Vec<&Value> = std::iter::once(frame).chain(entry).collect();
+        let words: Vec<FormResolution> = objects.iter().copied().filter_map(word).collect();
+        let escalated = words.contains(&FormResolution::Escalated);
+        let dismissed = !escalated && objects.iter().copied().any(flag);
+        let settled = !escalated && (!words.is_empty() || dismissed);
+        if escalated {
+            must!(
+                spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded),
+                "an escalated form hands the page to the computer: {spec:?}"
+            );
+        }
         must!(
-            spec.title == str_at(&frame["arguments"], "title") && spec.is_unresolved(),
-            "an open card titled as the form: {spec:?}"
+            spec.title == str_at(&frame["arguments"], "title") && spec.is_unresolved() != settled,
+            "the card titled as the form, {}: {spec:?}",
+            if settled {
+                "settled as its frame says"
+            } else {
+                "open"
+            }
         );
         let card = |part: &ChatPart| matches!(part, ChatPart::UserForm(card) if card.entry_id == spec.entry_id);
         must!(
-            assembler.waiting_user_form()
+            assembler.waiting_user_form() != settled
                 && parts.iter().any(card)
                 && !parts
                     .iter()
                     .any(|part| matches!(part, ChatPart::Approval(_))),
             "a form card, and not a permission card: {parts:?}"
         );
+        let expected = if settled {
+            ActivityTick::Clear
+        } else {
+            label(WAITING_FOR_YOU)
+        };
         must!(
-            tick(frame) == label(WAITING_FOR_YOU),
-            "a form should say {WAITING_FOR_YOU:?}, not {:?}",
+            tick(frame) == expected,
+            "a form should tick {expected:?}, not {:?}",
             tick(frame)
         );
         return Ok(());
@@ -2440,9 +2485,8 @@ fn thread_list(_: u16, body: &Value) -> Check {
 /// A run's frames read back to the words the coworker said, as the transcript rebuilds them: the
 /// person's own words, which a replay opens each run with, are none of them. And a card the
 /// replay says is settled ends settled: the server lays the card's `formResolution` over its park
-/// (`overlay_form`), which the app does not read there, and journals the settled card after it
-/// (`journal_settled_form`), which is where the app takes the settlement from. A replay without
-/// the second would rebuild a settled card as open.
+/// (`overlay_form`), which the app reads there (#139), and journals the settled card after it
+/// (`journal_settled_form`) while its run still waits.
 fn reads_back(run_id: &str, events: &[Value]) -> Check {
     let persons: BTreeSet<&str> = events
         .iter()
@@ -3462,6 +3506,52 @@ fn every_fixture_sits_where_its_layout_says() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The ledger's reading of a park agrees with the client's for the shapes no recording has yet:
+/// escalated with a dismissal beside it, on the entry or split between the frame and the entry,
+/// is an open form with the computer needing the person, and a dismissal alone settles it (#139).
+#[test]
+fn the_ledger_reads_a_park_settlement_as_the_client_does() {
+    let park = |resolution: Value, entry: Value| {
+        serde_json::json!({
+            "type": "CUSTOM", "name": "run-awaiting-approval", "reason": "user-form",
+            "tool": "request_user_form", "why": "Waiting for you",
+            "runId": "run-1", "callId": "call-9", "entryId": "e_1",
+            "arguments": {"title": "Google account",
+                "fields": [{"id": "email", "label": "Email", "type": "email"}]},
+            "formResolution": resolution,
+            "value": entry,
+        })
+    };
+    for frame in [
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "formResolution": "escalated", "widgetDismissed": true}),
+        ),
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "widgetDismissed": true}),
+        ),
+        park(
+            Value::Null,
+            serde_json::json!({"id": "e_1", "widgetDismissed": true}),
+        ),
+        park(Value::Null, Value::Null),
+        // Another spelling of the escalation, as the client's parse reads it.
+        park(Value::from("Escalated"), serde_json::json!({"id": "e_1"})),
+        // Another card's entry, matched by title and fields: it settles nothing here.
+        park(
+            Value::Null,
+            serde_json::json!({"id": "e_0", "callId": "call-1", "formResolution": "submitted"}),
+        ),
+        park(
+            Value::Null,
+            serde_json::json!({"id": "e_0", "callId": "call-1", "widgetDismissed": true}),
+        ),
+    ] {
+        awaiting(&frame).unwrap_or_else(|problem| panic!("{problem}: {frame}"));
+    }
 }
 
 /// Every frame goes through the code that handles its type and name, and comes out the way this
