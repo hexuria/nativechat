@@ -45,6 +45,7 @@ use serde_json::Value;
 
 use super::activity::{
     ActivityTick, BOX_WAKING, BotActivity, ToolCallTracker, WAKING_COMPUTER, activity_from_agui,
+    activity_from_replay,
 };
 use super::client::{
     AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerComputer, CoworkerUsage, DaemonEnrol,
@@ -919,6 +920,12 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
 /// none of the reply's.
 fn text_start(corpus: &Corpus, frame: &Value) -> Check {
     let role = str_at(frame, "role");
+    // AG-UI also has `system` and `developer` messages. The server replays neither, and one that
+    // came would read here as the coworker writing, so a new role is caught rather than blessed.
+    must!(
+        matches!(role, "assistant" | "user"),
+        "a TEXT_MESSAGE_START with role {role:?}, which this app reads as the coworker's"
+    );
     let persons = role == "user";
     let mut tracker = ToolCallTracker::default();
     let status = tracker.tick(frame);
@@ -2593,6 +2600,25 @@ fn persons_side(run_id: &str, events: &[Value]) -> Check {
         kept == asked,
         "run {run_id:?} should give back the person's messages {asked:?}, not {kept:?}"
     );
+    // A run picked up by its replay before the coworker has said anything (`activity_from_replay`)
+    // says what its opening said: the person's messages the replay opens with are not it writing.
+    let theirs: BTreeSet<&str> = asked.iter().map(|(id, _)| id.as_str()).collect();
+    let opening = events
+        .iter()
+        .take_while(|frame| {
+            str_at(frame, "type") == "RUN_STARTED"
+                || (str_at(frame, "type").starts_with("TEXT_MESSAGE_")
+                    && theirs.contains(str_at(frame, "messageId")))
+        })
+        .count();
+    if opening > 1 && str_at(&events[0], "type") == "RUN_STARTED" {
+        must!(
+            activity_from_replay(&events[..opening]) == activity_from_replay(&events[..1]),
+            "run {run_id:?}: the person's messages should leave the status line as the run's start \
+             set it, not at {:?}",
+            activity_from_replay(&events[..opening])
+        );
+    }
     Ok(())
 }
 
@@ -2677,7 +2703,8 @@ fn run_replay(_: u16, body: &Value) -> Check {
         .and_then(Value::as_array)
         .ok_or("a replay with no events array")?;
     same_len(&replay.events, events)?;
-    reads_back(&replay.run_id, &replay.events)
+    reads_back(&replay.run_id, &replay.events)?;
+    persons_side(&replay.run_id, &replay.events)
 }
 
 /// `stop_run`: the run, and what it is now. The route is idempotent, so a run that had already
@@ -4076,10 +4103,11 @@ fn a_steps_arguments_are_held_to_the_cards_rules_as_stated() {
     }
 }
 
-/// The readings of a refusal hold for every shape opengrok-server's error-bodies change (#262)
-/// writes, beyond the ones this recording happens to hold: `run-exists` under `code`, the queue's
-/// codes under `error` (which stay) or under `code`, a 502 or a 503 of the server's own as JSON,
-/// and a form's refusal in either shape. A plain-text 502, and `run-exists` under `error`, the
+/// The readings of a refusal hold for the shapes opengrok-server's error-bodies change (#262)
+/// writes, beyond the ones this recording happens to hold (`run-exists` under `code`, a 502 or a
+/// 503 of the server's own as JSON), and for the shapes it still writes and may move to: the
+/// queue's codes under `error` (as it sends them) or under `code`, and a form's refusal with its
+/// code under `error` beside a `message` (as `agui/user_form.rs` sends it) or under `code`. A plain-text 502, and `run-exists` under `error`, the
 /// shapes that change retired, still fail, so a recording that brings one back is caught rather
 /// than read.
 #[test]
