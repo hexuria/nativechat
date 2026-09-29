@@ -514,6 +514,16 @@ impl Render for AgentSettings {
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
+        // The person's connections, each lendable to this bot (#2).
+        let connections_card = self
+            .state
+            .read(cx)
+            .active_coworker_id
+            .clone()
+            .map(|coworker_id| {
+                crate::components::connections::agent_card(app.clone(), &coworker_id, cx)
+                    .into_any_element()
+            });
         // Floating over the chat (a narrow window), the pane carries its own header; docked,
         // the title bar shows it over the pane.
         let floats = chrome_floats(f32::from(window.viewport_size().width));
@@ -975,6 +985,7 @@ impl Render for AgentSettings {
                                                 }),
                                         )
                                     })
+                                    .when_some(connections_card, |this, card| this.child(card))
                                     .when_some(error, |this, message| {
                                         this.child(
                                             div()

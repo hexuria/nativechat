@@ -1411,6 +1411,137 @@ impl OpenGrokClient {
         Ok(listing.tools)
     }
 
+    /// `GET /connections` — the person's own connections, each with the Bots it is lent to
+    /// (opengrok-server#267, `list_connections` in `connections/routes.rs`). Always an array, and
+    /// an empty one is an answer: nothing connected yet.
+    pub async fn list_connections(&self) -> Result<Vec<ConnectionView>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/connections", None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `POST /connections/{id}/lend` — let a Bot use one of the person's connections without
+    /// signing in again. The body is today's `LendRequest`, snake_case, in `connections/routes.rs`.
+    /// A 404 ("no such connection") is a connection that is not this person's or does not exist,
+    /// and a 409 is the server refusing the change, each in the server's plain words.
+    pub async fn lend_connection(
+        &self,
+        connection_id: &str,
+        coworker_id: &str,
+    ) -> Result<Option<ConnectionChanged>, OpenGrokError> {
+        let path = format!("/connections/{}/lend", path_segment(connection_id));
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                &path,
+                Some(&json!({ "coworker_id": coworker_id })),
+            )
+            .await?;
+        Self::connection_changed(response).await
+    }
+
+    /// `POST /connections/{id}/revoke` — take a connection back from a Bot; the same body and the
+    /// same answers as [`Self::lend_connection`].
+    pub async fn revoke_connection(
+        &self,
+        connection_id: &str,
+        coworker_id: &str,
+    ) -> Result<Option<ConnectionChanged>, OpenGrokError> {
+        let path = format!("/connections/{}/revoke", path_segment(connection_id));
+        let response = self
+            .send_json(
+                reqwest::Method::POST,
+                &path,
+                Some(&json!({ "coworker_id": coworker_id })),
+            )
+            .await?;
+        Self::connection_changed(response).await
+    }
+
+    /// `DELETE /connections/{id}` — disconnect it, and every loan goes with it. `None` is a 2xx
+    /// with no body: the connection is gone and there is nothing left to list.
+    pub async fn disconnect_connection(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<ConnectionChanged>, OpenGrokError> {
+        let path = format!("/connections/{}", path_segment(connection_id));
+        let response = self
+            .send_json::<()>(reqwest::Method::DELETE, &path, None)
+            .await?;
+        Self::connection_changed(response).await
+    }
+
+    async fn connection_changed(
+        response: reqwest::Response,
+    ) -> Result<Option<ConnectionChanged>, OpenGrokError> {
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        Self::connection_change_reply(status, &body)
+    }
+
+    /// [`Self::connection_changed`] on a status and a body already read. A refusal is read as any
+    /// other ([`Self::refusal`]), so the person is shown the server's own words.
+    fn connection_change_reply(
+        status: u16,
+        body: &str,
+    ) -> Result<Option<ConnectionChanged>, OpenGrokError> {
+        if !(200..300).contains(&status) {
+            return Err(Self::refusal(status, body));
+        }
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(body).map(Some).map_err(|error| {
+            OpenGrokError::message(format!("the server's answer could not be read: {error}"))
+        })
+    }
+
+    /// `GET /connectors` — the services this server is configured to connect (opengrok-server
+    /// #269, as agreed). An empty list is a server that offers none.
+    pub async fn list_connectors(&self) -> Result<Vec<Connector>, OpenGrokError> {
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, "/connectors", None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `GET /connections/{connector}/authorize?format=json` — the service's sign-in page, for the
+    /// person's browser (opengrok-server#269, as agreed). The route wants the bearer, which a
+    /// browser cannot send, so the app asks for the page and opens it; the browser comes back to
+    /// the server's callback, never to the app, and no token ever reaches the app. `coworker_id`
+    /// makes the connection that Bot's own rather than the person's.
+    ///
+    /// Only a web address is handed back. It is opened by the system, which would as readily open
+    /// a file or another program for any other kind of link.
+    pub async fn connect_link(
+        &self,
+        connector: &str,
+        coworker_id: Option<&str>,
+    ) -> Result<String, OpenGrokError> {
+        let mut path = format!(
+            "/connections/{}/authorize?format=json",
+            path_segment(connector)
+        );
+        if let Some(coworker_id) = coworker_id {
+            path.push_str("&coworker_id=");
+            path.extend(url::form_urlencoded::byte_serialize(coworker_id.as_bytes()));
+        }
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        let link: ConnectLink = Self::json_or_error(response).await?;
+        match Url::parse(&link.url) {
+            Ok(url) if matches!(url.scheme(), "https" | "http") => Ok(link.url),
+            _ => Err(OpenGrokError::message(
+                "the server's sign-in link is not a web address",
+            )),
+        }
+    }
+
     /// `POST /artifacts` for a file the person attaches to a message (#90): the bytes go up first,
     /// and the message then names the returned `art_` id. `threadId` is the conversation's own
     /// thread, the one `POST /ag-ui` sends. Transcribed from opengrok-server `artifacts.rs`
@@ -2625,6 +2756,92 @@ impl CoworkerTool {
 pub(crate) struct ToolListing {
     #[serde(default)]
     pub(crate) tools: Vec<CoworkerTool>,
+}
+
+/// Whose sign-in a connection is: `{"scope": "user", "id": "acct_…"}`, `{"scope": "bot", "id":
+/// "cw_…"}` or `{"scope": "global"}`.
+///
+/// Transcribed from `Owner` in opengrok-server `crates/opengrok-core/src/connection.rs`, in the
+/// shape agreed with the server session for opengrok-server#267: adjacently tagged, one `id` key
+/// for every scope. On the server's main it is internally tagged, which serde cannot write for a
+/// person or a Bot, so no connection of theirs could be kept at all; `global` reads the same
+/// under both.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "scope", content = "id", rename_all = "kebab-case")]
+pub enum ConnectionOwner {
+    /// The whole deployment's key for something that belongs to nobody, and nobody's to lend.
+    Global,
+    /// A person's account, which is almost every connection.
+    User(String),
+    /// A Bot's own identity, so what it does is done under its name and not its owner's.
+    Bot(String),
+}
+
+/// One of the person's connections, as `GET /connections` lists it: a service they signed in to
+/// once, and the Bots they have lent it to.
+///
+/// Transcribed from `ConnectionView` in opengrok-server `crates/opengrok-core/src/connection.rs`
+/// and `list_connections` in `crates/opengrok-server/src/connections/routes.rs`, in the camelCase
+/// agreed with the server session for opengrok-server#267 (main writes it snake_case, and has
+/// never had a row to write). The list is an array, empty when nothing is connected, of the
+/// caller's own connections that are still connected: a disconnected one is not listed.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionView {
+    pub id: String,
+    /// The service, by the name `GET /connectors` lists it under: `gmail`, `github`.
+    pub connector: String,
+    pub owner: ConnectionOwner,
+    /// What a person is shown for it: the account signed in to, or the connector's name until
+    /// the server asks the service who that was. Never a secret.
+    pub label: String,
+    /// The Bots it is lent to, by coworker id.
+    pub loans: Vec<String>,
+    pub updated_at_ms: i64,
+    /// When the service's token stops working. `None` is a token that does not expire, which is
+    /// not one that already has.
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
+}
+
+/// A connection as a lend, a revoke or a disconnect leaves it: what `POST
+/// /connections/{id}/lend`, `POST /connections/{id}/revoke` and `DELETE /connections/{id}` answer.
+///
+/// Transcribed from the reply `mutate` writes in opengrok-server
+/// `crates/opengrok-server/src/connections/routes.rs`, as agreed with the server session for
+/// opengrok-server#267. On main that reply is `{id, connector, lentTo, disconnected}`; #267 names
+/// the Bots `loans`, as the list does, and answers with the list's own row. So `loans` is read,
+/// the rest of a row is left unread, and `disconnected` is read where it is sent and is false
+/// where it is not. A reply with no body at all is a connection with nothing left to list, and
+/// the client reads it as `None` ([`OpenGrokClient::disconnect_connection`]).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ConnectionChanged {
+    pub id: String,
+    pub connector: String,
+    pub loans: Vec<String>,
+    #[serde(default)]
+    pub disconnected: bool,
+}
+
+/// A service this server can connect, as `GET /connectors` lists it: `{name, label}`, where
+/// `name` is what a connection's `connector` says and `label` is what a person reads ("Gmail").
+///
+/// Transcribed from the shape agreed with the server session for opengrok-server#269, which adds
+/// the route; the server keeps the services it can connect as provider configs keyed by `name`
+/// (`Connectors::providers` in `crates/opengrok-server/src/connections/routes.rs`). A connector
+/// with no label is shown by its name.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Connector {
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// What `GET /connections/{connector}/authorize?format=json` answers (opengrok-server#269, as
+/// agreed): the service's own sign-in page, for the app to open in the person's browser.
+#[derive(Debug, Deserialize)]
+struct ConnectLink {
+    url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -6442,6 +6659,293 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client.coworker_tools("cw_1").await.unwrap_err();
         assert_eq!(error.status, Some(404));
+    }
+
+    /// A row of `GET /connections` in the shape agreed for opengrok-server#267: camelCase, the
+    /// owner adjacently tagged with one `id` key, and no expiry for a token that does not expire.
+    fn connection_row(id: &str, loans: &[&str]) -> Value {
+        json!({
+            "id": id, "connector": "gmail",
+            "owner": {"scope": "user", "id": "acct_1"},
+            "label": "you@work.com", "loans": loans, "updatedAtMs": 1_790_000_000_000_i64
+        })
+    }
+
+    /// The list is read in the agreed shape (opengrok-server#267), every owner's scope with it,
+    /// and nothing connected is an empty list rather than a failure.
+    #[tokio::test]
+    async fn a_persons_connections_are_read_in_the_agreed_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connections"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                connection_row("conn_1", &["cw_1", "cw_2"]),
+                {
+                    "id": "conn_2", "connector": "github", "owner": {"scope": "bot", "id": "cw_1"},
+                    "label": "octo-bot", "loans": [], "updatedAtMs": 1, "expiresAtMs": 2
+                },
+                {
+                    "id": "conn_3", "connector": "weather", "owner": {"scope": "global"},
+                    "label": "weather", "loans": [], "updatedAtMs": 1, "expiresAtMs": null
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let listed = client.list_connections().await.unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].owner, ConnectionOwner::User("acct_1".into()));
+        assert_eq!(listed[0].loans, ["cw_1", "cw_2"]);
+        assert_eq!(
+            (listed[0].label.as_str(), listed[0].updated_at_ms),
+            ("you@work.com", 1_790_000_000_000)
+        );
+        assert_eq!(
+            listed[0].expires_at_ms, None,
+            "no expiry is a token that does not expire"
+        );
+        assert_eq!(listed[1].owner, ConnectionOwner::Bot("cw_1".into()));
+        assert_eq!(listed[1].expires_at_ms, Some(2));
+        assert_eq!(listed[2].owner, ConnectionOwner::Global);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connections"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert!(client.list_connections().await.unwrap().is_empty());
+    }
+
+    /// Lend and revoke name the Bot as today's `LendRequest` does, snake_case, and read the Bots
+    /// it is lent to from `loans`: out of the list's own row, as #267 answers, and out of the
+    /// narrower reply with no `disconnected` in it.
+    #[tokio::test]
+    async fn a_lend_and_a_revoke_name_the_bot_and_read_back_the_loans() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/connections/conn_1/lend"))
+            .and(body_json(json!({ "coworker_id": "cw_1" })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(connection_row("conn_1", &["cw_1"])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/connections/conn_1/revoke"))
+            .and(body_json(json!({ "coworker_id": "cw_1" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "conn_1", "connector": "gmail", "loans": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let lent = client
+            .lend_connection("conn_1", "cw_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lent,
+            ConnectionChanged {
+                id: "conn_1".into(),
+                connector: "gmail".into(),
+                loans: vec!["cw_1".into()],
+                disconnected: false,
+            }
+        );
+        let revoked = client
+            .revoke_connection("conn_1", "cw_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(revoked.loans.is_empty() && !revoked.disconnected);
+    }
+
+    /// A disconnect is read from a reply that says so, and from a 2xx with nothing in it: a
+    /// disconnected connection is not listed, so there may be no row left to answer with.
+    #[tokio::test]
+    async fn a_disconnect_is_read_with_its_reply_or_without_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/connections/conn_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "conn_1", "connector": "gmail", "loans": [], "disconnected": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/connections/conn_2"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let gone = client.disconnect_connection("conn_1").await.unwrap();
+        assert!(gone.is_some_and(|reply| reply.disconnected && reply.loans.is_empty()));
+        assert_eq!(client.disconnect_connection("conn_2").await.unwrap(), None);
+    }
+
+    /// A change the server refuses is its verdict, in its words: the 404 that is somebody else's
+    /// connection or none at all, and the plain-text 409 of a change the connection refuses.
+    #[tokio::test]
+    async fn a_refused_connection_change_is_the_servers_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/connections/conn_theirs/lend"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such connection"))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/connections/conn_1"))
+            .respond_with(
+                ResponseTemplate::new(409).set_body_string("that connection has been disconnected"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let theirs = client
+            .lend_connection("conn_theirs", "cw_1")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (theirs.status, theirs.message.as_str(), theirs.failure()),
+            (Some(404), "no such connection", Failure::Verdict)
+        );
+        let refused = client.disconnect_connection("conn_1").await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str(), refused.failure()),
+            (
+                Some(409),
+                "that connection has been disconnected",
+                Failure::Verdict
+            )
+        );
+    }
+
+    /// A 2xx whose body is not a connection is not taken for one.
+    #[test]
+    fn a_change_reply_that_is_not_a_connection_is_an_error() {
+        assert!(OpenGrokClient::connection_change_reply(200, "{\"lentTo\": []}").is_err());
+        assert!(OpenGrokClient::connection_change_reply(200, "  \n").is_ok_and(|r| r.is_none()));
+    }
+
+    /// The services on offer are read as `[{name, label}]` (opengrok-server#269, as agreed), a
+    /// missing label is no reason to drop the service, and an empty list is a server that offers
+    /// none.
+    #[tokio::test]
+    async fn the_services_a_server_can_connect_are_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connectors"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"name": "gmail", "label": "Gmail"},
+                {"name": "github"}
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let offered = client.list_connectors().await.unwrap();
+        assert_eq!(
+            offered,
+            vec![
+                Connector {
+                    name: "gmail".into(),
+                    label: "Gmail".into()
+                },
+                Connector {
+                    name: "github".into(),
+                    label: String::new()
+                },
+            ]
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connectors"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert!(client.list_connectors().await.unwrap().is_empty());
+    }
+
+    /// The sign-in page is asked for as JSON with the person's bearer, which is the whole reason
+    /// the app asks rather than the browser (opengrok-server#269), and a Bot's own connection
+    /// names the Bot.
+    #[tokio::test]
+    async fn a_connect_link_is_asked_for_with_the_bearer_and_comes_back_as_a_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connections/gmail/authorize"))
+            .and(wiremock::matchers::query_param("format", "json"))
+            .and(wiremock::matchers::query_param_is_missing("coworker_id"))
+            .and(wiremock::matchers::header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "url": "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=s"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/connections/gmail/authorize"))
+            .and(wiremock::matchers::query_param("format", "json"))
+            .and(wiremock::matchers::query_param("coworker_id", "cw 1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "url": "https://example.com/a" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        assert_eq!(
+            client.connect_link("gmail", None).await.unwrap(),
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&state=s"
+        );
+        assert_eq!(
+            client.connect_link("gmail", Some("cw 1")).await.unwrap(),
+            "https://example.com/a"
+        );
+    }
+
+    /// Only a web address goes to the browser: the system opens a file or another program for
+    /// any other kind of link just as readily. A service this server does not connect is its 404,
+    /// in its words.
+    #[tokio::test]
+    async fn a_connect_link_that_is_not_a_web_address_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connections/gmail/authorize"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "url": "file:///Applications/Calculator.app" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/connections/fax/authorize"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string("no provider is configured for fax"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let error = client.connect_link("gmail", None).await.unwrap_err();
+        assert_eq!(
+            error.message,
+            "the server's sign-in link is not a web address"
+        );
+        let unknown = client.connect_link("fax", None).await.unwrap_err();
+        assert_eq!(
+            (unknown.status, unknown.message.as_str()),
+            (Some(404), "no provider is configured for fax")
+        );
     }
 
     /// A type with parameters or capitals is sent as the plain lowercase type the server reads.

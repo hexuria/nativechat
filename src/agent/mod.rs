@@ -108,6 +108,30 @@
 //! `plugin`; visible while the card is open). Read-only: what the server's
 //! `GET /coworkers/{id}/tools` says the bot is offered on its next turn.
 //!
+//! Connections (#2), a connection named by the server's id and a service by the name
+//! `GET /connectors` lists it under. `settings-tab-connections`; while Settings is open on it,
+//! `settings-connections-refresh`, `settings-connections` (value = how many are connected) with
+//! a `settings-connection-{id}` per connection (label = its label, value = the line under it:
+//! the service and who it is lent to, by bot name; state `changing` while a change to it is
+//! with the server), holding `settings-connection-disconnect-{id}` (dead while changing) and
+//! `settings-connection-error-{id}` (why its last change did not go through);
+//! `settings-connections-empty` / `settings-connections-error` in its place when there is
+//! nothing to list or it could not be read. Then `settings-connectors` (value = how many
+//! services are on offer and not connected) with `settings-connect-{connector}` (label `Connect
+//! Gmail`, or `Opening…` with state `opening` while its sign-in page is asked for, when every
+//! Connect is dead; state `waiting` once the browser has the page, until the service is listed)
+//! and `settings-connect-error-{connector}` (why Connect did not open the browser);
+//! `settings-connectors-empty` (the server offers none, or all are connected) /
+//! `settings-connectors-error` in its place. A click on a Connect opens the person's browser, as
+//! a person's does.
+//!
+//! In the bot's settings: `agent-connections` (value = the card's second line: `1 of 2 lent to
+//! this Bot`, `Asking the server…`, or why there is nothing to count), and per connection
+//! `agent-connection-lend-{id}` (a switch, label = its label, value = its service, checked while
+//! it shows as lent to this bot; a click asks for the other way; dead and `changing` while a
+//! change is with the server) and `agent-connection-error-{id}`; `agent-connections-note`, the
+//! card's sentence that lending alone does not change the bot's next turn (opengrok-server#268).
+//!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /

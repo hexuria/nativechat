@@ -25,6 +25,9 @@
 //!   means to read it, not merely without a panic;
 //! - every route the corpus records has that reading, or is excused in [`REST_NOT_READ`] with
 //!   why this app never asks it;
+//! - a route this app was built to ask ahead of the server's recording of it is owed a reading
+//!   in [`REST_NOT_RECORDED_YET`], which says what brings its fixtures, until the corpus holds
+//!   it;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
 //!   server sends or excused in [`NOT_SENT_BY_SERVER`], with the evidence;
 //! - every word the server sends is either in the ledger or excused in [`CLIENT_IGNORES`], so a
@@ -572,6 +575,58 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
         "This account's recent reverse-exec commands and their outcomes (local_exec.rs \
          audit_log). Settings shows each machine's mode and standing rules from GET \
          /local-exec/policy, and no log.",
+    ),
+];
+
+/// Routes this app asks that the corpus does not record yet: the app was built to a shape agreed
+/// with the server session before the server recorded it. Each is named by the directory the
+/// recorder will file it under, with the route as the server's router writes it and what brings
+/// its fixtures. Nothing reads them against the server's evidence yet, so each is owed a
+/// reading: the day the corpus holds one, it gets a reading in [`REST_ROUTES`] and comes off this
+/// list in the same change, and
+/// [`every_route_asked_ahead_of_its_recording_is_asked_and_not_recorded_yet`] fails until it
+/// does.
+///
+/// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
+/// server drives are a different gap, and not this list's.
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
+    (
+        "GET__connections",
+        "/connections",
+        "Settings → Connections and a bot's Connections card (nativechat#2). The server could not \
+         write a person's connection until opengrok-server#267, whose corpus records this list \
+         with one person's connection lent to a coworker; ConnectionView is transcribed from \
+         the shape agreed there.",
+    ),
+    (
+        "POST__connections__id__lend",
+        "/connections/{id}/lend",
+        "A bot's Connections switch. opengrok-server#267 records a lend, and a lend refused with \
+         404 for another account's connection.",
+    ),
+    (
+        "POST__connections__id__revoke",
+        "/connections/{id}/revoke",
+        "A bot's Connections switch, the other way. opengrok-server#267 records a revoke.",
+    ),
+    (
+        "DELETE__connections__id_",
+        "/connections/{id}",
+        "Settings → Connections' Disconnect. No server issue promises its recording yet: \
+         opengrok-server#267 records the list, a lend and a revoke. Read as a lend's reply is, \
+         or as nothing left to list when it has no body.",
+    ),
+    (
+        "GET__connectors",
+        "/connectors",
+        "The services Settings → Connections offers to connect. The route is \
+         opengrok-server#269, which brings its fixtures.",
+    ),
+    (
+        "GET__connections__connector__authorize",
+        "/connections/{connector}/authorize",
+        "Connect, asked with ?format=json for the page the browser opens. The JSON answer is \
+         opengrok-server#269, which brings its fixtures.",
     ),
 ];
 
@@ -3788,6 +3843,55 @@ fn every_route_this_app_does_not_read_is_recorded_and_says_why() {
         if read(route) == 0 {
             problems.push(format!(
                 "REFUSALS reads the refusals of {route}, which has no reading in REST_ROUTES"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The routes this app asks ahead of their recordings ([`REST_NOT_RECORDED_YET`]) are routes
+/// the shipped source does ask, filed under the directory the recorder will file them in, each
+/// saying what brings its fixtures, that the corpus does not hold yet. Once it holds one, the
+/// entry has gone stale: the route gets a reading in [`REST_ROUTES`] and leaves the list.
+#[test]
+fn every_route_asked_ahead_of_its_recording_is_asked_and_not_recorded_yet() {
+    let corpus = Corpus::load();
+    let recorded: BTreeSet<&str> = corpus
+        .bodies
+        .keys()
+        .filter_map(|file| file.split('/').nth(1))
+        .collect();
+    let mut problems = Vec::new();
+    for (route, pattern, why) in REST_NOT_RECORDED_YET {
+        if recorded.contains(route) {
+            problems.push(format!(
+                "the corpus records {route} now: give it a reading in REST_ROUTES and take it off \
+                 REST_NOT_RECORDED_YET"
+            ));
+        }
+        if REST_ROUTES.iter().any(|(dir, _)| dir == route)
+            || REST_NOT_READ.iter().any(|(dir, _, _)| dir == route)
+        {
+            problems.push(format!(
+                "{route} is owed a reading and is in REST_ROUTES or REST_NOT_READ as well"
+            ));
+        }
+        if why.trim().is_empty() {
+            problems.push(format!(
+                "REST_NOT_RECORDED_YET does not say what brings {route}'s fixtures"
+            ));
+        }
+        let method = route.split('_').next().unwrap_or("");
+        let filed = format!("{method}_{}", pattern.replace(['/', '{', '}'], "_"));
+        if filed != *route {
+            problems.push(format!(
+                "REST_NOT_RECORDED_YET names {route} as {method} {pattern}, which the recorder \
+                 files as {filed}"
+            ));
+        }
+        if source_asks(method, pattern).is_empty() {
+            problems.push(format!(
+                "nothing asks {method} {pattern} any more: take {route} off REST_NOT_RECORDED_YET"
             ));
         }
     }

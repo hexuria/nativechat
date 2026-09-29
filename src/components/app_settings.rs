@@ -111,6 +111,10 @@ impl Render for AppSettings {
             AppSettingsTab::Updates => Some(
                 updates_page(&bot_name, &controls, muted, app.clone(), &theme).into_any_element(),
             ),
+            AppSettingsTab::Connections => Some(
+                crate::components::connections::connections_page(app.clone(), cx)
+                    .into_any_element(),
+            ),
             AppSettingsTab::Logins | AppSettingsTab::Skills => None,
         };
         let body = match cards {
@@ -276,6 +280,13 @@ impl AppSettings {
                 cx,
             ))
             .child(nav_item(
+                crate::components::connections::SETTINGS_TAB,
+                "Connections",
+                tab == AppSettingsTab::Connections,
+                AppSettingsTab::Connections,
+                cx,
+            ))
+            .child(nav_item(
                 "settings-tab-skills",
                 "Skills",
                 tab == AppSettingsTab::Skills,
@@ -294,6 +305,7 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Computer => "Computer",
         AppSettingsTab::Updates => "Updates",
         AppSettingsTab::Logins => "Logins",
+        AppSettingsTab::Connections => "Connections",
         AppSettingsTab::Skills => "Skills",
     }
 }
