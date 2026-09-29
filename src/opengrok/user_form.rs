@@ -997,8 +997,8 @@ impl UserFormSpec {
         let (resolution, dismissed, handoff) = park_settlement(event);
         if handoff.is_some() {
             // An escalation leaves the form in place, whatever a fallback parse above took
-            // from the same frame.
-            spec.resolution = None;
+            // from the same frame, until the handoff's own end settles it (`box_settlement`).
+            spec.resolution = resolution;
             spec.widget_dismissed = false;
         } else {
             spec.resolution = spec.resolution.or(resolution);
@@ -1024,8 +1024,15 @@ impl UserFormSpec {
         let request = form_request_object(value);
         let wire_resolution = parse_resolution(value);
         let widget_dismissed = bool_at(value, "widgetDismissed").unwrap_or(false);
-        let (resolution, widget_dismissed, computer_handoff) =
+        let (mut resolution, widget_dismissed, mut computer_handoff) =
             absorb_escalated_wire(wire_resolution, widget_dismissed);
+        if computer_handoff.is_some()
+            && let Some((form, computer)) =
+                box_settlement(&[value, value.get("value").unwrap_or(&Value::Null)])
+        {
+            resolution = Some(form);
+            computer_handoff = Some(computer);
+        }
         let fields = request
             .map(parse_fields)
             .or_else(|| value.get("fields").map(parse_fields_value))
@@ -1549,12 +1556,38 @@ pub(crate) fn park_settlement(
         .filter_map(parse_resolution)
         .collect();
     if said.contains(&FormResolution::Escalated) {
+        if let Some((form, computer)) = box_settlement(&[event, value]) {
+            return (Some(form), false, Some(computer));
+        }
         return absorb_escalated_wire(Some(FormResolution::Escalated), false);
     }
     let dismissed = [event, value]
         .into_iter()
         .any(|source| bool_at(source, "widgetDismissed") == Some(true));
     absorb_escalated_wire(said.first().copied(), dismissed)
+}
+
+/// How an escalated form's hand-off to the computer ended, as a replay says it (opengrok-server
+/// #143's half: the server stamps the escalated form's entry with the `sand://box` entry's own
+/// `boxResolution` when the handoff settles, and a replay carries it on the form's frames, top
+/// level and in `value`). Read the way the live answer is painted (`UserFormDispatch::
+/// ResolveHandoff`): handed back or timed out closes the form and marks the computer Done, and
+/// declined skips both. A word this app does not know still ends the handoff, closed and
+/// skipped, so no new word can bring back an "Action needed" nobody can answer. Absent, the
+/// handoff is still live.
+fn box_settlement(sources: &[&Value]) -> Option<(FormResolution, ComputerHandoffStatus)> {
+    let word = sources.iter().find_map(|source| {
+        source
+            .get("boxResolution")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+    })?;
+    Some(match word.to_ascii_lowercase().as_str() {
+        "handed_back" | "timed_out" => (FormResolution::Dismissed, ComputerHandoffStatus::Done),
+        "declined" => (FormResolution::Skipped, ComputerHandoffStatus::Skipped),
+        _ => (FormResolution::Dismissed, ComputerHandoffStatus::Skipped),
+    })
 }
 
 fn absorb_escalated_wire(

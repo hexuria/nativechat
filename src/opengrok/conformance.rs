@@ -1713,12 +1713,30 @@ fn awaiting(frame: &Value) -> Check {
         let objects: Vec<&Value> = std::iter::once(frame).chain(entry).collect();
         let words: Vec<FormResolution> = objects.iter().copied().filter_map(word).collect();
         let escalated = words.contains(&FormResolution::Escalated);
+        // How an escalation's hand-off ended, stamped on the form's entry once it settles
+        // (#143): any word at all ends it, and none means the computer still needs the person.
+        let handed_off = escalated
+            && objects.iter().any(|object| {
+                object
+                    .get("boxResolution")
+                    .and_then(Value::as_str)
+                    .is_some_and(|word| !word.trim().is_empty())
+            });
         let dismissed = !escalated && objects.iter().copied().any(flag);
-        let settled = !escalated && (!words.is_empty() || dismissed);
+        let settled = handed_off || (!escalated && (!words.is_empty() || dismissed));
         if escalated {
+            let computer = spec.computer_handoff;
             must!(
-                spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded),
-                "an escalated form hands the page to the computer: {spec:?}"
+                if handed_off {
+                    matches!(
+                        computer,
+                        Some(ComputerHandoffStatus::Done | ComputerHandoffStatus::Skipped)
+                    )
+                } else {
+                    computer == Some(ComputerHandoffStatus::ActionNeeded)
+                },
+                "an escalated form hands the page to the computer until the hand-off ends: \
+                 {spec:?}"
             );
         }
         must!(
@@ -3687,6 +3705,17 @@ fn the_ledger_reads_a_park_settlement_as_the_client_does() {
         park(Value::Null, Value::Null),
         // Another spelling of the escalation, as the client's parse reads it.
         park(Value::from("Escalated"), serde_json::json!({"id": "e_1"})),
+        // The hand-off ended (#143): stamped on the entry, and on the frame beside it.
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "formResolution": "escalated",
+                "widgetDismissed": true, "boxResolution": "handed_back"}),
+        ),
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "formResolution": "escalated",
+                "boxResolution": "declined"}),
+        ),
         // Another card's entry, matched by title and fields: it settles nothing here.
         park(
             Value::Null,
