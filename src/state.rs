@@ -148,6 +148,11 @@ pub struct AccountConnections {
     /// the connection's switch on that Bot's card and on no other Bot's, until that switch is
     /// pressed again or the server stops listing the connection.
     pub not_changed: HashMap<(String, String), String>,
+    /// Which way each lend or revoke in [`Self::not_changed`] was asked: `true` for a lend. A
+    /// change whose answer was lost past the deadline may still have been taken, and the read
+    /// that follows it settles that: once the server lists the connection lent (or not) to that
+    /// Bot as asked, the line saying it was not is untrue and goes.
+    pub not_changed_asked: HashMap<(String, String), bool>,
     /// The service whose sign-in page is being asked for.
     pub opening: Option<String>,
     /// The services the person was sent to their browser to connect, each with when the app
@@ -295,6 +300,10 @@ impl AccountConnections {
         }
         self.not_disconnected.remove(id);
         self.not_changed.retain(|(about, _), _| about != id);
+        self.not_changed_asked.retain(|(about, _), _| about != id);
+        if self.confirming_disconnect.as_deref() == Some(id) {
+            self.confirming_disconnect = None;
+        }
     }
 }
 
@@ -5319,6 +5328,32 @@ impl AppState {
                 // person's takes its lines along.
                 connections.not_disconnected.retain(|id, _| own(id));
                 connections.not_changed.retain(|(id, _), _| own(id));
+                // A change the server took after all, its answer lost, is a refusal no longer: the
+                // read shows the loan as it was asked.
+                let asked = &connections.not_changed_asked;
+                connections.not_changed.retain(|(id, bot), _| {
+                    let Some(lend) = asked.get(&(id.clone(), bot.clone())) else {
+                        return true;
+                    };
+                    let lent = rows
+                        .iter()
+                        .any(|row| &row.id == id && row.loans.iter().any(|loan| loan == bot));
+                    lent != *lend
+                });
+                let still = &connections.not_changed;
+                connections
+                    .not_changed_asked
+                    .retain(|key, _| still.contains_key(key));
+                // A "Disconnect …?" is about the row it was asked on. Once the server stops listing
+                // it, the question goes: a reconnect makes a connection under the same id, and it
+                // must come back as a row, not already asking to be deleted.
+                if connections
+                    .confirming_disconnect
+                    .as_deref()
+                    .is_some_and(|id| !own(id))
+                {
+                    connections.confirming_disconnect = None;
+                }
                 // The browser is done with a Connect once the service is one of the person's
                 // connections. Every other wait goes on until it has too, or runs out.
                 connections.waiting.retain(|service, _| {
@@ -5507,10 +5542,13 @@ impl AppState {
             (_, Ok(Some(row))) if row.id == connection_id => connections.put_row(row),
             (_, Ok(_)) => {}
             (ConnectionChange::Lend(coworker) | ConnectionChange::Revoke(coworker), Err(error)) => {
-                connections.not_changed.insert(
-                    (connection_id.to_string(), coworker.clone()),
-                    rules_refusal(NOT_CHANGED, &error),
-                );
+                let key = (connection_id.to_string(), coworker.clone());
+                connections
+                    .not_changed_asked
+                    .insert(key.clone(), matches!(change, ConnectionChange::Lend(_)));
+                connections
+                    .not_changed
+                    .insert(key, rules_refusal(NOT_CHANGED, &error));
             }
         }
         self.begin_connections_read()
@@ -25205,6 +25243,61 @@ mod tests {
             state.rereads_connections_on_activation(now),
             "a Bot's settings, with its Connections card, is on screen"
         );
+    }
+
+    /// A "Disconnect …?" goes when the server stops listing its row: the server makes a
+    /// reconnected service's connection under the same id, and the row must come back as a row,
+    /// not already asking, where Yes would delete the connection just made. A read that fails
+    /// says nothing about the row, and leaves the question as it was.
+    #[test]
+    fn a_disconnect_question_goes_with_its_row_and_does_not_come_back_with_it() {
+        let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+        assert!(state.connections.ask_to_disconnect("conn_1"));
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(
+            read,
+            Err(OpenGrokError::from_server(Some(503), "the store is down"))
+        ));
+        assert_eq!(
+            state.connections.confirming_disconnect.as_deref(),
+            Some("conn_1"),
+            "a failed read says nothing about the row"
+        );
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(vec![])));
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[])])));
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_1"),
+            "the reconnected row is not asking to be deleted"
+        );
+        assert_eq!(state.connections.confirming_disconnect, None);
+    }
+
+    /// A lend whose answer was lost past the deadline may have been taken. The read that follows
+    /// settles it: listed lent as asked, the line saying it was not goes; not lent, it stays.
+    #[test]
+    fn a_lend_the_read_shows_taken_is_no_longer_said_refused() {
+        let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+        for (lent_after, line_stays) in [(&[][..], true), (&["cw_1"][..], false)] {
+            state.connections.not_changed.insert(
+                ("conn_1".into(), "cw_1".into()),
+                "Could not change this: could not reach the server".into(),
+            );
+            state
+                .connections
+                .not_changed_asked
+                .insert(("conn_1".into(), "cw_1".into()), true);
+            let read = state.begin_connections_read().expect("a read").generation;
+            assert!(
+                state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", lent_after)]))
+            );
+            assert_eq!(
+                state.connections.lend_refusal("conn_1", "cw_1").is_some(),
+                line_stays,
+                "lent after the read: {lent_after:?}"
+            );
+        }
     }
 
     /// A refusal goes with its connection once the server no longer lists it as the person's.
