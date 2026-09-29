@@ -102,11 +102,30 @@
 //! bot used this month, or why it cannot say), `agent-usage-toggle` (Show / Hide, only while the
 //! server reported models), and `agent-usage-model-{i}` per model, visible while open (#138).
 //!
-//! In the bot's settings: `agent-tools` (value = the Tools card's second line: `2 built in · 1
-//! from plugins`, `Asking the server…`, or why there is no list), `agent-tools-toggle` (Show /
-//! Hide, only while tools are listed), and `agent-tool-{name}` per tool (value `builtin` /
-//! `plugin`; visible while the card is open). Read-only: what the server's
-//! `GET /coworkers/{id}/tools` says the bot is offered on its next turn.
+//! In the bot's settings: `agent-tools` (value = the Tools card's first line, what the server's
+//! `GET /coworkers/{id}/tools` says the bot is offered on its next turn: `2 built in · 1 from
+//! plugins`, `Asking the server…`, or why there is no list), `agent-ceiling` (value = `3 of 8
+//! allowed`, or why there are no switches; in the tree once the server has answered), and
+//! `agent-tools-toggle` (Show / Hide, only while there is something to show). Visible while the
+//! card is open: the card's own lines, `agent-ceiling-read-only` (the server's words for a 403:
+//! every switch is dead), `agent-ceiling-wait` (why every switch is dead for now: another Bot's
+//! switch, or a read of this Bot's ceiling, is with the server) and `agent-ceiling-note` (the
+//! server's words about the last switch when no row is the one they are about, as a 409's "the
+//! tools changed since you looked"); and one `agent-ceiling-switch-{name}` per row of the bot's
+//! tool ceiling (opengrok-server#268): a switch named by the row's heading, value `builtin` /
+//! `plugin`, `checked` where it stands (where it was asked to go while that is with the server),
+//! enabled only while a click would send it, states `switching` and `unavailable`. Under it:
+//! `agent-ceiling-why-{name}` (why the server cannot offer it now),
+//! `agent-ceiling-connector-{name}` (the connection a plugin uses) and
+//! `agent-ceiling-error-{name}` (the server's words for a switch it did not take, or that nobody
+//! knows whether it did). Every id under a row has
+//! its fixed word (`switch`, `why`, `connector`, `error`) before the row's name and the card's
+//! own ids have none, so no plugin's name makes one id another's. A click moves a live switch the
+//! other way and sends the whole ceiling at once, with the version it was read at; one at a time,
+//! so every switch is refused while any is with the server or the ceiling is being read, and a
+//! plugin the server no longer loads is refused going back on. Where the ceiling could not be
+//! read (a server without the route, a Bot this person does not own), the card lists what the
+//! next turn is offered instead, read-only: `agent-tool-{name}` (value `builtin` / `plugin`).
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
