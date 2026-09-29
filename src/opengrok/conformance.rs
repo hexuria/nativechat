@@ -47,12 +47,12 @@ use super::activity::{
     activity_from_replay,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerComputer, CoworkerUsage, DaemonEnrol,
-    DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail,
-    RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay, ScheduleKind,
-    ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary,
-    SkillVersion, StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available,
-    host_egress_tunnel_flag,
+    AnswerReply, AsyncRunResponse, BoxShareScope, ConnectionOwner, ConnectionView,
+    CoworkerComputer, CoworkerUsage, DaemonEnrol, DaemonList, LocalExecMode, LocalExecPolicy,
+    OpenGrokClient, QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult,
+    RunCause, RunReplay, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted,
+    ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion, StopReply, ThreadReplay,
+    ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -590,33 +590,6 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
 const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__connections",
-        "/connections",
-        "Settings → Connections and a bot's Connections card (nativechat#2). The server could not \
-         write a person's connection until opengrok-server#267, whose corpus records this list \
-         with one person's connection lent to a coworker; ConnectionView is transcribed from \
-         the shape agreed there.",
-    ),
-    (
-        "POST__connections__id__lend",
-        "/connections/{id}/lend",
-        "A bot's Connections switch. opengrok-server#267 records a lend, answered with the \
-         list's own row, and a lend refused with a JSON 404 for another account's connection.",
-    ),
-    (
-        "POST__connections__id__revoke",
-        "/connections/{id}/revoke",
-        "A bot's Connections switch, the other way. opengrok-server#267 records a revoke, \
-         answered with the list's own row.",
-    ),
-    (
-        "DELETE__connections__id_",
-        "/connections/{id}",
-        "Settings → Connections' Disconnect. opengrok-server#267 records one: a 204 with no \
-         body, after which the list no longer names the connection. Any 2xx is read as the \
-         connection gone.",
-    ),
     (
         "GET__connectors",
         "/connectors",
@@ -2057,6 +2030,10 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("PATCH__coworkers__coworker_id_", coworker_row),
     ("DELETE__coworkers__coworker_id_", coworker_deleted),
     ("GET__coworkers__coworker_id__tools", coworker_tools),
+    ("GET__connections", connections_listed),
+    ("POST__connections__id__lend", connection_changed),
+    ("POST__connections__id__revoke", connection_changed),
+    ("DELETE__connections__id_", connection_gone),
     ("GET__coworkers__coworker_id__usage", coworker_usage),
     ("GET__coworkers__coworker_id__computer", computer),
     ("GET__coworkers__coworker_id__screen", screen),
@@ -3242,6 +3219,62 @@ fn coworker_usage(_: u16, body: &Value) -> Check {
     must!(
         !usage.metered || usage.note.is_none() || usage.models.is_empty(),
         "a metered report with a note should have no models: {usage:?}"
+    );
+    Ok(())
+}
+
+/// One of the person's connections as the list and a lend or a revoke answer it
+/// (opengrok-server#267 `ConnectionView`): its id, service, whose it is, its label and the Bots
+/// it is lent to come through as sent.
+fn connection_reads_as_sent(row: &ConnectionView, raw: &Value) -> Check {
+    let owner = match (str_at(&raw["owner"], "scope"), opt_str(&raw["owner"], "id")) {
+        ("user", Some(id)) => ConnectionOwner::User(id.to_string()),
+        ("bot", Some(id)) => ConnectionOwner::Bot(id.to_string()),
+        ("global", _) => ConnectionOwner::Global,
+        _ => ConnectionOwner::Other,
+    };
+    let loans: Vec<&str> = raw["loans"]
+        .as_array()
+        .ok_or("a connection should carry its loans")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    must!(
+        row.id == str_at(raw, "id")
+            && row.connector == str_at(raw, "connector")
+            && row.owner == owner
+            && row.label == str_at(raw, "label")
+            && row.loans == loans
+            && Some(row.updated_at_ms) == raw.get("updatedAtMs").and_then(Value::as_i64)
+            && row.expires_at_ms == raw.get("expiresAtMs").and_then(Value::as_i64),
+        "a connection came through changed: {row:?} from {raw}"
+    );
+    Ok(())
+}
+
+/// `GET /connections`: always a list, and every row as sent.
+fn connections_listed(_: u16, body: &Value) -> Check {
+    let listed: Vec<ConnectionView> = parse(body)?;
+    let raw = body.as_array().ok_or("the connections should be a list")?;
+    same_len(&listed, raw)?;
+    for (row, raw) in listed.iter().zip(raw) {
+        connection_reads_as_sent(row, raw)?;
+    }
+    Ok(())
+}
+
+/// A lend or a revoke answers with the connection's row as the list has it, which the app puts
+/// in place of the one it listed.
+fn connection_changed(_: u16, body: &Value) -> Check {
+    let row: ConnectionView = parse(body)?;
+    connection_reads_as_sent(&row, body)
+}
+
+/// A disconnect answers 204 with nothing; the app takes any 2xx as the connection gone.
+fn connection_gone(status: u16, body: &Value) -> Check {
+    must!(
+        (200..300).contains(&status) && body_json(body).is_null(),
+        "a disconnect should be a 2xx with no body, not {status} {body}"
     );
     Ok(())
 }
