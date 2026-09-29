@@ -372,9 +372,11 @@ impl RenderOnce for MessageBubble {
             .into_any_element()
         };
 
+        let files_only = self.text.trim().is_empty() && !self.files.is_empty();
         let quote = self.reply_preview.clone().map(|preview| {
             div()
-                .mb(px(6.))
+                // Room before the words, and none in a bubble with no words under it.
+                .when(!files_only, |this| this.mb(px(6.)))
                 .pl(px(8.))
                 .border_l_2()
                 .border_color(fg.opacity(0.35))
@@ -395,38 +397,9 @@ impl RenderOnce for MessageBubble {
 
         // A message of files alone draws no bubble of words, but what it answers and whose it
         // is still go above its tiles (review of #140).
-        // With no bubble behind them, the quote and caption take the page's colours, not the
-        // bubble's: the person's bubble writes white on its fill, which on the page is white on
-        // white in the light theme (Cursor on #140). They are held to the bubble's width.
-        let wordless_head = (self.text.trim().is_empty() && !self.files.is_empty()).then(|| {
-            let page_fg = cx.theme().muted_foreground;
-            let page_rule = cx.theme().border;
-            v_flex()
-                .max_w(max_bubble)
-                .items_end()
-                .when_some(self.caption.clone(), |this, caption| {
-                    this.child(
-                        div()
-                            .mb(px(4.))
-                            .text_xs()
-                            .text_color(page_fg)
-                            .child(caption),
-                    )
-                })
-                .when_some(self.reply_preview.clone(), |this, preview| {
-                    this.child(
-                        div()
-                            .mb(px(6.))
-                            .pr(px(8.))
-                            .border_r_2()
-                            .border_color(page_rule)
-                            .text_xs()
-                            .text_color(page_fg)
-                            .text_right()
-                            .child(truncate_preview(&preview, 88)),
-                    )
-                })
-        });
+        // The bubble is drawn unless the message is files alone with nothing to say above them:
+        // a files-only reply keeps its quote in the same bubble a worded reply draws it in.
+        let draw_bubble = !files_only || self.reply_preview.is_some() || self.caption.is_some();
         let bubble = div()
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
             .flex_shrink_0()
@@ -443,7 +416,9 @@ impl RenderOnce for MessageBubble {
                 v_flex()
                     .when_some(caption, |this, caption| this.child(caption))
                     .when_some(quote, |this, quote| this.child(quote))
-                    .child(body),
+                    // A message of files alone has no words to draw: its bubble, when it has one,
+                    // holds only what it answers or whose it is (Cursor on #140).
+                    .when(!files_only, |this| this.child(body)),
             );
 
         let reaction_bg = cx.theme().background;
@@ -457,17 +432,15 @@ impl RenderOnce for MessageBubble {
         // The bubble shrink-wraps its text up to its cap; the shrink is a safety net only, for
         // a row narrower than chat_w says. The chip sits on the bubble's bottom edge: half of
         // its 22px is on the fill.
-        let wordless = self.text.trim().is_empty() && !self.files.is_empty();
         let tiles = (!self.files.is_empty()).then(|| sent_file_tiles(&self.files, is_me, cx));
         let bubble_stack = div()
             .relative()
             .flex_shrink(1.)
             .min_w_0()
             .when(self.reaction.is_some(), |this| this.mb(px(12.)))
-            .when(!wordless, |this| this.child(bubble))
-            .when_some(wordless_head, |this, head| this.child(head))
+            .when(draw_bubble, |this| this.child(bubble))
             .when_some(tiles, |this, tiles| {
-                this.child(div().when(!wordless, |this| this.mt(px(6.))).child(tiles))
+                this.child(div().when(draw_bubble, |this| this.mt(px(6.))).child(tiles))
             })
             // Under the bubble rather than in it: the words are the person's, the wait is
             // the app's, and the line goes the moment the turn is posted. Cancel and Edit
