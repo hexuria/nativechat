@@ -3804,12 +3804,11 @@ fn a_replayed_hand_off_that_ended_leaves_nothing_waiting() {
             }
         }
     }
-    // The recordings of opengrok-server #277: hand-back, declined, timed out and the park-only
-    // case. Its backfill recording (a form settled before the stamp) carries no word on its
-    // frames yet, reported to the server session; this becomes 5 when it does. Fewer means the
-    // corpus lost the case this test is about.
+    // The recordings of opengrok-server #277: hand-back, declined, timed out, the park-only case
+    // and the backfill (a form settled before the stamp, its end read from its run's answer).
+    // Fewer means the corpus lost the case this test is about.
     assert!(
-        ended.len() >= 4,
+        ended.len() >= 5,
         "the recorded hand-offs that ended: {ended:?}"
     );
 }
