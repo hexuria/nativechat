@@ -56,6 +56,10 @@ pub struct MessageBubble {
     timestamps_ok: bool,
     /// Held until the thread is idle: a small "Queued" under the bubble says so.
     queued: bool,
+    /// The files the person's message carried (#90), drawn under its words. A message of files
+    /// alone draws only them, with the same time, toolbar and queued line a worded one has
+    /// (#136).
+    files: Vec<crate::opengrok::Attachment>,
     app: Option<Entity<AppState>>,
 }
 
@@ -88,6 +92,7 @@ impl MessageBubble {
             ts_peek: 0.0,
             timestamps_ok: true,
             queued: false,
+            files: Vec::new(),
             app: None,
         }
     }
@@ -242,6 +247,11 @@ impl MessageBubble {
     pub fn is_cached(self, _is_cached: bool) -> Self {
         self
     }
+    pub fn files(mut self, files: Vec<crate::opengrok::Attachment>) -> Self {
+        self.files = files;
+        self
+    }
+
     pub fn queued(mut self, queued: bool) -> Self {
         self.queued = queued;
         self
@@ -362,9 +372,11 @@ impl RenderOnce for MessageBubble {
             .into_any_element()
         };
 
+        let files_only = self.text.trim().is_empty() && !self.files.is_empty();
         let quote = self.reply_preview.clone().map(|preview| {
             div()
-                .mb(px(6.))
+                // Room before the words, and none in a bubble with no words under it.
+                .when(!files_only, |this| this.mb(px(6.)))
                 .pl(px(8.))
                 .border_l_2()
                 .border_color(fg.opacity(0.35))
@@ -383,6 +395,11 @@ impl RenderOnce for MessageBubble {
                 .into_any_element()
         });
 
+        // A message of files alone draws no bubble of words, but what it answers and whose it
+        // is still go above its tiles (review of #140).
+        // The bubble is drawn unless the message is files alone with nothing to say above them:
+        // a files-only reply keeps its quote in the same bubble a worded reply draws it in.
+        let draw_bubble = !files_only || self.reply_preview.is_some() || self.caption.is_some();
         let bubble = div()
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
             .flex_shrink_0()
@@ -399,7 +416,9 @@ impl RenderOnce for MessageBubble {
                 v_flex()
                     .when_some(caption, |this, caption| this.child(caption))
                     .when_some(quote, |this, quote| this.child(quote))
-                    .child(body),
+                    // A message of files alone has no words to draw: its bubble, when it has one,
+                    // holds only what it answers or whose it is (Cursor on #140).
+                    .when(!files_only, |this| this.child(body)),
             );
 
         let reaction_bg = cx.theme().background;
@@ -413,12 +432,16 @@ impl RenderOnce for MessageBubble {
         // The bubble shrink-wraps its text up to its cap; the shrink is a safety net only, for
         // a row narrower than chat_w says. The chip sits on the bubble's bottom edge: half of
         // its 22px is on the fill.
+        let tiles = (!self.files.is_empty()).then(|| sent_file_tiles(&self.files, is_me, cx));
         let bubble_stack = div()
             .relative()
             .flex_shrink(1.)
             .min_w_0()
             .when(self.reaction.is_some(), |this| this.mb(px(12.)))
-            .child(bubble)
+            .when(draw_bubble, |this| this.child(bubble))
+            .when_some(tiles, |this, tiles| {
+                this.child(div().when(draw_bubble, |this| this.mt(px(6.))).child(tiles))
+            })
             // Under the bubble rather than in it: the words are the person's, the wait is
             // the app's, and the line goes the moment the turn is posted. Cancel and Edit
             // sit here so they do not wait on hovering the ⋯.
@@ -785,4 +808,59 @@ fn queued_hold_actions(
                     });
                 }),
         )
+}
+
+/// A sent message's files, each a tile with its name, kind and size (#90). The file stays on
+/// the server; the tile is drawn from the listing, not the bytes.
+fn sent_file_tiles(files: &[crate::opengrok::Attachment], is_me: bool, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    h_flex()
+        .flex_wrap()
+        .when(is_me, |this| this.justify_end())
+        .gap(px(6.))
+        .children(files.iter().map(|file| {
+            let kind = if file.mime == "application/pdf" {
+                "PDF"
+            } else if file.mime.starts_with("image/") {
+                "Image"
+            } else if file.mime.starts_with("video/") {
+                "Video"
+            } else {
+                "Text"
+            };
+            v_flex()
+                .id(ElementId::Name(format!("message-file-{}", file.id).into()))
+                .max_w(px(220.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(10.))
+                .bg(theme.secondary)
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.secondary_foreground)
+                        .truncate()
+                        .child(file.filename.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.secondary_foreground.opacity(0.7))
+                        .child(format!("{kind} · {}", human_size(file.size_bytes))),
+                )
+        }))
+        .into_any_element()
+}
+
+/// A file's size the way a person reads it.
+pub(crate) fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.;
+    let b = bytes as f64;
+    if b < KIB {
+        format!("{bytes} B")
+    } else if b < KIB * KIB {
+        format!("{:.0} KB", b / KIB)
+    } else {
+        format!("{:.1} MB", b / KIB / KIB)
+    }
 }
