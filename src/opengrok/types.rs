@@ -68,6 +68,22 @@ pub struct Coworker {
     pub hidden_from_sidebar: bool,
     #[serde(default, alias = "boxId", alias = "box_id")]
     pub box_id: Option<String>,
+    /// Who may use this bot: `private`, its owner alone, or `org`, shared with the owner's
+    /// organization. Transcribed from opengrok-server `agui/routes.rs` `coworker_row`, which
+    /// writes it on every row, as `fixtures/wire/rest/GET__coworkers/` records both words. The
+    /// app reads it through [`Self::is_shared`].
+    #[serde(default)]
+    pub visibility: Option<String>,
+}
+
+impl Coworker {
+    /// Shared with the owner's organization, so the people in it use this bot too, and a bot
+    /// used by others lets them read the skills attached to it (opengrok-server#270). Only the
+    /// server's `org` says so: a row that does not say, or says a word this app does not know,
+    /// is not claimed as shared.
+    pub fn is_shared(&self) -> bool {
+        self.visibility.as_deref() == Some("org")
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
