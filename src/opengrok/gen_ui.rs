@@ -3467,6 +3467,40 @@ mod tests {
                 other => panic!("expected the card, got {other:?}"),
             }
             assert!(!turn.waiting_user_form(), "nothing is being asked");
+            assert_eq!(
+                crate::opengrok::activity_from_agui(&event, None),
+                crate::opengrok::ActivityTick::Clear,
+                "an answered card is not waiting on anyone"
+            );
+        }
+
+        // Escalated to the computer: the escalation wins over a dismissal beside it, whether
+        // both are on the entry or split between the frame and the entry. The form stays in
+        // place and the computer is what now needs the person.
+        let escalated_entry = frame(
+            json!("escalated"),
+            json!({"id": "entry-1", "callId": "call-9", "formResolution": "escalated",
+                   "widgetDismissed": true}),
+        );
+        let split = frame(
+            json!("escalated"),
+            json!({"id": "entry-1", "callId": "call-9", "widgetDismissed": true}),
+        );
+        for event in [escalated_entry, split] {
+            let mut turn = TurnAssembler::default();
+            turn.push_event(&event);
+            let (_, parts) = turn.snapshot();
+            match parts.as_slice() {
+                [ChatPart::UserForm(spec)] => {
+                    assert!(spec.is_unresolved(), "escalated is not settled: {spec:?}");
+                    assert_eq!(
+                        spec.computer_handoff,
+                        Some(crate::opengrok::ComputerHandoffStatus::ActionNeeded)
+                    );
+                }
+                other => panic!("expected the card, got {other:?}"),
+            }
+            assert!(turn.waiting_user_form());
         }
     }
 
