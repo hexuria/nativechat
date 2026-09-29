@@ -47,12 +47,12 @@ use super::activity::{
     activity_from_replay,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, BoxShareScope, ConnectionOwner, ConnectionView,
-    CoworkerComputer, CoworkerUsage, DaemonEnrol, DaemonList, LocalExecMode, LocalExecPolicy,
-    OpenGrokClient, QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult,
-    RunCause, RunReplay, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted,
-    ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion, StopReply, ThreadReplay,
-    ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
+    AnswerReply, AsyncRunResponse, BoxShareScope, ConnectLink, ConnectionOwner, ConnectionView,
+    Connector, CoworkerComputer, CoworkerUsage, DaemonEnrol, DaemonList, LocalExecMode,
+    LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind,
+    RecipeRunResult, RunCause, RunReplay, ScheduleKind, ScheduleRow, ScheduleRun,
+    ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion, StopReply,
+    ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -476,6 +476,18 @@ const FIVE_HUNDRED_SHAPE: &str = "should carry its sentence under error, as JSON
 /// [`every_route_this_app_does_not_read_is_recorded_and_says_why`] fails until it does.
 const REST_NOT_READ: &[(&str, &str, &str)] = &[
     (
+        "GET__coworkers__coworker_id__ceiling",
+        "/coworkers/{coworker_id}/ceiling",
+        "A Bot's tool ceiling (opengrok-server#268, recorded since #282). This branch does not read \
+         it; nativechat#151 does, and takes this entry off when it lands.",
+    ),
+    (
+        "PUT__coworkers__coworker_id__ceiling",
+        "/coworkers/{coworker_id}/ceiling",
+        "A Bot's tool ceiling (opengrok-server#268, recorded since #282). This branch does not read \
+         it; nativechat#151 does, and takes this entry off when it lands.",
+    ),
+    (
         "GET__auth_cursor_dev_session_token",
         "/auth/cursor_dev_session_token",
         "The dev sign-in that stands in for Cursor's OAuth (opengrok-server auth/routes.rs). This \
@@ -589,20 +601,7 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__connectors",
-        "/connectors",
-        "The services Settings → Connections offers to connect. The route is \
-         opengrok-server#269, which brings its fixtures.",
-    ),
-    (
-        "GET__connections__connector__authorize",
-        "/connections/{connector}/authorize",
-        "Connect, asked with ?format=json for the page the browser opens. The JSON answer is \
-         opengrok-server#269, which brings its fixtures.",
-    ),
-];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
 
@@ -2034,6 +2033,8 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("POST__connections__id__lend", connection_changed),
     ("POST__connections__id__revoke", connection_changed),
     ("DELETE__connections__id_", connection_gone),
+    ("GET__connectors", connectors_listed),
+    ("GET__connections__connector__authorize", sign_in_link),
     ("GET__coworkers__coworker_id__usage", coworker_usage),
     ("GET__coworkers__coworker_id__computer", computer),
     ("GET__coworkers__coworker_id__screen", screen),
@@ -3248,6 +3249,37 @@ fn connection_reads_as_sent(row: &ConnectionView, raw: &Value) -> Check {
             && Some(row.updated_at_ms) == raw.get("updatedAtMs").and_then(Value::as_i64)
             && row.expires_at_ms == raw.get("expiresAtMs").and_then(Value::as_i64),
         "a connection came through changed: {row:?} from {raw}"
+    );
+    Ok(())
+}
+
+/// `GET /connectors` (opengrok-server#269): the services this server can connect, always a list,
+/// each by the name Connect asks for and the label its button says.
+fn connectors_listed(_: u16, body: &Value) -> Check {
+    let listed: Vec<Connector> = parse(body)?;
+    let raw = body.as_array().ok_or("the connectors should be a list")?;
+    same_len(&listed, raw)?;
+    for (connector, raw) in listed.iter().zip(raw) {
+        must!(
+            connector.name == str_at(raw, "name") && connector.label == str_at(raw, "label"),
+            "a connector came through changed: {connector:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
+/// `GET /connections/{connector}/authorize?format=json` (opengrok-server#269): the sign-in page the
+/// app opens in the person's browser, a web address, with when its signed state lapses.
+fn sign_in_link(_: u16, body: &Value) -> Check {
+    let link: ConnectLink = parse(body)?;
+    must!(
+        link.url == str_at(body, "url")
+            && url::Url::parse(&link.url).is_ok_and(|url| matches!(url.scheme(), "https" | "http")),
+        "the sign-in link should be a web address the app opens: {link:?}"
+    );
+    must!(
+        body.get("expiresAtMs").and_then(Value::as_i64).is_some(),
+        "the sign-in link should say when it lapses: {body}"
     );
     Ok(())
 }

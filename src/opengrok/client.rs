@@ -2876,8 +2876,8 @@ pub struct Connector {
 /// What `GET /connections/{connector}/authorize?format=json` answers (opengrok-server#269, as
 /// agreed): the service's own sign-in page, for the app to open in the person's browser.
 #[derive(Debug, Deserialize)]
-struct ConnectLink {
-    url: String,
+pub(crate) struct ConnectLink {
+    pub(crate) url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
