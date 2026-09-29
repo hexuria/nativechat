@@ -43,6 +43,34 @@ pub(crate) fn disconnect_id(connection_id: &str) -> String {
 }
 
 /// Why that row's last Disconnect did not go through.
+/// The row's "Disconnect …?" line, and its Yes and No.
+pub(crate) fn confirm_question_id(connection_id: &str) -> String {
+    format!("settings-connection-ask-{connection_id}")
+}
+
+pub(crate) fn confirm_yes_id(connection_id: &str) -> String {
+    format!("settings-connection-confirm-{connection_id}")
+}
+
+pub(crate) fn confirm_no_id(connection_id: &str) -> String {
+    format!("settings-connection-keep-{connection_id}")
+}
+
+/// What the row asks before a Disconnect: the service, and the Bots that would lose it, by name.
+pub(crate) fn confirm_question(
+    connections: &AccountConnections,
+    row: &ConnectionView,
+    name_of: impl Fn(&str) -> Option<String>,
+) -> String {
+    let service = connections.connector_label(&row.connector);
+    if row.loans.is_empty() {
+        return format!("Disconnect {service}? No Bot is using it.");
+    }
+    let lent = lent_line(&row.loans, name_of);
+    let who = lent.strip_prefix("Lent to ").unwrap_or(&lent);
+    format!("Disconnect {service}? {who} will lose it.")
+}
+
 pub(crate) fn row_error_id(connection_id: &str) -> String {
     format!("settings-connection-error-{connection_id}")
 }
@@ -301,20 +329,69 @@ pub(crate) fn connections_page(app: Entity<AppState>, cx: &App) -> impl IntoElem
                                     )
                                 }),
                         )
-                        .child(
-                            div().flex_shrink_0().child(
-                                Button::new(ElementId::Name(disconnect_id(&row.id).into()))
-                                    .label(disconnect_label(connections, &row.id))
-                                    .ghost()
-                                    .small()
-                                    .disabled(changing)
-                                    .on_click(move |_, _, cx| {
-                                        app.update(cx, |state, cx| {
-                                            state.disconnect_connection(id.clone(), cx);
-                                        });
-                                    }),
-                            ),
-                        ),
+                        .child(if connections.is_confirming_disconnect(&row.id) {
+                            // Asked first: the row says which Bots would lose the service, and
+                            // nothing is sent until Yes.
+                            let yes_app = app.clone();
+                            let yes_id = id.clone();
+                            v_flex()
+                                .flex_shrink_0()
+                                .items_end()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(confirm_question_id(&row.id)))
+                                        .text_xs()
+                                        .child(confirm_question(connections, row, name_of)),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap(px(6.))
+                                        .child(
+                                            Button::new(ElementId::Name(
+                                                confirm_no_id(&row.id).into(),
+                                            ))
+                                            .label("No")
+                                            .ghost()
+                                            .small()
+                                            .on_click(move |_, _, cx| {
+                                                app.update(cx, |state, cx| {
+                                                    state.keep_connection(cx);
+                                                });
+                                            }),
+                                        )
+                                        .child(
+                                            Button::new(ElementId::Name(
+                                                confirm_yes_id(&row.id).into(),
+                                            ))
+                                            .label("Yes, disconnect")
+                                            .danger()
+                                            .small()
+                                            .on_click(move |_, _, cx| {
+                                                yes_app.update(cx, |state, cx| {
+                                                    state.disconnect_connection(yes_id.clone(), cx);
+                                                });
+                                            }),
+                                        ),
+                                )
+                                .into_any_element()
+                        } else {
+                            div()
+                                .flex_shrink_0()
+                                .child(
+                                    Button::new(ElementId::Name(disconnect_id(&row.id).into()))
+                                        .label(disconnect_label(connections, &row.id))
+                                        .ghost()
+                                        .small()
+                                        .disabled(changing)
+                                        .on_click(move |_, _, cx| {
+                                            app.update(cx, |state, cx| {
+                                                state.ask_to_disconnect(id.clone(), cx);
+                                            });
+                                        }),
+                                )
+                                .into_any_element()
+                        }),
                 );
             }
             list.into_any_element()
@@ -548,6 +625,35 @@ pub(crate) fn agent_card(app: Entity<AppState>, coworker_id: &str, cx: &App) -> 
 
 #[cfg(test)]
 mod tests {
+    /// The row's question names the service and the Bots that would lose it, the way the row's
+    /// own line names them.
+    #[test]
+    fn a_disconnect_asks_about_the_bots_it_would_cut_off() {
+        let connections = AccountConnections::default();
+        let row = |loans: &[&str]| ConnectionView {
+            id: "conn_1".into(),
+            connector: "gmail".into(),
+            owner: crate::opengrok::ConnectionOwner::User("acct_1".into()),
+            label: "you@work.com".into(),
+            loans: loans.iter().map(|lent| lent.to_string()).collect(),
+            updated_at_ms: 1,
+            expires_at_ms: None,
+        };
+        let name_of = |id: &str| match id {
+            "cw_1" => Some("Ada".to_string()),
+            "cw_2" => Some("Bo".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            super::confirm_question(&connections, &row(&["cw_1", "cw_2"]), name_of),
+            "Disconnect gmail? Ada and Bo will lose it."
+        );
+        assert_eq!(
+            super::confirm_question(&connections, &row(&[]), name_of),
+            "Disconnect gmail? No Bot is using it."
+        );
+    }
+
     // Named rather than globbed: the module above takes all of `gpui_kit`, whose own `test`
     // attribute would stand in for the standard one.
     use super::{

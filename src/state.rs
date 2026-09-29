@@ -156,6 +156,10 @@ pub struct AccountConnections {
     pub waiting: HashMap<String, Instant>,
     /// Why the last Connect did not open the browser: the service, and why.
     pub connect_refused: Option<(String, String)>,
+    /// The connection whose Disconnect was pressed and is waiting on Yes or No. A Disconnect takes
+    /// the service from every Bot it is lent to and needs a browser sign-in to undo, so the row
+    /// asks first, naming the Bots that would lose it. One at a time.
+    pub confirming_disconnect: Option<String>,
 }
 
 impl AccountConnections {
@@ -174,6 +178,25 @@ impl AccountConnections {
 
     pub fn is_changing(&self, id: &str) -> bool {
         self.changing.contains_key(id)
+    }
+
+    /// Whether this row is asking "Disconnect …?" now: pressed, and still one of the person's own
+    /// listed connections with nothing with the server.
+    pub fn is_confirming_disconnect(&self, id: &str) -> bool {
+        self.confirming_disconnect.as_deref() == Some(id)
+            && !self.is_changing(id)
+            && self.own_rows().iter().any(|row| row.id == id)
+    }
+
+    /// Disconnect pressed: the row asks first. Refused for a row that is not the person's own
+    /// or has a change with the server.
+    pub fn ask_to_disconnect(&mut self, id: &str) -> bool {
+        if self.is_changing(id) || !self.own_rows().iter().any(|row| row.id == id) {
+            return false;
+        }
+        self.not_disconnected.remove(id);
+        self.confirming_disconnect = Some(id.to_string());
+        true
     }
 
     /// Why the last Disconnect of this connection did not go through.
@@ -5355,7 +5378,23 @@ impl AppState {
     /// Settings → Connections' Disconnect. The row stays, dimmed, until the server has said the
     /// connection is gone, and every loan goes with it.
     pub fn disconnect_connection(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        self.connections.confirming_disconnect = None;
         self.change_connection(connection_id, ConnectionChange::Disconnect, cx);
+    }
+
+    /// Settings → Connections' Disconnect, pressed: the row asks "Disconnect …?" before anything
+    /// is sent (see [`AccountConnections::confirming_disconnect`]).
+    pub fn ask_to_disconnect(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        if self.connections.ask_to_disconnect(&connection_id) {
+            cx.notify();
+        }
+    }
+
+    /// No, on the row's "Disconnect …?": nothing is sent and the row is as it was.
+    pub fn keep_connection(&mut self, cx: &mut Context<Self>) {
+        if self.connections.confirming_disconnect.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn change_connection(
@@ -24710,6 +24749,51 @@ mod tests {
             updated_at_ms: 1,
             expires_at_ms: None,
         }
+    }
+
+    /// Disconnect takes a service from every Bot it is lent to, so pressing it only asks: nothing
+    /// is with the server until Yes, and only the person's own listed connection can be asked
+    /// about, one at a time.
+    #[test]
+    fn a_disconnect_asks_first_and_sends_nothing_until_yes() {
+        let mut state = listed(vec![
+            connection("conn_1", "gmail", &["cw_1"]),
+            connection("conn_2", "github", &[]),
+        ]);
+        assert!(state.connections.ask_to_disconnect("conn_1"));
+        assert!(state.connections.is_confirming_disconnect("conn_1"));
+        assert!(
+            state.connections.changing.is_empty(),
+            "nothing is sent by asking"
+        );
+        assert!(state.connections.ask_to_disconnect("conn_2"));
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_1"),
+            "one row asks at a time"
+        );
+        assert!(
+            !state.connections.ask_to_disconnect("conn_9"),
+            "not a listed connection"
+        );
+        state
+            .connections
+            .changing
+            .insert("conn_2".into(), ConnectionChange::Disconnect);
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_2"),
+            "a row with a change at the server asks nothing"
+        );
+        assert!(!state.connections.ask_to_disconnect("conn_2"));
+        state.connections.changing.clear();
+        state.connections.list = Some(ConnectionList::Listed(vec![connection(
+            "conn_1",
+            "gmail",
+            &["cw_1"],
+        )]));
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_2"),
+            "a connection no longer listed asks nothing"
+        );
     }
 
     /// Signed in, with a server to ask, and the person's connections listed. Nothing is ever

@@ -625,6 +625,10 @@ pub enum Command {
     ConnectService(String),
     /// Settings → Connections' Disconnect, by the server's connection id.
     DisconnectConnection(String),
+    /// Disconnect pressed: the row asks "Disconnect …?" first.
+    AskDisconnect(String),
+    /// No, on that question.
+    KeepConnection,
     /// The open bot's Connections switch: lend it the connection, or take it back.
     SetConnectionLent {
         connection_id: String,
@@ -846,6 +850,8 @@ impl Command {
             Self::RefreshConnections => state.refresh_connections(cx),
             Self::ConnectService(connector) => state.connect_service(connector, cx),
             Self::DisconnectConnection(id) => state.disconnect_connection(id, cx),
+            Self::AskDisconnect(id) => state.ask_to_disconnect(id, cx),
+            Self::KeepConnection => state.keep_connection(cx),
             Self::SetConnectionLent {
                 connection_id,
                 lent,
@@ -3646,13 +3652,29 @@ impl NativeChatHost {
                     if changing {
                         node.states.push("changing".into());
                     }
-                    node = node.with_child(
-                        UiNode::button(
-                            ids::connection_disconnect(&row.id),
-                            connections::disconnect_label(connections, &row.id),
-                        )
-                        .with_enabled(!changing),
-                    );
+                    if connections.is_confirming_disconnect(&row.id) {
+                        // Asked first: the question, and its Yes and No, in place of Disconnect.
+                        node = node
+                            .with_child(UiNode::status(
+                                connections::confirm_question_id(&row.id),
+                                connections::confirm_question(connections, row, |id| {
+                                    self.bot_name(id)
+                                }),
+                            ))
+                            .with_child(UiNode::button(
+                                connections::confirm_yes_id(&row.id),
+                                "Yes, disconnect",
+                            ))
+                            .with_child(UiNode::button(connections::confirm_no_id(&row.id), "No"));
+                    } else {
+                        node = node.with_child(
+                            UiNode::button(
+                                ids::connection_disconnect(&row.id),
+                                connections::disconnect_label(connections, &row.id),
+                            )
+                            .with_enabled(!changing),
+                        );
+                    }
                     if let Some(why) = connections.disconnect_refusal(&row.id) {
                         node = node.with_child(UiNode::status(ids::connection_error(&row.id), why));
                     }
@@ -3778,8 +3800,31 @@ impl NativeChatHost {
                 off_tab()
             } else if connections.is_changing(&row.id) {
                 busy(&row.label)
+            } else if connections.is_confirming_disconnect(&row.id) {
+                Err(format!(
+                    "`{target}` is asking first: click `{}` or `{}`",
+                    connections::confirm_yes_id(&row.id),
+                    connections::confirm_no_id(&row.id)
+                ))
             } else {
+                Ok(Command::AskDisconnect(row.id.clone()))
+            });
+        }
+        if let Some(row) = rows.iter().find(|row| {
+            target == connections::confirm_yes_id(&row.id)
+                || target == connections::confirm_no_id(&row.id)
+        }) {
+            return Some(if !on_tab {
+                off_tab()
+            } else if !connections.is_confirming_disconnect(&row.id) {
+                Err(format!(
+                    "`{target}` is only there while the row asks \"Disconnect …?\": click `{}` first",
+                    ids::connection_disconnect(&row.id)
+                ))
+            } else if target == connections::confirm_yes_id(&row.id) {
                 Ok(Command::DisconnectConnection(row.id.clone()))
+            } else {
+                Ok(Command::KeepConnection)
             });
         }
         if let Some(row) = rows
@@ -3821,6 +3866,8 @@ impl NativeChatHost {
         // address rather than an unknown control. A Connect's refusal line shares its prefix
         // and is no control at all.
         let shaped = target.starts_with("settings-connection-disconnect-")
+            || target.starts_with("settings-connection-confirm-")
+            || target.starts_with("settings-connection-keep-")
             || target.starts_with("agent-connection-lend-")
             || (target.starts_with("settings-connect-")
                 && !target.starts_with("settings-connect-error-"));
@@ -9157,11 +9204,35 @@ mod tests {
         );
         assert!(tree.ids_are_unique());
 
+        // Disconnect asks first; its Yes and No are not there until it does.
+        let yes = crate::components::connections::confirm_yes_id("conn_1");
+        let no = crate::components::connections::confirm_no_id("conn_1");
+        assert!(host.click(&yes).is_err(), "nothing to say yes to yet");
         host.click(&ids::connection_disconnect("conn_1")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::AskDisconnect(id)) if id == "conn_1"
+        ));
+        host.connections.confirming_disconnect = Some("conn_1".into());
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&crate::components::connections::confirm_question_id(
+                "conn_1"
+            ))
+            .unwrap()
+            .name,
+            "Disconnect Gmail? Ada and 1 Bot not on your list will lose it."
+        );
+        assert!(tree.find(&ids::connection_disconnect("conn_1")).is_none());
+        assert!(tree.ids_are_unique());
+        host.click(&no).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::KeepConnection)));
+        host.click(&yes).unwrap();
         assert!(matches!(
             host.take_command(),
             Some(Command::DisconnectConnection(id)) if id == "conn_1"
         ));
+        host.connections.confirming_disconnect = None;
         host.click(&ids::connect("github")).unwrap();
         assert!(matches!(
             host.take_command(),

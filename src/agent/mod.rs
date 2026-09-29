@@ -116,7 +116,10 @@
 //! many are connected) with a `settings-connection-{id}` per connection (label = its label,
 //! value = the line under it: the service and who it is lent to, by bot name, a lend or a revoke
 //! with the server shown as asked; state `changing` while a change to it is with the server),
-//! holding `settings-connection-disconnect-{id}` (dead while changing) and
+//! holding `settings-connection-disconnect-{id}` (dead while changing; pressing it only asks,
+//! and while the row asks it is replaced by `settings-connection-ask-{id}`, value = "Disconnect
+//! Gmail? Ada and Bo will lose it.", with `settings-connection-confirm-{id}` to disconnect and
+//! `settings-connection-keep-{id}` to leave it) and
 //! `settings-connection-error-{id}` (why its last Disconnect did not go through);
 //! `settings-connections-empty` / `settings-connections-error` in its place when there is
 //! nothing to list or it could not be read. Then `settings-connectors` (value = how many
