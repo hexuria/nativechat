@@ -4104,6 +4104,11 @@ impl NativeChatHost {
             }
             Command::ToggleAgentTools
         } else if target == "agent-usage-toggle" {
+            if !self.agent_settings_open {
+                return Err(
+                    "`agent-usage-toggle` is in the bot's settings, which are closed".into(),
+                );
+            }
             if !matches!(&self.agent_usage, Some(crate::state::UsageReport::Read(read)) if !read.models.is_empty())
             {
                 return Err(
@@ -8695,12 +8700,16 @@ mod tests {
                 requests: 2,
                 input_tokens: 20,
                 output_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 cost_usd: "2.000000".into(),
             }],
             totals: UsageTotals {
                 requests: Some(2),
                 input_tokens: Some(20),
                 output_tokens: Some(10),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
                 cost_usd: Some("2.000000".into()),
             },
         }));
@@ -8722,6 +8731,11 @@ mod tests {
         ));
         host.agent_usage_open = true;
         assert!(host.snapshot().find("agent-usage-model-0").unwrap().visible);
+
+        // With the settings closed, the toggle is not on screen to click.
+        host.agent_settings_open = false;
+        assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+        host.agent_settings_open = true;
 
         // No models, nothing to open: the toggle is not there to click.
         host.agent_usage = Some(crate::state::UsageReport::Loading);

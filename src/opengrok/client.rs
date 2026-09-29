@@ -2550,7 +2550,9 @@ pub(crate) fn upload_filename(name: &str) -> String {
 /// Transcribed from opengrok-server `crates/opengrok-server/src/points.rs` (`UsageView`,
 /// `ModelUsageView`, `TotalsView`, camelCase) and its recorded answers in
 /// `fixtures/wire/rest/GET__coworkers__coworker_id__usage/`. A bot that is not metered has no
-/// models and every total null, and `note` says why. Only what the Usage card shows is read.
+/// models and every total null, and `note` says why. A metered bot whose gateway could not be
+/// asked is `metered: true` with a `note`, no models and zero totals: those zeros are not a
+/// measurement. Only what the Usage card shows is read.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CoworkerUsage {
@@ -2571,6 +2573,8 @@ pub struct ModelUsage {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     /// Dollars as the server writes them, six decimals: `"2.000000"`.
     pub cost_usd: String,
 }
@@ -2584,6 +2588,10 @@ pub struct UsageTotals {
     pub input_tokens: Option<i64>,
     #[serde(default)]
     pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
     #[serde(default)]
     pub cost_usd: Option<String>,
 }
@@ -6342,10 +6350,10 @@ mod tests {
                 "metered": true, "note": null, "seat": "api", "keyPrefix": "oag_live_x",
                 "window": "month",
                 "models": [{"modelId": "oag/cheap", "requests": 2, "inputTokens": 20,
-                    "outputTokens": 10, "cacheReadTokens": 0, "cacheWriteTokens": 0,
+                    "outputTokens": 10, "cacheReadTokens": 5, "cacheWriteTokens": 3,
                     "costUsd": "2.000000", "listUsd": "2.000000", "points": 10000000}],
                 "totals": {"requests": 2, "inputTokens": 20, "outputTokens": 10,
-                    "cacheReadTokens": 0, "cacheWriteTokens": 0, "costUsd": "2.000000",
+                    "cacheReadTokens": 5, "cacheWriteTokens": 3, "costUsd": "2.000000",
                     "listUsd": "2.000000", "points": 10000000}
             })))
             .mount(&server)
@@ -6366,6 +6374,20 @@ mod tests {
         assert!(used.metered);
         assert_eq!(used.models[0].model_id, "oag/cheap");
         assert_eq!(used.totals.requests, Some(2));
+        assert_eq!(
+            (
+                used.models[0].cache_read_tokens,
+                used.models[0].cache_write_tokens
+            ),
+            (5, 3)
+        );
+        assert_eq!(
+            (
+                used.totals.cache_read_tokens,
+                used.totals.cache_write_tokens
+            ),
+            (Some(5), Some(3))
+        );
         assert_eq!(used.totals.cost_usd.as_deref(), Some("2.000000"));
         let unmetered = client.coworker_usage("cw_2").await.unwrap();
         assert!(!unmetered.metered && unmetered.models.is_empty());

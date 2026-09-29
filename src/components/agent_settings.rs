@@ -819,14 +819,7 @@ impl Render for AgentSettings {
                                                                     // What the server says the bot used,
                                                                     // not a word the app made up (#138).
                                                                     .child(usage_line),
-                                                            )
-                                                            .children(usage_rows.into_iter().enumerate().map(|(i, line)| {
-                                                                div()
-                                                                    .id(SharedString::from(format!("agent-usage-model-{i}")))
-                                                                    .text_xs()
-                                                                    .text_color(muted)
-                                                                    .child(line)
-                                                            })),
+                                                            ),
                                                     )
                                                     // Only a list of models has anything to open to.
                                                     .when(
@@ -854,7 +847,22 @@ impl Render for AgentSettings {
                                                             )
                                                         },
                                                     ),
-                                            ),
+                                            )
+                                            // Under the header row, as the Tools card's list is, so
+                                            // the Hide button stays beside the card's own line.
+                                            .when(!usage_rows.is_empty(), |this| {
+                                                this.child(
+                                                    v_flex().pt(px(8.)).gap(px(4.)).children(
+                                                        usage_rows.into_iter().enumerate().map(|(i, line)| {
+                                                            div()
+                                                                .id(SharedString::from(format!("agent-usage-model-{i}")))
+                                                                .text_xs()
+                                                                .text_color(muted)
+                                                                .child(line)
+                                                        }),
+                                                    ),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -1570,17 +1578,30 @@ pub(crate) fn usage_summary(report: &UsageReport) -> String {
     match report {
         UsageReport::Loading => "Asking the server…".to_string(),
         UsageReport::Unavailable(why) => why.clone(),
-        // The server's note is a clause ("this coworker has no key of its own yet, …"); on the
-        // card it stands as its own line, so it starts with a capital.
-        UsageReport::Read(usage) if !usage.metered => usage
+        // A note means the numbers are not a measurement: the bot is not metered, or it is and
+        // the gateway could not be asked, which the server answers with zero totals. Either way
+        // the note is what the card says, never "No requests". The note is a clause ("this
+        // coworker has no key of its own yet, …"); on the card it stands as its own line, so it
+        // starts with a capital.
+        UsageReport::Read(usage) if usage.note.is_some() || !usage.metered => usage
             .note
             .as_deref()
             .map_or_else(|| "This bot's use is not measured.".to_string(), sentence),
+        // The gateway leaves attempts that were paid for but lost out of `requests`, so a month
+        // of none can still have models to show; only a month with nothing at all is "No".
         UsageReport::Read(usage) => match usage.totals.requests.unwrap_or(0) {
-            0 => "No requests this month".to_string(),
+            0 if usage.models.is_empty() => "No requests this month".to_string(),
             requests => {
-                let tokens = usage.totals.input_tokens.unwrap_or(0)
-                    + usage.totals.output_tokens.unwrap_or(0);
+                let totals = &usage.totals;
+                let tokens = [
+                    totals.input_tokens,
+                    totals.output_tokens,
+                    totals.cache_read_tokens,
+                    totals.cache_write_tokens,
+                ]
+                .into_iter()
+                .flatten()
+                .fold(0i64, i64::saturating_add);
                 let mut line = format!(
                     "{} this month · {} tokens",
                     plural(requests, "request"),
@@ -1609,7 +1630,13 @@ pub(crate) fn model_line(model: &crate::opengrok::ModelUsage) -> String {
         "{} · {} · {} tokens",
         model.model_id,
         plural(model.requests, "request"),
-        grouped(model.input_tokens + model.output_tokens)
+        grouped(
+            model
+                .input_tokens
+                .saturating_add(model.output_tokens)
+                .saturating_add(model.cache_read_tokens)
+                .saturating_add(model.cache_write_tokens)
+        )
     );
     if let Some(cost) = dollars(&model.cost_usd) {
         line.push_str(&format!(" · {cost}"));
@@ -1639,14 +1666,34 @@ fn grouped(n: i64) -> String {
 }
 
 /// The server's six-decimal dollars as a person reads them, to the cent; a sum under a cent that
-/// is not zero reads as "under $0.01" rather than as nothing spent.
+/// is not zero reads as "under $0.01" rather than as nothing spent. The decimal string is
+/// rounded as written, half a cent up: through a float, "1.005000" is 1.00499… and would read
+/// a cent short.
 fn dollars(six: &str) -> Option<String> {
-    let value: f64 = six.parse().ok()?;
-    Some(if value > 0.0 && value < 0.005 {
-        "under $0.01".to_string()
-    } else {
-        format!("${value:.2}")
-    })
+    let (whole, fraction) = six.trim().split_once('.').unwrap_or((six.trim(), ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digit = |at: usize| u64::from(fraction.as_bytes().get(at).map_or(0, |b| b - b'0'));
+    let whole: u64 = whole.parse().ok()?;
+    let cents = whole
+        .checked_mul(100)?
+        .checked_add(digit(0) * 10 + digit(1) + u64::from(digit(2) >= 5))?;
+    if cents == 0 {
+        return Some(if fraction.bytes().any(|b| b != b'0') {
+            "under $0.01".to_string()
+        } else {
+            "$0.00".to_string()
+        });
+    }
+    Some(format!(
+        "${}.{:02}",
+        grouped(i64::try_from(cents / 100).ok()?),
+        cents % 100
+    ))
 }
 
 /// The Tools card's second line: how many the bot is offered, and from where, or why the app
@@ -1803,22 +1850,38 @@ mod tools_tests {
                 requests: 1234,
                 input_tokens: 20000,
                 output_tokens: 1000,
+                cache_read_tokens: 500,
+                cache_write_tokens: 0,
                 cost_usd: "2.000000".into(),
             }],
             totals: crate::opengrok::UsageTotals {
                 requests: Some(1234),
                 input_tokens: Some(20000),
                 output_tokens: Some(1000),
+                cache_read_tokens: Some(500),
+                cache_write_tokens: Some(0),
                 cost_usd: Some("2.000000".into()),
             },
         };
         assert_eq!(
             usage_summary(&UsageReport::Read(used.clone())),
-            "1,234 requests this month · 21,000 tokens · $2.00"
+            "1,234 requests this month · 21,500 tokens · $2.00"
         );
         assert_eq!(
             model_line(&used.models[0]),
-            "oag/cheap · 1,234 requests · 21,000 tokens · $2.00"
+            "oag/cheap · 1,234 requests · 21,500 tokens · $2.00"
+        );
+        let one = ModelUsage {
+            requests: 1,
+            input_tokens: 900,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cost_usd: "0.004000".into(),
+            ..used.models[0].clone()
+        };
+        assert_eq!(
+            model_line(&one),
+            "oag/cheap · 1 request · 901 tokens · under $0.01"
         );
         let idle = CoworkerUsage {
             models: Vec::new(),
@@ -1829,8 +1892,35 @@ mod tools_tests {
             ..used.clone()
         };
         assert_eq!(
-            usage_summary(&UsageReport::Read(idle)),
-            "No requests this month"
+            usage_summary(&UsageReport::Read(idle.clone())),
+            "No requests this month",
+            "a fresh bot with real zeros and no note"
+        );
+        // Every attempt paid for but lost: no requests counted, yet a model with tokens and cost.
+        let lost = CoworkerUsage {
+            models: vec![ModelUsage {
+                requests: 0,
+                ..used.models[0].clone()
+            }],
+            totals: crate::opengrok::UsageTotals {
+                requests: Some(0),
+                ..used.totals.clone()
+            },
+            ..used.clone()
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(lost)),
+            "0 requests this month · 21,500 tokens · $2.00"
+        );
+        // Metered, but the gateway could not be asked: the server sends zero totals with a
+        // note, and those zeros are not a measurement.
+        let unread = CoworkerUsage {
+            note: Some("the gateway could not be asked: timed out".into()),
+            ..idle
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(unread)),
+            "The gateway could not be asked: timed out"
         );
         let unmetered = CoworkerUsage {
             metered: false,
@@ -1840,9 +1930,48 @@ mod tools_tests {
             ..used
         };
         assert_eq!(
-            usage_summary(&UsageReport::Read(unmetered)),
+            usage_summary(&UsageReport::Read(unmetered.clone())),
             "This coworker's key cannot serve"
         );
+        let unexplained = CoworkerUsage {
+            metered: false,
+            note: None,
+            ..unmetered
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(unexplained)),
+            "This bot's use is not measured."
+        );
         assert_eq!(usage_summary(&UsageReport::Loading), "Asking the server…");
+        assert_eq!(
+            usage_summary(&UsageReport::Unavailable(
+                "Only this bot's owner can see its usage.".into()
+            )),
+            "Only this bot's owner can see its usage."
+        );
+    }
+
+    /// The cents are rounded from the server's decimal string, not through a float, which puts
+    /// "1.005000" at 1.00499… and a cent short.
+    #[test]
+    fn dollars_round_the_servers_decimals_to_the_cent() {
+        for (six, read) in [
+            ("2.000000", Some("$2.00")),
+            ("0.015000", Some("$0.02")),
+            ("1.005000", Some("$1.01")),
+            ("1.004999", Some("$1.00")),
+            ("0.005000", Some("$0.01")),
+            ("0.004000", Some("under $0.01")),
+            ("0.000001", Some("under $0.01")),
+            ("0.000000", Some("$0.00")),
+            ("1234.5", Some("$1,234.50")),
+            ("7", Some("$7.00")),
+            ("-1.000000", None),
+            ("", None),
+            ("abc", None),
+            ("1.2.3", None),
+        ] {
+            assert_eq!(super::dollars(six).as_deref(), read, "{six:?}");
+        }
     }
 }

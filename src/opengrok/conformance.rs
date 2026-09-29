@@ -2950,10 +2950,6 @@ fn coworker_row(_: u16, body: &Value) -> Check {
     coworker_matches(&parse(body)?, body)
 }
 
-/// A bot's tools (opengrok-server `agui/routes.rs` `list_tools`): every tool the server lists
-/// comes through by the name the model is told, with its words and its kind. The kind is what
-/// sorts a tool under the server's own or a plugin's, and the parse defaults a missing one to
-/// empty, so a row that says none is caught here rather than filed as a plugin's.
 /// A bot's usage this month (opengrok-server `points.rs` `UsageView`): what the Usage card
 /// shows comes through as sent, metered or not (#138).
 fn coworker_usage(_: u16, body: &Value) -> Check {
@@ -2972,12 +2968,20 @@ fn coworker_usage(_: u16, body: &Value) -> Check {
         must!(
             model.model_id == str_at(raw, "modelId")
                 && Some(model.requests) == raw["requests"].as_i64()
+                && Some(model.input_tokens) == raw["inputTokens"].as_i64()
+                && Some(model.output_tokens) == raw["outputTokens"].as_i64()
+                && Some(model.cache_read_tokens) == raw["cacheReadTokens"].as_i64()
+                && Some(model.cache_write_tokens) == raw["cacheWriteTokens"].as_i64()
                 && model.cost_usd == str_at(raw, "costUsd"),
             "each model's use should come through: {model:?} from {raw}"
         );
     }
     must!(
         usage.totals.requests == body["totals"]["requests"].as_i64()
+            && usage.totals.input_tokens == body["totals"]["inputTokens"].as_i64()
+            && usage.totals.output_tokens == body["totals"]["outputTokens"].as_i64()
+            && usage.totals.cache_read_tokens == body["totals"]["cacheReadTokens"].as_i64()
+            && usage.totals.cache_write_tokens == body["totals"]["cacheWriteTokens"].as_i64()
             && usage.totals.cost_usd.as_deref() == body["totals"]["costUsd"].as_str(),
         "the totals should come through: {:?}",
         usage.totals
@@ -2986,9 +2990,19 @@ fn coworker_usage(_: u16, body: &Value) -> Check {
         usage.metered || (usage.models.is_empty() && usage.totals.requests.is_none()),
         "a bot that is not metered should have nothing to show: {usage:?}"
     );
+    // Metered with a note is the gateway not answering: its zeros are not a measurement, and
+    // the card shows the note instead of them.
+    must!(
+        !usage.metered || usage.note.is_none() || usage.models.is_empty(),
+        "a metered report with a note should have no models: {usage:?}"
+    );
     Ok(())
 }
 
+/// A bot's tools (opengrok-server `agui/routes.rs` `list_tools`): every tool the server lists
+/// comes through by the name the model is told, with its words and its kind. The kind is what
+/// sorts a tool under the server's own or a plugin's, and the parse defaults a missing one to
+/// empty, so a row that says none is caught here rather than filed as a plugin's.
 fn coworker_tools(_: u16, body: &Value) -> Check {
     let listing: ToolListing = parse(body)?;
     let raw = body["tools"]

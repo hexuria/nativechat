@@ -4869,20 +4869,34 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.coworker_usage(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                if state.usage_generation != generation
-                    || state.active_coworker_id.as_deref() != Some(coworker_id.as_str())
-                {
-                    return;
+                if state.settle_coworker_usage(generation, coworker_id, result) {
+                    cx.notify();
                 }
-                let report = match result {
-                    Ok(usage) => UsageReport::Read(usage),
-                    Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
-                };
-                state.coworker_usage = Some((coworker_id, report));
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Put an answer about a bot's usage on the card, unless it is no longer the one wanted: a
+    /// newer ask was made since, or the person has moved to another bot. Either way the card
+    /// must not show a report under the wrong bot's name, or an older report over a newer one.
+    fn settle_coworker_usage(
+        &mut self,
+        generation: u64,
+        coworker_id: String,
+        result: Result<crate::opengrok::CoworkerUsage, OpenGrokError>,
+    ) -> bool {
+        if self.usage_generation != generation
+            || self.active_coworker_id.as_deref() != Some(coworker_id.as_str())
+        {
+            return false;
+        }
+        let report = match result {
+            Ok(usage) => UsageReport::Read(usage),
+            Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+        };
+        self.coworker_usage = Some((coworker_id, report));
+        true
     }
 
     /// Ask the server what the open bot is offered on a turn. Asked each time its settings
@@ -23960,6 +23974,43 @@ mod tests {
         );
         state.auth_status = AuthStatus::SignedIn;
         state
+    }
+
+    /// A usage answer lands on the card only while it is still the one wanted: an older ask
+    /// that comes back after a newer one, or an answer for a bot the person has left, is
+    /// dropped rather than shown under the wrong name or over a newer report (#138).
+    #[test]
+    fn a_late_usage_answer_does_not_replace_the_card() {
+        let usage = |requests: i64| {
+            Ok(crate::opengrok::CoworkerUsage {
+                metered: true,
+                note: None,
+                window: "month".into(),
+                models: Vec::new(),
+                totals: crate::opengrok::UsageTotals {
+                    requests: Some(requests),
+                    ..Default::default()
+                },
+            })
+        };
+        let requests = |state: &AppState| match &state.coworker_usage {
+            Some((id, super::UsageReport::Read(read))) => Some((id.clone(), read.totals.requests)),
+            _ => None,
+        };
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+
+        // Two asks for the same bot; the newer answers first, then the older comes in late.
+        state.usage_generation = 2;
+        assert!(state.settle_coworker_usage(2, "cw_1".into(), usage(7)));
+        assert!(!state.settle_coworker_usage(1, "cw_1".into(), usage(3)));
+        assert_eq!(requests(&state), Some(("cw_1".into(), Some(7))));
+
+        // The person moved to another bot before the answer for the first came back.
+        state.active_coworker_id = Some("cw_2".into());
+        state.coworker_usage = None;
+        assert!(!state.settle_coworker_usage(2, "cw_1".into(), usage(9)));
+        assert_eq!(state.coworker_usage, None);
     }
 
     /// A walk, start to landing, the way `sync_server_threads` makes one.
