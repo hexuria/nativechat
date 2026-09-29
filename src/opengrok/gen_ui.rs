@@ -3558,8 +3558,8 @@ mod tests {
             ),
             (
                 "timed_out",
-                FormResolution::Dismissed,
-                ComputerHandoffStatus::Done,
+                FormResolution::Skipped,
+                ComputerHandoffStatus::Skipped,
             ),
             (
                 "declined",

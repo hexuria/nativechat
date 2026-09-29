@@ -1127,12 +1127,14 @@ impl UserFormSpec {
             .is_some_and(ComputerHandoffStatus::is_live)
     }
 
-    /// I'm done → Dismissed; Skip → Skipped.
+    /// I'm done → Dismissed; Skip, or a hand-off nobody finished in time → Skipped. A timeout is
+    /// the person never handing the computer back, so it is not said as done (#143, as agreed
+    /// with the server in opengrok-server #277).
     pub fn settle_form_from_box(resolution: BoxHandoffResolution) -> FormResolution {
         match resolution {
-            BoxHandoffResolution::Declined => FormResolution::Skipped,
-            BoxHandoffResolution::HandedBack | BoxHandoffResolution::TimedOut => {
-                FormResolution::Dismissed
+            BoxHandoffResolution::HandedBack => FormResolution::Dismissed,
+            BoxHandoffResolution::Declined | BoxHandoffResolution::TimedOut => {
+                FormResolution::Skipped
             }
         }
     }
@@ -1571,8 +1573,8 @@ pub(crate) fn park_settlement(
 /// #143's half: the server stamps the escalated form's entry with the `sand://box` entry's own
 /// `boxResolution` when the handoff settles, and a replay carries it on the form's frames, top
 /// level and in `value`). Read the way the live answer is painted (`UserFormDispatch::
-/// ResolveHandoff`): handed back or timed out closes the form and marks the computer Done, and
-/// declined skips both. A word this app does not know still ends the handoff, closed and
+/// ResolveHandoff`): handed back closes the form and marks the computer Done, and declined or
+/// timed out (nobody finished the hand-off) skips both. A word this app does not know still ends the handoff, closed and
 /// skipped, so no new word can bring back an "Action needed" nobody can answer. Absent, the
 /// handoff is still live.
 fn box_settlement(sources: &[&Value]) -> Option<(FormResolution, ComputerHandoffStatus)> {
@@ -1584,8 +1586,8 @@ fn box_settlement(sources: &[&Value]) -> Option<(FormResolution, ComputerHandoff
             .filter(|word| !word.is_empty())
     })?;
     Some(match word.to_ascii_lowercase().as_str() {
-        "handed_back" | "timed_out" => (FormResolution::Dismissed, ComputerHandoffStatus::Done),
-        "declined" => (FormResolution::Skipped, ComputerHandoffStatus::Skipped),
+        "handed_back" => (FormResolution::Dismissed, ComputerHandoffStatus::Done),
+        "declined" | "timed_out" => (FormResolution::Skipped, ComputerHandoffStatus::Skipped),
         _ => (FormResolution::Dismissed, ComputerHandoffStatus::Skipped),
     })
 }
@@ -2944,6 +2946,11 @@ mod tests {
         );
         assert_eq!(
             UserFormSpec::settle_form_from_box(BoxHandoffResolution::Declined),
+            FormResolution::Skipped
+        );
+        // Nobody finished the hand-off in time: skipped, never said as done, live as on replay.
+        assert_eq!(
+            UserFormSpec::settle_form_from_box(BoxHandoffResolution::TimedOut),
             FormResolution::Skipped
         );
     }

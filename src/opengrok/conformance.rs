@@ -1933,10 +1933,8 @@ fn settled_form(frame: &Value) -> Check {
         .filter(|word| !word.trim().is_empty());
         let expected = match ended {
             None => (None, ComputerHandoffStatus::ActionNeeded),
-            Some("handed_back" | "timed_out") => {
-                (Some(FormResolution::Dismissed), ComputerHandoffStatus::Done)
-            }
-            Some("declined") => (
+            Some("handed_back") => (Some(FormResolution::Dismissed), ComputerHandoffStatus::Done),
+            Some("declined" | "timed_out") => (
                 Some(FormResolution::Skipped),
                 ComputerHandoffStatus::Skipped,
             ),
