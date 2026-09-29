@@ -4,8 +4,8 @@ use crate::chrome::{
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
-use crate::opengrok::{CoworkerPatch, CoworkerTool, ModelEntry};
-use crate::state::{AppState, ToolList, UsageReport};
+use crate::opengrok::{CeilingRow, CoworkerPatch, ModelEntry, USER_MACHINE_SHELL};
+use crate::state::{AppState, CeilingRead, CeilingSwitch, ToolCeiling, ToolList, UsageReport};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
@@ -494,6 +494,37 @@ impl Render for AgentSettings {
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, list)| list.clone())
         };
+        let (ceiling, pending, in_flight) = {
+            let state = self.state.read(cx);
+            let open = state.active_coworker_id.as_deref();
+            (
+                state
+                    .coworker_ceiling
+                    .as_ref()
+                    .filter(|(owner, _)| open == Some(owner.as_str()))
+                    .map(|(_, ceiling)| ceiling.clone()),
+                // The switch with the server is drawn on its own Bot's row only; another Bot's
+                // still deadens every switch here, since one at a time is one at a time.
+                state
+                    .ceiling_switch
+                    .clone()
+                    .filter(|switch| open == Some(switch.coworker_id.as_str())),
+                state.ceiling_switch.is_some(),
+            )
+        };
+        let tools_line = tools.as_ref().map(tools_summary);
+        let allowed_line = ceiling
+            .as_ref()
+            .and_then(|ceiling| ceiling_line(ceiling, pending.as_ref()));
+        let (ceiling_rows, read_only) = match &ceiling {
+            Some(ToolCeiling::Read(read)) => (
+                shown_ceiling_rows(read, pending.as_ref(), in_flight),
+                read.read_only.clone(),
+            ),
+            _ => (Vec::new(), None),
+        };
+        let has_switches = !ceiling_rows.is_empty();
+        let danger = theme.danger;
         let usage = {
             let state = self.state.read(cx);
             state
@@ -908,7 +939,7 @@ impl Render for AgentSettings {
                                                 this.child(self.auto_review_body(auto_review_mode, cx))
                                             }),
                                     )
-                                    .when_some(tools, |this, tools| {
+                                    .when(tools.is_some() || ceiling.is_some(), |this| {
                                         this.child(
                                             div()
                                                 .id("agent-tools")
@@ -926,17 +957,33 @@ impl Render for AgentSettings {
                                                         .gap(px(10.))
                                                         .child(
                                                             v_flex()
+                                                                .min_w(px(0.))
                                                                 .gap(px(2.))
                                                                 .child(div().text_sm().child("Tools"))
-                                                                .child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(muted)
-                                                                        .child(tools_summary(&tools)),
-                                                                ),
+                                                                // What the next turn is offered, as
+                                                                // the server lists it: the switches
+                                                                // below are one of what decides that,
+                                                                // not the whole of it.
+                                                                .when_some(tools_line, |this, line| {
+                                                                    this.child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(muted)
+                                                                            .child(line),
+                                                                    )
+                                                                })
+                                                                .when_some(allowed_line, |this, line| {
+                                                                    this.child(
+                                                                        div()
+                                                                            .id("agent-ceiling")
+                                                                            .text_xs()
+                                                                            .text_color(muted)
+                                                                            .child(line),
+                                                                    )
+                                                                }),
                                                         )
                                                         .when(
-                                                            matches!(tools, ToolList::Listed(ref all) if !all.is_empty()),
+                                                            has_switches,
                                                             |this| {
                                                                 this.child(
                                                                     div()
@@ -964,14 +1011,14 @@ impl Render for AgentSettings {
                                                             },
                                                         ),
                                                 )
-                                                .when(tools_open, |this| {
-                                                    this.when_some(
-                                                        match &tools {
-                                                            ToolList::Listed(all) => Some(all.clone()),
-                                                            _ => None,
-                                                        },
-                                                        |this, all| this.child(tools_body(&all, muted)),
-                                                    )
+                                                .when(tools_open && has_switches, |this| {
+                                                    this.child(ceiling_body(
+                                                        app.clone(),
+                                                        ceiling_rows,
+                                                        read_only,
+                                                        muted,
+                                                        danger,
+                                                    ))
                                                 }),
                                         )
                                     })
@@ -1731,52 +1778,461 @@ fn first_line_of(description: &str) -> String {
     format!("{}…", cut[..at_word].trim_end())
 }
 
-/// The list itself: each tool by its wire name, which is what the model is told, with the
-/// first line of what the server says it does. Nothing here can be switched: choosing a bot's
-/// tools is not on the server yet (opengrok-server#84), and a switch that only lived in this
-/// app would not change what the bot is offered.
-fn tools_body(all: &[CoworkerTool], muted: Hsla) -> impl IntoElement {
-    let (built_in, plugins): (Vec<_>, Vec<_>) = all.iter().partition(|tool| tool.is_builtin());
-    let group = |title: &'static str, tools: Vec<&CoworkerTool>| {
+/// Why `user_machine_shell` cannot be offered: it runs its commands on the person's own machine,
+/// and the server has none enrolled to run them on.
+pub(crate) const NEEDS_AN_ENROLLED_MAC: &str = "Needs this Mac enrolled as a machine";
+
+/// Why a plugin the server no longer loads cannot be offered. It stays listed while it is on,
+/// and its switch can only take it off.
+pub(crate) const NO_LONGER_ON_THE_SERVER: &str = "No longer on the server";
+
+/// Why any other row cannot be offered. The server says that it cannot and not why, so this says
+/// no more than that.
+pub(crate) const NOT_AVAILABLE_NOW: &str = "Not available on this server now";
+
+/// The ceiling's line when the server has no rows in it at all.
+pub(crate) const NOTHING_TO_SWITCH: &str = "Nothing to switch on or off.";
+
+/// One row of the Tools card, as it is drawn and as the driver is told it is drawn: both are made
+/// from this, so the two cannot disagree about where a switch stands or whether it can move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShownCeilingRow {
+    /// The server's name for it, which is what its switch is known by.
+    pub name: String,
+    /// What the row is headed with: a builtin's wire name, which is what the model is told, or a
+    /// plugin's label, or the plugin's name where it has none.
+    pub title: String,
+    pub builtin: bool,
+    /// The first line of what the server says it is.
+    pub first_line: String,
+    /// Where the switch stands: where the server has it, or where it was asked to go while that
+    /// is with the server.
+    pub on: bool,
+    /// This row's switch is the one with the server.
+    pub switching: bool,
+    /// The switch can be moved now. It cannot while any switch is with the server, on a card the
+    /// server has said is not this person's to change, or to switch on a row the server could
+    /// not offer.
+    pub live: bool,
+    /// Why the server could not offer it, when it could not.
+    pub unavailable: Option<&'static str>,
+    /// The connection a plugin works through, as a note.
+    pub connector: Option<String>,
+    /// Why the server did not take this row's last switch, in its words.
+    pub refused: Option<String>,
+}
+
+/// The rows of a ceiling as the Tools card draws them, in the server's order. `pending` is the
+/// open Bot's switch with the server, if there is one; `in_flight` is whether any switch is, for
+/// any Bot, since only one is ever sent at a time.
+pub(crate) fn shown_ceiling_rows(
+    read: &CeilingRead,
+    pending: Option<&CeilingSwitch>,
+    in_flight: bool,
+) -> Vec<ShownCeilingRow> {
+    read.rows
+        .iter()
+        .map(|row| {
+            let on = read.shown_on(row, pending);
+            ShownCeilingRow {
+                name: row.name.clone(),
+                title: ceiling_title(row),
+                builtin: row.is_builtin(),
+                first_line: row
+                    .description
+                    .as_deref()
+                    .map(first_line_of)
+                    .unwrap_or_default(),
+                on,
+                switching: pending.is_some_and(|switch| switch.name == row.name),
+                live: read.may_switch(&row.name, !on, in_flight).is_ok(),
+                unavailable: unavailable_why(row),
+                connector: connector_note(row),
+                refused: read
+                    .refused
+                    .as_ref()
+                    .filter(|(name, _)| *name == row.name)
+                    .map(|(_, why)| why.clone()),
+            }
+        })
+        .collect()
+}
+
+/// The Tools card's line about the ceiling, under the line about the next turn: how many rows are
+/// allowed as the switches stand, or why there are no switches. Nothing while it is still being
+/// asked for, which the card's own line is already saying.
+pub(crate) fn ceiling_line(
+    ceiling: &ToolCeiling,
+    pending: Option<&CeilingSwitch>,
+) -> Option<String> {
+    match ceiling {
+        ToolCeiling::Loading => None,
+        ToolCeiling::Unavailable(why) => Some(why.clone()),
+        ToolCeiling::Read(read) if read.rows.is_empty() => Some(NOTHING_TO_SWITCH.to_string()),
+        ToolCeiling::Read(read) => {
+            let (on, of) = read.allowed(pending);
+            Some(format!("{on} of {of} allowed"))
+        }
+    }
+}
+
+/// What a row is headed with; see [`ShownCeilingRow::title`].
+fn ceiling_title(row: &CeilingRow) -> String {
+    if row.is_builtin() {
+        return row.name.clone();
+    }
+    row.label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(&row.name)
+        .to_string()
+}
+
+/// Why the server could not offer a row, in words for the row, when it could not.
+pub(crate) fn unavailable_why(row: &CeilingRow) -> Option<&'static str> {
+    if row.is_available() {
+        return None;
+    }
+    Some(if row.name == USER_MACHINE_SHELL {
+        NEEDS_AN_ENROLLED_MAC
+    } else if row.is_builtin() {
+        NOT_AVAILABLE_NOW
+    } else {
+        NO_LONGER_ON_THE_SERVER
+    })
+}
+
+/// The note on a plugin that works through one of the person's connections: "Uses a Gmail
+/// connection". The server sends the connector's id, which is written here as a name; the
+/// connection itself is made and lent elsewhere, and the plugin's switch does not do either.
+pub(crate) fn connector_note(row: &CeilingRow) -> Option<String> {
+    if row.is_builtin() {
+        return None;
+    }
+    let connector = row
+        .connector
+        .as_deref()
+        .map(str::trim)
+        .filter(|connector| !connector.is_empty())?;
+    let service = connector
+        .split(['_', '-', ' '])
+        .filter(|word| !word.is_empty())
+        .map(sentence)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let article = if service.starts_with(['A', 'E', 'I', 'O', 'U']) {
+        "an"
+    } else {
+        "a"
+    };
+    Some(format!("Uses {article} {service} connection"))
+}
+
+/// The switches: every tool the server has and every plugin it knows, under the two headings the
+/// card has always had. A switch is sent the moment it is clicked, and only a live one takes a
+/// click; one that cannot move now is drawn dimmed.
+fn ceiling_body(
+    app: Entity<AppState>,
+    rows: Vec<ShownCeilingRow>,
+    read_only: Option<String>,
+    muted: Hsla,
+    danger: Hsla,
+) -> impl IntoElement {
+    let (built_in, plugins): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.builtin);
+    let group = |title: &'static str, rows: Vec<ShownCeilingRow>| {
         v_flex()
-            .gap(px(6.))
+            .gap(px(8.))
             .child(div().text_xs().text_color(muted).child(title))
-            .children(tools.into_iter().enumerate().map(|(at, tool)| {
-                let first_line = first_line_of(&tool.description);
-                // By place, not by name: the server's names are unique per turn, but a row's id
-                // must not depend on that holding.
-                v_flex()
-                    .id(SharedString::from(format!("agent-tool-{title}-{at}")))
-                    .gap(px(1.))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_family("Menlo")
-                            .child(tool.name.clone()),
-                    )
-                    .when(!first_line.is_empty(), |this| {
-                        this.child(div().text_xs().text_color(muted).child(first_line))
-                    })
-            }))
+            .children(
+                rows.into_iter()
+                    .map(|row| ceiling_row(app.clone(), row, muted, danger)),
+            )
     };
     v_flex()
         .pt(px(12.))
         .gap(px(12.))
+        // Above the switches, because it is why every one of them is dead.
+        .when_some(read_only, |this, why| {
+            this.child(
+                div()
+                    .id("agent-ceiling-read-only")
+                    .text_xs()
+                    .text_color(muted)
+                    .child(why),
+            )
+        })
         .when(!built_in.is_empty(), |this| this.child(group("Built in", built_in)))
         .when(!plugins.is_empty(), |this| this.child(group("From plugins", plugins)))
         .child(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child("What this bot is offered on its next turn. Choosing which tools it gets is not on the server yet."),
+                .child("What this Bot may be offered. Its next turn is not offered anything switched off here."),
         )
+}
+
+/// One row: what it is, and its switch at the right. A row the server could not offer is dimmed
+/// with why under it, and the server's words for a switch it refused are under the row they are
+/// about.
+fn ceiling_row(
+    app: Entity<AppState>,
+    row: ShownCeilingRow,
+    muted: Hsla,
+    danger: Hsla,
+) -> impl IntoElement {
+    let ShownCeilingRow {
+        name,
+        title,
+        builtin,
+        first_line,
+        on,
+        live,
+        unavailable,
+        connector,
+        refused,
+        ..
+    } = row;
+    let switch_id = SharedString::from(format!("agent-ceiling-{name}"));
+    let why_id = SharedString::from(format!("agent-ceiling-why-{name}"));
+    let connector_id = SharedString::from(format!("agent-ceiling-connector-{name}"));
+    let error_id = SharedString::from(format!("agent-ceiling-error-{name}"));
+    v_flex()
+        .id(SharedString::from(format!("agent-ceiling-row-{name}")))
+        .gap(px(2.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.))
+                .child(
+                    v_flex()
+                        .min_w(px(0.))
+                        .flex_1()
+                        .gap(px(1.))
+                        .when(unavailable.is_some(), |this| this.opacity(0.5))
+                        .child(
+                            div()
+                                .text_sm()
+                                .when(builtin, |this| this.font_family("Menlo"))
+                                .child(title),
+                        )
+                        .when(!first_line.is_empty(), |this| {
+                            this.child(div().text_xs().text_color(muted).child(first_line))
+                        }),
+                )
+                .child(
+                    div()
+                        .id(switch_id)
+                        .flex_shrink_0()
+                        .when(!live, |this| this.opacity(0.5))
+                        .when(live, |this| {
+                            this.cursor_pointer().on_mouse_down(
+                                MouseButton::Left,
+                                move |_, _, cx| {
+                                    app.update(cx, |state, cx| {
+                                        state.switch_ceiling_tool(name.clone(), !on, cx);
+                                    });
+                                },
+                            )
+                        })
+                        .child(notify_switch(on)),
+                ),
+        )
+        .when_some(unavailable, |this, why| {
+            this.child(div().id(why_id).text_xs().text_color(muted).child(why))
+        })
+        .when_some(connector, |this, note| {
+            this.child(
+                div()
+                    .id(connector_id)
+                    .text_xs()
+                    .text_color(muted)
+                    .child(note),
+            )
+        })
+        .when_some(refused, |this, words| {
+            this.child(div().id(error_id).text_xs().text_color(danger).child(words))
+        })
 }
 
 #[cfg(test)]
 mod tools_tests {
-    use super::{first_line_of, model_line, tools_summary, usage_summary};
-    use crate::opengrok::CoworkerTool;
-    use crate::state::ToolList;
+    use super::{
+        NEEDS_AN_ENROLLED_MAC, NO_LONGER_ON_THE_SERVER, NOT_AVAILABLE_NOW, NOTHING_TO_SWITCH,
+        ceiling_line, connector_note, first_line_of, model_line, shown_ceiling_rows, tools_summary,
+        usage_summary,
+    };
+    use crate::opengrok::{CeilingRow, CoworkerTool};
+    use crate::state::{CeilingRead, CeilingSwitch, NOT_THE_OWNER, ToolCeiling, ToolList};
+
+    fn rows(json: serde_json::Value) -> Vec<CeilingRow> {
+        serde_json::from_value(json).expect("ceiling rows")
+    }
+
+    /// A ceiling with every kind of row the card draws: a builtin with words, `user_machine_shell`
+    /// with no machine enrolled, a plugin with its label and connection, a plugin with a label
+    /// and nothing else, and one the server no longer loads, still on.
+    fn a_read() -> CeilingRead {
+        CeilingRead {
+            rows: rows(serde_json::json!([
+                {"name": "shell", "kind": "builtin", "enabled": true,
+                    "description": "Run a shell command.\nIt runs on the Bot's own computer."},
+                {"name": "user_machine_shell", "kind": "builtin", "enabled": false,
+                    "available": false},
+                {"name": "gmail", "kind": "plugin", "enabled": false, "label": "Gmail",
+                    "description": "Read and send mail.", "connector": "gmail"},
+                {"name": "notes", "kind": "plugin", "enabled": true, "label": "  "},
+                {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
+            ])),
+            read_only: None,
+            refused: None,
+        }
+    }
+
+    /// The card's line about the ceiling counts the switches as they stand on screen, and says
+    /// why there are none when there are none. While it is being asked for it says nothing: the
+    /// card's own line is saying that already.
+    #[test]
+    fn the_tools_card_says_how_many_are_allowed() {
+        let read = a_read();
+        let line = |pending: Option<&CeilingSwitch>| {
+            ceiling_line(&ToolCeiling::Read(read.clone()), pending)
+        };
+        assert_eq!(line(None).as_deref(), Some("3 of 5 allowed"));
+        let asked = CeilingSwitch {
+            coworker_id: "cw_1".into(),
+            name: "gmail".into(),
+            enabled: true,
+        };
+        assert_eq!(
+            line(Some(&asked)).as_deref(),
+            Some("4 of 5 allowed"),
+            "the count says what the switches say"
+        );
+        assert_eq!(ceiling_line(&ToolCeiling::Loading, None), None);
+        assert_eq!(
+            ceiling_line(&ToolCeiling::Unavailable(NOT_THE_OWNER.into()), None).as_deref(),
+            Some(NOT_THE_OWNER)
+        );
+        let empty = CeilingRead {
+            rows: Vec::new(),
+            ..read
+        };
+        assert_eq!(
+            ceiling_line(&ToolCeiling::Read(empty), None).as_deref(),
+            Some(NOTHING_TO_SWITCH)
+        );
+    }
+
+    /// Each row is drawn as the server describes it: a builtin by its wire name, a plugin by its
+    /// label or else its name, the first line of its words, and why it cannot be offered when it
+    /// cannot. Only a switch a click would send is live.
+    #[test]
+    fn a_ceiling_row_is_drawn_as_the_server_describes_it() {
+        let shown = shown_ceiling_rows(&a_read(), None, false);
+        let titles: Vec<&str> = shown.iter().map(|row| row.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["shell", "user_machine_shell", "Gmail", "notes", "old_crm"],
+            "a blank label is no label"
+        );
+        assert_eq!(shown[0].first_line, "Run a shell command.");
+        assert!(shown[0].builtin && !shown[2].builtin);
+        assert_eq!(
+            shown.iter().map(|row| row.unavailable).collect::<Vec<_>>(),
+            [
+                None,
+                Some(NEEDS_AN_ENROLLED_MAC),
+                None,
+                None,
+                Some(NO_LONGER_ON_THE_SERVER)
+            ]
+        );
+        assert_eq!(
+            shown[2].connector.as_deref(),
+            Some("Uses a Gmail connection")
+        );
+        assert_eq!(
+            shown.iter().map(|row| row.live).collect::<Vec<_>>(),
+            [true, false, true, true, true],
+            "unavailable and off cannot go on; unavailable and on can go off"
+        );
+    }
+
+    /// Nothing is live while a switch is with the server, whichever Bot's, or once the server has
+    /// said the person cannot change the ceiling; the row that was switched shows where it was
+    /// asked to go, and the server's words sit under the row they are about and no other.
+    #[test]
+    fn a_switch_is_dead_while_another_is_with_the_server() {
+        let asked = CeilingSwitch {
+            coworker_id: "cw_1".into(),
+            name: "gmail".into(),
+            enabled: true,
+        };
+        let shown = shown_ceiling_rows(&a_read(), Some(&asked), true);
+        assert!(shown.iter().all(|row| !row.live));
+        assert!(shown[2].on && shown[2].switching);
+        assert!(!shown[0].switching);
+        let another_bots = shown_ceiling_rows(&a_read(), None, true);
+        assert!(another_bots.iter().all(|row| !row.live));
+        assert!(
+            !another_bots[2].on,
+            "and draws nothing of another Bot's switch"
+        );
+
+        let read_only = CeilingRead {
+            read_only: Some(NOT_THE_OWNER.into()),
+            refused: Some(("gmail".into(), "no tool or plugin named gmail".into())),
+            ..a_read()
+        };
+        let shown = shown_ceiling_rows(&read_only, None, false);
+        assert!(shown.iter().all(|row| !row.live));
+        assert_eq!(
+            shown
+                .iter()
+                .map(|row| row.refused.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                None,
+                None,
+                Some("no tool or plugin named gmail"),
+                None,
+                None
+            ]
+        );
+    }
+
+    /// A connection is named as a person names the service, with the article it takes, and only
+    /// on a plugin.
+    #[test]
+    fn a_plugins_connection_is_named_as_a_service() {
+        let row = |kind: &str, connector: &str| {
+            rows(serde_json::json!([
+                {"name": "x", "kind": kind, "enabled": true, "connector": connector}
+            ]))
+            .remove(0)
+        };
+        assert_eq!(
+            connector_note(&row("plugin", "google_drive")).as_deref(),
+            Some("Uses a Google Drive connection")
+        );
+        assert_eq!(
+            connector_note(&row("plugin", "outlook")).as_deref(),
+            Some("Uses an Outlook connection")
+        );
+        assert_eq!(connector_note(&row("plugin", " ")), None);
+        assert_eq!(connector_note(&row("builtin", "gmail")), None);
+        let odd = rows(serde_json::json!([
+            {"name": "fetch", "kind": "builtin", "enabled": false, "available": false}
+        ]));
+        assert_eq!(
+            super::unavailable_why(&odd[0]),
+            Some(NOT_AVAILABLE_NOW),
+            "a builtin the server could not offer, and did not say why"
+        );
+    }
 
     fn tool(name: &str, kind: &str) -> CoworkerTool {
         CoworkerTool {

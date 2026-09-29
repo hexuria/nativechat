@@ -1397,8 +1397,9 @@ impl OpenGrokClient {
     }
 
     /// `GET /coworkers/{id}/tools` — exactly what the model is offered on this bot's next turn,
-    /// assembled from its grant, its computer and its plugins. Read-only: nothing on the server
-    /// changes the set yet (opengrok-server#84), so the app only shows it.
+    /// assembled from its grant, its computer and its plugins, under its ceiling. The app changes
+    /// the ceiling ([`Self::set_coworker_ceiling`]) and only ever reads this, since what comes of
+    /// a change is the server's to work out.
     pub async fn coworker_tools(
         &self,
         coworker_id: &str,
@@ -1409,6 +1410,41 @@ impl OpenGrokClient {
             .await?;
         let listing: ToolListing = Self::json_or_error(response).await?;
         Ok(listing.tools)
+    }
+
+    /// `GET /coworkers/{id}/ceiling` — every tool the server has and every plugin it knows, and
+    /// which of them this bot may be offered at all (opengrok-server#268). Owner only: anybody
+    /// else is answered 404, `{"error": "no such coworker"}`.
+    pub async fn coworker_ceiling(
+        &self,
+        coworker_id: &str,
+    ) -> Result<CoworkerCeiling, OpenGrokError> {
+        let path = format!("/coworkers/{}/ceiling", path_segment(coworker_id));
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `PUT /coworkers/{id}/ceiling` with `{"enabled": [names]}` — the whole ceiling, replaced by
+    /// exactly these, answered with the body `GET` gives (opengrok-server#268). An empty list is
+    /// allowed and allows nothing. A name the server does not list is refused with 422 and its
+    /// sentence, and nothing changes; a plugin the server no longer loads may be named only to
+    /// keep it, never to switch it on.
+    pub async fn set_coworker_ceiling(
+        &self,
+        coworker_id: &str,
+        enabled: &[String],
+    ) -> Result<CoworkerCeiling, OpenGrokError> {
+        let path = format!("/coworkers/{}/ceiling", path_segment(coworker_id));
+        let response = self
+            .send_json(
+                reqwest::Method::PUT,
+                &path,
+                Some(&json!({ "enabled": enabled })),
+            )
+            .await?;
+        Self::json_or_error(response).await
     }
 
     /// `POST /artifacts` for a file the person attaches to a message (#90): the bytes go up first,
@@ -2625,6 +2661,71 @@ impl CoworkerTool {
 pub(crate) struct ToolListing {
     #[serde(default)]
     pub(crate) tools: Vec<CoworkerTool>,
+}
+
+/// Everything a bot could be offered, and which of it it may be: its tool ceiling, as
+/// `GET /coworkers/{id}/ceiling` gives it and `PUT` answers with.
+///
+/// Transcribed from the shape agreed with the opengrok-server session for #268 (the server half
+/// of this app's #2), ahead of the server's code and of any recording of it:
+/// `{"tools": [row…]}`, the array always there and possibly empty. The run path reads this
+/// ceiling, so a turn is offered what is enabled here, granted and available, and
+/// `GET /coworkers/{id}/tools` goes on listing that offered set. No `#[serde(default)]` on the
+/// array: a body without one is not a ceiling with nothing in it.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CoworkerCeiling {
+    pub tools: Vec<CeilingRow>,
+}
+
+/// One row of a bot's tool ceiling: one of the server's own tools, or one plugin. A plugin is one
+/// row however many tools it brings, because enabling it admits all of them (opengrok-server#268).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CeilingRow {
+    /// What the `PUT` names it by: a builtin's wire name (`shell`), or the plugin's name.
+    pub name: String,
+    pub kind: CeilingKind,
+    /// In the ceiling now.
+    pub enabled: bool,
+    /// Sent only where it can be false, and absent means available: `user_machine_shell` is
+    /// unavailable until a machine is enrolled, and an enabled plugin the server no longer loads
+    /// stays listed as unavailable. Read through [`Self::is_available`], which takes a `null` for
+    /// absent too.
+    #[serde(default)]
+    pub available: Option<bool>,
+    /// A plugin's name for people.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// A builtin's words are the ones `/tools` gives it; a plugin's are its manifest's, and a
+    /// plugin the server no longer loads may have none.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The connector a plugin's credential names (`gmail`), on a plugin whose credential names one.
+    #[serde(default)]
+    pub connector: Option<String>,
+}
+
+impl CeilingRow {
+    pub fn is_builtin(&self) -> bool {
+        self.kind == CeilingKind::Builtin
+    }
+
+    /// Whether the server could offer it at all. A row that is not can be kept switched on, and
+    /// switched off, but never switched on: the server refuses that.
+    pub fn is_available(&self) -> bool {
+        self.available != Some(false)
+    }
+}
+
+/// What a ceiling row is: one of the executor's own tools, `user_machine_shell` among them, or a
+/// plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CeilingKind {
+    Builtin,
+    /// A word this app has no name for yet is filed with the plugins rather than claimed as the
+    /// server's own, as the Tools listing files one ([`CoworkerTool::is_builtin`]).
+    #[serde(other)]
+    Plugin,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -6442,6 +6543,182 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client.coworker_tools("cw_1").await.unwrap_err();
         assert_eq!(error.status, Some(404));
+    }
+
+    /// A ceiling in the shape agreed for opengrok-server#268: the server's own tools, a plugin
+    /// with its label, words and connector, `user_machine_shell` unavailable with no machine
+    /// enrolled, and an enabled plugin the server no longer loads, with nothing but its name.
+    fn a_ceiling() -> Value {
+        json!({"tools": [
+            {
+                "name": "shell",
+                "kind": "builtin",
+                "enabled": true,
+                "description": "Run a shell command on THIS BOT'S OWN computer."
+            },
+            {"name": "read_file", "kind": "builtin", "enabled": false, "description": "Read a file."},
+            {
+                "name": "user_machine_shell",
+                "kind": "builtin",
+                "enabled": false,
+                "available": false,
+                "description": "Run a shell command on the person's own machine."
+            },
+            {
+                "name": "gmail",
+                "kind": "plugin",
+                "enabled": true,
+                "label": "Gmail",
+                "description": "Read and send mail.",
+                "connector": "gmail"
+            },
+            {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
+        ]})
+    }
+
+    #[tokio::test]
+    async fn a_bots_ceiling_is_read_as_the_server_gives_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/ceiling"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(a_ceiling()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let ceiling = client.coworker_ceiling("cw_1").await.unwrap();
+        let names: Vec<&str> = ceiling.tools.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "shell",
+                "read_file",
+                "user_machine_shell",
+                "gmail",
+                "old_crm"
+            ]
+        );
+        let shell = &ceiling.tools[0];
+        assert!(shell.is_builtin() && shell.enabled && shell.is_available());
+        assert_eq!(
+            shell.description.as_deref(),
+            Some("Run a shell command on THIS BOT'S OWN computer.")
+        );
+        assert!(!ceiling.tools[1].enabled && ceiling.tools[1].is_available());
+        let enrolled = &ceiling.tools[2];
+        assert!(
+            enrolled.is_builtin() && !enrolled.is_available(),
+            "no machine enrolled, so the server could not offer it"
+        );
+        let gmail = &ceiling.tools[3];
+        assert_eq!(gmail.kind, CeilingKind::Plugin);
+        assert_eq!(
+            (gmail.label.as_deref(), gmail.connector.as_deref()),
+            (Some("Gmail"), Some("gmail"))
+        );
+        let gone = &ceiling.tools[4];
+        assert!(gone.enabled && !gone.is_available());
+        assert_eq!(
+            (&gone.label, &gone.description, &gone.connector),
+            (&None, &None, &None),
+            "a plugin the server no longer loads may have nothing but its name"
+        );
+    }
+
+    /// An empty ceiling is a ceiling; a body with no list at all is not one, and a row that does
+    /// not say whether it is enabled cannot be sent back as it stands. A kind the app does not
+    /// know is filed with the plugins, and a `null` availability is an absent one.
+    #[test]
+    fn a_ceiling_reads_only_in_its_own_shape() {
+        let read = |body: Value| serde_json::from_value::<CoworkerCeiling>(body);
+        assert_eq!(read(json!({"tools": []})).unwrap().tools, Vec::new());
+        assert!(read(json!({})).is_err(), "no tools array");
+        assert!(
+            read(json!({"tools": [{"name": "shell", "kind": "builtin"}]})).is_err(),
+            "a row with no enabled"
+        );
+        assert!(
+            read(json!({"tools": [{"name": "shell", "enabled": true}]})).is_err(),
+            "a row with no kind"
+        );
+        let later = read(json!({"tools": [
+            {"name": "x", "kind": "connector", "enabled": false, "available": null}
+        ]}))
+        .unwrap();
+        assert_eq!(later.tools[0].kind, CeilingKind::Plugin);
+        assert!(!later.tools[0].is_builtin() && later.tools[0].is_available());
+    }
+
+    /// A switch sends the whole ceiling as it should now be and takes what the server answers,
+    /// which is the whole ceiling again. `[]` is sent as a list, since it means no tools at all.
+    #[tokio::test]
+    async fn setting_a_ceiling_sends_every_name_and_reads_the_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/ceiling"))
+            .and(body_json(json!({"enabled": ["shell", "gmail", "old_crm"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(a_ceiling()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/ceiling"))
+            .and(body_json(json!({"enabled": []})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tools": [
+                {"name": "shell", "kind": "builtin", "enabled": false}
+            ]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let sent: Vec<String> = ["shell", "gmail", "old_crm"].map(String::from).to_vec();
+        let answer = client.set_coworker_ceiling("cw_1", &sent).await.unwrap();
+        assert_eq!(answer.tools.len(), 5);
+        assert!(answer.tools[3].enabled);
+        let nothing = client.set_coworker_ceiling("cw_1", &[]).await.unwrap();
+        assert!(!nothing.tools[0].enabled);
+    }
+
+    /// A name the server does not list is refused with its own sentence, and a bot the person does
+    /// not own is a 404 to a read and to a write alike: both reach the app as the server wrote them.
+    #[tokio::test]
+    async fn a_refused_ceiling_keeps_the_servers_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/ceiling"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"error": "no tool or plugin named nope"})),
+            )
+            .mount(&server)
+            .await;
+        for verb in ["GET", "PUT"] {
+            Mock::given(method(verb))
+                .and(path("/coworkers/cw_2/ceiling"))
+                .respond_with(
+                    ResponseTemplate::new(404).set_body_json(json!({"error": "no such coworker"})),
+                )
+                .mount(&server)
+                .await;
+        }
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let unknown = client
+            .set_coworker_ceiling("cw_1", &["nope".to_string()])
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.status, Some(422));
+        assert_eq!(unknown.message, "no tool or plugin named nope");
+        assert_eq!(unknown.failure(), Failure::Verdict);
+        let read = client.coworker_ceiling("cw_2").await.unwrap_err();
+        let write = client
+            .set_coworker_ceiling("cw_2", &["shell".to_string()])
+            .await
+            .unwrap_err();
+        for refused in [read, write] {
+            assert_eq!(refused.status, Some(404));
+            assert_eq!(refused.message, "no such coworker");
+            assert_eq!(refused.failure(), Failure::Verdict);
+        }
     }
 
     /// A type with parameters or capitals is sent as the plain lowercase type the server reads.

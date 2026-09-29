@@ -102,11 +102,21 @@
 //! bot used this month, or why it cannot say), `agent-usage-toggle` (Show / Hide, only while the
 //! server reported models), and `agent-usage-model-{i}` per model, visible while open (#138).
 //!
-//! In the bot's settings: `agent-tools` (value = the Tools card's second line: `2 built in · 1
-//! from plugins`, `Asking the server…`, or why there is no list), `agent-tools-toggle` (Show /
-//! Hide, only while tools are listed), and `agent-tool-{name}` per tool (value `builtin` /
-//! `plugin`; visible while the card is open). Read-only: what the server's
-//! `GET /coworkers/{id}/tools` says the bot is offered on its next turn.
+//! In the bot's settings: `agent-tools` (value = the Tools card's first line, what the server's
+//! `GET /coworkers/{id}/tools` says the bot is offered on its next turn: `2 built in · 1 from
+//! plugins`, `Asking the server…`, or why there is no list), `agent-ceiling` (value = `3 of 8
+//! allowed`, or why there are no switches; in the tree once the server has answered),
+//! `agent-tools-toggle` (Show / Hide, only while there are switches), `agent-ceiling-read-only`
+//! (why every switch is dead, once the server has refused one as not the owner's), and one
+//! `agent-ceiling-{name}` per row of the bot's tool ceiling (opengrok-server#268), visible while
+//! the card is open: a switch named by the row's heading, value `builtin` / `plugin`, `checked`
+//! where it stands (where it was asked to go while that is with the server), enabled only while a
+//! click would send it, states `switching` and `unavailable`. Under it:
+//! `agent-ceiling-why-{name}` (why the server cannot offer it), `agent-ceiling-connector-{name}`
+//! (the connection a plugin uses) and `agent-ceiling-error-{name}` (the server's words for a
+//! switch it did not take). A click moves a live switch the other way and sends the whole
+//! ceiling at once; one at a time, so every switch is refused while one is with the server, and
+//! a row the server cannot offer is refused going on.
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
