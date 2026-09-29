@@ -104,13 +104,12 @@ pub(crate) const NO_CONNECTORS: &str = "This server offers no services to connec
 pub(crate) const ALL_CONNECTED: &str = "Every service this server offers is connected.";
 pub(crate) const NOTHING_TO_LEND: &str =
     "Nothing connected yet. Connect a service in Settings → Connections.";
-/// What a Bot's card says about what lending does, and what it does not do yet. A connection
-/// reaches a Bot's turn through a plugin, and only a plugin the Bot is allowed; nothing can allow
-/// one yet (opengrok-server#268). Saying less would be a switch that looks like it changes the
-/// next turn and does not.
+/// What a Bot's card says about what lending does. A connection reaches a Bot's turn through a
+/// plugin, and only a plugin the Bot is allowed, which its Tools card switches (opengrok-server
+/// #268, `connect_plugins` gating on both). Saying less would be a switch that looks like it
+/// changes the next turn when the plugin is not allowed.
 pub(crate) const LEND_NOTE: &str = "A lent connection reaches a plugin only once this Bot is \
-     allowed that plugin. Allowing plugins is not on the server yet, so lending alone does not \
-     change this Bot's next turn.";
+     allowed that plugin in its Tools.";
 
 /// While the person is signing in to a service in their browser.
 pub(crate) fn waiting_line(label: &str) -> String {

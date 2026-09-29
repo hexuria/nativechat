@@ -137,8 +137,8 @@
 //! it shows as lent to this bot; a click asks for the other way; dead and `changing` while a
 //! change is with the server) and `agent-connection-error-{id}` (why a lend or a revoke of it to
 //! this bot did not go through; another bot's is on that bot's card); `agent-connections-note`,
-//! the card's sentence that lending alone does not change the bot's next turn
-//! (opengrok-server#268).
+//! the card's sentence that a lent connection reaches a plugin only once the bot is allowed it in
+//! its Tools (opengrok-server#268).
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
