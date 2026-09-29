@@ -125,7 +125,6 @@ pub struct AgentSettings {
     /// The profile is with the server. The Save button is out of the person's hands until the
     /// answer comes back, whichever way it goes.
     saving: bool,
-    usage_open: bool,
     auto_review_open: bool,
     auto_review_mode: AutoReviewMode,
 }
@@ -203,7 +202,6 @@ impl AgentSettings {
             model_scroll: ScrollHandle::new(),
             synced_id: None,
             saving: false,
-            usage_open: false,
             auto_review_open: false,
             auto_review_mode: AutoReviewMode::Inherit,
         }
@@ -485,7 +483,7 @@ impl Render for AgentSettings {
         let model_highlight = self.model_highlight;
         let model_scroll = self.model_scroll.clone();
         let saving = self.saving;
-        let usage_open = self.usage_open;
+        let usage_open = self.state.read(cx).agent_usage_open;
         let auto_review_open = self.auto_review_open;
         let tools_open = self.state.read(cx).agent_tools_open;
         let tools = {
@@ -830,26 +828,31 @@ impl Render for AgentSettings {
                                                                     .child(line)
                                                             })),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .id("agent-usage-open")
-                                                            .px(px(11.))
-                                                            .py(px(5.))
-                                                            .rounded(px(8.))
-                                                            .border_1()
-                                                            .border_color(
-                                                                rgb(0x7f7f7f).opacity(0.4),
+                                                    // Only a list of models has anything to open to.
+                                                    .when(
+                                                        matches!(usage, Some(UsageReport::Read(ref read)) if !read.models.is_empty()),
+                                                        |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .id("agent-usage-toggle")
+                                                                    .px(px(11.))
+                                                                    .py(px(5.))
+                                                                    .rounded(px(8.))
+                                                                    .border_1()
+                                                                    .border_color(
+                                                                        rgb(0x7f7f7f).opacity(0.4),
+                                                                    )
+                                                                    .text_xs()
+                                                                    .cursor_pointer()
+                                                                    .on_mouse_down(MouseButton::Left, {
+                                                                        let app = app.clone();
+                                                                        move |_, _, cx| {
+                                                                            app.update(cx, |state, cx| state.toggle_agent_usage(cx));
+                                                                        }
+                                                                    })
+                                                                    .child(if usage_open { "Hide" } else { "Show" }),
                                                             )
-                                                            .text_xs()
-                                                            .cursor_pointer()
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(|this, _, _, cx| {
-                                                                    this.usage_open = !this.usage_open;
-                                                                    cx.notify();
-                                                                }),
-                                                            )
-                                                            .child("Open"),
+                                                        },
                                                     ),
                                             ),
                                     )
@@ -1567,10 +1570,12 @@ pub(crate) fn usage_summary(report: &UsageReport) -> String {
     match report {
         UsageReport::Loading => "Asking the server…".to_string(),
         UsageReport::Unavailable(why) => why.clone(),
+        // The server's note is a clause ("this coworker has no key of its own yet, …"); on the
+        // card it stands as its own line, so it starts with a capital.
         UsageReport::Read(usage) if !usage.metered => usage
             .note
-            .clone()
-            .unwrap_or_else(|| "This bot's use is not measured.".to_string()),
+            .as_deref()
+            .map_or_else(|| "This bot's use is not measured.".to_string(), sentence),
         UsageReport::Read(usage) => match usage.totals.requests.unwrap_or(0) {
             0 => "No requests this month".to_string(),
             requests => {
@@ -1588,6 +1593,14 @@ pub(crate) fn usage_summary(report: &UsageReport) -> String {
             }
         },
     }
+}
+
+/// `text` with its first letter capitalised.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// One model's line once the card is open.
@@ -1828,7 +1841,7 @@ mod tools_tests {
         };
         assert_eq!(
             usage_summary(&UsageReport::Read(unmetered)),
-            "this coworker's key cannot serve"
+            "This coworker's key cannot serve"
         );
         assert_eq!(usage_summary(&UsageReport::Loading), "Asking the server…");
     }

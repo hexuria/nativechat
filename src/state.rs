@@ -2970,6 +2970,8 @@ pub struct AppState {
     usage_generation: u64,
     /// The bot settings' Tools card is open to its list.
     pub agent_tools_open: bool,
+    /// The bot settings' Usage card is open to its per-model lines (#138).
+    pub agent_usage_open: bool,
     /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
     /// same bot can come back out of order, and the older must not replace the newer.
     tools_generation: u64,
@@ -3492,6 +3494,7 @@ impl AppState {
             coworker_usage: None,
             usage_generation: 0,
             agent_tools_open: false,
+            agent_usage_open: false,
             tools_generation: 0,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
@@ -4924,6 +4927,11 @@ impl AppState {
 
     pub fn toggle_agent_tools(&mut self, cx: &mut Context<Self>) {
         self.agent_tools_open = !self.agent_tools_open;
+        cx.notify();
+    }
+
+    pub fn toggle_agent_usage(&mut self, cx: &mut Context<Self>) {
+        self.agent_usage_open = !self.agent_usage_open;
         cx.notify();
     }
 
@@ -8309,6 +8317,7 @@ impl AppState {
         self.coworker_tools = None;
         self.coworker_usage = None;
         self.agent_tools_open = false;
+        self.agent_usage_open = false;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
             self.refresh_coworker_usage(cx);

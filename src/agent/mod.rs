@@ -99,7 +99,8 @@
 //! card is `not-answered`: only the newest card asks.
 //!
 //! In the bot's settings: `agent-usage` (value = the Usage card's line: what the server says the
-//! bot used this month, or why it cannot say) with `agent-usage-model-{i}` per model (#138).
+//! bot used this month, or why it cannot say), `agent-usage-toggle` (Show / Hide, only while the
+//! server reported models), and `agent-usage-model-{i}` per model, visible while open (#138).
 //! In the bot's settings: `agent-tools` (value = the Tools card's second line: `2 built in · 1
 //! from plugins`, `Asking the server…`, or why there is no list), `agent-tools-toggle` (Show /
 //! Hide, only while tools are listed), and `agent-tool-{name}` per tool (value `builtin` /
