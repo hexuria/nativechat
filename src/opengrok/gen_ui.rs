@@ -338,9 +338,10 @@ pub struct ApprovalSpec {
     pub reason: String,
     /// What the call would do, in the words the server's own approval card uses: "Click at
     /// (120, 40) on the agent's own screen", "Open https://example.com/inbox in the agent's own
-    /// browser". Built from the tool and its arguments by [`approval_summary`], because neither
-    /// the frame nor the approvals queue carries the server's sentence. Empty for a shell, whose
-    /// command is what the card shows, and for a call that came without its arguments.
+    /// browser". Built from the tool and its arguments by [`approval_summary`], the same way the
+    /// server builds the `summary` it now sends on the frame and the queue (#263), which older
+    /// servers do not send; the conformance ledger holds the two to the same words. Empty for a
+    /// shell, whose command is what the card shows, and for a call that came without arguments.
     pub summary: String,
     /// Tool result after the command ran (`exit 0` + stdout/stderr).
     pub output: Option<String>,
@@ -1700,10 +1701,11 @@ pub fn approval_from_event(event: &Value) -> Option<ApprovalSpec> {
 /// browser". Transcribed from `summary_for` in opengrok-server `cards.rs` (#211, and #246 for
 /// the redaction) as of 234e755.
 ///
-/// It is built here because the server writes that sentence only onto its gateway transcript
-/// card, which this app does not read. The `run-awaiting-approval` frame and the approvals
-/// queue carry the tool and its arguments and nothing else about what the call would do, so
-/// the card used to show the arguments as JSON. Built the same way, typed text and keys that
+/// It is built here because servers before opengrok-server #263 sent the tool and its arguments
+/// and nothing else about what the call would do, so the card used to show the arguments as
+/// JSON. Since #263 the `run-awaiting-approval` frame, its replay and the approvals queue carry
+/// the server's own `summary` (`summary_for_ask`, null for a form), and the conformance ledger
+/// holds every recorded one to what this builds. Built the same way, typed text and keys that
 /// look like secrets read `«redacted»` and a page is named without its query, as on the
 /// server's card.
 ///
@@ -2583,9 +2585,9 @@ mod tests {
         assert!(!turn.waiting_approval());
     }
 
-    /// The frame is the one the server sends today (opengrok-harness `projection.rs`
-    /// `awaiting_approval`): the tool and its arguments, and no summary. The card says what the
-    /// call would do all the same, in the server's card's words.
+    /// The frame as servers before opengrok-server #263 send it (opengrok-harness
+    /// `projection.rs` `awaiting_approval`): the tool and its arguments, and no summary. The card
+    /// says what the call would do all the same, in the server's card's words.
     #[test]
     fn a_card_says_what_the_call_would_do_from_the_frame_the_server_sends() {
         let mut turn = TurnAssembler::default();
