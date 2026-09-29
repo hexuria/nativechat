@@ -1667,25 +1667,32 @@ fn awaiting(frame: &Value) -> Check {
         // (`journal_agui_custom` journals none onto a run that no longer waits), so the park is
         // the only place its settlement is said (#139). An escalation is the computer's
         // sibling, not a settlement of the form.
-        let words: Vec<&str> = [
-            frame.get("formResolution"),
-            frame.pointer("/message/formResolution"),
-            frame.pointer("/value/formResolution"),
-            frame.pointer("/value/message/formResolution"),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-        let escalated = words.contains(&"escalated");
-        let dismissed = !escalated
-            && [
-                frame.get("widgetDismissed"),
-                frame.pointer("/value/widgetDismissed"),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|flag| flag.as_bool() == Some(true));
+        // The entry folded into `value` speaks for this card only when it names this call or
+        // none: the server can match another card's entry by title and fields alone.
+        let ours = str_at(frame, "callId");
+        let entry = frame.get("value").filter(|entry| {
+            let theirs = str_at(entry, "callId");
+            theirs.is_empty() || ours.is_empty() || theirs == ours
+        });
+        // Each object's word as the client reads it: its own `formResolution` (a null there
+        // says none, as the client takes it), else its message's, through the client's own
+        // spelling rules.
+        let word = |object: &Value| {
+            object
+                .get("formResolution")
+                .or_else(|| object.pointer("/message/formResolution"))
+                .and_then(Value::as_str)
+                .map(FormResolution::parse)
+        };
+        let flag = |object: &Value| match object.get("widgetDismissed") {
+            Some(Value::Bool(on)) => *on,
+            Some(Value::String(text)) => text.eq_ignore_ascii_case("true") || text == "1",
+            _ => false,
+        };
+        let objects: Vec<&Value> = std::iter::once(frame).chain(entry).collect();
+        let words: Vec<FormResolution> = objects.iter().copied().filter_map(word).collect();
+        let escalated = words.contains(&FormResolution::Escalated);
+        let dismissed = !escalated && objects.iter().copied().any(flag);
         let settled = !escalated && (!words.is_empty() || dismissed);
         if escalated {
             must!(
@@ -3487,6 +3494,17 @@ fn the_ledger_reads_a_park_settlement_as_the_client_does() {
             serde_json::json!({"id": "e_1", "widgetDismissed": true}),
         ),
         park(Value::Null, Value::Null),
+        // Another spelling of the escalation, as the client's parse reads it.
+        park(Value::from("Escalated"), serde_json::json!({"id": "e_1"})),
+        // Another card's entry, matched by title and fields: it settles nothing here.
+        park(
+            Value::Null,
+            serde_json::json!({"id": "e_0", "callId": "call-1", "formResolution": "submitted"}),
+        ),
+        park(
+            Value::Null,
+            serde_json::json!({"id": "e_0", "callId": "call-1", "widgetDismissed": true}),
+        ),
     ] {
         awaiting(&frame).unwrap_or_else(|problem| panic!("{problem}: {frame}"));
     }
