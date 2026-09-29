@@ -4,8 +4,12 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
-//! from the server's `tests/fixtures/wire/` at f190933 (#260), which re-recorded it on main so
-//! that `MANIFEST.json` names 7c5d026, the commit whose code produced it. The layout is
+//! from the server's `tests/fixtures/wire/` at e620011 (#262, the error-bodies change), whose
+//! `MANIFEST.json` names 244f0bc, the commit on #262's branch it was recorded at. The squash-merge
+//! left that commit out of main's history, as #258's did before #260 re-recorded on main; the
+//! code at the two differs only in how much of a plain-text 502, 503 or 504 the server reads
+//! before it sends it on as JSON, and what it sends for one too long to read
+//! (`gateway_errors_as_json` in `lib.rs`), which no body recorded here comes near. The layout is
 //! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
 //! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
 //! per distinct shape, named after the first test that produced it. `MANIFEST.json` names the
@@ -458,44 +462,7 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
-    (
-        "rest/POST__recipes/503-a_recipe_whose_tape_cannot_be_stored_is_not_a_200.json",
-        FIVE_HUNDRED_SHAPE,
-        "A tape the database will not store is refused the same way every time, and this \
-         recording answers it as a 503 in plain text, which this app cannot tell from a proxy's: \
-         it reads the server as out of reach and offers the tape again. With opengrok-server's \
-         error-bodies change a tape holding a NUL is refused with a 422 in plain text, \"the tape \
-         holds a NUL character (U+0000), which cannot be stored; teach it again\", and this 503 \
-         is no longer sent.",
-    ),
-    (
-        "rest/POST__recipes__id__run/502-failed_runs_are_pruned_like_played_ones.json",
-        FIVE_HUNDRED_SHAPE,
-        "This recording answers a box that is down as a plain-text 502, which this app cannot \
-         tell from a proxy's: it reads the server as out of reach and reloads the recipe as if \
-         the run might have started. With opengrok-server's error-bodies change every 502, 503 \
-         and 504 the server writes itself is JSON, {\"error\": sentence}, which this app reads \
-         as the server's verdict.",
-    ),
-    (
-        "rest/POST__skills_from-tape/502-a_lesson_over_the_cap_is_refused_rather_than_cut.json",
-        FIVE_HUNDRED_SHAPE,
-        "Plain text, the shape opengrok-server's error-bodies change retires for every 502, 503 \
-         and 504 it writes itself, which are JSON, {\"error\": sentence}, from it on. This app \
-         reads this one right either way, since tape_error takes this route's every refusal as \
-         the server's own; the entry keeps the old shape from being blessed.",
-    ),
-    (
-        "rest/POST__ag-ui/409-another_account_cannot_take_a_run_by_its_id.json",
-        CODE_UNDER_CODE,
-        "Recorded with the code under error and the sentence under message. With \
-         opengrok-server's error-bodies change this refusal is {\"error\": \"this run id already \
-         has a run; a new turn needs a new run id\", \"code\": \"run-exists\"}. This app reads \
-         both shapes the same way, the sentence shown and the code kept; the queue's 409s keep \
-         the old shape and are not listed here.",
-    ),
-];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
 
 /// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
 /// that says so.
@@ -904,14 +871,7 @@ fn check_frame(corpus: &Corpus, frame: &Value) -> Check {
             Ok(())
         }
         "RUN_FINISHED" | "RUN_ERROR" => run_ended(corpus, frame),
-        "TEXT_MESSAGE_START" => {
-            must!(
-                tick(frame) == label("Writing"),
-                "TEXT_MESSAGE_START should say Writing, not {:?}",
-                tick(frame)
-            );
-            Ok(())
-        }
+        "TEXT_MESSAGE_START" => text_start(corpus, frame),
         "TEXT_MESSAGE_CONTENT" => text_content(corpus, frame),
         "TEXT_MESSAGE_END" => text_end(corpus, frame),
         "TOOL_CALL_START" => tool_call_start(frame),
@@ -949,6 +909,58 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
             "RUN_ERROR should end the turn with the server's sentence, got {said:?}"
         );
     }
+    Ok(())
+}
+
+/// A message's opening paints nothing, and says whose words follow. The coworker's is it writing.
+/// The person's, which a replay opens each run with right after `RUN_STARTED` (opengrok-server
+/// `agui/history.rs` `with_prompt_frames`), is the question and not the coworker doing anything:
+/// it leaves the status line as it was, and so do the words that follow under its id, which are
+/// none of the reply's.
+fn text_start(corpus: &Corpus, frame: &Value) -> Check {
+    let role = str_at(frame, "role");
+    let persons = role == "user";
+    let mut tracker = ToolCallTracker::default();
+    let status = tracker.tick(frame);
+    let expected = if persons {
+        ActivityTick::Keep
+    } else {
+        label("Writing")
+    };
+    must!(
+        status == expected,
+        "a TEXT_MESSAGE_START with role {role:?} should leave the status line at {expected:?}, \
+         not {status:?}"
+    );
+    let (plain, parts) = assembled(&[frame]).snapshot();
+    must!(
+        plain.is_empty() && parts.is_empty(),
+        "an opening paints nothing, got {plain:?} {parts:?}"
+    );
+    if !persons {
+        return Ok(());
+    }
+    let id = str_at(frame, "messageId");
+    must!(!id.is_empty(), "the person's message names no id");
+    // Only the opening names the person, so words from the corpus re-aimed at this message are
+    // the person's by its id alone.
+    let mut words = corpus
+        .frames_of("TEXT_MESSAGE_CONTENT")
+        .next()
+        .ok_or("the corpus has no words to follow the person's opening")?
+        .clone();
+    words["messageId"] = Value::String(id.to_string());
+    let status = tracker.tick(&words);
+    must!(
+        status == ActivityTick::Keep,
+        "the person's words should leave the status line as it was, not {status:?}"
+    );
+    let delta = str_at(&words, "delta");
+    let (plain, _) = assembled(&[frame, &words]).snapshot();
+    must!(
+        !plain.contains(delta),
+        "the person's own words {delta:?} were painted as the coworker's reply: {plain:?}"
+    );
     Ok(())
 }
 
@@ -992,16 +1004,27 @@ fn text_end(corpus: &Corpus, frame: &Value) -> Check {
 fn text_content(corpus: &Corpus, frame: &Value) -> Check {
     let delta = str_at(frame, "delta");
     must!(!delta.is_empty(), "a text frame with no delta");
-    must!(
-        tick(frame) == label("Writing"),
-        "text should say Writing, not {:?}",
-        tick(frame)
-    );
     // The message's own opening says whose words these are.
     let start = corpus
         .frames_of("TEXT_MESSAGE_START")
         .find(|start| start.get("messageId") == frame.get("messageId"));
     let persons = start.is_some_and(|start| str_at(start, "role") == "user");
+    // The status line as the app keeps it, from the message's opening on: the person's words
+    // leave it as it was, and the coworker's say Writing.
+    let mut tracker = ToolCallTracker::default();
+    if let Some(start) = start {
+        tracker.tick(start);
+    }
+    let status = tracker.tick(frame);
+    let expected = if persons {
+        ActivityTick::Keep
+    } else {
+        label("Writing")
+    };
+    must!(
+        status == expected,
+        "text should leave the status line at {expected:?}, not {status:?}"
+    );
     let mut frames: Vec<&Value> = start.into_iter().collect();
     frames.push(frame);
     let (plain, _) = assembled(&frames).snapshot();
@@ -2540,6 +2563,39 @@ fn reads_back(run_id: &str, events: &[Value]) -> Check {
     Ok(())
 }
 
+/// The person's side of a run, as the thread rebuilds it (`missing_questions` in `state.rs`, by
+/// `persons_messages`): every message the replay opens as the person's comes back, by the id it
+/// was sent under and with its words. One closed on none is a message of files alone
+/// (opengrok-server#259), kept so its files have a bubble to be drawn under; one opened and never
+/// closed on none is a message cut off, and not one.
+fn persons_side(run_id: &str, events: &[Value]) -> Check {
+    let mut asked: Vec<(String, String)> = Vec::new();
+    for start in events.iter().filter(|frame| {
+        str_at(frame, "type") == "TEXT_MESSAGE_START" && str_at(frame, "role") == "user"
+    }) {
+        let id = str_at(start, "messageId");
+        let words: String = events
+            .iter()
+            .filter(|frame| {
+                str_at(frame, "type") == "TEXT_MESSAGE_CONTENT" && str_at(frame, "messageId") == id
+            })
+            .map(|frame| str_at(frame, "delta"))
+            .collect();
+        let closed = events.iter().any(|frame| {
+            str_at(frame, "type") == "TEXT_MESSAGE_END" && str_at(frame, "messageId") == id
+        });
+        if closed || !words.trim().is_empty() {
+            asked.push((id.to_string(), words));
+        }
+    }
+    let kept = super::gen_ui::persons_messages(events);
+    must!(
+        kept == asked,
+        "run {run_id:?} should give back the person's messages {asked:?}, not {kept:?}"
+    );
+    Ok(())
+}
+
 fn thread_replay(_: u16, body: &Value) -> Check {
     let replay: ThreadReplay = parse(body)?;
     must!(
@@ -2564,6 +2620,7 @@ fn thread_replay(_: u16, body: &Value) -> Check {
             run.run_id
         );
         reads_back(&run.run_id, &run.events)?;
+        persons_side(&run.run_id, &run.events)?;
     }
     let hidden: Vec<&str> = body
         .get("hiddenRunIds")
@@ -4019,14 +4076,14 @@ fn a_steps_arguments_are_held_to_the_cards_rules_as_stated() {
     }
 }
 
-/// The readings of a refusal hold for the shapes opengrok-server's error-bodies change writes as
-/// well as the ones recorded today, so the new recording is read the day it lands: `run-exists`
-/// under `code`, the queue's codes under `error` (which stay) or under `code`, a 502 or a 503 of
-/// the server's own as JSON, and a form's refusal in either shape. A plain-text 502, and
-/// `run-exists` under `error`, the shapes the change retires, fail the way [`KNOWN_DRIFT`] says
-/// the recorded ones do.
+/// The readings of a refusal hold for every shape opengrok-server's error-bodies change (#262)
+/// writes, beyond the ones this recording happens to hold: `run-exists` under `code`, the queue's
+/// codes under `error` (which stay) or under `code`, a 502 or a 503 of the server's own as JSON,
+/// and a form's refusal in either shape. A plain-text 502, and `run-exists` under `error`, the
+/// shapes that change retired, still fail, so a recording that brings one back is caught rather
+/// than read.
 #[test]
-fn a_refusal_reads_in_the_shape_the_server_sends_and_the_one_it_is_moving_to() {
+fn a_refusal_reads_in_the_shape_the_server_sends_and_not_in_the_ones_it_retired() {
     use serde_json::json;
     let read = |route: &str, path: &str, status: u16, body: Value| {
         read_fixture(
@@ -4110,7 +4167,7 @@ fn a_refusal_reads_in_the_shape_the_server_sends_and_the_one_it_is_moving_to() {
         retired
             .as_ref()
             .is_err_and(|why| why.contains(FIVE_HUNDRED_SHAPE)),
-        "a plain-text 502 is the shape being retired: {retired:?}"
+        "a plain-text 502 is the shape the server retired: {retired:?}"
     );
 }
 

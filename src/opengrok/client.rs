@@ -5060,11 +5060,10 @@ mod tests {
 
     /// A turn sent under a run id that already has a run is refused with a code and a sentence
     /// beside it: `{"error": sentence, "code": "run-exists"}` from opengrok-server's error-bodies
-    /// change on, and the code under `error` with the sentence under `message` before it
-    /// (`agui/routes.rs` `run_taken`, as `fixtures/wire/rest/POST__ag-ui/409-another_account_cannot_take_a_run_by_its_id`
-    /// records it). The person used to be shown the code, `run-exists`; in either shape they are
-    /// shown the sentence, and the code is kept for a caller, and read as none of the queue's
-    /// words.
+    /// change on (`agui/routes.rs` `run_taken`, as `fixtures/wire/rest/POST__ag-ui/409-another_account_cannot_take_a_run_by_its_id`
+    /// records it), and the code under `error` with the sentence under `message` before it. The
+    /// person used to be shown the code, `run-exists`; in either shape they are shown the
+    /// sentence, and the code is kept for a caller, and read as none of the queue's words.
     #[tokio::test]
     async fn a_refusal_with_a_code_and_a_sentence_shows_the_sentence() {
         let said = "this run id already has a run; a new turn needs a new run id";

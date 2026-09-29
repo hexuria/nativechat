@@ -34,11 +34,21 @@ pub struct ToolCallTracker {
     /// Call ids as they first appeared: the maps say what each call was, this says in what order,
     /// which is what `deeds` needs to tell a turn's story.
     order: Vec<String>,
+    /// The person's own messages, which a replay opens each run with (opengrok-server
+    /// `agui/history.rs` `with_prompt_frames`). Only a message's opening names it as the
+    /// person's, so the frames after it are known by its id.
+    persons: super::gen_ui::PersonsText,
 }
 
 impl ToolCallTracker {
     /// The status one frame implies, given the frames before it.
     pub fn tick(&mut self, event: &Value) -> ActivityTick {
+        // The person's words are the question, not the coworker writing: a run picked up by its
+        // replay before the coworker has said anything is still Thinking.
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind.starts_with("TEXT_MESSAGE") && self.persons.is_persons(event) {
+            return ActivityTick::Keep;
+        }
         let call_id = event.get("toolCallId").and_then(Value::as_str);
         if let Some(id) = call_id {
             if !self.order.iter().any(|seen| seen == id) {
@@ -529,6 +539,41 @@ mod tests {
         let mut finished = events.clone();
         finished.push(json!({"type":"RUN_FINISHED"}));
         assert_eq!(activity_from_replay(&finished), None);
+    }
+
+    /// A replay opens each run with the person's own messages, right after `RUN_STARTED` and
+    /// before anything the coworker said (opengrok-server `agui/history.rs` `with_prompt_frames`,
+    /// recorded in `fixtures/wire/agui/TEXT_MESSAGE_START/a_fired_routine_reports_its_last_run_on_its_row.json`).
+    /// They are the question, not the coworker writing: a run picked up by its replay before the
+    /// coworker has said anything is still Thinking. Only a message's opening names it as the
+    /// person's, so its words and its close are known by its id; a message of files alone, opened
+    /// and closed on no words, moves nothing either.
+    #[test]
+    fn the_persons_own_message_in_a_replay_is_not_the_coworker_writing() {
+        let asked = vec![
+            json!({"type":"RUN_STARTED","runId":"r1"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"u1","role":"user"}),
+            json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"u1","delta":"What is on today?"}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"u1"}),
+            json!({"type":"TEXT_MESSAGE_START","messageId":"u2","role":"user"}),
+            json!({"type":"TEXT_MESSAGE_END","messageId":"u2"}),
+        ];
+        assert_eq!(
+            activity_from_replay(&asked),
+            Some(BotActivity {
+                label: "Thinking".into()
+            })
+        );
+        let mut answering = asked.clone();
+        answering.push(json!({"type":"TEXT_MESSAGE_START","messageId":"m1","role":"assistant"}));
+        answering
+            .push(json!({"type":"TEXT_MESSAGE_CONTENT","messageId":"m1","delta":"Two meetings."}));
+        assert_eq!(
+            activity_from_replay(&answering),
+            Some(BotActivity {
+                label: "Writing".into()
+            })
+        );
     }
 
     #[test]
