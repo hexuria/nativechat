@@ -2767,7 +2767,7 @@ pub(crate) struct ToolListing {
 /// person or a Bot, so no connection of theirs could be kept at all; `global` reads the same
 /// under both.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(tag = "scope", content = "id", rename_all = "kebab-case")]
+#[serde(from = "OwnerOnTheWire")]
 pub enum ConnectionOwner {
     /// The whole deployment's key for something that belongs to nobody, and nobody's to lend.
     Global,
@@ -2775,6 +2775,31 @@ pub enum ConnectionOwner {
     User(String),
     /// A Bot's own identity, so what it does is done under its name and not its owner's.
     Bot(String),
+    /// A scope this app does not know yet. The server session expects more (an `org` connection
+    /// shared across an organization is plausible), and one such row must not fail the whole
+    /// list.
+    Other,
+}
+
+/// The owner as the wire spells it, read loosely so a scope from later lands as
+/// [`ConnectionOwner::Other`] instead of failing the list; serde's own `other` cannot take a
+/// scope that carries an `id`.
+#[derive(Deserialize)]
+struct OwnerOnTheWire {
+    scope: String,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+impl From<OwnerOnTheWire> for ConnectionOwner {
+    fn from(owner: OwnerOnTheWire) -> Self {
+        match (owner.scope.as_str(), owner.id) {
+            ("global", _) => Self::Global,
+            ("user", Some(id)) => Self::User(id),
+            ("bot", Some(id)) => Self::Bot(id),
+            _ => Self::Other,
+        }
+    }
 }
 
 /// One of the person's connections, as `GET /connections` lists it: a service they signed in to
@@ -6687,6 +6712,10 @@ mod tests {
                 {
                     "id": "conn_3", "connector": "weather", "owner": {"scope": "global"},
                     "label": "weather", "loans": [], "updatedAtMs": 1, "expiresAtMs": null
+                },
+                {
+                    "id": "conn_4", "connector": "slack", "owner": {"scope": "org", "id": "org_1"},
+                    "label": "Acme Slack", "loans": [], "updatedAtMs": 1
                 }
             ])))
             .expect(1)
@@ -6694,7 +6723,7 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let listed = client.list_connections().await.unwrap();
-        assert_eq!(listed.len(), 3);
+        assert_eq!(listed.len(), 4, "a scope from later does not fail the list");
         assert_eq!(listed[0].owner, ConnectionOwner::User("acct_1".into()));
         assert_eq!(listed[0].loans, ["cw_1", "cw_2"]);
         assert_eq!(
@@ -6708,6 +6737,7 @@ mod tests {
         assert_eq!(listed[1].owner, ConnectionOwner::Bot("cw_1".into()));
         assert_eq!(listed[1].expires_at_ms, Some(2));
         assert_eq!(listed[2].owner, ConnectionOwner::Global);
+        assert_eq!(listed[3].owner, ConnectionOwner::Other);
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
