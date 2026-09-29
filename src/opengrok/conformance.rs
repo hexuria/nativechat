@@ -474,6 +474,54 @@ const FIVE_HUNDRED_SHAPE: &str = "should carry its sentence under error, as JSON
 /// [`every_route_this_app_does_not_read_is_recorded_and_says_why`] fails until it does.
 const REST_NOT_READ: &[(&str, &str, &str)] = &[
     (
+        "GET__connections",
+        "/connections",
+        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
+        "POST__connections__id__lend",
+        "/connections/{id}/lend",
+        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
+        "POST__connections__id__revoke",
+        "/connections/{id}/revoke",
+        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
+        "DELETE__connections__id_",
+        "/connections/{id}",
+        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
+        "GET__connectors",
+        "/connectors",
+        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
+        "GET__connections__connector__authorize",
+        "/connections/{connector}/authorize",
+        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
+        "GET__coworkers__coworker_id__ceiling",
+        "/coworkers/{coworker_id}/ceiling",
+        "A Bot's tool ceiling (opengrok-server#268). This branch does not read it; nativechat#151 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
+        "PUT__coworkers__coworker_id__ceiling",
+        "/coworkers/{coworker_id}/ceiling",
+        "A Bot's tool ceiling (opengrok-server#268). This branch does not read it; nativechat#151 does, and takes this entry off when it \
+         lands.",
+    ),
+    (
         "GET__auth_cursor_dev_session_token",
         "/auth/cursor_dev_session_token",
         "The dev sign-in that stands in for Cursor's OAuth (opengrok-server auth/routes.rs). This \
