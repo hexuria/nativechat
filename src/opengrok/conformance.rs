@@ -4,12 +4,8 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
-//! from the server's `tests/fixtures/wire/` at e620011 (#262, the error-bodies change), whose
-//! `MANIFEST.json` names 244f0bc, the commit on #262's branch it was recorded at. The squash-merge
-//! left that commit out of main's history, as #258's did before #260 re-recorded on main; the
-//! code at the two differs only in how much of a plain-text 502, 503 or 504 the server reads
-//! before it sends it on as JSON, and what it sends for one too long to read
-//! (`gateway_errors_as_json` in `lib.rs`), which no body recorded here comes near. The layout is
+//! from the server's `tests/fixtures/wire/` at a4a8073 (#264), whose `MANIFEST.json` names
+//! 4bc4095, the commit on the server's main it was recorded at. The layout is
 //! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
 //! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
 //! per distinct shape, named after the first test that produced it. `MANIFEST.json` names the
@@ -60,7 +56,8 @@ use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
 use super::gen_ui::{
     BAR_CHART_NAMES, ChatPart, EGRESS_TUNNEL_ASK_REASON, FORM_NAMES, REVIEW_AN_ACTION_REASONS,
     RUN_AWAITING_APPROVAL, ScreenshotSpec, StepSpec, TurnAssembler, UI_CUSTOM_NAME,
-    USER_MACHINE_SHELL, approval_from_event, capped, command_from_replay_events, is_ui_tool,
+    USER_MACHINE_SHELL, approval_from_event, approval_summary, capped, command_from_replay_events,
+    is_ui_tool,
 };
 use super::pending::{
     CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
@@ -1764,6 +1761,11 @@ fn awaiting(frame: &Value) -> Check {
             && spec.thread_id.as_deref() == frame.get("threadId").and_then(Value::as_str),
         "the card should carry the frame's run, call, tool, reason and why: {spec:?}"
     );
+    holds_the_servers_sentence(
+        str_at(frame, "tool"),
+        frame.get("arguments").unwrap_or(&Value::Null),
+        frame.get("summary"),
+    )?;
     if let Some(command) = frame.pointer("/arguments/command").and_then(Value::as_str) {
         must!(
             spec.command == command,
@@ -2647,6 +2649,7 @@ fn thread_replay(_: u16, body: &Value) -> Check {
         );
         reads_back(&run.run_id, &run.events)?;
         persons_side(&run.run_id, &run.events)?;
+        replayed_parks(&run.events)?;
     }
     let hidden: Vec<&str> = body
         .get("hiddenRunIds")
@@ -2704,7 +2707,8 @@ fn run_replay(_: u16, body: &Value) -> Check {
         .ok_or("a replay with no events array")?;
     same_len(&replay.events, events)?;
     reads_back(&replay.run_id, &replay.events)?;
-    persons_side(&replay.run_id, &replay.events)
+    persons_side(&replay.run_id, &replay.events)?;
+    replayed_parks(&replay.events)
 }
 
 /// `stop_run`: the run, and what it is now. The route is idempotent, so a run that had already
@@ -2833,6 +2837,64 @@ fn file_as_sent(file: &Attachment, raw: &Value) -> Check {
     Ok(())
 }
 
+/// The card's sentence the server sends (opengrok-server #263, `cards.rs` `summary_for_ask`,
+/// null for a form) is the one this app builds itself (`approval_summary`, transcribed from the
+/// same `summary_for`), on the live frame, its replay and the queue's rows alike. A shell's card
+/// shows its command in place of a sentence, and the server's sentence for one is its fixed
+/// opening and the command clipped at 200 characters, so that is what it is held to.
+fn holds_the_servers_sentence(tool: &str, arguments: &Value, said: Option<&Value>) -> Check {
+    let Some(said) = said.filter(|said| !said.is_null()) else {
+        return Ok(());
+    };
+    let said = said.as_str().ok_or("a summary that is not a sentence")?;
+    let ours = approval_summary(tool, arguments);
+    if !ours.is_empty() {
+        must!(
+            ours == said,
+            "the card says {ours:?} where the server's own says {said:?}"
+        );
+        return Ok(());
+    }
+    let opening = match tool {
+        USER_MACHINE_SHELL => "Command on your own computer: ",
+        "shell" => "Command on the agent's own box: ",
+        _ => {
+            return Err(format!(
+                "the card has no sentence for {tool} where the server says {said:?}"
+            ));
+        }
+    };
+    let command = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("(none)");
+    let clipped: String = if command.chars().count() > 200 {
+        format!("{}…", command.chars().take(200).collect::<String>())
+    } else {
+        command.to_string()
+    };
+    must!(
+        said == format!("{opening}{clipped}"),
+        "the server's sentence for a {tool} should be its opening and the command, not {said:?}"
+    );
+    Ok(())
+}
+
+/// Every card a replay parks on says what the live one said (#263): the server stamps the
+/// sentence into the journal the replay reads from.
+fn replayed_parks(events: &[Value]) -> Check {
+    for frame in events.iter().filter(|frame| {
+        str_at(frame, "type") == "CUSTOM" && str_at(frame, "name") == RUN_AWAITING_APPROVAL
+    }) {
+        holds_the_servers_sentence(
+            str_at(frame, "tool"),
+            frame.get("arguments").unwrap_or(&Value::Null),
+            frame.get("summary"),
+        )?;
+    }
+    Ok(())
+}
+
 fn approvals(_: u16, body: &Value) -> Check {
     let queue: Vec<QueuedApproval> = parse(body)?;
     let raw = rows(body)?;
@@ -2848,6 +2910,7 @@ fn approvals(_: u16, body: &Value) -> Check {
                 && item.why.as_deref() == opt_str(raw, "why"),
             "a queued card came through changed: {item:?}"
         );
+        holds_the_servers_sentence(&item.tool, &item.arguments, raw.get("summary"))?;
     }
     Ok(())
 }

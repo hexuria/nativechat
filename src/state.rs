@@ -15667,9 +15667,9 @@ fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
             .as_deref()
             .and_then(some_unless_blank)
             .unwrap_or_else(|| "exec-consent".to_string()),
-        // The queue's rows carry the tool and its arguments but no summary (opengrok-server
-        // `list_awaiting`), so a card rebuilt from one says what the call would do the same
-        // way the stream's card does.
+        // Built from the tool and its arguments, as the stream's card is: rows from servers
+        // before opengrok-server #263 carry no summary, and the conformance ledger holds this to
+        // the `summary` newer rows carry.
         summary: approval_summary(&item.tool, &item.arguments),
         output: None,
         ok: None,
@@ -23651,7 +23651,8 @@ mod tests {
     }
 
     /// A card rebuilt off the queue after a relaunch says what the call would do, the same way
-    /// the stream's card does: the queue carries the tool and its arguments and no summary.
+    /// the stream's card does, from the tool and its arguments alone, as a queue from a server
+    /// before opengrok-server #263 carries them.
     #[test]
     fn a_queued_card_says_what_the_call_would_do() {
         let read = spec_from_queued(&queued("mcp-cw_1", "call_9", "read_file"));
