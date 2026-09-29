@@ -5593,11 +5593,24 @@ impl AppState {
 
     /// The window has come to the front. A Connect finishes in the person's browser, which comes
     /// back to the server and never to the app, so coming back to the window is when the app
-    /// looks for the new connection: while a sign-in is still waited on, and not after.
+    /// looks for the new connection: while a sign-in is still waited on, and whenever a
+    /// connections list is on screen, so someone who signed in and came back later than the wait
+    /// still finds it without pressing Refresh.
     pub fn window_activated(&mut self, cx: &mut Context<Self>) {
-        if self.connections.still_waiting(Instant::now()) {
+        if self.rereads_connections_on_activation(Instant::now()) {
             self.read_connections(cx);
         }
+    }
+
+    /// Whether coming back to the window asks for the person's connections again: a sign-in is
+    /// still waited on, or Settings → Connections or a Bot's settings (with its Connections
+    /// card) is showing.
+    fn rereads_connections_on_activation(&mut self, now: Instant) -> bool {
+        let waiting = self.connections.still_waiting(now);
+        let showing = (self.is_app_settings_open
+            && self.app_settings_tab == AppSettingsTab::Connections)
+            || self.right_pane == RightPane::Settings;
+        waiting || showing
     }
 
     pub fn close_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -25165,6 +25178,33 @@ mod tests {
         assert!(!state.connections.is_waiting("github", all_over));
         assert!(!state.connections.still_waiting(all_over));
         assert!(state.connections.waiting.is_empty());
+    }
+
+    /// Coming back to the window reads the connections again while a sign-in is waited on, and
+    /// also, once the wait is over, whenever a connections list is on screen: someone who signed
+    /// in and came back after the ten minutes still finds the new connection.
+    #[test]
+    fn coming_back_to_the_window_reads_the_connections_while_they_are_on_screen() {
+        let mut state = listed(vec![]);
+        let now = Instant::now();
+        assert!(
+            !state.rereads_connections_on_activation(now),
+            "nothing waited on and nothing on screen"
+        );
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Connections;
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "Settings → Connections is on screen, after any wait"
+        );
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.rereads_connections_on_activation(now));
+        state.is_app_settings_open = false;
+        state.right_pane = super::RightPane::Settings;
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "a Bot's settings, with its Connections card, is on screen"
+        );
     }
 
     /// A refusal goes with its connection once the server no longer lists it as the person's.
