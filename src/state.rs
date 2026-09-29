@@ -50,6 +50,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+/// The open bot's usage this month, as far as the settings pane knows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageReport {
+    Loading,
+    Read(crate::opengrok::CoworkerUsage),
+    /// The server would not say, in its words or the app's.
+    Unavailable(String),
+}
+
 /// The open bot's tools, as far as the settings pane knows them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolList {
@@ -674,6 +683,15 @@ fn carries_choice_card(message: &Message) -> bool {
         .parts
         .iter()
         .any(|part| matches!(part, ChatPart::Ui(crate::opengrok::UiSpec::Form(_))))
+}
+
+/// Why the open bot's usage is not shown, in words for its settings.
+fn usage_unavailable(error: &OpenGrokError) -> String {
+    match error.status {
+        Some(404) => "Only this bot's owner can see its usage.".to_string(),
+        Some(401) => "Sign in again to see this bot's usage.".to_string(),
+        _ => format!("Could not load this bot's usage: {}", error.message),
+    }
 }
 
 /// Why the open bot's tools are not listed, in words for its settings. A 404 is the server
@@ -2945,8 +2963,15 @@ pub struct AppState {
     /// and the answer, so a late answer for a bot the person has left is never shown as this
     /// one's.
     pub coworker_tools: Option<(String, ToolList)>,
+    /// What the open bot used this month, as its settings' Usage card shows it (#138): the
+    /// bot's id and the answer, like [`Self::coworker_tools`].
+    pub coworker_usage: Option<(String, UsageReport)>,
+    /// Counts usage reports asked for, so only the newest answer is shown.
+    usage_generation: u64,
     /// The bot settings' Tools card is open to its list.
     pub agent_tools_open: bool,
+    /// The bot settings' Usage card is open to its per-model lines (#138).
+    pub agent_usage_open: bool,
     /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
     /// same bot can come back out of order, and the older must not replace the newer.
     tools_generation: u64,
@@ -3466,7 +3491,10 @@ impl AppState {
             local_rules_epoch: 0,
             coworker_computer: None,
             coworker_tools: None,
+            coworker_usage: None,
+            usage_generation: 0,
             agent_tools_open: false,
+            agent_usage_open: false,
             tools_generation: 0,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
@@ -4815,7 +4843,60 @@ impl AppState {
             // record; opening the sidebar is the moment to make sure it is this bot's and fresh.
             self.refresh_coworker_computer_quietly(cx);
             self.refresh_coworker_tools(cx);
+            self.refresh_coworker_usage(cx);
         }
+    }
+
+    /// Ask the server what the open bot used this month. Asked each time its settings open and on
+    /// a switch while they are open; the last answer for the same bot stays up while it is asked
+    /// again, and a late answer for a bot the person has left, or an older ask, is dropped.
+    pub fn refresh_coworker_usage(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            self.coworker_usage = None;
+            return;
+        };
+        let read = matches!(
+            &self.coworker_usage,
+            Some((id, UsageReport::Read(_))) if *id == coworker_id
+        );
+        if !read {
+            self.coworker_usage = Some((coworker_id.clone(), UsageReport::Loading));
+        }
+        self.usage_generation += 1;
+        let generation = self.usage_generation;
+        cx.spawn(async move |this, cx| {
+            let result = client.coworker_usage(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_coworker_usage(generation, coworker_id, result) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Put an answer about a bot's usage on the card, unless it is no longer the one wanted: a
+    /// newer ask was made since, or the person has moved to another bot. Either way the card
+    /// must not show a report under the wrong bot's name, or an older report over a newer one.
+    fn settle_coworker_usage(
+        &mut self,
+        generation: u64,
+        coworker_id: String,
+        result: Result<crate::opengrok::CoworkerUsage, OpenGrokError>,
+    ) -> bool {
+        if self.usage_generation != generation
+            || self.active_coworker_id.as_deref() != Some(coworker_id.as_str())
+        {
+            return false;
+        }
+        let report = match result {
+            Ok(usage) => UsageReport::Read(usage),
+            Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+        };
+        self.coworker_usage = Some((coworker_id, report));
+        true
     }
 
     /// Ask the server what the open bot is offered on a turn. Asked each time its settings
@@ -4860,6 +4941,11 @@ impl AppState {
 
     pub fn toggle_agent_tools(&mut self, cx: &mut Context<Self>) {
         self.agent_tools_open = !self.agent_tools_open;
+        cx.notify();
+    }
+
+    pub fn toggle_agent_usage(&mut self, cx: &mut Context<Self>) {
+        self.agent_usage_open = !self.agent_usage_open;
         cx.notify();
     }
 
@@ -8241,11 +8327,14 @@ impl AppState {
         self.last_box_shot = None;
         self.computer_confirm = None;
         self.computer_action_error = None;
-        // The last bot's tools must not be listed under this one's name.
+        // The last bot's tools and usage must not be shown under this one's name.
         self.coworker_tools = None;
+        self.coworker_usage = None;
         self.agent_tools_open = false;
+        self.agent_usage_open = false;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
+            self.refresh_coworker_usage(cx);
         }
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(
@@ -23885,6 +23974,43 @@ mod tests {
         );
         state.auth_status = AuthStatus::SignedIn;
         state
+    }
+
+    /// A usage answer lands on the card only while it is still the one wanted: an older ask
+    /// that comes back after a newer one, or an answer for a bot the person has left, is
+    /// dropped rather than shown under the wrong name or over a newer report (#138).
+    #[test]
+    fn a_late_usage_answer_does_not_replace_the_card() {
+        let usage = |requests: i64| {
+            Ok(crate::opengrok::CoworkerUsage {
+                metered: true,
+                note: None,
+                window: "month".into(),
+                models: Vec::new(),
+                totals: crate::opengrok::UsageTotals {
+                    requests: Some(requests),
+                    ..Default::default()
+                },
+            })
+        };
+        let requests = |state: &AppState| match &state.coworker_usage {
+            Some((id, super::UsageReport::Read(read))) => Some((id.clone(), read.totals.requests)),
+            _ => None,
+        };
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+
+        // Two asks for the same bot; the newer answers first, then the older comes in late.
+        state.usage_generation = 2;
+        assert!(state.settle_coworker_usage(2, "cw_1".into(), usage(7)));
+        assert!(!state.settle_coworker_usage(1, "cw_1".into(), usage(3)));
+        assert_eq!(requests(&state), Some(("cw_1".into(), Some(7))));
+
+        // The person moved to another bot before the answer for the first came back.
+        state.active_coworker_id = Some("cw_2".into());
+        state.coworker_usage = None;
+        assert!(!state.settle_coworker_usage(2, "cw_1".into(), usage(9)));
+        assert_eq!(state.coworker_usage, None);
     }
 
     /// A walk, start to landing, the way `sync_server_threads` makes one.

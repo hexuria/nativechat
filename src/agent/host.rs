@@ -492,6 +492,7 @@ pub enum Command {
         message_id: String,
     },
     ToggleAgentTools,
+    ToggleAgentUsage,
     /// Attach a file to the draft by path, as the + would (#90).
     AttachFile(std::path::PathBuf),
     /// Take a file off the draft by its place, as its ✕ would.
@@ -707,6 +708,7 @@ impl Command {
             }
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
+            Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
             Self::AttachFile(path) => state.request_attach(path, cx),
             Self::DetachFile(index) => state.request_detach(index, cx),
             Self::UserFormDismiss { card_key } => {
@@ -1973,6 +1975,9 @@ pub struct NativeChatHost {
     agent_settings_open: bool,
     /// The open bot's tools as its settings list them, and whether the card is open to them.
     agent_tools: Option<crate::state::ToolList>,
+    /// The open bot's usage this month, as its settings' Usage card shows it (#138).
+    agent_usage: Option<crate::state::UsageReport>,
+    agent_usage_open: bool,
     agent_tools_open: bool,
     model_picker_open: bool,
     avatar_editor_open: bool,
@@ -2170,6 +2175,12 @@ impl NativeChatHost {
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, list)| list.clone()),
             agent_tools_open: state.agent_tools_open,
+            agent_usage_open: state.agent_usage_open,
+            agent_usage: state
+                .coworker_usage
+                .as_ref()
+                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+                .map(|(_, report)| report.clone()),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
             approvals: state
@@ -2924,6 +2935,35 @@ impl NativeChatHost {
             );
         if let Some(tools) = &self.agent_tools {
             settings = settings.with_child(agent_tools_node(tools, self.agent_tools_open));
+        }
+        if let Some(usage) = &self.agent_usage {
+            // `agent-usage` (value = the card's second line), with `agent-usage-toggle` while
+            // there are models to show and one `agent-usage-model-{i}` per model the server
+            // reported, label = that model's line, visible while the card is open (#138).
+            let mut node = UiNode::new("agent-usage", "status", "Usage")
+                .with_value(crate::components::agent_settings::usage_summary(usage));
+            if let crate::state::UsageReport::Read(read) = usage
+                && !read.models.is_empty()
+            {
+                node = node.with_child(UiNode::button(
+                    "agent-usage-toggle",
+                    if self.agent_usage_open {
+                        "Hide"
+                    } else {
+                        "Show"
+                    },
+                ));
+                for (i, model) in read.models.iter().enumerate() {
+                    node = node.with_child(
+                        UiNode::listitem(
+                            format!("agent-usage-model-{i}"),
+                            crate::components::agent_settings::model_line(model),
+                        )
+                        .with_visible(self.agent_usage_open),
+                    );
+                }
+            }
+            settings = settings.with_child(node);
         }
         if let Some(note) = &self.model_note {
             // The server's word about why the list is not fuller, under the field, exactly where
@@ -4063,6 +4103,19 @@ impl NativeChatHost {
                 );
             }
             Command::ToggleAgentTools
+        } else if target == "agent-usage-toggle" {
+            if !self.agent_settings_open {
+                return Err(
+                    "`agent-usage-toggle` is in the bot's settings, which are closed".into(),
+                );
+            }
+            if !matches!(&self.agent_usage, Some(crate::state::UsageReport::Read(read)) if !read.models.is_empty())
+            {
+                return Err(
+                    "`agent-usage-toggle` is only there while the server reported models".into(),
+                );
+            }
+            Command::ToggleAgentUsage
         } else if target == "agent-model-field" || target == "agent-model-dismiss" {
             Command::ToggleModelPicker
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
@@ -8630,5 +8683,63 @@ mod tests {
             host.invoke("composer.detach", &serde_json::json!({"index": "5"}))
                 .is_err()
         );
+    }
+
+    /// The Usage card is on the tree with what the server said the bot used (#138).
+    #[test]
+    fn a_bots_usage_is_on_the_tree() {
+        use crate::opengrok::{CoworkerUsage, ModelUsage, UsageTotals};
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_usage = Some(crate::state::UsageReport::Read(CoworkerUsage {
+            metered: true,
+            note: None,
+            window: "month".into(),
+            models: vec![ModelUsage {
+                model_id: "oag/cheap".into(),
+                requests: 2,
+                input_tokens: 20,
+                output_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: "2.000000".into(),
+            }],
+            totals: UsageTotals {
+                requests: Some(2),
+                input_tokens: Some(20),
+                output_tokens: Some(10),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                cost_usd: Some("2.000000".into()),
+            },
+        }));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-usage").unwrap().value.as_deref(),
+            Some("2 requests this month · 30 tokens · $2.00")
+        );
+        let row = tree.find("agent-usage-model-0").unwrap();
+        assert_eq!(row.name, "oag/cheap · 2 requests · 30 tokens · $2.00");
+        assert!(
+            !row.visible,
+            "closed card: the model lines are not on screen"
+        );
+        host.dispatch(&Op::click("agent-usage-toggle")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleAgentUsage)
+        ));
+        host.agent_usage_open = true;
+        assert!(host.snapshot().find("agent-usage-model-0").unwrap().visible);
+
+        // With the settings closed, the toggle is not on screen to click.
+        host.agent_settings_open = false;
+        assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+        host.agent_settings_open = true;
+
+        // No models, nothing to open: the toggle is not there to click.
+        host.agent_usage = Some(crate::state::UsageReport::Loading);
+        assert!(host.snapshot().find("agent-usage-toggle").is_none());
+        assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
     }
 }

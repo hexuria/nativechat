@@ -43,11 +43,12 @@ use super::activity::{
     ActivityTick, BOX_WAKING, BotActivity, ToolCallTracker, WAKING_COMPUTER, activity_from_agui,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerComputer, DaemonEnrol, DaemonList,
-    LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail, RecipeList,
-    RecipeParameterKind, RecipeRunResult, RunCause, RunReplay, ScheduleKind, ScheduleRow,
-    ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion,
-    StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
+    AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerComputer, CoworkerUsage, DaemonEnrol,
+    DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail,
+    RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay, ScheduleKind,
+    ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary,
+    SkillVersion, StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available,
+    host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -599,13 +600,6 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
         "/coworkers/{coworker_id}/spend",
         "A coworker's three spend meters and the limits an admin set; no page in this app shows \
          them.",
-    ),
-    (
-        "GET__coworkers__coworker_id__usage",
-        "/coworkers/{coworker_id}/usage",
-        "Usage per model for a window (agui/routes.rs get_usage). A bot's settings have a Usage \
-         card, but it asks the server nothing: it says \"No usage this month\", or \"No \
-         requests this month\" once opened, whatever the bot has used.",
     ),
     (
         "GET__local-exec_audit",
@@ -1930,6 +1924,7 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("PATCH__coworkers__coworker_id_", coworker_row),
     ("DELETE__coworkers__coworker_id_", coworker_deleted),
     ("GET__coworkers__coworker_id__tools", coworker_tools),
+    ("GET__coworkers__coworker_id__usage", coworker_usage),
     ("GET__coworkers__coworker_id__computer", computer),
     ("GET__coworkers__coworker_id__screen", screen),
     (
@@ -2953,6 +2948,55 @@ fn coworkers(_: u16, body: &Value) -> Check {
 /// A hire and an edit answer with the coworker as it now is, which is the row the roster keeps.
 fn coworker_row(_: u16, body: &Value) -> Check {
     coworker_matches(&parse(body)?, body)
+}
+
+/// A bot's usage this month (opengrok-server `points.rs` `UsageView`): what the Usage card
+/// shows comes through as sent, metered or not (#138).
+fn coworker_usage(_: u16, body: &Value) -> Check {
+    let usage: CoworkerUsage = parse(body)?;
+    must!(
+        usage.metered == body["metered"].as_bool().unwrap_or(!usage.metered)
+            && usage.note.as_deref() == opt_str(body, "note")
+            && usage.window == str_at(body, "window"),
+        "the usage report's header should come through: {usage:?}"
+    );
+    let raw = body["models"]
+        .as_array()
+        .ok_or("a usage report should carry models")?;
+    same_len(&usage.models, raw)?;
+    for (model, raw) in usage.models.iter().zip(raw) {
+        must!(
+            model.model_id == str_at(raw, "modelId")
+                && Some(model.requests) == raw["requests"].as_i64()
+                && Some(model.input_tokens) == raw["inputTokens"].as_i64()
+                && Some(model.output_tokens) == raw["outputTokens"].as_i64()
+                && Some(model.cache_read_tokens) == raw["cacheReadTokens"].as_i64()
+                && Some(model.cache_write_tokens) == raw["cacheWriteTokens"].as_i64()
+                && model.cost_usd == str_at(raw, "costUsd"),
+            "each model's use should come through: {model:?} from {raw}"
+        );
+    }
+    must!(
+        usage.totals.requests == body["totals"]["requests"].as_i64()
+            && usage.totals.input_tokens == body["totals"]["inputTokens"].as_i64()
+            && usage.totals.output_tokens == body["totals"]["outputTokens"].as_i64()
+            && usage.totals.cache_read_tokens == body["totals"]["cacheReadTokens"].as_i64()
+            && usage.totals.cache_write_tokens == body["totals"]["cacheWriteTokens"].as_i64()
+            && usage.totals.cost_usd.as_deref() == body["totals"]["costUsd"].as_str(),
+        "the totals should come through: {:?}",
+        usage.totals
+    );
+    must!(
+        usage.metered || (usage.models.is_empty() && usage.totals.requests.is_none()),
+        "a bot that is not metered should have nothing to show: {usage:?}"
+    );
+    // Metered with a note is the gateway not answering: its zeros are not a measurement, and
+    // the card shows the note instead of them.
+    must!(
+        !usage.metered || usage.note.is_none() || usage.models.is_empty(),
+        "a metered report with a note should have no models: {usage:?}"
+    );
+    Ok(())
 }
 
 /// A bot's tools (opengrok-server `agui/routes.rs` `list_tools`): every tool the server lists

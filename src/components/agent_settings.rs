@@ -5,7 +5,7 @@ use crate::chrome::{
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
 use crate::opengrok::{CoworkerPatch, CoworkerTool, ModelEntry};
-use crate::state::{AppState, ToolList};
+use crate::state::{AppState, ToolList, UsageReport};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
@@ -125,7 +125,6 @@ pub struct AgentSettings {
     /// The profile is with the server. The Save button is out of the person's hands until the
     /// answer comes back, whichever way it goes.
     saving: bool,
-    usage_open: bool,
     auto_review_open: bool,
     auto_review_mode: AutoReviewMode,
 }
@@ -203,7 +202,6 @@ impl AgentSettings {
             model_scroll: ScrollHandle::new(),
             synced_id: None,
             saving: false,
-            usage_open: false,
             auto_review_open: false,
             auto_review_mode: AutoReviewMode::Inherit,
         }
@@ -485,7 +483,7 @@ impl Render for AgentSettings {
         let model_highlight = self.model_highlight;
         let model_scroll = self.model_scroll.clone();
         let saving = self.saving;
-        let usage_open = self.usage_open;
+        let usage_open = self.state.read(cx).agent_usage_open;
         let auto_review_open = self.auto_review_open;
         let tools_open = self.state.read(cx).agent_tools_open;
         let tools = {
@@ -495,6 +493,23 @@ impl Render for AgentSettings {
                 .as_ref()
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, list)| list.clone())
+        };
+        let usage = {
+            let state = self.state.read(cx);
+            state
+                .coworker_usage
+                .as_ref()
+                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+                .map(|(_, report)| report.clone())
+        };
+        let usage_line = usage
+            .as_ref()
+            .map_or_else(|| "Asking the server…".to_string(), usage_summary);
+        let usage_rows: Vec<String> = match &usage {
+            Some(UsageReport::Read(read)) if usage_open => {
+                read.models.iter().map(model_line).collect()
+            }
+            _ => Vec::new(),
         };
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
@@ -801,35 +816,53 @@ impl Render for AgentSettings {
                                                                 div()
                                                                     .text_xs()
                                                                     .text_color(muted)
-                                                                    .child(if usage_open {
-                                                                        "No requests this month"
-                                                                    } else {
-                                                                        "No usage this month"
-                                                                    }),
+                                                                    // What the server says the bot used,
+                                                                    // not a word the app made up (#138).
+                                                                    .child(usage_line),
                                                             ),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .id("agent-usage-open")
-                                                            .px(px(11.))
-                                                            .py(px(5.))
-                                                            .rounded(px(8.))
-                                                            .border_1()
-                                                            .border_color(
-                                                                rgb(0x7f7f7f).opacity(0.4),
+                                                    // Only a list of models has anything to open to.
+                                                    .when(
+                                                        matches!(usage, Some(UsageReport::Read(ref read)) if !read.models.is_empty()),
+                                                        |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .id("agent-usage-toggle")
+                                                                    .px(px(11.))
+                                                                    .py(px(5.))
+                                                                    .rounded(px(8.))
+                                                                    .border_1()
+                                                                    .border_color(
+                                                                        rgb(0x7f7f7f).opacity(0.4),
+                                                                    )
+                                                                    .text_xs()
+                                                                    .cursor_pointer()
+                                                                    .on_mouse_down(MouseButton::Left, {
+                                                                        let app = app.clone();
+                                                                        move |_, _, cx| {
+                                                                            app.update(cx, |state, cx| state.toggle_agent_usage(cx));
+                                                                        }
+                                                                    })
+                                                                    .child(if usage_open { "Hide" } else { "Show" }),
                                                             )
-                                                            .text_xs()
-                                                            .cursor_pointer()
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(|this, _, _, cx| {
-                                                                    this.usage_open = !this.usage_open;
-                                                                    cx.notify();
-                                                                }),
-                                                            )
-                                                            .child("Open"),
+                                                        },
                                                     ),
-                                            ),
+                                            )
+                                            // Under the header row, as the Tools card's list is, so
+                                            // the Hide button stays beside the card's own line.
+                                            .when(!usage_rows.is_empty(), |this| {
+                                                this.child(
+                                                    v_flex().pt(px(8.)).gap(px(4.)).children(
+                                                        usage_rows.into_iter().enumerate().map(|(i, line)| {
+                                                            div()
+                                                                .id(SharedString::from(format!("agent-usage-model-{i}")))
+                                                                .text_xs()
+                                                                .text_color(muted)
+                                                                .child(line)
+                                                        }),
+                                                    ),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -1540,6 +1573,129 @@ mod tests {
     }
 }
 
+/// The Usage card's second line: what the bot used this month, or why the app cannot say.
+pub(crate) fn usage_summary(report: &UsageReport) -> String {
+    match report {
+        UsageReport::Loading => "Asking the server…".to_string(),
+        UsageReport::Unavailable(why) => why.clone(),
+        // A note means the numbers are not a measurement: the bot is not metered, or it is and
+        // the gateway could not be asked, which the server answers with zero totals. Either way
+        // the note is what the card says, never "No requests". The note is a clause ("this
+        // coworker has no key of its own yet, …"); on the card it stands as its own line, so it
+        // starts with a capital.
+        UsageReport::Read(usage) if usage.note.is_some() || !usage.metered => usage
+            .note
+            .as_deref()
+            .map_or_else(|| "This bot's use is not measured.".to_string(), sentence),
+        // The gateway leaves attempts that were paid for but lost out of `requests`, so a month
+        // of none can still have models to show; only a month with nothing at all is "No".
+        UsageReport::Read(usage) => match usage.totals.requests.unwrap_or(0) {
+            0 if usage.models.is_empty() => "No requests this month".to_string(),
+            requests => {
+                let totals = &usage.totals;
+                let tokens = [
+                    totals.input_tokens,
+                    totals.output_tokens,
+                    totals.cache_read_tokens,
+                    totals.cache_write_tokens,
+                ]
+                .into_iter()
+                .flatten()
+                .fold(0i64, i64::saturating_add);
+                let mut line = format!(
+                    "{} this month · {} tokens",
+                    plural(requests, "request"),
+                    grouped(tokens)
+                );
+                if let Some(cost) = usage.totals.cost_usd.as_deref().and_then(dollars) {
+                    line.push_str(&format!(" · {cost}"));
+                }
+                line
+            }
+        },
+    }
+}
+
+/// `text` with its first letter capitalised.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// One model's line once the card is open.
+pub(crate) fn model_line(model: &crate::opengrok::ModelUsage) -> String {
+    let mut line = format!(
+        "{} · {} · {} tokens",
+        model.model_id,
+        plural(model.requests, "request"),
+        grouped(
+            model
+                .input_tokens
+                .saturating_add(model.output_tokens)
+                .saturating_add(model.cache_read_tokens)
+                .saturating_add(model.cache_write_tokens)
+        )
+    );
+    if let Some(cost) = dollars(&model.cost_usd) {
+        line.push_str(&format!(" · {cost}"));
+    }
+    line
+}
+
+fn plural(n: i64, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{} {word}s", grouped(n))
+    }
+}
+
+/// A count with thousands separated, the way a person reads a big number.
+fn grouped(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+/// The server's six-decimal dollars as a person reads them, to the cent; a sum under a cent that
+/// is not zero reads as "under $0.01" rather than as nothing spent. The decimal string is
+/// rounded as written, half a cent up: through a float, "1.005000" is 1.00499… and would read
+/// a cent short.
+fn dollars(six: &str) -> Option<String> {
+    let (whole, fraction) = six.trim().split_once('.').unwrap_or((six.trim(), ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digit = |at: usize| u64::from(fraction.as_bytes().get(at).map_or(0, |b| b - b'0'));
+    let whole: u64 = whole.parse().ok()?;
+    let cents = whole
+        .checked_mul(100)?
+        .checked_add(digit(0) * 10 + digit(1) + u64::from(digit(2) >= 5))?;
+    if cents == 0 {
+        return Some(if fraction.bytes().any(|b| b != b'0') {
+            "under $0.01".to_string()
+        } else {
+            "$0.00".to_string()
+        });
+    }
+    Some(format!(
+        "${}.{:02}",
+        grouped(i64::try_from(cents / 100).ok()?),
+        cents % 100
+    ))
+}
+
 /// The Tools card's second line: how many the bot is offered, and from where, or why the app
 /// cannot say.
 pub(crate) fn tools_summary(list: &ToolList) -> String {
@@ -1618,7 +1774,7 @@ fn tools_body(all: &[CoworkerTool], muted: Hsla) -> impl IntoElement {
 
 #[cfg(test)]
 mod tools_tests {
-    use super::{first_line_of, tools_summary};
+    use super::{first_line_of, model_line, tools_summary, usage_summary};
     use crate::opengrok::CoworkerTool;
     use crate::state::ToolList;
 
@@ -1677,5 +1833,145 @@ mod tools_tests {
             161,
             "no spaces: cut on a char"
         );
+    }
+
+    /// The Usage card says what the server says the bot used, and never "no usage" for a bot that
+    /// used some, nor for one the server does not measure (#138).
+    #[test]
+    fn the_usage_card_says_what_the_server_measured() {
+        use crate::opengrok::{CoworkerUsage, ModelUsage};
+        use crate::state::UsageReport;
+        let used = CoworkerUsage {
+            metered: true,
+            note: None,
+            window: "month".into(),
+            models: vec![ModelUsage {
+                model_id: "oag/cheap".into(),
+                requests: 1234,
+                input_tokens: 20000,
+                output_tokens: 1000,
+                cache_read_tokens: 500,
+                cache_write_tokens: 0,
+                cost_usd: "2.000000".into(),
+            }],
+            totals: crate::opengrok::UsageTotals {
+                requests: Some(1234),
+                input_tokens: Some(20000),
+                output_tokens: Some(1000),
+                cache_read_tokens: Some(500),
+                cache_write_tokens: Some(0),
+                cost_usd: Some("2.000000".into()),
+            },
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(used.clone())),
+            "1,234 requests this month · 21,500 tokens · $2.00"
+        );
+        assert_eq!(
+            model_line(&used.models[0]),
+            "oag/cheap · 1,234 requests · 21,500 tokens · $2.00"
+        );
+        let one = ModelUsage {
+            requests: 1,
+            input_tokens: 900,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cost_usd: "0.004000".into(),
+            ..used.models[0].clone()
+        };
+        assert_eq!(
+            model_line(&one),
+            "oag/cheap · 1 request · 901 tokens · under $0.01"
+        );
+        let idle = CoworkerUsage {
+            models: Vec::new(),
+            totals: crate::opengrok::UsageTotals {
+                requests: Some(0),
+                ..Default::default()
+            },
+            ..used.clone()
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(idle.clone())),
+            "No requests this month",
+            "a fresh bot with real zeros and no note"
+        );
+        // Every attempt paid for but lost: no requests counted, yet a model with tokens and cost.
+        let lost = CoworkerUsage {
+            models: vec![ModelUsage {
+                requests: 0,
+                ..used.models[0].clone()
+            }],
+            totals: crate::opengrok::UsageTotals {
+                requests: Some(0),
+                ..used.totals.clone()
+            },
+            ..used.clone()
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(lost)),
+            "0 requests this month · 21,500 tokens · $2.00"
+        );
+        // Metered, but the gateway could not be asked: the server sends zero totals with a
+        // note, and those zeros are not a measurement.
+        let unread = CoworkerUsage {
+            note: Some("the gateway could not be asked: timed out".into()),
+            ..idle
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(unread)),
+            "The gateway could not be asked: timed out"
+        );
+        let unmetered = CoworkerUsage {
+            metered: false,
+            note: Some("this coworker's key cannot serve".into()),
+            models: Vec::new(),
+            totals: Default::default(),
+            ..used
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(unmetered.clone())),
+            "This coworker's key cannot serve"
+        );
+        let unexplained = CoworkerUsage {
+            metered: false,
+            note: None,
+            ..unmetered
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(unexplained)),
+            "This bot's use is not measured."
+        );
+        assert_eq!(usage_summary(&UsageReport::Loading), "Asking the server…");
+        assert_eq!(
+            usage_summary(&UsageReport::Unavailable(
+                "Only this bot's owner can see its usage.".into()
+            )),
+            "Only this bot's owner can see its usage."
+        );
+    }
+
+    /// The cents are rounded from the server's decimal string, not through a float, which puts
+    /// "1.005000" at 1.00499… and a cent short.
+    #[test]
+    fn dollars_round_the_servers_decimals_to_the_cent() {
+        for (six, read) in [
+            ("2.000000", Some("$2.00")),
+            ("0.015000", Some("$0.02")),
+            ("1.005000", Some("$1.01")),
+            ("1.004999", Some("$1.00")),
+            ("0.005000", Some("$0.01")),
+            ("0.004000", Some("under $0.01")),
+            ("0.000001", Some("under $0.01")),
+            ("0.000000", Some("$0.00")),
+            ("1234.5", Some("$1,234.50")),
+            ("7", Some("$7.00")),
+            ("-1.000000", None),
+            ("", None),
+            ("abc", None),
+            ("1.2.3", None),
+        ] {
+            assert_eq!(super::dollars(six).as_deref(), read, "{six:?}");
+        }
     }
 }

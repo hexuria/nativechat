@@ -1386,6 +1386,16 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// `GET /coworkers/{id}/usage` — what the bot used this month, per model (#138). The
+    /// server's default window is the month, which is what the Usage card shows.
+    pub async fn coworker_usage(&self, coworker_id: &str) -> Result<CoworkerUsage, OpenGrokError> {
+        let path = format!("/coworkers/{}/usage", path_segment(coworker_id));
+        let response = self
+            .send_json::<()>(reqwest::Method::GET, &path, None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     /// `GET /coworkers/{id}/tools` — exactly what the model is offered on this bot's next turn,
     /// assembled from its grant, its computer and its plugins. Read-only: nothing on the server
     /// changes the set yet (opengrok-server#84), so the app only shows it.
@@ -2533,6 +2543,57 @@ pub(crate) fn upload_filename(name: &str) -> String {
     } else {
         clean
     }
+}
+
+/// What a bot used in a window, per model, as `GET /coworkers/{id}/usage` answers it.
+///
+/// Transcribed from opengrok-server `crates/opengrok-server/src/points.rs` (`UsageView`,
+/// `ModelUsageView`, `TotalsView`, camelCase) and its recorded answers in
+/// `fixtures/wire/rest/GET__coworkers__coworker_id__usage/`. A bot that is not metered has no
+/// models and every total null, and `note` says why. A metered bot whose gateway could not be
+/// asked is `metered: true` with a `note`, no models and zero totals: those zeros are not a
+/// measurement. Only what the Usage card shows is read.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CoworkerUsage {
+    pub metered: bool,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub window: String,
+    #[serde(default)]
+    pub models: Vec<ModelUsage>,
+    #[serde(default)]
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub model_id: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    /// Dollars as the server writes them, six decimals: `"2.000000"`.
+    pub cost_usd: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub requests: Option<i64>,
+    #[serde(default)]
+    pub input_tokens: Option<i64>,
+    #[serde(default)]
+    pub output_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
+    #[serde(default)]
+    pub cost_usd: Option<String>,
 }
 
 /// One tool the bot is offered on a turn right now, as `GET /coworkers/{id}/tools` lists it.
@@ -6275,6 +6336,65 @@ mod tests {
         assert_eq!(
             queue[1].why.as_deref(),
             Some("Reading a file outside the workspace.")
+        );
+    }
+
+    /// The recorded answers, metered and not (opengrok-server wire corpus,
+    /// `GET__coworkers__coworker_id__usage/200-…`), read as the Usage card needs them.
+    #[tokio::test]
+    async fn a_bots_usage_is_read_metered_or_not() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "metered": true, "note": null, "seat": "api", "keyPrefix": "oag_live_x",
+                "window": "month",
+                "models": [{"modelId": "oag/cheap", "requests": 2, "inputTokens": 20,
+                    "outputTokens": 10, "cacheReadTokens": 5, "cacheWriteTokens": 3,
+                    "costUsd": "2.000000", "listUsd": "2.000000", "points": 10000000}],
+                "totals": {"requests": 2, "inputTokens": 20, "outputTokens": 10,
+                    "cacheReadTokens": 5, "cacheWriteTokens": 3, "costUsd": "2.000000",
+                    "listUsd": "2.000000", "points": 10000000}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_2/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "metered": false, "note": "this coworker's key cannot serve",
+                "seat": null, "keyPrefix": null, "window": "month", "models": [],
+                "totals": {"requests": null, "inputTokens": null, "outputTokens": null,
+                    "cacheReadTokens": null, "cacheWriteTokens": null, "costUsd": null,
+                    "listUsd": null, "points": null}
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let used = client.coworker_usage("cw_1").await.unwrap();
+        assert!(used.metered);
+        assert_eq!(used.models[0].model_id, "oag/cheap");
+        assert_eq!(used.totals.requests, Some(2));
+        assert_eq!(
+            (
+                used.models[0].cache_read_tokens,
+                used.models[0].cache_write_tokens
+            ),
+            (5, 3)
+        );
+        assert_eq!(
+            (
+                used.totals.cache_read_tokens,
+                used.totals.cache_write_tokens
+            ),
+            (Some(5), Some(3))
+        );
+        assert_eq!(used.totals.cost_usd.as_deref(), Some("2.000000"));
+        let unmetered = client.coworker_usage("cw_2").await.unwrap();
+        assert!(!unmetered.metered && unmetered.models.is_empty());
+        assert_eq!(unmetered.totals.requests, None);
+        assert_eq!(
+            unmetered.note.as_deref(),
+            Some("this coworker's key cannot serve")
         );
     }
 
