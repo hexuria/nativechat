@@ -3486,7 +3486,13 @@ mod tests {
             json!("escalated"),
             json!({"id": "entry-1", "callId": "call-9", "widgetDismissed": true}),
         );
-        for event in [escalated_entry, split] {
+        // A fallback parse that took a dismissal off the frame does not outvote the escalation.
+        let mut fallback = frame(
+            Value::Null,
+            json!({"id": "entry-1", "callId": "call-9", "formResolution": "escalated"}),
+        );
+        fallback["widgetDismissed"] = json!(true);
+        for event in [escalated_entry, split, fallback] {
             let mut turn = TurnAssembler::default();
             turn.push_event(&event);
             let (_, parts) = turn.snapshot();

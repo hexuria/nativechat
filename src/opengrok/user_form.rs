@@ -995,12 +995,16 @@ impl UserFormSpec {
         // is redrawn asking again for something already answered (#139). A live frame has
         // neither, and stays open.
         let (resolution, dismissed, handoff) = park_settlement(event);
-        spec.resolution = spec.resolution.or(resolution);
-        spec.widget_dismissed |= dismissed;
-        spec.computer_handoff = ComputerHandoffStatus::fold(spec.computer_handoff, handoff);
-        if spec.handoff_entry_id.is_none() {
-            spec.handoff_entry_id = parse_handoff_entry_id(event);
+        if handoff.is_some() {
+            // An escalation leaves the form in place, whatever a fallback parse above took
+            // from the same frame.
+            spec.resolution = None;
+            spec.widget_dismissed = false;
+        } else {
+            spec.resolution = spec.resolution.or(resolution);
+            spec.widget_dismissed |= dismissed;
         }
+        spec.computer_handoff = ComputerHandoffStatus::fold(spec.computer_handoff, handoff);
         fill_run_and_call(&mut spec, event);
         Some(spec)
     }
@@ -1529,7 +1533,17 @@ fn arguments_object(event: &Value, fallback: Option<&Value>) -> Value {
 pub(crate) fn park_settlement(
     event: &Value,
 ) -> (Option<FormResolution>, bool, Option<ComputerHandoffStatus>) {
-    let value = event.get("value").unwrap_or(&Value::Null);
+    // The server matches a replayed card to its park by entry, call, or failing both by the
+    // form's title and fields across the bot's whole transcript; an entry that names another
+    // call is another card's, and says nothing about this one.
+    let value = event
+        .get("value")
+        .filter(|entry| {
+            let theirs = entry.get("callId").and_then(Value::as_str).unwrap_or("");
+            let ours = event.get("callId").and_then(Value::as_str).unwrap_or("");
+            theirs.is_empty() || ours.is_empty() || theirs == ours
+        })
+        .unwrap_or(&Value::Null);
     let said: Vec<FormResolution> = [event, value]
         .into_iter()
         .filter_map(parse_resolution)
