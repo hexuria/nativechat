@@ -530,10 +530,10 @@ mod tests {
     }
 
     /// A refusal with a code and a sentence is shown as the sentence, with the code kept apart,
-    /// in the shape the server sends today (the code under `error`, the sentence under `message`,
-    /// as `fixtures/wire/rest/POST__ag-ui/409-…` records it) and in the one it is moving to (the
-    /// sentence under `error`, the code under `code`). `run-exists` used to reach the person as
-    /// it was.
+    /// in the shape the server sends (the sentence under `error`, the code under `code`, as
+    /// `fixtures/wire/rest/POST__ag-ui/409-…` records it since opengrok-server's error-bodies
+    /// change) and in the one it sent before (the code under `error`, the sentence under
+    /// `message`), which the queue's 409s keep. `run-exists` used to reach the person as it was.
     #[test]
     fn a_code_beside_a_sentence_is_shown_as_the_sentence() {
         let said = "this run id already has a run; a new turn needs a new run id";
