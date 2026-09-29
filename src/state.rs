@@ -10860,7 +10860,7 @@ impl AppState {
                 // The policy answers what it covers; the rest wait for a card.
                 let mut needs_card = Vec::new();
                 for item in queue {
-                    if state.approval_answered(&item.call_id) {
+                    if state.approval_answered(&item.call_id) || is_form_park(&item) {
                         continue;
                     }
                     let spec = spec_from_queued(&item);
@@ -10923,6 +10923,9 @@ impl AppState {
     }
 
     fn attach_queued_approval(&mut self, item: QueuedApproval) {
+        if is_form_park(&item) {
+            return;
+        }
         let spec = spec_from_queued(&item);
         self.approval_decisions
             .entry(spec.call_id.clone())
@@ -15637,6 +15640,14 @@ fn card_answer(
         pattern: spec.command.clone(),
     };
     (approved, decision, Some(rule))
+}
+
+/// The approvals queue lists a form's park beside the permission cards (opengrok-server
+/// `GET /ag-ui/approvals`, `reason: user-form`). The form card is what asks the person for it, off
+/// the park's own frame; a permission card for `request_user_form` would ask nothing anyone can
+/// answer (#144).
+fn is_form_park(item: &QueuedApproval) -> bool {
+    item.reason.as_deref() == Some(crate::opengrok::USER_FORM_REASON)
 }
 
 fn spec_from_queued(item: &QueuedApproval) -> ApprovalSpec {
@@ -23544,6 +23555,49 @@ mod tests {
             reason: Some("policy-approval".into()),
             why: Some("Reading a file outside the workspace.".into()),
         }
+    }
+
+    /// #144: the approvals queue lists a form's park too (`reason: user-form`, recorded in
+    /// `fixtures/wire/rest/GET__ag-ui_approvals/200-a_chat_turns_card_is_placed_by_its_coworker.json`).
+    /// The form card is what asks the person for it; an Allow / Deny card for
+    /// `request_user_form` beside it asks nothing anyone can answer.
+    #[test]
+    fn a_forms_park_in_the_approvals_queue_is_not_a_permission_card() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/wire/rest/GET__ag-ui_approvals/200-a_chat_turns_card_is_placed_by_its_coworker.json"
+        ))
+        .expect("the recording");
+        let queue: Vec<QueuedApproval> =
+            serde_json::from_value(recorded["body"].clone()).expect("the queue");
+        let form = queue[0].clone();
+        assert_eq!(form.reason.as_deref(), Some("user-form"));
+
+        let mut state = AppState::new();
+        let coworker = form.thread_id.clone();
+        state.conversations.push(thread(
+            &coworker,
+            vec![at(message("m_said", false, "Let me sign in."), 10)],
+        ));
+        state.attach_queued_approval(form);
+
+        assert!(
+            !state.conversations[0].messages.iter().any(|message| message
+                .parts
+                .iter()
+                .any(|part| matches!(part, ChatPart::Approval(_)))),
+            "no permission card for a form's park"
+        );
+        assert!(
+            state.approval_decisions.is_empty(),
+            "nothing pending to answer"
+        );
+
+        // A real permission card in the same queue still comes through.
+        state.attach_queued_approval(queued(&coworker, "call_9", "read_file"));
+        assert!(matches!(
+            state.conversations[0].messages[0].parts.as_slice(),
+            [ChatPart::Approval(spec)] if spec.call_id == "call_9"
+        ));
     }
 
     /// The door files its cards under a thread of its own, `mcp-{coworker}`. There is no

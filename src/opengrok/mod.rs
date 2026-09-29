@@ -33,6 +33,7 @@ pub use gen_ui::{
     place_hitl_cards_in_document_order, policy_answer,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
+pub(crate) use user_form::USER_FORM_REASON;
 pub use user_form::{
     BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, ComputerHandoffSpec,
     ComputerHandoffStatus, FORM_ENTRY_MISSING, FormResolution, MASKED_PRESENCE_STUB,
