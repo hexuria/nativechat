@@ -393,6 +393,15 @@ impl RenderOnce for MessageBubble {
                 .into_any_element()
         });
 
+        // A message of files alone draws no bubble of words, but what it answers and whose it
+        // is still go above its tiles (review of #140).
+        let (mut caption, mut quote) = (caption, quote);
+        let wordless_head = (self.text.trim().is_empty() && !self.files.is_empty()).then(|| {
+            v_flex()
+                .items_end()
+                .when_some(caption.take(), |this, caption| this.child(caption))
+                .when_some(quote.take(), |this, quote| this.child(quote))
+        });
         let bubble = div()
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
             .flex_shrink_0()
@@ -431,6 +440,7 @@ impl RenderOnce for MessageBubble {
             .min_w_0()
             .when(self.reaction.is_some(), |this| this.mb(px(12.)))
             .when(!wordless, |this| this.child(bubble))
+            .when_some(wordless_head, |this, head| this.child(head))
             .when_some(tiles, |this, tiles| {
                 this.child(div().when(!wordless, |this| this.mt(px(6.))).child(tiles))
             })

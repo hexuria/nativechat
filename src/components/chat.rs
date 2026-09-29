@@ -637,6 +637,10 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         .join(", ");
                     rows.push(ChatRow {
                         is_me: true,
+                        // Read aloud says the names, and its button follows it as for words.
+                        is_native_speaking,
+                        is_native_paused: state.native_tts.is_paused && is_native_speaking,
+                        is_native_loading: state.native_tts.is_loading && is_native_speaking,
                         timestamp: SharedString::from(msg.formatted_time()),
                         queued: state.is_send_queued(&msg.id),
                         show_footer: true,
@@ -2461,6 +2465,11 @@ mod tests {
         );
         assert_eq!(row.files.len(), 2);
         assert_eq!(row.tts_text.as_ref(), "art_1.pdf, art_2.pdf");
+        // Read aloud on it shows as reading, as for a worded message (review of #140).
+        state.native_tts.message_id = Some("m_files".into());
+        let rows = snapshot_rows(&state);
+        let row = rows.iter().find(|row| row.source_id == "m_files").unwrap();
+        assert!(row.is_native_speaking);
         let worded = of("m_words");
         assert_eq!(worded.len(), 1, "the files ride on the words' own row");
         assert_eq!(worded[0].content.as_ref(), "see these");
