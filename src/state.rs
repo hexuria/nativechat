@@ -13583,10 +13583,12 @@ impl AppState {
                     &card_key,
                     crate::opengrok::UserFormSpec::settle_form_from_box(*resolution),
                 );
+                // A timeout is the hand-off nobody finished, so it is Skipped, never Done, the
+                // same as a replay reads it (`box_settlement`).
                 let computer = match resolution {
-                    BoxHandoffResolution::Declined => ComputerHandoffStatus::Skipped,
-                    BoxHandoffResolution::HandedBack | BoxHandoffResolution::TimedOut => {
-                        ComputerHandoffStatus::Done
+                    BoxHandoffResolution::HandedBack => ComputerHandoffStatus::Done,
+                    BoxHandoffResolution::Declined | BoxHandoffResolution::TimedOut => {
+                        ComputerHandoffStatus::Skipped
                     }
                 };
                 self.set_computer_handoff(&card_key, computer);
