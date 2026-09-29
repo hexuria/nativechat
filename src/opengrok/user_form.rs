@@ -988,6 +988,21 @@ impl UserFormSpec {
                     .then(|| Self::parse(value, hint.clone()))
                     .flatten()
             })?;
+        // On replay the server folds the card's entry onto this same frame (opengrok-server
+        // `agui/user_form.rs` `overlay_form`): `formResolution` beside the arguments and the
+        // whole entry, `widgetDismissed` too, in `value`. A card settled after its run stopped
+        // waiting has no later settled frame to fold, so its settled state is read here, or it
+        // is redrawn asking again for something already answered (#139). A live frame has
+        // neither, and stays open.
+        for source in [event, value] {
+            let (resolution, dismissed, handoff) = absorb_escalated_wire(
+                parse_resolution(source),
+                bool_at(source, "widgetDismissed").unwrap_or(false),
+            );
+            spec.resolution = spec.resolution.or(resolution);
+            spec.widget_dismissed |= dismissed;
+            spec.computer_handoff = ComputerHandoffStatus::fold(spec.computer_handoff, handoff);
+        }
         fill_run_and_call(&mut spec, event);
         Some(spec)
     }

@@ -1660,18 +1660,36 @@ fn awaiting(frame: &Value) -> Check {
             "every field should show, and every secret one masked: {:?}",
             spec.fields
         );
-        // Open, whatever the frame says. A replay lays the card's settled `formResolution` over
-        // its park (opengrok-server `agui/user_form.rs` `overlay_form`), and the app does not
-        // read it there: the settlement reaches it as the `user-form` CUSTOM the server
-        // journals onto the run when the card settles (`journal_settled_form`), and
-        // `reads_back` holds every recorded replay to ending with the card settled.
+        // Open unless the frame itself says the card was settled. A replay lays the card's
+        // entry over its park (opengrok-server `agui/user_form.rs` `overlay_form`):
+        // `formResolution` beside the arguments and the entry, `widgetDismissed` too, in
+        // `value`. A card settled after its run stopped waiting gets no later `user-form` frame
+        // (`journal_agui_custom` journals none onto a run that no longer waits), so the park is
+        // the only place its settlement is said (#139). An escalation is the computer's
+        // sibling, not a settlement of the form.
+        let resolution = frame
+            .get("formResolution")
+            .or_else(|| frame.pointer("/value/formResolution"))
+            .and_then(Value::as_str)
+            .filter(|word| *word != "escalated");
+        let dismissed = frame
+            .pointer("/value/widgetDismissed")
+            .and_then(Value::as_bool)
+            == Some(true)
+            || frame.get("widgetDismissed").and_then(Value::as_bool) == Some(true);
+        let settled = resolution.is_some() || dismissed;
         must!(
-            spec.title == str_at(&frame["arguments"], "title") && spec.is_unresolved(),
-            "an open card titled as the form: {spec:?}"
+            spec.title == str_at(&frame["arguments"], "title") && spec.is_unresolved() != settled,
+            "the card titled as the form, {}: {spec:?}",
+            if settled {
+                "settled as its frame says"
+            } else {
+                "open"
+            }
         );
         let card = |part: &ChatPart| matches!(part, ChatPart::UserForm(card) if card.entry_id == spec.entry_id);
         must!(
-            assembler.waiting_user_form()
+            assembler.waiting_user_form() != settled
                 && parts.iter().any(card)
                 && !parts
                     .iter()
