@@ -395,12 +395,37 @@ impl RenderOnce for MessageBubble {
 
         // A message of files alone draws no bubble of words, but what it answers and whose it
         // is still go above its tiles (review of #140).
-        let (mut caption, mut quote) = (caption, quote);
+        // With no bubble behind them, the quote and caption take the page's colours, not the
+        // bubble's: the person's bubble writes white on its fill, which on the page is white on
+        // white in the light theme (Cursor on #140). They are held to the bubble's width.
         let wordless_head = (self.text.trim().is_empty() && !self.files.is_empty()).then(|| {
+            let page_fg = cx.theme().muted_foreground;
+            let page_rule = cx.theme().border;
             v_flex()
+                .max_w(max_bubble)
                 .items_end()
-                .when_some(caption.take(), |this, caption| this.child(caption))
-                .when_some(quote.take(), |this, quote| this.child(quote))
+                .when_some(self.caption.clone(), |this, caption| {
+                    this.child(
+                        div()
+                            .mb(px(4.))
+                            .text_xs()
+                            .text_color(page_fg)
+                            .child(caption),
+                    )
+                })
+                .when_some(self.reply_preview.clone(), |this, preview| {
+                    this.child(
+                        div()
+                            .mb(px(6.))
+                            .pr(px(8.))
+                            .border_r_2()
+                            .border_color(page_rule)
+                            .text_xs()
+                            .text_color(page_fg)
+                            .text_right()
+                            .child(truncate_preview(&preview, 88)),
+                    )
+                })
         });
         let bubble = div()
             .id(ElementId::Name(format!("bubble-{row_key}").into()))
