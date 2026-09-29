@@ -1764,6 +1764,25 @@ fn awaiting(frame: &Value) -> Check {
             && spec.thread_id.as_deref() == frame.get("threadId").and_then(Value::as_str),
         "the card should carry the frame's run, call, tool, reason and why: {spec:?}"
     );
+    // The server now sends its own card's sentence (opengrok-server #263, `cards.rs`
+    // `summary_for`), which this app builds itself from the tool and its arguments
+    // (`approval_summary`, transcribed from the same function). The two must say the same; a
+    // shell's card shows its command in place of a summary, and the server's sentence ends on it.
+    if let Some(said) = frame.get("summary").and_then(Value::as_str) {
+        if spec.summary.is_empty() {
+            must!(
+                !spec.command.is_empty() && said.ends_with(&spec.command),
+                "the server says {said:?} and the card shows only {:?}",
+                spec.command
+            );
+        } else {
+            must!(
+                spec.summary == said,
+                "the card says {:?} where the server's own says {said:?}",
+                spec.summary
+            );
+        }
+    }
     if let Some(command) = frame.pointer("/arguments/command").and_then(Value::as_str) {
         must!(
             spec.command == command,
