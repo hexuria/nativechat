@@ -615,14 +615,41 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             }
         }
         flush_text(&mut rows, &mut text_buf, &mut text_n);
+        // A person's files go on their message's last row of words, under the bubble. A message
+        // of files alone gets a row of its own that is otherwise a message like any other: its
+        // time, its toolbar (reply, delete), its queued line (#136).
         if msg.is_me
             && let Some(files) = state.message_files.get(&msg.id)
             && !files.is_empty()
         {
-            rows.push(ChatRow {
-                files: files.clone(),
-                ..ChatRow::slot(format!("{}-files", msg.id), msg.id.clone())
-            });
+            let last_words = rows
+                .iter_mut()
+                .rev()
+                .take_while(|row| row.source_id == msg.id)
+                .find(|row| row.show_footer);
+            match last_words {
+                Some(row) => row.files = files.clone(),
+                None => {
+                    let names = files
+                        .iter()
+                        .map(|file| file.filename.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    rows.push(ChatRow {
+                        is_me: true,
+                        timestamp: SharedString::from(msg.formatted_time()),
+                        queued: state.is_send_queued(&msg.id),
+                        show_footer: true,
+                        // What Copy puts on the clipboard and what is read aloud: the files'
+                        // names, the only words a files-alone message has.
+                        tts_text: SharedString::from(names),
+                        reply_preview: msg.reply_preview.clone(),
+                        reaction: state.message_reactions.get(&msg.id).cloned(),
+                        files: files.clone(),
+                        ..ChatRow::slot(text_row_id(&msg.id, 0), msg.id.clone())
+                    });
+                }
+            }
         }
     }
     Arc::new(rows)
@@ -1184,16 +1211,6 @@ impl Render for ChatTranscript {
                                     .child(render_run_row(run, app_state.clone(), cx))
                                     .into_any_element();
                             }
-                            if !row.files.is_empty() {
-                                return div()
-                                    .id(ElementId::Name(row.id.clone().into()))
-                                    .w_full()
-                                    .flex()
-                                    .justify_end()
-                                    .py(px(2.))
-                                    .child(render_sent_files(&row.files, &palette))
-                                    .into_any_element();
-                            }
                             if let Some(spec) = &row.widget {
                                 return div()
                                     .id(ElementId::Name(row.id.clone().into()))
@@ -1382,6 +1399,7 @@ impl Render for ChatTranscript {
                                 .is_ai_loading(row.is_ai_loading)
                                 .is_cached(row.is_cached)
                                 .queued(row.queued)
+                                .files(row.files.clone())
                                 .highlight_range(row.highlight_range.clone())
                                 .highlight_color(highlight_color)
                                 .find_marks(marks_for_row(ix, &find_hits, find_current))
@@ -1982,61 +2000,6 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
     }
 }
 
-/// A sent message's files, each a tile with its name and what kind of file it is (#90). The
-/// file itself stays on the server; the tile is drawn from the listing, not the bytes.
-fn render_sent_files(files: &[crate::opengrok::Attachment], palette: &ChatPalette) -> AnyElement {
-    h_flex()
-        .max_w(px(CHAT_CONTENT_MAX * 0.72))
-        .flex_wrap()
-        .justify_end()
-        .gap(px(6.))
-        .children(files.iter().map(|file| {
-            let kind = if file.mime == "application/pdf" {
-                "PDF"
-            } else if file.mime.starts_with("image/") {
-                "Image"
-            } else if file.mime.starts_with("video/") {
-                "Video"
-            } else {
-                "Text"
-            };
-            v_flex()
-                .id(ElementId::Name(format!("message-file-{}", file.id).into()))
-                .max_w(px(220.))
-                .px(px(10.))
-                .py(px(6.))
-                .rounded(px(10.))
-                .bg(palette.secondary)
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(palette.secondary_foreground)
-                        .truncate()
-                        .child(file.filename.clone()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(palette.secondary_foreground.opacity(0.7))
-                        .child(format!("{kind} · {}", human_size(file.size_bytes))),
-                )
-        }))
-        .into_any_element()
-}
-
-/// A file's size the way a person reads it.
-fn human_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.;
-    let b = bytes as f64;
-    if b < KIB {
-        format!("{bytes} B")
-    } else if b < KIB * KIB {
-        format!("{:.0} KB", b / KIB)
-    } else {
-        format!("{:.1} MB", b / KIB / KIB)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2446,5 +2409,61 @@ mod tests {
             .expect("c1's row");
         assert_eq!(opened, ("✓", true, Some("4.0G".to_string())));
         assert_eq!(feed(&state)[3], "2 steps ✗ shut");
+    }
+
+    fn person_says(words: &str, id: &str) -> crate::state::Message {
+        let mut state = one_reply(Vec::new());
+        let mut message = state.conversations[0].messages.remove(0);
+        message.id = id.into();
+        message.is_me = true;
+        message.sender = "Me".into();
+        message.content = words.into();
+        message
+    }
+
+    fn a_file(id: &str) -> crate::opengrok::Attachment {
+        crate::opengrok::Attachment {
+            id: id.into(),
+            mime: "application/pdf".into(),
+            filename: format!("{id}.pdf"),
+            size_bytes: 10,
+        }
+    }
+
+    /// A message of files alone is a message like any other: one row, with its time and its
+    /// footer (reply, delete), carrying its files, and the files' names for copy and read aloud.
+    /// A worded message carries its files on its own row, with no extra row (#136).
+    #[test]
+    fn a_message_of_files_alone_has_its_time_and_controls() {
+        let mut state = one_reply(Vec::new());
+        state.conversations[0].messages = vec![
+            person_says("", "m_files"),
+            person_says("see these", "m_words"),
+        ];
+        state
+            .message_files
+            .insert("m_files".into(), vec![a_file("art_1"), a_file("art_2")]);
+        state
+            .message_files
+            .insert("m_words".into(), vec![a_file("art_3")]);
+        let rows = snapshot_rows(&state);
+        let of = |id: &str| {
+            rows.iter()
+                .filter(|row| row.source_id == id)
+                .collect::<Vec<_>>()
+        };
+        let files_alone = of("m_files");
+        assert_eq!(files_alone.len(), 1, "one row, not a bare row of tiles");
+        let row = files_alone[0];
+        assert!(
+            row.show_footer && row.is_me,
+            "it has the footer a message has"
+        );
+        assert_eq!(row.files.len(), 2);
+        assert_eq!(row.tts_text.as_ref(), "art_1.pdf, art_2.pdf");
+        let worded = of("m_words");
+        assert_eq!(worded.len(), 1, "the files ride on the words' own row");
+        assert_eq!(worded[0].content.as_ref(), "see these");
+        assert_eq!(worded[0].files.len(), 1);
     }
 }
