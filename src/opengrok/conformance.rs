@@ -475,6 +475,18 @@ const FIVE_HUNDRED_SHAPE: &str = "should carry its sentence under error, as JSON
 /// [`every_route_this_app_does_not_read_is_recorded_and_says_why`] fails until it does.
 const REST_NOT_READ: &[(&str, &str, &str)] = &[
     (
+        "GET__connectors",
+        "/connectors",
+        "Connect (opengrok-server#269, recorded since #285). This branch does not read it; \
+         nativechat#150 does, and takes this entry off when it lands.",
+    ),
+    (
+        "GET__connections__connector__authorize",
+        "/connections/{connector}/authorize",
+        "Connect (opengrok-server#269, recorded since #285). This branch does not read it; \
+         nativechat#150 does, and takes this entry off when it lands.",
+    ),
+    (
         "GET__connections",
         "/connections",
         "A person's connections (opengrok-server#267, recorded since #279). This branch does not \
@@ -607,21 +619,7 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 /// the shape agreed with the server, so the recording is read the day it arrives.
 /// [`a_route_asked_before_it_is_recorded_is_on_its_way`] fails that day until the entry comes off,
 /// and fails too for an entry whose route the app no longer asks, so none can linger here.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__coworkers__coworker_id__skills",
-        "/coworkers/{coworker_id}/skills",
-        "A bot's skills, which its Skills card's switches are drawn from. opengrok-server#270 adds \
-         the route and records the read, the write and their refusals; the app was written to the \
-         shape agreed with the server session before that code, and its fixtures arrive with it.",
-    ),
-    (
-        "PUT__coworkers__coworker_id__skills",
-        "/coworkers/{coworker_id}/skills",
-        "A switch on the Skills card, which sends every attached skill's id with the version it \
-         was read at; see GET. Recorded with #270.",
-    ),
-];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
 
